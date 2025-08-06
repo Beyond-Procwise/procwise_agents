@@ -419,3 +419,59 @@ AttributeError: 'AgentNick' object has no attribute 'policy_engine'
 2025-08-04 19:14:59,275 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
 2025-08-04 19:14:59,294 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 93749 (char 93748)
 2025-08-05 06:05:41,598 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-06 07:52:04,476 - INFO - api.main - API shutting down.
+2025-08-06 07:52:21,656 - INFO - api.main - API starting up...
+2025-08-06 07:52:21,656 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-06 07:52:21,656 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-06 07:52:21,774 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-06 07:52:22,225 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-06 07:52:22,225 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-06 07:52:25,428 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-06 07:52:25,823 - INFO - agents.base_agent - Clients initialized.
+2025-08-06 07:52:25,823 - INFO - agents.base_agent - Initializing core engines...
+2025-08-06 07:52:25,824 - INFO - agents.base_agent - Engines initialized.
+2025-08-06 07:52:25,836 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-06 07:52:25,838 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-06 07:52:25,838 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-06 07:52:25,838 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-06 07:52:25,838 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-06 07:52:25,892 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-06 07:52:25,893 - INFO - api.main - System initialized successfully.
+2025-08-06 09:00:56,102 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-06 09:00:56,105 - INFO - engines.query_engine - QueryEngine: Fetching dynamic data for intent -> {'template_id': 'rank_by_criteria', 'parameters': {'category': None, 'criteria': ['price', 'delivery performance', 'risk'], 'time_period': None, 'filters': None}}
+2025-08-06 09:00:56,130 - ERROR - engines.query_engine - QueryEngine: Failed to execute query against database: Execution failed on sql '
+        SELECT
+            vendor_name,
+            AVG(total_amount) as price_score_raw,
+            (array_agg(payment_terms ORDER BY invoice_date DESC))[1] as payment_terms_raw
+        FROM
+            proc.invoice_agent
+        WHERE
+            vendor_name IS NOT NULL
+        GROUP BY
+            vendor_name;
+        ': column "vendor_name" does not exist
+LINE 3:             vendor_name,
+                    ^
+
+2025-08-06 09:01:54,817 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-06 09:01:54,817 - INFO - engines.query_engine - QueryEngine: Fetching dynamic data for intent -> {'template_id': 'rank_by_criteria', 'parameters': {'category': None, 'criteria': ['price', 'delivery performance', 'risk'], 'time_period': None, 'filters': None}}
+2025-08-06 09:01:54,851 - ERROR - engines.query_engine - QueryEngine: Failed to execute query against database: Execution failed on sql '
+        SELECT
+            vendor_name,
+            AVG(total_amount) as price_score_raw,
+            (array_agg(payment_terms ORDER BY invoice_date DESC))[1] as payment_terms_raw
+        FROM
+            proc.invoice_agent
+        WHERE
+            vendor_name IS NOT NULL
+        GROUP BY
+            vendor_name;
+        ': column "vendor_name" does not exist
+LINE 3:             vendor_name,
+                    ^
+
+2025-08-06 13:42:09,208 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-06 13:42:09,723 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings/points/search "HTTP/1.1 200 OK"
+2025-08-06 13:45:06,837 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-06 13:45:06,839 - INFO - services.model_selector - Generating follow-up questions...
