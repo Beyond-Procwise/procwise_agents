@@ -1,0 +1,421 @@
+2025-08-03 20:16:39,698 - INFO - api.main - API starting up...
+2025-08-03 20:16:39,699 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-03 20:16:39,699 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-03 20:16:39,775 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-03 20:16:40,065 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-03 20:16:40,065 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-03 20:16:41,791 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-03 20:16:41,874 - INFO - agents.base_agent - Clients initialized.
+2025-08-03 20:16:41,874 - INFO - agents.base_agent - Initializing core engines...
+2025-08-03 20:16:41,874 - INFO - agents.base_agent - Engines initialized.
+2025-08-03 20:16:41,885 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 404 Not Found"
+2025-08-03 20:16:41,886 - INFO - agents.base_agent - Creating Qdrant collection 'procurement_documents_v2'...
+2025-08-03 20:16:42,082 - INFO - httpx - HTTP Request: PUT https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-03 20:16:42,083 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-03 20:16:42,083 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-03 20:16:42,084 - INFO - agents.data_extraction_agent - Fetching database schemas for all agents...
+2025-08-03 20:16:42,151 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-03 20:16:42,151 - INFO - api.main - System initialized successfully.
+2025-08-03 20:17:40,193 - INFO - api.main - API shutting down.
+2025-08-03 20:17:55,018 - INFO - api.main - API starting up...
+2025-08-03 20:17:55,018 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-03 20:17:55,018 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-03 20:17:55,094 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-03 20:17:55,382 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-03 20:17:55,382 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-03 20:17:57,108 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-03 20:17:57,170 - INFO - agents.base_agent - Clients initialized.
+2025-08-03 20:17:57,170 - INFO - agents.base_agent - Initializing core engines...
+2025-08-03 20:17:57,171 - INFO - agents.base_agent - Engines initialized.
+2025-08-03 20:17:57,181 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-03 20:17:57,183 - INFO - agents.base_agent - Qdrant collection 'procurement_documents_v2' already exists.
+2025-08-03 20:17:57,183 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-03 20:17:57,183 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-03 20:17:57,183 - INFO - agents.data_extraction_agent - Fetching database schemas for all agents...
+2025-08-03 20:17:57,222 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-03 20:17:57,222 - INFO - api.main - System initialized successfully.
+2025-08-03 20:19:36,566 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-03 20:32:12,960 - INFO - api.main - API shutting down.
+2025-08-03 20:32:27,644 - INFO - api.main - API starting up...
+2025-08-03 20:32:27,644 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-03 20:32:27,644 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-03 20:32:27,720 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-03 20:32:28,039 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-03 20:32:28,039 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-03 20:32:29,665 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-03 20:32:29,732 - INFO - agents.base_agent - Clients initialized.
+2025-08-03 20:32:29,732 - INFO - agents.base_agent - Initializing core engines...
+2025-08-03 20:32:29,733 - INFO - agents.base_agent - Engines initialized.
+2025-08-03 20:32:29,743 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-03 20:32:29,745 - INFO - agents.base_agent - Qdrant collection 'procurement_documents_v2' already exists.
+2025-08-03 20:32:29,745 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-03 20:32:29,745 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-03 20:32:29,745 - INFO - agents.data_extraction_agent - Fetching database schemas for all agents...
+2025-08-03 20:32:29,798 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-03 20:32:29,798 - INFO - api.main - System initialized successfully.
+2025-08-03 20:33:33,328 - INFO - services.model_selector - Answering query with model 'llama3.2' and filter: doc_type='string'
+2025-08-03 20:33:33,573 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-03 20:35:26,664 - INFO - agents.data_extraction_agent - DataExtractionAgent starting run...
+2025-08-03 20:42:05,159 - INFO - api.main - API shutting down.
+2025-08-03 20:42:12,282 - INFO - api.main - API starting up...
+2025-08-03 20:42:12,282 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-03 20:42:12,282 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-03 20:42:12,378 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-03 20:42:12,679 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-03 20:42:12,680 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-03 20:42:14,437 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-03 20:42:14,503 - INFO - agents.base_agent - Clients initialized.
+2025-08-03 20:42:14,503 - INFO - agents.base_agent - Initializing core engines...
+2025-08-03 20:42:14,503 - INFO - agents.base_agent - Engines initialized.
+2025-08-03 20:42:14,513 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-03 20:42:14,515 - INFO - agents.base_agent - Qdrant collection 'procurement_documents_v2' already exists.
+2025-08-03 20:42:14,515 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-03 20:42:14,515 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-03 20:42:14,515 - INFO - agents.data_extraction_agent - Fetching database schemas for all agents...
+2025-08-03 20:42:14,574 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-03 20:42:14,574 - INFO - api.main - System initialized successfully.
+2025-08-04 02:20:32,309 - INFO - api.main - API shutting down.
+2025-08-04 02:20:43,633 - INFO - api.main - API starting up...
+2025-08-04 02:20:43,633 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 02:20:43,633 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 02:20:43,715 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 02:20:44,117 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 02:20:44,118 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 02:20:45,960 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 02:20:46,035 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 02:20:46,035 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 02:20:46,035 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 02:20:46,046 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-04 02:20:46,048 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 02:20:46,048 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 02:20:46,048 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 02:20:46,245 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 02:20:46,245 - INFO - api.main - System initialized successfully.
+2025-08-04 03:39:34,288 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 03:40:57,972 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 03:41:13,288 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 03:41:31,581 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 04:04:09,786 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-04 04:06:51,679 - INFO - api.main - API shutting down.
+2025-08-04 04:07:15,340 - INFO - api.main - API starting up...
+2025-08-04 04:07:15,340 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 04:07:15,340 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 04:07:15,447 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 04:07:15,932 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 04:07:15,932 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 04:07:18,446 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 04:07:18,540 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 04:07:18,540 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 04:07:18,540 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 04:07:18,552 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2 "HTTP/1.1 200 OK"
+2025-08-04 04:07:18,555 - INFO - agents.base_agent - Qdrant collection 'procurement_documents_v2' already exists.
+2025-08-04 04:07:18,555 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 04:07:18,555 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 04:07:18,555 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 04:07:18,638 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 04:07:18,639 - INFO - api.main - System initialized successfully.
+2025-08-04 04:08:37,636 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procurement_documents_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-04 04:11:31,855 - INFO - api.main - API shutting down.
+2025-08-04 04:11:58,177 - INFO - api.main - API starting up...
+2025-08-04 04:11:58,178 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 04:11:58,178 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 04:11:58,299 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 04:11:58,768 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 04:11:58,768 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 04:12:01,115 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 04:12:01,207 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 04:12:01,207 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 04:12:01,208 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 04:12:01,220 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/document_embeddings_v2 "HTTP/1.1 200 OK"
+2025-08-04 04:12:01,223 - INFO - agents.base_agent - Qdrant collection 'document_embeddings_v2' already exists.
+2025-08-04 04:12:01,223 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 04:12:01,224 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 04:12:01,224 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 04:12:01,354 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 04:12:01,354 - INFO - api.main - System initialized successfully.
+2025-08-04 04:12:11,970 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/document_embeddings_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-04 04:17:39,783 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/document_embeddings_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-04 04:17:42,066 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/document_embeddings_v2/points/search "HTTP/1.1 400 Bad Request"
+2025-08-04 04:28:00,549 - INFO - api.main - API shutting down.
+2025-08-04 04:28:25,315 - INFO - api.main - API starting up...
+2025-08-04 04:28:25,315 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 04:28:25,315 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 04:28:25,424 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 04:28:25,924 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 04:28:25,924 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 04:28:28,199 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 04:28:28,295 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 04:28:28,306 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 04:28:28,309 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 04:28:28,309 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 04:28:28,309 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 04:28:28,309 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 04:28:28,390 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 04:28:28,391 - CRITICAL - api.main - FATAL: System initialization failed: 'AgentNick' object has no attribute 'policy_engine'
+Traceback (most recent call last):
+  File "/home/muthu/PycharmProjects/procwise_agents/api/main.py", line 30, in lifespan
+    'supplier_ranking': SupplierRankingAgent(agent_nick)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/muthu/PycharmProjects/procwise_agents/agents/supplier_ranking_agent.py", line 21, in __init__
+    self.policy_engine = agent_nick.policy_engine
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AgentNick' object has no attribute 'policy_engine'
+2025-08-04 04:30:32,020 - INFO - api.main - API shutting down.
+2025-08-04 04:30:57,441 - INFO - api.main - API starting up...
+2025-08-04 04:30:57,441 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 04:30:57,441 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 04:30:57,551 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 04:30:57,989 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 04:30:57,989 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 04:31:00,535 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 04:31:00,643 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 04:31:00,643 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 04:31:00,644 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 04:31:00,655 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 04:31:00,657 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 04:31:00,657 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 04:31:00,657 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 04:31:00,657 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 04:31:00,725 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 04:31:00,725 - INFO - api.main - System initialized successfully.
+2025-08-04 05:30:49,818 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 05:31:07,505 - INFO - agents.data_extraction_agent - --- High-Accuracy Data Extraction Run Starting ---
+2025-08-04 06:28:59,299 - INFO - services.model_selector - Answering query with model 'string' and filters: doc_type='string', product_type='string'
+2025-08-04 08:13:49,129 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 08:16:17,754 - INFO - services.model_selector - Answering query with model 'string' and filters: doc_type='string', product_type='string'
+2025-08-04 09:15:53,303 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:16:46,390 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:17:11,802 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:28:14,606 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 09:31:21,532 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:39:03,306 - INFO - api.main - API shutting down.
+2025-08-04 09:41:00,680 - INFO - api.main - API starting up...
+2025-08-04 09:41:00,680 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 09:41:00,680 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 09:41:00,786 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 09:41:01,222 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 09:41:01,222 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 09:41:03,416 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 09:41:03,512 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 09:41:03,512 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 09:41:03,512 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 09:41:03,523 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 09:41:03,526 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 09:41:03,526 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 09:41:03,526 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 09:41:03,526 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 09:41:03,648 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 09:41:03,648 - INFO - api.main - System initialized successfully.
+2025-08-04 09:41:54,754 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='None'
+2025-08-04 09:45:14,779 - INFO - api.main - API shutting down.
+2025-08-04 09:45:25,482 - INFO - api.main - API starting up...
+2025-08-04 09:45:25,482 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 09:45:25,482 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 09:45:25,586 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 09:45:26,027 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 09:45:26,028 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 09:45:28,086 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 09:45:28,191 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 09:45:28,191 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 09:45:28,191 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 09:45:28,203 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 09:45:28,206 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 09:45:28,206 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 09:45:28,206 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 09:45:28,206 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 09:45:28,362 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 09:45:28,362 - INFO - api.main - System initialized successfully.
+2025-08-04 09:46:53,200 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:47:38,959 - INFO - api.main - API shutting down.
+2025-08-04 09:48:02,434 - INFO - api.main - API starting up...
+2025-08-04 09:48:02,434 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 09:48:02,434 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 09:48:02,538 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 09:48:02,953 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 09:48:02,953 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 09:48:05,158 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 09:48:05,257 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 09:48:05,257 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 09:48:05,257 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 09:48:05,268 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 09:48:05,271 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 09:48:05,271 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 09:48:05,271 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 09:48:05,271 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 09:48:05,327 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 09:48:05,327 - INFO - api.main - System initialized successfully.
+2025-08-04 09:48:06,160 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:56:21,244 - INFO - api.main - API shutting down.
+2025-08-04 09:56:40,105 - INFO - api.main - API starting up...
+2025-08-04 09:56:40,105 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 09:56:40,105 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 09:56:40,179 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 09:56:40,540 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 09:56:40,540 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 09:56:42,314 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 09:56:42,384 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 09:56:42,384 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 09:56:42,385 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 09:56:42,395 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 09:56:42,397 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 09:56:42,397 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 09:56:42,397 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 09:56:42,398 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 09:56:42,464 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 09:56:42,465 - INFO - api.main - System initialized successfully.
+2025-08-04 09:57:49,826 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 09:58:19,854 - INFO - services.model_selector - Answering query with model 'string' and filters: doc_type='string', product_type='string'
+2025-08-04 09:58:19,896 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 09:58:20,067 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 404 Not Found"
+2025-08-04 09:58:31,503 - INFO - api.main - API shutting down.
+2025-08-04 09:58:41,914 - INFO - api.main - API starting up...
+2025-08-04 09:58:41,914 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 09:58:41,914 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 09:58:41,990 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 09:58:42,390 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 09:58:42,390 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 09:58:44,190 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 09:58:44,257 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 09:58:44,257 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 09:58:44,257 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 09:58:44,267 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 09:58:44,270 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 09:58:44,270 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 09:58:44,270 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 09:58:44,270 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 09:58:44,322 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 09:58:44,322 - INFO - api.main - System initialized successfully.
+2025-08-04 09:59:05,950 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 09:59:05,981 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:00:51,631 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:00:51,632 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:01:51,414 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:01:51,414 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 1375 (char 1374)
+2025-08-04 10:01:52,499 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-04 10:07:01,684 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 10:07:01,710 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:07:19,375 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:07:19,375 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:07:56,950 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:11:10,702 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:11:10,728 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:11:29,791 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:11:29,791 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:12:57,230 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:14:15,309 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:14:15,334 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:14:36,703 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:14:36,704 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:15:08,725 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:16:29,539 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:16:29,563 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:16:57,065 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:16:57,066 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:17:22,589 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:17:22,589 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 70 (char 69)
+2025-08-04 10:18:10,994 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:18:11,018 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:18:49,709 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:18:49,709 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:19:23,081 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:19:23,082 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 190 (char 189)
+2025-08-04 10:24:06,345 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:24:06,372 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:24:51,965 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:24:51,965 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:25:45,491 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:26:48,441 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:26:48,467 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:27:28,690 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:27:28,691 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:28:51,150 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:30:43,262 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:30:43,289 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:31:47,151 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:31:47,152 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:34:18,636 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:35:12,683 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:35:12,708 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:36:31,673 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:36:31,673 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:41:27,168 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:46:00,865 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 10:46:00,890 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 10:47:15,536 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 10:47:15,536 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 10:47:43,874 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:07:39,282 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 11:07:39,307 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 11:09:21,605 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:09:21,606 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 11:10:48,977 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:12:45,766 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 11:12:45,791 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 11:14:35,262 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:14:35,262 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 11:15:12,220 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:54:41,189 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 11:54:41,214 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 11:56:41,930 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 11:56:41,930 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 11:57:19,832 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:07:42,605 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 12:07:42,642 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 12:09:46,565 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:09:46,566 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 12:10:21,310 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:25:15,980 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 12:25:16,007 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 12:27:22,263 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:27:22,264 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 12:27:48,640 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:40:49,757 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 12:40:49,793 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 12:43:29,873 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 12:43:29,874 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 12:44:54,434 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:02:28,743 - INFO - api.main - API shutting down.
+2025-08-04 13:02:47,479 - INFO - api.main - API starting up...
+2025-08-04 13:02:47,479 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-04 13:02:47,479 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-04 13:02:47,556 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-04 13:02:47,934 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-04 13:02:47,934 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-08-04 13:02:49,685 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-04 13:02:49,751 - INFO - agents.base_agent - Clients initialized.
+2025-08-04 13:02:49,751 - INFO - agents.base_agent - Initializing core engines...
+2025-08-04 13:02:49,752 - INFO - agents.base_agent - Engines initialized.
+2025-08-04 13:02:49,761 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7 "HTTP/1.1 200 OK"
+2025-08-04 13:02:49,763 - INFO - agents.base_agent - Qdrant collection 'procwise_collection_final_v7' already exists.
+2025-08-04 13:02:49,763 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-04 13:02:49,763 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-04 13:02:49,763 - INFO - agents.data_extraction_agent - Fetching database schemas...
+2025-08-04 13:02:49,942 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-04 13:02:49,943 - INFO - api.main - System initialized successfully.
+2025-08-04 13:03:36,428 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='string', product_type='string'
+2025-08-04 13:03:36,460 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 13:06:41,634 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:06:41,635 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 13:08:06,096 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:10:02,417 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 13:10:02,446 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 13:13:03,080 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:13:03,080 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 13:13:27,172 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:22:39,290 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 13:22:39,321 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 13:25:45,595 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:25:45,596 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 13:26:26,873 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:49:03,531 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 13:49:03,555 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 13:52:40,469 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:52:40,470 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 13:53:29,239 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:53:46,129 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-04 13:53:46,163 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/procwise_collection_final_v7/points/search "HTTP/1.1 200 OK"
+2025-08-04 13:57:37,708 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 13:57:37,709 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-04 19:14:59,275 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-04 19:14:59,294 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 93749 (char 93748)
+2025-08-05 06:05:41,598 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"

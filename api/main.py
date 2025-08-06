@@ -1,0 +1,51 @@
+# ProcWise/api/main.py
+
+import sys, os, uvicorn, logging
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from orchestration.orchestrator import Orchestrator
+from services.model_selector import RAGPipeline
+from agents.base_agent import AgentNick
+from agents.data_extraction_agent import DataExtractionAgent
+from agents.supplier_ranking_agent import SupplierRankingAgent
+from api.routers import workflows, system
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+                    handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(LOG_DIR, "procwise.log"))])
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("API starting up...")
+    try:
+        agent_nick = AgentNick()
+        agent_nick.agents = {
+            'data_extraction': DataExtractionAgent(agent_nick),
+            'supplier_ranking': SupplierRankingAgent(agent_nick)
+        }
+        app.state.orchestrator = Orchestrator(agent_nick)
+        app.state.rag_pipeline = RAGPipeline(agent_nick)
+        logger.info("System initialized successfully.")
+    except Exception as e:
+        logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
+        app.state.orchestrator = None; app.state.rag_pipeline = None
+    yield
+    logger.info("API shutting down.")
+
+app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.include_router(workflows.router)
+app.include_router(system.router)
+
+@app.get("/", tags=["General"])
+def read_root(): return {"message": "Welcome to the ProcWise Agentic System API"}
+
+if __name__ == "__main__":
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

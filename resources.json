@@ -1,0 +1,42 @@
+[
+  {
+    "resourceId": "s3_client",
+    "type": "Client",
+    "description": "Boto3 client for interacting with AWS S3."
+  },
+  {
+    "resourceId": "db_client",
+    "type": "Client",
+    "description": "Psycopg2 client for interacting with PostgreSQL."
+  },
+  {
+    "resourceId": "qdrant_client",
+    "type": "Client",
+    "description": "Client for interacting with Qdrant vector database."
+  },
+  {
+    "resourceId": "ollama_client",
+    "type": "Client",
+    "description": "Client for interacting with local Ollama LLMs."
+  },
+  {
+    "resourceId": "embedding_model",
+    "type": "Model",
+    "description": "SentenceTransformer model for creating vector embeddings."
+  },
+  {
+    "resourceId": "prompt_engine",
+    "type": "Engine",
+    "description": "Deconstructs natural language queries into structured intents."
+  },
+  {
+    "resourceId": "policy_engine",
+    "type": "Engine",
+    "description": "Validates intents against business rules and policies."
+  },
+  {
+    "resourceId": "query_engine",
+    "type": "Engine",
+    "description": "Fetches data from datastores based on a query intent."
+  }
+]

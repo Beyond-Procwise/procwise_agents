@@ -1,0 +1,22 @@
+{
+  "templates": [
+    {
+      "template_id": "rank_by_criteria",
+      "description": "Ranks suppliers based on a dynamic set of performance criteria.",
+      "natural_language_example": "Rank our top IT hardware suppliers based on price, delivery performance, and risk.",
+      "input_parameters": [ "category", "criteria", "time_period", "filters" ]
+    },
+    {
+      "template_id": "find_best_supplier_for_category",
+      "description": "Finds the single best supplier for a specific procurement category using default policies.",
+      "natural_language_example": "Who is our best supplier for 'Cloud Services'?",
+      "input_parameters": [ "category" ]
+    },
+    {
+      "template_id": "compare_specific_suppliers",
+      "description": "Compares a specific list of suppliers on given criteria.",
+      "natural_language_example": "Compare Supplier A and Supplier B on price and payment terms.",
+      "input_parameters": [ "suppliers_list", "criteria" ]
+    }
+  ]
+}

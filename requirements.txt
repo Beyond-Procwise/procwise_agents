@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic-settings
+boto3
+psycopg2-binary
+ollama
+pdfplumber
+python-dateutil
+qdrant-client
+sentence-transformers
+pandas
+unstructured[local-inference]
+pdf2image
+pytesseract

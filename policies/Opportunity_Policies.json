@@ -1,0 +1,32 @@
+[
+  {
+    "policyName": "VolumeDiscountOpportunity",
+    "description": "Identifies potential cost savings through volume-based discounts.",
+    "is_active": true,
+    "details": {
+      "rules": {
+        "trigger_condition": "analyze_purchase_orders",
+        "parameters": {
+          "lookback_period_days": 180,
+          "minimum_quantity_threshold": 1000,
+          "minimum_spend_threshold": 50000
+        },
+        "output_suggestion": "Potential for volume discount with supplier {supplier_name} for item {item_description}. Total quantity in the last 6 months: {total_quantity}."
+      }
+    }
+  },
+  {
+    "policyName": "SupplierConsolidationOpportunity",
+    "description": "Identifies opportunities to consolidate spend by finding multiple suppliers for the same item category.",
+    "is_active": true,
+    "details": {
+      "rules": {
+        "trigger_condition": "analyze_supplier_spend_by_category",
+        "parameters": {
+          "minimum_supplier_count": 3
+        },
+        "output_suggestion": "Opportunity to consolidate spend in category {category}. Currently served by {supplier_count} suppliers."
+      }
+    }
+  }
+]

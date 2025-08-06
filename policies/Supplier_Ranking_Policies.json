@@ -1,0 +1,43 @@
+[
+  {
+    "policyName": "WeightAllocationPolicy",
+    "description": "Defines the default weights for standard supplier ranking criteria.",
+    "details": {
+      "rules": {
+        "default_weights": {
+          "price": 0.5,
+          "delivery": 0.3,
+          "risk": 0.2,
+          "payment_terms": 0.0,
+          "delivery performance": 0.3
+        }
+      }
+    }
+  },
+  {
+    "policyName": "CategoricalScoringPolicy",
+    "description": "Defines how to convert categorical data into a numerical score (0-10 scale).",
+    "details": {
+      "rules": {
+        "payment_terms": {
+          "Net 30": 10,
+          "Net 45": 8,
+          "Net 60": 6,
+          "Net 90": 4
+        }
+      }
+    }
+  },
+  {
+    "policyName": "NormalizationDirectionPolicy",
+    "description": "Specifies whether a higher or lower raw value is better for normalization.",
+    "details": {
+      "rules": {
+        "price": "lower_is_better",
+        "delivery": "higher_is_better",
+        "delivery performance": "higher_is_better",
+        "risk": "lower_is_better"
+      }
+    }
+  }
+]
