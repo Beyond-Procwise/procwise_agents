@@ -135,9 +135,13 @@ class DataExtractionAgent(BaseAgent):
         logger.info("  -> Stage 2b: Extracting Line Items...")
         prompt = "Extract line items (description, quantity, unitPrice, lineTotal) from the text. Respond with a JSON object with a single \"lineItems\" key."
         try:
-            response = ollama.generate(model=self.extraction_model,
-                                       prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:", format='json')
-            return json.loads(response.get('response', '{"lineItems": []}')).get('lineItems')
+            response = ollama.generate(
+                model=self.extraction_model,
+                prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:",
+                format='json'
+            )
+            # Ensure we always return a list; missing keys should yield an empty list rather than ``None``
+            return json.loads(response.get('response', '{"lineItems": []}')).get('lineItems', [])
         except Exception as e:
             logger.error(f"Line item extraction failed: {e}");
             return []
