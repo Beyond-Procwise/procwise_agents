@@ -1,17 +1,60 @@
 # ProcWise/agents/base_agent.py
 
 import boto3
-import psycopg2
 import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+import psycopg2
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
+import ollama
 
 from config.settings import settings
 from orchestration.prompt_engine import PromptEngine
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
+from engines.routing_engine import RoutingEngine
 
 logger = logging.getLogger(__name__)
+
+
+class AgentStatus(str, Enum):
+    """Execution status for an agent."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+@dataclass
+class AgentContext:
+    """Runtime information passed between agents."""
+
+    workflow_id: str
+    agent_id: str
+    user_id: str
+    input_data: Dict[str, Any]
+    parent_agent: Optional[str] = None
+    routing_history: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # track invocation time and update routing path
+        self.timestamp = datetime.utcnow()
+        self.routing_history.append(self.agent_id)
+
+
+@dataclass
+class AgentOutput:
+    """Standardised output returned by agents."""
+
+    status: AgentStatus
+    data: Dict[str, Any]
+    next_agents: List[str] = field(default_factory=list)
+    pass_fields: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    confidence: Optional[float] = None
 
 class BaseAgent:
     def __init__(self, agent_nick):
@@ -21,6 +64,25 @@ class BaseAgent:
 
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+    def call_ollama(self, prompt: str, model: Optional[str] = None,
+                    format: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Lightweight wrapper around :func:`ollama.generate` used by agents."""
+        model_to_use = model or getattr(self.settings, 'extraction_model', 'llama3')
+        try:
+            return ollama.generate(
+                model=model_to_use,
+                prompt=prompt,
+                format=format,
+                stream=False,
+                **kwargs,
+            )
+        except Exception as exc:  # pragma: no cover - network / runtime issues
+            logger.error("Ollama generation failed: %s", exc)
+            return {"response": "", "error": str(exc)}
 
 class AgentNick:
     def __init__(self):
@@ -36,6 +98,7 @@ class AgentNick:
         self.prompt_engine = PromptEngine()
         self.policy_engine = PolicyEngine()
         self.query_engine = QueryEngine(self)
+        self.routing_engine = RoutingEngine(self)
         logger.info("Engines initialized.")
 
         self.agents = {}

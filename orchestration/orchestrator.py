@@ -22,6 +22,7 @@ class Orchestrator:
         self.policy_engine = agent_nick.policy_engine
         self.query_engine = agent_nick.query_engine
         self.routing_engine = agent_nick.routing_engine
+        self.routing_model = self.routing_engine.routing_model
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
 
     def execute_workflow(self, workflow_name: str, input_data: Dict,
