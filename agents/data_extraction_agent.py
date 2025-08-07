@@ -80,11 +80,7 @@ class DataExtractionAgent(BaseAgent):
                     # With the new schema, this step is now extremely robust.
                     validated_doc = ExtractedDocument.model_validate(final_data)
                 except Exception as e:
-                    logger.error(
-                        f"Pydantic Schema Validation Failed for {object_key}: {e}\nRaw Data was: {final_data}");
-                    continue
 
-                pk_value = validated_doc.header_data.invoice_id or validated_doc.header_data.po_number
                 if not pk_value:
                     logger.error("Persistence Failed: No primary key found.")
                     continue
@@ -149,9 +145,6 @@ class DataExtractionAgent(BaseAgent):
             return ""
 
     def _extract_header(self, text: str) -> Dict | None:
-        # ... this method remains the same ...
-        logger.info(" -> Stage 2a: Extracting Header Data...")
-        prompt = "Extract header info (invoiceId, poNumber, vendorName, totalAmount, etc.) from the text. Respond with a single JSON object."
         try:
             response = ollama.generate(model=self.extraction_model,
                                        prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:", format='json')
@@ -165,9 +158,13 @@ class DataExtractionAgent(BaseAgent):
         logger.info(" -> Stage 2b: Extracting Line Items...")
         prompt = "Extract line items (description, quantity, etc.) from the text. Respond with a JSON object with a single \"lineItems\" key."
         try:
-            response = ollama.generate(model=self.extraction_model,
-                                       prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:", format='json')
-            return json.loads(response.get('response', '{"lineItems": []}')).get('lineItems')
+            response = ollama.generate(
+                model=self.extraction_model,
+                prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:",
+                format='json'
+            )
+            # Ensure we always return a list; missing keys should yield an empty list rather than ``None``
+            return json.loads(response.get('response', '{"lineItems": []}')).get('lineItems', [])
         except Exception as e:
             logger.error(f"Line item extraction failed: {e}");
             return []
@@ -213,8 +210,7 @@ class DataExtractionAgent(BaseAgent):
             return None
 
     def _classify_document_type(self, text: str) -> str | None:
-        # ... this method remains the same ...
-        prompt = f"""Is the text an "Invoice" or a "Purchase Order"? Respond with JSON: {{"document_type": "value"}}"""
+
         try:
             response = ollama.generate(model=self.extraction_model, prompt=f"{prompt}\n\nText:\n{text[:1000]}",
                                        format='json')
@@ -236,19 +232,7 @@ class DataExtractionAgent(BaseAgent):
             return "General Goods"
 
     def _upsert_to_qdrant(self, data: Dict, pk_value: str, doc_type: str, product_type: str, object_key: str):
-        # ... this method remains the same ...
-        try:
-            point_id = _normalize_point_id(pk_value)
-            summary = self._generate_document_summary(data, pk_value, doc_type)
-            logger.info(f"Generating vector for summary: '{summary}'")
-            vector = self.agent_nick.embedding_model.encode(summary).tolist()
-            payload = {"document_type": doc_type, "product_type": product_type, "s3_object_key": object_key,
-                       "summary": summary, "confidence": data.get('validation', {}).get('confidence_score')}
-            self.agent_nick.qdrant_client.upsert(collection_name=self.settings.qdrant_collection_name, points=[
-                models.PointStruct(id=point_id, vector=vector, payload=payload)], wait=True)
-            logger.info(f"SUCCESS (Qdrant): Vector for {pk_value} (ID: {point_id}) was created/updated.")
-        except Exception as e:
-            logger.error(f"ERROR (Qdrant): Failed to upsert vector for {pk_value}. Reason: {e}")
+
 
     def _generate_document_summary(self, data: Dict, pk_value: str, doc_type: str) -> str:
         # ... this method remains the same ...
@@ -262,18 +246,11 @@ class DataExtractionAgent(BaseAgent):
     def _fetch_all_table_schemas(self):
         # This method is unchanged
         logger.info("Fetching database schemas...")
-        schemas = {'Invoice': {'pk_col': 'invoice_id'}, 'Purchase_Order': {'pk_col': 'po_id'}}
+        schemas = {'Invoice': {'pk_col': 'invoice_id'},
+                   'Purchase_Order': {'pk_col': 'po_id'},
+                   'Quote': {'pk_col': 'quote_id'}}
         with self.agent_nick.get_db_connection() as conn:
-            for doc_type, config in schemas.items():
-                table_prefix = doc_type.lower()
-                header_table_name = f"{table_prefix}_agent"
-                line_table_name = f"{table_prefix}_line_items_agent" if doc_type == "Invoice" else "po_line_items_agent"
-                config['header_table'] = f"proc.{header_table_name}"
-                config['line_table'] = f"proc.{line_table_name}"
-                config['header_cols'] = self._get_table_columns(conn, 'proc', header_table_name)
-                config['line_cols'] = self._get_table_columns(conn, 'proc', line_table_name)
-                status_col = next((c for c in config['header_cols'] if c.endswith('_status')), 'status')
-                config['status_col'] = status_col
+
         return schemas
 
     def _get_table_columns(self, db_conn, table_schema, table_name):
@@ -287,45 +264,10 @@ class DataExtractionAgent(BaseAgent):
             except psycopg2.Error:
                 return []
 
-    def _clean_and_standardize_data_for_db(self, data_dict: dict, db_cols: list) -> dict:
-        # This method is unchanged
-        cleaned_data = {}
-        PYDANTIC_TO_DB_MAP = {
-            'invoice_id': 'invoice_id', 'po_number': 'po_id', 'vendor_name': 'vendor_name',
-            'total_amount': 'total_amount', 'subtotal': 'subtotal', 'tax_amount': 'tax_amount',
-            'invoice_date': 'invoice_date', 'due_date': 'due_date', 'order_date': 'order_date',
-            'payment_terms': 'payment_terms', 'description': 'description', 'quantity': 'quantity',
-            'unit_price': 'unit_price', 'line_total': 'line_total'
-        }
-        for db_col in db_cols:
-            pydantic_field = next((k for k, v in PYDANTIC_TO_DB_MAP.items() if v == db_col), None)
-            if not pydantic_field: continue
-            value = data_dict.get(pydantic_field)
-            if value is None or (isinstance(value, str) and not value.strip()): cleaned_data[db_col] = None; continue
-            if 'date' in db_col and isinstance(value, str):
                 try:
                     cleaned_data[db_col] = parse_date(value).strftime('%Y-%m-%d')
                 except (ValueError, TypeError):
-                    cleaned_data[db_col] = None
-                continue
-            if any(t in db_col for t in ['amount', 'price', 'quantity', 'total', 'subtotal', 'tax']):
-                if isinstance(value, (int, float)):
-                    cleaned_data[db_col] = value
-                else:
-                    cleaned_data[db_col] = None
-                continue
-            cleaned_data[db_col] = str(value)
-        return cleaned_data
 
-    def _insert_data_to_postgres(self, data: Dict, pk_value: str, config: Dict, status: str):
-        # This method is unchanged
-        pk_col_db = config.get('pk_col')
-        if not pk_col_db or not pk_value:
-            raise ValueError("No primary key found for PostgreSQL insertion.")
-        header_pydantic_data = data.get('header_data', {})
-        cleaned_header = self._clean_and_standardize_data_for_db(header_pydantic_data, config['header_cols'])
-        cleaned_header[pk_col_db] = pk_value
-        status_column_name = config.get('status_col', 'status')
         current_time = datetime.now()
         cleaned_header.update({'last_modified_date': current_time, 'last_modified_by': self.settings.script_user,
                                'created_date': current_time, 'created_by': self.settings.script_user,
@@ -340,12 +282,7 @@ class DataExtractionAgent(BaseAgent):
                 cols_str, vals_ph = ', '.join(cols_to_insert.keys()), ', '.join(['%s'] * len(cols_to_insert))
                 sql_upsert = f"INSERT INTO {config['header_table']} ({cols_str}) VALUES ({vals_ph}) ON CONFLICT ({pk_col_db}) DO UPDATE SET {update_clause};"
                 cursor.execute(sql_upsert, tuple(cols_to_insert.values()))
-                cursor.execute(f"DELETE FROM {config['line_table']} WHERE {pk_col_db} = %s;", (pk_value,))
-                for i, item in enumerate(data.get('line_items', []), 1):
-                    cleaned_item = self._clean_and_standardize_data_for_db(item, config['line_cols'])
-                    line_pk_col = 'invoice_line_id' if 'invoice' in config['line_table'] else 'po_line_id'
-                    cleaned_item.update({pk_col_db: pk_value, 'line_no': i, line_pk_col: f"{pk_value}-{i}"})
-                    item_to_insert = {k: v for k, v in cleaned_item.items() if k in config['line_cols']}
+
                     if not item_to_insert.get(line_pk_col): continue
                     line_cols, line_vals = ', '.join(item_to_insert.keys()), ', '.join(['%s'] * len(item_to_insert))
                     cursor.execute(f"INSERT INTO {config['line_table']} ({line_cols}) VALUES ({line_vals});",
