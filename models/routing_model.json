@@ -1,0 +1,6 @@
+{
+  "global_settings": {
+    "max_chain_depth": 10
+  },
+  "routing_rules": []
+}

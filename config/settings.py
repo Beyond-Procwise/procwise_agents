@@ -30,6 +30,20 @@ class Settings(BaseSettings):
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']
 
+    # Worker and processing settings
+    max_workers: int = Field(default=4, env="MAX_WORKERS")
+    parallel_processing: bool = Field(default=False, env="PARALLEL_PROCESSING")
+
+    # Learning and optimization
+    enable_learning: bool = Field(default=False, env="ENABLE_LEARNING")
+
+    # Caching settings
+    cache_enabled: bool = Field(default=False, env="CACHE_ENABLED")
+    cache_ttl: int = Field(default=3600, env="CACHE_TTL")
+
+    # Auditing settings
+    audit_enabled: bool = Field(default=True, env="AUDIT_ENABLED")
+
     class Config:
         env_file = ENV_FILE_PATH
         env_file_encoding = 'utf-8'
