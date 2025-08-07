@@ -262,3 +262,14 @@ class DataExtractionAgent(BaseAgent):
                     [item[c] for c in item_cols],
                 )
             conn.commit()
+
+if __name__ == "__main__":
+    # This is just a placeholder to allow running the module directly for testing.
+    # In production, this agent would be invoked by the main application logic.
+    from agents.base_agent import AgentNick
+
+    agent_nick = AgentNick()
+    logging.basicConfig(level=logging.INFO)
+    agent = DataExtractionAgent(agent_nick)  # Replace with actual AgentNick instance
+    result = agent.run(s3_prefix="Invoices/")
+    print(result)
