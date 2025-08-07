@@ -21,11 +21,11 @@ class Settings(BaseSettings):
     qdrant_url: str = Field(..., env="QDRANT_URL")
     qdrant_api_key: str = Field(..., env="QDRANT_API_KEY")
     # --- THIS IS THE SINGLE SOURCE OF TRUTH. A NEW NAME TO GUARANTEE A FRESH START. ---
-    qdrant_collection_name: str = "procwise_collection_final_v7"
+    qdrant_collection_name: str = "ProcWise_document_embeddings"
 
     extraction_model: str = "llama3.2"
-    embedding_model: str = "all-MiniLM-L6-v2"
-    vector_size: int = 384
+    embedding_model: str = "all-roberta-large-v1"
+    vector_size: int = 1024
 
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']
