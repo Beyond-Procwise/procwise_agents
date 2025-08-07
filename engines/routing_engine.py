@@ -1,9 +1,15 @@
 import json
 import logging
-from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Fallback routing configuration used if no external model is provided.
+routing_model: Dict[str, Any] = {
+    "global_settings": {"max_chain_depth": 10},
+    "routing_rules": [],
+}
 
 
 @dataclass
