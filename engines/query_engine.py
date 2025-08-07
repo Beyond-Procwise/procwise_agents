@@ -22,17 +22,24 @@ class QueryEngine(BaseEngine):
         """Return supplier information required for ranking.
 
         The query joins ``proc.supplier`` with invoice and purchase order
-        tables.  Only suppliers that appear in either table are returned.  Raw
-        numeric metrics are suffixed with ``_score_raw`` so that the ranking
-        agent can normalise them according to the defined policies.
+        tables.  Only suppliers that appear in either table are returned.  In
+        addition to scoring fields, key attributes such as ``trading_name``,
+        ``legal_structure`` and ``is_preferred_supplier`` are returned so that
+        prompts can reference these values.  Raw numeric metrics are suffixed
+        with ``_score_raw`` so that the ranking agent can normalise them
+        according to the defined policies.
         """
         sql = """
             SELECT s.supplier_id,
                    s.supplier_name,
+                   s.trading_name,
+                   s.legal_structure,
+                   s.is_preferred_supplier,
                    s.payment_terms     AS payment_terms_raw,
                    s.price_score       AS price_score_raw,
                    s.delivery_score    AS delivery_score_raw,
                    s.risk_score        AS risk_score_raw,
+                   s.risk_score        AS risk_score,
                    COALESCE(inv.total_invoiced, 0) AS total_invoiced_score_raw,
                    COALESCE(po.total_ordered, 0)  AS total_ordered_score_raw
             FROM proc.supplier s
