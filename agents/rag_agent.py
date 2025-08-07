@@ -68,12 +68,22 @@ ANSWER:"""
 
     def _save_chat_history(self, user_id: str, history: list):
         history_key = f"chat_history/{user_id}.json"
+        bucket_name = getattr(self.settings, "s3_bucket_name", None)
+        if not bucket_name:
+            print("ERROR: S3 bucket name is not configured. Please set 's3_bucket_name' in settings.")
+            return
         try:
             self.agent_nick.s3_client.put_object(
-                Bucket=self.settings.s_bucket_name,
+                Bucket=bucket_name,
                 Key=history_key,
                 Body=json.dumps(history, indent=2)
             )
-            print(f"Saved chat history for user '{user_id}'.")
+            print(f"Saved chat history for user '{user_id}' in bucket '{bucket_name}'.")
+        except ClientError as e:
+            error_code = e.response["Error"].get("Code", "Unknown")
+            if error_code == "NoSuchBucket":
+                print(f"ERROR: S3 bucket '{bucket_name}' does not exist. Please check configuration.")
+            else:
+                print(f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}")
         except Exception as e:
-            print(f"ERROR: Could not save chat history to S3. {e}")
+            print(f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}")
