@@ -13,6 +13,10 @@ SCHEMA_TO_PROMPT_MAP = {
     'customer_name': 'the name of the company or person receiving the invoice/PO (e.g., To, Bill To, Customer)',
     'po_id': 'the unique purchase order identifier (often labeled as PO No, PO #, or Purchase Order)',
     'po_number': 'the unique purchase order identifier (often labeled as PO No, PO #, or Purchase Order)',
+    'quote_id': 'the unique quote identifier (often labeled as Quote No, Quote #, or Quote ID)',
+    'quote_number': 'the unique quote identifier (often labeled as Quote No, Quote #, or Quote ID)',
+    'quote_date': 'the date the quote was issued (e.g., Quote Date)',
+    'valid_until': 'the expiration date of the quote (e.g., Valid Until, Expiration Date)',
     'order_date': 'the date the purchase order was created (e.g., Order Date)',
     'description': 'the description of the product or service',
     'item_description': 'the description of the product or service', 'quantity': 'the quantity of the item',
@@ -30,10 +34,14 @@ class LineItem(BaseModel):
 class HeaderData(BaseModel):
     invoice_id: Optional[str] = Field(None, alias='invoiceId')
     po_number: Optional[str] = Field(None, alias='poNumber')
+    quote_id: Optional[str] = Field(None, alias='quoteId')
+    quote_number: Optional[str] = Field(None, alias='quoteNumber')
     vendor_name: Optional[str] = Field(None, alias='vendorName')
     total_amount: Optional[float] = Field(None, alias='totalAmount')
     invoice_date: Optional[str] = Field(None, alias='invoiceDate')
+    quote_date: Optional[str] = Field(None, alias='quoteDate')
     due_date: Optional[str] = Field(None, alias='dueDate')
+    valid_until: Optional[str] = Field(None, alias='validUntil')
     order_date: Optional[str] = Field(None, alias='orderDate')
     customer_name: Optional[str] = Field(None, alias='customerName')
     po_id: Optional[str] = Field(None, alias='poId')
