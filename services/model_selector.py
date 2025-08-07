@@ -101,7 +101,11 @@ class RAGPipeline:
             limit=5
         )
         retrieved_context = "\n---\n".join(
-            [hit.payload['summary'] for hit in search_results]) if search_results else "No relevant documents found."
+            [
+                f"Document ID: {hit.payload.get('record_id', hit.id)}\nSummary: {hit.payload.get('summary')}"
+                for hit in search_results
+            ]
+        ) if search_results else "No relevant documents found."
 
         # --- Process Uploaded Files & Chat History ---
         ad_hoc_context = self._extract_text_from_uploads(files) if files else ""

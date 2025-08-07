@@ -86,7 +86,7 @@ class DataExtractionAgent(BaseAgent):
 
                 pk_value = validated_doc.header_data.invoice_id or validated_doc.header_data.po_number
                 if not pk_value:
-                    logger.error(f"Persistence Failed: No primary key identified for {object_key}.");
+                    logger.error("Persistence Failed: No primary key found.")
                     continue
 
                 logger.info(f"Successfully identified PK '{pk_value}' for {object_key}.")
@@ -107,6 +107,9 @@ class DataExtractionAgent(BaseAgent):
 
                 try:
                     self._insert_data_to_postgres(db_data, pk_value, self.table_schemas[doc_type], status)
+                except ValueError as e:
+                    logger.error(str(e))
+                    status = "db_failed"
                 except Exception as e:
                     logger.error(f"DB insertion failed for {object_key}, but vector was saved. Error: {e}")
                     status = "db_failed"
@@ -316,9 +319,11 @@ class DataExtractionAgent(BaseAgent):
 
     def _insert_data_to_postgres(self, data: Dict, pk_value: str, config: Dict, status: str):
         # This method is unchanged
+        pk_col_db = config.get('pk_col')
+        if not pk_col_db or not pk_value:
+            raise ValueError("No primary key found for PostgreSQL insertion.")
         header_pydantic_data = data.get('header_data', {})
         cleaned_header = self._clean_and_standardize_data_for_db(header_pydantic_data, config['header_cols'])
-        pk_col_db = config['pk_col']
         cleaned_header[pk_col_db] = pk_value
         status_column_name = config.get('status_col', 'status')
         current_time = datetime.now()
