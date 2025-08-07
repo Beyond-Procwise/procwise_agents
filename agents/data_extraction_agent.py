@@ -248,11 +248,23 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
         point_id = _normalize_point_id(pk_value)
         summary = self._generate_document_summary(data, pk_value, doc_type)
         vector = self.agent_nick.embedding_model.encode(summary).tolist()
-        payload = {"document_type": doc_type, "product_type": product_type, "s3_object_key": object_key,
-                   "summary": summary, "confidence": data.get('validation', {}).get('confidenceScore')}
-        self.agent_nick.qdrant_client.upsert(collection_name=self.settings.qdrant_collection_name,
-                                             points=[models.PointStruct(id=point_id, vector=vector, payload=payload)],
-                                             wait=True)
+        header = data.get('headerData', {})
+        payload = {
+            "document_type": doc_type,
+            "product_type": product_type,
+            "s3_object_key": object_key,
+            "summary": summary,
+            "confidence": data.get('validation', {}).get('confidenceScore'),
+            "record_id": pk_value,
+            "vendor_name": header.get('vendorName'),
+            "invoice_date": header.get('invoiceDate'),
+            "total_amount": header.get('totalAmount'),
+        }
+        self.agent_nick.qdrant_client.upsert(
+            collection_name=self.settings.qdrant_collection_name,
+            points=[models.PointStruct(id=point_id, vector=vector, payload=payload)],
+            wait=True,
+        )
 
     def _generate_document_summary(self, data: Dict, pk_value: str, doc_type: str) -> str:
         header = data.get('headerData', {})
