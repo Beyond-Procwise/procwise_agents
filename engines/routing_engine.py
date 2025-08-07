@@ -1,6 +1,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,10 @@ class RoutingEngine:
     def load_routing_rules(self):
         """Load routing rules from configuration"""
         try:
-            with open('models/routing_model.json', 'r') as f:
+            model_path = (
+                Path(__file__).resolve().parent.parent / "models" / "routing_model.json"
+            )
+            with model_path.open("r") as f:
                 self.routing_model = json.load(f)
         except Exception as e:
             logger.error(f"Failed to load routing model: {e}")
