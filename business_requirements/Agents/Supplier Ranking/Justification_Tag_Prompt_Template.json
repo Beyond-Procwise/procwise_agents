@@ -1,0 +1,13 @@
+{
+    "template_id": "justification_tag_template",
+    "type": "justification",
+    "description": "Summarizes procurement scoring output into a clear 1-line justification tag.",
+    "output_format": "plain_text",
+    "max_length": 25,
+    "used_by": [
+        "Opportunity Miner Agent",
+        "Quote Evaluation Agent",
+        "Audit Trail Agent"
+    ],
+    "prompt_template": "You are an LLM that writes procurement decision justifications.\n\nGiven:\n- Opportunity type: {{opportunity_type}}\n- Supplier: {{supplier}}\n- Item: {{item}}\n- Expected unit price: \u00a3{{expected_unit_price}}\n- Actual unit price: \u00a3{{actual_unit_price}}\n- Volume purchased: {{volume}}\n- Lost savings: \u00a3{{lost_savings}}\n- Confidence level: {{confidence_level}}\n- Score: {{score}}\n\nTask:\nWrite a 1-line justification for a flagged opportunity (max 25 words). Be clear, data-backed, and suitable for procurement decision-makers. Avoid technical jargon.\n\nOutput example:\n\"Unit price drift on Steel Pipe 6-inch from Acme: paid \u00a35.15 vs \u00a34.25 over 3,000 units. \u00a32,700 overspend. Confidence: High.\""
+}

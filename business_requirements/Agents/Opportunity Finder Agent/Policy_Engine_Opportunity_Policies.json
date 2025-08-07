@@ -1,0 +1,902 @@
+[
+    {
+        "policy_id": "policy_unit_price_reduction",
+        "opportunity_type": "Unit Price Reduction",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Unit Price Reduction' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Unit Price Reduction'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Unit Price Reduction', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Unit Price Reduction'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_volume_discounts",
+        "opportunity_type": "Volume Discounts",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Volume Discounts' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Volume Discounts'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Volume Discounts', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Volume Discounts'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_early_payment_discounts",
+        "opportunity_type": "Early Payment Discounts",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Early Payment Discounts' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Early Payment Discounts'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Early Payment Discounts', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Early Payment Discounts'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_benchmarking_based_reductions",
+        "opportunity_type": "Benchmarking-Based Reductions",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Benchmarking-Based Reductions' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Benchmarking-Based Reductions'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Benchmarking-Based Reductions', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Benchmarking-Based Reductions'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_index_linked_pricing_adjustments",
+        "opportunity_type": "Index-Linked Pricing Adjustments",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Index-Linked Pricing Adjustments' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Index-Linked Pricing Adjustments'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Index-Linked Pricing Adjustments', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Index-Linked Pricing Adjustments'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_should_cost_modelling",
+        "opportunity_type": "Should-Cost Modelling",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Should-Cost Modelling' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Should-Cost Modelling'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Should-Cost Modelling', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Should-Cost Modelling'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_bundled_pricing",
+        "opportunity_type": "Bundled Pricing",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Bundled Pricing' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Bundled Pricing'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Bundled Pricing', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Bundled Pricing'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_zero_based_budgeting_challenges",
+        "opportunity_type": "Zero-Based Budgeting Challenges",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Zero-Based Budgeting Challenges' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Zero-Based Budgeting Challenges'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Zero-Based Budgeting Challenges', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Zero-Based Budgeting Challenges'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_alternative_supplier_sourcing",
+        "opportunity_type": "Alternative Supplier Sourcing",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Alternative Supplier Sourcing' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Alternative Supplier Sourcing'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Alternative Supplier Sourcing', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Alternative Supplier Sourcing'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_reverse_auctions",
+        "opportunity_type": "Reverse Auctions",
+        "category": "Price-Based",
+        "trigger": "When procurement data reveals a potential opportunity in 'Reverse Auctions' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Reverse Auctions'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Price-Based'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Reverse Auctions', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Reverse Auctions'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_specification_simplification",
+        "opportunity_type": "Specification Simplification",
+        "category": "Specification & Demand",
+        "trigger": "When procurement data reveals a potential opportunity in 'Specification Simplification' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Specification Simplification'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Specification & Demand'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Specification Simplification', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Specification Simplification'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_demand_aggregation",
+        "opportunity_type": "Demand Aggregation",
+        "category": "Specification & Demand",
+        "trigger": "When procurement data reveals a potential opportunity in 'Demand Aggregation' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Demand Aggregation'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Specification & Demand'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Demand Aggregation', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Demand Aggregation'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_elimination_of_tail_spend",
+        "opportunity_type": "Elimination of Tail Spend",
+        "category": "Specification & Demand",
+        "trigger": "When procurement data reveals a potential opportunity in 'Elimination of Tail Spend' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Elimination of Tail Spend'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Specification & Demand'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Elimination of Tail Spend', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Elimination of Tail Spend'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_standardisation_of_skus",
+        "opportunity_type": "Standardisation of SKUs",
+        "category": "Specification & Demand",
+        "trigger": "When procurement data reveals a potential opportunity in 'Standardisation of SKUs' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Standardisation of SKUs'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Specification & Demand'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Standardisation of SKUs', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Standardisation of SKUs'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_buy_to_order_vs._stocked_supply",
+        "opportunity_type": "Buy-to-Order vs. Stocked Supply",
+        "category": "Specification & Demand",
+        "trigger": "When procurement data reveals a potential opportunity in 'Buy-to-Order vs. Stocked Supply' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Buy-to-Order vs. Stocked Supply'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Specification & Demand'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Buy-to-Order vs. Stocked Supply', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Buy-to-Order vs. Stocked Supply'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_improved_payment_terms",
+        "opportunity_type": "Improved Payment Terms",
+        "category": "Contractual & Commercial Terms",
+        "trigger": "When procurement data reveals a potential opportunity in 'Improved Payment Terms' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Improved Payment Terms'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Contractual & Commercial Terms'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Improved Payment Terms', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Improved Payment Terms'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_reduced_minimum_order_quantities_(moqs)",
+        "opportunity_type": "Reduced Minimum Order Quantities (MOQs)",
+        "category": "Contractual & Commercial Terms",
+        "trigger": "When procurement data reveals a potential opportunity in 'Reduced Minimum Order Quantities (MOQs)' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Reduced Minimum Order Quantities (MOQs)'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Contractual & Commercial Terms'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Reduced Minimum Order Quantities (MOQs)', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Reduced Minimum Order Quantities (MOQs)'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_service_level_rebates",
+        "opportunity_type": "Service Level Rebates",
+        "category": "Contractual & Commercial Terms",
+        "trigger": "When procurement data reveals a potential opportunity in 'Service Level Rebates' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Service Level Rebates'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Contractual & Commercial Terms'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Service Level Rebates', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Service Level Rebates'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_volume_commitment_rebates",
+        "opportunity_type": "Volume Commitment Rebates",
+        "category": "Contractual & Commercial Terms",
+        "trigger": "When procurement data reveals a potential opportunity in 'Volume Commitment Rebates' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Volume Commitment Rebates'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Contractual & Commercial Terms'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Volume Commitment Rebates', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Volume Commitment Rebates'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_index_re_alignment_or_re_basing",
+        "opportunity_type": "Index Re-alignment or Re-basing",
+        "category": "Contractual & Commercial Terms",
+        "trigger": "When procurement data reveals a potential opportunity in 'Index Re-alignment or Re-basing' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Index Re-alignment or Re-basing'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Contractual & Commercial Terms'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Index Re-alignment or Re-basing', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Index Re-alignment or Re-basing'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_supplier_consolidation",
+        "opportunity_type": "Supplier Consolidation",
+        "category": "Supplier Management & Sourcing",
+        "trigger": "When procurement data reveals a potential opportunity in 'Supplier Consolidation' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Supplier Consolidation'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Management & Sourcing'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Supplier Consolidation', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Supplier Consolidation'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_offshoring_low_cost_country_sourcing",
+        "opportunity_type": "Offshoring/Low-Cost Country Sourcing",
+        "category": "Supplier Management & Sourcing",
+        "trigger": "When procurement data reveals a potential opportunity in 'Offshoring/Low-Cost Country Sourcing' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Offshoring/Low-Cost Country Sourcing'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Management & Sourcing'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Offshoring/Low-Cost Country Sourcing', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Offshoring/Low-Cost Country Sourcing'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_supplier_performance_improvement",
+        "opportunity_type": "Supplier Performance Improvement",
+        "category": "Supplier Management & Sourcing",
+        "trigger": "When procurement data reveals a potential opportunity in 'Supplier Performance Improvement' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Supplier Performance Improvement'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Management & Sourcing'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Supplier Performance Improvement', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Supplier Performance Improvement'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_insourcing_outsourcing_decisions",
+        "opportunity_type": "Insourcing/Outsourcing Decisions",
+        "category": "Supplier Management & Sourcing",
+        "trigger": "When procurement data reveals a potential opportunity in 'Insourcing/Outsourcing Decisions' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Insourcing/Outsourcing Decisions'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Management & Sourcing'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Insourcing/Outsourcing Decisions', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Insourcing/Outsourcing Decisions'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_multi_sourcing_to_reduce_dependency",
+        "opportunity_type": "Multi-Sourcing to Reduce Dependency",
+        "category": "Supplier Management & Sourcing",
+        "trigger": "When procurement data reveals a potential opportunity in 'Multi-Sourcing to Reduce Dependency' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Multi-Sourcing to Reduce Dependency'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Management & Sourcing'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Multi-Sourcing to Reduce Dependency', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Multi-Sourcing to Reduce Dependency'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_automation_of_purchase_to_pay_(p2p)",
+        "opportunity_type": "Automation of Purchase-to-Pay (P2P)",
+        "category": "Process & Operational Efficiency",
+        "trigger": "When procurement data reveals a potential opportunity in 'Automation of Purchase-to-Pay (P2P)' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Automation of Purchase-to-Pay (P2P)'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Process & Operational Efficiency'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Automation of Purchase-to-Pay (P2P)', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Automation of Purchase-to-Pay (P2P)'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_improved_forecasting_accuracy",
+        "opportunity_type": "Improved Forecasting Accuracy",
+        "category": "Process & Operational Efficiency",
+        "trigger": "When procurement data reveals a potential opportunity in 'Improved Forecasting Accuracy' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Improved Forecasting Accuracy'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Process & Operational Efficiency'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Improved Forecasting Accuracy', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Improved Forecasting Accuracy'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_just_in_time_deliveries",
+        "opportunity_type": "Just-In-Time Deliveries",
+        "category": "Process & Operational Efficiency",
+        "trigger": "When procurement data reveals a potential opportunity in 'Just-In-Time Deliveries' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Just-In-Time Deliveries'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Process & Operational Efficiency'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Just-In-Time Deliveries', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Just-In-Time Deliveries'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_use_of_framework_agreements",
+        "opportunity_type": "Use of Framework Agreements",
+        "category": "Process & Operational Efficiency",
+        "trigger": "When procurement data reveals a potential opportunity in 'Use of Framework Agreements' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Use of Framework Agreements'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Process & Operational Efficiency'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Use of Framework Agreements', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Use of Framework Agreements'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_eliminating_non_value_add_steps",
+        "opportunity_type": "Eliminating Non-Value Add Steps",
+        "category": "Process & Operational Efficiency",
+        "trigger": "When procurement data reveals a potential opportunity in 'Eliminating Non-Value Add Steps' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Eliminating Non-Value Add Steps'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Process & Operational Efficiency'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Eliminating Non-Value Add Steps', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Eliminating Non-Value Add Steps'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_waste_reduction_in_supply_chain",
+        "opportunity_type": "Waste Reduction in Supply Chain",
+        "category": "Sustainability & ESG",
+        "trigger": "When procurement data reveals a potential opportunity in 'Waste Reduction in Supply Chain' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Waste Reduction in Supply Chain'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Sustainability & ESG'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Waste Reduction in Supply Chain', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Waste Reduction in Supply Chain'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_switch_to_sustainable_materials",
+        "opportunity_type": "Switch to Sustainable Materials",
+        "category": "Sustainability & ESG",
+        "trigger": "When procurement data reveals a potential opportunity in 'Switch to Sustainable Materials' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Switch to Sustainable Materials'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Sustainability & ESG'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Switch to Sustainable Materials', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Switch to Sustainable Materials'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_carbon_cost_avoidance",
+        "opportunity_type": "Carbon Cost Avoidance",
+        "category": "Sustainability & ESG",
+        "trigger": "When procurement data reveals a potential opportunity in 'Carbon Cost Avoidance' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Carbon Cost Avoidance'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Sustainability & ESG'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Carbon Cost Avoidance', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Carbon Cost Avoidance'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_supplier_esg_incentives",
+        "opportunity_type": "Supplier ESG Incentives",
+        "category": "Sustainability & ESG",
+        "trigger": "When procurement data reveals a potential opportunity in 'Supplier ESG Incentives' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Supplier ESG Incentives'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Sustainability & ESG'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Supplier ESG Incentives', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Supplier ESG Incentives'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_product_life_extension_initiatives",
+        "opportunity_type": "Product Life Extension Initiatives",
+        "category": "Sustainability & ESG",
+        "trigger": "When procurement data reveals a potential opportunity in 'Product Life Extension Initiatives' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Product Life Extension Initiatives'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Sustainability & ESG'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Product Life Extension Initiatives', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Product Life Extension Initiatives'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_contract_compliance_enforcement",
+        "opportunity_type": "Contract Compliance Enforcement",
+        "category": "Compliance & Risk",
+        "trigger": "When procurement data reveals a potential opportunity in 'Contract Compliance Enforcement' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Contract Compliance Enforcement'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Compliance & Risk'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Contract Compliance Enforcement', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Contract Compliance Enforcement'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_spend_under_management_expansion",
+        "opportunity_type": "Spend Under Management Expansion",
+        "category": "Compliance & Risk",
+        "trigger": "When procurement data reveals a potential opportunity in 'Spend Under Management Expansion' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Spend Under Management Expansion'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Compliance & Risk'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Spend Under Management Expansion', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Spend Under Management Expansion'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_regulatory_change_leverage",
+        "opportunity_type": "Regulatory Change Leverage",
+        "category": "Compliance & Risk",
+        "trigger": "When procurement data reveals a potential opportunity in 'Regulatory Change Leverage' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Regulatory Change Leverage'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Compliance & Risk'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Regulatory Change Leverage', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Regulatory Change Leverage'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_third_party_risk_insurance_review",
+        "opportunity_type": "Third-Party Risk Insurance Review",
+        "category": "Compliance & Risk",
+        "trigger": "When procurement data reveals a potential opportunity in 'Third-Party Risk Insurance Review' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Third-Party Risk Insurance Review'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Compliance & Risk'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Third-Party Risk Insurance Review', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Third-Party Risk Insurance Review'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_eprocurement_tool_adoption",
+        "opportunity_type": "eProcurement Tool Adoption",
+        "category": "Digital & Technology",
+        "trigger": "When procurement data reveals a potential opportunity in 'eProcurement Tool Adoption' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'eProcurement Tool Adoption'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Digital & Technology'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'eProcurement Tool Adoption', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'eProcurement Tool Adoption'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_analytics_driven_price_intelligence",
+        "opportunity_type": "Analytics-Driven Price Intelligence",
+        "category": "Digital & Technology",
+        "trigger": "When procurement data reveals a potential opportunity in 'Analytics-Driven Price Intelligence' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Analytics-Driven Price Intelligence'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Digital & Technology'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Analytics-Driven Price Intelligence', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Analytics-Driven Price Intelligence'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_predictive_demand_analytics",
+        "opportunity_type": "Predictive Demand Analytics",
+        "category": "Digital & Technology",
+        "trigger": "When procurement data reveals a potential opportunity in 'Predictive Demand Analytics' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Predictive Demand Analytics'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Digital & Technology'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Predictive Demand Analytics', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Predictive Demand Analytics'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_blockchain_for_transparency",
+        "opportunity_type": "Blockchain for Transparency",
+        "category": "Digital & Technology",
+        "trigger": "When procurement data reveals a potential opportunity in 'Blockchain for Transparency' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Blockchain for Transparency'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Digital & Technology'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Blockchain for Transparency', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Blockchain for Transparency'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_ai_based_contract_analysis",
+        "opportunity_type": "AI-Based Contract Analysis",
+        "category": "Digital & Technology",
+        "trigger": "When procurement data reveals a potential opportunity in 'AI-Based Contract Analysis' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'AI-Based Contract Analysis'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Digital & Technology'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'AI-Based Contract Analysis', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'AI-Based Contract Analysis'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_supplier_innovation_partnerships",
+        "opportunity_type": "Supplier Innovation Partnerships",
+        "category": "Supplier Innovation",
+        "trigger": "When procurement data reveals a potential opportunity in 'Supplier Innovation Partnerships' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Supplier Innovation Partnerships'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Innovation'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Supplier Innovation Partnerships', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Supplier Innovation Partnerships'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_joint_r&d_for_custom_components",
+        "opportunity_type": "Joint R&D for Custom Components",
+        "category": "Supplier Innovation",
+        "trigger": "When procurement data reveals a potential opportunity in 'Joint R&D for Custom Components' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Joint R&D for Custom Components'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Innovation'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Joint R&D for Custom Components', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Joint R&D for Custom Components'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_vmi_(vendor_managed_inventory)",
+        "opportunity_type": "VMI (Vendor Managed Inventory)",
+        "category": "Supplier Innovation",
+        "trigger": "When procurement data reveals a potential opportunity in 'VMI (Vendor Managed Inventory)' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'VMI (Vendor Managed Inventory)'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Innovation'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'VMI (Vendor Managed Inventory)', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'VMI (Vendor Managed Inventory)'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_collaborative_demand_planning",
+        "opportunity_type": "Collaborative Demand Planning",
+        "category": "Supplier Innovation",
+        "trigger": "When procurement data reveals a potential opportunity in 'Collaborative Demand Planning' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Collaborative Demand Planning'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Supplier Innovation'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Collaborative Demand Planning', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Collaborative Demand Planning'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_category_reclassification",
+        "opportunity_type": "Category Reclassification",
+        "category": "Category Strategy",
+        "trigger": "When procurement data reveals a potential opportunity in 'Category Reclassification' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Category Reclassification'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Category Strategy'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Category Reclassification', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Category Reclassification'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    },
+    {
+        "policy_id": "policy_leverage_consortia_or_group_buying",
+        "opportunity_type": "Leverage Consortia or Group Buying",
+        "category": "Category Strategy",
+        "trigger": "When procurement data reveals a potential opportunity in 'Leverage Consortia or Group Buying' that deviates from optimal or expected performance benchmarks.",
+        "conditions": [
+            "Relevant procurement, contract, or pricing data indicates suboptimal performance or savings gap for 'Leverage Consortia or Group Buying'.",
+            "Deviation from best practices, benchmarks, or supplier terms exists in 'Category Strategy'."
+        ],
+        "logic": "If deviation threshold (e.g., price gap, missed term, or demand volume) exceeds acceptable range for 'Leverage Consortia or Group Buying', flag the opportunity for review.",
+        "scoring_logic": "Score based on projected financial impact, supplier risk, and implementation complexity of 'Leverage Consortia or Group Buying'.",
+        "actions": [
+            "Flag opportunity for Opportunity Miner Agent",
+            "Route to Human-in-the-Loop Agent for commercial engagement",
+            "Trigger LLM Drafting Agent to engage supplier if savings potential is confirmed",
+            "Record all decisions and escalations in Audit Trail Agent"
+        ]
+    }
+]

@@ -1,0 +1,118 @@
+[
+  {
+    "policy_name": "SupplierScoringPolicy",
+    "description": "Defines how suppliers are scored based on evaluation criteria like price, quality, and risk.",
+    "triggered_by": [
+      "RankSuppliers"
+    ],
+    "rules": {
+      "scoring_formula": "weighted_sum(criteria_scores)",
+      "requires_normalization": true
+    }
+  },
+  {
+    "policy_name": "WeightAllocationPolicy",
+    "description": "Determines default or custom weights for supplier ranking criteria.",
+    "triggered_by": [
+      "RankSuppliers"
+    ],
+    "rules": {
+      "default_weights": {
+        "price": 0.4,
+        "delivery": 0.3,
+        "risk": 0.3
+      },
+      "allow_custom_weights": true
+    }
+  },
+  {
+    "policy_name": "ContractCompliancePolicy",
+    "description": "Filters out suppliers who do not have an active signed contract.",
+    "triggered_by": [
+      "compliance_only"
+    ],
+    "rules": {
+      "require_field": "contract_signed",
+      "must_be": true
+    }
+  },
+  {
+    "policy_name": "ESGQualificationPolicy",
+    "description": "Enforces ESG score threshold for eligible suppliers.",
+    "triggered_by": [
+      "esg_compliance"
+    ],
+    "rules": {
+      "min_esg_score": 70
+    }
+  },
+  {
+    "policy_name": "DeliveryPerformancePolicy",
+    "description": "Scores suppliers based on on-time delivery performance.",
+    "triggered_by": [
+      "delivery_performance"
+    ],
+    "rules": {
+      "metric_field": "on_time_delivery_rate",
+      "minimum_threshold": 95
+    }
+  },
+  {
+    "policy_name": "UnitPriceBenchmarkPolicy",
+    "description": "Scores suppliers based on lowest pricing compared to benchmarks.",
+    "triggered_by": [
+      "price_comparison"
+    ],
+    "rules": {
+      "benchmark_type": "category_average",
+      "penalty_above_percent": 10
+    }
+  },
+  {
+    "policy_name": "VolumeCommitmentPolicy",
+    "description": "Prioritizes suppliers offering volume-based pricing incentives.",
+    "triggered_by": [
+      "volume_discounts"
+    ],
+    "rules": {
+      "reward_metric": "volume_discount_tier"
+    }
+  },
+  {
+    "policy_name": "RiskRatingPolicy",
+    "description": "Ranks or filters suppliers based on third-party or internal risk ratings.",
+    "triggered_by": [
+      "risk_score"
+    ],
+    "rules": {
+      "max_risk_score_allowed": 5
+    }
+  },
+  {
+    "policy_name": "InnovationContributionPolicy",
+    "description": "Scores suppliers based on innovation inputs like R&D participation or IP.",
+    "triggered_by": [
+      "innovation"
+    ],
+    "rules": {
+      "evaluation_metric": "innovation_score",
+      "scoring_range": [
+        0,
+        10
+      ]
+    }
+  },
+  {
+    "policy_name": "SupplierTieringPolicy",
+    "description": "Filters or prioritizes based on supplier tier (preferred, strategic, etc.).",
+    "triggered_by": [
+      "preferred_suppliers_only"
+    ],
+    "rules": {
+      "allowed_tiers": [
+        "preferred",
+        "strategic"
+      ]
+    }
+  }
+]

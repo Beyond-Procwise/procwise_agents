@@ -1,0 +1,902 @@
+[
+    {
+        "template_id": "unit_price_reduction",
+        "opportunity_type": "Unit Price Reduction",
+        "category": "Price-Based",
+        "intent": "detect_unit_price_reduction_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Unit Price Reduction' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Unit Price Reduction' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "volume_discounts",
+        "opportunity_type": "Volume Discounts",
+        "category": "Price-Based",
+        "intent": "detect_volume_discounts_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Volume Discounts' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Volume Discounts' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "early_payment_discounts",
+        "opportunity_type": "Early Payment Discounts",
+        "category": "Price-Based",
+        "intent": "detect_early_payment_discounts_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Early Payment Discounts' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Early Payment Discounts' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "benchmarking_based_reductions",
+        "opportunity_type": "Benchmarking-Based Reductions",
+        "category": "Price-Based",
+        "intent": "detect_benchmarking_based_reductions_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Benchmarking-Based Reductions' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Benchmarking-Based Reductions' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "index_linked_pricing_adjustments",
+        "opportunity_type": "Index-Linked Pricing Adjustments",
+        "category": "Price-Based",
+        "intent": "detect_index_linked_pricing_adjustments_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Index-Linked Pricing Adjustments' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Index-Linked Pricing Adjustments' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "should_cost_modelling",
+        "opportunity_type": "Should-Cost Modelling",
+        "category": "Price-Based",
+        "intent": "detect_should_cost_modelling_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Should-Cost Modelling' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Should-Cost Modelling' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "bundled_pricing",
+        "opportunity_type": "Bundled Pricing",
+        "category": "Price-Based",
+        "intent": "detect_bundled_pricing_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Bundled Pricing' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Bundled Pricing' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "zero_based_budgeting_challenges",
+        "opportunity_type": "Zero-Based Budgeting Challenges",
+        "category": "Price-Based",
+        "intent": "detect_zero_based_budgeting_challenges_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Zero-Based Budgeting Challenges' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Zero-Based Budgeting Challenges' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "alternative_supplier_sourcing",
+        "opportunity_type": "Alternative Supplier Sourcing",
+        "category": "Price-Based",
+        "intent": "detect_alternative_supplier_sourcing_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Alternative Supplier Sourcing' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Alternative Supplier Sourcing' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "reverse_auctions",
+        "opportunity_type": "Reverse Auctions",
+        "category": "Price-Based",
+        "intent": "detect_reverse_auctions_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Reverse Auctions' initiatives within the 'Price-Based' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Reverse Auctions' in the 'Price-Based' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "specification_simplification",
+        "opportunity_type": "Specification Simplification",
+        "category": "Specification & Demand",
+        "intent": "detect_specification_simplification_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Specification Simplification' initiatives within the 'Specification & Demand' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Specification Simplification' in the 'Specification & Demand' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "demand_aggregation",
+        "opportunity_type": "Demand Aggregation",
+        "category": "Specification & Demand",
+        "intent": "detect_demand_aggregation_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Demand Aggregation' initiatives within the 'Specification & Demand' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Demand Aggregation' in the 'Specification & Demand' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "elimination_of_tail_spend",
+        "opportunity_type": "Elimination of Tail Spend",
+        "category": "Specification & Demand",
+        "intent": "detect_elimination_of_tail_spend_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Elimination of Tail Spend' initiatives within the 'Specification & Demand' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Elimination of Tail Spend' in the 'Specification & Demand' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "standardisation_of_skus",
+        "opportunity_type": "Standardisation of SKUs",
+        "category": "Specification & Demand",
+        "intent": "detect_standardisation_of_skus_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Standardisation of SKUs' initiatives within the 'Specification & Demand' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Standardisation of SKUs' in the 'Specification & Demand' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "buy_to_order_vs._stocked_supply",
+        "opportunity_type": "Buy-to-Order vs. Stocked Supply",
+        "category": "Specification & Demand",
+        "intent": "detect_buy_to_order_vs._stocked_supply_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Buy-to-Order vs. Stocked Supply' initiatives within the 'Specification & Demand' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Buy-to-Order vs. Stocked Supply' in the 'Specification & Demand' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "improved_payment_terms",
+        "opportunity_type": "Improved Payment Terms",
+        "category": "Contractual & Commercial Terms",
+        "intent": "detect_improved_payment_terms_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Improved Payment Terms' initiatives within the 'Contractual & Commercial Terms' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Improved Payment Terms' in the 'Contractual & Commercial Terms' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "reduced_minimum_order_quantities_(moqs)",
+        "opportunity_type": "Reduced Minimum Order Quantities (MOQs)",
+        "category": "Contractual & Commercial Terms",
+        "intent": "detect_reduced_minimum_order_quantities_(moqs)_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Reduced Minimum Order Quantities (MOQs)' initiatives within the 'Contractual & Commercial Terms' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Reduced Minimum Order Quantities (MOQs)' in the 'Contractual & Commercial Terms' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "service_level_rebates",
+        "opportunity_type": "Service Level Rebates",
+        "category": "Contractual & Commercial Terms",
+        "intent": "detect_service_level_rebates_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Service Level Rebates' initiatives within the 'Contractual & Commercial Terms' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Service Level Rebates' in the 'Contractual & Commercial Terms' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "volume_commitment_rebates",
+        "opportunity_type": "Volume Commitment Rebates",
+        "category": "Contractual & Commercial Terms",
+        "intent": "detect_volume_commitment_rebates_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Volume Commitment Rebates' initiatives within the 'Contractual & Commercial Terms' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Volume Commitment Rebates' in the 'Contractual & Commercial Terms' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "index_re_alignment_or_re_basing",
+        "opportunity_type": "Index Re-alignment or Re-basing",
+        "category": "Contractual & Commercial Terms",
+        "intent": "detect_index_re_alignment_or_re_basing_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Index Re-alignment or Re-basing' initiatives within the 'Contractual & Commercial Terms' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Index Re-alignment or Re-basing' in the 'Contractual & Commercial Terms' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "supplier_consolidation",
+        "opportunity_type": "Supplier Consolidation",
+        "category": "Supplier Management & Sourcing",
+        "intent": "detect_supplier_consolidation_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Supplier Consolidation' initiatives within the 'Supplier Management & Sourcing' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Supplier Consolidation' in the 'Supplier Management & Sourcing' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "offshoring_low_cost_country_sourcing",
+        "opportunity_type": "Offshoring/Low-Cost Country Sourcing",
+        "category": "Supplier Management & Sourcing",
+        "intent": "detect_offshoring_low_cost_country_sourcing_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Offshoring/Low-Cost Country Sourcing' initiatives within the 'Supplier Management & Sourcing' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Offshoring/Low-Cost Country Sourcing' in the 'Supplier Management & Sourcing' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "supplier_performance_improvement",
+        "opportunity_type": "Supplier Performance Improvement",
+        "category": "Supplier Management & Sourcing",
+        "intent": "detect_supplier_performance_improvement_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Supplier Performance Improvement' initiatives within the 'Supplier Management & Sourcing' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Supplier Performance Improvement' in the 'Supplier Management & Sourcing' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "insourcing_outsourcing_decisions",
+        "opportunity_type": "Insourcing/Outsourcing Decisions",
+        "category": "Supplier Management & Sourcing",
+        "intent": "detect_insourcing_outsourcing_decisions_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Insourcing/Outsourcing Decisions' initiatives within the 'Supplier Management & Sourcing' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Insourcing/Outsourcing Decisions' in the 'Supplier Management & Sourcing' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "multi_sourcing_to_reduce_dependency",
+        "opportunity_type": "Multi-Sourcing to Reduce Dependency",
+        "category": "Supplier Management & Sourcing",
+        "intent": "detect_multi_sourcing_to_reduce_dependency_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Multi-Sourcing to Reduce Dependency' initiatives within the 'Supplier Management & Sourcing' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Multi-Sourcing to Reduce Dependency' in the 'Supplier Management & Sourcing' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "automation_of_purchase_to_pay_(p2p)",
+        "opportunity_type": "Automation of Purchase-to-Pay (P2P)",
+        "category": "Process & Operational Efficiency",
+        "intent": "detect_automation_of_purchase_to_pay_(p2p)_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Automation of Purchase-to-Pay (P2P)' initiatives within the 'Process & Operational Efficiency' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Automation of Purchase-to-Pay (P2P)' in the 'Process & Operational Efficiency' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "improved_forecasting_accuracy",
+        "opportunity_type": "Improved Forecasting Accuracy",
+        "category": "Process & Operational Efficiency",
+        "intent": "detect_improved_forecasting_accuracy_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Improved Forecasting Accuracy' initiatives within the 'Process & Operational Efficiency' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Improved Forecasting Accuracy' in the 'Process & Operational Efficiency' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "just_in_time_deliveries",
+        "opportunity_type": "Just-In-Time Deliveries",
+        "category": "Process & Operational Efficiency",
+        "intent": "detect_just_in_time_deliveries_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Just-In-Time Deliveries' initiatives within the 'Process & Operational Efficiency' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Just-In-Time Deliveries' in the 'Process & Operational Efficiency' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "use_of_framework_agreements",
+        "opportunity_type": "Use of Framework Agreements",
+        "category": "Process & Operational Efficiency",
+        "intent": "detect_use_of_framework_agreements_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Use of Framework Agreements' initiatives within the 'Process & Operational Efficiency' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Use of Framework Agreements' in the 'Process & Operational Efficiency' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "eliminating_non_value_add_steps",
+        "opportunity_type": "Eliminating Non-Value Add Steps",
+        "category": "Process & Operational Efficiency",
+        "intent": "detect_eliminating_non_value_add_steps_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Eliminating Non-Value Add Steps' initiatives within the 'Process & Operational Efficiency' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Eliminating Non-Value Add Steps' in the 'Process & Operational Efficiency' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "waste_reduction_in_supply_chain",
+        "opportunity_type": "Waste Reduction in Supply Chain",
+        "category": "Sustainability & ESG",
+        "intent": "detect_waste_reduction_in_supply_chain_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Waste Reduction in Supply Chain' initiatives within the 'Sustainability & ESG' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Waste Reduction in Supply Chain' in the 'Sustainability & ESG' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "switch_to_sustainable_materials",
+        "opportunity_type": "Switch to Sustainable Materials",
+        "category": "Sustainability & ESG",
+        "intent": "detect_switch_to_sustainable_materials_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Switch to Sustainable Materials' initiatives within the 'Sustainability & ESG' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Switch to Sustainable Materials' in the 'Sustainability & ESG' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "carbon_cost_avoidance",
+        "opportunity_type": "Carbon Cost Avoidance",
+        "category": "Sustainability & ESG",
+        "intent": "detect_carbon_cost_avoidance_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Carbon Cost Avoidance' initiatives within the 'Sustainability & ESG' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Carbon Cost Avoidance' in the 'Sustainability & ESG' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "supplier_esg_incentives",
+        "opportunity_type": "Supplier ESG Incentives",
+        "category": "Sustainability & ESG",
+        "intent": "detect_supplier_esg_incentives_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Supplier ESG Incentives' initiatives within the 'Sustainability & ESG' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Supplier ESG Incentives' in the 'Sustainability & ESG' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "product_life_extension_initiatives",
+        "opportunity_type": "Product Life Extension Initiatives",
+        "category": "Sustainability & ESG",
+        "intent": "detect_product_life_extension_initiatives_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Product Life Extension Initiatives' initiatives within the 'Sustainability & ESG' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Product Life Extension Initiatives' in the 'Sustainability & ESG' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "contract_compliance_enforcement",
+        "opportunity_type": "Contract Compliance Enforcement",
+        "category": "Compliance & Risk",
+        "intent": "detect_contract_compliance_enforcement_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Contract Compliance Enforcement' initiatives within the 'Compliance & Risk' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Contract Compliance Enforcement' in the 'Compliance & Risk' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "spend_under_management_expansion",
+        "opportunity_type": "Spend Under Management Expansion",
+        "category": "Compliance & Risk",
+        "intent": "detect_spend_under_management_expansion_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Spend Under Management Expansion' initiatives within the 'Compliance & Risk' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Spend Under Management Expansion' in the 'Compliance & Risk' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "regulatory_change_leverage",
+        "opportunity_type": "Regulatory Change Leverage",
+        "category": "Compliance & Risk",
+        "intent": "detect_regulatory_change_leverage_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Regulatory Change Leverage' initiatives within the 'Compliance & Risk' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Regulatory Change Leverage' in the 'Compliance & Risk' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "third_party_risk_insurance_review",
+        "opportunity_type": "Third-Party Risk Insurance Review",
+        "category": "Compliance & Risk",
+        "intent": "detect_third_party_risk_insurance_review_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Third-Party Risk Insurance Review' initiatives within the 'Compliance & Risk' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Third-Party Risk Insurance Review' in the 'Compliance & Risk' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "eprocurement_tool_adoption",
+        "opportunity_type": "eProcurement Tool Adoption",
+        "category": "Digital & Technology",
+        "intent": "detect_eprocurement_tool_adoption_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'eProcurement Tool Adoption' initiatives within the 'Digital & Technology' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'eProcurement Tool Adoption' in the 'Digital & Technology' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "analytics_driven_price_intelligence",
+        "opportunity_type": "Analytics-Driven Price Intelligence",
+        "category": "Digital & Technology",
+        "intent": "detect_analytics_driven_price_intelligence_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Analytics-Driven Price Intelligence' initiatives within the 'Digital & Technology' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Analytics-Driven Price Intelligence' in the 'Digital & Technology' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "predictive_demand_analytics",
+        "opportunity_type": "Predictive Demand Analytics",
+        "category": "Digital & Technology",
+        "intent": "detect_predictive_demand_analytics_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Predictive Demand Analytics' initiatives within the 'Digital & Technology' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Predictive Demand Analytics' in the 'Digital & Technology' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "blockchain_for_transparency",
+        "opportunity_type": "Blockchain for Transparency",
+        "category": "Digital & Technology",
+        "intent": "detect_blockchain_for_transparency_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Blockchain for Transparency' initiatives within the 'Digital & Technology' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Blockchain for Transparency' in the 'Digital & Technology' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "ai_based_contract_analysis",
+        "opportunity_type": "AI-Based Contract Analysis",
+        "category": "Digital & Technology",
+        "intent": "detect_ai_based_contract_analysis_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'AI-Based Contract Analysis' initiatives within the 'Digital & Technology' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'AI-Based Contract Analysis' in the 'Digital & Technology' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "supplier_innovation_partnerships",
+        "opportunity_type": "Supplier Innovation Partnerships",
+        "category": "Supplier Innovation",
+        "intent": "detect_supplier_innovation_partnerships_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Supplier Innovation Partnerships' initiatives within the 'Supplier Innovation' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Supplier Innovation Partnerships' in the 'Supplier Innovation' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "joint_r&d_for_custom_components",
+        "opportunity_type": "Joint R&D for Custom Components",
+        "category": "Supplier Innovation",
+        "intent": "detect_joint_r&d_for_custom_components_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Joint R&D for Custom Components' initiatives within the 'Supplier Innovation' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Joint R&D for Custom Components' in the 'Supplier Innovation' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "vmi_(vendor_managed_inventory)",
+        "opportunity_type": "VMI (Vendor Managed Inventory)",
+        "category": "Supplier Innovation",
+        "intent": "detect_vmi_(vendor_managed_inventory)_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'VMI (Vendor Managed Inventory)' initiatives within the 'Supplier Innovation' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'VMI (Vendor Managed Inventory)' in the 'Supplier Innovation' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "collaborative_demand_planning",
+        "opportunity_type": "Collaborative Demand Planning",
+        "category": "Supplier Innovation",
+        "intent": "detect_collaborative_demand_planning_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Collaborative Demand Planning' initiatives within the 'Supplier Innovation' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Collaborative Demand Planning' in the 'Supplier Innovation' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "category_reclassification",
+        "opportunity_type": "Category Reclassification",
+        "category": "Category Strategy",
+        "intent": "detect_category_reclassification_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Category Reclassification' initiatives within the 'Category Strategy' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Category Reclassification' in the 'Category Strategy' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    },
+    {
+        "template_id": "leverage_consortia_or_group_buying",
+        "opportunity_type": "Leverage Consortia or Group Buying",
+        "category": "Category Strategy",
+        "intent": "detect_leverage_consortia_or_group_buying_opportunity",
+        "description": "Identify cost savings or value enhancement opportunities through 'Leverage Consortia or Group Buying' initiatives within the 'Category Strategy' category.",
+        "prompt_template": "Analyze procurement and commercial data related to 'Leverage Consortia or Group Buying' in the 'Category Strategy' category. Evaluate contracts, spend, pricing, and supplier behavior to determine if there is an opportunity for cost reduction or improved efficiency. If the opportunity is viable, estimate the potential financial benefit and suggest a course of action.",
+        "variables": [
+            "category",
+            "supplier",
+            "item",
+            "contract_terms",
+            "pricing",
+            "volume",
+            "time_period",
+            "benchmark"
+        ]
+    }
+]

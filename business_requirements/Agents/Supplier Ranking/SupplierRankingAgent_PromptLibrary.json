@@ -1,0 +1,631 @@
+{
+  "agent": "SupplierRankingAgent",
+  "intent": "RankSuppliers",
+  "templates": [
+    {
+      "natural_language_query": "Which supplier offers the best value for money?",
+      "llm_prompt": "LLM Query: Which supplier offers the best value for money?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Compare suppliers based on total cost of ownership.",
+      "llm_prompt": "LLM Query: Compare suppliers based on total cost of ownership.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who has the lowest unit price for this category?",
+      "llm_prompt": "LLM Query: Who has the lowest unit price for this category?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Rank suppliers by pricing and payment terms.",
+      "llm_prompt": "LLM Query: Rank suppliers by pricing and payment terms.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which supplier gives the highest volume discounts?",
+      "llm_prompt": "LLM Query: Which supplier gives the highest volume discounts?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which supplier has the best delivery record?",
+      "llm_prompt": "LLM Query: Which supplier has the best delivery record?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Rank suppliers by quality performance over the past year.",
+      "llm_prompt": "LLM Query: Rank suppliers by quality performance over the past year.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who has the least number of service issues?",
+      "llm_prompt": "LLM Query: Who has the least number of service issues?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which suppliers consistently meet SLAs?",
+      "llm_prompt": "LLM Query: Which suppliers consistently meet SLAs?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who is our top-performing supplier in IT hardware?",
+      "llm_prompt": "LLM Query: Who is our top-performing supplier in IT hardware?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which suppliers have the highest risk score?",
+      "llm_prompt": "LLM Query: Which suppliers have the highest risk score?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Rank suppliers by ESG compliance.",
+      "llm_prompt": "LLM Query: Rank suppliers by ESG compliance.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which of our suppliers are non-compliant with contract terms?",
+      "llm_prompt": "LLM Query: Which of our suppliers are non-compliant with contract terms?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who has the fewest audit issues or late invoices?",
+      "llm_prompt": "LLM Query: Who has the fewest audit issues or late invoices?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Identify the lowest-risk supplier for critical components.",
+      "llm_prompt": "LLM Query: Identify the lowest-risk supplier for critical components.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which suppliers align best with our strategic goals?",
+      "llm_prompt": "LLM Query: Which suppliers align best with our strategic goals?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who supports our sustainability targets most effectively?",
+      "llm_prompt": "LLM Query: Who supports our sustainability targets most effectively?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Rank suppliers based on innovation contribution.",
+      "llm_prompt": "LLM Query: Rank suppliers based on innovation contribution.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which suppliers offer global coverage for this category?",
+      "llm_prompt": "LLM Query: Which suppliers offer global coverage for this category?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Who is most scalable if we expand next year?",
+      "llm_prompt": "LLM Query: Who is most scalable if we expand next year?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Rank suppliers based on price, performance, and risk combined.",
+      "llm_prompt": "LLM Query: Rank suppliers based on price, performance, and risk combined.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which supplier is the best overall across all dimensions?",
+      "llm_prompt": "LLM Query: Which supplier is the best overall across all dimensions?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "If we had to consolidate, who should we keep?",
+      "llm_prompt": "LLM Query: If we had to consolidate, who should we keep?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Show me a weighted ranking for our top 5 suppliers.",
+      "llm_prompt": "LLM Query: Show me a weighted ranking for our top 5 suppliers.",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    },
+    {
+      "natural_language_query": "Which supplier gives us the most savings opportunity?",
+      "llm_prompt": "LLM Query: Which supplier gives us the most savings opportunity?",
+      "inputs": {
+        "category": "{{category}}",
+        "criteria": [
+          "{{criteria_1}}",
+          "{{criteria_2}}",
+          "{{criteria_3}}"
+        ],
+        "weighting": {
+          "{{criteria_1}}": "{{weight_1}}",
+          "{{criteria_2}}": "{{weight_2}}",
+          "{{criteria_3}}": "{{weight_3}}"
+        },
+        "time_period": "{{time_period}}",
+        "supplier_scope": "{{supplier_scope}}",
+        "filters": {
+          "min_volume": "{{min_volume}}",
+          "region": "{{region}}",
+          "compliance_only": "{{compliance_filter}}"
+        },
+        "output_format": "{{output_format}}"
+      }
+    }
+  ]
+}
