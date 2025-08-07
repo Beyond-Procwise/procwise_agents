@@ -18,7 +18,7 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-    def fetch_supplier_data(self, intent: dict) -> pd.DataFrame:
+    def fetch_supplier_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return supplier information required for ranking.
 
         The query joins ``proc.supplier`` with invoice and purchase order

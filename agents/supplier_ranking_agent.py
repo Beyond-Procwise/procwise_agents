@@ -1,11 +1,12 @@
 # ProcWise/agents/supplier_ranking_agent.py
 
 import json
-import pandas as pd
-import ollama
 import os
 import logging
-from .base_agent import BaseAgent
+import pandas as pd
+import ollama
+
+from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 logger = logging.getLogger(__name__)
@@ -19,13 +20,21 @@ class SupplierRankingAgent(BaseAgent):
         self.justification_template = self._load_json_file('prompts/Justification_Tag_Prompt_Template.json')
         self.policy_engine = agent_nick.policy_engine
 
-    def run(self, intent: dict, data: pd.DataFrame) -> dict:
+    def run(self, context: AgentContext) -> AgentOutput:
         logger.info("SupplierRankingAgent: Executing core logic...")
-        criteria = intent.get('parameters', {}).get('criteria', [])
+        intent = context.input_data.get('intent', {})
+        data = context.input_data.get('supplier_data')
+        if data is None:
+            return AgentOutput(status=AgentStatus.FAILED, data={}, error='Supplier data missing')
 
+        criteria = intent.get('parameters', {}).get('criteria', [])
         weight_policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'WeightAllocationPolicy'), {})
+            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'WeightAllocationPolicy'),
+            {}
+        )
         weights = weight_policy.get('details', {}).get('rules', {}).get('default_weights', {})
+        if not criteria:
+            criteria = list(weights.keys())
         applicable_weights = {c: weights.get(c, 0) for c in criteria if weights.get(c, 0) > 0}
 
         # --- UPGRADE: Expand Ranking Criteria ---
@@ -34,7 +43,9 @@ class SupplierRankingAgent(BaseAgent):
 
         # 2. Normalize the remaining numeric scores
         norm_policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'NormalizationDirectionPolicy'), {})
+            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'NormalizationDirectionPolicy'),
+            {}
+        )
         criteria_direction = norm_policy.get('details', {}).get('rules', {})
         scored_df = self._normalize_numeric_scores(scored_df, criteria_direction)
 
@@ -55,7 +66,8 @@ class SupplierRankingAgent(BaseAgent):
         for i, row in ranked_df.head(3).iterrows():
             ranked_df.at[i, 'justification'] = self._generate_justification(row, applicable_weights.keys())
 
-        return json.loads(ranked_df.to_json(orient='records'))
+        ranking = json.loads(ranked_df.to_json(orient='records'))
+        return AgentOutput(status=AgentStatus.SUCCESS, data={'ranking': ranking})
 
     def _load_json_file(self, relative_path: str) -> dict:
         absolute_path = os.path.join(PROJECT_ROOT, relative_path)
