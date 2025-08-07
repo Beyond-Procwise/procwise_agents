@@ -185,8 +185,8 @@ class DataExtractionAgent(BaseAgent):
         vector = self.agent_nick.embedding_model.encode(summary).tolist()
         payload = {
             "record_id": pk_value,
-            "document_type": doc_type,
-            "product_type": product_type,
+            "document_type": doc_type.lower(),
+            "product_type": product_type.lower(),
             "s3_key": object_key,
             "summary": summary,
         }

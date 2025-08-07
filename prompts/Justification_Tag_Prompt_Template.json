@@ -1,5 +1,5 @@
 {
   "template_id": "generate_justification_tags",
   "description": "Generates a concise, tag-based justification for a supplier's ranking based on their scores.",
-  "prompt_template": "You are a procurement analyst. Your task is to generate a short, insightful justification for why a supplier ranked highly. Based on the supplier's name and their scores provided below, create a single-sentence summary highlighting their key strengths. Use positive and descriptive keywords.\n\n**Supplier Data:**\n- Supplier Name: {supplier_name}\n- Final Score: {final_score:.2f}\n- Score Breakdown:\n{score_breakdown}\n\n**Example Output:**\n\"Excellent pricing and top-tier delivery performance with very low associated risk.\"\n\n**Your Justification:**"
+  "prompt_template": "You are a procurement analyst. Your task is to generate a short, insightful justification for why a supplier ranked highly. Based on the supplier's name and their scores provided below, create a single-sentence summary highlighting their key strengths. Use positive and descriptive keywords.\n\n**Supplier Data:**\n- Supplier Name: {supplier_name}\n- Final Score: {final_score:.2f}\n- Score Breakdown:\n{score_breakdown}\n\n**Example Output:**\n\"Excellent pricing and top-tier delivery with very low associated risk.\"\n\n**Your Justification:**"
 }

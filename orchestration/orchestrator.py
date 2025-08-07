@@ -25,6 +25,33 @@ class Orchestrator:
         self.routing_model = self.routing_engine.routing_model
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
 
+    def execute_ranking_flow(self, query: str) -> Dict:
+        """Public wrapper for the supplier ranking workflow."""
+        return self.execute_workflow("supplier_ranking", {"query": query})
+
+    def execute_ranking_workflow(self, query: str) -> Dict:
+        """Backward compatible alias for :meth:`execute_ranking_flow`."""
+        return self.execute_ranking_flow(query)
+
+    def execute_extraction_flow(
+        self,
+        s3_prefix: Optional[str] = None,
+        s3_object_key: Optional[str] = None,
+    ) -> Dict:
+        """Public wrapper for the document extraction workflow."""
+        return self.execute_workflow(
+            "document_extraction",
+            {"s3_prefix": s3_prefix, "s3_object_key": s3_object_key},
+        )
+
+    def execute_extraction_workflow(
+        self,
+        s3_prefix: Optional[str] = None,
+        s3_object_key: Optional[str] = None,
+    ) -> Dict:
+        """Backward compatible alias for :meth:`execute_extraction_flow`."""
+        return self.execute_extraction_flow(s3_prefix, s3_object_key)
+
     def execute_workflow(self, workflow_name: str, input_data: Dict,
                          user_id: str = None) -> Dict:
         """Execute a complete workflow"""
