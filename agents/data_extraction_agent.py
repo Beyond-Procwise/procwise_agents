@@ -223,12 +223,20 @@ class DataExtractionAgent(BaseAgent):
 
 
 if __name__ == "__main__":
-    # This is just a placeholder to allow running the module directly for testing.
-    # In production, this agent would be invoked by the main application logic.
-    from agents.base_agent import AgentNick
+    # Simple manual invocation used during local development. The production
+    # system always provides an ``AgentContext`` via the orchestrator.
+    from agents.base_agent import AgentNick, AgentContext
 
     agent_nick = AgentNick()
     logging.basicConfig(level=logging.INFO)
     agent = DataExtractionAgent(agent_nick)  # Replace with actual AgentNick instance
-    result = agent.run(s3_prefix="Invoices/")
+
+    context = AgentContext(
+        workflow_id="manual-test",
+        agent_id="data_extraction",
+        user_id=agent_nick.settings.script_user,
+        input_data={"s3_prefix": "Invoices/"},
+    )
+
+    result = agent.run(context)
     print(result)
