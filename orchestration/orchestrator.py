@@ -142,7 +142,7 @@ class Orchestrator:
         """Execute supplier ranking workflow"""
         # Get supplier data first
         context.input_data['supplier_data'] = self.query_engine.fetch_supplier_data(
-            context.input_data.get('suppliers', [])
+            context.input_data
         )
 
         # Execute ranking

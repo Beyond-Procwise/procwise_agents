@@ -30,7 +30,12 @@ import ollama
 import pdfplumber
 from qdrant_client import models
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import (
+    BaseAgent,
+    AgentContext,
+    AgentOutput,
+    AgentStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +59,18 @@ class DataExtractionAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def run(self, s3_prefix: str | None = None, s3_object_key: str | None = None) -> Dict:
+    def run(self, context: AgentContext) -> AgentOutput:
+        """Entry point used by the orchestrator."""
+        try:
+            s3_prefix = context.input_data.get("s3_prefix")
+            s3_object_key = context.input_data.get("s3_object_key")
+            data = self._process_documents(s3_prefix, s3_object_key)
+            return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+        except Exception as exc:
+            logger.error("DataExtractionAgent failed: %s", exc)
+            return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+
+    def _process_documents(self, s3_prefix: str | None = None, s3_object_key: str | None = None) -> Dict:
         """Process documents stored under the given prefix.
 
         Parameters

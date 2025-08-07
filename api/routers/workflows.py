@@ -7,7 +7,7 @@ import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
@@ -36,7 +36,7 @@ class AskRequest(BaseModel):
     model_name: Optional[str] = None
     doc_type: Optional[str] = None
     product_type: Optional[str] = None
-    file_path: Optional[str] = None
+    file_path: Optional[str] = Field(default=None, description="Optional local file path", json_schema_extra={"example": None})
 
     @field_validator("doc_type", "product_type", "file_path", mode="before")
     @classmethod
@@ -45,7 +45,7 @@ class AskRequest(BaseModel):
             return None
         if isinstance(value, str):
             value = value.strip()
-            if not value:
+            if not value or value.lower() == "string":
                 return None
         return value
 
@@ -84,6 +84,8 @@ async def ask_question(
 ):
     file_data: List[tuple[bytes, str]] = []
     if req.file_path:
+        if not os.path.isfile(req.file_path):
+            raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
         try:
             with open(req.file_path, "rb") as f:
                 file_data.append((f.read(), os.path.basename(req.file_path)))
