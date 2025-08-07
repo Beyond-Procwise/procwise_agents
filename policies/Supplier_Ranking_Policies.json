@@ -8,8 +8,7 @@
           "price": 0.4,
           "delivery": 0.3,
           "risk": 0.2,
-          "payment_terms": 0.1,
-          "delivery performance": 0.3
+          "payment_terms": 0.1
         }
       }
     }
@@ -36,7 +35,6 @@
       "rules": {
         "price": "lower_is_better",
         "delivery": "higher_is_better",
-        "delivery performance": "higher_is_better",
         "risk": "lower_is_better",
         "payment_terms": "higher_is_better"
       }

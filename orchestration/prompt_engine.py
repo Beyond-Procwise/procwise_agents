@@ -23,7 +23,7 @@ class PromptEngine:
 **Instructions:**
 1.  Analyze the user's query.
 2.  Infer values for `category`, `criteria`, `time_period`, and `filters`.
-3.  If the query mentions ranking but no specific criteria are named (e.g., "rank the suppliers"), you MUST default the `criteria` to `["price", "delivery performance", "risk"]`.
+3.  If the query mentions ranking but no specific criteria are named (e.g., "rank the suppliers"), you MUST default the `criteria` to `["price", "delivery", "risk"]`.
 4.  If no time period is mentioned, `time_period` must be `null`.
 5.  Find the best matching template from the "PROMPT LIBRARY" below.
 6.  Infer the values for the template's input parameters (like `category`, `criteria`, `time_period`, `filters`) from the user's query.

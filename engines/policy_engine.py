@@ -10,7 +10,22 @@ class PolicyEngine(BaseEngine):
         super().__init__()
         self.supplier_policies = self._load_json_file('policies/Supplier_Ranking_Policies.json')
         self.opportunity_policies = self._load_json_file('policies/Opportunity_Policies.json')
+        self._normalise_weight_policy()
         print("PolicyEngine: All policies loaded.")
+
+    def _normalise_weight_policy(self) -> None:
+        """Ensure default weights sum to 1."""
+        weight_policy = next(
+            (p for p in self.supplier_policies if p.get('policyName') == 'WeightAllocationPolicy'),
+            None,
+        )
+        if not weight_policy:
+            return
+        weights = weight_policy.get('details', {}).get('rules', {}).get('default_weights', {})
+        total = sum(weights.values())
+        if total and abs(total - 1.0) > 1e-6:
+            for key in list(weights.keys()):
+                weights[key] = round(weights[key] / total, 4)
 
     def validate_and_apply(self, intent: dict) -> tuple[bool, str, dict]:
         # ... (rest of the method is the same)
