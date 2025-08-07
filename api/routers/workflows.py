@@ -108,7 +108,11 @@ def rank_suppliers(
     req: RankingRequest,
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ):
-    return orchestrator.execute_ranking_flow(req.query)
+    # Use the public workflow entry point so that the orchestrator can build a
+    # proper ``AgentContext``. Calling internal methods directly would bypass
+    # this setup and lead to attribute errors such as ``'str' object has no
+    # attribute 'input_data'`` when the workflow tries to access context fields.
+    return orchestrator.execute_workflow("supplier_ranking", {"query": req.query})
 
 
 @router.post("/extract")
