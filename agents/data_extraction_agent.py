@@ -87,14 +87,23 @@ class DataExtractionAgent(BaseAgent):
                 product_type = self._classify_product_type(validated_doc.line_items)
 
                 doc_type_from_llm = self._classify_document_type(document_representation)
-                doc_type = doc_type_from_llm.replace(" ", "_") if doc_type_from_llm else (
-                    'Invoice' if 'invoice' in prefix.lower() else 'Purchase_Order')
+                if doc_type_from_llm:
+                    doc_type = doc_type_from_llm.replace(" ", "_")
+                else:
+                    if 'invoice' in prefix.lower():
+                        doc_type = 'Invoice'
+                    elif 'quote' in prefix.lower():
+                        doc_type = 'Quote'
+                    else:
+                        doc_type = 'Purchase_Order'
 
                 if doc_type not in self.table_schemas:
                     logger.error(f"Invalid doc_type '{doc_type}' generated. Skipping.");
                     continue
 
-                pk_value = validated_doc.header_data.invoice_id or validated_doc.header_data.po_number
+                pk_value = (validated_doc.header_data.invoice_id or
+                            validated_doc.header_data.po_number or
+                            validated_doc.header_data.quote_id)
 
                 if not pk_value:
                     logger.error("Persistence Failed: No primary key found.");
@@ -122,7 +131,7 @@ class DataExtractionAgent(BaseAgent):
 
     def _extract_header(self, text: str) -> Dict | None:
         logger.info("  -> Stage 2a: Extracting Header Data...")
-        prompt = "Extract header info (invoiceId, poNumber, vendorName, totalAmount, subtotal, taxAmount, invoiceDate, dueDate) from the text. Respond with a single JSON object."
+        prompt = "Extract header info (invoiceId, poNumber, quoteId, quoteNumber, vendorName, totalAmount, subtotal, taxAmount, invoiceDate, quoteDate, dueDate, validUntil) from the text. Respond with a single JSON object."
         try:
             response = ollama.generate(model=self.extraction_model,
                                        prompt=f"{prompt}\n\nDocument Content:\n---\n{text}\n---\nJSON:", format='json')
@@ -212,7 +221,7 @@ Cleaned Data:\n- Header: {json.dumps(cleaned_header)}\n- Line Items: {json.dumps
                                    "notes": "Catastrophic failure in validation LLM call."}}
 
     def _classify_document_type(self, text: str) -> str | None:
-        prompt = f"""Is the text an "Invoice" or a "Purchase Order"? Respond with JSON: {{"document_type": "value"}}"""
+        prompt = f"""Is the text an "Invoice", a "Purchase Order", or a "Quote"? Respond with JSON: {{"document_type": "value"}}"""
         try:
             response = ollama.generate(model=self.extraction_model, prompt=f"{prompt}\n\nText:\n{text[:1000]}",
                                        format='json')
@@ -272,7 +281,9 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
 
     def _fetch_all_table_schemas(self):
         logger.info("Fetching database schemas...")
-        schemas = {'Invoice': {'pk_col': 'invoice_id'}, 'Purchase_Order': {'pk_col': 'po_id'}}
+        schemas = {'Invoice': {'pk_col': 'invoice_id'},
+                   'Purchase_Order': {'pk_col': 'po_id'},
+                   'Quote': {'pk_col': 'quote_id'}}
         with self.agent_nick.get_db_connection() as conn:
             schemas['Invoice']['header_table'], schemas['Invoice'][
                 'line_table'] = "proc.invoice_agent", "proc.invoice_line_items_agent"
@@ -282,6 +293,9 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
                 'line_table'] = "proc.purchase_order_agent", "proc.po_line_items_agent"
             schemas['Purchase_Order']['header_cols'] = self._get_table_columns(conn, 'proc', 'purchase_order_agent')
             schemas['Purchase_Order']['line_cols'] = self._get_table_columns(conn, 'proc', 'po_line_items_agent')
+            schemas['Quote']['header_table'], schemas['Quote']['line_table'] = "proc.quote_agent", "proc.quote_line_items_agent"
+            schemas['Quote']['header_cols'] = self._get_table_columns(conn, 'proc', 'quote_agent')
+            schemas['Quote']['line_cols'] = self._get_table_columns(conn, 'proc', 'quote_line_items_agent')
         return schemas
 
     def _get_table_columns(self, db_conn, table_schema, table_name):
@@ -300,7 +314,7 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
         float_fields = ['amount', 'price', 'total', 'subtotal', 'tax_amount', 'line_total', 'unit_price']
         for key, value in cleaned.items():
             if value is None or value == '': continue
-            if "date" in key and isinstance(value, str):
+            if ("date" in key or key in {'valid_until'}) and isinstance(value, str):
                 try:
                     cleaned[key] = parse_date(value).strftime('%Y-%m-%d')
                 except (ValueError, TypeError):
@@ -319,12 +333,21 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
 
     def _insert_data_to_postgres(self, data: Dict, config: Dict):
         header_pydantic = data.get('headerData', {})
-        header_data = {'invoice_id': header_pydantic.get('invoiceId'), 'po_id': header_pydantic.get('poNumber'),
-                       'vendor_name': header_pydantic.get('vendorName'),
-                       'total_amount': header_pydantic.get('totalAmount'), 'subtotal': header_pydantic.get('subtotal'),
-                       'tax_amount': header_pydantic.get('taxAmount'),
-                       'invoice_date': header_pydantic.get('invoiceDate'), 'due_date': header_pydantic.get('dueDate'),
-                       'order_date': header_pydantic.get('invoiceDate')}
+        header_data = {
+            'invoice_id': header_pydantic.get('invoiceId'),
+            'po_id': header_pydantic.get('poNumber'),
+            'quote_id': header_pydantic.get('quoteId'),
+            'quote_number': header_pydantic.get('quoteNumber'),
+            'vendor_name': header_pydantic.get('vendorName'),
+            'total_amount': header_pydantic.get('totalAmount'),
+            'subtotal': header_pydantic.get('subtotal'),
+            'tax_amount': header_pydantic.get('taxAmount'),
+            'invoice_date': header_pydantic.get('invoiceDate'),
+            'quote_date': header_pydantic.get('quoteDate'),
+            'due_date': header_pydantic.get('dueDate'),
+            'valid_until': header_pydantic.get('validUntil'),
+            'order_date': header_pydantic.get('orderDate') or header_pydantic.get('invoiceDate') or header_pydantic.get('quoteDate')
+        }
         line_items = [{'description': str(li.get('description')), 'quantity': li.get('quantity'),
                        'unit_price': li.get('unitPrice'), 'line_total': li.get('lineTotal')} for li in
                       data.get('lineItems', [])]
@@ -352,7 +375,12 @@ Respond with a single JSON object: {{"product_category": "Your Category"}}"""
                 cursor.execute(f"DELETE FROM {config['line_table']} WHERE {config['pk_col']} = %s;", (pk_value,))
                 for i, item in enumerate(line_items, 1):
                     cleaned_item = self._clean_and_standardize_data_for_db(item)
-                    line_pk_col = 'invoice_line_id' if 'invoice' in config['line_table'] else 'po_line_id'
+                    if 'invoice' in config['line_table']:
+                        line_pk_col = 'invoice_line_id'
+                    elif 'po' in config['line_table']:
+                        line_pk_col = 'po_line_id'
+                    else:
+                        line_pk_col = 'quote_line_id'
                     cleaned_item.update({config['pk_col']: pk_value, 'line_no': i, line_pk_col: f"{pk_value}-{i}",
                                          'created_date': current_time, 'created_by': self.settings.script_user,
                                          'last_modified_date': current_time,
