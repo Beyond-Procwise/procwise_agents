@@ -23,8 +23,6 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional
 
@@ -48,18 +46,10 @@ def _normalize_point_id(raw_id: str) -> int | str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw_id))
 
 
-@dataclass
-class TableConfig:
-    header_table: str
-    line_table: str
-    pk_col: str
-
-
 class DataExtractionAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.extraction_model = self.settings.extraction_model
-        self.table_schemas = self._fetch_all_table_schemas()
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,14 +125,7 @@ class DataExtractionAgent(BaseAgent):
                 product_type = self._classify_product_type(line_items)
                 self._upsert_to_qdrant(data, pk_value, doc_type, product_type, object_key)
 
-                status = "success"
-                try:
-                    self._insert_data_to_postgres(data, pk_value, self.table_schemas[doc_type], status)
-                except Exception as exc:  # pragma: no cover - requires db
-                    logger.error("DB insertion failed for %s: %s", object_key, exc)
-                    status = "db_failed"
-
-                results.append({"object_key": object_key, "id": pk_value, "status": status})
+                results.append({"object_key": object_key, "id": pk_value, "status": "success"})
 
         return {"status": "completed", "details": results}
 
@@ -219,49 +202,9 @@ class DataExtractionAgent(BaseAgent):
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
     # ------------------------------------------------------------------
-    # Database operations
+    # End of class
     # ------------------------------------------------------------------
-    def _fetch_all_table_schemas(self) -> Dict[str, TableConfig]:
-        # Real implementation would introspect the database; here we use a
-        # static map to keep the example focused.
-        return {
-            "Invoice": TableConfig("proc.invoice", "proc.invoice_line", "invoice_id"),
-            "Purchase_Order": TableConfig("proc.purchase_order", "proc.purchase_order_line", "po_id"),
-            "Quote": TableConfig("proc.quote", "proc.quote_line", "quote_id"),
-        }
 
-    def _insert_data_to_postgres(
-        self, data: Dict, pk_value: str, config: TableConfig, status: str
-    ) -> None:
-        header = dict(data.get("header_data", {}))
-        header[config.pk_col] = pk_value
-        header["status"] = status
-        now = datetime.utcnow()
-        header.setdefault("created_date", now)
-        header.setdefault("last_modified_date", now)
-
-        line_items = data.get("line_items", [])
-
-        with self.agent_nick.get_db_connection() as conn, conn.cursor() as cur:
-            cols = list(header.keys())
-            placeholders = ",".join(["%s"] * len(cols))
-            update_set = ",".join(f"{c}=EXCLUDED.{c}" for c in cols if c != config.pk_col)
-            sql = (
-                f"INSERT INTO {config.header_table} ({','.join(cols)}) VALUES ({placeholders}) "
-                f"ON CONFLICT ({config.pk_col}) DO UPDATE SET {update_set};"
-            )
-            cur.execute(sql, [header[c] for c in cols])
-
-            for item in line_items:
-                if not item:
-                    continue
-                item_cols = list(item.keys())
-                ph = ",".join(["%s"] * len(item_cols))
-                cur.execute(
-                    f"INSERT INTO {config.line_table} ({','.join(item_cols)}) VALUES ({ph});",
-                    [item[c] for c in item_cols],
-                )
-            conn.commit()
 
 if __name__ == "__main__":
     # This is just a placeholder to allow running the module directly for testing.

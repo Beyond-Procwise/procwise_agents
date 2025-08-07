@@ -6,7 +6,7 @@ import json
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from orchestration.orchestrator import Orchestrator
@@ -30,24 +30,13 @@ def get_rag_pipeline(request: Request) -> RAGPipeline:
     return pipeline
 
 
-class QuestionParams:
-    """Utility class used with ``Depends`` to parse multipart form requests."""
-
-    def __init__(
-        self,
-        query: str = Form(...),
-        user_id: str = Form(...),
-        model_name: Optional[str] = Form(None),
-        doc_type: Optional[str] = Form(None),
-        product_type: Optional[str] = Form(None),
-        files: List[UploadFile] | None = File(None),
-    ):
-        self.query = query
-        self.user_id = user_id
-        self.model_name = model_name
-        self.doc_type = doc_type
-        self.product_type = product_type
-        self.files = files or []
+class AskRequest(BaseModel):
+    query: str
+    user_id: str
+    model_name: Optional[str] = None
+    doc_type: Optional[str] = None
+    product_type: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class RankingRequest(BaseModel):
@@ -74,19 +63,24 @@ router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
 # ---------------------------------------------------------------------------
 @router.post("/ask")
 async def ask_question(
-    params: QuestionParams = Depends(),
+    req: AskRequest,
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
 ):
-    if len(params.files) > 3:
-        raise HTTPException(status_code=400, detail="Max 3 files allowed.")
-    file_data = [(await f.read(), f.filename) for f in params.files if f.filename]
+    file_data: List[tuple[bytes, str]] = []
+    if req.file_path:
+        try:
+            with open(req.file_path, "rb") as f:
+                file_data.append((f.read(), os.path.basename(req.file_path)))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
+
     result = pipeline.answer_question(
-        query=params.query,
-        user_id=params.user_id,
-        model_name=params.model_name,
-        files=file_data,
-        doc_type=params.doc_type,
-        product_type=params.product_type,
+        query=req.query,
+        user_id=req.user_id,
+        model_name=req.model_name,
+        files=file_data or None,
+        doc_type=req.doc_type,
+        product_type=req.product_type,
     )
     return result
 
