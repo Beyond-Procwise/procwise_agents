@@ -83,13 +83,18 @@ class RAGPipeline:
         logger.info(
             f"Answering query with model '{llm_to_use}' and filters: doc_type='{doc_type}', product_type='{product_type}'")
 
-        # --- Build Vector DB Filter with multiple conditions ---
-        must_conditions = []
+        # --- Normalise filters and build Vector DB filter conditions ---
+        must_conditions: List[models.FieldCondition] = []
         if doc_type:
-            must_conditions.append(models.FieldCondition(key="document_type", match=models.MatchValue(value=doc_type)))
-        if product_type:
+            doc_type = doc_type.lower()
             must_conditions.append(
-                models.FieldCondition(key="product_type", match=models.MatchValue(value=product_type)))
+                models.FieldCondition(key="document_type", match=models.MatchValue(value=doc_type))
+            )
+        if product_type:
+            product_type = product_type.lower()
+            must_conditions.append(
+                models.FieldCondition(key="product_type", match=models.MatchValue(value=product_type))
+            )
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
         # --- Retrieve from Vector DB using the unified collection name ---

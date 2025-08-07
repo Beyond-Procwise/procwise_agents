@@ -7,7 +7,7 @@ import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
@@ -37,6 +37,22 @@ class AskRequest(BaseModel):
     doc_type: Optional[str] = None
     product_type: Optional[str] = None
     file_path: Optional[str] = None
+
+    @field_validator("doc_type", "product_type", "file_path", mode="before")
+    @classmethod
+    def _empty_to_none(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+        return value
+
+    @field_validator("doc_type", "product_type")
+    @classmethod
+    def _normalize_case(cls, value: Optional[str]) -> Optional[str]:
+        return value.lower() if isinstance(value, str) else value
 
 
 class RankingRequest(BaseModel):
