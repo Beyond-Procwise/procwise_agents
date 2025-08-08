@@ -27,6 +27,28 @@ class PolicyEngine(BaseEngine):
             for key in list(weights.keys()):
                 weights[key] = round(weights[key] / total, 4)
 
+    def validate_workflow(self, workflow_name: str, user_id: str, input_data: dict) -> dict:
+        """Validate a workflow against policy rules.
+
+        For supplier ranking workflows we build a ranking intent and
+        delegate validation to :meth:`validate_and_apply`.  The tuple
+        returned by that method is then converted into a simple dict with
+        ``allowed`` and ``reason`` fields so that upstream callers have a
+        consistent interface.  All other workflows currently bypass
+        policy checks and are allowed by default.
+        """
+        if workflow_name == 'supplier_ranking':
+            intent = {
+                'template_id': 'rank_by_criteria',
+                'parameters': {
+                    'criteria': input_data.get('criteria')
+                }
+            }
+            allowed, reason, _ = self.validate_and_apply(intent)
+            return {'allowed': allowed, 'reason': reason}
+
+        return {'allowed': True, 'reason': 'No policy checks'}
+
     def validate_and_apply(self, intent: dict) -> tuple[bool, str, dict]:
         # ... (rest of the method is the same)
         print(f"PolicyEngine: Validating intent -> {intent}")
