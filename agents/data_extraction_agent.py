@@ -197,8 +197,11 @@ class DataExtractionAgent(BaseAgent):
     def _upsert_to_qdrant(
         self, data: Dict, pk_value: str, doc_type: str, product_type: str, object_key: str
     ) -> None:
+        self.agent_nick._initialize_qdrant_collection()
         summary = self._generate_document_summary(data, pk_value, doc_type)
-        vector = self.agent_nick.embedding_model.encode(summary).tolist()
+        vector = self.agent_nick.embedding_model.encode(
+            summary, normalize_embeddings=True
+        ).tolist()
         payload = {
             "record_id": pk_value,
             "document_type": doc_type.lower(),

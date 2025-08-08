@@ -89,14 +89,15 @@ class SupplierRankingAgent(BaseAgent):
 
         ranked_df = scored_df.sort_values(by='final_score', ascending=False).reset_index(drop=True)
 
-        # 6. Generate justifications for top-N
+        # 6. Generate justifications for top-N and limit output
         top_n = intent.get('parameters', {}).get('top_n', 3)
-        ranked_df['justification'] = ranked_df.apply(
-            lambda row: self._generate_justification(row, weights.keys()) if row.name < top_n else '',
+        top_df = ranked_df.head(top_n).copy()
+        top_df['justification'] = top_df.apply(
+            lambda row: self._generate_justification(row, weights.keys()),
             axis=1
         )
 
-        ranking = json.loads(ranked_df.to_json(orient='records'))
+        ranking = json.loads(top_df.to_json(orient='records'))
         logger.info("SupplierRankingAgent: Ranking complete.")
         return AgentOutput(
             status=AgentStatus.SUCCESS,
