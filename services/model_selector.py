@@ -113,7 +113,7 @@ class RAGPipeline:
         )
         retrieved_context = "\n---\n".join(
             [
-                f"Document ID: {hit.payload.get('record_id', hit.id)}\nSummary: {hit.payload.get('summary')}"
+                f"Document ID: {hit.payload.get('record_id', hit.id)}\nContent: {hit.payload.get('content', hit.payload.get('summary'))}"
                 for hit in search_results
             ]
         ) if search_results else "No relevant documents found."

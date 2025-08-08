@@ -19,6 +19,7 @@ from orchestration.prompt_engine import PromptEngine
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
+from services.process_routing_service import ProcessRoutingService
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ class AgentNick:
         self.policy_engine = PolicyEngine()
         self.query_engine = QueryEngine(self)
         self.routing_engine = RoutingEngine(self)
+        self.process_routing_service = ProcessRoutingService(self)
         logger.info("Engines initialized.")
 
         self.agents = {}
@@ -122,7 +124,11 @@ class AgentNick:
             collection_info = self.qdrant_client.get_collection(collection_name=collection_name)
             logger.info(f"Qdrant collection '{collection_name}' already exists.")
             existing_indexes = collection_info.payload_schema.keys()
-            required_indexes = {"document_type": models.PayloadSchemaType.KEYWORD, "product_type": models.PayloadSchemaType.KEYWORD}
+            required_indexes = {
+                "document_type": models.PayloadSchemaType.KEYWORD,
+                "product_type": models.PayloadSchemaType.KEYWORD,
+                "record_id": models.PayloadSchemaType.KEYWORD,
+            }
             for field_name, field_schema in required_indexes.items():
                 if field_name not in existing_indexes:
                     logger.warning(f"Index for '{field_name}' not found. Creating it now...")
@@ -136,4 +142,5 @@ class AgentNick:
             )
             self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="document_type", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
             self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="product_type", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
+            self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="record_id", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
             logger.info("Collection and payload indexes created successfully.")
