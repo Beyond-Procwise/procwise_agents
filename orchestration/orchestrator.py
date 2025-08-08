@@ -239,6 +239,8 @@ class Orchestrator:
 
         result = agent.run(context)
 
+        agent_label = agent.__class__.__name__
+
         try:
             status = 1 if result.status == AgentStatus.SUCCESS else 0
         except Exception:
@@ -247,7 +249,7 @@ class Orchestrator:
         process_id = None
         try:
             process_id = self.agent_nick.process_routing_service.log_process(
-                process_name=agent_name,
+                process_name=agent_label,
                 process_details={
                     'input': context.input_data,
                     'output': getattr(result, 'data', None)
@@ -257,13 +259,13 @@ class Orchestrator:
                 user_name=self.agent_nick.settings.script_user,
             )
         except Exception as e:
-            logger.error(f"Routing log failed for {agent_name}: {e}")
+            logger.error(f"Routing log failed for {agent_label}: {e}")
 
         if process_id is not None:
             try:
                 self.agent_nick.process_routing_service.log_action(
                     process_id=process_id,
-                    agent_type=agent_name,
+                    agent_type=agent_label,
                     action_desc=context.input_data,
                     process_output=getattr(result, 'data', None),
                     status=(
@@ -273,7 +275,7 @@ class Orchestrator:
                     ),
                 )
             except Exception as e:
-                logger.error(f"Action log failed for {agent_name}: {e}")
+                logger.error(f"Action log failed for {agent_label}: {e}")
 
         return result
 

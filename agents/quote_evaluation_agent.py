@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 class QuoteEvaluationAgent(BaseAgent):
     """Agent for evaluating and comparing supplier quotes"""
 
+    def run(self, context: AgentContext) -> AgentOutput:
+        """Execute the quote evaluation flow."""
+        return self.process(context)
+
     def process(self, context: AgentContext) -> AgentOutput:
         """Process quote evaluation"""
         try:
