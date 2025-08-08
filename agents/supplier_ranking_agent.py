@@ -82,7 +82,8 @@ class SupplierRankingAgent(BaseAgent):
         for crit, w in weights.items():
             col = f"{crit}_score"
             if col in scored_df.columns:
-                scored_df['final_score'] += scored_df[col].fillna(0) * w
+                scored_df['final_score'] += pd.to_numeric(scored_df[col].fillna(0), errors='coerce') * float(w)
+
             else:
                 logger.warning(f"Criterion column missing: {col}")
 
@@ -140,11 +141,11 @@ class SupplierRankingAgent(BaseAgent):
             if max_v - min_v == 0:
                 out[score_col] = 10.0
             else:
-                out[score_col] = (
-                    10 * (max_v - vals) / (max_v - min_v)
-                    if direction == 'lower_is_better'
-                    else 10 * (vals - min_v) / (max_v - min_v)
-                )
+                range_diff = float(max_v - min_v)  # Convert to float to avoid integer division issues
+                if direction == 'lower_is_better':
+                    out[score_col] = 10 * (max_v - vals) / range_diff
+                else:
+                    out[score_col] = 10 * (vals - min_v) / range_diff
         return out
 
     def _generate_justification(self, row: pd.Series, criteria: list) -> str:
@@ -154,7 +155,12 @@ class SupplierRankingAgent(BaseAgent):
         for crit in criteria:
             score_col = f"{crit}_score"
             if score_col in row:
-                breakdown.append(f"- {crit.replace('_', ' ').title()}: {row[score_col]:.2f}")
+                score_value = row.get(score_col)
+                if isinstance(score_value, (int, float)):
+                    breakdown.append(f"- {crit.replace('_', ' ').title()}: {score_value:.2f}")
+                else:
+                    logger.warning(f"Score value for {crit} is not numeric: {score_value}")
+                    breakdown.append(f"- {crit.replace('_', ' ').title()}: N/A")
         prompt = self.justification_template['prompt_template'].format(
             supplier_name=row.get('supplier_name', 'Unknown'),
             final_score=row.get('final_score', 0.0),

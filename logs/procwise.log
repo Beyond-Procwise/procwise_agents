@@ -651,3 +651,181 @@ LINE 21:                 SELECT supplier_id, SUM(invoice_total_Incl_t...
 2025-08-08 06:49:14,607 - INFO - api.main - System initialized successfully.
 2025-08-08 06:50:02,244 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID ca86639b-26fc-4c03-998d-d8bd835b32a0
 2025-08-08 06:50:02,286 - ERROR - orchestration.orchestrator - Workflow ca86639b-26fc-4c03-998d-d8bd835b32a0 failed: Query must be a string unless using sqlalchemy.
+2025-08-08 07:08:30,226 - INFO - api.main - API shutting down.
+2025-08-08 07:09:36,520 - INFO - api.main - API starting up...
+2025-08-08 07:09:36,520 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:09:36,520 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:09:36,654 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:09:37,016 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:09:37,017 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:09:40,456 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:09:40,593 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:09:40,594 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:09:40,595 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:09:40,606 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:09:40,615 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:09:40,615 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:09:40,615 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:09:40,615 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:09:40,616 - INFO - api.main - System initialized successfully.
+2025-08-08 07:12:54,243 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID de0a483d-8b49-4a10-99c3-5c91243c235b
+2025-08-08 07:19:19,477 - INFO - api.main - API starting up...
+2025-08-08 07:19:19,477 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:19:19,477 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:19:19,587 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:19:19,933 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:19:19,933 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:19:23,620 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:19:23,773 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:19:23,773 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:19:23,775 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:19:23,787 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:19:23,793 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:19:23,793 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:19:23,793 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:19:23,793 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:19:23,794 - INFO - api.main - System initialized successfully.
+2025-08-08 07:19:35,864 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID c8665a23-0ee3-445b-a5ba-232d709cf19a
+2025-08-08 07:19:35,903 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:19:35,905 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:19:35,905 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:19:35,906 - ERROR - orchestration.orchestrator - Workflow c8665a23-0ee3-445b-a5ba-232d709cf19a failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:20:20,240 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID cb1a7cf5-2e73-4af3-b0d6-4f30ea128ea2
+2025-08-08 07:20:20,276 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:20:48,302 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:20:48,303 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:20:48,306 - ERROR - orchestration.orchestrator - Workflow cb1a7cf5-2e73-4af3-b0d6-4f30ea128ea2 failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:22:59,115 - INFO - api.main - API shutting down.
+2025-08-08 07:24:05,664 - INFO - api.main - API starting up...
+2025-08-08 07:24:05,664 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:24:05,665 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:24:05,790 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:24:06,266 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:24:06,267 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:24:10,360 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:24:10,495 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:24:10,496 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:24:10,497 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:24:10,510 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:24:10,519 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:24:10,519 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:24:10,519 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:24:10,519 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:24:10,520 - INFO - api.main - System initialized successfully.
+2025-08-08 07:24:30,549 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 3d9ef325-9dd7-442d-aa0e-ee44cdba421d
+2025-08-08 07:24:30,605 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:24:44,347 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:24:44,348 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:24:44,351 - ERROR - orchestration.orchestrator - Workflow 3d9ef325-9dd7-442d-aa0e-ee44cdba421d failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:25:05,758 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID c4097390-25dc-4100-b04a-fa3a0969926f
+2025-08-08 07:25:05,788 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:25:05,790 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:25:05,791 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:25:05,792 - ERROR - orchestration.orchestrator - Workflow c4097390-25dc-4100-b04a-fa3a0969926f failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:25:12,794 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID ef5c3ad8-25b5-4ad0-a107-ce8e51715751
+2025-08-08 07:25:12,823 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:25:12,824 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:25:12,824 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:25:12,826 - ERROR - orchestration.orchestrator - Workflow ef5c3ad8-25b5-4ad0-a107-ce8e51715751 failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:25:23,885 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 5ec58e92-d440-47bd-81b1-517d857bfde8
+2025-08-08 07:25:23,921 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:25:23,923 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:25:23,923 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:25:23,925 - ERROR - orchestration.orchestrator - Workflow 5ec58e92-d440-47bd-81b1-517d857bfde8 failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:25:30,607 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 3ab1d549-0928-439c-bf15-5b3440a28152
+2025-08-08 07:25:30,640 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:26:17,680 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:26:17,681 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:26:56,350 - ERROR - orchestration.orchestrator - Workflow 3ab1d549-0928-439c-bf15-5b3440a28152 failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:27:17,771 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 82a1d014-c3f1-4a42-96e2-c68b7f2b5b56
+2025-08-08 07:27:17,819 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:27:29,376 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:27:29,376 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:27:31,837 - ERROR - orchestration.orchestrator - Workflow 82a1d014-c3f1-4a42-96e2-c68b7f2b5b56 failed: can't multiply sequence by non-int of type 'float'
+2025-08-08 07:28:14,939 - INFO - api.main - API shutting down.
+2025-08-08 07:29:23,366 - INFO - api.main - API starting up...
+2025-08-08 07:29:23,367 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:29:23,367 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:29:23,484 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:29:23,812 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:29:23,813 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:29:28,111 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:29:28,297 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:29:28,298 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:29:28,299 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:29:28,313 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:29:28,322 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:29:28,322 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:29:28,322 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:29:28,322 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:29:28,323 - INFO - api.main - System initialized successfully.
+2025-08-08 07:29:31,082 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID df08dcfd-3df8-42e4-a368-0c4abd7429df
+2025-08-08 07:29:31,118 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:29:31,120 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:29:31,121 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:29:36,256 - WARNING - agents.supplier_ranking_agent - Criterion column missing: payment_terms_score
+2025-08-08 07:29:37,763 - ERROR - orchestration.orchestrator - Workflow df08dcfd-3df8-42e4-a368-0c4abd7429df failed: Unknown format code 'f' for object of type 'str'
+2025-08-08 07:31:00,082 - INFO - api.main - API shutting down.
+2025-08-08 07:32:06,654 - INFO - api.main - API starting up...
+2025-08-08 07:32:06,654 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:32:06,655 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:32:06,852 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:32:07,182 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:32:07,183 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:32:10,596 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:32:10,737 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:32:10,737 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:32:10,738 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:32:10,751 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:32:10,757 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:32:10,757 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:32:10,757 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:32:10,757 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:32:10,758 - INFO - api.main - System initialized successfully.
+2025-08-08 07:33:08,696 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 5d9941b9-035f-4b60-b137-c4a10353394d
+2025-08-08 07:33:08,756 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:33:08,758 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:33:08,759 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:33:12,530 - WARNING - agents.supplier_ranking_agent - Criterion column missing: payment_terms_score
+2025-08-08 07:33:17,430 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.95
+2025-08-08 07:33:39,610 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:33:39,611 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.92
+2025-08-08 07:33:48,972 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:33:48,973 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.81
+2025-08-08 07:34:00,428 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:34:00,444 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Ranking complete.
+2025-08-08 07:34:57,052 - INFO - api.main - API shutting down.
+2025-08-08 07:35:17,757 - INFO - api.main - API starting up...
+2025-08-08 07:35:17,757 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 07:35:17,757 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 07:35:17,834 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 07:35:18,127 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 07:35:18,128 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 07:35:20,153 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 07:35:20,218 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 07:35:20,219 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 07:35:20,219 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 07:35:20,229 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 07:35:20,231 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 07:35:20,231 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 07:35:20,231 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 07:35:20,231 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 07:35:20,231 - INFO - api.main - System initialized successfully.
+2025-08-08 07:36:48,376 - INFO - orchestration.orchestrator - Starting workflow document_extraction with ID 7205881e-f874-4890-b39a-c958fdf5cdcf
+2025-08-08 07:36:48,549 - INFO - agents.data_extraction_agent - Processing Invoice/DIXON, REYNOLDS ETC INV600784 for QUT10253.pdf
+2025-08-08 07:36:49,147 - INFO - httpx - HTTP Request: PUT https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings/points?wait=true "HTTP/1.1 404 Not Found"
+2025-08-08 07:36:49,147 - ERROR - agents.data_extraction_agent - DataExtractionAgent failed: Unexpected Response: 404 (Not Found)
+Raw response content:
+b'{"status":{"error":"Not found: Collection `ProcWise_document_embeddings` doesn\'t exist!"},"time":1.723e-6}'
+2025-08-08 07:38:01,245 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID aba39716-e4fa-45f1-9fa4-4f5de8066534
+2025-08-08 07:38:01,279 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Starting ranking...
+2025-08-08 07:38:01,280 - WARNING - agents.supplier_ranking_agent - Criterion column missing: price_score
+2025-08-08 07:38:01,280 - WARNING - agents.supplier_ranking_agent - Criterion column missing: delivery_score
+2025-08-08 07:38:01,282 - WARNING - agents.supplier_ranking_agent - Criterion column missing: payment_terms_score
+2025-08-08 07:38:01,283 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.95
+2025-08-08 07:38:10,888 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:38:10,889 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.92
+2025-08-08 07:38:22,781 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:38:22,781 - WARNING - agents.supplier_ranking_agent - Score value for risk is not numeric: 99.81
+2025-08-08 07:38:32,744 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 07:38:32,755 - INFO - agents.supplier_ranking_agent - SupplierRankingAgent: Ranking complete.

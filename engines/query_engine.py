@@ -29,8 +29,8 @@ class QueryEngine(BaseEngine):
         with ``_score_raw`` so that the ranking agent can normalise them
         according to the defined policies.
         """
-        sql = """SELECT supplier_id, supplier_name, trading_name, supplier_type, 
-                    registered_country, is_preferred_supplier, risk_score 
-                    FROM proc.supplier;""",
+        sql = """SELECT supplier_id, supplier_name, trading_name, supplier_type,
+                registered_country, is_preferred_supplier, risk_score
+                FROM proc.supplier;"""
         with self.agent_nick.get_db_connection() as conn:
             return pd.read_sql(sql, conn)
