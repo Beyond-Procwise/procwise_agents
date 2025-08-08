@@ -25,7 +25,7 @@ class RAGAgent(BaseAgent):
             return {"answer": "I could not find any relevant documents to answer your question."}
 
         context = "".join(
-            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\nSummary: {hit.payload.get('summary')}\n---\n"
+            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\nContent: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
             for hit in search_result
         )
 

@@ -139,7 +139,14 @@ class DataExtractionAgent(BaseAgent):
                 }
 
                 product_type = self._classify_product_type(line_items)
-                self._upsert_to_qdrant(data, pk_value, doc_type, product_type, object_key)
+                self._upsert_to_qdrant(
+                    data,
+                    text,
+                    pk_value,
+                    doc_type,
+                    product_type,
+                    object_key,
+                )
 
                 results.append({"object_key": object_key, "id": pk_value, "status": "success"})
 
@@ -195,24 +202,45 @@ class DataExtractionAgent(BaseAgent):
             return "General Goods"
 
     def _upsert_to_qdrant(
-        self, data: Dict, pk_value: str, doc_type: str, product_type: str, object_key: str
+        self,
+        data: Dict,
+        full_text: str,
+        pk_value: str,
+        doc_type: str,
+        product_type: str,
+        object_key: str,
     ) -> None:
+        """Store document chunks and metadata in the vector database."""
         self.agent_nick._initialize_qdrant_collection()
         summary = self._generate_document_summary(data, pk_value, doc_type)
-        vector = self.agent_nick.embedding_model.encode(
-            summary, normalize_embeddings=True
-        ).tolist()
-        payload = {
-            "record_id": pk_value,
-            "document_type": doc_type.lower(),
-            "product_type": product_type.lower(),
-            "s3_key": object_key,
-            "summary": summary,
-        }
-        point = models.PointStruct(id=_normalize_point_id(pk_value), vector=vector, payload=payload)
-        self.agent_nick.qdrant_client.upsert(
-            collection_name=self.settings.qdrant_collection_name, points=[point]
-        )
+        chunks = self._chunk_text(full_text)
+
+        points: List[models.PointStruct] = []
+        for idx, chunk in enumerate(chunks):
+            vector = self.agent_nick.embedding_model.encode(
+                chunk, normalize_embeddings=True
+            ).tolist()
+            payload = {
+                "record_id": pk_value,
+                "document_type": doc_type.lower(),
+                "product_type": product_type.lower(),
+                "s3_key": object_key,
+                "chunk_id": idx,
+                "content": chunk,
+                "summary": summary,
+            }
+            point_id = _normalize_point_id(f"{pk_value}_{idx}")
+            points.append(models.PointStruct(id=point_id, vector=vector, payload=payload))
+
+        if points:
+            self.agent_nick.qdrant_client.upsert(
+                collection_name=self.settings.qdrant_collection_name, points=points
+            )
+
+    def _chunk_text(self, text: str, max_chars: int = 1000) -> List[str]:
+        """Simple whitespace-aware text chunking."""
+        text = re.sub(r"\s+", " ", text).strip()
+        return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
     def _generate_document_summary(self, data: Dict, pk_value: str, doc_type: str) -> str:
         header = data.get("header_data", {})
