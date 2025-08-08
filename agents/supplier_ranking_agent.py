@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class SupplierRankingAgent(BaseAgent):
+    """
+    Ranks suppliers based on provided criteria and data from QueryEngine.
+    Expects `supplier_data` in context.input_data as list of dicts or DataFrame.
+    """
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
@@ -21,117 +25,148 @@ class SupplierRankingAgent(BaseAgent):
         self.policy_engine = agent_nick.policy_engine
 
     def run(self, context: AgentContext) -> AgentOutput:
-        logger.info("SupplierRankingAgent: Executing core logic...")
-        intent = context.input_data.get('intent', {})
-        data = context.input_data.get('supplier_data')
-        if data is None:
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error='Supplier data missing')
+        logger.info("SupplierRankingAgent: Starting ranking...")
 
-        criteria = intent.get('parameters', {}).get('criteria', [])
+        # 1. Load supplier_data from context
+        supplier_data = context.input_data.get('supplier_data')
+        if supplier_data is None:
+            return AgentOutput(
+                status=AgentStatus.FAILED,
+                data={},
+                error='No supplier_data provided to SupplierRankingAgent'
+            )
+        # Convert to DataFrame
+        if isinstance(supplier_data, pd.DataFrame):
+            df = supplier_data.copy()
+        else:
+            try:
+                df = pd.DataFrame(supplier_data)
+            except Exception as e:
+                logger.error(f"Invalid supplier_data format: {e}")
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error='Failed to parse supplier_data into DataFrame'
+                )
+        if df.empty:
+            return AgentOutput(
+                status=AgentStatus.FAILED,
+                data={},
+                error='supplier_data is empty'
+            )
+
+        # 2. Determine criteria and weights
+        intent = context.input_data.get('intent', {})
+        requested = intent.get('parameters', {}).get('criteria', [])
         weight_policy = next(
             (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'WeightAllocationPolicy'),
             {}
         )
-        weights = weight_policy.get('details', {}).get('rules', {}).get('default_weights', {})
-        if not criteria:
-            criteria = list(weights.keys())
-        applicable_weights = {c: weights.get(c, 0) for c in criteria if weights.get(c, 0) > 0}
+        default_weights = weight_policy.get('details', {}).get('rules', {}).get('default_weights', {})
+        criteria = requested if requested else list(default_weights.keys())
+        weights = {c: default_weights.get(c, 0) for c in criteria if default_weights.get(c, 0) > 0}
 
-        # --- UPGRADE: Expand Ranking Criteria ---
-        # 1. Apply categorical scoring first for criteria like 'payment_terms'
-        scored_df = self._score_categorical_criteria(data, applicable_weights.keys())
+        # 3. Apply categorical scoring
+        scored_df = self._score_categorical_criteria(df, weights.keys())
 
-        # 2. Normalize the remaining numeric scores
+        # 4. Apply numeric normalization
         norm_policy = next(
             (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'NormalizationDirectionPolicy'),
             {}
         )
-        criteria_direction = norm_policy.get('details', {}).get('rules', {})
-        scored_df = self._normalize_numeric_scores(scored_df, criteria_direction)
+        direction_map = norm_policy.get('details', {}).get('rules', {})
+        scored_df = self._normalize_numeric_scores(scored_df, direction_map)
 
-        # 3. Calculate the final weighted score
+        # 5. Calculate final weighted score
         scored_df['final_score'] = 0.0
-        for criterion, weight in applicable_weights.items():
-            score_col = f"{criterion}_score"
-            if score_col in scored_df.columns:
-                scored_df['final_score'] += scored_df[score_col].fillna(0) * weight
+        for crit, w in weights.items():
+            col = f"{crit}_score"
+            if col in scored_df.columns:
+                scored_df['final_score'] += scored_df[col].fillna(0) * w
             else:
-                logger.warning(f"Score column '{score_col}' not found for weighting.")
+                logger.warning(f"Criterion column missing: {col}")
 
         ranked_df = scored_df.sort_values(by='final_score', ascending=False).reset_index(drop=True)
-        logger.info("<- Ranking complete.")
 
-        logger.info("-> Generating justifications for top suppliers...")
-        ranked_df['justification'] = ''
-        for i, row in ranked_df.head(3).iterrows():
-            ranked_df.at[i, 'justification'] = self._generate_justification(row, applicable_weights.keys())
+        # 6. Generate justifications for top-N
+        top_n = intent.get('parameters', {}).get('top_n', 3)
+        ranked_df['justification'] = ranked_df.apply(
+            lambda row: self._generate_justification(row, weights.keys()) if row.name < top_n else '',
+            axis=1
+        )
 
         ranking = json.loads(ranked_df.to_json(orient='records'))
-        return AgentOutput(status=AgentStatus.SUCCESS, data={'ranking': ranking})
+        logger.info("SupplierRankingAgent: Ranking complete.")
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={'ranking': ranking}
+        )
 
-    def _load_json_file(self, relative_path: str) -> dict:
-        absolute_path = os.path.join(PROJECT_ROOT, relative_path)
+    def _load_json_file(self, rel_path: str) -> dict:
+        path = os.path.join(PROJECT_ROOT, rel_path)
         try:
-            with open(absolute_path, 'r') as f:
+            with open(path, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            logger.critical(
-                f"FATAL ERROR (SupplierRankingAgent): Failed to load/parse JSON from {absolute_path}. Error: {e}")
+            logger.critical(f"Failed to load JSON at {path}: {e}")
             raise
 
     def _score_categorical_criteria(self, df: pd.DataFrame, criteria: list) -> pd.DataFrame:
-        scored_df = df.copy()
-        cat_policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'CategoricalScoringPolicy'), None)
-        if not cat_policy: return scored_df
+        out = df.copy()
+        policy = next(
+            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'CategoricalScoringPolicy'),
+            None
+        )
+        if not policy:
+            return out
+        rules = policy.get('details', {}).get('rules', {})
+        for crit in criteria:
+            raw_col = crit
+            score_col = f"{crit}_score"
+            if raw_col in out.columns and crit in rules:
+                mapping = rules[crit]
+                out[score_col] = out[raw_col].map(mapping).fillna(mapping.get('default', 0))
+        return out
 
-        policy_rules = cat_policy.get('details', {}).get('rules', {})
-        for criterion in [c for c in criteria if c in policy_rules]:
-            logger.info(f"Applying categorical scoring for '{criterion}'")
-            raw_col = f"{criterion}_raw"
-            score_col = f"{criterion}_score"
-            if raw_col in scored_df.columns:
-                mapping = policy_rules[criterion]
-                default_value = mapping.get('default', 0)
-                scored_df[score_col] = scored_df[raw_col].map(mapping).fillna(default_value)
-        return scored_df
+    def _normalize_numeric_scores(self, df: pd.DataFrame, dirs: dict) -> pd.DataFrame:
+        out = df.copy()
+        for crit, direction in dirs.items():
+            raw_col = crit
+            score_col = f"{crit}_score"
+            if raw_col not in df.columns:
+                continue
+            vals = df[raw_col]
+            min_v, max_v = vals.min(), vals.max()
+            if max_v - min_v == 0:
+                out[score_col] = 10.0
+            else:
+                out[score_col] = (
+                    10 * (max_v - vals) / (max_v - min_v)
+                    if direction == 'lower_is_better'
+                    else 10 * (vals - min_v) / (max_v - min_v)
+                )
+        return out
 
-    def _normalize_numeric_scores(self, df: pd.DataFrame, criteria_map: dict) -> pd.DataFrame:
-        normalized_df = df.copy()
-        for criterion, direction in criteria_map.items():
-            raw_col = f"{criterion}_score_raw"
-            score_col = f"{criterion}_score"
-
-            if score_col in normalized_df.columns or raw_col not in df.columns: continue
-
-            min_val, max_val = df[raw_col].min(), df[raw_col].max()
-            if (max_val - min_val) == 0: normalized_df[score_col] = 10.0; continue
-
-            if direction == 'lower_is_better':
-                normalized_df[score_col] = 10 * (max_val - df[raw_col]) / (max_val - min_val)
-            else:  # higher_is_better
-                normalized_df[score_col] = 10 * (df[raw_col] - min_val) / (max_val - min_val)
-
-        return normalized_df
-
-    def _generate_justification(self, supplier_row, criteria) -> str:
-        if not self.justification_template: return "Justification prompt template not found."
-
-        score_details = []
-        for c in criteria:
-            score_col = f"{c}_score"
-            if score_col in supplier_row and pd.notna(supplier_row[score_col]):
-                score_details.append(f"- {c.replace('_', ' ').title()}: {supplier_row[score_col]:.2f}")
-
+    def _generate_justification(self, row: pd.Series, criteria: list) -> str:
+        if not self.justification_template:
+            return "No justification template available."
+        breakdown = []
+        for crit in criteria:
+            score_col = f"{crit}_score"
+            if score_col in row:
+                breakdown.append(f"- {crit.replace('_', ' ').title()}: {row[score_col]:.2f}")
         prompt = self.justification_template['prompt_template'].format(
-            supplier_name=supplier_row.get('supplier_name', 'N/A'),
-            final_score=supplier_row.get('final_score', 0),
-            score_breakdown="\n".join(score_details)
+            supplier_name=row.get('supplier_name', 'Unknown'),
+            final_score=row.get('final_score', 0.0),
+            score_breakdown="\n".join(breakdown)
         )
         try:
-            response = ollama.generate(model=self.settings.extraction_model, prompt=prompt, stream=False)
-            return response.get('response', 'Could not generate justification.').strip()
+            resp = ollama.generate(
+                model=self.settings.extraction_model,
+                prompt=prompt,
+                stream=False
+            )
+            return resp.get('response', '').strip()
         except Exception as e:
-            logger.error(f"ERROR generating justification: {e}");
+            logger.error(f"Justification generation failed: {e}")
             return "Justification generation failed."
-

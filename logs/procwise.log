@@ -419,3 +419,235 @@ AttributeError: 'AgentNick' object has no attribute 'policy_engine'
 2025-08-04 19:14:59,275 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
 2025-08-04 19:14:59,294 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 93749 (char 93748)
 2025-08-05 06:05:41,598 - INFO - httpx - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-08-07 20:49:25,258 - INFO - api.main - API starting up...
+2025-08-07 20:49:25,258 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-07 20:49:25,258 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-07 20:49:25,337 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-07 20:49:25,677 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-07 20:49:25,677 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-07 20:49:27,984 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-07 20:49:28,051 - INFO - agents.base_agent - Clients initialized.
+2025-08-07 20:49:28,051 - INFO - agents.base_agent - Initializing core engines...
+2025-08-07 20:49:28,051 - INFO - agents.base_agent - Engines initialized.
+2025-08-07 20:49:28,063 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-07 20:49:28,065 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-07 20:49:28,066 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-07 20:49:28,066 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-07 20:49:28,066 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-07 20:49:28,066 - INFO - api.main - System initialized successfully.
+2025-08-07 20:50:19,639 - INFO - api.main - API starting up...
+2025-08-07 20:50:19,639 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-07 20:50:19,639 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-07 20:50:19,718 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-07 20:50:20,025 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-07 20:50:20,026 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-07 20:50:22,090 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-07 20:50:22,159 - INFO - agents.base_agent - Clients initialized.
+2025-08-07 20:50:22,159 - INFO - agents.base_agent - Initializing core engines...
+2025-08-07 20:50:22,159 - INFO - agents.base_agent - Engines initialized.
+2025-08-07 20:50:22,169 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-07 20:50:22,171 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-07 20:50:22,171 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-07 20:50:22,171 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-07 20:50:22,171 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-07 20:50:22,171 - INFO - api.main - System initialized successfully.
+2025-08-07 20:50:27,646 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 0d89beaa-1c0f-43b0-965f-7910f66fd3f8
+2025-08-07 20:50:27,646 - ERROR - orchestration.orchestrator - Workflow 0d89beaa-1c0f-43b0-965f-7910f66fd3f8 failed: 'PolicyEngine' object has no attribute 'validate_workflow'
+2025-08-07 20:54:23,328 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-07 20:54:23,712 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings/points/search "HTTP/1.1 200 OK"
+2025-08-07 20:58:13,346 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-07 20:58:13,347 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-07 20:58:53,141 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-07 20:58:53,141 - ERROR - services.model_selector - Error generating follow-ups: Unterminated string starting at: line 1 column 557 (char 556)
+2025-08-07 21:00:24,143 - INFO - services.model_selector - Answering query with model 'llama3.2' and filters: doc_type='None', product_type='None'
+2025-08-07 21:00:24,476 - INFO - httpx - HTTP Request: POST https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings/points/search "HTTP/1.1 200 OK"
+2025-08-07 21:03:48,353 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-07 21:03:48,354 - INFO - services.model_selector - Generating follow-up questions...
+2025-08-07 21:04:22,301 - INFO - httpx - HTTP Request: POST http://127.0.0.1:11434/api/generate "HTTP/1.1 200 OK"
+2025-08-08 06:06:34,553 - INFO - api.main - API shutting down.
+2025-08-08 06:06:49,884 - INFO - api.main - API starting up...
+2025-08-08 06:06:49,885 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:06:49,885 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:06:49,960 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:06:50,281 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:06:50,281 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:06:52,573 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:06:52,640 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:06:52,640 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:06:52,640 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:06:52,651 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:06:52,653 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:06:52,653 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:06:52,653 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:06:52,653 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:06:52,653 - INFO - api.main - System initialized successfully.
+2025-08-08 06:07:01,788 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 87089a47-3c10-4948-b16e-a7725f3e15af
+2025-08-08 06:12:51,935 - INFO - api.main - API shutting down.
+2025-08-08 06:13:07,589 - INFO - api.main - API starting up...
+2025-08-08 06:13:07,589 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:13:07,589 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:13:07,689 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:13:08,001 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:13:08,002 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:13:10,032 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:13:10,097 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:13:10,097 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:13:10,098 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:13:10,108 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:13:10,110 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:13:10,110 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:13:10,110 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:13:10,110 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:13:10,110 - INFO - api.main - System initialized successfully.
+2025-08-08 06:13:16,266 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 4c83e48a-301d-42b8-86f9-a6a1ad087edd
+2025-08-08 06:14:05,944 - INFO - api.main - API shutting down.
+2025-08-08 06:14:21,909 - INFO - api.main - API starting up...
+2025-08-08 06:14:21,910 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:14:21,910 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:14:21,988 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:14:22,306 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:14:22,307 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:14:24,310 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:14:24,377 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:14:24,377 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:14:24,377 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:14:24,388 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:14:24,390 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:14:24,390 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:14:24,390 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:14:24,390 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:14:24,390 - INFO - api.main - System initialized successfully.
+2025-08-08 06:14:27,993 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID bdfea013-f5aa-4620-9a02-c2464c0f1498
+2025-08-08 06:14:54,730 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 36a012b2-bdd3-4204-89e0-5f569bacac46
+2025-08-08 06:19:34,087 - INFO - api.main - API starting up...
+2025-08-08 06:19:34,087 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:19:34,087 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:19:34,167 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:19:34,476 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:19:34,476 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:19:36,549 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:19:36,619 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:19:36,619 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:19:36,620 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:19:36,630 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:19:36,632 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:19:36,632 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:19:36,632 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:19:36,632 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:19:36,633 - INFO - api.main - System initialized successfully.
+2025-08-08 06:19:39,614 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 3a1139d5-d2dc-4c64-a275-60e4f824249b
+2025-08-08 06:19:55,451 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 5828528c-0d36-4982-b60d-734b3ba9f289
+2025-08-08 06:27:33,770 - INFO - api.main - API shutting down.
+2025-08-08 06:27:49,602 - INFO - api.main - API starting up...
+2025-08-08 06:27:49,602 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:27:49,602 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:27:49,680 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:27:49,998 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:27:49,999 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:27:52,172 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:27:52,239 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:27:52,239 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:27:52,240 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:27:52,251 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:27:52,253 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:27:52,253 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:27:52,253 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:27:52,253 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:27:52,254 - INFO - api.main - System initialized successfully.
+2025-08-08 06:28:19,339 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID 4d2fe7fd-bcfe-40c6-bcab-67b0ccf84c83
+2025-08-08 06:28:19,387 - ERROR - orchestration.orchestrator - Workflow 4d2fe7fd-bcfe-40c6-bcab-67b0ccf84c83 failed: Execution failed on sql '
+            SELECT s.supplier_id,
+                   s.supplier_name,
+                   s.trading_name,
+                   s.legal_structure,
+                   s.is_preferred_supplier,
+                   s.payment_terms     AS payment_terms_raw,
+                   s.price_score       AS price_score_raw,
+                   s.delivery_score    AS delivery_score_raw,
+                   s.risk_score        AS risk_score_raw,
+                   s.risk_score        AS risk_score,
+                   COALESCE(inv.total_invoiced, 0) AS total_invoiced_score_raw,
+                   COALESCE(po.total_ordered, 0)  AS total_ordered_score_raw
+            FROM proc.supplier s
+            LEFT JOIN (
+                SELECT supplier_id, SUM(total_amount) AS total_invoiced
+                FROM proc.invoice
+                GROUP BY supplier_id
+            ) inv ON inv.supplier_id = s.supplier_id
+            LEFT JOIN (
+                SELECT supplier_id, SUM(total_amount) AS total_ordered
+                FROM proc.purchase_order
+                GROUP BY supplier_id
+            ) po ON po.supplier_id = s.supplier_id
+            WHERE inv.supplier_id IS NOT NULL OR po.supplier_id IS NOT NULL;
+        ': column "total_amount" does not exist
+LINE 16:                 SELECT supplier_id, SUM(total_amount) AS tot...
+                                                 ^
+HINT:  Perhaps you meant to reference the column "invoice.tax_amount".
+
+2025-08-08 06:39:00,890 - INFO - api.main - API shutting down.
+2025-08-08 06:39:15,762 - INFO - api.main - API starting up...
+2025-08-08 06:39:15,762 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:39:15,762 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:39:15,839 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:39:16,148 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:39:16,148 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:39:18,266 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:39:18,334 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:39:18,334 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:39:18,334 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:39:18,344 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:39:18,346 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:39:18,346 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:39:18,346 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:39:18,346 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:39:18,346 - INFO - api.main - System initialized successfully.
+2025-08-08 06:39:32,275 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID e3541072-e307-4d33-ab33-bfb5cd799232
+2025-08-08 06:39:32,429 - ERROR - orchestration.orchestrator - Workflow e3541072-e307-4d33-ab33-bfb5cd799232 failed: Execution failed on sql '
+            SELECT s.supplier_id,
+                   s.supplier_name,
+                   s.trading_name,
+                   s.legal_structure,
+                   s.is_preferred_supplier,
+                   s.payment_terms     AS payment_terms_raw,
+                   s.price_score       AS price_score_raw,
+                   s.delivery_score    AS delivery_score_raw,
+                   s.risk_score        AS risk_score_raw,
+                   s.risk_score        AS risk_score,
+                   COALESCE(inv.total_invoiced, 0) AS total_invoiced_score_raw,
+                   COALESCE(po.total_ordered, 0)  AS total_ordered_score_raw
+            FROM proc.supplier s
+            LEFT JOIN (
+                SELECT supplier_id, SUM(invoice_total_Incl_tax) AS total_invoiced
+                FROM proc.invoice
+                GROUP BY supplier_id
+            ) inv ON inv.supplier_id = s.supplier_id
+            LEFT JOIN (
+                SELECT supplier_id, SUM(invoice_total_Incl_tax) AS total_ordered
+                FROM proc.purchase_order
+                GROUP BY supplier_id
+            ) po ON po.supplier_id = s.supplier_id
+            WHERE inv.supplier_id IS NOT NULL OR po.supplier_id IS NOT NULL;
+        ': column "invoice_total_incl_tax" does not exist
+LINE 21:                 SELECT supplier_id, SUM(invoice_total_Incl_t...
+                                                 ^
+
+2025-08-08 06:48:55,895 - INFO - api.main - API shutting down.
+2025-08-08 06:49:12,023 - INFO - api.main - API starting up...
+2025-08-08 06:49:12,023 - INFO - agents.base_agent - AgentNick is waking up...
+2025-08-08 06:49:12,023 - INFO - agents.base_agent - Initializing shared clients...
+2025-08-08 06:49:12,100 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333 "HTTP/1.1 200 OK"
+2025-08-08 06:49:12,414 - INFO - sentence_transformers.SentenceTransformer - Use pytorch device_name: cpu
+2025-08-08 06:49:12,414 - INFO - sentence_transformers.SentenceTransformer - Load pretrained SentenceTransformer: all-roberta-large-v1
+2025-08-08 06:49:14,528 - INFO - botocore.credentials - Found credentials in shared credentials file: ~/.aws/credentials
+2025-08-08 06:49:14,593 - INFO - agents.base_agent - Clients initialized.
+2025-08-08 06:49:14,594 - INFO - agents.base_agent - Initializing core engines...
+2025-08-08 06:49:14,594 - INFO - agents.base_agent - Engines initialized.
+2025-08-08 06:49:14,604 - INFO - httpx - HTTP Request: GET https://bf53d8ba-32ce-44b4-ba32-bbc9fd9b688c.eu-west-1-0.aws.cloud.qdrant.io:6333/collections/ProcWise_document_embeddings "HTTP/1.1 200 OK"
+2025-08-08 06:49:14,606 - INFO - agents.base_agent - Qdrant collection 'ProcWise_document_embeddings' already exists.
+2025-08-08 06:49:14,606 - INFO - agents.base_agent - AgentNick is ready.
+2025-08-08 06:49:14,606 - INFO - agents.base_agent - Initialized agent: DataExtractionAgent
+2025-08-08 06:49:14,606 - INFO - agents.base_agent - Initialized agent: SupplierRankingAgent
+2025-08-08 06:49:14,607 - INFO - api.main - System initialized successfully.
+2025-08-08 06:50:02,244 - INFO - orchestration.orchestrator - Starting workflow supplier_ranking with ID ca86639b-26fc-4c03-998d-d8bd835b32a0
+2025-08-08 06:50:02,286 - ERROR - orchestration.orchestrator - Workflow ca86639b-26fc-4c03-998d-d8bd835b32a0 failed: Query must be a string unless using sqlalchemy.
