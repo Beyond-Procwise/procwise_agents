@@ -83,6 +83,9 @@ class RAGPipeline:
         logger.info(
             f"Answering query with model '{llm_to_use}' and filters: doc_type='{doc_type}', product_type='{product_type}'")
 
+        # Ensure the target collection exists before querying
+        self.agent_nick._initialize_qdrant_collection()
+
         # --- Normalise filters and build Vector DB filter conditions ---
         must_conditions: List[models.FieldCondition] = []
         if doc_type:
@@ -98,12 +101,15 @@ class RAGPipeline:
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
         # --- Retrieve from Vector DB using the unified collection name ---
-        query_vector = self.agent_nick.embedding_model.encode(query).tolist()
+        query_vector = self.agent_nick.embedding_model.encode(
+            query, normalize_embeddings=True
+        ).tolist()
         search_results = self.agent_nick.qdrant_client.search(
             collection_name=self.settings.qdrant_collection_name,
             query_vector=query_vector,
             query_filter=qdrant_filter,
-            limit=5
+            limit=3,
+            score_threshold=0.7,
         )
         retrieved_context = "\n---\n".join(
             [

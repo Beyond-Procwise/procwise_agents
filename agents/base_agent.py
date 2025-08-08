@@ -2,12 +2,14 @@
 
 import boto3
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import psycopg2
+import torch
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import ollama
@@ -89,8 +91,10 @@ class AgentNick:
         logger.info("AgentNick is waking up...")
         self.settings = settings
         logger.info("Initializing shared clients...")
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
-        self.embedding_model = SentenceTransformer(self.settings.embedding_model)
+        self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.s3_client = boto3.client('s3')
         logger.info("Clients initialized.")
 
