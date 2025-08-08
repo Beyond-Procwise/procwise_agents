@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 class DiscrepancyDetectionAgent(BaseAgent):
     """Agent for detecting discrepancies in procurement data"""
 
+    def run(self, context: AgentContext) -> AgentOutput:
+        """Execute the discrepancy detection flow."""
+        return self.process(context)
+
     def process(self, context: AgentContext) -> AgentOutput:
         """Process discrepancy detection"""
         try:

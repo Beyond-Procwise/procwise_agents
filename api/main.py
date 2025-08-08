@@ -12,6 +12,9 @@ from services.model_selector import RAGPipeline
 from agents.base_agent import AgentNick
 from agents.data_extraction_agent import DataExtractionAgent
 from agents.supplier_ranking_agent import SupplierRankingAgent
+from agents.quote_evaluation_agent import QuoteEvaluationAgent
+from agents.opportunity_miner_agent import OpportunityMinerAgent
+from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from api.routers import workflows, system
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -27,7 +30,10 @@ async def lifespan(app: FastAPI):
         agent_nick = AgentNick()
         agent_nick.agents = {
             'data_extraction': DataExtractionAgent(agent_nick),
-            'supplier_ranking': SupplierRankingAgent(agent_nick)
+            'supplier_ranking': SupplierRankingAgent(agent_nick),
+            'quote_evaluation': QuoteEvaluationAgent(agent_nick),
+            'opportunity_miner': OpportunityMinerAgent(agent_nick),
+            'discrepancy_detection': DiscrepancyDetectionAgent(agent_nick),
         }
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)

@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 class OpportunityMinerAgent(BaseAgent):
     """Agent for identifying cost-saving opportunities"""
 
+    def run(self, context: AgentContext) -> AgentOutput:
+        """Execute the opportunity mining flow."""
+        return self.process(context)
+
     def process(self, context: AgentContext) -> AgentOutput:
         """Process opportunity mining"""
         try:
