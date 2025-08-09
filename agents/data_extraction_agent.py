@@ -24,7 +24,7 @@ import logging
 import re
 import uuid
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import ollama
 import pdfplumber
@@ -33,6 +33,8 @@ try:  # PyMuPDF is optional; handled gracefully if unavailable
 except Exception:  # pragma: no cover - optional dependency
     fitz = None
 from qdrant_client import models
+from sentence_transformers import util
+import torch
 
 from agents.base_agent import (
     BaseAgent,
@@ -112,12 +114,11 @@ class DataExtractionAgent(BaseAgent):
                     continue
 
                 text = self._extract_text_from_pdf(file_bytes)
-                header = self._parse_header(text)
+                header, line_items = self._extract_structured_data(text)
                 if not header:
                     logger.warning("No header information found in %s", object_key)
                     continue
 
-                line_items: List[Dict] = []  # heuristic line-item extraction could be added later
                 doc_type = header.get("doc_type", "Invoice")
                 pk_value = (
                     header.get("invoice_id")
@@ -138,12 +139,12 @@ class DataExtractionAgent(BaseAgent):
                     "validation": {
                         "is_valid": True,
                         "confidence_score": 1.0,
-                        "notes": "heuristic parser",
+                        "notes": "llm parser",
                     },
                 }
 
                 product_type = self._classify_product_type(line_items)
-                self._upsert_to_qdrant(
+                self._vectorize_document(
                     data,
                     text,
                     pk_value,
@@ -152,15 +153,17 @@ class DataExtractionAgent(BaseAgent):
                     object_key,
                 )
 
-                # Persist structured header data to PostgreSQL for downstream analysis
-                self._persist_to_postgres(header, doc_type)
+                # Persist structured header and line item data to PostgreSQL
+                self._persist_to_postgres(header, line_items, doc_type, pk_value)
 
-                results.append({
-                    "object_key": object_key,
-                    "id": pk_value,
-                    "doc_type": doc_type,
-                    "status": "success",
-                })
+                results.append(
+                    {
+                        "object_key": object_key,
+                        "id": pk_value,
+                        "doc_type": doc_type,
+                        "status": "success",
+                    }
+                )
 
         return {"status": "completed", "details": results}
 
@@ -195,34 +198,87 @@ class DataExtractionAgent(BaseAgent):
         return text
 
     def _parse_header(self, text: str) -> Dict[str, str]:
-        header: Dict[str, str] = {}
-        inv = re.search(r"Invoice(?:\s*(?:No|Number|ID))?[:#\s]*([A-Za-z0-9-]+)", text, re.I)
-        if inv:
-            header["invoice_id"] = inv.group(1)
-            header["doc_type"] = "Invoice"
-        po = re.search(r"Purchase\s+Order(?:\s*(?:No|Number|ID))?[:#\s]*([A-Za-z0-9-]+)", text, re.I)
-        if po:
-            header["po_id"] = po.group(1)
-            header["doc_type"] = "Purchase_Order"
-        quote = re.search(r"Quote(?:\s*(?:No|Number|ID))?[:#\s]*([A-Za-z0-9-]+)", text, re.I)
-        if quote:
-            header["quote_id"] = quote.group(1)
-            header["doc_type"] = "Quote"
-        vendor = re.search(r"(?:Vendor|From|Supplier)[:#\s]*([\w \-]+)", text, re.I)
-        if vendor:
-            header["vendor_name"] = vendor.group(1).strip()
-        supplier = re.search(r"Supplier\s*ID[:#\s]*([A-Za-z0-9-]+)", text, re.I)
-        if supplier:
-            header["supplier_id"] = supplier.group(1)
-        total = re.search(r"Total(?:\s+Amount)?[:#\s]*([\d.,]+)", text, re.I)
-        if total:
-            try:
-                header["total_amount"] = float(total.group(1).replace(",", ""))
-            except ValueError:
-                pass
+        """Use semantic similarity to locate common header fields."""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return {}
 
-        if "doc_type" not in header:
+        try:
+            line_vecs = self.agent_nick.embedding_model.encode(
+                lines, convert_to_tensor=True, show_progress_bar=False
+            )
+        except Exception:
+            return {}
+
+        field_synonyms = {
+            "invoice_id": ["invoice number", "invoice id", "invoice no"],
+            "po_id": ["purchase order", "po number", "po id"],
+            "quote_id": ["quote number", "quote id"],
+            "vendor_name": ["vendor", "supplier", "from"],
+            "supplier_id": ["supplier id", "supplier number"],
+            "total_amount": ["total amount", "grand total", "total"],
+            "invoice_date": ["invoice date"],
+            "due_date": ["due date"],
+            "currency": ["currency"],
+            "tax_percent": ["tax rate", "tax percent"],
+            "tax_amount": ["tax amount", "tax"],
+        }
+        header: Dict[str, str] = {}
+        for field, synonyms in field_synonyms.items():
+            try:
+                syn_vec = self.agent_nick.embedding_model.encode(
+                    synonyms, convert_to_tensor=True, show_progress_bar=False
+                )
+                field_vec = torch.mean(syn_vec, dim=0, keepdim=True)
+                sims = util.cos_sim(field_vec, line_vecs)[0]
+                score, idx = torch.max(sims, dim=0)
+                idx = int(idx.item())
+            except Exception:
+                continue
+            if score.item() < 0.5:
+                continue
+            candidate = lines[idx]
+            lower_candidate = candidate.lower()
+            value = candidate
+            for syn in synonyms:
+                syn_l = syn.lower()
+                if syn_l in lower_candidate:
+                    value = candidate[lower_candidate.index(syn_l) + len(syn_l) :]
+                    break
+            value = value.split(":")[-1].strip(" -#")
+            if field in {"total_amount", "tax_percent", "tax_amount"}:
+                cleaned = value.replace(",", "").replace("%", "")
+                try:
+                    header[field] = float(cleaned)
+                except ValueError:
+                    header[field] = value
+            else:
+                header[field] = value
+
+        if "invoice_id" in header:
+            header["doc_type"] = "Invoice"
+        elif "po_id" in header:
+            header["doc_type"] = "Purchase_Order"
+        elif "quote_id" in header:
+            header["doc_type"] = "Quote"
+        else:
             header["doc_type"] = self._classify_doc_type(text)
+
+        prompt = (
+            "Extract header details from the following procurement document.\n"
+            "Return JSON with any of these keys if present: "
+            "invoice_id, po_id, supplier_id, buyer_id, requisition_id, requested_by, "
+            "requested_date, invoice_date, due_date, currency, invoice_amount, tax_percent, "
+            "tax_amount, invoice_total_incl_tax.\n"
+            f"Text:\n{text[:2000]}"
+        )
+        try:  # pragma: no cover - network call
+            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
+            llm_header = json.loads(resp.get("response", "{}"))
+            header.update({k: v for k, v in llm_header.items() if v})
+        except Exception:
+            pass
+
         return header
 
     def _classify_doc_type(self, text: str) -> str:
@@ -240,8 +296,55 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             return "Other"
 
+    def _extract_structured_data(self, text: str) -> Tuple[Dict[str, str], List[Dict]]:
+        """Parse header and line items from raw text."""
+        header = self._parse_header(text)
+        line_items = self._extract_line_items(text, header.get("doc_type", "Invoice"))
+        return header, line_items
+
+    def _extract_line_items(self, text: str, doc_type: str) -> List[Dict]:
+        """Use the LLM to extract line items from a document."""
+        if doc_type == "Invoice":
+            prompt = (
+                "Extract line items from the following invoice. "
+                "Return JSON with a list under the key 'line_items' where each item has "
+                "line_no, item_id, quantity, unit_price, tax_percent, line_total, "
+                "tax_amount and total_with_tax.\n"
+                f"Text:\n{text[:4000]}"
+            )
+        elif doc_type == "Purchase_Order":
+            prompt = (
+                "Extract line items from the following purchase order. "
+                "Return JSON with a list under the key 'line_items' where each item has "
+                "line_number, item_id, item_description, quantity, unit_price, "
+                "unit_of_measue, currency, line_total, tax_percent, tax_amount, "
+                "total_amount.\n"
+                f"Text:\n{text[:4000]}"
+            )
+        else:
+            prompt = (
+                f"Extract line items from the following {doc_type}. "
+                "Return JSON with a list under the key 'line_items'.\n"
+                f"Text:\n{text[:4000]}"
+            )
+        try:  # pragma: no cover - network call
+            response = self.call_ollama(prompt, model=self.extraction_model, format="json")
+            data = json.loads(response.get("response", "{}"))
+            items = data.get("line_items", [])
+            if isinstance(items, list):
+                return items
+        except Exception:
+            pass
+        return []
+
     def _classify_product_type(self, line_items: List[Dict]) -> str:
-        descriptions = "\n- ".join(item.get("description", "") for item in line_items if item)
+        descriptions = "\n- ".join(
+            item.get("description")
+            or item.get("item_description")
+            or ""
+            for item in line_items
+            if item
+        )
         if not descriptions.strip():
             return "General Goods"
         prompt = (
@@ -254,7 +357,7 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             return "General Goods"
 
-    def _upsert_to_qdrant(
+    def _vectorize_document(
         self,
         data: Dict,
         full_text: str,
@@ -318,14 +421,18 @@ class DataExtractionAgent(BaseAgent):
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
-    def _persist_to_postgres(self, header: Dict[str, str], doc_type: str) -> None:
-        """Write the extracted header information to the appropriate table.
+    def _persist_to_postgres(
+        self,
+        header: Dict[str, str],
+        line_items: List[Dict],
+        doc_type: str,
+        pk_value: str,
+    ) -> None:
+        """Persist extracted header and line items to PostgreSQL."""
+        self._persist_header_to_postgres(header, doc_type)
+        self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header)
 
-        The function performs a lightweight schema introspection to align the
-        extracted keys with existing table columns and uses an upsert so that
-        reprocessing a document simply updates the stored record.  Any database
-        errors are logged but do not interrupt the extraction pipeline.
-        """
+    def _persist_header_to_postgres(self, header: Dict[str, str], doc_type: str) -> None:
         table_map = {
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
@@ -358,6 +465,83 @@ class DataExtractionAgent(BaseAgent):
                 cur.execute(sql, list(payload.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist %s data: %s", doc_type, exc)
+
+    def _persist_line_items_to_postgres(
+        self,
+        pk_value: str,
+        line_items: List[Dict],
+        doc_type: str,
+        header: Dict[str, str],
+    ) -> None:
+        table_map = {
+            "Invoice": ("proc", "invoice_line_items", "invoice_id", "line_no"),
+            "Purchase_Order": (
+                "proc",
+                "po_line_items_agent",
+                "po_id",
+                "line_number",
+            ),
+        }
+        field_map = {
+            "Invoice": [
+                "item_id",
+                "quantity",
+                "unit_price",
+                "tax_percent",
+                "line_total",
+                "tax_amount",
+                "total_with_tax",
+            ],
+            "Purchase_Order": [
+                "item_id",
+                "item_description",
+                "quantity",
+                "unit_price",
+                "unit_of_measue",
+                "currency",
+                "line_total",
+                "tax_percent",
+                "tax_amount",
+                "total_amount",
+            ],
+        }
+        target = table_map.get(doc_type)
+        fields = field_map.get(doc_type, [])
+        if not target or not line_items:
+            return
+        schema, table, fk_col, line_no_col = target
+        try:
+            conn = self.agent_nick.get_db_connection()
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                columns = [r[0] for r in cur.fetchall()]
+                for idx, item in enumerate(line_items, start=1):
+                    line_key = "line_no" if line_no_col == "line_no" else "line_number"
+                    payload = {fk_col: pk_value, line_no_col: item.get(line_key, idx)}
+                    if doc_type == "Invoice" and "po_id" in columns and header.get("po_id"):
+                        payload["po_id"] = header.get("po_id")
+                    for key in fields:
+                        if key in payload:
+                            continue
+                        if key in columns and item.get(key) is not None:
+                            payload[key] = item[key]
+                    cols = ", ".join(payload.keys())
+                    placeholders = ", ".join(["%s"] * len(payload))
+                    update_cols = ", ".join(
+                        f"{c}=EXCLUDED.{c}" for c in payload.keys() if c not in [fk_col, line_no_col]
+                    )
+                    sql = (
+                        f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
+                        f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
+                    )
+                    cur.execute(sql, list(payload.values()))
+        except Exception as exc:  # pragma: no cover - database connectivity
+            logger.error("Failed to persist line items for %s: %s", doc_type, exc)
+
 
     # ------------------------------------------------------------------
     # End of class
