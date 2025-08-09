@@ -129,6 +129,8 @@ class AgentNick:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         os.environ.setdefault("OLLAMA_USE_GPU", "1")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Ensure downstream libraries default to the detected device
+        os.environ.setdefault("SENTENCE_TRANSFORMERS_DEFAULT_DEVICE", self.device)
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.s3_client = boto3.client('s3')
