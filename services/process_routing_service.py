@@ -188,3 +188,36 @@ class ProcessRoutingService:
                 "Failed to log action for process %s: %s", process_id, exc
             )
             return None
+
+    def update_process_status(
+        self,
+        process_id: int,
+        process_status: int,
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Update the status of an existing process routing entry."""
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE proc.routing
+                        SET process_status = %s,
+                            modified_on = CURRENT_TIMESTAMP,
+                            modified_by = %s
+                        WHERE process_id = %s
+                        """,
+                        (
+                            process_status,
+                            modified_by or self.settings.script_user,
+                            process_id,
+                        ),
+                    )
+                    conn.commit()
+                    logger.info(
+                        "Updated process %s to status %s", process_id, process_status
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Failed to update process %s: %s", process_id, exc
+            )

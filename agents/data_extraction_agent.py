@@ -129,6 +129,12 @@ class DataExtractionAgent(BaseAgent):
                     logger.error("No primary key found for %s", object_key)
                     continue
 
+                # try to derive vendor/supplier name from document title or header
+                if not header.get("vendor_name"):
+                    vendor_guess = self._infer_vendor_name(text, object_key)
+                    if vendor_guess:
+                        header["vendor_name"] = vendor_guess
+
                 # ensure supplier id always populated
                 if not header.get("supplier_id"):
                     header["supplier_id"] = header.get("vendor_name")
@@ -296,6 +302,25 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             return "Other"
 
+    def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
+        """Best-effort vendor/supplier name extraction.
+
+        Many procurement documents place the vendor name prominently in the
+        title or top header without an explicit label.  This helper searches the
+        first few lines for a candidate and falls back to the file name when
+        necessary.
+        """
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines[:5]:
+            if not re.search(r"(invoice|purchase order|quote|bill|statement)", line, re.I):
+                return line
+        if object_key:
+            base = object_key.split("/")[-1].rsplit(".", 1)[0]
+            token = re.split(r"[-_]", base)[0]
+            if token and not re.search(r"(invoice|po|purchase|quote)", token, re.I):
+                return token
+        return ""
+
     def _extract_structured_data(self, text: str) -> Tuple[Dict[str, str], List[Dict]]:
         """Parse header and line items from raw text."""
         header = self._parse_header(text)
@@ -421,6 +446,11 @@ class DataExtractionAgent(BaseAgent):
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
+    def _sanitize_value(self, value):
+        if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
+            return None
+        return value
+
     def _persist_to_postgres(
         self,
         header: Dict[str, str],
@@ -450,7 +480,9 @@ class DataExtractionAgent(BaseAgent):
                     (schema, table),
                 )
                 columns = [r[0] for r in cur.fetchall()]
-                payload = {k: v for k, v in header.items() if k in columns}
+                payload = {
+                    k: self._sanitize_value(v) for k, v in header.items() if k in columns
+                }
                 if not payload:
                     return
                 cols = ", ".join(payload.keys())
@@ -528,7 +560,7 @@ class DataExtractionAgent(BaseAgent):
                         if key in payload:
                             continue
                         if key in columns and item.get(key) is not None:
-                            payload[key] = item[key]
+                            payload[key] = self._sanitize_value(item[key])
                     cols = ", ".join(payload.keys())
                     placeholders = ", ".join(["%s"] * len(payload))
                     update_cols = ", ".join(
@@ -538,7 +570,8 @@ class DataExtractionAgent(BaseAgent):
                         f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
                         f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
                     )
-                    cur.execute(sql, list(payload.values()))
+                    sanitized = {k: self._sanitize_value(v) for k, v in payload.items()}
+                    cur.execute(sql, list(sanitized.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
 

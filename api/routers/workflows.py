@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -12,6 +13,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
+
+# Ensure GPU-related environment variables are set
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +125,63 @@ def rank_suppliers(
 
 
 @router.post("/extract")
-def extract_documents(
+async def extract_documents(
     req: ExtractRequest,
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ):
-    return orchestrator.execute_extraction_flow(req.s3_prefix, req.s3_object_key)
+    prs = orchestrator.agent_nick.process_routing_service
+    process_id = prs.log_process(
+        process_name="document_extraction",
+        process_details={
+            "s3_prefix": req.s3_prefix,
+            "s3_object_key": req.s3_object_key,
+        },
+        process_status=1,
+    )
+    if process_id is None:
+        raise HTTPException(status_code=500, detail="Failed to log process")
+
+    action_id = prs.log_action(
+        process_id=process_id,
+        agent_type="document_extraction",
+        action_desc={
+            "s3_prefix": req.s3_prefix,
+            "s3_object_key": req.s3_object_key,
+        },
+        status="started",
+    )
+
+    async def run_flow() -> None:
+        try:
+            result = await run_in_threadpool(
+                orchestrator.execute_extraction_flow,
+                req.s3_prefix,
+                req.s3_object_key,
+            )
+            prs.log_action(
+                process_id=process_id,
+                agent_type="document_extraction",
+                action_desc={
+                    "s3_prefix": req.s3_prefix,
+                    "s3_object_key": req.s3_object_key,
+                },
+                process_output=result,
+                status="completed",
+                action_id=action_id,
+            )
+            prs.update_process_status(process_id, 2)
+        except Exception as exc:  # pragma: no cover - network/runtime
+            prs.log_action(
+                process_id=process_id,
+                agent_type="document_extraction",
+                action_desc=str(exc),
+                status="failed",
+                action_id=action_id,
+            )
+            prs.update_process_status(process_id, 0)
+
+    asyncio.create_task(run_flow())
+    return {"status": "process started", "process_id": process_id}
 
 
 @router.get(
