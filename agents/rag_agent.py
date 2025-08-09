@@ -1,6 +1,5 @@
 # ProcWise/agents/rag_agent.py
 
-import ollama
 import json
 from botocore.exceptions import ClientError
 from .base_agent import BaseAgent
@@ -43,7 +42,7 @@ RETRIEVED DOCUMENTS:
 USER QUESTION: {query}
 ANSWER:"""
 
-        response = ollama.generate(model=self.settings.extraction_model, prompt=rag_prompt, stream=False)
+        response = self.call_ollama(rag_prompt, model=self.settings.extraction_model)
         answer = response.get('response', "I am sorry, I could not generate an answer.")
 
         # Update and save history

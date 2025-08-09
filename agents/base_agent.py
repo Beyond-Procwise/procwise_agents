@@ -68,6 +68,37 @@ class BaseAgent:
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")
 
+    def execute(self, context: "AgentContext") -> "AgentOutput":
+        """Execute the agent with process logging.
+
+        This centralises writes to ``proc.routing`` and ``proc.action`` so that
+        every agent invocation is captured in the database regardless of how it
+        is triggered.
+        """
+        try:
+            result = self.run(context)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("%s execution failed: %s", self.__class__.__name__, exc)
+            result = AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+
+        status = 1 if result.status == AgentStatus.SUCCESS else 0
+        process_id = self.agent_nick.process_routing_service.log_process(
+            process_name=self.__class__.__name__,
+            process_details={"input": context.input_data, "output": result.data},
+            process_status=status,
+            user_id=context.user_id,
+            user_name=self.agent_nick.settings.script_user,
+        )
+        if process_id is not None:
+            self.agent_nick.process_routing_service.log_action(
+                process_id=process_id,
+                agent_type=self.__class__.__name__,
+                action_desc=context.input_data,
+                process_output=result.data,
+                status="completed" if result.status == AgentStatus.SUCCESS else "failed",
+            )
+        return result
+
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
@@ -76,11 +107,14 @@ class BaseAgent:
         """Lightweight wrapper around :func:`ollama.generate` used by agents."""
         model_to_use = model or getattr(self.settings, 'extraction_model', 'llama3')
         try:
+            options = kwargs.pop("options", {})
+            options = {**self.agent_nick.ollama_options(), **options}
             return ollama.generate(
                 model=model_to_use,
                 prompt=prompt,
                 format=format,
                 stream=False,
+                options=options,
                 **kwargs,
             )
         except Exception as exc:  # pragma: no cover - network / runtime issues
@@ -93,6 +127,7 @@ class AgentNick:
         self.settings = settings
         logger.info("Initializing shared clients...")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        os.environ.setdefault("OLLAMA_USE_GPU", "1")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
@@ -110,6 +145,12 @@ class AgentNick:
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    def ollama_options(self) -> Dict[str, Any]:
+        """Return default options for Ollama requests respecting GPU availability."""
+        if self.device == "cuda":
+            return {"num_gpu_layers": -1}
+        return {}
 
     def get_db_connection(self):
         return psycopg2.connect(
