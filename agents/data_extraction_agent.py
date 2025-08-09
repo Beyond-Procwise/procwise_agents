@@ -253,11 +253,7 @@ class DataExtractionAgent(BaseAgent):
                     break
             value = value.split(":")[-1].strip(" -#")
             if field in {"total_amount", "tax_percent", "tax_amount"}:
-                cleaned = value.replace(",", "").replace("%", "")
-                try:
-                    header[field] = float(cleaned)
-                except ValueError:
-                    header[field] = value
+                header[field] = self._clean_numeric(value)
             else:
                 header[field] = value
 
@@ -284,6 +280,16 @@ class DataExtractionAgent(BaseAgent):
             header.update({k: v for k, v in llm_header.items() if v})
         except Exception:
             pass
+
+        numeric_fields = {"total_amount", "tax_percent", "tax_amount"}
+        numeric_id_fields = {"buyer_id", "supplier_id", "requisition_id"}
+        for field in numeric_fields:
+            if field in header:
+                header[field] = self._clean_numeric(header[field])
+        for field in numeric_id_fields:
+            if field in header:
+                num = self._clean_numeric(header[field])
+                header[field] = int(num) if num is not None else None
 
         return header
 
@@ -446,6 +452,30 @@ class DataExtractionAgent(BaseAgent):
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
+    def _clean_numeric(self, value: str) -> Optional[float]:
+        """Strip non-numeric characters and attempt float casting.
+
+        Parameters
+        ----------
+        value: str
+            Raw numeric string potentially containing currency symbols or
+            free-form text.
+
+        Returns
+        -------
+        Optional[float]
+            ``float`` representation if parsing succeeds otherwise ``None``.
+        """
+        cleaned = re.sub(r"[^0-9.]", "", str(value))
+        if not cleaned:
+            logger.warning("Unable to parse numeric value '%s'", value)
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            logger.warning("Unable to parse numeric value '%s'", value)
+            return None
+
     def _sanitize_value(self, value):
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
             return None
@@ -475,14 +505,43 @@ class DataExtractionAgent(BaseAgent):
             conn = self.agent_nick.get_db_connection()
             with conn, conn.cursor() as cur:
                 cur.execute(
-                    "SELECT column_name FROM information_schema.columns "
+                    "SELECT column_name, data_type FROM information_schema.columns "
                     "WHERE table_schema=%s AND table_name=%s",
                     (schema, table),
                 )
-                columns = [r[0] for r in cur.fetchall()]
-                payload = {
-                    k: self._sanitize_value(v) for k, v in header.items() if k in columns
+                columns = {r[0]: r[1] for r in cur.fetchall()}
+                payload = {}
+                numeric_types = {
+                    "integer",
+                    "bigint",
+                    "smallint",
+                    "numeric",
+                    "decimal",
+                    "double precision",
+                    "real",
                 }
+                for k, v in header.items():
+                    if k not in columns:
+                        continue
+                    sanitized = self._sanitize_value(v)
+                    if sanitized is None:
+                        continue
+                    col_type = columns[k]
+                    if col_type in numeric_types:
+                        if isinstance(sanitized, str):
+                            sanitized = self._clean_numeric(sanitized)
+                        try:
+                            if sanitized is None:
+                                raise ValueError
+                            sanitized = float(sanitized)
+                            if col_type in {"integer", "bigint", "smallint"}:
+                                sanitized = int(sanitized)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Dropping %s due to type mismatch (%s)", k, v
+                            )
+                            continue
+                    payload[k] = sanitized
                 if not payload:
                     return
                 cols = ", ".join(payload.keys())
