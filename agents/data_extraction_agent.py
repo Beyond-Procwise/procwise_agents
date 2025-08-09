@@ -215,11 +215,16 @@ class DataExtractionAgent(BaseAgent):
         summary = self._generate_document_summary(data, pk_value, doc_type)
         chunks = self._chunk_text(full_text)
 
+        # Batch encode the chunks so the GPU can be utilised efficiently instead of
+        # invoking the embedding model for every iteration.  ``SentenceTransformer``
+        # transparently handles batching and will fall back to the CPU if no GPU is
+        # available.
+        vectors = self.agent_nick.embedding_model.encode(
+            chunks, normalize_embeddings=True, show_progress_bar=False
+        )
+
         points: List[models.PointStruct] = []
-        for idx, chunk in enumerate(chunks):
-            vector = self.agent_nick.embedding_model.encode(
-                chunk, normalize_embeddings=True
-            ).tolist()
+        for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
             payload = {
                 "record_id": pk_value,
                 "document_type": doc_type.lower(),
@@ -230,7 +235,9 @@ class DataExtractionAgent(BaseAgent):
                 "summary": summary,
             }
             point_id = _normalize_point_id(f"{pk_value}_{idx}")
-            points.append(models.PointStruct(id=point_id, vector=vector, payload=payload))
+            points.append(
+                models.PointStruct(id=point_id, vector=vector.tolist(), payload=payload)
+            )
 
         if points:
             self.agent_nick.qdrant_client.upsert(
@@ -239,10 +246,18 @@ class DataExtractionAgent(BaseAgent):
                 wait=True,
             )
 
-    def _chunk_text(self, text: str, max_chars: int = 1000) -> List[str]:
-        """Simple whitespace-aware text chunking."""
+    def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
+        """Whitespace-aware text chunking with configurable overlap.
+
+        A small overlap between chunks helps the retriever maintain context
+        around boundaries which in turn improves answer quality.
+        """
         text = re.sub(r"\s+", " ", text).strip()
-        return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
+        if not text:
+            return []
+
+        step = max_chars - overlap if max_chars > overlap else max_chars
+        return [text[i : i + max_chars] for i in range(0, len(text), step)]
 
     def _generate_document_summary(self, data: Dict, pk_value: str, doc_type: str) -> str:
         header = data.get("header_data", {})

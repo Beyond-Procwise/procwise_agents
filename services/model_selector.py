@@ -115,14 +115,18 @@ class RAGPipeline:
             collection_name=self.settings.qdrant_collection_name,
             query_vector=query_vector,
             query_filter=qdrant_filter,
-            limit=3,
-            score_threshold=0.7,
+            limit=5,
+            score_threshold=0.6,
             with_payload=True,
             with_vectors=False,
         )
         retrieved_context = "\n---\n".join(
             [
-                f"Document ID: {hit.payload.get('record_id', hit.id)}\nContent: {hit.payload.get('content', hit.payload.get('summary'))}"
+                (
+                    f"{hit.payload.get('document_type', 'document').title()} "
+                    f"{hit.payload.get('record_id', hit.id)}\n"
+                    f"Summary: {hit.payload.get('summary', hit.payload.get('content', ''))}"
+                )
                 for hit in search_results
             ]
         ) if search_results else "No relevant documents found."

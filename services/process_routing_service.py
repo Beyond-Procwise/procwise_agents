@@ -4,6 +4,10 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+import pandas as pd
+import numpy as np
+from dataclasses import asdict, is_dataclass
+
 logger = logging.getLogger(__name__)
 
 
@@ -13,6 +17,32 @@ class ProcessRoutingService:
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize(obj: Any) -> Any:
+        """Best effort serialization for complex objects.
+
+        Converts pandas objects, numpy types and dataclasses into plain
+        Python data structures so they can be dumped to JSON. Falls back to
+        ``str(obj)`` for unknown types.
+        """
+        if isinstance(obj, pd.DataFrame):
+            return obj.to_dict(orient="records")
+        if isinstance(obj, pd.Series):
+            return obj.to_dict()
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if is_dataclass(obj):
+            return asdict(obj)
+        return str(obj)
+
+    @classmethod
+    def _safe_dumps(cls, data: Any) -> str:
+        """JSON dump that tolerates DataFrames and other complex objects."""
+        return json.dumps(data, default=cls._serialize)
 
     def log_process(
         self,
@@ -54,7 +84,7 @@ class ProcessRoutingService:
                         """,
                         (
                             process_name,
-                            json.dumps(process_details),
+                            self._safe_dumps(process_details),
                             process_status,
                             created_by or self.settings.script_user,
                             user_id,
@@ -124,9 +154,9 @@ class ProcessRoutingService:
                                 str(process_id),
                                 run_id,
                                 agent_type,
-                                json.dumps(process_output) if process_output is not None else None,
+                                self._safe_dumps(process_output) if process_output is not None else None,
                                 status,
-                                json.dumps(action_desc) if not isinstance(action_desc, str) else action_desc,
+                                action_desc if isinstance(action_desc, str) else self._safe_dumps(action_desc),
                                 datetime.utcnow(),
                             ),
                         )
@@ -140,7 +170,7 @@ class ProcessRoutingService:
                             WHERE action_id = %s
                             """,
                             (
-                                json.dumps(process_output) if process_output is not None else None,
+                                self._safe_dumps(process_output) if process_output is not None else None,
                                 status,
                                 action_id,
                             ),

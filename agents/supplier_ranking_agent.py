@@ -3,6 +3,7 @@
 import json
 import os
 import logging
+import re
 import pandas as pd
 import ollama
 
@@ -90,7 +91,13 @@ class SupplierRankingAgent(BaseAgent):
         ranked_df = scored_df.sort_values(by='final_score', ascending=False).reset_index(drop=True)
 
         # 6. Generate justifications for top-N and limit output
-        top_n = intent.get('parameters', {}).get('top_n', 3)
+        top_n = intent.get('parameters', {}).get('top_n')
+        if not top_n:
+            query_text = context.input_data.get('query', '')
+            match = re.search(r'top[-\s]*(\d+)', query_text, re.IGNORECASE)
+            top_n = int(match.group(1)) if match else 3
+        top_n = max(1, min(int(top_n), len(ranked_df)))
+
         top_df = ranked_df.head(top_n).copy()
         top_df['justification'] = top_df.apply(
             lambda row: self._generate_justification(row, weights.keys()),

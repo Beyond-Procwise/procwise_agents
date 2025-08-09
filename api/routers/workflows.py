@@ -7,6 +7,7 @@ import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 
 from orchestration.orchestrator import Orchestrator
@@ -92,7 +93,8 @@ async def ask_question(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
 
-    result = pipeline.answer_question(
+    result = await run_in_threadpool(
+        pipeline.answer_question,
         query=req.query,
         user_id=req.user_id,
         model_name=req.model_name,
