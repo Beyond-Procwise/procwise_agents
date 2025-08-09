@@ -28,6 +28,10 @@ from typing import Dict, List, Optional
 
 import ollama
 import pdfplumber
+try:  # PyMuPDF is optional; handled gracefully if unavailable
+    import fitz  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    fitz = None
 from qdrant_client import models
 
 from agents.base_agent import (
@@ -148,7 +152,15 @@ class DataExtractionAgent(BaseAgent):
                     object_key,
                 )
 
-                results.append({"object_key": object_key, "id": pk_value, "status": "success"})
+                # Persist structured header data to PostgreSQL for downstream analysis
+                self._persist_to_postgres(header, doc_type)
+
+                results.append({
+                    "object_key": object_key,
+                    "id": pk_value,
+                    "doc_type": doc_type,
+                    "status": "success",
+                })
 
         return {"status": "completed", "details": results}
 
@@ -156,8 +168,31 @@ class DataExtractionAgent(BaseAgent):
     # Helpers
     # ------------------------------------------------------------------
     def _extract_text_from_pdf(self, file_bytes: bytes) -> str:
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        """Extract text using pdfplumber with a PyMuPDF fallback.
+
+        pdfplumber provides high quality layout aware extraction but can be
+        slow or fail on certain documents.  PyMuPDF is considerably faster and
+        therefore used as a fallback whenever pdfplumber returns no text or
+        raises an exception.
+        """
+        text = ""
+        try:
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("pdfplumber failed: %s", exc)
+
+        if not text.strip() and fitz is not None:
+            try:
+                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                    text = "\n".join(page.get_text() for page in doc)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("PyMuPDF failed extracting text: %s", exc)
+                return ""
+        elif not text.strip():
+            logger.warning("No text extracted from PDF; PyMuPDF not installed")
+            return ""
+        return text
 
     def _parse_header(self, text: str) -> Dict[str, str]:
         header: Dict[str, str] = {}
@@ -185,7 +220,25 @@ class DataExtractionAgent(BaseAgent):
                 header["total_amount"] = float(total.group(1).replace(",", ""))
             except ValueError:
                 pass
+
+        if "doc_type" not in header:
+            header["doc_type"] = self._classify_doc_type(text)
         return header
+
+    def _classify_doc_type(self, text: str) -> str:
+        """Use the LLM to infer the document type when heuristics fail."""
+        prompt = (
+            "Identify the document type from the text. Possible values: "
+            "invoice, purchase_order, quote, user_agreement, supplier_data, procurement_insight.\n"
+            "Respond with JSON {\"doc_type\": \"<type>\"}.\n"
+            f"Text snippet:\n{text[:1000]}"
+        )
+        try:  # pragma: no cover - network call
+            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
+            doc_type = json.loads(resp.get("response", "{}")).get("doc_type", "other")
+            return doc_type.replace(" ", "_").title()
+        except Exception:
+            return "Other"
 
     def _classify_product_type(self, line_items: List[Dict]) -> str:
         descriptions = "\n- ".join(item.get("description", "") for item in line_items if item)
@@ -264,6 +317,47 @@ class DataExtractionAgent(BaseAgent):
         vendor = header.get("vendor_name", "Unknown Vendor")
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
+
+    def _persist_to_postgres(self, header: Dict[str, str], doc_type: str) -> None:
+        """Write the extracted header information to the appropriate table.
+
+        The function performs a lightweight schema introspection to align the
+        extracted keys with existing table columns and uses an upsert so that
+        reprocessing a document simply updates the stored record.  Any database
+        errors are logged but do not interrupt the extraction pipeline.
+        """
+        table_map = {
+            "Invoice": ("proc", "invoice_agent", "invoice_id"),
+            "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
+        }
+        target = table_map.get(doc_type)
+        if not target:
+            return
+        schema, table, pk_col = target
+        try:
+            conn = self.agent_nick.get_db_connection()
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                columns = [r[0] for r in cur.fetchall()]
+                payload = {k: v for k, v in header.items() if k in columns}
+                if not payload:
+                    return
+                cols = ", ".join(payload.keys())
+                placeholders = ", ".join(["%s"] * len(payload))
+                update_cols = ", ".join(
+                    f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col
+                )
+                sql = (
+                    f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
+                )
+                cur.execute(sql, list(payload.values()))
+        except Exception as exc:  # pragma: no cover - database connectivity
+            logger.error("Failed to persist %s data: %s", doc_type, exc)
 
     # ------------------------------------------------------------------
     # End of class
