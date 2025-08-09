@@ -168,11 +168,7 @@ class SupplierRankingAgent(BaseAgent):
             score_breakdown="\n".join(breakdown)
         )
         try:
-            resp = ollama.generate(
-                model=self.settings.extraction_model,
-                prompt=prompt,
-                stream=False
-            )
+            resp = self.call_ollama(prompt, model=self.settings.extraction_model)
             return resp.get('response', '').strip()
         except Exception as e:
             logger.error(f"Justification generation failed: {e}")

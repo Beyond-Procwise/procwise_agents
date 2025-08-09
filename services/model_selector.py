@@ -60,9 +60,9 @@ class RAGPipeline:
         return "\n\n".join(ad_hoc_context)
 
     def _generate_follow_ups(self, query: str, answer: str, context: str, model: str) -> list:
-        """Generates a list of relevant follow-up questions."""
+        """Generates between three and five relevant follow-up questions."""
         logger.info("Generating follow-up questions...")
-        prompt = f"""Based on the user's question and the provided answer, generate 3 relevant and concise follow-up questions.
+        prompt = f"""Based on the user's question and the provided answer, generate 3 to 5 relevant and concise follow-up questions.
 **Context:**
 - Original Question: "{query}"
 - Answer Provided: "{answer}"
@@ -70,8 +70,14 @@ class RAGPipeline:
 **Instructions:**
 - Your entire response MUST be a single, valid JSON array of strings. Example: ["What was the total amount?", "Who was the vendor?"]"""
         try:
-            response = ollama.generate(model=model, prompt=prompt, format='json')
-            return list(json.loads(response.get('response', '[]')))
+            response = ollama.generate(
+                model=model,
+                prompt=prompt,
+                format='json',
+                options=self.agent_nick.ollama_options(),
+            )
+            questions = list(json.loads(response.get('response', '[]')))
+            return questions[:5]
         except Exception as e:
             logger.error(f"Error generating follow-ups: {e}")
             return []
@@ -83,8 +89,9 @@ class RAGPipeline:
         logger.info(
             f"Answering query with model '{llm_to_use}' and filters: doc_type='{doc_type}', product_type='{product_type}'")
 
-        # Ensure the target collection exists before querying
-        self.agent_nick._initialize_qdrant_collection()
+        # The vector collection is initialized once during application startup
+        # via ``AgentNick``. Re-initializing here would trigger unnecessary
+        # Qdrant calls and slow down the ``/ask`` endpoint.
 
         # --- Normalise filters and build Vector DB filter conditions ---
         must_conditions: List[models.FieldCondition] = []
@@ -110,6 +117,8 @@ class RAGPipeline:
             query_filter=qdrant_filter,
             limit=3,
             score_threshold=0.7,
+            with_payload=True,
+            with_vectors=False,
         )
         retrieved_context = "\n---\n".join(
             [
@@ -139,7 +148,11 @@ class RAGPipeline:
 ### Answer:"""
 
         # --- Generate Answer and Follow-ups ---
-        response = ollama.generate(model=llm_to_use, prompt=prompt)
+        response = ollama.generate(
+            model=llm_to_use,
+            prompt=prompt,
+            options=self.agent_nick.ollama_options(),
+        )
         answer = response.get('response', "Could not generate an answer.")
         follow_ups = self._generate_follow_ups(query, answer, retrieved_context, llm_to_use)
 

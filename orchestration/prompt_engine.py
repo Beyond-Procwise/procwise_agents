@@ -2,6 +2,7 @@
 
 import ollama
 import json
+import torch
 from config.settings import settings
 
 
@@ -39,11 +40,14 @@ class PromptEngine:
 
 **JSON OUTPUT:**"""
         try:
+            options = {'temperature': 0.0}
+            if torch.cuda.is_available():
+                options['num_gpu_layers'] = -1
             response = ollama.generate(
                 model=self.llm_model,
                 prompt=prompt,
                 format='json',
-                options={'temperature': 0.0}
+                options=options
             )
             parsed_query = json.loads(response.get('response'))
             print(f"PromptEngine: Query deconstructed successfully -> {parsed_query}")

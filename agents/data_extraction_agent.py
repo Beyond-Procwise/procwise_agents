@@ -196,7 +196,7 @@ class DataExtractionAgent(BaseAgent):
             f"Items:\n- {descriptions}\nRespond with JSON {{\"product_category\": \"<category>\"}}"
         )
         try:  # pragma: no cover - network call
-            response = ollama.generate(model=self.extraction_model, prompt=prompt, format="json")
+            response = self.call_ollama(prompt, model=self.extraction_model, format="json")
             return json.loads(response.get("response", "{}")).get("product_category", "General Goods")
         except Exception:
             return "General Goods"
@@ -234,7 +234,9 @@ class DataExtractionAgent(BaseAgent):
 
         if points:
             self.agent_nick.qdrant_client.upsert(
-                collection_name=self.settings.qdrant_collection_name, points=points
+                collection_name=self.settings.qdrant_collection_name,
+                points=points,
+                wait=True,
             )
 
     def _chunk_text(self, text: str, max_chars: int = 1000) -> List[str]:
