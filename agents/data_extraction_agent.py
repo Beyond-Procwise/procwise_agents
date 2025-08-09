@@ -446,9 +446,28 @@ class DataExtractionAgent(BaseAgent):
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
-    def _sanitize_value(self, value):
+    def _clean_numeric(self, value):
+        """Best effort conversion of noisy numeric strings to ``float``."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = re.sub(r"[^0-9.\-]", "", value)
+            try:
+                return float(cleaned)
+            except ValueError:
+                logger.warning("Could not parse numeric value: %r", value)
+        return None
+
+    def _sanitize_value(self, value, key: str | None = None):
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
             return None
+
+        numeric_targets = {"quantity", "unit_price", "tax_percent", "tax_amount"}
+        if key and (key in numeric_targets or "total" in key):
+            return self._clean_numeric(value)
+
         return value
 
     def _persist_to_postgres(
@@ -481,7 +500,7 @@ class DataExtractionAgent(BaseAgent):
                 )
                 columns = [r[0] for r in cur.fetchall()]
                 payload = {
-                    k: self._sanitize_value(v) for k, v in header.items() if k in columns
+                    k: self._sanitize_value(v, k) for k, v in header.items() if k in columns
                 }
                 if not payload:
                     return
@@ -560,7 +579,22 @@ class DataExtractionAgent(BaseAgent):
                         if key in payload:
                             continue
                         if key in columns and item.get(key) is not None:
-                            payload[key] = self._sanitize_value(item[key])
+                            payload[key] = item[key]
+
+                    payload = {k: self._sanitize_value(v, k) for k, v in payload.items()}
+                    numeric_targets = {"quantity", "unit_price", "tax_percent", "tax_amount"}
+                    for k in list(payload.keys()):
+                        if k in numeric_targets or "total" in k:
+                            v = payload[k]
+                            if not (isinstance(v, float) or v is None):
+                                logger.warning(
+                                    "Dropping non-numeric field %s=%r from payload %s",
+                                    k,
+                                    v,
+                                    payload,
+                                )
+                                payload.pop(k)
+
                     cols = ", ".join(payload.keys())
                     placeholders = ", ".join(["%s"] * len(payload))
                     update_cols = ", ".join(
@@ -570,8 +604,7 @@ class DataExtractionAgent(BaseAgent):
                         f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
                         f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
                     )
-                    sanitized = {k: self._sanitize_value(v) for k, v in payload.items()}
-                    cur.execute(sql, list(sanitized.values()))
+                    cur.execute(sql, list(payload.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
 
