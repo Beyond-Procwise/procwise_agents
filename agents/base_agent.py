@@ -102,23 +102,42 @@ class BaseAgent:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
-    def call_ollama(self, prompt: str, model: Optional[str] = None,
-                    format: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Lightweight wrapper around :func:`ollama.generate` used by agents."""
-        model_to_use = model or getattr(self.settings, 'extraction_model', 'llama3')
+    def call_ollama(
+        self,
+        prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        format: Optional[str] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Wrapper around :func:`ollama.generate`/``ollama.chat`` used by agents.
+
+        ``messages`` enables use of the chat endpoint which streams tokens faster
+        on GPU-enabled systems.  When ``messages`` is provided the ``prompt`` is
+        ignored.
+        """
+        model_to_use = model or getattr(self.settings, "extraction_model", "llama3")
         try:
             options = kwargs.pop("options", {})
             options = {**self.agent_nick.ollama_options(), **options}
+            if messages is not None:
+                return ollama.chat(
+                    model=model_to_use,
+                    messages=messages,
+                    options=options,
+                    stream=False,
+                    **kwargs,
+                )
             return ollama.generate(
                 model=model_to_use,
-                prompt=prompt,
+                prompt=prompt or "",
                 format=format,
                 stream=False,
                 options=options,
                 **kwargs,
             )
         except Exception as exc:  # pragma: no cover - network / runtime issues
-            logger.error("Ollama generation failed: %s", exc)
+            logger.error("Ollama call failed: %s", exc)
             return {"response": "", "error": str(exc)}
 
 class AgentNick:
@@ -128,6 +147,8 @@ class AgentNick:
         logger.info("Initializing shared clients...")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         os.environ.setdefault("OLLAMA_USE_GPU", "1")
+        os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+        os.environ.setdefault("OMP_NUM_THREADS", "8")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # Ensure downstream libraries default to the detected device
         os.environ.setdefault("SENTENCE_TRANSFORMERS_DEFAULT_DEVICE", self.device)
@@ -151,8 +172,8 @@ class AgentNick:
     def ollama_options(self) -> Dict[str, Any]:
         """Return default options for Ollama requests respecting GPU availability."""
         if self.device == "cuda":
-            return {"num_gpu_layers": -1}
-        return {}
+            return {"num_gpu_layers": -1, "keep_alive": "10m"}
+        return {"keep_alive": "10m"}
 
     def get_db_connection(self):
         return psycopg2.connect(

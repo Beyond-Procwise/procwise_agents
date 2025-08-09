@@ -59,28 +59,27 @@ class RAGPipeline:
                 logger.error(f"Failed to process uploaded file {filename}: {e}")
         return "\n\n".join(ad_hoc_context)
 
-    def _generate_follow_ups(self, query: str, answer: str, context: str, model: str) -> list:
-        """Generates between three and five relevant follow-up questions."""
-        logger.info("Generating follow-up questions...")
-        prompt = f"""Based on the user's question and the provided answer, generate 3 to 5 relevant and concise follow-up questions.
-**Context:**
-- Original Question: "{query}"
-- Answer Provided: "{answer}"
-- Retrieved Document Summaries: "{context}"
-**Instructions:**
-- Your entire response MUST be a single, valid JSON array of strings. Example: ["What was the total amount?", "Who was the vendor?"]"""
+    def _generate_response(self, prompt: str, model: str) -> Dict:
+        """Calls :func:`ollama.chat` once to get answer and follow-ups."""
+        system = (
+            "You are a helpful assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
+            "where 'follow_ups' is a list of 3 to 5 short questions."
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
         try:
-            response = ollama.generate(
+            response = ollama.chat(
                 model=model,
-                prompt=prompt,
-                format='json',
+                messages=messages,
                 options=self.agent_nick.ollama_options(),
             )
-            questions = list(json.loads(response.get('response', '[]')))
-            return questions[:5]
+            content = response.get("message", {}).get("content", "{}")
+            return json.loads(content)
         except Exception as e:
-            logger.error(f"Error generating follow-ups: {e}")
-            return []
+            logger.error(f"Error generating answer: {e}")
+            return {"answer": "Could not generate an answer.", "follow_ups": []}
 
     def answer_question(self, query: str, user_id: str, model_name: Optional[str] = None,
                         files: Optional[List[tuple[bytes, str]]] = None, doc_type: Optional[str] = None,
@@ -136,8 +135,8 @@ class RAGPipeline:
         history = self.history_manager.get_history(user_id)
         history_context = "\n".join([f"Q: {h['query']}\nA: {h['answer']}" for h in history])
 
-        # --- Build Final Prompt ---
-        prompt = f"""You are a helpful assistant. Answer the user's question using the provided context in this order of priority: Uploaded Files, Retrieved Documents, Chat History.
+        # --- Build Final Prompt for single chat call ---
+        prompt = f"""Use the following information in priority order to answer the user's question and suggest follow-ups.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
@@ -148,17 +147,13 @@ class RAGPipeline:
 ### Chat History:
 {history_context if history_context else "No previous conversation history."}
 
-### User's Question: {query}
-### Answer:"""
+### User's Question:
+{query}
+"""
 
-        # --- Generate Answer and Follow-ups ---
-        response = ollama.generate(
-            model=llm_to_use,
-            prompt=prompt,
-            options=self.agent_nick.ollama_options(),
-        )
-        answer = response.get('response', "Could not generate an answer.")
-        follow_ups = self._generate_follow_ups(query, answer, retrieved_context, llm_to_use)
+        model_output = self._generate_response(prompt, llm_to_use)
+        answer = model_output.get("answer", "Could not generate an answer.")
+        follow_ups = model_output.get("follow_ups", [])
 
         # --- Save History to S3 ---
         history.append({"query": query, "answer": answer})

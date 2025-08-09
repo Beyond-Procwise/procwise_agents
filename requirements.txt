@@ -5,6 +5,7 @@ boto3
 psycopg2-binary
 ollama
 pdfplumber
+pymupdf
 python-dateutil
 qdrant-client
 sentence-transformers
