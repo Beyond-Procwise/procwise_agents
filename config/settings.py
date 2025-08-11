@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # --- THIS IS THE SINGLE SOURCE OF TRUTH. A NEW NAME TO GUARANTEE A FRESH START. ---
     qdrant_collection_name: str = "ProcWise_document_embeddings"
 
-    extraction_model: str = "llama3.2"
+    extraction_model: str = "mistral"
     embedding_model: str = "all-roberta-large-v1"
     vector_size: int = 1024
 

@@ -262,7 +262,7 @@ class DataExtractionAgent(BaseAgent):
 
         prompt = (
             "Extract header details from the following procurement document.\n"
-            "Return JSON with any of these keys if present: "
+            "Return JSON with any of these keys if matching or present: "
             "invoice_id, po_id, supplier_id, buyer_id, requisition_id, requested_by, "
             "requested_date, invoice_date, due_date, currency, invoice_amount, tax_percent, "
             "tax_amount, invoice_total_incl_tax.\n"
