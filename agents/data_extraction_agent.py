@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import uuid
+import os
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
@@ -47,6 +48,13 @@ from agents.base_agent import (
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is accessible when available
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+if torch.cuda.is_available():  # pragma: no cover - hardware dependent
+    torch.set_default_device("cuda")
+else:  # pragma: no cover - hardware dependent
+    logger.warning("CUDA not available; defaulting to CPU.")
 
 HITL_CONFIDENCE_THRESHOLD = 0.85
 
@@ -721,7 +729,10 @@ class DataExtractionAgent(BaseAgent):
                 }
                 for idx, item in enumerate(line_items, start=1):
                     line_key = "line_no" if line_no_col == "line_no" else "line_number"
-                    payload = {fk_col: pk_value, line_no_col: item.get(line_key, idx)}
+                    line_value = item.get(line_key)
+                    if line_value in (None, ""):
+                        line_value = idx
+                    payload = {fk_col: pk_value, line_no_col: line_value}
                     if doc_type == "Invoice" and "po_id" in columns and header.get("po_id"):
                         payload["po_id"] = header.get("po_id")
                     for key in fields:
