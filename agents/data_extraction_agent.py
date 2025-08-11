@@ -1,24 +1,4 @@
-# ProcWise/agents/data_extraction_agent.py
-"""Agent responsible for ingesting procurement documents.
-
-The previous version of this module was heavily truncated which made the
-pipeline fragile.  This rewrite focuses on a small but fully functional
-implementation that fulfils the repository requirements:
-
-* Read PDF based invoices, purchase orders and quotes from S3.
-* Extract a handful of key attributes from the text.
-* Persist the structured information in PostgreSQL.
-* Store a summary of each document in Qdrant for later retrieval by the
-  RAG based ``/ask`` endpoint.
-
-The implementation intentionally keeps the heuristics simple – the goal is
-not to perfectly understand every possible document, but to provide a
-robust skeleton that can be iteratively improved.  The agent only depends on
-``pdfplumber`` for text extraction and ``ollama`` for the lightweight
-product category classification.
-"""
 from __future__ import annotations
-
 import json
 import logging
 import re
@@ -26,7 +6,6 @@ import uuid
 import os
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
-
 import ollama
 import pdfplumber
 try:  # PyMuPDF is optional; handled gracefully if unavailable
