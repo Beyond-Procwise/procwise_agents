@@ -35,6 +35,8 @@ except Exception:  # pragma: no cover - optional dependency
 from qdrant_client import models
 from sentence_transformers import util
 import torch
+from datetime import datetime, timedelta
+from dateutil import parser
 
 from agents.base_agent import (
     BaseAgent,
@@ -42,6 +44,7 @@ from agents.base_agent import (
     AgentOutput,
     AgentStatus,
 )
+from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,18 @@ class DataExtractionAgent(BaseAgent):
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
             data = self._process_documents(s3_prefix, s3_object_key)
+            try:
+                discrepancy_agent = DiscrepancyDetectionAgent(self.agent_nick)
+                disc_context = AgentContext(
+                    workflow_id=context.workflow_id,
+                    agent_id="discrepancy_detection",
+                    user_id=context.user_id,
+                    input_data={},
+                )
+                disc_result = discrepancy_agent.execute(disc_context)
+                data["discrepancy_check"] = disc_result.data
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Discrepancy detection failed: %s", exc)
             return AgentOutput(status=AgentStatus.SUCCESS, data=data)
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
@@ -476,9 +491,50 @@ class DataExtractionAgent(BaseAgent):
             logger.warning("Unable to parse numeric value '%s'", value)
             return None
 
-    def _sanitize_value(self, value):
+    def _clean_date(self, value: str) -> Optional[datetime.date]:
+        """Parse fuzzy or relative date strings.
+
+        Supports expressions like "Jan 15, 2024 + 30 days" by applying the
+        specified offset. Returns ``datetime.date`` objects or ``None`` when
+        parsing fails.
+        """
+        try:
+            value_str = str(value)
+            match = re.match(r"(.+?)\s*\+\s*(\d+)\s*days", value_str, re.I)
+            if match:
+                base = parser.parse(match.group(1), fuzzy=True)
+                offset = int(match.group(2))
+                return (base + timedelta(days=offset)).date()
+            return parser.parse(value_str, fuzzy=True).date()
+        except Exception:
+            logger.warning("Unable to parse date value '%s'", value)
+            return None
+
+    def _sanitize_value(self, value, key: Optional[str] = None):
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
             return None
+        numeric_fields = {
+            "quantity",
+            "unit_price",
+            "tax_percent",
+            "tax_amount",
+            "line_total",
+            "total_with_tax",
+            "total_amount",
+            "total",
+        }
+        date_fields = {
+            "invoice_date",
+            "due_date",
+            "po_date",
+            "requested_date",
+        }
+        if key:
+            lower = key.lower()
+            if lower in numeric_fields:
+                return self._clean_numeric(value)
+            if lower in date_fields:
+                return self._clean_date(value)
         return value
 
     def _persist_to_postgres(
@@ -523,7 +579,7 @@ class DataExtractionAgent(BaseAgent):
                 for k, v in header.items():
                     if k not in columns:
                         continue
-                    sanitized = self._sanitize_value(v)
+                    sanitized = self._sanitize_value(v, k)
                     if sanitized is None:
                         continue
                     col_type = columns[k]
@@ -588,7 +644,7 @@ class DataExtractionAgent(BaseAgent):
                 "item_description",
                 "quantity",
                 "unit_price",
-                "unit_of_measue",
+                "unit_of_measure",
                 "currency",
                 "line_total",
                 "tax_percent",
@@ -610,6 +666,15 @@ class DataExtractionAgent(BaseAgent):
                     (schema, table),
                 )
                 columns = [r[0] for r in cur.fetchall()]
+                numeric_fields = {
+                    "quantity",
+                    "unit_price",
+                    "tax_percent",
+                    "tax_amount",
+                    "line_total",
+                    "total_with_tax",
+                    "total_amount",
+                }
                 for idx, item in enumerate(line_items, start=1):
                     line_key = "line_no" if line_no_col == "line_no" else "line_number"
                     payload = {fk_col: pk_value, line_no_col: item.get(line_key, idx)}
@@ -619,17 +684,29 @@ class DataExtractionAgent(BaseAgent):
                         if key in payload:
                             continue
                         if key in columns and item.get(key) is not None:
-                            payload[key] = self._sanitize_value(item[key])
-                    cols = ", ".join(payload.keys())
-                    placeholders = ", ".join(["%s"] * len(payload))
+                            payload[key] = item[key]
+                    sanitized = {}
+                    for k, v in payload.items():
+                        val = self._sanitize_value(v, k)
+                        if k in numeric_fields:
+                            if isinstance(val, str):
+                                val = self._clean_numeric(val)
+                            if val is None or not isinstance(val, (int, float)):
+                                logger.warning(
+                                    "Dropping field %s due to non-numeric value. Payload: %s", k, payload
+                                )
+                                continue
+                            val = float(val)
+                        sanitized[k] = val
+                    cols = ", ".join(sanitized.keys())
+                    placeholders = ", ".join(["%s"] * len(sanitized))
                     update_cols = ", ".join(
-                        f"{c}=EXCLUDED.{c}" for c in payload.keys() if c not in [fk_col, line_no_col]
+                        f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in [fk_col, line_no_col]
                     )
                     sql = (
                         f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
                         f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
                     )
-                    sanitized = {k: self._sanitize_value(v) for k, v in payload.items()}
                     cur.execute(sql, list(sanitized.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
