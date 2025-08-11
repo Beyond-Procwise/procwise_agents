@@ -27,14 +27,16 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("API starting up...")
     try:
-        agent_nick = AgentNick()
-        agent_nick.agents = {
-            'data_extraction': DataExtractionAgent(agent_nick),
-            'supplier_ranking': SupplierRankingAgent(agent_nick),
-            'quote_evaluation': QuoteEvaluationAgent(agent_nick),
-            'opportunity_miner': OpportunityMinerAgent(agent_nick),
-            'discrepancy_detection': DiscrepancyDetectionAgent(agent_nick),
-        }
+            agent_nick = AgentNick()
+            discrepancy_agent = DiscrepancyDetectionAgent(agent_nick)
+            agent_nick.agents = {
+                'data_extraction': DataExtractionAgent(agent_nick),
+                'supplier_ranking': SupplierRankingAgent(agent_nick),
+                'quote_evaluation': QuoteEvaluationAgent(agent_nick),
+                'opportunity_miner': OpportunityMinerAgent(agent_nick),
+                'discrepancy_detection': discrepancy_agent,
+                'DiscrepancyDetectionAgent': discrepancy_agent,
+            }
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)
         logger.info("System initialized successfully.")

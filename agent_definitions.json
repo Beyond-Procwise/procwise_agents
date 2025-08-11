@@ -16,5 +16,11 @@
     "agentType": "RAGAgent (via RAGPipeline)",
     "description": "Answers user questions based on vectorized documents.",
     "dependencies": ["qdrant_client", "embedding_model", "chat_history_manager"]
+  },
+  {
+    "agentId": 4,
+    "agentType": "DiscrepancyDetectionAgent",
+    "description": "Detects missing or inconsistent fields in extracted documents.",
+    "dependencies": ["db_client"]
   }
 ]

@@ -45,7 +45,6 @@ from agents.base_agent import (
     AgentOutput,
     AgentStatus,
 )
-from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 
 logger = logging.getLogger(__name__)
 
@@ -82,19 +81,12 @@ class DataExtractionAgent(BaseAgent):
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
             data = self._process_documents(s3_prefix, s3_object_key)
-            try:
-                discrepancy_agent = DiscrepancyDetectionAgent(self.agent_nick)
-                disc_context = AgentContext(
-                    workflow_id=context.workflow_id,
-                    agent_id="discrepancy_detection",
-                    user_id=context.user_id,
-                    input_data={},
-                )
-                disc_result = discrepancy_agent.execute(disc_context)
-                data["discrepancy_check"] = disc_result.data
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error("Discrepancy detection failed: %s", exc)
-            return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                next_agents=["discrepancy_detection"],
+                pass_fields={"extracted_docs": data.get("details", [])},
+            )
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
@@ -657,10 +649,11 @@ class DataExtractionAgent(BaseAgent):
                 update_cols = ", ".join(
                     f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col
                 )
-                sql = (
-                    f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
-                    f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
-                )
+                sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
+                if update_cols:
+                    sql = sql_base + f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
+                else:
+                    sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
                 cur.execute(sql, list(payload.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist %s data: %s", doc_type, exc)
@@ -758,10 +751,11 @@ class DataExtractionAgent(BaseAgent):
                     update_cols = ", ".join(
                         f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in [fk_col, line_no_col]
                     )
-                    sql = (
-                        f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
-                        f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
-                    )
+                    sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
+                    if update_cols:
+                        sql = sql_base + f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
+                    else:
+                        sql = sql_base + f"ON CONFLICT ({fk_col}, {line_no_col}) DO NOTHING"
                     cur.execute(sql, list(sanitized.values()))
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
