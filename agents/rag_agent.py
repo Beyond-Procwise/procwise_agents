@@ -1,66 +1,125 @@
 # ProcWise/agents/rag_agent.py
 
+"""RAG agent with GPU-optimised retrieval and parallel response generation."""
+
 import json
+from concurrent.futures import ThreadPoolExecutor
+
 from botocore.exceptions import ClientError
+from qdrant_client import models
+from sentence_transformers import CrossEncoder
+
 from .base_agent import BaseAgent
 
 
 class RAGAgent(BaseAgent):
+    """Retrieval augmented generation agent with GPU optimisations."""
+
+    def __init__(self, agent_nick):
+        super().__init__(agent_nick)
+        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        # Cross encoder ensures accurate ranking while utilising the GPU
+        self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
+        # Thread pool enables parallel answer and follow-up generation
+        self._executor = ThreadPoolExecutor(max_workers=2)
+
     def run(self, query: str, user_id: str, top_k: int = 5):
-        """Answers questions, loading and saving chat history for the user."""
+        """Answer questions while maintaining chat history."""
         print(f"RAGAgent received query: '{query}' for user: '{user_id}'")
 
         history = self._load_chat_history(user_id)
 
         query_vector = self.agent_nick.embedding_model.encode(query).tolist()
+        # Retrieve more documents for re-ranking and enable fast approximate search
         search_result = self.agent_nick.qdrant_client.search(
             collection_name=self.settings.qdrant_collection_name,
             query_vector=query_vector,
-            limit=top_k,
-            with_payload=True
+            limit=top_k * 3,
+            with_payload=True,
+            search_params=models.SearchParams(hnsw_ef=256, exact=False),
         )
 
         if not search_result:
             return {"answer": "I could not find any relevant documents to answer your question."}
 
+        reranked = self._rerank(query, search_result, top_k)
+
         context = "".join(
-            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\nContent: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
-            for hit in search_result
+            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
+            f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
+            for hit in reranked
         )
 
-        history_context = "\n".join([f"Previous Q: {h['query']}\nPrevious A: {h['answer']}" for h in history])
+        history_context = "\n".join(
+            [f"Previous Q: {h['query']}\nPrevious A: {h['answer']}" for h in history]
+        )
 
-        rag_prompt = f"""You are a helpful procurement assistant.
-Considering the chat history and the retrieved documents, answer the user's question concisely.
-Cite the Document ID for new information you use.
+        rag_prompt = (
+            "You are a helpful procurement assistant.\n"
+            "Considering the chat history and the retrieved documents, answer the user's question concisely.\n"
+            "Cite the Document ID for new information you use.\n\n"
+            f"CHAT HISTORY:\n{history_context}\n\nRETRIEVED DOCUMENTS:\n{context}\n"
+            f"USER QUESTION: {query}\nANSWER:"
+        )
 
-CHAT HISTORY:
-{history_context}
+        # Generate answer and follow-up suggestions in parallel
+        answer_future = self._executor.submit(
+            self.call_ollama, rag_prompt, model=self.settings.extraction_model
+        )
+        follow_future = self._executor.submit(self._generate_followups, query, context)
 
-RETRIEVED DOCUMENTS:
-{context}
-USER QUESTION: {query}
-ANSWER:"""
+        answer_resp = answer_future.result()
+        followups = follow_future.result()
+        answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
 
-        response = self.call_ollama(rag_prompt, model=self.settings.extraction_model)
-        answer = response.get('response', "I am sorry, I could not generate an answer.")
-
-        # Update and save history
         history.append({"query": query, "answer": answer})
         self._save_chat_history(user_id, history)
 
-        return {"answer": answer, "retrieved_documents": [hit.payload for hit in search_result]}
+        return {
+            "answer": answer,
+            "follow_up_questions": followups,
+            "retrieved_documents": [hit.payload for hit in reranked],
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _rerank(self, query: str, hits, top_k: int):
+        """Re-rank search hits using a cross-encoder for improved accuracy."""
+        pairs = [
+            (query, hit.payload.get("content", hit.payload.get("summary", "")))
+            for hit in hits
+        ]
+        scores = self._reranker.predict(pairs)
+        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+        return [hit for hit, _ in ranked[:top_k]]
+
+    def _generate_followups(self, query: str, context: str):
+        """Generate follow-up questions based on current context."""
+        prompt = (
+            "You are a helpful procurement assistant. Based on the user's question and the "
+            "retrieved context, suggest three concise follow-up questions that would clarify "
+            "the request or gather more details. Return each question on a new line.\n\n"
+            f"QUESTION: {query}\n\nCONTEXT:\n{context}\n\nFOLLOW_UP_QUESTIONS:"
+        )
+        resp = self.call_ollama(prompt, model=self.settings.extraction_model)
+        questions = resp.get("response", "").strip().splitlines()
+        return [q for q in questions if q]
 
     def _load_chat_history(self, user_id: str) -> list:
         history_key = f"chat_history/{user_id}.json"
         try:
-            s3_object = self.agent_nick.s3_client.get_object(Bucket=self.settings.s3_bucket_name, Key=history_key)
-            history = json.loads(s3_object['Body'].read().decode('utf-8'))
+            s3_object = self.agent_nick.s3_client.get_object(
+                Bucket=self.settings.s3_bucket_name, Key=history_key
+            )
+            history = json.loads(s3_object["Body"].read().decode("utf-8"))
             print(f"Loaded {len(history)} items from chat history for user '{user_id}'.")
             return history
         except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                print(f"No chat history found for user '{user_id}'. Starting new session.")
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                print(
+                    f"No chat history found for user '{user_id}'. Starting new session."
+                )
                 return []
             else:
                 raise
@@ -69,20 +128,31 @@ ANSWER:"""
         history_key = f"chat_history/{user_id}.json"
         bucket_name = getattr(self.settings, "s3_bucket_name", None)
         if not bucket_name:
-            print("ERROR: S3 bucket name is not configured. Please set 's3_bucket_name' in settings.")
+            print(
+                "ERROR: S3 bucket name is not configured. Please set 's3_bucket_name' in settings."
+            )
             return
         try:
             self.agent_nick.s3_client.put_object(
                 Bucket=bucket_name,
                 Key=history_key,
-                Body=json.dumps(history, indent=2)
+                Body=json.dumps(history, indent=2),
             )
-            print(f"Saved chat history for user '{user_id}' in bucket '{bucket_name}'.")
+            print(
+                f"Saved chat history for user '{user_id}' in bucket '{bucket_name}'."
+            )
         except ClientError as e:
             error_code = e.response["Error"].get("Code", "Unknown")
             if error_code == "NoSuchBucket":
-                print(f"ERROR: S3 bucket '{bucket_name}' does not exist. Please check configuration.")
+                print(
+                    f"ERROR: S3 bucket '{bucket_name}' does not exist. Please check configuration."
+                )
             else:
-                print(f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}")
+                print(
+                    f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}"
+                )
         except Exception as e:
-            print(f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}")
+            print(
+                f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}"
+            )
+
