@@ -716,22 +716,22 @@ class DataExtractionAgent(BaseAgent):
     # End of class
     # ------------------------------------------------------------------
 
-
-if __name__ == "__main__":
-    # Simple manual invocation used during local development. The production
-    # system always provides an ``AgentContext`` via the orchestrator.
-    from agents.base_agent import AgentNick, AgentContext
-
-    agent_nick = AgentNick()
-    logging.basicConfig(level=logging.INFO)
-    agent = DataExtractionAgent(agent_nick)  # Replace with actual AgentNick instance
-
-    context = AgentContext(
-        workflow_id="manual-test",
-        agent_id="data_extraction",
-        user_id=agent_nick.settings.script_user,
-        input_data={"s3_prefix": "Invoices/"},
-    )
+#
+# if __name__ == "__main__":
+#     # Simple manual invocation used during local development. The production
+#     # system always provides an ``AgentContext`` via the orchestrator.
+#     from agents.base_agent import AgentNick, AgentContext
+#
+#     agent_nick = AgentNick()
+#     logging.basicConfig(level=logging.INFO)
+#     agent = DataExtractionAgent(agent_nick)  # Replace with actual AgentNick instance
+#
+#     context = AgentContext(
+#         workflow_id="manual-test",
+#         agent_id="data_extraction",
+#         user_id=agent_nick.settings.script_user,
+#         input_data={"s3_prefix": "Invoices/"},
+#     )
 
     result = agent.run(context)
     print(result)
