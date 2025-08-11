@@ -6,12 +6,23 @@ import uuid
 import os
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
+import concurrent.futures
 import ollama
 import pdfplumber
 try:  # PyMuPDF is optional; handled gracefully if unavailable
     import fitz  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     fitz = None
+try:  # Optional dependency for DOCX extraction
+    import docx  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    docx = None
+try:  # Optional dependencies for image OCR
+    from PIL import Image  # type: ignore
+    import pytesseract  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+    pytesseract = None
 from qdrant_client import models
 from sentence_transformers import util
 import torch
@@ -84,88 +95,95 @@ class DataExtractionAgent(BaseAgent):
         """
         results: List[Dict[str, str]] = []
         prefixes = [s3_prefix] if s3_prefix else self.settings.s3_prefixes
-
+        keys: List[str] = []
         for prefix in prefixes:
             if s3_object_key and s3_object_key.startswith(prefix):
-                keys = [s3_object_key]
+                keys.append(s3_object_key)
             else:
                 resp = self.agent_nick.s3_client.list_objects_v2(
                     Bucket=self.settings.s3_bucket_name, Prefix=prefix
                 )
-                keys = [obj["Key"] for obj in resp.get("Contents", [])]
+                keys.extend(obj["Key"] for obj in resp.get("Contents", []))
 
-            for object_key in keys:
-                if not object_key.lower().endswith(".pdf"):
-                    continue
-                logger.info("Processing %s", object_key)
-                try:
-                    obj = self.agent_nick.s3_client.get_object(
-                        Bucket=self.settings.s3_bucket_name, Key=object_key
-                    )
-                    file_bytes = obj["Body"].read()
-                except Exception as exc:  # pragma: no cover - network failures
-                    logger.error("Failed downloading %s: %s", object_key, exc)
-                    continue
+        supported_exts = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
+        keys = [k for k in keys if os.path.splitext(k)[1].lower() in supported_exts]
 
-                text = self._extract_text_from_pdf(file_bytes)
-                header, line_items = self._extract_structured_data(text)
-                if not header:
-                    logger.warning("No header information found in %s", object_key)
-                    continue
-
-                doc_type = header.get("doc_type", "Invoice")
-                pk_value = (
-                    header.get("invoice_id")
-                    or header.get("po_id")
-                    or header.get("quote_id")
-                )
-                if not pk_value:
-                    logger.error("No primary key found for %s", object_key)
-                    continue
-
-                # try to derive vendor/supplier name from document title or header
-                if not header.get("vendor_name"):
-                    vendor_guess = self._infer_vendor_name(text, object_key)
-                    if vendor_guess:
-                        header["vendor_name"] = vendor_guess
-
-                # ensure supplier id always populated
-                if not header.get("supplier_id"):
-                    header["supplier_id"] = header.get("vendor_name")
-
-                data = {
-                    "header_data": header,
-                    "line_items": line_items,
-                    "validation": {
-                        "is_valid": True,
-                        "confidence_score": 1.0,
-                        "notes": "llm parser",
-                    },
-                }
-
-                product_type = self._classify_product_type(line_items)
-                self._vectorize_document(
-                    data,
-                    text,
-                    pk_value,
-                    doc_type,
-                    product_type,
-                    object_key,
-                )
-
-                # Persist structured header and line item data to PostgreSQL
-                self._persist_to_postgres(header, line_items, doc_type, pk_value)
-
-                results.append(
-                    {
-                        "object_key": object_key,
-                        "id": pk_value,
-                        "doc_type": doc_type,
-                        "status": "success",
-                    }
-                )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count() or 4
+        ) as executor:
+            futures = [executor.submit(self._process_single_document, k) for k in keys]
+            for fut in concurrent.futures.as_completed(futures):
+                res = fut.result()
+                if res:
+                    results.append(res)
 
         return {"status": "completed", "details": results}
+
+    def _process_single_document(self, object_key: str) -> Optional[Dict[str, str]]:
+        if not object_key:
+            return None
+        logger.info("Processing %s", object_key)
+        try:
+            obj = self.agent_nick.s3_client.get_object(
+                Bucket=self.settings.s3_bucket_name, Key=object_key
+            )
+            file_bytes = obj["Body"].read()
+        except Exception as exc:  # pragma: no cover - network failures
+            logger.error("Failed downloading %s: %s", object_key, exc)
+            return None
+
+        text = self._extract_text(file_bytes, object_key)
+        header, line_items = self._extract_structured_data(text)
+        if not header:
+            logger.warning("No header information found in %s", object_key)
+            return None
+
+        doc_type = header.get("doc_type", "Invoice")
+        pk_value = (
+            header.get("invoice_id")
+            or header.get("po_id")
+            or header.get("quote_id")
+        )
+        if not pk_value:
+            logger.error("No primary key found for %s", object_key)
+            return None
+
+        if not header.get("vendor_name"):
+            vendor_guess = self._infer_vendor_name(text, object_key)
+            if vendor_guess:
+                header["vendor_name"] = vendor_guess
+
+        if not header.get("supplier_id"):
+            header["supplier_id"] = header.get("vendor_name")
+
+        data = {
+            "header_data": header,
+            "line_items": line_items,
+            "validation": {
+                "is_valid": True,
+                "confidence_score": 1.0,
+                "notes": "llm parser",
+            },
+        }
+
+        product_type = self._classify_product_type(line_items)
+        self._vectorize_document(
+            data,
+            text,
+            pk_value,
+            doc_type,
+            product_type,
+            object_key,
+        )
+
+        self._persist_to_postgres(header, line_items, doc_type, pk_value)
+
+        return {
+            "object_key": object_key,
+            "id": pk_value,
+            "doc_type": doc_type,
+            "status": "success",
+        }
 
     # ------------------------------------------------------------------
     # Helpers
@@ -196,6 +214,42 @@ class DataExtractionAgent(BaseAgent):
             logger.warning("No text extracted from PDF; PyMuPDF not installed")
             return ""
         return text
+
+    def _extract_text_from_docx(self, file_bytes: bytes) -> str:
+        """Extract text from DOCX files using python-docx when available."""
+        if docx is None:
+            logger.warning("python-docx not installed; cannot extract DOCX text")
+            return ""
+        try:
+            document = docx.Document(BytesIO(file_bytes))
+            return "\n".join(par.text for par in document.paragraphs)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Failed extracting DOCX text: %s", exc)
+            return ""
+
+    def _extract_text_from_image(self, file_bytes: bytes) -> str:
+        """OCR text from image files using pytesseract when available."""
+        if Image is None or pytesseract is None:
+            logger.warning("pytesseract not installed; cannot OCR image")
+            return ""
+        try:
+            img = Image.open(BytesIO(file_bytes))
+            return pytesseract.image_to_string(img)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Failed OCR on image: %s", exc)
+            return ""
+
+    def _extract_text(self, file_bytes: bytes, object_key: str) -> str:
+        """Route to appropriate extractor based on file extension."""
+        ext = os.path.splitext(object_key)[1].lower()
+        if ext == ".pdf":
+            return self._extract_text_from_pdf(file_bytes)
+        if ext in {".doc", ".docx"}:
+            return self._extract_text_from_docx(file_bytes)
+        if ext in {".png", ".jpg", ".jpeg"}:
+            return self._extract_text_from_image(file_bytes)
+        logger.warning("Unsupported document type '%s' for %s", ext, object_key)
+        return ""
 
     def _parse_header(self, text: str) -> Dict[str, str]:
         """Use semantic similarity to locate common header fields."""
@@ -452,7 +506,25 @@ class DataExtractionAgent(BaseAgent):
         header = data.get("header_data", {})
         vendor = header.get("vendor_name", "Unknown Vendor")
         total = header.get("total_amount", "unknown amount")
-        return f"{doc_type} {pk_value} from {vendor} for {total}"
+        date = (
+            header.get("invoice_date")
+            or header.get("po_date")
+            or header.get("quote_date")
+            or "unknown date"
+        )
+        items = data.get("line_items", [])[:3]
+        item_summaries = []
+        for item in items:
+            desc = item.get("description") or item.get("item_description") or ""
+            qty = item.get("quantity")
+            price = item.get("unit_price") or item.get("price")
+            snippet = desc[:30].strip()
+            item_summaries.append(f"{snippet} (qty {qty}, price {price})")
+        items_text = "; ".join(item_summaries)
+        return (
+            f"{doc_type} {pk_value} from {vendor} dated {date} for {total}. "
+            f"Items: {items_text}"
+        )
 
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:
         """Best-effort parsing of free-form numeric strings.
@@ -479,12 +551,14 @@ class DataExtractionAgent(BaseAgent):
         value_str = str(value).strip()
         if not value_str:
             return None
+        if not any(ch.isdigit() for ch in value_str):
+            return None
         trimmed = value_str.strip()
         is_negative = trimmed.startswith("(") and trimmed.endswith(")")
         value_str = value_str.replace(",", "")
         numbers = re.findall(r"\d*\.\d+|\d+", value_str)
         if not numbers:
-            logger.warning("Unable to parse numeric value '%s'", value)
+            logger.debug("Unable to parse numeric value '%s'", value)
             return None
         # When a percent sign is present the first number usually represents
         # the percentage, otherwise the last number tends to be the amount.
@@ -493,7 +567,7 @@ class DataExtractionAgent(BaseAgent):
             num = float(num_str)
             return -num if is_negative else num
         except ValueError:
-            logger.warning("Unable to parse numeric value '%s'", value)
+            logger.debug("Unable to parse numeric value '%s'", value)
             return None
 
     def _clean_date(self, value: str) -> Optional[datetime.date]:
@@ -739,6 +813,46 @@ class DataExtractionAgent(BaseAgent):
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
 
+    def train_extraction_model(
+        self, training_data: List[Tuple[str, str]], epochs: int = 1
+    ) -> Optional[str]:
+        """Fine-tune the embedding model using provided training data.
+
+        Parameters
+        ----------
+        training_data: List[Tuple[str, str]]
+            Pairs of text segments that should be close in embedding space.
+        epochs: int
+            Number of training epochs.
+
+        Returns
+        -------
+        Optional[str]
+            Path to the directory containing the fine-tuned model.
+        """
+        if not training_data:
+            logger.info("No training data provided; skipping fine-tuning.")
+            return None
+        try:
+            from sentence_transformers import InputExample, losses
+            from torch.utils.data import DataLoader
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.error("sentence-transformers training dependencies missing: %s", exc)
+            return None
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = self.agent_nick.embedding_model
+        examples = [InputExample(texts=[t, l]) for t, l in training_data]
+        train_loader = DataLoader(examples, batch_size=8, shuffle=True)
+        train_loss = losses.CosineSimilarityLoss(model)
+        output_dir = os.path.join("/tmp", f"fine_tuned_{uuid.uuid4().hex[:8]}")
+        model.fit(
+            train_objectives=[(train_loader, train_loss)],
+            epochs=epochs,
+            output_path=output_dir,
+            device=device,
+        )
+        logger.info("Fine-tuned extraction model saved to %s", output_dir)
+        return output_dir
 
     # ------------------------------------------------------------------
     # End of class
