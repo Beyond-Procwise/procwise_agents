@@ -296,10 +296,18 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             pass
 
-        numeric_fields = {"total_amount", "tax_percent", "tax_amount"}
+        numeric_fields = {
+            "total_amount",
+            "tax_percent",
+            "tax_amount",
+            "invoice_amount",
+            "invoice_total_incl_tax",
+            "exchange_rate_to_usd",
+            "converted_amount_usd",
+        }
         numeric_id_fields = {"buyer_id", "supplier_id", "requisition_id"}
         for field in numeric_fields:
-            if field in header:
+            if field in header and header[field] is not None:
                 header[field] = self._clean_numeric(header[field])
         for field in numeric_id_fields:
             if field in header:
@@ -467,26 +475,44 @@ class DataExtractionAgent(BaseAgent):
         total = header.get("total_amount", "unknown amount")
         return f"{doc_type} {pk_value} from {vendor} for {total}"
 
-    def _clean_numeric(self, value: str) -> Optional[float]:
-        """Strip non-numeric characters and attempt float casting.
+    def _clean_numeric(self, value: str | int | float) -> Optional[float]:
+        """Best-effort parsing of free-form numeric strings.
+
+        The helper is tolerant to common human formats such as ``20%``,
+        ``£1,200.50`` or ``(100)`` for negative numbers.  Any non-numeric
+        characters, including currency symbols and thousand separators, are
+        stripped before casting.
 
         Parameters
         ----------
-        value: str
-            Raw numeric string potentially containing currency symbols or
-            free-form text.
+        value: str | int | float
+            Raw numeric value or string potentially containing decorations.
 
         Returns
         -------
         Optional[float]
             ``float`` representation if parsing succeeds otherwise ``None``.
         """
-        cleaned = re.sub(r"[^0-9.]", "", str(value))
-        if not cleaned:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        value_str = str(value).strip()
+        if not value_str:
+            return None
+        trimmed = value_str.strip()
+        is_negative = trimmed.startswith("(") and trimmed.endswith(")")
+        value_str = value_str.replace(",", "")
+        numbers = re.findall(r"\d*\.\d+|\d+", value_str)
+        if not numbers:
             logger.warning("Unable to parse numeric value '%s'", value)
             return None
+        # When a percent sign is present the first number usually represents
+        # the percentage, otherwise the last number tends to be the amount.
+        num_str = numbers[0] if "%" in value_str else numbers[-1]
         try:
-            return float(cleaned)
+            num = float(num_str)
+            return -num if is_negative else num
         except ValueError:
             logger.warning("Unable to parse numeric value '%s'", value)
             return None
@@ -500,6 +526,10 @@ class DataExtractionAgent(BaseAgent):
         """
         try:
             value_str = str(value)
+            # Some documents include a trailing dot after the month name,
+            # e.g. ``30 MARCH. 2024`` which confuses the parser.  Strip dots
+            # that directly follow a word token.
+            value_str = re.sub(r"([A-Za-z])\.", r"\1", value_str)
             match = re.match(r"(.+?)\s*\+\s*(\d+)\s*days", value_str, re.I)
             if match:
                 base = parser.parse(match.group(1), fuzzy=True)
@@ -522,6 +552,10 @@ class DataExtractionAgent(BaseAgent):
             "total_with_tax",
             "total_amount",
             "total",
+            "invoice_amount",
+            "invoice_total_incl_tax",
+            "exchange_rate_to_usd",
+            "converted_amount_usd",
         }
         date_fields = {
             "invoice_date",
@@ -529,12 +563,22 @@ class DataExtractionAgent(BaseAgent):
             "po_date",
             "requested_date",
         }
+        currency_fields = {"currency"}
         if key:
             lower = key.lower()
             if lower in numeric_fields:
                 return self._clean_numeric(value)
             if lower in date_fields:
                 return self._clean_date(value)
+            if lower in currency_fields:
+                if isinstance(value, str):
+                    val = value.strip().upper()
+                    symbol_map = {"$": "USD", "£": "GBP", "€": "EUR"}
+                    if val in symbol_map:
+                        return symbol_map[val]
+                    val = re.sub(r"[^A-Z]", "", val)
+                    return val[:3] if val else None
+                return None
         return value
 
     def _persist_to_postgres(
@@ -733,5 +777,5 @@ class DataExtractionAgent(BaseAgent):
 #         input_data={"s3_prefix": "Invoices/"},
 #     )
 
-    result = agent.run(context)
-    print(result)
+#     result = agent.run(context)
+#     print(result)
