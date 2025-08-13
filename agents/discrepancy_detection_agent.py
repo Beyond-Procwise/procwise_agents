@@ -31,35 +31,51 @@ class DiscrepancyDetectionAgent(BaseAgent):
         mismatches: List[Dict[str, Dict[str, str]]] = []
         docs: List[Dict] = context.input_data.get("extracted_docs", [])
 
+        def _detect_vendor_column(cur, connection) -> str | None:
+            """Return the vendor-related column present in the invoice table."""
+            for col in ("vendor_name", "vendor"):
+                try:
+                    cur.execute(
+                        f"SELECT {col} FROM proc.invoice_agent LIMIT 0"
+                    )
+                    return col
+                except errors.UndefinedColumn:
+                    connection.rollback()
+            return None
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
+                    vendor_col = _detect_vendor_column(cursor, conn)
                     for doc in docs:
                         doc_type = doc.get("doc_type")
                         pk = doc.get("id")
                         if doc_type != "Invoice":
                             continue  # Only invoices supported for now
                         try:
-                            try:
+                            if vendor_col:
                                 cursor.execute(
-                                    """
-                                    SELECT vendor_name, invoice_date, total_amount
+                                    f"""
+                                    SELECT {vendor_col}, invoice_date, total_amount
                                     FROM proc.invoice_agent
                                     WHERE invoice_id = %s
                                     """,
                                     (pk,),
                                 )
-                            except errors.UndefinedColumn:
-                                conn.rollback()
+                                row = cursor.fetchone()
+                                vendor_name, invoice_date, total_amount = row
+                            else:
                                 cursor.execute(
                                     """
-                                    SELECT vendor, invoice_date, total_amount
+                                    SELECT invoice_date, total_amount
                                     FROM proc.invoice_agent
                                     WHERE invoice_id = %s
                                     """,
                                     (pk,),
                                 )
-                            row = cursor.fetchone()
+                                row = cursor.fetchone()
+                                vendor_name = None
+                                invoice_date, total_amount = row if row else (None, None)
                         except Exception as db_exc:
                             conn.rollback()
                             logger.error("DB error during discrepancy check: %s", db_exc)
@@ -80,7 +96,6 @@ class DiscrepancyDetectionAgent(BaseAgent):
                                 }
                             )
                             continue
-                        vendor_name, invoice_date, total_amount = row
                         checks = {}
                         if not vendor_name:
                             checks["vendor_name"] = "missing"
