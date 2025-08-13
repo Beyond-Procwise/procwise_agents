@@ -1,227 +1,506 @@
+"""Opportunity Miner Agent.
+
+This agent implements a lightweight version of the functional
+requirements supplied in the task description.  It ingests procurement
+tables, performs basic validation and currency normalisation and then
+runs a set of seven fixed detectors.  Each detector produces a list of
+opportunities which are filtered using a global financial impact
+threshold before being written to Excel and a JSON feed that mimics the
+dashboard output.
+
+The implementation is intentionally simplified: the goal is to provide a
+clear, auditable pipeline that can be expanded upon.  The detectors use
+very small placeholder calculations so the agent can operate without a
+fully‑fledged dataset or database connection, making it suitable for the
+MVP and unit tests.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
-from typing import Dict, List, Optional
+import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional
+
+import pandas as pd
+
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 logger = logging.getLogger(__name__)
 
 
-class OpportunityMinerAgent(BaseAgent):
-    """Agent for identifying cost-saving opportunities"""
+@dataclass
+class Finding:
+    """Dataclass representing a single opportunity finding."""
 
+    opportunity_id: str
+    detector_type: str
+    supplier_id: Optional[str]
+    category_id: Optional[str]
+    item_id: Optional[str]
+    financial_impact_gbp: float
+    calculation_details: Dict
+    source_records: List[str]
+    detected_on: datetime
+
+    def as_dict(self) -> Dict:
+        d = self.__dict__.copy()
+        d["detected_on"] = self.detected_on.isoformat()
+        return d
+
+
+class OpportunityMinerAgent(BaseAgent):
+    """Agent for identifying procurement anomalies and savings opportunities."""
+
+    def __init__(self, agent_nick, min_financial_impact: float = 100.0) -> None:
+        super().__init__(agent_nick)
+        self.min_financial_impact = min_financial_impact
+
+        # ------------------------------------------------------------------
+        # GPU configuration
+        # ------------------------------------------------------------------
+        try:  # pragma: no cover - torch is optional for this repository
+            import torch
+
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:  # pragma: no cover - defensive
+            self.device = "cpu"
+        os.environ.setdefault("PROCWISE_DEVICE", self.device)
+        logger.info("OpportunityMinerAgent using device: %s", self.device)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def run(self, context: AgentContext) -> AgentOutput:
-        """Execute the opportunity mining flow."""
+        """Entry point for the orchestration layer."""
         return self.process(context)
 
+    # ------------------------------------------------------------------
+    # Processing pipeline
+    # ------------------------------------------------------------------
     def process(self, context: AgentContext) -> AgentOutput:
-        """Process opportunity mining"""
         try:
-            input_data = context.input_data
+            tables = self._ingest_data()
+            tables = self._validate_data(tables)
+            tables = self._normalise_currency(tables)
+            tables = self._apply_index_adjustment(tables)
 
-            # Analyze spend patterns
-            spend_analysis = self._analyze_spend_patterns()
+            findings: List[Finding] = []
+            findings.extend(self._detect_unit_price_vs_benchmark(tables))
+            findings.extend(self._detect_contract_price_drift(tables))
+            findings.extend(self._detect_po_invoice_discrepancy(tables))
+            findings.extend(self._detect_early_payment_discount(tables))
+            findings.extend(self._detect_demand_aggregation(tables))
+            findings.extend(self._detect_logistics_cost_outliers(tables))
+            findings.extend(self._detect_supplier_consolidation(tables))
 
-            # Identify opportunities
-            opportunities = self._identify_opportunities(spend_analysis)
+            filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
 
-            # Calculate potential savings
-            total_savings = sum(opp['estimated_savings'] for opp in opportunities)
+            self._output_excel(filtered)
+            self._output_feed(filtered)
 
-            # Generate action plan using Ollama
-            action_plan = self._generate_action_plan(opportunities)
-
-            output_data = {
-                'opportunities_found': len(opportunities),
-                'total_savings_potential': total_savings,
-                'opportunities': opportunities,
-                'action_plan': action_plan,
-                'confidence': self._calculate_confidence(opportunities)
+            data = {
+                "findings": [f.as_dict() for f in filtered],
+                "opportunity_count": len(filtered),
+                "total_savings": sum(f.financial_impact_gbp for f in filtered),
             }
 
-            # Determine next agents
-            next_agents = []
-            if total_savings > 50000:
-                next_agents.append('HumanEscalationAgent')
-            if any(opp['type'] == 'contract_discrepancy' for opp in opportunities):
-                next_agents.append('DiscrepancyDetectionAgent')
-            if total_savings > 10000:
-                next_agents.append('AutomatedActionAgent')
+            return AgentOutput(status=AgentStatus.SUCCESS, data=data, confidence=1.0)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("OpportunityMinerAgent error: %s", exc)
+            return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
 
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=output_data,
-                next_agents=next_agents,
-                pass_fields={
-                    'opportunity_ids': [opp['id'] for opp in opportunities],
-                    'action_items': action_plan.get('immediate_actions', []),
-                    'estimated_savings': total_savings
-                },
-                confidence=output_data['confidence']
-            )
+    # ------------------------------------------------------------------
+    # Data ingestion and preparation
+    # ------------------------------------------------------------------
+    TABLES = [
+        "purchase_orders",
+        "invoices",
+        "contracts",
+        "price_benchmarks",
+        "indices",
+        "shipments",
+        "supplier_master",
+    ]
 
-        except Exception as e:
-            logger.error(f"OpportunityMinerAgent error: {e}")
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error=str(e)
-            )
+    def _ingest_data(self) -> Dict[str, pd.DataFrame]:
+        """Fetch required tables from the database or fall back to mock data."""
 
-    def _analyze_spend_patterns(self) -> Dict:
-        """Analyze spending patterns from database"""
+        dfs: Dict[str, pd.DataFrame] = {}
         try:
             with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Analyze invoice spend patterns
-                    cursor.execute("""
-                        SELECT 
-                            vendor_name,
-                            COUNT(*) as transaction_count,
-                            SUM(total_amount) as total_spend,
-                            AVG(total_amount) as avg_spend,
-                            MAX(total_amount) - MIN(total_amount) as spend_variance,
-                            MAX(invoice_date) as last_transaction
-                        FROM proc.invoice_agent
-                        WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months'
-                        GROUP BY vendor_name
-                        HAVING COUNT(*) > 3
-                        ORDER BY total_spend DESC
-                    """)
+                for table in self.TABLES:
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {table}", conn)
+        except Exception as exc:  # pragma: no cover - database is optional for tests
+            logger.warning("Using mock data for opportunity mining: %s", exc)
+            dfs = self._mock_data()
+        return dfs
 
-                    spend_data = cursor.fetchall()
+    def _mock_data(self) -> Dict[str, pd.DataFrame]:
+        """Return a minimal in-memory dataset used for unit tests and demos."""
 
-                    return {
-                        'vendor_spend': [
-                            {
-                                'vendor': row[0],
-                                'transactions': row[1],
-                                'total_spend': float(row[2]) if row[2] else 0,
-                                'avg_spend': float(row[3]) if row[3] else 0,
-                                'variance': float(row[4]) if row[4] else 0
-                            }
-                            for row in spend_data
-                        ]
-                    }
+        # All values already in GBP for simplicity
+        purchase_orders = pd.DataFrame(
+            [
+                {
+                    "po_id": "PO1",
+                    "supplier_id": "S1",
+                    "category_id": "C1",
+                    "item_id": "I1",
+                    "unit_price": 12.0,
+                    "quantity": 10,
+                    "currency": "GBP",
+                    "order_date": "2024-01-01",
+                    "contract_id": "CT1",
+                }
+            ]
+        )
 
-        except Exception as e:
-            logger.error(f"Failed to analyze spend: {e}")
-            # Return mock data
-            return {
-                'vendor_spend': [
-                    {
-                        'vendor': 'Supplier A',
-                        'transactions': 25,
-                        'total_spend': 150000,
-                        'avg_spend': 6000,
-                        'variance': 3000
-                    }
-                ]
-            }
+        invoices = pd.DataFrame(
+            [
+                {
+                    "invoice_id": "INV1",
+                    "po_id": "PO1",
+                    "supplier_id": "S1",
+                    "item_id": "I1",
+                    "unit_price": 13.0,
+                    "quantity": 10,
+                    "currency": "GBP",
+                    "invoice_date": "2024-01-05",
+                    "payment_terms": "30",
+                }
+            ]
+        )
 
-    def _identify_opportunities(self, spend_analysis: Dict) -> List[Dict]:
-        """Identify cost-saving opportunities"""
-        opportunities = []
+        contracts = pd.DataFrame(
+            [
+                {
+                    "contract_id": "CT1",
+                    "supplier_id": "S1",
+                    "category_id": "C1",
+                    "item_id": "I1",
+                    "agreed_price": 11.0,
+                    "currency": "GBP",
+                    "start_date": "2023-01-01",
+                    "end_date": "2025-01-01",
+                    "index_link": None,
+                }
+            ]
+        )
 
-        for vendor_data in spend_analysis.get('vendor_spend', []):
-            # Check for high variance (potential for standardization)
-            if vendor_data['variance'] > vendor_data['avg_spend'] * 0.5:
-                opportunities.append({
-                    'id': f"OPP_{vendor_data['vendor']}_{len(opportunities)}",
-                    'type': 'price_standardization',
-                    'vendor': vendor_data['vendor'],
-                    'description': f"High price variance for {vendor_data['vendor']}",
-                    'estimated_savings': vendor_data['variance'] * vendor_data['transactions'] * 0.1,
-                    'confidence': 0.7
-                })
+        price_benchmarks = pd.DataFrame(
+            [
+                {
+                    "item_id": "I1",
+                    "benchmark_price": 10.0,
+                    "currency": "GBP",
+                    "source": "internal",
+                    "effective_date": "2024-01-01",
+                }
+            ]
+        )
 
-            # Check for volume consolidation opportunity
-            if vendor_data['transactions'] > 10:
-                opportunities.append({
-                    'id': f"OPP_VOL_{vendor_data['vendor']}_{len(opportunities)}",
-                    'type': 'volume_consolidation',
-                    'vendor': vendor_data['vendor'],
-                    'description': f"Volume consolidation opportunity with {vendor_data['vendor']}",
-                    'estimated_savings': vendor_data['total_spend'] * 0.05,
-                    'confidence': 0.8
-                })
+        indices = pd.DataFrame(
+            [
+                {"index_name": "FX_GBP", "value": 1.0, "effective_date": "2024-01-01", "currency": "GBP"}
+            ]
+        )
 
-        # Use Ollama to identify additional opportunities
-        additional_opps = self._identify_ml_opportunities(spend_analysis)
-        opportunities.extend(additional_opps)
+        shipments = pd.DataFrame(
+            [
+                {
+                    "shipment_id": "SH1",
+                    "po_id": "PO1",
+                    "logistics_cost": 5.0,
+                    "currency": "GBP",
+                    "delivery_date": "2024-01-10",
+                }
+            ]
+        )
 
-        return opportunities
+        supplier_master = pd.DataFrame(
+            [
+                {"supplier_id": "S1", "supplier_name": "Supplier One", "region": "UK", "risk_rating": 1}
+            ]
+        )
 
-    def _identify_ml_opportunities(self, spend_analysis: Dict) -> List[Dict]:
-        """Use Ollama to identify additional opportunities"""
-        prompt = f"""Analyze this procurement spend data and identify cost-saving opportunities:
+        return {
+            "purchase_orders": purchase_orders,
+            "invoices": invoices,
+            "contracts": contracts,
+            "price_benchmarks": price_benchmarks,
+            "indices": indices,
+            "shipments": shipments,
+            "supplier_master": supplier_master,
+        }
 
-        Spend Data: {json.dumps(spend_analysis, indent=2)}
+    def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """Basic validation ensuring required columns exist and dropping nulls."""
 
-        Identify opportunities in these categories:
-        1. Contract renegotiation
-        2. Supplier consolidation
-        3. Payment term optimization
-        4. Process automation
+        required_columns = {
+            "purchase_orders": ["po_id", "supplier_id", "category_id", "item_id", "unit_price", "quantity", "currency"],
+            "invoices": ["invoice_id", "po_id", "supplier_id", "item_id", "unit_price", "quantity", "currency"],
+            "contracts": ["contract_id", "supplier_id", "category_id", "item_id", "agreed_price", "currency"],
+            "price_benchmarks": ["item_id", "benchmark_price", "currency"],
+            "indices": ["index_name", "value", "currency"],
+            "shipments": ["shipment_id", "po_id", "logistics_cost", "currency"],
+            "supplier_master": ["supplier_id"],
+        }
 
-        Return as JSON array with objects containing: type, description, estimated_savings_percentage
-        """
+        for name, cols in required_columns.items():
+            df = tables.get(name, pd.DataFrame())
+            missing = [c for c in cols if c not in df.columns]
+            if missing:
+                raise ValueError(f"Table {name} missing columns: {missing}")
+            tables[name] = df.dropna(subset=cols)
 
-        response = self.call_ollama(prompt, format='json')
+        return tables
 
-        try:
-            ml_opportunities = json.loads(response.get('response', '[]'))
+    def _normalise_currency(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """Convert all monetary values to GBP using simple FX mapping."""
 
-            # Convert to standard format
-            opportunities = []
-            for opp in ml_opportunities:
-                if isinstance(opp, dict):
-                    opportunities.append({
-                        'id': f"OPP_ML_{len(opportunities)}",
-                        'type': opp.get('type', 'general'),
-                        'vendor': 'Multiple',
-                        'description': opp.get('description', ''),
-                        'estimated_savings': 10000 * opp.get('estimated_savings_percentage', 0.05),
-                        'confidence': 0.6
-                    })
+        fx_rates = {"GBP": 1.0}
+        indices = tables.get("indices", pd.DataFrame())
+        if not indices.empty:
+            for _, row in indices.iterrows():
+                if row.get("currency") and row.get("value"):
+                    fx_rates[row["currency"]] = float(row["value"])
 
-            return opportunities
+        def convert(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+            if df.empty:
+                return df
+            rate_col = df["currency"].map(lambda c: fx_rates.get(c, 1.0))
+            for col in cols:
+                if col in df.columns:
+                    df[f"{col}_gbp"] = df[col] * rate_col
+            return df
 
-        except:
-            return []
+        tables["purchase_orders"] = convert(tables["purchase_orders"], ["unit_price"])
+        tables["invoices"] = convert(tables["invoices"], ["unit_price"])
+        tables["contracts"] = convert(tables["contracts"], ["agreed_price"])
+        tables["price_benchmarks"] = convert(tables["price_benchmarks"], ["benchmark_price"])
+        tables["shipments"] = convert(tables["shipments"], ["logistics_cost"])
+        return tables
 
-    def _generate_action_plan(self, opportunities: List[Dict]) -> Dict:
-        """Generate action plan using Ollama"""
-        if not opportunities:
-            return {'immediate_actions': [], 'long_term_actions': []}
+    def _apply_index_adjustment(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """Placeholder for index-based price adjustment."""
 
-        prompt = f"""Create an action plan for these procurement opportunities:
+        contracts = tables.get("contracts", pd.DataFrame())
+        if not contracts.empty:
+            contracts["adjusted_price_gbp"] = contracts.get("agreed_price_gbp", contracts.get("agreed_price", 0.0))
+            tables["contracts"] = contracts
+        return tables
 
-        Opportunities: {json.dumps(opportunities, indent=2)}
+    # ------------------------------------------------------------------
+    # Detector implementations
+    # ------------------------------------------------------------------
+    def _build_finding(
+        self,
+        detector: str,
+        supplier_id: Optional[str],
+        category_id: Optional[str],
+        item_id: Optional[str],
+        impact: float,
+        details: Dict,
+        sources: List[str],
+    ) -> Finding:
+        return Finding(
+            opportunity_id=f"{detector}_{len(sources)}_{supplier_id or 'NA'}_{item_id or 'NA'}",
+            detector_type=detector,
+            supplier_id=supplier_id,
+            category_id=category_id,
+            item_id=item_id,
+            financial_impact_gbp=float(impact),
+            calculation_details=details,
+            source_records=sources,
+            detected_on=datetime.utcnow(),
+        )
 
-        Provide:
-        1. Immediate actions (within 1 week)
-        2. Short-term actions (within 1 month)
-        3. Long-term actions (within 3 months)
-        4. Success metrics
+    def _detect_unit_price_vs_benchmark(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        po = tables["purchase_orders"]
+        bm = tables["price_benchmarks"]
+        if po.empty or bm.empty:
+            return findings
+        merged = po.merge(bm, on="item_id", suffixes=("_po", "_bm"))
+        merged["variance"] = merged["unit_price_gbp"] - merged["benchmark_price_gbp"]
+        cond = merged["variance"] > 0
+        for _, row in merged[cond].iterrows():
+            savings = row["variance"] * row.get("quantity", 1)
+            findings.append(
+                self._build_finding(
+                    "Unit Price vs Benchmark",
+                    row.get("supplier_id"),
+                    row.get("category_id"),
+                    row.get("item_id"),
+                    savings,
+                    {"unit_price_gbp": row["unit_price_gbp"], "benchmark_price_gbp": row["benchmark_price_gbp"]},
+                    [row.get("po_id")],
+                )
+            )
+        return findings
 
-        Format as JSON with keys: immediate_actions, short_term_actions, long_term_actions, success_metrics"""
+    def _detect_contract_price_drift(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        inv = tables["invoices"]
+        ct = tables["contracts"]
+        if inv.empty or ct.empty:
+            return findings
+        merged = inv.merge(ct, on=["supplier_id", "item_id", "contract_id"], how="inner")
+        merged["variance"] = merged["unit_price_gbp"] - merged.get("adjusted_price_gbp", merged.get("agreed_price_gbp"))
+        cond = merged["variance"] > 0
+        for _, row in merged[cond].iterrows():
+            savings = row["variance"] * row.get("quantity", 1)
+            findings.append(
+                self._build_finding(
+                    "Contract Price Drift",
+                    row.get("supplier_id"),
+                    row.get("category_id"),
+                    row.get("item_id"),
+                    savings,
+                    {"invoice_price_gbp": row["unit_price_gbp"], "contract_price_gbp": row["adjusted_price_gbp"]},
+                    [row.get("invoice_id"), row.get("contract_id")],
+                )
+            )
+        return findings
 
-        response = self.call_ollama(prompt, format='json')
+    def _detect_po_invoice_discrepancy(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        po = tables["purchase_orders"]
+        inv = tables["invoices"]
+        if po.empty or inv.empty:
+            return findings
+        merged = po.merge(inv, on="po_id", suffixes=("_po", "_inv"))
+        merged["price_diff"] = merged["unit_price_gbp_inv"] - merged["unit_price_gbp_po"]
+        merged["qty_diff"] = merged["quantity_inv"] - merged["quantity_po"]
+        cond = (merged["price_diff"] != 0) | (merged["qty_diff"] != 0)
+        for _, row in merged[cond].iterrows():
+            impact = row["price_diff"] * row.get("quantity_inv", 1)
+            findings.append(
+                self._build_finding(
+                    "PO↔Invoice Discrepancy",
+                    row.get("supplier_id_po"),
+                    row.get("category_id"),
+                    row.get("item_id_po"),
+                    impact,
+                    {"price_diff": row["price_diff"], "qty_diff": row["qty_diff"]},
+                    [row.get("po_id"), row.get("invoice_id")],
+                )
+            )
+        return findings
 
-        try:
-            return json.loads(response.get('response', '{}'))
-        except:
-            return {
-                'immediate_actions': ['Review top 3 opportunities', 'Contact suppliers'],
-                'short_term_actions': ['Implement quick wins', 'Start negotiations'],
-                'long_term_actions': ['Full supplier review', 'Process optimization'],
-                'success_metrics': ['Cost reduction %', 'Process efficiency']
-            }
+    def _detect_early_payment_discount(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        inv = tables["invoices"]
+        if inv.empty:
+            return findings
+        # Placeholder: assume a 2% discount could have been taken if payment_terms < 30
+        for _, row in inv.iterrows():
+            try:
+                terms = int(row.get("payment_terms", 0))
+            except ValueError:
+                terms = 0
+            if terms > 0 and terms <= 15:
+                discount = row["unit_price_gbp"] * row.get("quantity", 1) * 0.02
+                findings.append(
+                    self._build_finding(
+                        "Early Payment Discount Missed",
+                        row.get("supplier_id"),
+                        None,
+                        row.get("item_id"),
+                        discount,
+                        {"terms": terms},
+                        [row.get("invoice_id")],
+                    )
+                )
+        return findings
 
-    def _calculate_confidence(self, opportunities: List[Dict]) -> float:
-        """Calculate overall confidence score"""
-        if not opportunities:
-            return 0
+    def _detect_demand_aggregation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        po = tables["purchase_orders"]
+        if po.empty:
+            return findings
+        grouped = po.groupby(["supplier_id", "item_id"]).agg({"quantity": "sum"}).reset_index()
+        cond = grouped["quantity"] < 20  # small orders could be aggregated
+        for _, row in grouped[cond].iterrows():
+            savings = row["quantity"] * 0.5  # placeholder saving
+            findings.append(
+                self._build_finding(
+                    "Demand Aggregation",
+                    row.get("supplier_id"),
+                    None,
+                    row.get("item_id"),
+                    savings,
+                    {"total_quantity": row["quantity"]},
+                    [],
+                )
+            )
+        return findings
 
-        confidences = [opp.get('confidence', 0.5) for opp in opportunities]
-        return sum(confidences) / len(confidences)
+    def _detect_logistics_cost_outliers(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        shipments = tables["shipments"]
+        if shipments.empty:
+            return findings
+        avg = shipments["logistics_cost_gbp"].mean()
+        cond = shipments["logistics_cost_gbp"] > avg * 1.5
+        for _, row in shipments[cond].iterrows():
+            impact = row["logistics_cost_gbp"] - avg
+            findings.append(
+                self._build_finding(
+                    "Logistics Cost Outliers",
+                    None,
+                    None,
+                    None,
+                    impact,
+                    {"average_cost": avg, "actual_cost": row["logistics_cost_gbp"]},
+                    [row.get("shipment_id"), row.get("po_id")],
+                )
+            )
+        return findings
+
+    def _detect_supplier_consolidation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        po = tables["purchase_orders"]
+        if po.empty:
+            return findings
+        supplier_counts = po.groupby("category_id")["supplier_id"].nunique().reset_index(name="supplier_count")
+        cond = supplier_counts["supplier_count"] > 1
+        for _, row in supplier_counts[cond].iterrows():
+            savings = row["supplier_count"] * 10.0  # placeholder
+            findings.append(
+                self._build_finding(
+                    "Supplier Consolidation",
+                    None,
+                    row.get("category_id"),
+                    None,
+                    savings,
+                    {"supplier_count": row["supplier_count"]},
+                    [],
+                )
+            )
+        return findings
+
+    # ------------------------------------------------------------------
+    # Output helpers
+    # ------------------------------------------------------------------
+    def _output_excel(self, findings: List[Finding]) -> None:
+        if not findings:
+            return
+        df = pd.DataFrame([f.as_dict() for f in findings]).sort_values("financial_impact_gbp", ascending=False)
+        with pd.ExcelWriter("opportunity_findings.xlsx") as writer:
+            summary = df.groupby("detector_type")["financial_impact_gbp"].sum().reset_index()
+            summary.to_excel(writer, sheet_name="summary", index=False)
+            for detector, group in df.groupby("detector_type"):
+                group.sort_values("financial_impact_gbp", ascending=False).to_excel(
+                    writer, sheet_name=detector[:31], index=False
+                )
+
+    def _output_feed(self, findings: List[Finding]) -> None:
+        path = "opportunity_findings.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([f.as_dict() for f in findings], f, ensure_ascii=False, indent=2)
+        logger.info("Wrote %d findings to %s", len(findings), path)
+

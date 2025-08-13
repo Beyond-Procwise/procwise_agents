@@ -72,6 +72,12 @@ class ExtractRequest(BaseModel):
     s3_object_key: Optional[str] = None
 
 
+class OpportunityMiningRequest(BaseModel):
+    """Parameters for opportunity mining workflow."""
+
+    min_financial_impact: float = 100.0
+
+
 class AgentType(BaseModel):
     agentId: int
     agentType: str
@@ -122,6 +128,52 @@ def rank_suppliers(
     # this setup and lead to attribute errors such as ``'str' object has no
     # attribute 'input_data'`` when the workflow tries to access context fields.
     return orchestrator.execute_workflow("supplier_ranking", {"query": req.query})
+
+
+@router.post("/opportunities")
+def mine_opportunities(
+    req: OpportunityMiningRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    prs = orchestrator.agent_nick.process_routing_service
+    process_id = prs.log_process(
+        process_name="opportunity_mining",
+        process_details=req.model_dump(),
+        process_status=1,
+    )
+    if process_id is None:
+        raise HTTPException(status_code=500, detail="Failed to log process")
+
+    action_id = prs.log_action(
+        process_id=process_id,
+        agent_type="opportunity_miner",
+        action_desc=req.model_dump(),
+        status="started",
+    )
+    try:
+        result = orchestrator.execute_workflow(
+            "opportunity_mining", req.model_dump()
+        )
+        prs.log_action(
+            process_id=process_id,
+            agent_type="opportunity_miner",
+            action_desc=req.model_dump(),
+            process_output=result,
+            status="completed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, 2)
+        return result
+    except Exception as exc:  # pragma: no cover - defensive
+        prs.log_action(
+            process_id=process_id,
+            agent_type="opportunity_miner",
+            action_desc=str(exc),
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, 0)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/extract")

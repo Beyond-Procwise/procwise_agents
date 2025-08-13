@@ -5,7 +5,7 @@ import re
 import uuid
 import os
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import concurrent.futures
 import ollama
 import pdfplumber
@@ -55,6 +55,20 @@ def _normalize_point_id(raw_id: str) -> int | str:
     if raw_id.isdigit():
         return int(raw_id)
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw_id))
+
+
+def _normalize_label(value: Any) -> str:
+    """Return a lowercase label for ``doc_type``/``product_type`` fields.
+
+    Upstream LLM responses may occasionally return lists or other unexpected
+    types.  This helper safely converts those to a deterministic lowercase
+    string so downstream processing is robust.
+    """
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if value is None:
+        return ""
+    return str(value).lower()
 
 
 class DataExtractionAgent(BaseAgent):
@@ -449,8 +463,8 @@ class DataExtractionAgent(BaseAgent):
         data: Dict,
         full_text: str,
         pk_value: str,
-        doc_type: str,
-        product_type: str,
+        doc_type: Any,
+        product_type: Any,
         object_key: str,
     ) -> None:
         """Store document chunks and metadata in the vector database."""
@@ -470,8 +484,8 @@ class DataExtractionAgent(BaseAgent):
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
             payload = {
                 "record_id": pk_value,
-                "document_type": doc_type.lower(),
-                "product_type": product_type.lower(),
+                "document_type": _normalize_label(doc_type),
+                "product_type": _normalize_label(product_type),
                 "s3_key": object_key,
                 "chunk_id": idx,
                 "content": chunk,
