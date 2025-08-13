@@ -3,13 +3,20 @@
 """RAG agent with GPU-optimised retrieval and parallel response generation."""
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 from botocore.exceptions import ClientError
 from qdrant_client import models
 from sentence_transformers import CrossEncoder
+import torch
 
 from .base_agent import BaseAgent
+
+# Ensure GPU variables are set for execution environments that provide CUDA
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+if torch.cuda.is_available():  # pragma: no cover - hardware dependent
+    torch.set_default_device("cuda")
 
 
 class RAGAgent(BaseAgent):
@@ -29,20 +36,31 @@ class RAGAgent(BaseAgent):
 
         history = self._load_chat_history(user_id)
 
-        query_vector = self.agent_nick.embedding_model.encode(query).tolist()
-        # Retrieve more documents for re-ranking and enable fast approximate search
-        search_result = self.agent_nick.qdrant_client.search(
-            collection_name=self.settings.qdrant_collection_name,
-            query_vector=query_vector,
-            limit=top_k * 3,
-            with_payload=True,
-            search_params=models.SearchParams(hnsw_ef=256, exact=False),
-        )
+        # Expand the user's query to improve recall in the vector search stage
+        query_variants = [query] + self._expand_query(query)
+        search_hits = []
+        seen_ids = set()
+        for q in query_variants:
+            q_vec = self.agent_nick.embedding_model.encode(q).tolist()
+            hits = self.agent_nick.qdrant_client.search(
+                collection_name=self.settings.qdrant_collection_name,
+                query_vector=q_vec,
+                limit=top_k * 3,
+                with_payload=True,
+                search_params=models.SearchParams(hnsw_ef=256, exact=False),
+            )
+            for h in hits:
+                if h.id not in seen_ids:
+                    search_hits.append(h)
+                    seen_ids.add(h.id)
 
-        if not search_result:
+        if not search_hits:
             return {"answer": "I could not find any relevant documents to answer your question."}
 
-        reranked = self._rerank(query, search_result, top_k)
+        reranked = self._rerank(query, search_hits, top_k)
+
+        if not reranked:
+            return {"answer": "I could not find any relevant documents to answer your question."}
 
         context = "".join(
             f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
@@ -56,7 +74,8 @@ class RAGAgent(BaseAgent):
 
         rag_prompt = (
             "You are a helpful procurement assistant.\n"
-            "Considering the chat history and the retrieved documents, answer the user's question concisely.\n"
+            "Use only the retrieved documents to answer the user's question. "
+            "If the documents do not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
             "Cite the Document ID for new information you use.\n\n"
             f"CHAT HISTORY:\n{history_context}\n\nRETRIEVED DOCUMENTS:\n{context}\n"
             f"USER QUESTION: {query}\nANSWER:"
@@ -92,7 +111,26 @@ class RAGAgent(BaseAgent):
         ]
         scores = self._reranker.predict(pairs)
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
-        return [hit for hit, _ in ranked[:top_k]]
+        # Filter out obviously irrelevant documents using a neutral score
+        filtered = [hit for hit, score in ranked if score > 0][:top_k]
+        return filtered
+
+    def _expand_query(self, query: str) -> list:
+        """Generate alternative phrasings to boost retrieval recall."""
+        prompt = (
+            "Provide up to three alternate phrasings or related search terms for the "
+            "following procurement question. Return JSON {\"expansions\": [\"...\"]}.\n"
+            f"QUESTION: {query}"
+        )
+        try:  # pragma: no cover - network call
+            resp = self.call_ollama(prompt, model=self.settings.extraction_model, format="json")
+            data = json.loads(resp.get("response", "{}"))
+            expansions = data.get("expansions", [])
+            if isinstance(expansions, list):
+                return [e for e in expansions if isinstance(e, str)]
+        except Exception:
+            pass
+        return []
 
     def _generate_followups(self, query: str, context: str):
         """Generate follow-up questions based on current context."""
