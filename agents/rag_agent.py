@@ -36,10 +36,11 @@ class RAGAgent(BaseAgent):
 
         history = self._load_chat_history(user_id)
 
-        # Expand the user's query to improve recall in the vector search stage
-        query_variants = [query] + self._expand_query(query)
         search_hits = []
         seen_ids = set()
+
+        # Expand the user's query to improve recall in the vector search stage
+        query_variants = [query] + self._expand_query(query)
         for q in query_variants:
             q_vec = self.agent_nick.embedding_model.encode(q).tolist()
             hits = self.agent_nick.qdrant_client.search(

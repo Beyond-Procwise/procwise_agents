@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 
 # Ensure GPU is accessible when available
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault(
+    "SENTENCE_TRANSFORMERS_DEFAULT_DEVICE",
+    "cuda" if torch.cuda.is_available() else "cpu",
+)
 if torch.cuda.is_available():  # pragma: no cover - hardware dependent
     torch.set_default_device("cuda")
 else:  # pragma: no cover - hardware dependent
@@ -148,41 +153,28 @@ class DataExtractionAgent(BaseAgent):
 
         text = self._extract_text(file_bytes, object_key)
         header, line_items = self._extract_structured_data(text)
-        if not header:
-            logger.warning("No header information found in %s", object_key)
-            return None
 
-        doc_type = header.get("doc_type", "Invoice")
-        pk_value = (
-            header.get("invoice_id")
-            or header.get("po_id")
-            or header.get("quote_id")
-        )
-        if not pk_value:
-            logger.error("No primary key found for %s", object_key)
-            return None
+        doc_type = header.get("doc_type") if header else None
+        pk_value = None
+        if header:
+            pk_value = (
+                header.get("invoice_id")
+                or header.get("po_id")
+                or header.get("quote_id")
+            )
 
-        if not header.get("vendor_name"):
-            vendor_guess = self._infer_vendor_name(text, object_key)
-            if vendor_guess:
-                header["vendor_name"] = vendor_guess
+            if not header.get("vendor_name"):
+                vendor_guess = self._infer_vendor_name(text, object_key)
+                if vendor_guess:
+                    header["vendor_name"] = vendor_guess
 
-        if not header.get("supplier_id"):
-            header["supplier_id"] = header.get("vendor_name")
+            if not header.get("supplier_id"):
+                header["supplier_id"] = header.get("vendor_name")
 
-        data = {
-            "header_data": header,
-            "line_items": line_items,
-            "validation": {
-                "is_valid": True,
-                "confidence_score": 1.0,
-                "notes": "llm parser",
-            },
-        }
+        product_type = self._classify_product_type(line_items) if line_items else None
 
-        product_type = self._classify_product_type(line_items)
+        # Always vectorize the raw document text, even when structured parsing fails
         self._vectorize_document(
-            data,
             text,
             pk_value,
             doc_type,
@@ -190,12 +182,26 @@ class DataExtractionAgent(BaseAgent):
             object_key,
         )
 
-        self._persist_to_postgres(header, line_items, doc_type, pk_value)
+        if header and pk_value:
+            data = {
+                "header_data": header,
+                "line_items": line_items,
+                "validation": {
+                    "is_valid": True,
+                    "confidence_score": 1.0,
+                    "notes": "llm parser",
+                },
+            }
+            self._persist_to_postgres(header, line_items, doc_type, pk_value)
+            doc_id = pk_value
+        else:
+            data = None
+            doc_id = pk_value or object_key
 
         return {
             "object_key": object_key,
-            "id": pk_value,
-            "doc_type": doc_type,
+            "id": doc_id,
+            "doc_type": doc_type or "",
             "status": "success",
         }
 
@@ -460,30 +466,30 @@ class DataExtractionAgent(BaseAgent):
 
     def _vectorize_document(
         self,
-        data: Dict,
         full_text: str,
-        pk_value: str,
+        pk_value: str | None,
         doc_type: Any,
         product_type: Any,
         object_key: str,
     ) -> None:
         """Store document chunks and metadata in the vector database."""
         self.agent_nick._initialize_qdrant_collection()
-        summary = self._generate_document_summary(data, pk_value, doc_type)
         chunks = self._chunk_text(full_text)
 
-        # Batch encode the chunks so the GPU can be utilised efficiently instead of
-        # invoking the embedding model for every iteration.  ``SentenceTransformer``
-        # transparently handles batching and will fall back to the CPU if no GPU is
-        # available.
+        # Batch encode the chunks so the GPU can be utilised efficiently.  The
+        # embedding model automatically uses the GPU when available via
+        # ``torch.set_default_device`` above.
         vectors = self.agent_nick.embedding_model.encode(
             chunks, normalize_embeddings=True, show_progress_bar=False
         )
 
+        summary = full_text[:200]
+        record_id = pk_value or object_key
+
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
             payload = {
-                "record_id": pk_value,
+                "record_id": record_id,
                 "document_type": _normalize_label(doc_type),
                 "product_type": _normalize_label(product_type),
                 "s3_key": object_key,
@@ -491,7 +497,7 @@ class DataExtractionAgent(BaseAgent):
                 "content": chunk,
                 "summary": summary,
             }
-            point_id = _normalize_point_id(f"{pk_value}_{idx}")
+            point_id = _normalize_point_id(f"{record_id}_{idx}")
             points.append(
                 models.PointStruct(id=point_id, vector=vector.tolist(), payload=payload)
             )
@@ -515,30 +521,6 @@ class DataExtractionAgent(BaseAgent):
 
         step = max_chars - overlap if max_chars > overlap else max_chars
         return [text[i : i + max_chars] for i in range(0, len(text), step)]
-
-    def _generate_document_summary(self, data: Dict, pk_value: str, doc_type: str) -> str:
-        header = data.get("header_data", {})
-        vendor = header.get("vendor_name", "Unknown Vendor")
-        total = header.get("total_amount", "unknown amount")
-        date = (
-            header.get("invoice_date")
-            or header.get("po_date")
-            or header.get("quote_date")
-            or "unknown date"
-        )
-        items = data.get("line_items", [])[:3]
-        item_summaries = []
-        for item in items:
-            desc = item.get("description") or item.get("item_description") or ""
-            qty = item.get("quantity")
-            price = item.get("unit_price") or item.get("price")
-            snippet = desc[:30].strip()
-            item_summaries.append(f"{snippet} (qty {qty}, price {price})")
-        items_text = "; ".join(item_summaries)
-        return (
-            f"{doc_type} {pk_value} from {vendor} dated {date} for {total}. "
-            f"Items: {items_text}"
-        )
 
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:
         """Best-effort parsing of free-form numeric strings.

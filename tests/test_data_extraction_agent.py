@@ -29,11 +29,12 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
     )
 
     agent = DataExtractionAgent(nick)
-    monkeypatch.setattr(agent, "_generate_document_summary", lambda *a, **k: "summary")
     monkeypatch.setattr(agent, "_chunk_text", lambda text: [text])
 
-    agent._vectorize_document({}, "hello world", "1", ["Invoice"], ["Hardware"], "doc.pdf")
+    agent._vectorize_document("hello world", "1", ["Invoice"], ["Hardware"], "doc.pdf")
 
     payload = captured["points"][0].payload
     assert payload["document_type"] == "invoice"
     assert payload["product_type"] == "hardware"
+    assert payload["record_id"] == "1"
+    assert payload["content"] == "hello world"
