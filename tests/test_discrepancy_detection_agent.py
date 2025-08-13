@@ -6,22 +6,19 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents import discrepancy_detection_agent as dd_module
 from agents.base_agent import AgentContext, AgentStatus
-from psycopg2.errors import InFailedSqlTransaction, UndefinedColumn
+from psycopg2.errors import UndefinedColumn
 
 
 class FakeCursor:
-    def __init__(self, row, raise_undefined=False, conn=None):
+    def __init__(self, row, undefined_cols=None, conn=None):
         self.row = row
-        self.raise_undefined = raise_undefined
+        self.undefined_cols = set(undefined_cols or [])
         self.conn = conn
-        self.calls = 0
 
-    def execute(self, query, params):
-        self.calls += 1
-        if self.raise_undefined and self.calls == 1:
-            raise UndefinedColumn()
-        if self.raise_undefined and self.calls > 1 and not self.conn.rollback_called:
-            raise InFailedSqlTransaction()
+    def execute(self, query, params=None):
+        for col in self.undefined_cols:
+            if col in query:
+                raise UndefinedColumn()
 
     def fetchone(self):
         return self.row
@@ -34,15 +31,17 @@ class FakeCursor:
 
 
 class FakeConn:
-    def __init__(self, row, raise_undefined=False):
+    def __init__(self, row, undefined_cols=None):
         self.rollback_called = False
-        self._cursor = FakeCursor(row, raise_undefined, self)
+        self.rollback_calls = 0
+        self._cursor = FakeCursor(row, undefined_cols, self)
 
     def cursor(self):
         return self._cursor
 
     def rollback(self):
         self.rollback_called = True
+        self.rollback_calls += 1
 
     def __enter__(self):
         return self
@@ -61,12 +60,12 @@ def make_context(doc):
 
 
 def test_fallback_to_vendor_column(monkeypatch):
-    conn = FakeConn(("Acme", "2025-01-01", 100.0), raise_undefined=True)
+    conn = FakeConn(("Acme", "2025-01-01", 100.0), undefined_cols={"vendor_name"})
     agent = build_agent(conn)
     out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
     assert out.status == AgentStatus.SUCCESS
     assert out.data["mismatches"] == []
-    assert conn.rollback_called
+    assert conn.rollback_calls == 1
 
 
 def test_detects_missing_fields(monkeypatch):
@@ -76,3 +75,13 @@ def test_detects_missing_fields(monkeypatch):
     assert out.data["mismatches"][0]["checks"]["vendor_name"] == "missing"
     assert out.data["mismatches"][0]["checks"]["invoice_date"] == "missing"
     assert out.data["mismatches"][0]["checks"]["total_amount"] == "invalid"
+
+
+def test_handles_missing_vendor_columns(monkeypatch):
+    conn = FakeConn(("2025-01-01", 100.0), undefined_cols={"vendor_name", "vendor"})
+    agent = build_agent(conn)
+    out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
+    checks = out.data["mismatches"][0]["checks"]
+    assert checks["vendor_name"] == "missing"
+    assert "db_error" not in checks
+    assert conn.rollback_calls == 2
