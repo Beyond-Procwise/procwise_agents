@@ -40,24 +40,37 @@ class DiscrepancyDetectionAgent(BaseAgent):
                         if doc_type != "Invoice":
                             continue  # Only invoices supported for now
                         try:
-                            cursor.execute(
-                                """
-                                SELECT vendor_name, invoice_date, total_amount
-                                FROM proc.invoice_agent
-                                WHERE invoice_id = %s
-                                """,
-                                (pk,),
+                            try:
+                                cursor.execute(
+                                    """
+                                    SELECT vendor_name, invoice_date, total_amount
+                                    FROM proc.invoice_agent
+                                    WHERE invoice_id = %s
+                                    """,
+                                    (pk,),
+                                )
+                            except errors.UndefinedColumn:
+                                conn.rollback()
+                                cursor.execute(
+                                    """
+                                    SELECT vendor, invoice_date, total_amount
+                                    FROM proc.invoice_agent
+                                    WHERE invoice_id = %s
+                                    """,
+                                    (pk,),
+                                )
+                            row = cursor.fetchone()
+                        except Exception as db_exc:
+                            conn.rollback()
+                            logger.error("DB error during discrepancy check: %s", db_exc)
+                            mismatches.append(
+                                {
+                                    "doc_type": doc_type,
+                                    "id": pk,
+                                    "checks": {"db_error": str(db_exc)},
+                                }
                             )
-                        except errors.UndefinedColumn:
-                            cursor.execute(
-                                """
-                                SELECT vendor, invoice_date, total_amount
-                                FROM proc.invoice_agent
-                                WHERE invoice_id = %s
-                                """,
-                                (pk,),
-                            )
-                        row = cursor.fetchone()
+                            continue
                         if not row:
                             mismatches.append(
                                 {
