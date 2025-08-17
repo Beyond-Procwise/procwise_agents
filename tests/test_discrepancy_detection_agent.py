@@ -56,11 +56,31 @@ def build_agent(conn):
 
 
 def make_context(doc):
-    return AgentContext(workflow_id="w", agent_id="a", user_id="u", input_data={"extracted_docs": [doc]})
+    return AgentContext(
+        workflow_id="w", agent_id="a", user_id="u", input_data={"extracted_docs": [doc]}
+    )
 
 
 def test_fallback_to_vendor_column(monkeypatch):
     conn = FakeConn(("Acme", "2025-01-01", 100.0), undefined_cols={"vendor_name"})
+    agent = build_agent(conn)
+    out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
+    assert out.status == AgentStatus.SUCCESS
+    assert out.data["mismatches"] == []
+    assert conn.rollback_calls == 1
+
+
+def test_fallback_to_amount_column(monkeypatch):
+    conn = FakeConn(("Acme", "2025-01-01", 100.0), undefined_cols={"total_amount"})
+    agent = build_agent(conn)
+    out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
+    assert out.status == AgentStatus.SUCCESS
+    assert out.data["mismatches"] == []
+    assert conn.rollback_calls == 1
+
+
+def test_fallback_to_date_column(monkeypatch):
+    conn = FakeConn(("Acme", "2025-01-01", 100.0), undefined_cols={"invoice_date"})
     agent = build_agent(conn)
     out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
     assert out.status == AgentStatus.SUCCESS
@@ -85,3 +105,13 @@ def test_handles_missing_vendor_columns(monkeypatch):
     assert checks["vendor_name"] == "missing"
     assert "db_error" not in checks
     assert conn.rollback_calls == 2
+
+
+def test_handles_missing_date_columns(monkeypatch):
+    conn = FakeConn(("Acme", 100.0), undefined_cols={"invoice_date", "invoice_dt", "date"})
+    agent = build_agent(conn)
+    out = agent.run(make_context({"doc_type": "Invoice", "id": "1"}))
+    checks = out.data["mismatches"][0]["checks"]
+    assert checks["invoice_date"] == "missing"
+    assert "db_error" not in checks
+    assert conn.rollback_calls == 3
