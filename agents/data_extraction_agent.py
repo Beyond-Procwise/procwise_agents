@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import concurrent.futures
 import ollama
 import pdfplumber
+import pandas as pd
 try:  # PyMuPDF is optional; handled gracefully if unavailable
     import fitz  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -152,24 +153,28 @@ class DataExtractionAgent(BaseAgent):
             return None
 
         text = self._extract_text(file_bytes, object_key)
-        header, line_items = self._extract_structured_data(text)
 
-        doc_type = header.get("doc_type") if header else None
-        pk_value = None
-        if header:
+        # Determine the document type up-front so downstream logic can be
+        # content-aware.  Only purchase orders and invoices are structured; all
+        # other documents are merely vectorized for retrieval.
+        doc_type = self._classify_doc_type(text)
+
+        if doc_type in {"Purchase_Order", "Invoice"}:
+            header, line_items = self._extract_structured_data(text, file_bytes)
+            header["doc_type"] = doc_type
             pk_value = (
                 header.get("invoice_id")
                 or header.get("po_id")
                 or header.get("quote_id")
             )
-
             if not header.get("vendor_name"):
                 vendor_guess = self._infer_vendor_name(text, object_key)
                 if vendor_guess:
                     header["vendor_name"] = vendor_guess
-
             if not header.get("supplier_id"):
                 header["supplier_id"] = header.get("vendor_name")
+        else:
+            header, line_items, pk_value = {"doc_type": doc_type}, [], None
 
         product_type = self._classify_product_type(line_items) if line_items else None
 
@@ -209,31 +214,75 @@ class DataExtractionAgent(BaseAgent):
     # Helpers
     # ------------------------------------------------------------------
     def _extract_text_from_pdf(self, file_bytes: bytes) -> str:
-        """Extract text using pdfplumber with a PyMuPDF fallback.
+        """Extract text from PDF files with OCR and table awareness.
 
-        pdfplumber provides high quality layout aware extraction but can be
-        slow or fail on certain documents.  PyMuPDF is considerably faster and
-        therefore used as a fallback whenever pdfplumber returns no text or
-        raises an exception.
+        The routine first attempts layout aware extraction using
+        :mod:`pdfplumber`.  When a page contains no embedded text (e.g. a
+        scanned image) an OCR fallback via ``pytesseract`` is used.  Word level
+        coordinates are leveraged to separate left/right columns so that the
+        reading order is preserved for common two column layouts.  Basic table
+        extraction is also performed and appended line-wise to the output.
         """
-        text = ""
+
+        lines: List[str] = []
+
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                for page in pdf.pages:
+                    # Group words by their vertical position and side of page
+                    words = page.extract_words() or []
+                    row_dict: Dict[float, Dict[str, List[str]]] = {}
+                    for word in words:
+                        row_y = round(word["top"], 0)
+                        x_center = (word["x0"] + word["x1"]) / 2
+                        if row_y not in row_dict:
+                            row_dict[row_y] = {"left": [], "right": []}
+                        side = "left" if x_center < page.width / 2 else "right"
+                        row_dict[row_y][side].append(word["text"])
+
+                    if row_dict:
+                        for y in sorted(row_dict.keys()):
+                            left_text = " ".join(row_dict[y]["left"]).strip()
+                            right_text = " ".join(row_dict[y]["right"]).strip()
+                            if right_text:
+                                lines.append(f"{left_text} | {right_text}".strip())
+                            elif left_text:
+                                lines.append(left_text)
+
+                        # Append any detected tables as additional lines
+                        for table in page.extract_tables() or []:
+                            for row in table:
+                                row_text = " ".join(cell or "" for cell in row).strip()
+                                if row_text:
+                                    lines.append(row_text)
+                    else:
+                        # OCR fallback for scanned pages
+                        if Image is not None and pytesseract is not None:
+                            try:
+                                page_image = page.to_image(resolution=300).original
+                                ocr_text = pytesseract.image_to_string(page_image)
+                                lines.extend(
+                                    ln.strip() for ln in ocr_text.splitlines() if ln.strip()
+                                )
+                            except Exception as ocr_exc:  # pragma: no cover - defensive
+                                logger.warning("OCR failed: %s", ocr_exc)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("pdfplumber failed: %s", exc)
 
-        if not text.strip() and fitz is not None:
+        # Fallback to PyMuPDF if pdfplumber produced nothing
+        if not lines and fitz is not None:
             try:
                 with fitz.open(stream=file_bytes, filetype="pdf") as doc:
                     text = "\n".join(page.get_text() for page in doc)
+                    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("PyMuPDF failed extracting text: %s", exc)
                 return ""
-        elif not text.strip():
+        elif not lines:
             logger.warning("No text extracted from PDF; PyMuPDF not installed")
             return ""
-        return text
+
+        return "\n".join(lines)
 
     def _extract_text_from_docx(self, file_bytes: bytes) -> str:
         """Extract text from DOCX files using python-docx when available."""
@@ -403,10 +452,72 @@ class DataExtractionAgent(BaseAgent):
                 return token
         return ""
 
-    def _extract_structured_data(self, text: str) -> Tuple[Dict[str, str], List[Dict]]:
-        """Parse header and line items from raw text."""
+    def _extract_line_items_from_pdf_tables(
+        self, file_bytes: bytes, doc_type: str
+    ) -> List[Dict]:
+        """Extract line items by parsing tabular data directly from the PDF."""
+        if pdfplumber is None:
+            return []
+        line_items: List[Dict] = []
+        column_synonyms = {
+            "item_id": ["item", "sku", "part", "product code"],
+            "item_description": ["description", "item description"],
+            "quantity": ["qty", "quantity"],
+            "unit_price": ["unit price", "price", "rate", "unit cost"],
+            "unit_of_measure": ["unit", "uom"],
+            "currency": ["currency"],
+            "line_total": ["line total", "amount", "total"],
+            "tax_percent": ["tax %", "tax percent", "tax rate"],
+            "tax_amount": ["tax", "tax amount"],
+            "total_amount": ["total", "total amount", "total with tax"],
+            "total_with_tax": ["total with tax"],
+        }
+        try:
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    for table in page.extract_tables() or []:
+                        df = pd.DataFrame(table).dropna(how="all")
+                        if df.empty:
+                            continue
+                        header = (
+                            df.iloc[0]
+                            .fillna("")
+                            .astype(str)
+                            .str.lower()
+                            .str.strip()
+                            .tolist()
+                        )
+                        col_map: Dict[int, str] = {}
+                        for idx, col in enumerate(header):
+                            for field, syns in column_synonyms.items():
+                                if any(syn in col for syn in syns):
+                                    col_map[idx] = field
+                                    break
+                        if len(col_map) < 2:
+                            continue
+                        for _, row in df.iloc[1:].iterrows():
+                            item: Dict[str, Any] = {}
+                            for idx, field in col_map.items():
+                                val = row.iloc[idx]
+                                if isinstance(val, str):
+                                    val = val.strip()
+                                if val not in (None, ""):
+                                    item[field] = val
+                            if item:
+                                line_items.append(item)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Table extraction failed: %s", exc)
+        return line_items
+
+    def _extract_structured_data(
+        self, text: str, file_bytes: bytes
+    ) -> Tuple[Dict[str, str], List[Dict]]:
+        """Parse header and line items from raw text and PDF tables."""
         header = self._parse_header(text)
-        line_items = self._extract_line_items(text, header.get("doc_type", "Invoice"))
+        doc_type = header.get("doc_type", "Invoice")
+        line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+        if not line_items:
+            line_items = self._extract_line_items(text, doc_type)
         return header, line_items
 
     def _extract_line_items(self, text: str, doc_type: str) -> List[Dict]:
