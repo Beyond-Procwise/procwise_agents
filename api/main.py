@@ -15,6 +15,7 @@ from agents.supplier_ranking_agent import SupplierRankingAgent
 from agents.quote_evaluation_agent import QuoteEvaluationAgent
 from agents.opportunity_miner_agent import OpportunityMinerAgent
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
+from agents.email_drafting_agent import EmailDraftingAgent
 from api.routers import workflows, system
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -36,6 +37,7 @@ async def lifespan(app: FastAPI):
             'opportunity_miner': OpportunityMinerAgent(agent_nick),
             'discrepancy_detection': discrepancy_agent,
             'DiscrepancyDetectionAgent': discrepancy_agent,
+            'email_drafting': EmailDraftingAgent(agent_nick),
         }
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)

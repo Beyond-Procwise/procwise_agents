@@ -76,9 +76,11 @@ def test_pipeline_answer_returns_documents(monkeypatch):
                                   put_object=lambda **_: None),
         settings=SimpleNamespace(qdrant_collection_name="c", s3_bucket_name="b", reranker_model="x"),
         embedding_model=DummyEmbed(),
-        qdrant_client=DummyQdrant(),
+        qdrant_client=SimpleNamespace(
+            search=lambda **_: [SimpleNamespace(id="1", payload={"record_id": "R1", "summary": "s"}, score=1.0)]
+        ),
         ollama_options=lambda: {},
     )
-    pipeline = RAGPipeline(nick)
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("q", "user")
     assert result["retrieved_documents"][0]["record_id"] == "R1"

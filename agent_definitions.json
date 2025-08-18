@@ -22,5 +22,11 @@
     "agentType": "DiscrepancyDetectionAgent",
     "description": "Detects missing or inconsistent fields in extracted documents.",
     "dependencies": ["db_client"]
+  },
+  {
+    "agentId": 5,
+    "agentType": "EmailDraftingAgent",
+    "description": "Drafts and sends emails via Amazon SES.",
+    "dependencies": ["prompt_engine"]
   }
 ]
