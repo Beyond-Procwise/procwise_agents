@@ -24,6 +24,15 @@ class Settings(BaseSettings):
         default="ProcWise_document_embeddings", env="QDRANT_COLLECTION_NAME"
     )
 
+    # Email settings
+    ses_smtp_user: str = Field(..., env="SES_SMTP_USER")
+    ses_smtp_password: str = Field(..., env="SES_SMTP_PASSWORD")
+    ses_smtp_endpoint: str = Field(
+        default="email-smtp.eu-west-1.amazonaws.com", env="SES_SMTP_ENDPOINT"
+    )
+    ses_smtp_port: int = Field(default=587, env="SES_SMTP_PORT")
+    ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
+
     extraction_model: str = "mistral"
     embedding_model: str = "all-roberta-large-v1"
     vector_size: int = 1024

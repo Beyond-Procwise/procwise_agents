@@ -9,6 +9,7 @@ from io import BytesIO
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional
 from sentence_transformers import CrossEncoder
+from typing import Type
 from config.settings import settings
 from qdrant_client import models
 from .rag_service import RAGService
@@ -48,14 +49,14 @@ class ChatHistoryManager:
 
 
 class RAGPipeline:
-    def __init__(self, agent_nick):
+    def __init__(self, agent_nick, cross_encoder_cls: Type[CrossEncoder] = CrossEncoder):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         self.default_llm_model = settings.extraction_model
         self.rag = RAGService(agent_nick)
         model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
+        self._reranker = cross_encoder_cls(model_name, device=self.agent_nick.device)
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
         """Return extracted text for each uploaded PDF."""
