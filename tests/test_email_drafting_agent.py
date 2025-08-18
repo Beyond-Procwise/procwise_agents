@@ -22,8 +22,14 @@ def test_email_drafting_agent(monkeypatch):
 
     sent = {}
 
-    def fake_send(subject, body, recipient, sender):
-        sent.update({'subject': subject, 'body': body, 'recipient': recipient, 'sender': sender})
+    def fake_send(subject, body, recipient, sender, attachments=None):
+        sent.update({
+            'subject': subject,
+            'body': body,
+            'recipient': recipient,
+            'sender': sender,
+            'attachments': attachments,
+        })
         return True
 
     monkeypatch.setattr(agent.email_service, 'send_email', fake_send)
@@ -32,10 +38,16 @@ def test_email_drafting_agent(monkeypatch):
         workflow_id='wf1',
         agent_id='email_drafting',
         user_id='u1',
-        input_data={'prompt': 'hi', 'subject': 'Sub', 'recipient': 'to@example.com'},
+        input_data={
+            'prompt': 'hi',
+            'subject': 'Sub',
+            'recipient': 'to@example.com',
+            'attachments': [(b'data', 'file.txt')],
+        },
     )
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert sent['body'] == 'draft'
     assert sent['subject'] == 'Sub'
+    assert sent['attachments'] == [(b'data', 'file.txt')]

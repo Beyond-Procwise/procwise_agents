@@ -36,6 +36,7 @@ class EmailDraftingAgent(BaseAgent):
         sender = context.input_data.get(
             "sender", self.agent_nick.settings.ses_default_sender
         )
+        attachments = context.input_data.get("attachments")
 
         if not recipient:
             return AgentOutput(
@@ -48,6 +49,17 @@ class EmailDraftingAgent(BaseAgent):
             response = self.call_ollama(prompt=prompt)
             body = response.get("response", "")
 
-        success = self.email_service.send_email(subject, body or "", recipient, sender)
+        success = self.email_service.send_email(
+            subject, body or "", recipient, sender, attachments
+        )
         status = AgentStatus.SUCCESS if success else AgentStatus.FAILED
-        return AgentOutput(status=status, data={"subject": subject, "body": body, "recipient": recipient, "sender": sender})
+        return AgentOutput(
+            status=status,
+            data={
+                "subject": subject,
+                "body": body,
+                "recipient": recipient,
+                "sender": sender,
+                "attachments": attachments,
+            },
+        )
