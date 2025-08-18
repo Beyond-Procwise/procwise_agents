@@ -1,11 +1,7 @@
-# ProcWise/agents/rag_agent.py
-
-"""RAG agent with GPU-optimised retrieval and parallel response generation."""
 
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-
 from botocore.exceptions import ClientError
 from qdrant_client import models
 from sentence_transformers import CrossEncoder
@@ -75,10 +71,12 @@ class RAGAgent(BaseAgent):
 
         rag_prompt = (
             "You are a helpful procurement assistant.\n"
-            "Use only the retrieved documents to answer the user's question. "
-            "If the documents do not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
+            "You have access to a large set of procurement documents.\n"
+            "Answer the user's question based on the provided context.\n"
+            "If the context contains relevant information, provide a concise answer.\n"
+            "If the context does not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
             "Cite the Document ID for new information you use.\n\n"
-            f"CHAT HISTORY:\n{history_context}\n\nRETRIEVED DOCUMENTS:\n{context}\n"
+            f"CHAT HISTORY:\n{history_context}\n\nRETRIEVED CONTENT:\n{context}\n"
             f"USER QUESTION: {query}\nANSWER:"
         )
 
