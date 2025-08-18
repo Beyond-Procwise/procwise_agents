@@ -20,8 +20,9 @@ class Settings(BaseSettings):
 
     qdrant_url: str = Field(..., env="QDRANT_URL")
     qdrant_api_key: str = Field(..., env="QDRANT_API_KEY")
-    # --- THIS IS THE SINGLE SOURCE OF TRUTH. A NEW NAME TO GUARANTEE A FRESH START. ---
-    qdrant_collection_name: str = "ProcWise_document_embeddings"
+    qdrant_collection_name: str = Field(
+        default="ProcWise_document_embeddings", env="QDRANT_COLLECTION_NAME"
+    )
 
     extraction_model: str = "mistral"
     embedding_model: str = "all-roberta-large-v1"
