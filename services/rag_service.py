@@ -95,6 +95,12 @@ class RAGService:
                 search_params=exact_params,
             )
         if not hits:
+            limit=top_k * 3,
+            with_payload=True,
+            with_vectors=False,
+            search_params=models.SearchParams(hnsw_ef=256, exact=False),
+        )
+        if not hits:
             return []
         pairs = [
             (query, h.payload.get("content", h.payload.get("summary", "")))
