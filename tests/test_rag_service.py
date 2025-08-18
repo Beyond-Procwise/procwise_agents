@@ -22,11 +22,16 @@ class DummyEmbed:
 class DummyQdrant:
     def __init__(self):
         self.upserts = []
+        self.search_calls = []
 
     def upsert(self, **kwargs):
         self.upserts.append(kwargs)
 
     def search(self, **kwargs):
+        self.search_calls.append(kwargs)
+        # Return empty list first to trigger exact search fallback
+        if len(self.search_calls) == 1:
+            return []
         hit = SimpleNamespace(id="1", payload={"record_id": "R1", "content": "doc"}, score=1.0)
         return [hit]
 
@@ -47,6 +52,9 @@ def test_upsert_and_search():
     assert nick.qdrant_client.upserts  # ensure upsert called
     hits = rag.search("query")
     assert hits[0].payload["record_id"] == "R1"
+    # ensure fallback search executed
+    assert nick.qdrant_client.search_calls[0]["search_params"].exact is False
+    assert nick.qdrant_client.search_calls[1]["search_params"].exact is True
 
 
 def test_pipeline_answer_returns_documents(monkeypatch):

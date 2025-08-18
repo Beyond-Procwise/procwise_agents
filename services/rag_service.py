@@ -73,10 +73,28 @@ class RAGService:
         query_vec = self.embedder.encode(
             query, normalize_embeddings=True
         ).tolist()
+        search_params = models.SearchParams(hnsw_ef=256, exact=False)
         hits = self.client.search(
             collection_name=self.settings.qdrant_collection_name,
             query_vector=query_vec,
             query_filter=filters,
+            limit=top_k * 5,
+            with_payload=True,
+            with_vectors=False,
+            search_params=search_params,
+        )
+        if not hits:
+            exact_params = models.SearchParams(hnsw_ef=256, exact=True)
+            hits = self.client.search(
+                collection_name=self.settings.qdrant_collection_name,
+                query_vector=query_vec,
+                query_filter=filters,
+                limit=top_k * 5,
+                with_payload=True,
+                with_vectors=False,
+                search_params=exact_params,
+            )
+        if not hits:
             limit=top_k * 3,
             with_payload=True,
             with_vectors=False,
@@ -89,5 +107,7 @@ class RAGService:
             for h in hits
         ]
         scores = self._reranker.predict(pairs)
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         return [h for h, _ in ranked[:top_k]]
