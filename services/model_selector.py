@@ -2,15 +2,23 @@
 
 import json
 import logging
+import os
 import ollama
 import pdfplumber
 from io import BytesIO
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional
+
+from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is utilised when available
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 
 
 class ChatHistoryManager:
@@ -45,6 +53,8 @@ class RAGPipeline:
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         self.default_llm_model = settings.extraction_model
+        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> str:
         """Extracts text from uploaded PDF files."""
@@ -58,6 +68,18 @@ class RAGPipeline:
             except Exception as e:
                 logger.error(f"Failed to process uploaded file {filename}: {e}")
         return "\n\n".join(ad_hoc_context)
+
+    def _rerank_search(self, query: str, hits: List, top_k: int = 5):
+        """Re-rank search hits using a cross-encoder for improved accuracy."""
+        if not hits:
+            return []
+        pairs = [
+            (query, h.payload.get("summary", h.payload.get("content", "")))
+            for h in hits
+        ]
+        scores = self._reranker.predict(pairs)
+        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+        return [h for h, _ in ranked[:top_k]]
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
@@ -74,9 +96,13 @@ class RAGPipeline:
                 model=model,
                 messages=messages,
                 options=self.agent_nick.ollama_options(),
+                format="json",
             )
-            content = response.get("message", {}).get("content", "{}")
+            content = response.get("message", {}).get("content", "")
             return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON response: {e}")
+            return {"answer": content.strip() or "Could not generate an answer.", "follow_ups": []}
         except Exception as e:
             logger.error(f"Error generating answer: {e}")
             return {"answer": "Could not generate an answer.", "follow_ups": []}
@@ -107,6 +133,7 @@ class RAGPipeline:
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
         # --- Retrieve from Vector DB using the unified collection name ---
+        top_k = 5
         query_vector = self.agent_nick.embedding_model.encode(
             query, normalize_embeddings=True
         ).tolist()
@@ -114,11 +141,13 @@ class RAGPipeline:
             collection_name=self.settings.qdrant_collection_name,
             query_vector=query_vector,
             query_filter=qdrant_filter,
-            limit=5,
-            score_threshold=0.6,
+            limit=top_k * 3,
             with_payload=True,
             with_vectors=False,
+            search_params=models.SearchParams(hnsw_ef=256, exact=False),
+            score_threshold=0.6,
         )
+        reranked = self._rerank_search(query, search_results, top_k)
         retrieved_context = "\n---\n".join(
             [
                 (
@@ -126,9 +155,9 @@ class RAGPipeline:
                     f"{hit.payload.get('record_id', hit.id)}\n"
                     f"Summary: {hit.payload.get('summary', hit.payload.get('content', ''))}"
                 )
-                for hit in search_results
+                for hit in reranked
             ]
-        ) if search_results else "No relevant documents found."
+        ) if reranked else "No relevant documents found."
 
         # --- Process Uploaded Files & Chat History ---
         ad_hoc_context = self._extract_text_from_uploads(files) if files else ""
@@ -158,6 +187,8 @@ class RAGPipeline:
         # --- Save History to S3 ---
         history.append({"query": query, "answer": answer})
         self.history_manager.save_history(user_id, history)
-
-        return {"answer": answer, "follow_ups": follow_ups,
-                "retrieved_documents": [hit.payload for hit in search_results]}
+        return {
+            "answer": answer,
+            "follow_ups": follow_ups,
+            "retrieved_documents": [hit.payload for hit in reranked],
+        }
