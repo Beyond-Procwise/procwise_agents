@@ -8,7 +8,7 @@ import pdfplumber
 from io import BytesIO
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional
-
+from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
 from .rag_service import RAGService
@@ -54,6 +54,8 @@ class RAGPipeline:
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         self.default_llm_model = settings.extraction_model
         self.rag = RAGService(agent_nick)
+        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
         """Return extracted text for each uploaded PDF."""
@@ -69,6 +71,18 @@ class RAGPipeline:
             except Exception as e:
                 logger.error(f"Failed to process uploaded file {filename}: {e}")
         return results
+
+    def _rerank_search(self, query: str, hits: List, top_k: int = 5):
+        """Re-rank search hits using a cross-encoder for improved accuracy."""
+        if not hits:
+            return []
+        pairs = [
+            (query, h.payload.get("summary", h.payload.get("content", "")))
+            for h in hits
+        ]
+        scores = self._reranker.predict(pairs)
+        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+        return [h for h, _ in ranked[:top_k]]
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
@@ -135,6 +149,22 @@ class RAGPipeline:
         # --- Retrieve from Vector DB ---
         top_k = 5
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
+        # --- Retrieve from Vector DB using the unified collection name ---
+        top_k = 5
+        query_vector = self.agent_nick.embedding_model.encode(
+            query, normalize_embeddings=True
+        ).tolist()
+        search_results = self.agent_nick.qdrant_client.search(
+            collection_name=self.settings.qdrant_collection_name,
+            query_vector=query_vector,
+            query_filter=qdrant_filter,
+            limit=top_k * 3,
+            with_payload=True,
+            with_vectors=False,
+            search_params=models.SearchParams(hnsw_ef=256, exact=False),
+            score_threshold=0.6,
+        )
+        reranked = self._rerank_search(query, search_results, top_k)
         retrieved_context = "\n---\n".join(
             [
                 (
