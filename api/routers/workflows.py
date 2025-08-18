@@ -267,6 +267,37 @@ async def draft_email(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Email drafting endpoint
+# ---------------------------------------------------------------------------
+@router.post("/email")
+async def draft_email(
+    subject: str = Form(...),
+    recipient: str = Form(...),
+    sender: Optional[str] = Form(None),
+    body: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Draft and send an email using the EmailDraftingAgent."""
+    attachments: List[tuple[bytes, str]] = []
+    if files:
+        for file in files:
+            attachments.append((await file.read(), file.filename))
+    input_data = {
+        "subject": subject,
+        "recipient": recipient,
+        "sender": sender,
+        "body": body,
+    }
+    if attachments:
+        input_data["attachments"] = attachments
+    result = await run_in_threadpool(
+        orchestrator.execute_workflow, "email_drafting", input_data
+    )
+    return result
+
+
 @router.get(
     "/types",
     response_model=List[AgentType],
