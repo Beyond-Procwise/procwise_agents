@@ -8,10 +8,10 @@ import pdfplumber
 from io import BytesIO
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional
-
 from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
+from .rag_service import RAGService
 
 logger = logging.getLogger(__name__)
 
@@ -53,21 +53,24 @@ class RAGPipeline:
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         self.default_llm_model = settings.extraction_model
+        self.rag = RAGService(agent_nick)
         model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
         self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
 
-    def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> str:
-        """Extracts text from uploaded PDF files."""
-        ad_hoc_context = []
+    def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
+        """Return extracted text for each uploaded PDF."""
+        results: List[tuple[str, str]] = []
         for content_bytes, filename in files:
             try:
                 if filename.lower().endswith('.pdf'):
                     with pdfplumber.open(BytesIO(content_bytes)) as pdf:
-                        text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
-                        ad_hoc_context.append(f"--- Content from uploaded file: {filename} ---\n{text}")
+                        text = "\n".join(
+                            page.extract_text() for page in pdf.pages if page.extract_text()
+                        )
+                        results.append((filename, text))
             except Exception as e:
                 logger.error(f"Failed to process uploaded file {filename}: {e}")
-        return "\n\n".join(ad_hoc_context)
+        return results
 
     def _rerank_search(self, query: str, hits: List, top_k: int = 5):
         """Re-rank search hits using a cross-encoder for improved accuracy."""
@@ -132,6 +135,20 @@ class RAGPipeline:
             )
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
+        # --- Process Uploaded Files ---
+        uploaded = self._extract_text_from_uploads(files) if files else []
+        ad_hoc_context = []
+        for fname, text in uploaded:
+            ad_hoc_context.append(f"--- Content from uploaded file: {fname} ---\n{text}")
+            meta = {"record_id": fname, "document_type": doc_type or "uploaded"}
+            if product_type:
+                meta["product_type"] = product_type.lower()
+            self.rag.upsert_texts([text], meta)
+        ad_hoc_context = "\n\n".join(ad_hoc_context)
+
+        # --- Retrieve from Vector DB ---
+        top_k = 5
+        reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
         # --- Retrieve from Vector DB using the unified collection name ---
         top_k = 5
         query_vector = self.agent_nick.embedding_model.encode(
@@ -159,8 +176,7 @@ class RAGPipeline:
             ]
         ) if reranked else "No relevant documents found."
 
-        # --- Process Uploaded Files & Chat History ---
-        ad_hoc_context = self._extract_text_from_uploads(files) if files else ""
+        # --- Chat History ---
         history = self.history_manager.get_history(user_id)
         history_context = "\n".join([f"Q: {h['query']}\nA: {h['answer']}" for h in history])
 
