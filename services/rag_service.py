@@ -99,7 +99,7 @@ class RAGService:
             with_payload=True,
             with_vectors=False,
             search_params=models.SearchParams(hnsw_ef=256, exact=False),
-        )
+
         if not hits:
             return []
         pairs = [
