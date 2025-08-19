@@ -78,6 +78,13 @@ class OpportunityMiningRequest(BaseModel):
     min_financial_impact: float = 100.0
 
 
+class QuoteEvaluationRequest(BaseModel):
+    """Input parameters for quote evaluation workflow."""
+
+    supplier_names: Optional[List[str]] = None
+    product_category: Optional[str] = None
+
+
 class AgentType(BaseModel):
     agentId: int
     agentType: str
@@ -128,6 +135,15 @@ def rank_suppliers(
     # this setup and lead to attribute errors such as ``'str' object has no
     # attribute 'input_data'`` when the workflow tries to access context fields.
     return orchestrator.execute_workflow("supplier_ranking", {"query": req.query})
+
+
+@router.post("/quotes/evaluate")
+def evaluate_quotes(
+    req: QuoteEvaluationRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Evaluate and compare supplier quotes."""
+    return orchestrator.execute_workflow("quote_evaluation", req.model_dump())
 
 
 @router.post("/opportunities")
