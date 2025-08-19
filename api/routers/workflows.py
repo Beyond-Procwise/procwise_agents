@@ -232,8 +232,8 @@ async def extract_documents(
             )
             prs.update_process_status(process_id, 0)
 
-asyncio.create_task(run_flow())
-return {"status": "process started", "process_id": process_id}
+    asyncio.create_task(run_flow())
+    return {"status": "process started", "process_id": process_id}
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +259,8 @@ async def draft_email(
         "sender": sender,
         "body": body,
     }
-    if attachments:
-        input_data["attachments"] = attachments
+    # if attachments:
+    #     input_data["attachments"] = attachments
     result = await run_in_threadpool(
         orchestrator.execute_workflow, "email_drafting", input_data
     )

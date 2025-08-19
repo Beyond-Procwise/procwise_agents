@@ -125,9 +125,9 @@ class OpportunityMinerAgent(BaseAgent):
         "purchase_orders": "proc.purchase_order_agent",
         "invoices": "proc.invoice_agent",
         "contracts": "proc.contracts",
-        "price_benchmarks": "price_benchmarks",
-        "indices": "indices",
-        "shipments": "shipments",
+        # "price_benchmarks": "price_benchmarks",
+        # "indices": "indices",
+        # "shipments": "shipments",
         "supplier_master": "proc.supplier",
     }
     TABLES = list(TABLE_MAP.keys())
