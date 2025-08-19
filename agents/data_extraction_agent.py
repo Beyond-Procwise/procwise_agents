@@ -459,19 +459,31 @@ class DataExtractionAgent(BaseAgent):
         if pdfplumber is None:
             return []
         line_items: List[Dict] = []
-        column_synonyms = {
-            "item_id": ["item", "sku", "part", "product code"],
-            "item_description": ["description", "item description"],
-            "quantity": ["qty", "quantity"],
-            "unit_price": ["unit price", "price", "rate", "unit cost"],
-            "unit_of_measure": ["unit", "uom"],
-            "currency": ["currency"],
-            "line_total": ["line total", "amount", "total"],
-            "tax_percent": ["tax %", "tax percent", "tax rate"],
-            "tax_amount": ["tax", "tax amount"],
-            "total_amount": ["total", "total amount", "total with tax"],
-            "total_with_tax": ["total with tax"],
-        }
+        if doc_type == "Invoice":
+            column_synonyms = {
+                "item_id": ["item", "sku", "part", "product code"],
+                "item_description": ["description", "item description"],
+                "quantity": ["qty", "quantity"],
+                "unit_price": ["unit price", "price", "rate", "unit cost"],
+                "unit_of_measure": ["unit", "uom"],
+                "line_amount": ["line total", "line amount", "amount", "total"],
+                "tax_percent": ["tax %", "tax percent", "tax rate"],
+                "tax_amount": ["tax", "tax amount"],
+                "total_amount_incl_tax": ["total amount incl tax", "total with tax"],
+            }
+        else:  # Purchase orders and others
+            column_synonyms = {
+                "item_id": ["item", "sku", "part", "product code"],
+                "item_description": ["description", "item description"],
+                "quantity": ["qty", "quantity"],
+                "unit_price": ["unit price", "price", "rate", "unit cost"],
+                "unit_of_measure": ["unit", "uom"],
+                "currency": ["currency"],
+                "line_total": ["line total", "amount", "total"],
+                "tax_percent": ["tax %", "tax percent", "tax rate"],
+                "tax_amount": ["tax", "tax amount"],
+                "total_amount": ["total", "total amount", "total with tax"],
+            }
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
@@ -526,8 +538,8 @@ class DataExtractionAgent(BaseAgent):
             prompt = (
                 "Extract line items from the following invoice. "
                 "Return JSON with a list under the key 'line_items' where each item has "
-                "line_no, item_id, quantity, unit_price, tax_percent, line_total, "
-                "tax_amount and total_with_tax.\n"
+                "line_no, item_id, item_description, quantity, unit_of_measure, unit_price, "
+                "line_amount, tax_percent, tax_amount, total_amount_incl_tax.\n"
                 f"Text:\n{text[:4000]}"
             )
         elif doc_type == "Purchase_Order":
@@ -535,7 +547,7 @@ class DataExtractionAgent(BaseAgent):
                 "Extract line items from the following purchase order. "
                 "Return JSON with a list under the key 'line_items' where each item has "
                 "line_number, item_id, item_description, quantity, unit_price, "
-                "unit_of_measue, currency, line_total, tax_percent, tax_amount, "
+                "unit_of_measure, currency, line_total, tax_percent, tax_amount, "
                 "total_amount.\n"
                 f"Text:\n{text[:4000]}"
             )
@@ -826,7 +838,7 @@ class DataExtractionAgent(BaseAgent):
         header: Dict[str, str],
     ) -> None:
         table_map = {
-            "Invoice": ("proc", "invoice_line_items", "invoice_id", "line_no"),
+            "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
             "Purchase_Order": (
                 "proc",
                 "po_line_items_agent",
@@ -837,12 +849,14 @@ class DataExtractionAgent(BaseAgent):
         field_map = {
             "Invoice": [
                 "item_id",
+                "item_description",
                 "quantity",
+                "unit_of_measure",
                 "unit_price",
+                "line_amount",
                 "tax_percent",
-                "line_total",
                 "tax_amount",
-                "total_with_tax",
+                "total_amount_incl_tax",
             ],
             "Purchase_Order": [
                 "item_id",
@@ -877,7 +891,9 @@ class DataExtractionAgent(BaseAgent):
                     "tax_percent",
                     "tax_amount",
                     "line_total",
+                    "line_amount",
                     "total_with_tax",
+                    "total_amount_incl_tax",
                     "total_amount",
                 }
                 for idx, item in enumerate(line_items, start=1):
@@ -886,8 +902,12 @@ class DataExtractionAgent(BaseAgent):
                     if line_value in (None, ""):
                         line_value = idx
                     payload = {fk_col: pk_value, line_no_col: line_value}
-                    if doc_type == "Invoice" and "po_id" in columns and header.get("po_id"):
-                        payload["po_id"] = header.get("po_id")
+                    if doc_type == "Invoice":
+                        if "po_id" in columns and header.get("po_id"):
+                            payload["po_id"] = header.get("po_id")
+                        for extra in ["delivery_date", "country", "region"]:
+                            if extra in columns and header.get(extra):
+                                payload[extra] = header.get(extra)
                     for key in fields:
                         if key in payload:
                             continue
