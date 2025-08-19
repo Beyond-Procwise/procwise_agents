@@ -1,5 +1,4 @@
 import os
-import os
 import sys
 from types import SimpleNamespace
 
@@ -25,14 +24,7 @@ def test_opportunity_miner_returns_findings(monkeypatch):
     # Avoid file system writes during tests
     monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
     monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    monkeypatch.setattr(
-        agent,
-        "_ingest_data",
-        lambda: {
-            **agent._mock_data(),
-            "invoices": agent._mock_data()["invoices"].assign(contract_id="CT1"),
-        },
-    )
+    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
 
     context = AgentContext(
         workflow_id="wf1",
@@ -45,3 +37,25 @@ def test_opportunity_miner_returns_findings(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     assert output.data["opportunity_count"] >= 0
     assert isinstance(output.data["findings"], list)
+
+
+def test_opportunity_miner_handles_missing_columns(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+
+    mock_tables = agent._mock_data()
+    mock_tables["purchase_orders"] = mock_tables["purchase_orders"][["po_id", "supplier_id", "currency"]]
+    monkeypatch.setattr(agent, "_ingest_data", lambda: mock_tables)
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS
