@@ -421,6 +421,11 @@ class OpportunityMinerAgent(BaseAgent):
         for _, row in inv.iterrows():
             terms = pd.to_numeric(row.get("payment_terms"), errors="coerce")
             if pd.notna(terms) and 0 < terms <= 15:
+            try:
+                terms = int(row.get("payment_terms", 0))
+            except ValueError:
+                terms = 0
+            if terms > 0 and terms <= 15:
                 discount = row["invoice_amount_gbp"] * 0.02
                 findings.append(
                     self._build_finding(
