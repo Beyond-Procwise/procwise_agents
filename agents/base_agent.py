@@ -9,7 +9,6 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import psycopg2
-import torch
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import ollama
@@ -20,6 +19,7 @@ from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -145,13 +145,9 @@ class AgentNick:
         logger.info("AgentNick is waking up...")
         self.settings = settings
         logger.info("Initializing shared clients...")
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        os.environ.setdefault("OLLAMA_USE_GPU", "1")
+        self.device = configure_gpu()
         os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
         os.environ.setdefault("OMP_NUM_THREADS", "8")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Ensure downstream libraries default to the detected device
-        os.environ.setdefault("SENTENCE_TRANSFORMERS_DEFAULT_DEVICE", self.device)
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.s3_client = boto3.client('s3')

@@ -1,24 +1,12 @@
 import logging
-import os
-
-import torch
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_service import EmailService
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
-# Ensure GPU variables are set
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault(
-    "SENTENCE_TRANSFORMERS_DEFAULT_DEVICE",
-    "cuda" if torch.cuda.is_available() else "cpu",
-)
-if torch.cuda.is_available():  # pragma: no cover - hardware dependent
-    torch.set_default_device("cuda")
-else:  # pragma: no cover - hardware dependent
-    logger.warning("CUDA not available; defaulting to CPU.")
+configure_gpu()
 
 
 class EmailDraftingAgent(BaseAgent):

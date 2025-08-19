@@ -1,12 +1,13 @@
 import logging
-import os
 import smtplib
 from typing import List, Optional, Tuple
-import torch
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from utils.gpu import configure_gpu
+
+configure_gpu()
 
 
 class EmailService:
@@ -30,17 +31,6 @@ class EmailService:
         Attachments should be provided as a list of ``(content, filename)`` tuples.
         Returns True on success, False otherwise.
         """
-        # Ensure GPU-related environment variables are set
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        os.environ.setdefault("OLLAMA_USE_GPU", "1")
-        os.environ.setdefault(
-            "SENTENCE_TRANSFORMERS_DEFAULT_DEVICE",
-            "cuda" if torch.cuda.is_available() else "cpu",
-        )
-        if torch.cuda.is_available():  # pragma: no cover - hardware dependent
-            torch.set_default_device("cuda")
-        else:  # pragma: no cover - hardware dependent
-            self.logger.warning("CUDA not available; defaulting to CPU.")
 
         msg = MIMEMultipart()
         msg["Subject"] = subject

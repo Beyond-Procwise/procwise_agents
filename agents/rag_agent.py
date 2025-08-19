@@ -1,17 +1,13 @@
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor
 from botocore.exceptions import ClientError
 from qdrant_client import models
 from sentence_transformers import CrossEncoder
-import torch
 
 from .base_agent import BaseAgent
+from utils.gpu import configure_gpu
 
-# Ensure GPU variables are set for execution environments that provide CUDA
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-if torch.cuda.is_available():  # pragma: no cover - hardware dependent
-    torch.set_default_device("cuda")
+configure_gpu()
 
 
 class RAGAgent(BaseAgent):

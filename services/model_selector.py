@@ -2,24 +2,20 @@
 
 import json
 import logging
-import os
 import ollama
 import pdfplumber
 from io import BytesIO
 from botocore.exceptions import ClientError
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Type
 from sentence_transformers import CrossEncoder
-from typing import Type
 from config.settings import settings
 from qdrant_client import models
 from .rag_service import RAGService
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
-# Ensure GPU is utilised when available
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+configure_gpu()
 
 
 class ChatHistoryManager:
