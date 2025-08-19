@@ -65,6 +65,8 @@ class OpportunityMinerAgent(BaseAgent):
             import torch
 
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self.device == "cuda":
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         except Exception:  # pragma: no cover - defensive
             self.device = "cpu"
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
@@ -115,15 +117,20 @@ class OpportunityMinerAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Data ingestion and preparation
     # ------------------------------------------------------------------
-    TABLES = [
-        "purchase_orders",
-        "invoices",
-        "contracts",
-        "price_benchmarks",
-        "indices",
-        "shipments",
-        "supplier_master",
-    ]
+    # Mapping from internal identifiers to database tables.  Core
+    # procurement data lives in the ``proc`` schema as indicated in the
+    # requirements: ``proc.invoice_agent``, ``proc.purchase_order_agent``,
+    # ``proc.contracts`` and ``proc.supplier``.
+    TABLE_MAP = {
+        "purchase_orders": "proc.purchase_order_agent",
+        "invoices": "proc.invoice_agent",
+        "contracts": "proc.contracts",
+        "price_benchmarks": "price_benchmarks",
+        "indices": "indices",
+        "shipments": "shipments",
+        "supplier_master": "proc.supplier",
+    }
+    TABLES = list(TABLE_MAP.keys())
 
     def _ingest_data(self) -> Dict[str, pd.DataFrame]:
         """Fetch required tables from the database or fall back to mock data."""
@@ -131,8 +138,8 @@ class OpportunityMinerAgent(BaseAgent):
         dfs: Dict[str, pd.DataFrame] = {}
         try:
             with self.agent_nick.get_db_connection() as conn:
-                for table in self.TABLES:
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {table}", conn)
+                for table, sql_name in self.TABLE_MAP.items():
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
         except Exception as exc:  # pragma: no cover - database is optional for tests
             logger.warning("Using mock data for opportunity mining: %s", exc)
             dfs = self._mock_data()
