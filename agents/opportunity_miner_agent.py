@@ -419,23 +419,25 @@ class OpportunityMinerAgent(BaseAgent):
             return findings
         # Placeholder: assume a 2% discount could have been taken if payment_terms < 30
         for _, row in inv.iterrows():
-            try:
-                terms = int(row.get("payment_terms", 0))
-            except (ValueError, TypeError):
-                terms = 0
-            if 0 < terms <= 15:
-                discount = row["invoice_amount_gbp"] * 0.02
-                findings.append(
-                    self._build_finding(
-                        "Early Payment Discount Missed",
-                        row.get("supplier_id"),
-                        None,
-                        None,
-                        discount,
-                        {"terms": float(terms)},
-                        [row.get("invoice_id")],
+            terms = pd.to_numeric(row.get("payment_terms"), errors="coerce")
+            if pd.notna(terms) and 0 < terms <= 15:
+                try:
+                    terms = int(row.get("payment_terms", 0))
+                except ValueError:
+                    terms = 0
+                if terms > 0 and terms <= 15:
+                    discount = row["invoice_amount_gbp"] * 0.02
+                    findings.append(
+                        self._build_finding(
+                            "Early Payment Discount Missed",
+                            row.get("supplier_id"),
+                            None,
+                            None,
+                            discount,
+                            {"terms": float(terms)},
+                            [row.get("invoice_id")],
+                        )
                     )
-                )
         return findings
 
     def _detect_demand_aggregation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
