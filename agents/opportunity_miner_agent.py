@@ -91,7 +91,7 @@ class OpportunityMinerAgent(BaseAgent):
 
             findings: List[Finding] = []
             findings.extend(self._detect_unit_price_vs_benchmark(tables))
-            findings.extend(self._detect_contract_price_drift(tables))
+            findings.extend(self._detect_contract_value_overrun(tables))
             findings.extend(self._detect_po_invoice_discrepancy(tables))
             findings.extend(self._detect_early_payment_discount(tables))
             findings.extend(self._detect_demand_aggregation(tables))
@@ -154,12 +154,11 @@ class OpportunityMinerAgent(BaseAgent):
                 {
                     "po_id": "PO1",
                     "supplier_id": "S1",
-                    "category_id": "C1",
-                    "item_id": "I1",
-                    "unit_price": 12.0,
-                    "quantity": 10,
                     "currency": "GBP",
-                    "order_date": "2024-01-01",
+                    "total_amount": 100.0,
+                    "payment_terms": "15",
+                    "exchange_rate_to_usd": 1.3,
+                    "converted_amount_usd": 130.0,
                     "contract_id": "CT1",
                 }
             ]
@@ -171,12 +170,12 @@ class OpportunityMinerAgent(BaseAgent):
                     "invoice_id": "INV1",
                     "po_id": "PO1",
                     "supplier_id": "S1",
-                    "item_id": "I1",
-                    "unit_price": 13.0,
-                    "quantity": 10,
                     "currency": "GBP",
-                    "invoice_date": "2024-01-05",
-                    "payment_terms": "30",
+                    "invoice_amount": 110.0,
+                    "invoice_total_incl_tax": 110.0,
+                    "payment_terms": "15",
+                    "exchange_rate_to_usd": 1.3,
+                    "converted_amount_usd": 143.0,
                 }
             ]
         )
@@ -185,27 +184,20 @@ class OpportunityMinerAgent(BaseAgent):
             [
                 {
                     "contract_id": "CT1",
+                    "contract_title": "Contract 1",
                     "supplier_id": "S1",
-                    "category_id": "C1",
-                    "item_id": "I1",
-                    "agreed_price": 11.0,
                     "currency": "GBP",
-                    "start_date": "2023-01-01",
-                    "end_date": "2025-01-01",
-                    "index_link": None,
-                }
-            ]
-        )
-
-        price_benchmarks = pd.DataFrame(
-            [
+                    "total_contract_value": 100.0,
+                    "spend_category": "CatA",
+                },
                 {
-                    "item_id": "I1",
-                    "benchmark_price": 10.0,
+                    "contract_id": "CT2",
+                    "contract_title": "Contract 2",
+                    "supplier_id": "S2",
                     "currency": "GBP",
-                    "source": "internal",
-                    "effective_date": "2024-01-01",
-                }
+                    "total_contract_value": 200.0,
+                    "spend_category": "CatA",
+                },
             ]
         )
 
@@ -229,7 +221,8 @@ class OpportunityMinerAgent(BaseAgent):
 
         supplier_master = pd.DataFrame(
             [
-                {"supplier_id": "S1", "supplier_name": "Supplier One", "region": "UK", "risk_rating": 1}
+                {"supplier_id": "S1", "supplier_name": "Supplier One"},
+                {"supplier_id": "S2", "supplier_name": "Supplier Two"},
             ]
         )
 
@@ -237,7 +230,6 @@ class OpportunityMinerAgent(BaseAgent):
             "purchase_orders": purchase_orders,
             "invoices": invoices,
             "contracts": contracts,
-            "price_benchmarks": price_benchmarks,
             "indices": indices,
             "shipments": shipments,
             "supplier_master": supplier_master,
@@ -246,23 +238,12 @@ class OpportunityMinerAgent(BaseAgent):
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Basic validation ensuring required columns exist and dropping nulls."""
 
-        required_columns = {
-            "purchase_orders": ["po_id", "supplier_id", "category_id", "item_id", "unit_price", "quantity", "currency"],
-            "invoices": ["invoice_id", "po_id", "supplier_id", "item_id", "unit_price", "quantity", "currency"],
-            "contracts": ["contract_id", "supplier_id", "category_id", "item_id", "agreed_price", "currency"],
-            "price_benchmarks": ["item_id", "benchmark_price", "currency"],
-            "indices": ["index_name", "value", "currency"],
-            "shipments": ["shipment_id", "po_id", "logistics_cost", "currency"],
-            "supplier_master": ["supplier_id"],
-        }
-
-        for name, cols in required_columns.items():
-            df = tables.get(name, pd.DataFrame())
-            missing = [c for c in cols if c not in df.columns]
-            if missing:
-                raise ValueError(f"Table {name} missing columns: {missing}")
-            tables[name] = df.dropna(subset=cols)
-
+        for name, df in list(tables.items()):
+            if df.empty:
+                continue
+            # Drop rows that are entirely null
+            tables[name] = df.dropna(how="all")
+            logger.debug("Table %s columns: %s", name, list(tables[name].columns))
         return tables
 
     def _normalise_currency(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -278,17 +259,21 @@ class OpportunityMinerAgent(BaseAgent):
         def convert(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
             if df.empty:
                 return df
-            rate_col = df["currency"].map(lambda c: fx_rates.get(c, 1.0))
+            currency_col = "currency" if "currency" in df.columns else (
+                "default_currency" if "default_currency" in df.columns else None
+            )
+            if currency_col is None:
+                return df
+            rate_col = df[currency_col].map(lambda c: fx_rates.get(c, 1.0))
             for col in cols:
                 if col in df.columns:
                     df[f"{col}_gbp"] = df[col] * rate_col
             return df
 
-        tables["purchase_orders"] = convert(tables["purchase_orders"], ["unit_price"])
-        tables["invoices"] = convert(tables["invoices"], ["unit_price"])
-        tables["contracts"] = convert(tables["contracts"], ["agreed_price"])
-        tables["price_benchmarks"] = convert(tables["price_benchmarks"], ["benchmark_price"])
-        tables["shipments"] = convert(tables["shipments"], ["logistics_cost"])
+        tables["purchase_orders"] = convert(tables.get("purchase_orders", pd.DataFrame()), ["total_amount"])
+        tables["invoices"] = convert(tables.get("invoices", pd.DataFrame()), ["invoice_amount", "invoice_total_incl_tax"])
+        tables["contracts"] = convert(tables.get("contracts", pd.DataFrame()), ["total_contract_value"])
+        tables["shipments"] = convert(tables.get("shipments", pd.DataFrame()), ["logistics_cost"])
         return tables
 
     def _apply_index_adjustment(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -327,9 +312,16 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_unit_price_vs_benchmark(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        po = tables["purchase_orders"]
-        bm = tables["price_benchmarks"]
-        if po.empty or bm.empty:
+        po = tables.get("purchase_orders", pd.DataFrame())
+        bm = tables.get("price_benchmarks", pd.DataFrame())
+        required_po = {"item_id", "unit_price_gbp"}
+        required_bm = {"item_id", "benchmark_price_gbp"}
+        if (
+            po.empty
+            or bm.empty
+            or not required_po.issubset(po.columns)
+            or not required_bm.issubset(bm.columns)
+        ):
             return findings
         merged = po.merge(bm, on="item_id", suffixes=("_po", "_bm"))
         merged["variance"] = merged["unit_price_gbp"] - merged["benchmark_price_gbp"]
@@ -349,50 +341,71 @@ class OpportunityMinerAgent(BaseAgent):
             )
         return findings
 
-    def _detect_contract_price_drift(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+    def _detect_contract_value_overrun(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        inv = tables["invoices"]
-        ct = tables["contracts"]
-        if inv.empty or ct.empty:
+        po = tables.get("purchase_orders", pd.DataFrame())
+        inv = tables.get("invoices", pd.DataFrame())
+        ct = tables.get("contracts", pd.DataFrame())
+        required_po = {"po_id", "contract_id"}
+        required_inv = {"po_id", "invoice_amount_gbp"}
+        required_ct = {"contract_id", "total_contract_value_gbp", "supplier_id", "spend_category"}
+        if (
+            po.empty
+            or inv.empty
+            or ct.empty
+            or not required_po.issubset(po.columns)
+            or not required_inv.issubset(inv.columns)
+            or not required_ct.issubset(ct.columns)
+        ):
             return findings
-        merged = inv.merge(ct, on=["supplier_id", "item_id", "contract_id"], how="inner")
-        merged["variance"] = merged["unit_price_gbp"] - merged.get("adjusted_price_gbp", merged.get("agreed_price_gbp"))
+        inv_contract = inv.merge(po[list(required_po)], on="po_id", how="left")
+        inv_sum = inv_contract.groupby("contract_id")["invoice_amount_gbp"].sum().reset_index()
+        merged = inv_sum.merge(ct, on="contract_id", how="inner")
+        merged["variance"] = merged["invoice_amount_gbp"] - merged["total_contract_value_gbp"]
         cond = merged["variance"] > 0
         for _, row in merged[cond].iterrows():
-            savings = row["variance"] * row.get("quantity", 1)
             findings.append(
                 self._build_finding(
-                    "Contract Price Drift",
+                    "Contract Value Overrun",
                     row.get("supplier_id"),
-                    row.get("category_id"),
-                    row.get("item_id"),
-                    savings,
-                    {"invoice_price_gbp": row["unit_price_gbp"], "contract_price_gbp": row["adjusted_price_gbp"]},
-                    [row.get("invoice_id"), row.get("contract_id")],
+                    row.get("spend_category"),
+                    None,
+                    row["variance"],
+                    {
+                        "invoice_total_gbp": row["invoice_amount_gbp"],
+                        "contract_value_gbp": row["total_contract_value_gbp"],
+                    },
+                    [row.get("contract_id")],
                 )
             )
         return findings
 
     def _detect_po_invoice_discrepancy(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        po = tables["purchase_orders"]
-        inv = tables["invoices"]
-        if po.empty or inv.empty:
+        po = tables.get("purchase_orders", pd.DataFrame())
+        inv = tables.get("invoices", pd.DataFrame())
+        required_po = {"po_id", "total_amount_gbp", "supplier_id"}
+        required_inv = {"po_id", "invoice_amount_gbp"}
+        if (
+            po.empty
+            or inv.empty
+            or not required_po.issubset(po.columns)
+            or not required_inv.issubset(inv.columns)
+        ):
             return findings
         merged = po.merge(inv, on="po_id", suffixes=("_po", "_inv"))
-        merged["price_diff"] = merged["unit_price_gbp_inv"] - merged["unit_price_gbp_po"]
-        merged["qty_diff"] = merged["quantity_inv"] - merged["quantity_po"]
-        cond = (merged["price_diff"] != 0) | (merged["qty_diff"] != 0)
+        merged["amount_diff"] = merged["invoice_amount_gbp"] - merged["total_amount_gbp"]
+        cond = merged["amount_diff"] != 0
         for _, row in merged[cond].iterrows():
-            impact = row["price_diff"] * row.get("quantity_inv", 1)
+            impact = row["amount_diff"]
             findings.append(
                 self._build_finding(
                     "PO↔Invoice Discrepancy",
-                    row.get("supplier_id_po"),
-                    row.get("category_id"),
-                    row.get("item_id_po"),
+                    row.get("supplier_id"),
+                    None,
+                    None,
                     impact,
-                    {"price_diff": row["price_diff"], "qty_diff": row["qty_diff"]},
+                    {"amount_diff": row["amount_diff"]},
                     [row.get("po_id"), row.get("invoice_id")],
                 )
             )
@@ -400,25 +413,23 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_early_payment_discount(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        inv = tables["invoices"]
-        if inv.empty:
+        inv = tables.get("invoices", pd.DataFrame())
+        required_inv = {"invoice_amount_gbp"}
+        if inv.empty or not required_inv.issubset(inv.columns):
             return findings
         # Placeholder: assume a 2% discount could have been taken if payment_terms < 30
         for _, row in inv.iterrows():
-            try:
-                terms = int(row.get("payment_terms", 0))
-            except ValueError:
-                terms = 0
-            if terms > 0 and terms <= 15:
-                discount = row["unit_price_gbp"] * row.get("quantity", 1) * 0.02
+            terms = pd.to_numeric(row.get("payment_terms"), errors="coerce")
+            if pd.notna(terms) and 0 < terms <= 15:
+                discount = row["invoice_amount_gbp"] * 0.02
                 findings.append(
                     self._build_finding(
                         "Early Payment Discount Missed",
                         row.get("supplier_id"),
                         None,
-                        row.get("item_id"),
+                        None,
                         discount,
-                        {"terms": terms},
+                        {"terms": float(terms)},
                         [row.get("invoice_id")],
                     )
                 )
@@ -426,21 +437,22 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_demand_aggregation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        po = tables["purchase_orders"]
-        if po.empty:
+        po = tables.get("purchase_orders", pd.DataFrame())
+        required_po = {"supplier_id", "total_amount_gbp"}
+        if po.empty or not required_po.issubset(po.columns):
             return findings
-        grouped = po.groupby(["supplier_id", "item_id"]).agg({"quantity": "sum"}).reset_index()
-        cond = grouped["quantity"] < 20  # small orders could be aggregated
+        grouped = po.groupby("supplier_id")["total_amount_gbp"].sum().reset_index()
+        cond = grouped["total_amount_gbp"] < 500  # small spend could be aggregated
         for _, row in grouped[cond].iterrows():
-            savings = row["quantity"] * 0.5  # placeholder saving
+            savings = row["total_amount_gbp"] * 0.05  # placeholder saving
             findings.append(
                 self._build_finding(
                     "Demand Aggregation",
                     row.get("supplier_id"),
                     None,
-                    row.get("item_id"),
+                    None,
                     savings,
-                    {"total_quantity": row["quantity"]},
+                    {"total_spend_gbp": row["total_amount_gbp"]},
                     [],
                 )
             )
@@ -448,8 +460,9 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_logistics_cost_outliers(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        shipments = tables["shipments"]
-        if shipments.empty:
+        shipments = tables.get("shipments", pd.DataFrame())
+        required_sh = {"logistics_cost_gbp"}
+        if shipments.empty or not required_sh.issubset(shipments.columns):
             return findings
         avg = shipments["logistics_cost_gbp"].mean()
         cond = shipments["logistics_cost_gbp"] > avg * 1.5
@@ -470,10 +483,13 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_supplier_consolidation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
-        po = tables["purchase_orders"]
-        if po.empty:
+        ct = tables.get("contracts", pd.DataFrame())
+        required_ct = {"spend_category", "supplier_id"}
+        if ct.empty or not required_ct.issubset(ct.columns):
             return findings
-        supplier_counts = po.groupby("category_id")["supplier_id"].nunique().reset_index(name="supplier_count")
+        supplier_counts = (
+            ct.groupby("spend_category")["supplier_id"].nunique().reset_index(name="supplier_count")
+        )
         cond = supplier_counts["supplier_count"] > 1
         for _, row in supplier_counts[cond].iterrows():
             savings = row["supplier_count"] * 10.0  # placeholder
@@ -481,7 +497,7 @@ class OpportunityMinerAgent(BaseAgent):
                 self._build_finding(
                     "Supplier Consolidation",
                     None,
-                    row.get("category_id"),
+                    row.get("spend_category"),
                     None,
                     savings,
                     {"supplier_count": row["supplier_count"]},
