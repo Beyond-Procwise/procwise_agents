@@ -76,3 +76,32 @@ def test_non_structured_docs_are_vectorized(monkeypatch):
     assert "persist" not in captured  # should not attempt DB insert
     assert res["id"] == "doc.pdf"
     assert res["doc_type"] == "Contract"
+
+
+def test_vectorize_structured_data_creates_points(monkeypatch):
+    captured = {}
+
+    import numpy as np
+
+    def fake_encode(chunks, **kwargs):
+        return [np.zeros(3) for _ in chunks]
+
+    def fake_upsert(collection_name, points, wait):
+        captured["points"] = points
+
+    nick = SimpleNamespace(
+        embedding_model=SimpleNamespace(encode=fake_encode),
+        qdrant_client=SimpleNamespace(upsert=fake_upsert),
+        _initialize_qdrant_collection=lambda: None,
+        settings=SimpleNamespace(qdrant_collection_name="test", extraction_model="m"),
+    )
+
+    agent = DataExtractionAgent(nick)
+    header = {"invoice_id": "1", "vendor_name": "acme"}
+    line_items = [{"item_id": "A1", "description": "Widget"}]
+
+    agent._vectorize_structured_data(header, line_items, "Invoice", "1")
+
+    assert len(captured["points"]) == 2
+    assert captured["points"][0].payload["data_type"] == "header"
+    assert captured["points"][1].payload["data_type"] == "line_item"
