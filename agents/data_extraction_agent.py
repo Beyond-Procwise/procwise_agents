@@ -198,6 +198,7 @@ class DataExtractionAgent(BaseAgent):
                 },
             }
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
+            self._vectorize_structured_data(header, line_items, doc_type, pk_value)
             doc_id = pk_value
         else:
             data = None
@@ -632,6 +633,75 @@ class DataExtractionAgent(BaseAgent):
                 wait=True,
             )
 
+    def _vectorize_structured_data(
+        self,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        doc_type: str,
+        pk_value: str,
+    ) -> None:
+        """Embed header and line items for fine-grained retrieval.
+
+        Each header and line item is converted to a compact text form and
+        embedded individually. This allows downstream retrieval to surface
+        specific fields (e.g. a single line item) rather than only the full
+        document chunk. Embeddings are stored in the same Qdrant collection
+        as the full document vectors, tagged with a ``data_type`` payload so
+        callers can filter as needed.
+        """
+
+        if not pk_value:
+            return
+
+        self.agent_nick._initialize_qdrant_collection()
+        points: List[models.PointStruct] = []
+
+        # Header payload -------------------------------------------------
+        if header:
+            header_text = json.dumps(header, default=str)
+            vec = self.agent_nick.embedding_model.encode(
+                [header_text], normalize_embeddings=True, show_progress_bar=False
+            )[0]
+            points.append(
+                models.PointStruct(
+                    id=_normalize_point_id(f"{pk_value}_header"),
+                    vector=vec.tolist(),
+                    payload={
+                        "record_id": pk_value,
+                        "document_type": _normalize_label(doc_type),
+                        "data_type": "header",
+                        "content": header_text,
+                    },
+                )
+            )
+
+        # Line item payloads --------------------------------------------
+        for idx, item in enumerate(line_items, start=1):
+            item_text = json.dumps(item, default=str)
+            vec = self.agent_nick.embedding_model.encode(
+                [item_text], normalize_embeddings=True, show_progress_bar=False
+            )[0]
+            points.append(
+                models.PointStruct(
+                    id=_normalize_point_id(f"{pk_value}_line_{idx}"),
+                    vector=vec.tolist(),
+                    payload={
+                        "record_id": pk_value,
+                        "document_type": _normalize_label(doc_type),
+                        "data_type": "line_item",
+                        "line_number": idx,
+                        "content": item_text,
+                    },
+                )
+            )
+
+        if points:
+            self.agent_nick.qdrant_client.upsert(
+                collection_name=self.settings.qdrant_collection_name,
+                points=points,
+                wait=True,
+            )
+
     def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
         """Whitespace-aware text chunking with configurable overlap.
 
@@ -885,6 +955,11 @@ class DataExtractionAgent(BaseAgent):
                     (schema, table),
                 )
                 columns = [r[0] for r in cur.fetchall()]
+                # Remove existing rows to avoid stale line items lingering
+                cur.execute(
+                    f"DELETE FROM {schema}.{table} WHERE {fk_col} = %s",
+                    (pk_value,),
+                )
                 numeric_fields = {
                     "quantity",
                     "unit_price",
