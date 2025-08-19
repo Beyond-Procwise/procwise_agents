@@ -19,12 +19,17 @@ from api.routers.workflows import router
 
 class DummyNick:
     def __init__(self):
-        self.settings = SimpleNamespace(extraction_model="llama3", script_user="tester")
+        self.settings = SimpleNamespace(
+            extraction_model="llama3",
+            script_user="tester",
+            qdrant_collection_name="dummy",
+        )
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: None,
             log_action=lambda **_: None,
         )
         self.ollama_options = lambda: {}
+        self.qdrant_client = SimpleNamespace()
 
 
 def _mock_quotes(*args, **kwargs):
@@ -107,3 +112,28 @@ def test_quote_evaluation_endpoint(monkeypatch):
     resp = client.post("/workflows/quotes/evaluate", json={})
     assert resp.status_code == 200
     assert resp.json()["result"]["best_quote"]["quote_id"] == "Q1"
+
+
+def test_fetch_quotes_from_qdrant():
+    nick = DummyNick()
+
+    class DummyPoint:
+        def __init__(self):
+            self.id = "p1"
+            self.payload = {
+                "quote_id": "Q1",
+                "supplier_name": "Supplier A",
+                "total_amount": 100,
+                "payment_terms": "Net 30",
+                "delivery_terms": "3 days",
+                "discount_percentage": 5,
+            }
+
+    class DummyClient:
+        def scroll(self, **_):
+            return [DummyPoint()], None
+
+    nick.qdrant_client = DummyClient()
+    agent = QuoteEvaluationAgent(nick)
+    quotes = agent._fetch_quotes(["Supplier A"])
+    assert quotes[0]["quote_id"] == "Q1"

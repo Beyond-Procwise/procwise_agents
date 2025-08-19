@@ -1,8 +1,17 @@
 import json
 import logging
+import os
 from typing import Dict, List, Optional
+
 import pandas as pd
+import torch
+from qdrant_client import models
+
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+if torch.cuda.is_available():  # pragma: no cover - hardware dependent
+    torch.set_default_device("cuda")
 
 logger = logging.getLogger(__name__)
 
@@ -85,68 +94,75 @@ class QuoteEvaluationAgent(BaseAgent):
                 error=str(e)
             )
 
-    def _fetch_quotes(self, supplier_names: List[str],
-                      product_category: Optional[str] = None) -> List[Dict]:
-        """Fetch quotes from database"""
+    def _fetch_quotes(
+        self,
+        supplier_names: List[str],
+        product_category: Optional[str] = None,
+    ) -> List[Dict]:
+        """Fetch quotes from Qdrant vector database."""
         try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Build query
-                    query = """
-                        SELECT 
-                            q.quote_id,
-                            q.supplier_name,
-                            q.customer_name,
-                            q.quote_date,
-                            q.valid_until,
-                            q.total_amount,
-                            q.currency,
-                            q.payment_terms,
-                            q.delivery_terms,
-                            q.discount_percentage,
-                            COUNT(ql.quote_line_id) as line_items_count,
-                            AVG(ql.unit_price) as avg_unit_price
-                        FROM proc.quotes_agent q
-                        LEFT JOIN proc.quote_line_items_agent ql ON q.quote_id = ql.quote_id
-                        WHERE q.valid_until >= CURRENT_DATE
-                    """
-
-                    params = []
-                    if supplier_names:
-                        query += " AND q.supplier_name = ANY(%s)"
-                        params.append(supplier_names)
-
-                    query += " GROUP BY q.quote_id, q.supplier_name, q.customer_name, "
-                    query += "q.quote_date, q.valid_until, q.total_amount, q.currency, "
-                    query += "q.payment_terms, q.delivery_terms, q.discount_percentage"
-
-                    cursor.execute(query, params)
-
-                    columns = [desc[0] for desc in cursor.description]
-                    quotes = [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-                    return quotes
-
+            filters = []
+            if supplier_names:
+                filters.append(
+                    models.FieldCondition(
+                        key="supplier_name",
+                        match=models.MatchAny(any=supplier_names),
+                    )
+                )
+            if product_category:
+                filters.append(
+                    models.FieldCondition(
+                        key="product_category",
+                        match=models.MatchValue(value=product_category),
+                    )
+                )
+            q_filter = models.Filter(must=filters) if filters else None
+            points, _ = self.agent_nick.qdrant_client.scroll(
+                collection_name=self.settings.qdrant_collection_name,
+                scroll_filter=q_filter,
+                with_payload=True,
+                limit=100,
+            )
+            quotes: List[Dict] = []
+            for point in points:
+                payload = point.payload or {}
+                quotes.append(
+                    {
+                        "quote_id": payload.get("quote_id", point.id),
+                        "supplier_name": payload.get("supplier_name", ""),
+                        "customer_name": payload.get("customer_name"),
+                        "quote_date": payload.get("quote_date"),
+                        "valid_until": payload.get("valid_until"),
+                        "total_amount": payload.get("total_amount", 0),
+                        "currency": payload.get("currency"),
+                        "payment_terms": payload.get("payment_terms"),
+                        "delivery_terms": payload.get("delivery_terms"),
+                        "discount_percentage": payload.get("discount_percentage", 0),
+                        "line_items_count": payload.get("line_items_count", 0),
+                        "avg_unit_price": payload.get("avg_unit_price", 0),
+                    }
+                )
+            return quotes
         except Exception as e:
-            logger.error(f"Failed to fetch quotes: {e}")
+            logger.error(f"Failed to fetch quotes from Qdrant: {e}")
             # Return mock data for testing
             return [
                 {
-                    'quote_id': 'Q001',
-                    'supplier_name': 'Supplier A',
-                    'total_amount': 45000,
-                    'payment_terms': 'Net 30',
-                    'delivery_terms': '5 days',
-                    'discount_percentage': 5
+                    "quote_id": "Q001",
+                    "supplier_name": "Supplier A",
+                    "total_amount": 45000,
+                    "payment_terms": "Net 30",
+                    "delivery_terms": "5 days",
+                    "discount_percentage": 5,
                 },
                 {
-                    'quote_id': 'Q002',
-                    'supplier_name': 'Supplier B',
-                    'total_amount': 42000,
-                    'payment_terms': 'Net 45',
-                    'delivery_terms': '7 days',
-                    'discount_percentage': 8
-                }
+                    "quote_id": "Q002",
+                    "supplier_name": "Supplier B",
+                    "total_amount": 42000,
+                    "payment_terms": "Net 45",
+                    "delivery_terms": "7 days",
+                    "discount_percentage": 8,
+                },
             ]
 
     def _evaluate_quotes(self, quotes: List[Dict]) -> Dict:
