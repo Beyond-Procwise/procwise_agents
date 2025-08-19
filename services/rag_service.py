@@ -2,12 +2,10 @@ import os
 import uuid
 from typing import List, Dict, Optional
 
-import torch
 from qdrant_client import models
+from utils.gpu import configure_gpu
 
-
-# Ensure GPU is enabled when available
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+configure_gpu()
 
 
 class RAGService:

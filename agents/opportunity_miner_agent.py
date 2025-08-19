@@ -27,6 +27,7 @@ from typing import Dict, Iterable, List, Optional
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +59,8 @@ class OpportunityMinerAgent(BaseAgent):
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
 
-        # ------------------------------------------------------------------
         # GPU configuration
-        # ------------------------------------------------------------------
-        try:  # pragma: no cover - torch is optional for this repository
-            import torch
-
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            if self.device == "cuda":
-                os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        except Exception:  # pragma: no cover - defensive
-            self.device = "cpu"
+        self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         logger.info("OpportunityMinerAgent using device: %s", self.device)
 
