@@ -59,3 +59,25 @@ def test_opportunity_miner_handles_missing_columns(monkeypatch):
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
+
+
+def test_opportunity_miner_handles_none_payment_terms(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+
+    mock_tables = agent._mock_data()
+    mock_tables["invoices"].loc[0, "payment_terms"] = None
+    monkeypatch.setattr(agent, "_ingest_data", lambda: mock_tables)
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS

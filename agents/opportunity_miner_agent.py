@@ -419,6 +419,8 @@ class OpportunityMinerAgent(BaseAgent):
             return findings
         # Placeholder: assume a 2% discount could have been taken if payment_terms < 30
         for _, row in inv.iterrows():
+            terms = pd.to_numeric(row.get("payment_terms"), errors="coerce")
+            if pd.notna(terms) and 0 < terms <= 15:
             try:
                 terms = int(row.get("payment_terms", 0))
             except ValueError:
@@ -432,7 +434,7 @@ class OpportunityMinerAgent(BaseAgent):
                         None,
                         None,
                         discount,
-                        {"terms": terms},
+                        {"terms": float(terms)},
                         [row.get("invoice_id")],
                     )
                 )
