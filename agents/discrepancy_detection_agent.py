@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Dict, Iterable, List, Optional
 
@@ -78,6 +79,15 @@ class DiscrepancyDetectionAgent(BaseAgent):
                                     (pk,),
                                 )
                                 row = cursor.fetchone()
+                                if row is None:
+                                    mismatches.append(
+                                        {
+                                            "doc_type": doc_type,
+                                            "id": pk,
+                                            "checks": {"record": "missing"},
+                                        }
+                                    )
+                                    continue
 
                                 idx = 0
                                 if vendor_col:
@@ -100,6 +110,15 @@ class DiscrepancyDetectionAgent(BaseAgent):
                                     (pk,),
                                 )
                                 row = cursor.fetchone()
+                                if not row:
+                                    mismatches.append(
+                                        {
+                                            "doc_type": doc_type,
+                                            "id": pk,
+                                            "checks": {"record": "missing"},
+                                        }
+                                    )
+                                    continue
                                 vendor_name = None
                                 invoice_date = None
                                 total_amount = None
@@ -113,15 +132,6 @@ class DiscrepancyDetectionAgent(BaseAgent):
                                     "doc_type": doc_type,
                                     "id": pk,
                                     "checks": {"db_error": str(db_exc)},
-                                }
-                            )
-                            continue
-                        if not row:
-                            mismatches.append(
-                                {
-                                    "doc_type": doc_type,
-                                    "id": pk,
-                                    "checks": {"record": "missing"},
                                 }
                             )
                             continue
@@ -144,4 +154,35 @@ class DiscrepancyDetectionAgent(BaseAgent):
                 error=str(exc),
             )
 
+        self._persist_mismatches(mismatches)
         return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": mismatches})
+
+    def _persist_mismatches(self, mismatches: List[Dict]) -> None:
+        """Store discrepancies in proc.data_discrepancy for auditing."""
+        if not mismatches:
+            return
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.data_discrepancy (
+                            id SERIAL PRIMARY KEY,
+                            doc_type TEXT NOT NULL,
+                            record_id TEXT NOT NULL,
+                            details JSONB NOT NULL,
+                            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+                        )
+                        """
+                    )
+                    for mis in mismatches:
+                        cur.execute(
+                            "INSERT INTO proc.data_discrepancy (doc_type, record_id, details) VALUES (%s, %s, %s)",
+                            (
+                                mis.get("doc_type"),
+                                mis.get("id"),
+                                json.dumps(mis.get("checks", {})),
+                            ),
+                        )
+        except Exception as exc:  # pragma: no cover - database connectivity
+            logger.error("Failed to persist discrepancies: %s", exc)

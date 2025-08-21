@@ -10,6 +10,7 @@ import concurrent.futures
 import ollama
 import pdfplumber
 import pandas as pd
+import numpy as np
 try:  # PyMuPDF is optional; handled gracefully if unavailable
     import fitz  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -19,16 +20,35 @@ try:  # Optional dependency for DOCX extraction
 except Exception:  # pragma: no cover - optional dependency
     docx = None
 try:  # Optional dependencies for image OCR
-    from PIL import Image  # type: ignore
+    from PIL import Image, UnidentifiedImageError  # type: ignore
     import pytesseract  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     Image = None
     pytesseract = None
+    UnidentifiedImageError = Exception  # type: ignore
+try:  # Optional GPU-accelerated OCR
+    import easyocr  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    easyocr = None
+_easyocr_reader = None
 from qdrant_client import models
 from sentence_transformers import util
 import torch
 from datetime import datetime, timedelta
 from dateutil import parser
+
+
+def _get_easyocr_reader():
+    """Lazily initialise an EasyOCR reader if the library is installed."""
+    global _easyocr_reader
+    if easyocr is None:
+        return None
+    if _easyocr_reader is None:
+        try:
+            _easyocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
+        except Exception:  # pragma: no cover - optional dependency
+            _easyocr_reader = None
+    return _easyocr_reader
 
 from agents.base_agent import (
     BaseAgent,
@@ -249,7 +269,18 @@ class DataExtractionAgent(BaseAgent):
                                     lines.append(row_text)
                     else:
                         # OCR fallback for scanned pages
-                        if Image is not None and pytesseract is not None:
+                        if easyocr is not None:
+                            try:
+                                page_image = page.to_image(resolution=300).original
+                                img_arr = np.array(page_image)
+                                reader = _get_easyocr_reader()
+                                ocr_lines = reader.readtext(img_arr, detail=0, paragraph=True)
+                                lines.extend(
+                                    ln.strip() for ln in ocr_lines if ln.strip()
+                                )
+                            except Exception as ocr_exc:  # pragma: no cover - defensive
+                                logger.warning("EasyOCR failed: %s", ocr_exc)
+                        elif Image is not None and pytesseract is not None:
                             try:
                                 page_image = page.to_image(resolution=300).original
                                 ocr_text = pytesseract.image_to_string(page_image)
@@ -289,16 +320,37 @@ class DataExtractionAgent(BaseAgent):
             return ""
 
     def _extract_text_from_image(self, file_bytes: bytes) -> str:
-        """OCR text from image files using pytesseract when available."""
-        if Image is None or pytesseract is None:
-            logger.warning("pytesseract not installed; cannot OCR image")
+        """OCR text from image files using EasyOCR or pytesseract."""
+        if Image is None:
+            logger.warning("PIL not installed; cannot OCR image")
             return ""
         try:
             img = Image.open(BytesIO(file_bytes))
-            return pytesseract.image_to_string(img)
+        except UnidentifiedImageError:
+            logger.warning(
+                "Provided bytes are not a valid image; attempting PDF extraction fallback",
+            )
+            return self._extract_text_from_pdf(file_bytes)
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed OCR on image: %s", exc)
             return ""
+        if easyocr is not None:
+            try:
+                arr = np.array(img)
+                reader = _get_easyocr_reader()
+                ocr_lines = reader.readtext(arr, detail=0, paragraph=True)
+                return "\n".join(ocr_lines)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("EasyOCR failed: %s", exc)
+        if pytesseract is not None:
+            try:
+                return pytesseract.image_to_string(img)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Failed OCR on image: %s", exc)
+                return ""
+        logger.warning("pytesseract not installed; cannot OCR image")
+        return ""
+
 
     def _extract_text(self, file_bytes: bytes, object_key: str) -> str:
         """Route to appropriate extractor based on file extension."""
@@ -311,6 +363,7 @@ class DataExtractionAgent(BaseAgent):
             return self._extract_text_from_image(file_bytes)
         logger.warning("Unsupported document type '%s' for %s", ext, object_key)
         return ""
+
 
     def _parse_header(self, text: str) -> Dict[str, str]:
         """Use semantic similarity to locate common header fields."""
@@ -822,10 +875,19 @@ class DataExtractionAgent(BaseAgent):
         pk_value: str,
     ) -> None:
         """Persist extracted header and line items to PostgreSQL."""
-        self._persist_header_to_postgres(header, doc_type)
-        self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header)
+        try:
+            conn = self.agent_nick.get_db_connection()
+            with conn:
+                self._persist_header_to_postgres(header, doc_type, conn)
+                self._persist_line_items_to_postgres(
+                    pk_value, line_items, doc_type, header, conn
+                )
+        except Exception as exc:  # pragma: no cover - database connectivity
+            logger.error("Failed to persist %s data: %s", doc_type, exc)
 
-    def _persist_header_to_postgres(self, header: Dict[str, str], doc_type: str) -> None:
+    def _persist_header_to_postgres(
+        self, header: Dict[str, str], doc_type: str, conn=None
+    ) -> None:
         table_map = {
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
@@ -834,9 +896,12 @@ class DataExtractionAgent(BaseAgent):
         if not target:
             return
         schema, table, pk_col = target
-        try:
+        close_conn = False
+        if conn is None:
             conn = self.agent_nick.get_db_connection()
-            with conn, conn.cursor() as cur:
+            close_conn = True
+        try:
+            with conn.cursor() as cur:
                 cur.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
                     "WHERE table_schema=%s AND table_name=%s",
@@ -888,8 +953,15 @@ class DataExtractionAgent(BaseAgent):
                 else:
                     sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
                 cur.execute(sql, list(payload.values()))
+            if close_conn:
+                conn.commit()
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist %s data: %s", doc_type, exc)
+            if close_conn:
+                conn.rollback()
+        finally:
+            if close_conn:
+                conn.close()
 
     def _persist_line_items_to_postgres(
         self,
@@ -897,6 +969,7 @@ class DataExtractionAgent(BaseAgent):
         line_items: List[Dict],
         doc_type: str,
         header: Dict[str, str],
+        conn=None,
     ) -> None:
         table_map = {
             "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
@@ -937,9 +1010,12 @@ class DataExtractionAgent(BaseAgent):
         if not target or not line_items:
             return
         schema, table, fk_col, line_no_col = target
-        try:
+        close_conn = False
+        if conn is None:
             conn = self.agent_nick.get_db_connection()
-            with conn, conn.cursor() as cur:
+            close_conn = True
+        try:
+            with conn.cursor() as cur:
                 cur.execute(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_schema=%s AND table_name=%s",
@@ -974,6 +1050,11 @@ class DataExtractionAgent(BaseAgent):
                         for extra in ["delivery_date", "country", "region"]:
                             if extra in columns and header.get(extra):
                                 payload[extra] = header.get(extra)
+                    # generate synthetic line identifiers when supported by the schema
+                    if doc_type == "Purchase_Order" and "po_line_id" in columns:
+                        payload.setdefault("po_line_id", f"{pk_value}-{line_value}")
+                    if doc_type == "Invoice" and "invoice_line_id" in columns:
+                        payload.setdefault("invoice_line_id", f"{pk_value}-{line_value}")
                     for key in fields:
                         if key in payload:
                             continue
@@ -994,17 +1075,17 @@ class DataExtractionAgent(BaseAgent):
                         sanitized[k] = val
                     cols = ", ".join(sanitized.keys())
                     placeholders = ", ".join(["%s"] * len(sanitized))
-                    update_cols = ", ".join(
-                        f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in [fk_col, line_no_col]
-                    )
-                    sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
-                    if update_cols:
-                        sql = sql_base + f"ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
-                    else:
-                        sql = sql_base + f"ON CONFLICT ({fk_col}, {line_no_col}) DO NOTHING"
+                    sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
                     cur.execute(sql, list(sanitized.values()))
+            if close_conn:
+                conn.commit()
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
+            if close_conn:
+                conn.rollback()
+        finally:
+            if close_conn:
+                conn.close()
 
     def train_extraction_model(
         self, training_data: List[Tuple[str, str]], epochs: int = 1
