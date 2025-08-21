@@ -9,7 +9,11 @@ from qdrant_client import models
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
+# Ensure GPU is used when available
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 if torch.cuda.is_available():  # pragma: no cover - hardware dependent
     torch.set_default_device("cuda")
 
@@ -101,7 +105,13 @@ class QuoteEvaluationAgent(BaseAgent):
     ) -> List[Dict]:
         """Fetch quotes from Qdrant vector database."""
         try:
-            filters = []
+            # Always filter for document type "quote"
+            filters = [
+                models.FieldCondition(
+                    key="document_type",
+                    match=models.MatchValue(value="quote"),
+                )
+            ]
             if supplier_names:
                 filters.append(
                     models.FieldCondition(
@@ -140,6 +150,9 @@ class QuoteEvaluationAgent(BaseAgent):
                         "discount_percentage": payload.get("discount_percentage", 0),
                         "line_items_count": payload.get("line_items_count", 0),
                         "avg_unit_price": payload.get("avg_unit_price", 0),
+                        # Baseline fields for variance detection
+                        "baseline_total_amount": payload.get("baseline_total_amount"),
+                        "baseline_payment_terms": payload.get("baseline_payment_terms"),
                     }
                 )
             return quotes
@@ -178,12 +191,25 @@ class QuoteEvaluationAgent(BaseAgent):
             delivery_score = self._score_delivery(quote)
             discount_score = quote.get('discount_percentage', 0) / 10
 
-            # Calculate overall score
+            # Baseline variance detection
+            variances = self._detect_variances(quote)
+
+            # Calculate overall score (0-10) for backwards compatibility
             overall_score = (
-                    price_score * 0.4 +
-                    terms_score * 0.2 +
-                    delivery_score * 0.2 +
-                    discount_score * 0.2
+                price_score * 0.4 +
+                terms_score * 0.2 +
+                delivery_score * 0.2 +
+                discount_score * 0.2
+            )
+
+            # Supplier ranking score (0-100)
+            price_component = price_score * 10
+            terms_component = terms_score * 10
+            accuracy_component = quote.get('transactional_accuracy', 10) * 10
+            supplier_score = (
+                price_component * 0.7 +
+                terms_component * 0.2 +
+                accuracy_component * 0.1
             )
 
             evaluation[quote_id] = {
@@ -193,10 +219,40 @@ class QuoteEvaluationAgent(BaseAgent):
                 'delivery_score': delivery_score,
                 'discount_score': discount_score,
                 'overall_score': overall_score,
-                'total_amount': quote['total_amount']
+                'total_amount': quote['total_amount'],
+                'price_variance': variances.get('price_variance'),
+                'term_variance': variances.get('term_variance'),
+                'total_cost_variance': variances.get('total_cost_variance'),
+                'supplier_score': supplier_score,
+                'opportunity_value': variances.get('opportunity_value'),
             }
 
         return evaluation
+
+    def _detect_variances(self, quote: Dict) -> Dict:
+        """Detect variances against baseline information."""
+        baseline_total = quote.get('baseline_total_amount')
+        price_variance = None
+        total_cost_variance = None
+        opportunity_value = 0.0
+        if baseline_total and baseline_total > 0:
+            price_variance = (
+                (quote.get('total_amount', 0) - baseline_total) / baseline_total
+            ) * 100
+            total_cost_variance = price_variance
+            opportunity_value = max(0.0, baseline_total - quote.get('total_amount', 0))
+
+        term_variance = 0
+        baseline_terms = quote.get('baseline_payment_terms')
+        if baseline_terms:
+            term_variance = 0 if quote.get('payment_terms') == baseline_terms else 1
+
+        return {
+            'price_variance': price_variance,
+            'term_variance': term_variance,
+            'total_cost_variance': total_cost_variance,
+            'opportunity_value': opportunity_value,
+        }
 
     def _score_price(self, quote: Dict, all_quotes: List[Dict]) -> float:
         """Score quote based on price"""
