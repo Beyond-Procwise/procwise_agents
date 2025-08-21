@@ -154,3 +154,59 @@ def test_fetch_quotes_from_qdrant():
     # Ensure document type filter is applied
     must_filters = nick.qdrant_client.last_filter.must
     assert any(f.key == "document_type" for f in must_filters)
+
+
+def test_fetch_quotes_handles_missing_supplier_index(monkeypatch):
+    nick = DummyNick()
+
+    class DummyPoint:
+        def __init__(self):
+            self.id = "p1"
+            self.payload = {
+                "quote_id": "Q1",
+                "supplier_name": "Supplier A",
+                "total_amount": 100,
+                "payment_terms": "Net 30",
+                "delivery_terms": "3 days",
+                "discount_percentage": 5,
+                "baseline_total_amount": 120,
+                "baseline_payment_terms": "Net 30",
+                "document_type": "quote",
+            }
+
+    class FailingClient:
+        def __init__(self):
+            self.attempts = 0
+
+        def scroll(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise Exception(
+                    "Bad request: Index required but not found for \"supplier_name\""
+                )
+            return [DummyPoint()], None
+
+    nick.qdrant_client = FailingClient()
+    agent = QuoteEvaluationAgent(nick)
+    quotes = agent._fetch_quotes(["Supplier A"], "")
+    assert quotes[0]["quote_id"] == "Q1"
+    assert nick.qdrant_client.attempts == 2
+
+
+def test_process_handles_empty_product_type(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    def capture_fetch(supplier_names, product_category=None):
+        capture_fetch.captured = product_category
+        return _mock_quotes()
+
+    monkeypatch.setattr(agent, "_fetch_quotes", capture_fetch)
+    context = AgentContext(
+        workflow_id="wf3",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={"product_type": ""},
+    )
+    agent.run(context)
+    assert capture_fetch.captured is None

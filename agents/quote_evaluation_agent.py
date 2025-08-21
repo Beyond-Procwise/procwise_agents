@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from qdrant_client import models
@@ -33,9 +34,14 @@ class QuoteEvaluationAgent(BaseAgent):
             input_data = context.input_data
 
             # Fetch quotes from database
+            product_category = (
+                input_data.get('product_category')
+                or input_data.get('product_type')
+                or None
+            )
             quotes = self._fetch_quotes(
                 input_data.get('supplier_names', []),
-                input_data.get('product_category')
+                product_category,
             )
 
             if not quotes:
@@ -59,14 +65,16 @@ class QuoteEvaluationAgent(BaseAgent):
                 best_quote, evaluation, comparison
             )
 
-            output_data = {
-                'quotes_analyzed': len(quotes),
-                'best_quote': best_quote,
-                'comparison_matrix': comparison,
-                'evaluation_scores': evaluation,
-                'recommendations': recommendations,
-                'savings_potential': self._calculate_savings(quotes, best_quote)
-            }
+            output_data = self._to_native(
+                {
+                    'quotes_analyzed': len(quotes),
+                    'best_quote': best_quote,
+                    'comparison_matrix': comparison,
+                    'evaluation_scores': evaluation,
+                    'recommendations': recommendations,
+                    'savings_potential': self._calculate_savings(quotes, best_quote),
+                }
+            )
 
             # Determine next agents
             next_agents = []
@@ -104,15 +112,15 @@ class QuoteEvaluationAgent(BaseAgent):
         product_category: Optional[str] = None,
     ) -> List[Dict]:
         """Fetch quotes from Qdrant vector database."""
-        try:
-            # Always filter for document type "quote"
+
+        def build_filter(include_supplier: bool = True) -> models.Filter:
             filters = [
                 models.FieldCondition(
                     key="document_type",
                     match=models.MatchValue(value="quote"),
                 )
             ]
-            if supplier_names:
+            if include_supplier and supplier_names:
                 filters.append(
                     models.FieldCondition(
                         key="supplier_name",
@@ -126,57 +134,69 @@ class QuoteEvaluationAgent(BaseAgent):
                         match=models.MatchValue(value=product_category),
                     )
                 )
-            q_filter = models.Filter(must=filters) if filters else None
-            points, _ = self.agent_nick.qdrant_client.scroll(
+            return models.Filter(must=filters)
+
+        def qdrant_scroll(q_filter: models.Filter):
+            return self.agent_nick.qdrant_client.scroll(
                 collection_name=self.settings.qdrant_collection_name,
                 scroll_filter=q_filter,
                 with_payload=True,
                 limit=100,
             )
-            quotes: List[Dict] = []
-            for point in points:
-                payload = point.payload or {}
-                quotes.append(
-                    {
-                        "quote_id": payload.get("quote_id", point.id),
-                        "supplier_name": payload.get("supplier_name", ""),
-                        "customer_name": payload.get("customer_name"),
-                        "quote_date": payload.get("quote_date"),
-                        "valid_until": payload.get("valid_until"),
-                        "total_amount": payload.get("total_amount", 0),
-                        "currency": payload.get("currency"),
-                        "payment_terms": payload.get("payment_terms"),
-                        "delivery_terms": payload.get("delivery_terms"),
-                        "discount_percentage": payload.get("discount_percentage", 0),
-                        "line_items_count": payload.get("line_items_count", 0),
-                        "avg_unit_price": payload.get("avg_unit_price", 0),
-                        # Baseline fields for variance detection
-                        "baseline_total_amount": payload.get("baseline_total_amount"),
-                        "baseline_payment_terms": payload.get("baseline_payment_terms"),
-                    }
-                )
-            return quotes
+
+        try:
+            points, _ = qdrant_scroll(build_filter())
         except Exception as e:
-            logger.error(f"Failed to fetch quotes from Qdrant: {e}")
-            # Return mock data for testing
-            return [
+            logger.warning(
+                "Primary quote fetch failed (%s). Retrying without supplier filter.", e
+            )
+            try:
+                points, _ = qdrant_scroll(build_filter(include_supplier=False))
+            except Exception as e2:
+                logger.error(f"Failed to fetch quotes from Qdrant: {e2}")
+                # Return mock data for testing
+                return [
+                    {
+                        "quote_id": "Q001",
+                        "supplier_name": "Supplier A",
+                        "total_amount": 45000,
+                        "payment_terms": "Net 30",
+                        "delivery_terms": "5 days",
+                        "discount_percentage": 5,
+                    },
+                    {
+                        "quote_id": "Q002",
+                        "supplier_name": "Supplier B",
+                        "total_amount": 42000,
+                        "payment_terms": "Net 45",
+                        "delivery_terms": "7 days",
+                        "discount_percentage": 8,
+                    },
+                ]
+
+        quotes: List[Dict] = []
+        for point in points:
+            payload = point.payload or {}
+            quotes.append(
                 {
-                    "quote_id": "Q001",
-                    "supplier_name": "Supplier A",
-                    "total_amount": 45000,
-                    "payment_terms": "Net 30",
-                    "delivery_terms": "5 days",
-                    "discount_percentage": 5,
-                },
-                {
-                    "quote_id": "Q002",
-                    "supplier_name": "Supplier B",
-                    "total_amount": 42000,
-                    "payment_terms": "Net 45",
-                    "delivery_terms": "7 days",
-                    "discount_percentage": 8,
-                },
-            ]
+                    "quote_id": payload.get("quote_id", point.id),
+                    "supplier_name": payload.get("supplier_name", ""),
+                    "customer_name": payload.get("customer_name"),
+                    "quote_date": payload.get("quote_date"),
+                    "valid_until": payload.get("valid_until"),
+                    "total_amount": payload.get("total_amount", 0),
+                    "currency": payload.get("currency"),
+                    "payment_terms": payload.get("payment_terms"),
+                    "delivery_terms": payload.get("delivery_terms"),
+                    "discount_percentage": payload.get("discount_percentage", 0),
+                    "line_items_count": payload.get("line_items_count", 0),
+                    "avg_unit_price": payload.get("avg_unit_price", 0),
+                    # Baseline fields for variance detection
+                    "baseline_total_amount": payload.get("baseline_total_amount"),
+                    "baseline_payment_terms": payload.get("baseline_payment_terms"),
+                }
+            )
+        return quotes
 
     def _evaluate_quotes(self, quotes: List[Dict]) -> Dict:
         """Evaluate quotes on multiple criteria"""
@@ -387,3 +407,13 @@ class QuoteEvaluationAgent(BaseAgent):
             }
 
         return recommendations
+
+    def _to_native(self, obj):
+        """Recursively convert numpy types to native Python types."""
+        if isinstance(obj, dict):
+            return {k: self._to_native(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._to_native(v) for v in obj]
+        if isinstance(obj, np.generic):
+            return obj.item()
+        return obj
