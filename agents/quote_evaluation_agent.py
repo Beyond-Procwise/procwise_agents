@@ -113,6 +113,22 @@ class QuoteEvaluationAgent(BaseAgent):
     ) -> List[Dict]:
         """Fetch quotes from Qdrant vector database."""
 
+        def ensure_index(field_name: str) -> None:
+            """Create a Qdrant payload index if it doesn't exist."""
+            try:
+                self.agent_nick.qdrant_client.create_payload_index(
+                    collection_name=self.settings.qdrant_collection_name,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception as ie:  # pragma: no cover - network dependent
+                logger.debug("Index creation skipped for %s: %s", field_name, ie)
+
+        if supplier_names:
+            ensure_index("supplier_name")
+        if product_category:
+            ensure_index("product_category")
+
         def build_filter(include_supplier: bool = True) -> models.Filter:
             filters = [
                 models.FieldCondition(
