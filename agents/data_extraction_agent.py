@@ -6,6 +6,7 @@ import uuid
 import os
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
+import gzip
 import concurrent.futures
 import ollama
 import pdfplumber
@@ -86,6 +87,16 @@ def _normalize_label(value: Any) -> str:
     if value is None:
         return ""
     return str(value).lower()
+
+
+def _maybe_decompress(content: bytes) -> bytes:
+    """Decompress gzip-compressed payloads if necessary."""
+    try:
+        if content[:2] == b"\x1f\x8b":
+            return gzip.decompress(content)
+    except Exception:
+        logger.warning("Failed to decompress gzip content")
+    return content
 
 
 class DataExtractionAgent(BaseAgent):
@@ -236,6 +247,13 @@ class DataExtractionAgent(BaseAgent):
         extraction is also performed and appended line-wise to the output.
         """
 
+        file_bytes = _maybe_decompress(file_bytes)
+        if not file_bytes.startswith(b"%PDF"):
+            logger.warning(
+                "Provided bytes do not look like a PDF; attempting image extraction"
+            )
+            return self._extract_text_from_image(file_bytes, allow_pdf_fallback=False)
+
         lines: List[str] = []
 
         try:
@@ -300,7 +318,10 @@ class DataExtractionAgent(BaseAgent):
                     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("PyMuPDF failed extracting text: %s", exc)
-                return ""
+                img_text = self._extract_text_from_image(
+                    file_bytes, allow_pdf_fallback=False
+                )
+                return img_text
         elif not lines:
             logger.warning("No text extracted from PDF; PyMuPDF not installed")
             return ""
@@ -319,7 +340,7 @@ class DataExtractionAgent(BaseAgent):
             logger.error("Failed extracting DOCX text: %s", exc)
             return ""
 
-    def _extract_text_from_image(self, file_bytes: bytes) -> str:
+    def _extract_text_from_image(self, file_bytes: bytes, allow_pdf_fallback: bool = True) -> str:
         """OCR text from image files using EasyOCR or pytesseract."""
         if Image is None:
             logger.warning("PIL not installed; cannot OCR image")
@@ -327,10 +348,13 @@ class DataExtractionAgent(BaseAgent):
         try:
             img = Image.open(BytesIO(file_bytes))
         except UnidentifiedImageError:
-            logger.warning(
-                "Provided bytes are not a valid image; attempting PDF extraction fallback",
-            )
-            return self._extract_text_from_pdf(file_bytes)
+            if allow_pdf_fallback:
+                logger.warning(
+                    "Provided bytes are not a valid image; attempting PDF extraction fallback",
+                )
+                return self._extract_text_from_pdf(file_bytes)
+            logger.warning("Provided bytes are not a valid image")
+            return ""
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed OCR on image: %s", exc)
             return ""
@@ -1040,9 +1064,12 @@ class DataExtractionAgent(BaseAgent):
                 }
                 for idx, item in enumerate(line_items, start=1):
                     line_key = "line_no" if line_no_col == "line_no" else "line_number"
-                    line_value = item.get(line_key)
-                    if line_value in (None, ""):
+                    raw_line = item.get(line_key)
+                    if raw_line in (None, ""):
                         line_value = idx
+                    else:
+                        cleaned = self._clean_numeric(raw_line)
+                        line_value = int(cleaned) if cleaned is not None else idx
                     payload = {fk_col: pk_value, line_no_col: line_value}
                     if doc_type == "Invoice":
                         if "po_id" in columns and header.get("po_id"):
