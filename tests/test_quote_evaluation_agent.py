@@ -41,6 +41,8 @@ def _mock_quotes(*args, **kwargs):
             "payment_terms": "Net 30",
             "delivery_terms": "3 days",
             "discount_percentage": 5,
+            "baseline_total_amount": 120,
+            "baseline_payment_terms": "Net 30",
         },
         {
             "quote_id": "Q2",
@@ -49,6 +51,8 @@ def _mock_quotes(*args, **kwargs):
             "payment_terms": "Net 45",
             "delivery_terms": "5 days",
             "discount_percentage": 0,
+            "baseline_total_amount": 110,
+            "baseline_payment_terms": "Net 30",
         },
     ]
 
@@ -81,6 +85,8 @@ def test_quote_evaluation_agent_run(monkeypatch):
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert output.data["best_quote"]["quote_id"] == "Q1"
+    assert output.data["evaluation_scores"]["Q1"]["opportunity_value"] == 20
+    assert output.data["evaluation_scores"]["Q1"]["supplier_score"] == 100
 
 
 class DummyOrchestrator:
@@ -112,6 +118,7 @@ def test_quote_evaluation_endpoint(monkeypatch):
     resp = client.post("/workflows/quotes/evaluate", json={})
     assert resp.status_code == 200
     assert resp.json()["result"]["best_quote"]["quote_id"] == "Q1"
+    assert resp.json()["result"]["evaluation_scores"]["Q1"]["opportunity_value"] == 20
 
 
 def test_fetch_quotes_from_qdrant():
@@ -127,13 +134,23 @@ def test_fetch_quotes_from_qdrant():
                 "payment_terms": "Net 30",
                 "delivery_terms": "3 days",
                 "discount_percentage": 5,
+                "baseline_total_amount": 120,
+                "baseline_payment_terms": "Net 30",
+                "document_type": "quote",
             }
 
     class DummyClient:
-        def scroll(self, **_):
+        def __init__(self):
+            self.last_filter = None
+
+        def scroll(self, scroll_filter=None, **_):
+            self.last_filter = scroll_filter
             return [DummyPoint()], None
 
     nick.qdrant_client = DummyClient()
     agent = QuoteEvaluationAgent(nick)
     quotes = agent._fetch_quotes(["Supplier A"])
     assert quotes[0]["quote_id"] == "Q1"
+    # Ensure document type filter is applied
+    must_filters = nick.qdrant_client.last_filter.must
+    assert any(f.key == "document_type" for f in must_filters)
