@@ -3,6 +3,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+# Ensure GPU utilisation by default on compatible hardware
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from orchestration.orchestrator import Orchestrator
@@ -14,6 +20,9 @@ from agents.quote_evaluation_agent import QuoteEvaluationAgent
 from agents.opportunity_miner_agent import OpportunityMinerAgent
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from agents.email_drafting_agent import EmailDraftingAgent
+from agents.negotiation_agent import NegotiationAgent
+from agents.approvals_agent import ApprovalsAgent
+from agents.supplier_interaction_agent import SupplierInteractionAgent
 from api.routers import workflows, system
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -36,6 +45,9 @@ async def lifespan(app: FastAPI):
             'discrepancy_detection': discrepancy_agent,
             'DiscrepancyDetectionAgent': discrepancy_agent,
             'email_drafting': EmailDraftingAgent(agent_nick),
+            'negotiation': NegotiationAgent(agent_nick),
+            'approvals': ApprovalsAgent(agent_nick),
+            'supplier_interaction': SupplierInteractionAgent(agent_nick),
         }
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)

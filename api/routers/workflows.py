@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from starlette.concurrency import run_in_threadpool
@@ -83,6 +83,31 @@ class QuoteEvaluationRequest(BaseModel):
 
     supplier_names: Optional[List[str]] = None
     product_category: Optional[str] = None
+
+
+class NegotiationRequest(BaseModel):
+    supplier: str
+    current_offer: float
+    target_price: float
+    user_id: Optional[str] = None
+
+
+class ApprovalRequest(BaseModel):
+    amount: float
+    supplier_id: Optional[str] = None
+    threshold: Optional[float] = None
+    user_id: Optional[str] = None
+
+
+class SupplierInteractionRequest(BaseModel):
+    message: str
+    supplier_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class DiscrepancyRequest(BaseModel):
+    extracted_docs: List[Dict[str, Any]]
+    user_id: Optional[str] = None
 
 
 class AgentType(BaseModel):
@@ -312,6 +337,42 @@ async def draft_email(
         orchestrator.execute_workflow, "email_drafting", input_data
     )
     return result
+
+
+@router.post("/negotiate")
+def negotiate(
+    req: NegotiationRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Execute the negotiation agent."""
+    return orchestrator.execute_workflow("negotiation", req.model_dump())
+
+
+@router.post("/approvals")
+def approvals(
+    req: ApprovalRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Run the approvals agent."""
+    return orchestrator.execute_workflow("approvals", req.model_dump())
+
+
+@router.post("/supplier-interaction")
+def supplier_interaction(
+    req: SupplierInteractionRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Trigger the supplier interaction agent."""
+    return orchestrator.execute_workflow("supplier_interaction", req.model_dump())
+
+
+@router.post("/discrepancy")
+def detect_discrepancy(
+    req: DiscrepancyRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Expose the discrepancy detection agent."""
+    return orchestrator.execute_workflow("discrepancy_detection", req.model_dump())
 
 
 @router.get(
