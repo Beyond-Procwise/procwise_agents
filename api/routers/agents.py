@@ -1,6 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Dict, Any
 import logging
+import os
+
+# Ensure GPU-related environment variables are set for agent operations
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 logger = logging.getLogger(__name__)
 
