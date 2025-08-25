@@ -1,0 +1,294 @@
+[
+  {
+    "id": "policy_unit_price_reduction_v2",
+    "category": "Price-Based",
+    "intents": [
+      "detect_unit_price_reduction_opportunity"
+    ],
+    "trigger": {
+      "signals": [
+        {
+          "name": "unit_price_vol_weighted_p90_vs_p10_variance",
+          "source": "spend.txn",
+          "calc": "(p90 - p10)/p50",
+          "comparison": ">=",
+          "threshold": 0.12
+        },
+        {
+          "name": "repeat_supplier_non_declining_price",
+          "source": "spend.txn",
+          "calc": "month_over_month_change",
+          "comparison": ">=",
+          "threshold": 0.0
+        }
+      ],
+      "window": "last_365_days",
+      "min_observations": 25
+    },
+    "conditions": {
+      "must_have": [
+        "active_contract"
+      ],
+      "exclude": [
+        "in_flight_negotiation",
+        "price_protection_clause_active"
+      ]
+    },
+    "evidence_requirements": [
+      "line_level_txns",
+      "contract_clause_refs",
+      "volume_forecast"
+    ],
+    "logic": {
+      "decision": "flag_if_all_required_signals_met"
+    },
+    "scoring": {
+      "weights": {
+        "impact": 0.55,
+        "confidence": 0.25,
+        "time_to_realise": 0.1,
+        "risk": 0.1
+      }
+    },
+    "guardrails": {
+      "external_claims": {
+        "ban_phrases": [
+          "benchmark",
+          "market rate",
+          "peer average"
+        ],
+        "transform": "ask_for_strongest_pricing"
+      }
+    },
+    "actions": [
+      {
+        "type": "open_opportunity_record"
+      },
+      {
+        "type": "handoff_to_negotiation",
+        "drafting_template_suggestions": [
+          "bafo_light_refresh_v1"
+        ],
+        "require_human_gate": true
+      },
+      {
+        "type": "write_audit_log"
+      }
+    ]
+  },
+  {
+    "id": "policy_volume_aggregation_v2",
+    "category": "Price-Based",
+    "intents": [
+      "detect_volume_discounts_opportunity"
+    ],
+    "trigger": {
+      "signals": [
+        {
+          "name": "supplier_spend_fragmentation",
+          "source": "spend.txn",
+          "calc": "num_po_per_bu > 3 && coeff_var_vol>0.25",
+          "comparison": "==",
+          "threshold": true
+        },
+        {
+          "name": "tier_break_economy",
+          "source": "contracts",
+          "calc": "current_unit_price - next_tier_unit_price",
+          "comparison": ">=",
+          "threshold": 0.03
+        }
+      ],
+      "window": "last_365_days",
+      "min_observations": 20
+    },
+    "conditions": {
+      "must_have": [
+        "multi_bu",
+        "active_contract"
+      ],
+      "exclude": [
+        "in_flight_negotiation"
+      ]
+    },
+    "evidence_requirements": [
+      "po_lines",
+      "tier_tables",
+      "volume_forecast"
+    ],
+    "logic": {
+      "decision": "flag_if_all_required_signals_met"
+    },
+    "scoring": {
+      "weights": {
+        "impact": 0.5,
+        "confidence": 0.3,
+        "time_to_realise": 0.15,
+        "risk": 0.05
+      }
+    },
+    "guardrails": {
+      "external_claims": {
+        "ban_phrases": [
+          "benchmark",
+          "market"
+        ],
+        "transform": "ask_for_strongest_pricing"
+      }
+    },
+    "actions": [
+      {
+        "type": "open_opportunity_record"
+      },
+      {
+        "type": "handoff_to_negotiation",
+        "drafting_template_suggestions": [
+          "volume_aggregation_signal_v1"
+        ],
+        "require_human_gate": true
+      },
+      {
+        "type": "write_audit_log"
+      }
+    ]
+  },
+  {
+    "id": "policy_payment_terms_trade_v2",
+    "category": "Contractual & Commercial Terms",
+    "intents": [
+      "detect_improved_payment_terms_opportunity"
+    ],
+    "trigger": {
+      "signals": [
+        {
+          "name": "dsos_high",
+          "source": "ap.ledger",
+          "calc": "dso_actual - dso_target",
+          "comparison": ">=",
+          "threshold": 10
+        },
+        {
+          "name": "epd_available",
+          "source": "supplier_history",
+          "calc": "exists(epd_offers)",
+          "comparison": "==",
+          "threshold": true
+        }
+      ],
+      "window": "last_180_days",
+      "min_observations": 12
+    },
+    "conditions": {
+      "must_have": [
+        "supplier_in_good_standing"
+      ],
+      "exclude": [
+        "contract_terms_locked"
+      ]
+    },
+    "evidence_requirements": [
+      "dso_trend",
+      "cash_cost_curve",
+      "historical_epd"
+    ],
+    "logic": {
+      "decision": "flag_if_all_required_signals_met"
+    },
+    "scoring": {
+      "weights": {
+        "impact": 0.45,
+        "confidence": 0.3,
+        "time_to_realise": 0.2,
+        "risk": 0.05
+      }
+    },
+    "guardrails": {
+      "external_claims": {
+        "ban_phrases": [
+          "benchmark"
+        ],
+        "transform": "invite options and EPDs"
+      }
+    },
+    "actions": [
+      {
+        "type": "handoff_to_negotiation",
+        "drafting_template_suggestions": [
+          "payment_terms_trade_v1"
+        ],
+        "require_human_gate": true
+      },
+      {
+        "type": "write_audit_log"
+      }
+    ]
+  },
+  {
+    "id": "policy_indexation_recalibration_v2",
+    "category": "Contractual & Commercial Terms",
+    "intents": [
+      "detect_index_linked_pricing_adjustments_opportunity"
+    ],
+    "trigger": {
+      "signals": [
+        {
+          "name": "index_mismatch",
+          "source": "contracts",
+          "calc": "supplier_index != appropriate_index",
+          "comparison": "==",
+          "threshold": true
+        },
+        {
+          "name": "cap_floor_absent",
+          "source": "contracts",
+          "calc": "missing(cap) || missing(floor)",
+          "comparison": "==",
+          "threshold": true
+        }
+      ],
+      "window": "contract_term",
+      "min_observations": 1
+    },
+    "conditions": {
+      "must_have": [
+        "indexation_clause_present"
+      ]
+    },
+    "evidence_requirements": [
+      "clause_text",
+      "index_series",
+      "revision_history"
+    ],
+    "logic": {
+      "decision": "flag_if_all_required_signals_met"
+    },
+    "scoring": {
+      "weights": {
+        "impact": 0.4,
+        "confidence": 0.35,
+        "time_to_realise": 0.15,
+        "risk": 0.1
+      }
+    },
+    "guardrails": {
+      "external_claims": {
+        "ban_phrases": [
+          "industry average"
+        ],
+        "transform": "offer structure options"
+      }
+    },
+    "actions": [
+      {
+        "type": "handoff_to_negotiation",
+        "drafting_template_suggestions": [
+          "indexation_recalibration_v1"
+        ],
+        "require_human_gate": true
+      },
+      {
+        "type": "write_audit_log"
+      }
+    ]
+  }
+]

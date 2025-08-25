@@ -1,0 +1,54 @@
+{
+  "bridge_id": "opportunity_to_outreach_v2",
+  "contract": {
+    "input": {
+      "opportunity_output": "prompts.standard_response",
+      "required_fields": [
+        "opportunity_summary",
+        "signals",
+        "score",
+        "viable",
+        "outreach"
+      ]
+    },
+    "output": {
+      "negotiation_handoff": {
+        "template_suggestions": [
+          "volume_aggregation_signal_v1",
+          "payment_terms_trade_v1",
+          "bafo_light_refresh_v1"
+        ],
+        "prefill_values": {
+          "Supplier_Name": "{{supplier}}",
+          "Contract_Name": "{{sku_or_service}}",
+          "Currency": "GBP",
+          "Deadline_Date": "{{+7d}}"
+        },
+        "guardrails": {
+          "ban_phrases": [
+            "benchmark",
+            "market average",
+            "peer price"
+          ]
+        }
+      }
+    }
+  },
+  "mapping_rules": [
+    {
+      "from": "signals",
+      "to": "audit.signals",
+      "note": "for buyer review only"
+    },
+    {
+      "from": "score.total",
+      "to": "triage.priority",
+      "note": "0-1 scale"
+    },
+    {
+      "from": "outreach.template_suggestions",
+      "to": "negotiation_agent.call.drafting.template_id",
+      "note": "pick top-1 or run A/B"
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+{
+  "$id": "opportunity_prompt_template_schema_v2",
+  "type": "object",
+  "required": [
+    "id",
+    "purpose",
+    "inputs",
+    "system",
+    "developer",
+    "user_template",
+    "response_schema",
+    "detail_controls"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "purpose": {
+      "type": "string"
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "system": {
+      "type": "string"
+    },
+    "developer": {
+      "type": "string"
+    },
+    "user_template": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "response_schema": {
+      "type": "object",
+      "required": [
+        "type",
+        "required",
+        "properties"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "required": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "properties": {
+          "type": "object"
+        }
+      }
+    },
+    "detail_controls": {
+      "type": "object"
+    }
+  },
+  "definitions": {
+    "standard_response": {
+      "type": "object",
+      "required": [
+        "opportunity_summary",
+        "signals",
+        "score",
+        "viable",
+        "recommended_actions",
+        "outreach"
+      ],
+      "properties": {
+        "opportunity_summary": {
+          "type": "string"
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "value",
+              "threshold",
+              "direction",
+              "status"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "value": {},
+              "threshold": {},
+              "direction": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "score": {
+          "type": "object",
+          "required": [
+            "impact",
+            "confidence",
+            "time_to_realise",
+            "risk",
+            "total"
+          ],
+          "properties": {
+            "impact": {},
+            "confidence": {},
+            "time_to_realise": {},
+            "risk": {},
+            "total": {}
+          }
+        },
+        "viable": {
+          "type": "boolean"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "lever",
+              "why",
+              "data_refs"
+            ],
+            "properties": {
+              "lever": {
+                "type": "string"
+              },
+              "why": {
+                "type": "string"
+              },
+              "data_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "outreach": {
+          "type": "object",
+          "required": [
+            "template_suggestions",
+            "prefill_values",
+            "guardrails"
+          ],
+          "properties": {
+            "template_suggestions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "prefill_values": {
+              "type": "object"
+            },
+            "guardrails": {
+              "type": "object",
+              "properties": {
+                "ban_phrases": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "policy_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

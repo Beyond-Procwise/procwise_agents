@@ -1,0 +1,59 @@
+{
+  "states": [
+    "scan",
+    "triage",
+    "scope",
+    "propose",
+    "human_gate",
+    "outreach",
+    "track_responses"
+  ],
+  "transitions": [
+    {
+      "from": "scan",
+      "to": "triage",
+      "on": "signals_detected"
+    },
+    {
+      "from": "triage",
+      "to": "scope",
+      "on": "priority_above_threshold"
+    },
+    {
+      "from": "scope",
+      "to": "propose",
+      "on": "viable_true"
+    },
+    {
+      "from": "propose",
+      "to": "human_gate",
+      "on": "proposal_ready"
+    },
+    {
+      "from": "human_gate",
+      "to": "outreach",
+      "on": "approved"
+    },
+    {
+      "from": "outreach",
+      "to": "track_responses",
+      "on": "messages_sent"
+    }
+  ],
+  "guards": {
+    "no_external_benchmarks": true,
+    "require_evidence_list": true
+  },
+  "detail_controls_defaults": {
+    "min_words": {
+      "opportunity_summary": 60,
+      "recommended_actions": 40
+    },
+    "ban_phrases": [
+      "benchmark",
+      "market average",
+      "industry rate",
+      "peer pricing"
+    ]
+  }
+}

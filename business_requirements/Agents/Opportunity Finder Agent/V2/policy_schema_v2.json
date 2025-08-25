@@ -1,0 +1,139 @@
+{
+  "$id": "opportunity_policy_schema_v2",
+  "type": "object",
+  "required": [
+    "id",
+    "category",
+    "intents",
+    "trigger",
+    "conditions",
+    "evidence_requirements",
+    "logic",
+    "scoring",
+    "guardrails",
+    "actions"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "category": {
+      "type": "string"
+    },
+    "intents": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "required": [
+        "signals",
+        "window",
+        "min_observations"
+      ],
+      "properties": {
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "source",
+              "calc",
+              "comparison",
+              "threshold"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "calc": {
+                "type": "string"
+              },
+              "comparison": {
+                "type": "string"
+              },
+              "threshold": {}
+            }
+          }
+        },
+        "window": {
+          "type": "string"
+        },
+        "min_observations": {
+          "type": "number"
+        }
+      }
+    },
+    "conditions": {
+      "type": "object",
+      "properties": {
+        "must_have": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "logic": {
+      "type": "object"
+    },
+    "scoring": {
+      "type": "object",
+      "properties": {
+        "weights": {
+          "type": "object"
+        },
+        "impact_calc": {
+          "type": "string"
+        },
+        "confidence_calc": {
+          "type": "string"
+        }
+      }
+    },
+    "guardrails": {
+      "type": "object",
+      "properties": {
+        "external_claims": {
+          "type": "object",
+          "properties": {
+            "ban_phrases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "transform": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

@@ -1,0 +1,486 @@
+[
+  {
+    "id": "opp_detect_unit_price_reduction_v2",
+    "purpose": "detect",
+    "inputs": {
+      "data_refs": [
+        "spend.txn",
+        "contracts"
+      ],
+      "variables": [
+        "supplier",
+        "sku_or_service",
+        "time_period"
+      ]
+    },
+    "system": "You are the Opportunity Agent. Return VALID JSON per response_schema. Do not mention benchmarks.",
+    "developer": "Compute unit price dispersion and non-declining price flags. Use provided percentiles and MoM series only.",
+    "user_template": [
+      "Supplier={{supplier}}, SKU/Service={{sku_or_service}}, Period={{time_period}}.",
+      "Compute p10/p50/p90, MoM trend, dispersion, and price protection flags. Score viability and propose levers."
+    ],
+    "response_schema": {
+      "type": "object",
+      "required": [
+        "opportunity_summary",
+        "signals",
+        "score",
+        "viable",
+        "recommended_actions",
+        "outreach"
+      ],
+      "properties": {
+        "opportunity_summary": {
+          "type": "string"
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "value",
+              "threshold",
+              "direction",
+              "status"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "value": {},
+              "threshold": {},
+              "direction": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "score": {
+          "type": "object",
+          "required": [
+            "impact",
+            "confidence",
+            "time_to_realise",
+            "risk",
+            "total"
+          ],
+          "properties": {
+            "impact": {},
+            "confidence": {},
+            "time_to_realise": {},
+            "risk": {},
+            "total": {}
+          }
+        },
+        "viable": {
+          "type": "boolean"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "lever",
+              "why",
+              "data_refs"
+            ],
+            "properties": {
+              "lever": {
+                "type": "string"
+              },
+              "why": {
+                "type": "string"
+              },
+              "data_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "outreach": {
+          "type": "object",
+          "required": [
+            "template_suggestions",
+            "prefill_values",
+            "guardrails"
+          ],
+          "properties": {
+            "template_suggestions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "prefill_values": {
+              "type": "object"
+            },
+            "guardrails": {
+              "type": "object",
+              "properties": {
+                "ban_phrases": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "policy_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "detail_controls": {
+      "min_words": {
+        "opportunity_summary": 60
+      },
+      "ban_phrases": [
+        "benchmark",
+        "market average",
+        "industry rate",
+        "peer pricing"
+      ]
+    }
+  },
+  {
+    "id": "opp_detect_volume_aggregation_v2",
+    "purpose": "detect",
+    "inputs": {
+      "data_refs": [
+        "spend.txn",
+        "contracts",
+        "forecasts"
+      ],
+      "variables": [
+        "supplier",
+        "sku_or_service",
+        "time_period"
+      ]
+    },
+    "system": "You are the Opportunity Agent. Return VALID JSON per response_schema. Do not mention benchmarks.",
+    "developer": "Aggregate volumes across business units and compute tiering breakpoints; check active price protection clauses.",
+    "user_template": [
+      "We suspect scope to consolidate volumes across BUs for {{sku_or_service}} with {{supplier}}.",
+      "Compute spend concentration, monthly volatility, and feasible tiers (3 tiers). Score and propose levers."
+    ],
+    "response_schema": {
+      "type": "object",
+      "required": [
+        "opportunity_summary",
+        "signals",
+        "score",
+        "viable",
+        "recommended_actions",
+        "outreach"
+      ],
+      "properties": {
+        "opportunity_summary": {
+          "type": "string"
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "value",
+              "threshold",
+              "direction",
+              "status"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "value": {},
+              "threshold": {},
+              "direction": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "score": {
+          "type": "object",
+          "required": [
+            "impact",
+            "confidence",
+            "time_to_realise",
+            "risk",
+            "total"
+          ],
+          "properties": {
+            "impact": {},
+            "confidence": {},
+            "time_to_realise": {},
+            "risk": {},
+            "total": {}
+          }
+        },
+        "viable": {
+          "type": "boolean"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "lever",
+              "why",
+              "data_refs"
+            ],
+            "properties": {
+              "lever": {
+                "type": "string"
+              },
+              "why": {
+                "type": "string"
+              },
+              "data_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "outreach": {
+          "type": "object",
+          "required": [
+            "template_suggestions",
+            "prefill_values",
+            "guardrails"
+          ],
+          "properties": {
+            "template_suggestions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "prefill_values": {
+              "type": "object"
+            },
+            "guardrails": {
+              "type": "object",
+              "properties": {
+                "ban_phrases": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "policy_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "detail_controls": {
+      "min_words": {
+        "opportunity_summary": 60
+      },
+      "ban_phrases": [
+        "benchmark",
+        "market"
+      ]
+    }
+  },
+  {
+    "id": "opp_detect_payment_terms_trade_v2",
+    "purpose": "detect",
+    "inputs": {
+      "data_refs": [
+        "ap.ledger",
+        "supplier_history",
+        "contracts"
+      ],
+      "variables": [
+        "supplier",
+        "time_period"
+      ]
+    },
+    "system": "Return VALID JSON; neutral supplier language.",
+    "developer": "Analyse DSO deltas, cash cost curve and historic EPD usage.",
+    "user_template": [
+      "Supplier={{supplier}}. Analyse payment terms history and DSO trend for {{time_period}}. Propose trade options and score."
+    ],
+    "response_schema": {
+      "type": "object",
+      "required": [
+        "opportunity_summary",
+        "signals",
+        "score",
+        "viable",
+        "recommended_actions",
+        "outreach"
+      ],
+      "properties": {
+        "opportunity_summary": {
+          "type": "string"
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "value",
+              "threshold",
+              "direction",
+              "status"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "value": {},
+              "threshold": {},
+              "direction": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "score": {
+          "type": "object",
+          "required": [
+            "impact",
+            "confidence",
+            "time_to_realise",
+            "risk",
+            "total"
+          ],
+          "properties": {
+            "impact": {},
+            "confidence": {},
+            "time_to_realise": {},
+            "risk": {},
+            "total": {}
+          }
+        },
+        "viable": {
+          "type": "boolean"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "lever",
+              "why",
+              "data_refs"
+            ],
+            "properties": {
+              "lever": {
+                "type": "string"
+              },
+              "why": {
+                "type": "string"
+              },
+              "data_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "outreach": {
+          "type": "object",
+          "required": [
+            "template_suggestions",
+            "prefill_values",
+            "guardrails"
+          ],
+          "properties": {
+            "template_suggestions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "prefill_values": {
+              "type": "object"
+            },
+            "guardrails": {
+              "type": "object",
+              "properties": {
+                "ban_phrases": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "policy_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "detail_controls": {
+      "min_words": {
+        "opportunity_summary": 60
+      },
+      "ban_phrases": [
+        "benchmark"
+      ]
+    }
+  }
+]
