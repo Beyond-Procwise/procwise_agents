@@ -26,7 +26,25 @@
   {
     "agentId": 5,
     "agentType": "EmailDraftingAgent",
-    "description": "Drafts and sends emails via Amazon SES.",
+    "description": "Drafts communication using an LLM and prepares emails via SES.",
     "dependencies": ["prompt_engine"]
+  },
+  {
+    "agentId": 6,
+    "agentType": "NegotiationAgent",
+    "description": "Generates supplier negotiation messages using an LLM.",
+    "dependencies": ["prompt_engine"]
+  },
+  {
+    "agentId": 7,
+    "agentType": "SupplierInteractionAgent",
+    "description": "Normalizes supplier communications and routes to the appropriate agent.",
+    "dependencies": ["routing_engine", "prompt_engine"]
+  },
+  {
+    "agentId": 8,
+    "agentType": "ApprovalsAgent",
+    "description": "Determines approval decisions based on policy thresholds.",
+    "dependencies": ["policy_engine"]
   }
 ]
