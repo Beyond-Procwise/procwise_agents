@@ -3,7 +3,6 @@ import sys
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from agents.email_drafting_agent import EmailDraftingAgent
 from agents.base_agent import AgentContext, AgentStatus
 
@@ -16,9 +15,6 @@ class DummyNick:
 def test_email_drafting_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
-
-    # Mock LLM response
-    monkeypatch.setattr(agent, 'call_ollama', lambda prompt=None, **kwargs: {'response': 'draft'})
 
     sent = {}
 
@@ -39,15 +35,21 @@ def test_email_drafting_agent(monkeypatch):
         agent_id='email_drafting',
         user_id='u1',
         input_data={
-            'prompt': 'hi',
-            'subject': 'Sub',
             'recipient': 'to@example.com',
+            'supplier_contact_name': 'John',
+            'submission_deadline': '01/01/2025',
+            'category_manager_name': 'Cat',
+            'category_manager_title': 'Mgr',
+            'category_manager_email': 'cat@example.com',
+            'your_name': 'Buyer',
+            'your_title': 'Procurement',
+            'your_company': 'Your Company',
             'attachments': [(b'data', 'file.txt')],
         },
     )
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert sent['body'] == 'draft'
-    assert sent['subject'] == 'Sub'
+    assert '<html>' in sent['body']
+    assert sent['subject'] == 'Request for Quotation (RFQ) – Office Furniture'
     assert sent['attachments'] == [(b'data', 'file.txt')]

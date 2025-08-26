@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -37,45 +36,30 @@ def _mock_quotes(*args, **kwargs):
         {
             "quote_id": "Q1",
             "supplier_name": "Supplier A",
-            "total_amount": 100,
-            "payment_terms": "Net 30",
-            "delivery_terms": "3 days",
-            "discount_percentage": 5,
-            "baseline_total_amount": 120,
-            "baseline_payment_terms": "Net 30",
+            "total_spend": 1000,
+            "tenure": "12 months",
+            "total_cost": 1000,
+            "unit_price": 10,
+            "volume": 100,
+            "quote_file_s3_path": "s3://bucket/q1.pdf",
         },
         {
             "quote_id": "Q2",
             "supplier_name": "Supplier B",
-            "total_amount": 120,
-            "payment_terms": "Net 45",
-            "delivery_terms": "5 days",
-            "discount_percentage": 0,
-            "baseline_total_amount": 110,
-            "baseline_payment_terms": "Net 30",
+            "total_spend": 1200,
+            "tenure": "12 months",
+            "total_cost": 1200,
+            "unit_price": 12,
+            "volume": 100,
+            "quote_file_s3_path": "s3://bucket/q2.pdf",
         },
     ]
-
-
-def _mock_ollama(*args, **kwargs):
-    return {"response": json.dumps({"negotiation_points": ["discount"]})}
-
-
-def _mock_comparison(quotes):
-    return {
-        "price_range": {"min": 100, "max": 120, "mean": 110, "std": 10},
-        "suppliers": ["Supplier A", "Supplier B"],
-        "best_payment_terms": {},
-        "discount_range": {"min": 0, "max": 5},
-    }
 
 
 def test_quote_evaluation_agent_run(monkeypatch):
     nick = DummyNick()
     agent = QuoteEvaluationAgent(nick)
     monkeypatch.setattr(agent, "_fetch_quotes", _mock_quotes)
-    monkeypatch.setattr(agent, "call_ollama", _mock_ollama)
-    monkeypatch.setattr(agent, "_generate_comparison", _mock_comparison)
     context = AgentContext(
         workflow_id="wf1",
         agent_id="quote_evaluation",
@@ -84,9 +68,7 @@ def test_quote_evaluation_agent_run(monkeypatch):
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["best_quote"]["quote_id"] == "Q1"
-    assert output.data["evaluation_scores"]["Q1"]["opportunity_value"] == 20
-    assert output.data["evaluation_scores"]["Q1"]["supplier_score"] == 100
+    assert output.data["quotes"][0]["total_spend"] == 1000
 
 
 class DummyOrchestrator:
@@ -109,16 +91,13 @@ def test_quote_evaluation_endpoint(monkeypatch):
     nick = DummyNick()
     agent = QuoteEvaluationAgent(nick)
     monkeypatch.setattr(agent, "_fetch_quotes", _mock_quotes)
-    monkeypatch.setattr(agent, "call_ollama", _mock_ollama)
-    monkeypatch.setattr(agent, "_generate_comparison", _mock_comparison)
     app = FastAPI()
     app.include_router(router)
     app.state.orchestrator = DummyOrchestrator(agent)
     client = TestClient(app)
     resp = client.post("/workflows/quotes/evaluate", json={})
     assert resp.status_code == 200
-    assert resp.json()["result"]["best_quote"]["quote_id"] == "Q1"
-    assert resp.json()["result"]["evaluation_scores"]["Q1"]["opportunity_value"] == 20
+    assert resp.json()["result"]["quotes"][1]["unit_price"] == 12
 
 
 def test_fetch_quotes_from_qdrant():
@@ -130,12 +109,12 @@ def test_fetch_quotes_from_qdrant():
             self.payload = {
                 "quote_id": "Q1",
                 "supplier_name": "Supplier A",
-                "total_amount": 100,
-                "payment_terms": "Net 30",
-                "delivery_terms": "3 days",
-                "discount_percentage": 5,
-                "baseline_total_amount": 120,
-                "baseline_payment_terms": "Net 30",
+                "total_spend": 1000,
+                "tenure": "12 months",
+                "total_cost": 1000,
+                "unit_price": 10,
+                "volume": 100,
+                "quote_file_s3_path": "s3://bucket/q1.pdf",
                 "document_type": "quote",
             }
 
@@ -165,12 +144,12 @@ def test_fetch_quotes_handles_missing_supplier_index(monkeypatch):
             self.payload = {
                 "quote_id": "Q1",
                 "supplier_name": "Supplier A",
-                "total_amount": 100,
-                "payment_terms": "Net 30",
-                "delivery_terms": "3 days",
-                "discount_percentage": 5,
-                "baseline_total_amount": 120,
-                "baseline_payment_terms": "Net 30",
+                "total_spend": 1000,
+                "tenure": "12 months",
+                "total_cost": 1000,
+                "unit_price": 10,
+                "volume": 100,
+                "quote_file_s3_path": "s3://bucket/q1.pdf",
                 "document_type": "quote",
             }
 
@@ -191,6 +170,7 @@ def test_fetch_quotes_handles_missing_supplier_index(monkeypatch):
     quotes = agent._fetch_quotes(["Supplier A"], "")
     assert quotes[0]["quote_id"] == "Q1"
     assert nick.qdrant_client.attempts == 2
+    assert quotes[0]["quote_file_s3_path"] == "s3://bucket/q1.pdf"
 
 
 def test_process_handles_empty_product_type(monkeypatch):
