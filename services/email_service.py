@@ -36,7 +36,7 @@ class EmailService:
         msg["Subject"] = subject
         msg["From"] = sender
         msg["To"] = recipient
-        msg.attach(MIMEText(body))
+        msg.attach(MIMEText(body, "html"))
 
         if attachments:
             for content, filename in attachments:
