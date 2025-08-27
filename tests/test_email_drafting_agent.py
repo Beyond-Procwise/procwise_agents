@@ -53,3 +53,5 @@ def test_email_drafting_agent(monkeypatch):
     assert '<html>' in sent['body']
     assert sent['subject'] == 'Request for Quotation (RFQ) – Office Furniture'
     assert sent['attachments'] == [(b'data', 'file.txt')]
+    assert 'Request for Quotation (RFQ) – Office Furniture' in output.data['prompt']
+    assert 'Deadline for submission: 01/01/2025' in output.data['prompt']
