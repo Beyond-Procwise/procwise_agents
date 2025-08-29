@@ -15,8 +15,8 @@ from services.model_selector import RAGPipeline
 class DummyEmbed:
     def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):
         if isinstance(texts, list):
-            return [SimpleNamespace(tolist=lambda: [0.1])] * len(texts)
-        return SimpleNamespace(tolist=lambda: [0.1])
+            return [[0.1] for _ in texts]
+        return [0.1]
 
 
 class DummyQdrant:
@@ -29,11 +29,7 @@ class DummyQdrant:
 
     def search(self, **kwargs):
         self.search_calls.append(kwargs)
-        # Return empty list first to trigger exact search fallback
-        if len(self.search_calls) == 1:
-            return []
-        hit = SimpleNamespace(id="1", payload={"record_id": "R1", "content": "doc"}, score=1.0)
-        return [hit]
+        return []
 
 
 class DummyCrossEncoder:
@@ -50,11 +46,10 @@ def test_upsert_and_search():
     rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
     rag.upsert_texts(["hello world"], {"record_id": "test"})
     assert nick.qdrant_client.upserts  # ensure upsert called
-    hits = rag.search("query")
-    assert hits[0].payload["record_id"] == "R1"
-    # ensure fallback search executed
-    assert nick.qdrant_client.search_calls[0]["search_params"].exact is False
-    assert nick.qdrant_client.search_calls[1]["search_params"].exact is True
+    hits = rag.search("hello")
+    assert hits[0].payload["record_id"] == "test"
+    # ensure local indexes were used without calling qdrant search
+    assert not nick.qdrant_client.search_calls
 
 
 def test_pipeline_answer_returns_documents(monkeypatch):

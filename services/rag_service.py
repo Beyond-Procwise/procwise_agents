@@ -1,7 +1,11 @@
 import os
 import uuid
 from typing import List, Dict, Optional
+from types import SimpleNamespace
 
+import numpy as np
+import faiss
+from rank_bm25 import BM25Okapi
 from qdrant_client import models
 from utils.gpu import configure_gpu
 
@@ -16,6 +20,12 @@ class RAGService:
         self.settings = agent_nick.settings
         self.client = agent_nick.qdrant_client
         self.embedder = agent_nick.embedding_model
+        # Local FAISS and BM25 indexes to complement Qdrant
+        self._faiss_index = None
+        self._doc_vectors: List[np.ndarray] = []
+        self._documents: List[Dict] = []  # payloads with content
+        self._bm25 = None
+        self._bm25_corpus: List[List[str]] = []
         if cross_encoder_cls is None:
             from sentence_transformers import CrossEncoder
             cross_encoder_cls = CrossEncoder
@@ -34,7 +44,7 @@ class RAGService:
         return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
 
     def upsert_texts(self, texts: List[str], metadata: Optional[Dict] = None):
-        """Encode and upsert texts into Qdrant."""
+        """Encode and upsert texts into Qdrant, FAISS and BM25."""
         points: List[models.PointStruct] = []
         metadata = metadata or {}
         for text in texts:
@@ -48,9 +58,27 @@ class RAGService:
             for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
                 payload = {"content": chunk, "chunk_id": idx, **metadata}
                 point_id = f"{record_id}_{idx}"
+                vec = np.array(vector, dtype="float32")
                 points.append(
-                    models.PointStruct(id=point_id, vector=vector.tolist(), payload=payload)
+                    models.PointStruct(id=point_id, vector=vec.tolist(), payload=payload)
                 )
+
+                # --- Update local FAISS/BM25 indexes ---
+                self._doc_vectors.append(vec)
+                self._documents.append({"id": point_id, **payload})
+                self._bm25_corpus.append(chunk.lower().split())
+
+        if self._doc_vectors:
+            dim = len(self._doc_vectors[0])
+            if self._faiss_index is None:
+                index = faiss.IndexFlatIP(dim)
+                if self.agent_nick.device == "cuda":
+                    res = faiss.StandardGpuResources()
+                    index = faiss.index_cpu_to_gpu(res, 0, index)
+                self._faiss_index = index
+            self._faiss_index.add(np.vstack(self._doc_vectors))
+            self._bm25 = BM25Okapi(self._bm25_corpus)
+
         if points:
             self.client.upsert(
                 collection_name=self.settings.qdrant_collection_name,
@@ -68,38 +96,65 @@ class RAGService:
         filters: Optional[models.Filter] = None,
     ):
         """Retrieve and rerank documents for the given query."""
-        query_vec = self.embedder.encode(
-            query, normalize_embeddings=True
-        ).tolist()
-        search_params = models.SearchParams(hnsw_ef=256, exact=False)
-        hits = self.client.search(
-            collection_name=self.settings.qdrant_collection_name,
-            query_vector=query_vec,
-            query_filter=filters,
-            limit=top_k * 5,
-            with_payload=True,
-            with_vectors=False,
-            search_params=search_params,
-        )
+        candidates: Dict[str, SimpleNamespace] = {}
+
+        # --- FAISS semantic search ---
+        if self._faiss_index is not None and self._doc_vectors:
+            q_vec = self.embedder.encode(query, normalize_embeddings=True)
+            q_vec = np.array([q_vec], dtype="float32")
+            scores, ids = self._faiss_index.search(q_vec, top_k * 5)
+            for score, idx in zip(scores[0], ids[0]):
+                if idx < 0 or idx >= len(self._documents):
+                    continue
+                doc = self._documents[idx]
+                candidates[doc["id"]] = SimpleNamespace(
+                    id=doc["id"], payload=doc, score=float(score)
+                )
+
+        # --- BM25 lexical search ---
+        if self._bm25 is not None:
+            tokens = query.lower().split()
+            bm25_scores = self._bm25.get_scores(tokens)
+            for idx, score in sorted(
+                enumerate(bm25_scores), key=lambda x: x[1], reverse=True
+            )[: top_k * 5]:
+                doc = self._documents[idx]
+                existing = candidates.get(doc["id"])
+                if existing is None or score > existing.score:
+                    candidates[doc["id"]] = SimpleNamespace(
+                        id=doc["id"], payload=doc, score=float(score)
+                    )
+
+        hits = list(candidates.values())
+
+        # --- Fallback to Qdrant if local indexes empty ---
         if not hits:
-            exact_params = models.SearchParams(hnsw_ef=256, exact=True)
+            q_vec = self.embedder.encode(query, normalize_embeddings=True).tolist()
+            search_params = models.SearchParams(hnsw_ef=256, exact=False)
             hits = self.client.search(
                 collection_name=self.settings.qdrant_collection_name,
-                query_vector=query_vec,
+                query_vector=q_vec,
                 query_filter=filters,
                 limit=top_k * 5,
                 with_payload=True,
                 with_vectors=False,
-                search_params=exact_params,
+                search_params=search_params,
             )
-        if not hits:
-            limit=top_k * 3,
-            with_payload=True,
-            with_vectors=False,
-            search_params=models.SearchParams(hnsw_ef=256, exact=False),
+            if not hits:
+                exact_params = models.SearchParams(hnsw_ef=256, exact=True)
+                hits = self.client.search(
+                    collection_name=self.settings.qdrant_collection_name,
+                    query_vector=q_vec,
+                    query_filter=filters,
+                    limit=top_k * 5,
+                    with_payload=True,
+                    with_vectors=False,
+                    search_params=exact_params,
+                )
+            if not hits:
+                return []
 
-        if not hits:
-            return []
+        # --- Re-rank with cross-encoder ---
         pairs = [
             (query, h.payload.get("content", h.payload.get("summary", "")))
             for h in hits
