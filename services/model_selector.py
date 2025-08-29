@@ -146,22 +146,6 @@ class RAGPipeline:
         # --- Retrieve from Vector DB ---
         top_k = 5
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
-        # --- Retrieve from Vector DB using the unified collection name ---
-        top_k = 5
-        query_vector = self.agent_nick.embedding_model.encode(
-            query, normalize_embeddings=True
-        ).tolist()
-        search_results = self.agent_nick.qdrant_client.search(
-            collection_name=self.settings.qdrant_collection_name,
-            query_vector=query_vector,
-            query_filter=qdrant_filter,
-            limit=top_k * 3,
-            with_payload=True,
-            with_vectors=False,
-            search_params=models.SearchParams(hnsw_ef=256, exact=False),
-            score_threshold=0.6,
-        )
-        reranked = self._rerank_search(query, search_results, top_k)
         retrieved_context = "\n---\n".join(
             [
                 (
@@ -171,23 +155,48 @@ class RAGPipeline:
                 )
                 for hit in reranked
             ]
-        ) if reranked else "No relevant documents found."
+        ) if reranked else ""
 
-        # --- Chat History ---
-        history = self.history_manager.get_history(user_id)
-        history_context = "\n".join([f"Q: {h['query']}\nA: {h['answer']}" for h in history])
+        history = []
+        if not reranked:
+            history = self.history_manager.get_history(user_id)
+            history_context = "\n".join([f"Q: {h['query']}\nA: {h['answer']}" for h in history])
+            if not history_context:
+                return {
+                    "answer": "Could not find relevant documents or chat history to answer the question.",
+                    "follow_ups": [],
+                    "retrieved_documents": [],
+                }
+            prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
 
-        # --- Build Final Prompt for single chat call ---
-        prompt = f"""Use the following information in priority order to answer the user's question and suggest follow-ups.
+### Ad-hoc Context from Uploaded Files:
+{ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
+
+### Chat History:
+{history_context}
+
+### User's Question:
+{query}
+"""
+            model_output = self._generate_response(prompt, llm_to_use)
+            answer = model_output.get("answer", "Could not generate an answer.")
+            follow_ups = model_output.get("follow_ups", [])
+            history.append({"query": query, "answer": answer})
+            self.history_manager.save_history(user_id, history)
+            return {
+                "answer": answer,
+                "follow_ups": follow_ups,
+                "retrieved_documents": [],
+            }
+
+        # When documents are found, prioritise them over chat history
+        prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
 
 ### Retrieved Documents from Knowledge Base:
 {retrieved_context}
-
-### Chat History:
-{history_context if history_context else "No previous conversation history."}
 
 ### User's Question:
 {query}
@@ -197,7 +206,8 @@ class RAGPipeline:
         answer = model_output.get("answer", "Could not generate an answer.")
         follow_ups = model_output.get("follow_ups", [])
 
-        # --- Save History to S3 ---
+        # Save history after answering
+        history = self.history_manager.get_history(user_id)
         history.append({"query": query, "answer": answer})
         self.history_manager.save_history(user_id, history)
         return {

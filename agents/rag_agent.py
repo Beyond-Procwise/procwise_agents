@@ -4,6 +4,7 @@ from botocore.exceptions import ClientError
 from qdrant_client import models
 from sentence_transformers import CrossEncoder
 
+from services.rag_service import RAGService
 from .base_agent import BaseAgent
 from utils.gpu import configure_gpu
 
@@ -20,60 +21,56 @@ class RAGAgent(BaseAgent):
         self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
         # Thread pool enables parallel answer and follow-up generation
         self._executor = ThreadPoolExecutor(max_workers=2)
+        # Service providing FAISS and BM25 retrieval
+        self.rag_service = RAGService(agent_nick)
 
     def run(self, query: str, user_id: str, top_k: int = 5):
         """Answer questions while maintaining chat history."""
         print(f"RAGAgent received query: '{query}' for user: '{user_id}'")
 
-        history = self._load_chat_history(user_id)
-
         search_hits = []
         seen_ids = set()
-
-        # Expand the user's query to improve recall in the vector search stage
         query_variants = [query] + self._expand_query(query)
         for q in query_variants:
-            q_vec = self.agent_nick.embedding_model.encode(q).tolist()
-            hits = self.agent_nick.qdrant_client.search(
-                collection_name=self.settings.qdrant_collection_name,
-                query_vector=q_vec,
-                limit=top_k * 3,
-                with_payload=True,
-                search_params=models.SearchParams(hnsw_ef=256, exact=False),
-            )
+            hits = self.rag_service.search(q, top_k=top_k)
             for h in hits:
                 if h.id not in seen_ids:
                     search_hits.append(h)
                     seen_ids.add(h.id)
 
-        if not search_hits:
-            return {"answer": "I could not find any relevant documents to answer your question."}
-
-        reranked = self._rerank(query, search_hits, top_k)
-
-        if not reranked:
-            return {"answer": "I could not find any relevant documents to answer your question."}
-
-        context = "".join(
-            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
-            f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
-            for hit in reranked
-        )
-
-        history_context = "\n".join(
-            [f"Previous Q: {h['query']}\nPrevious A: {h['answer']}" for h in history]
-        )
-
-        rag_prompt = (
-            "You are a helpful procurement assistant.\n"
-            "You have access to a large set of procurement documents.\n"
-            "Answer the user's question based on the provided context.\n"
-            "If the context contains relevant information, provide a concise answer.\n"
-            "If the context does not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
-            "Cite the Document ID for new information you use.\n\n"
-            f"CHAT HISTORY:\n{history_context}\n\nRETRIEVED CONTENT:\n{context}\n"
-            f"USER QUESTION: {query}\nANSWER:"
-        )
+        if search_hits:
+            reranked = self._rerank(query, search_hits, top_k)
+            if not reranked:
+                return {"answer": "I could not find any relevant documents to answer your question."}
+            context = "".join(
+                f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
+                f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
+                for hit in reranked
+            )
+            rag_prompt = (
+                "You are a helpful procurement assistant.\n"
+                "You have access to a large set of procurement documents.\n"
+                "Answer the user's question based on the provided context.\n"
+                "If the context contains relevant information, provide a concise answer.\n"
+                "If the context does not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
+                "Cite the Document ID for new information you use.\n\n"
+                f"RETRIEVED CONTENT:\n{context}\n"
+                f"USER QUESTION: {query}\nANSWER:"
+            )
+        else:
+            history = self._load_chat_history(user_id)
+            if not history:
+                return {"answer": "I could not find any relevant documents or prior conversation to answer your question."}
+            history_context = "\n".join(
+                [f"Previous Q: {h['query']}\nPrevious A: {h['answer']}" for h in history]
+            )
+            context = history_context
+            rag_prompt = (
+                "You are a helpful procurement assistant.\n"
+                "Use the chat history to answer the user's question when no documents are found.\n"
+                f"CHAT HISTORY:\n{history_context}\n"
+                f"USER QUESTION: {query}\nANSWER:"
+            )
 
         # Generate answer and follow-up suggestions in parallel
         answer_future = self._executor.submit(
@@ -85,13 +82,14 @@ class RAGAgent(BaseAgent):
         followups = follow_future.result()
         answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
 
+        history = self._load_chat_history(user_id)
         history.append({"query": query, "answer": answer})
         self._save_chat_history(user_id, history)
 
         return {
             "answer": answer,
             "follow_up_questions": followups,
-            "retrieved_documents": [hit.payload for hit in reranked],
+            "retrieved_documents": [hit.payload for hit in search_hits] if search_hits else [],
         }
 
     # ------------------------------------------------------------------
