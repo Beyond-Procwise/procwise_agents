@@ -2,6 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Dict, Any
 import logging
 import os
+from pydantic import BaseModel
+
+from orchestration.orchestrator import Orchestrator
 
 # Ensure GPU-related environment variables are set for agent operations
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -19,6 +22,13 @@ def get_agent_nick(request: Request):
     if not hasattr(request.app.state, 'agent_nick') or not request.app.state.agent_nick:
         raise HTTPException(status_code=503, detail="AgentNick not available")
     return request.app.state.agent_nick
+
+
+def get_orchestrator(request: Request) -> Orchestrator:
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator service is not available.")
+    return orchestrator
 
 
 @router.get("/list")
@@ -53,3 +63,50 @@ async def reload_policies(agent_nick=Depends(get_agent_nick)):
     except Exception as e:
         logger.error(f"Failed to reload policies: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentExecutionRequest(BaseModel):
+    agent_type: str
+    payload: Dict[str, Any] = {}
+
+
+@router.post("/execute")
+def execute_agent(
+    req: AgentExecutionRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Execute a specified agent workflow."""
+    prs = orchestrator.agent_nick.process_routing_service
+    process_id = prs.log_process(
+        process_name=req.agent_type,
+        process_details=req.payload,
+        process_status=1,
+    )
+    action_id = prs.log_action(
+        process_id=process_id,
+        agent_type=req.agent_type,
+        action_desc=req.payload,
+        status="started",
+    )
+    try:
+        result = orchestrator.execute_workflow(req.agent_type, req.payload)
+        prs.log_action(
+            process_id=process_id,
+            agent_type=req.agent_type,
+            action_desc=req.payload,
+            process_output=result,
+            status="completed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, 2)
+        return result
+    except Exception as exc:  # pragma: no cover - defensive
+        prs.log_action(
+            process_id=process_id,
+            agent_type=req.agent_type,
+            action_desc=str(exc),
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, 0)
+        raise HTTPException(status_code=500, detail=str(exc))
