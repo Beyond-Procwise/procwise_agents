@@ -37,6 +37,7 @@ from sentence_transformers import util
 import torch
 from datetime import datetime, timedelta
 from dateutil import parser
+from agents.document_jsonifier import convert_document_to_json
 
 
 def _get_easyocr_reader():
@@ -64,6 +65,120 @@ logger = logging.getLogger(__name__)
 configure_gpu()
 
 HITL_CONFIDENCE_THRESHOLD = 0.85
+
+# ---------------------------------------------------------------------------
+# Database schema mappings used for validation and type casting
+# ---------------------------------------------------------------------------
+
+INVOICE_SCHEMA = {
+    "invoice_id": "text",
+    "po_id": "text",
+    "supplier_id": "text",
+    "buyer_id": "text",
+    "requisition_id": "text",
+    "requested_by": "text",
+    "requested_date": "date",
+    "invoice_date": "date",
+    "due_date": "date",
+    "invoice_paid_date": "date",
+    "payment_terms": "text",
+    "currency": "character varying(3)",
+    "invoice_amount": "numeric(18,2)",
+    "tax_percent": "numeric(5,2)",
+    "tax_amount": "numeric(18,2)",
+    "invoice_total_incl_tax": "numeric(18,2)",
+    "exchange_rate_to_usd": "numeric(10,4)",
+    "converted_amount_usd": "numeric(18,2)",
+    "country": "text",
+    "region": "text",
+    "invoice_status": "text",
+    "ai_flag_required": "text",
+    "trigger_type": "text",
+    "trigger_context_description": "text",
+    "created_date": "timestamp without time zone",
+}
+
+INVOICE_LINE_ITEMS_SCHEMA = {
+    "invoice_line_id": "text",
+    "invoice_id": "text",
+    "line_no": "integer",
+    "item_id": "text",
+    "item_description": "text",
+    "quantity": "integer",
+    "unit_of_measure": "text",
+    "unit_price": "numeric(10,2)",
+    "line_amount": "numeric(18,2)",
+    "tax_percent": "numeric(5,2)",
+    "tax_amount": "numeric(18,2)",
+    "total_amount_incl_tax": "numeric(18,2)",
+    "po_id": "text",
+    "delivery_date": "date",
+    "country": "text",
+    "region": "text",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+}
+
+PURCHASE_ORDER_SCHEMA = {
+    "po_id": "text",
+    "supplier_id": "text",
+    "buyer_id": "text",
+    "requisition_id": "text",
+    "requested_by": "text",
+    "requested_date": "date",
+    "currency": "character varying(3)",
+    "order_date": "date",
+    "expected_delivery_date": "date",
+    "ship_to_country": "text",
+    "delivery_region": "text",
+    "incoterm": "text",
+    "incoterm_responsibility": "text",
+    "total_amount": "numeric(18,2)",
+    "delivery_address_line1": "text",
+    "delivery_address_line2": "text",
+    "delivery_city": "text",
+    "postal_code": "text",
+    "default_currency": "character varying(3)",
+    "po_status": "character varying(20)",
+    "payment_terms": "character varying(30)",
+    "exchange_rate_to_usd": "numeric(18,4)",
+    "converted_amount_usd": "numeric(18,4)",
+    "ai_flag_required": "character varying(5)",
+    "trigger_type": "character varying(30)",
+    "trigger_context_description": "text",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+    "contract_id": "text",
+}
+
+PO_LINE_ITEMS_SCHEMA = {
+    "po_line_id": "text",
+    "po_id": "text",
+    "line_number": "integer",
+    "item_id": "text",
+    "item_description": "text",
+    "quantity": "integer",
+    "unit_price": "numeric(18,2)",
+    "unit_of_measue": "text",
+    "currency": "character varying(3)",
+    "line_total": "numeric(18,2)",
+    "tax_percent": "smallint",
+    "tax_amount": "numeric(18,2)",
+    "total_amount": "numeric(18,2)",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+}
+
+SCHEMA_MAP = {
+    "Invoice": {"header": INVOICE_SCHEMA, "line_items": INVOICE_LINE_ITEMS_SCHEMA},
+    "Purchase_Order": {"header": PURCHASE_ORDER_SCHEMA, "line_items": PO_LINE_ITEMS_SCHEMA},
+}
 
 
 def _normalize_point_id(raw_id: str) -> int | str:
@@ -706,10 +821,11 @@ class DataExtractionAgent(BaseAgent):
     def _extract_structured_data(
         self, text: str, doc_type: str
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Parse header and line items using context-aware LLM extraction."""
-        header, line_items = self._context_based_extraction(text, doc_type)
-        header = self._normalize_header_fields(header or {}, doc_type)
-        line_items = self._normalize_line_item_fields(line_items or [], doc_type)
+        """Parse header and line items using JSON conversion submodule."""
+        data = convert_document_to_json(text, doc_type)
+        header = self._normalize_header_fields(data.get("header_data", {}), doc_type)
+        line_items = self._normalize_line_item_fields(data.get("line_items", []), doc_type)
+        header, line_items = self._validate_and_cast(header, line_items, doc_type)
         return header, line_items
 
     def _context_based_extraction(
@@ -1142,6 +1258,60 @@ class DataExtractionAgent(BaseAgent):
                     return val[:3] if val else None
                 return None
         return value
+
+    def _cast_sql_type(self, value: Any, sql_type: str):
+        """Cast ``value`` to a Python type based on a SQL type string."""
+        if value is None:
+            return None
+        sql_type = sql_type.lower()
+        try:
+            if "numeric" in sql_type or sql_type in {"integer", "smallint"}:
+                num = self._clean_numeric(value)
+                if num is None:
+                    return None
+                if sql_type in {"integer", "smallint"}:
+                    return int(num)
+                return float(num)
+            if sql_type == "integer":
+                return int(self._clean_numeric(value) or 0)
+            if "date" in sql_type and "timestamp" not in sql_type:
+                dt = self._clean_date(value)
+                return dt.isoformat() if dt else None
+            if "timestamp" in sql_type:
+                dt = parser.parse(str(value))
+                return dt.isoformat()
+        except Exception:
+            return None
+        return value
+
+    def _validate_and_cast(
+        self,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        doc_type: str,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Validate keys and cast values according to table schemas."""
+        schemas = SCHEMA_MAP.get(doc_type, {})
+        header_schema = schemas.get("header", {})
+        line_schema = schemas.get("line_items", {})
+
+        cast_header: Dict[str, Any] = {}
+        for k, sql_type in header_schema.items():
+            if k in header:
+                val = self._sanitize_value(header[k], k)
+                cast_header[k] = self._cast_sql_type(val, sql_type)
+
+        cast_lines: List[Dict[str, Any]] = []
+        for item in line_items:
+            cast_item: Dict[str, Any] = {}
+            for k, sql_type in line_schema.items():
+                if k in item:
+                    val = self._sanitize_value(item[k], k)
+                    cast_item[k] = self._cast_sql_type(val, sql_type)
+            if cast_item:
+                cast_lines.append(cast_item)
+
+        return cast_header, cast_lines
 
     def _persist_to_postgres(
         self,
