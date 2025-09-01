@@ -170,5 +170,6 @@ def test_po_line_items_unit_mapping(monkeypatch):
     )
 
     insert_sql, params = executed[-1]
+    assert "proc.po_line_items_agent" in insert_sql
     assert "unit_of_measue" in insert_sql
     assert "pcs" in params
