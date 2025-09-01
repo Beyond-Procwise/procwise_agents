@@ -105,3 +105,70 @@ def test_vectorize_structured_data_creates_points(monkeypatch):
     assert len(captured["points"]) == 2
     assert captured["points"][0].payload["data_type"] == "header"
     assert captured["points"][1].payload["data_type"] == "line_item"
+
+
+def test_contextual_field_normalisation():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    header = {"invoice_total": "100", "vendor": "Acme"}
+    normalised_header = agent._normalize_header_fields(header, "Invoice")
+    assert normalised_header["invoice_amount"] == "100"
+    assert normalised_header["vendor_name"] == "Acme"
+
+    items = [{"description": "Widget", "qty": "2", "price": "5"}]
+    normalised_items = agent._normalize_line_item_fields(items, "Invoice")
+    assert normalised_items[0]["item_description"] == "Widget"
+    assert normalised_items[0]["quantity"] == "2"
+    assert normalised_items[0]["unit_price"] == "5"
+
+
+def test_po_line_items_unit_mapping(monkeypatch):
+    executed = []
+
+    class DummyCursor:
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+        def fetchall(self):
+            return [
+                ("po_line_id",),
+                ("po_id",),
+                ("line_number",),
+                ("unit_of_measue",),
+                ("quantity",),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyConn:
+        def cursor(self):
+            return DummyCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    nick = SimpleNamespace(
+        get_db_connection=lambda: DummyConn(),
+        settings=SimpleNamespace(extraction_model="m"),
+    )
+    agent = DataExtractionAgent(nick)
+
+    item = {"unit_of_measure": "pcs", "quantity": "1"}
+    agent._persist_line_items_to_postgres(
+        "PO1", [item], "Purchase_Order", {}, None
+    )
+
+    insert_sql, params = executed[-1]
+    assert "unit_of_measue" in insert_sql
+    assert "pcs" in params

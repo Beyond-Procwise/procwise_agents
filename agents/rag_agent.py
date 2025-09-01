@@ -24,15 +24,37 @@ class RAGAgent(BaseAgent):
         # Service providing FAISS and BM25 retrieval
         self.rag_service = RAGService(agent_nick)
 
-    def run(self, query: str, user_id: str, top_k: int = 5):
+    def run(
+        self,
+        query: str,
+        user_id: str,
+        top_k: int = 5,
+        doc_type: str | None = None,
+        product_type: str | None = None,
+    ):
         """Answer questions while maintaining chat history."""
         print(f"RAGAgent received query: '{query}' for user: '{user_id}'")
+
+        must: list[models.FieldCondition] = []
+        if doc_type:
+            must.append(
+                models.FieldCondition(
+                    key="document_type", match=models.MatchValue(value=doc_type.lower())
+                )
+            )
+        if product_type:
+            must.append(
+                models.FieldCondition(
+                    key="product_type", match=models.MatchValue(value=product_type.lower())
+                )
+            )
+        qdrant_filter = models.Filter(must=must) if must else None
 
         search_hits = []
         seen_ids = set()
         query_variants = [query] + self._expand_query(query)
         for q in query_variants:
-            hits = self.rag_service.search(q, top_k=top_k)
+            hits = self.rag_service.search(q, top_k=top_k, filters=qdrant_filter)
             for h in hits:
                 if h.id not in seen_ids:
                     search_hits.append(h)

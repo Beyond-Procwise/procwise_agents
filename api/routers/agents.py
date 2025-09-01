@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import os
 from pydantic import BaseModel
@@ -68,6 +68,20 @@ async def reload_policies(agent_nick=Depends(get_agent_nick)):
 class AgentExecutionRequest(BaseModel):
     agent_type: str
     payload: Dict[str, Any] = {}
+
+
+class DocumentProcessRequest(BaseModel):
+    s3_prefix: Optional[str] = None
+    s3_object_key: Optional[str] = None
+
+
+@router.post("/process-document")
+def process_document(
+    req: DocumentProcessRequest, orchestrator: Orchestrator = Depends(get_orchestrator)
+):
+    """Convenience endpoint to run the document extraction workflow."""
+    payload = {"s3_prefix": req.s3_prefix, "s3_object_key": req.s3_object_key}
+    return orchestrator.execute_workflow("document_extraction", payload)
 
 
 @router.post("/execute")
