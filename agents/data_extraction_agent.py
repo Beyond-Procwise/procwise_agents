@@ -912,8 +912,10 @@ class DataExtractionAgent(BaseAgent):
             "tax_percent",
             "tax_amount",
             "line_total",
+            "line_amount",
             "total_with_tax",
             "total_amount",
+            "total_amount_incl_tax",
             "total",
             "invoice_amount",
             "invoice_total_incl_tax",
@@ -925,8 +927,14 @@ class DataExtractionAgent(BaseAgent):
             "due_date",
             "po_date",
             "requested_date",
+            "invoice_paid_date",
+            "delivery_date",
+            "order_date",
+            "expected_delivery_date",
+            "created_date",
+            "last_modified_date",
         }
-        currency_fields = {"currency"}
+        currency_fields = {"currency", "default_currency"}
         if key:
             lower = key.lower()
             if lower in numeric_fields:
@@ -966,8 +974,8 @@ class DataExtractionAgent(BaseAgent):
         self, header: Dict[str, str], doc_type: str, conn=None
     ) -> None:
         table_map = {
-            "Invoice": ("proc", "invoice_agent", "invoice_id"),
-            "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
+            "Invoice": ("proc", "invoice", "invoice_id"),
+            "Purchase_Order": ("proc", "purchase_order", "po_id"),
         }
         target = table_map.get(doc_type)
         if not target:
@@ -1049,41 +1057,41 @@ class DataExtractionAgent(BaseAgent):
         conn=None,
     ) -> None:
         table_map = {
-            "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
+            "Invoice": ("proc", "invoice_line_items", "invoice_id", "line_no"),
             "Purchase_Order": (
                 "proc",
-                "po_line_items_agent",
+                "purchase_order_line_items",
                 "po_id",
                 "line_number",
             ),
         }
         field_map = {
-            "Invoice": [
-                "item_id",
-                "item_description",
-                "quantity",
-                "unit_of_measure",
-                "unit_price",
-                "line_amount",
-                "tax_percent",
-                "tax_amount",
-                "total_amount_incl_tax",
-            ],
-            "Purchase_Order": [
-                "item_id",
-                "item_description",
-                "quantity",
-                "unit_price",
-                "unit_of_measure",
-                "currency",
-                "line_total",
-                "tax_percent",
-                "tax_amount",
-                "total_amount",
-            ],
+            "Invoice": {
+                "item_id": "item_id",
+                "item_description": "item_description",
+                "quantity": "quantity",
+                "unit_of_measure": "unit_of_measure",
+                "unit_price": "unit_price",
+                "line_amount": "line_amount",
+                "tax_percent": "tax_percent",
+                "tax_amount": "tax_amount",
+                "total_amount_incl_tax": "total_amount_incl_tax",
+            },
+            "Purchase_Order": {
+                "item_id": "item_id",
+                "item_description": "item_description",
+                "quantity": "quantity",
+                "unit_price": "unit_price",
+                "unit_of_measue": "unit_of_measure",
+                "currency": "currency",
+                "line_total": "line_total",
+                "tax_percent": "tax_percent",
+                "tax_amount": "tax_amount",
+                "total_amount": "total_amount",
+            },
         }
         target = table_map.get(doc_type)
-        fields = field_map.get(doc_type, [])
+        field_map = field_map.get(doc_type, {})
         if not target or not line_items:
             return
         schema, table, fk_col, line_no_col = target
@@ -1135,11 +1143,11 @@ class DataExtractionAgent(BaseAgent):
                         payload.setdefault("po_line_id", f"{pk_value}-{line_value}")
                     if doc_type == "Invoice" and "invoice_line_id" in columns:
                         payload.setdefault("invoice_line_id", f"{pk_value}-{line_value}")
-                    for key in fields:
-                        if key in payload:
+                    for col, source in field_map.items():
+                        if col in payload:
                             continue
-                        if key in columns and item.get(key) is not None:
-                            payload[key] = item[key]
+                        if col in columns and item.get(source) is not None:
+                            payload[col] = item[source]
                     sanitized = {}
                     for k, v in payload.items():
                         val = self._sanitize_value(v, k)
