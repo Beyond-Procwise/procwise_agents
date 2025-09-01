@@ -19,8 +19,8 @@
   },
   {
     "agentId": 4,
-    "agentType": "DiscrepancyDetectionAgent",
-    "description": "Detects missing or inconsistent fields in extracted documents.",
+    "agentType": "OpportunityMinerAgent",
+    "description": "Identifies procurement anomalies and savings opportunities.",
     "dependencies": ["db_client"]
   },
   {
