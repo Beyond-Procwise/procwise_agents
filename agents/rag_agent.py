@@ -48,15 +48,20 @@ class RAGAgent(BaseAgent):
                 for hit in reranked
             )
             rag_prompt = (
-                "You are a helpful procurement assistant.\n"
-                "You have access to a large set of procurement documents.\n"
-                "Answer the user's question based on the provided context.\n"
-                "If the context contains relevant information, provide a concise answer.\n"
-                "If the context does not contain the answer, reply with \"I could not find any relevant information in the provided documents.\"\n"
-                "Cite the Document ID for new information you use.\n\n"
-                f"RETRIEVED CONTENT:\n{context}\n"
-                f"USER QUESTION: {query}\nANSWER:"
-            )
+    "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
+    "the USER QUESTION. if required use external knowledge beyond the context only related to procurement process.\n\n"
+    "Instructions:\n"
+    "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
+    "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"
+    "3) If the context does not contain the answer, return exactly the following string (no extra text):\n"
+    "   I could not find any relevant information in the provided documents.\n"
+    "4) For any factual claims or new information derived from the retrieved content, append an inline citation immediately after the claim in this format: [Document ID: <id>] or for multiple documents [Document IDs: id1,id2].\n"
+    "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
+    "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
+    "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
+    "8) Keep the answer concise (aim for one short paragraph, up to ~250 words).\n\n"
+    f"RETRIEVED CONTENT:\n{context}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
+)
         else:
             history = self._load_chat_history(user_id)
             if not history:
