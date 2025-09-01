@@ -194,7 +194,7 @@ class DataExtractionAgent(BaseAgent):
         doc_type = self._classify_doc_type(text)
 
         if doc_type in {"Purchase_Order", "Invoice"}:
-            header, line_items = self._extract_structured_data(text, file_bytes)
+            header, line_items = self._extract_structured_data(text, doc_type)
             header["doc_type"] = doc_type
             pk_value = (
                 header.get("invoice_id")
@@ -238,12 +238,15 @@ class DataExtractionAgent(BaseAgent):
             data = None
             doc_id = pk_value or object_key
 
-        return {
+        result = {
             "object_key": object_key,
             "id": doc_id,
             "doc_type": doc_type or "",
             "status": "success",
         }
+        if data:
+            result["data"] = data
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
@@ -649,12 +652,18 @@ class DataExtractionAgent(BaseAgent):
                 "total_amount": "invoice_amount",
                 "vendor": "vendor_name",
                 "supplier": "vendor_name",
+                "recipient": "vendor_name",
+                "to": "vendor_name",
+                "supplier_name": "vendor_name",
             },
             "Purchase_Order": {
                 "po_number": "po_id",
                 "purchase_order_id": "po_id",
                 "vendor": "vendor_name",
                 "supplier": "vendor_name",
+                "recipient": "vendor_name",
+                "to": "vendor_name",
+                "supplier_name": "vendor_name",
             },
         }
         mapping = alias_map.get(doc_type, {})
@@ -695,16 +704,145 @@ class DataExtractionAgent(BaseAgent):
         return normalised_items
 
     def _extract_structured_data(
-        self, text: str, file_bytes: bytes
-    ) -> Tuple[Dict[str, str], List[Dict]]:
-        """Parse header and line items from raw text and PDF tables."""
-        header = self._parse_header(text)
-        doc_type = header.get("doc_type", "Invoice")
-        header = self._normalize_header_fields(header, doc_type)
-        line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
-        if not line_items:
-            line_items = self._extract_line_items(text, doc_type)
-        line_items = self._normalize_line_item_fields(line_items, doc_type)
+        self, text: str, doc_type: str
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Parse header and line items using context-aware LLM extraction."""
+        header, line_items = self._context_based_extraction(text, doc_type)
+        header = self._normalize_header_fields(header or {}, doc_type)
+        line_items = self._normalize_line_item_fields(line_items or [], doc_type)
+        return header, line_items
+
+    def _context_based_extraction(
+        self, text: str, doc_type: str
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Use the LLM to extract header fields and line items purely from text."""
+        schema = {
+            "Invoice": {
+                "header": [
+                    "invoice_id",
+                    "po_id",
+                    "supplier_id",
+                    "buyer_id",
+                    "requisition_id",
+                    "requested_by",
+                    "requested_date",
+                    "invoice_date",
+                    "due_date",
+                    "invoice_paid_date",
+                    "payment_terms",
+                    "currency",
+                    "invoice_amount",
+                    "tax_percent",
+                    "tax_amount",
+                    "invoice_total_incl_tax",
+                    "exchange_rate_to_usd",
+                    "converted_amount_usd",
+                    "country",
+                    "region",
+                    "invoice_status",
+                    "ai_flag_required",
+                    "trigger_type",
+                    "trigger_context_description",
+                    "created_date",
+                ],
+                "line_items": [
+                    "invoice_line_id",
+                    "invoice_id",
+                    "line_no",
+                    "item_id",
+                    "item_description",
+                    "quantity",
+                    "unit_of_measure",
+                    "unit_price",
+                    "line_amount",
+                    "tax_percent",
+                    "tax_amount",
+                    "total_amount_incl_tax",
+                    "po_id",
+                    "delivery_date",
+                    "country",
+                    "region",
+                    "created_date",
+                    "created_by",
+                    "last_modified_by",
+                    "last_modified_date",
+                ],
+            },
+            "Purchase_Order": {
+                "header": [
+                    "po_id",
+                    "supplier_id",
+                    "buyer_id",
+                    "requisition_id",
+                    "requested_by",
+                    "requested_date",
+                    "currency",
+                    "order_date",
+                    "expected_delivery_date",
+                    "ship_to_country",
+                    "delivery_region",
+                    "incoterm",
+                    "incoterm_responsibility",
+                    "total_amount",
+                    "delivery_address_line1",
+                    "delivery_address_line2",
+                    "delivery_city",
+                    "postal_code",
+                    "default_currency",
+                    "po_status",
+                    "payment_terms",
+                    "exchange_rate_to_usd",
+                    "converted_amount_usd",
+                    "ai_flag_required",
+                    "trigger_type",
+                    "trigger_context_description",
+                    "created_date",
+                    "created_by",
+                    "last_modified_by",
+                    "last_modified_date",
+                    "contract_id",
+                ],
+                "line_items": [
+                    "po_line_id",
+                    "po_id",
+                    "line_number",
+                    "item_id",
+                    "item_description",
+                    "quantity",
+                    "unit_price",
+                    "unit_of_measure",
+                    "currency",
+                    "line_total",
+                    "tax_percent",
+                    "tax_amount",
+                    "total_amount",
+                    "created_date",
+                    "created_by",
+                    "last_modified_by",
+                    "last_modified_date",
+                ],
+            },
+        }
+        fields = schema.get(doc_type)
+        if not fields:
+            return {}, []
+        prompt = (
+            f"You are a procurement data extraction agent. "
+            f"The supplier name may appear as vendor, recipient or after 'TO'. "
+            f"Extract data from this {doc_type.replace('_', ' ').lower()} and respond in JSON. "
+            "Use two keys: 'header' and 'line_items'. "
+            f"'header' must contain: {fields['header']}. "
+            f"'line_items' is a list of objects with: {fields['line_items']}. "
+            "Use null when a value is missing.\n"
+            f"Text:\n{text[:6000]}"
+        )
+        try:  # pragma: no cover - network call
+            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
+            data = json.loads(resp.get("response", "{}")) or {}
+            header = data.get("header", {}) or {}
+            line_items = data.get("line_items", []) or []
+        except Exception:
+            header, line_items = {}, []
         return header, line_items
 
     def _extract_line_items(self, text: str, doc_type: str) -> List[Dict]:
