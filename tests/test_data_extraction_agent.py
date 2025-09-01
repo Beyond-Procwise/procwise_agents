@@ -105,3 +105,19 @@ def test_vectorize_structured_data_creates_points(monkeypatch):
     assert len(captured["points"]) == 2
     assert captured["points"][0].payload["data_type"] == "header"
     assert captured["points"][1].payload["data_type"] == "line_item"
+
+
+def test_contextual_field_normalisation():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    header = {"invoice_total": "100", "vendor": "Acme"}
+    normalised_header = agent._normalize_header_fields(header, "Invoice")
+    assert normalised_header["invoice_amount"] == "100"
+    assert normalised_header["vendor_name"] == "Acme"
+
+    items = [{"description": "Widget", "qty": "2", "price": "5"}]
+    normalised_items = agent._normalize_line_item_fields(items, "Invoice")
+    assert normalised_items[0]["item_description"] == "Widget"
+    assert normalised_items[0]["quantity"] == "2"
+    assert normalised_items[0]["unit_price"] == "5"

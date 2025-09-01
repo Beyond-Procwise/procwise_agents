@@ -590,15 +590,68 @@ class DataExtractionAgent(BaseAgent):
             logger.warning("Table extraction failed: %s", exc)
         return line_items
 
+    def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
+        """Map LLM-extracted header keys to canonical column names."""
+        alias_map = {
+            "Invoice": {
+                "invoice_total": "invoice_amount",
+                "total_amount": "invoice_amount",
+                "vendor": "vendor_name",
+                "supplier": "vendor_name",
+            },
+            "Purchase_Order": {
+                "po_number": "po_id",
+                "purchase_order_id": "po_id",
+                "vendor": "vendor_name",
+                "supplier": "vendor_name",
+            },
+        }
+        mapping = alias_map.get(doc_type, {})
+        normalised: Dict[str, Any] = {}
+        for key, value in header.items():
+            normalised[mapping.get(key, key)] = value
+        return normalised
+
+    def _normalize_line_item_fields(
+        self, items: List[Dict[str, Any]], doc_type: str
+    ) -> List[Dict[str, Any]]:
+        """Rename common line-item field variants based on document type."""
+        alias_map = {
+            "Invoice": {
+                "description": "item_description",
+                "qty": "quantity",
+                "price": "unit_price",
+                "amount": "line_amount",
+                "tax": "tax_amount",
+            },
+            "Purchase_Order": {
+                "description": "item_description",
+                "qty": "quantity",
+                "price": "unit_price",
+                "amount": "line_total",
+                "uom": "unit_of_measure",
+            },
+        }
+        mapping = alias_map.get(doc_type, {})
+        normalised_items: List[Dict[str, Any]] = []
+        for item in items:
+            normalised: Dict[str, Any] = {}
+            for key, value in item.items():
+                normalised[mapping.get(key, key)] = value
+            normalised_items.append(normalised)
+        return normalised_items
+
     def _extract_structured_data(
         self, text: str, file_bytes: bytes
     ) -> Tuple[Dict[str, str], List[Dict]]:
         """Parse header and line items from raw text and PDF tables."""
         header = self._parse_header(text)
         doc_type = header.get("doc_type", "Invoice")
+        header = self._normalize_header_fields(header, doc_type)
         line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
         if not line_items:
             line_items = self._extract_line_items(text, doc_type)
+        line_items = self._normalize_line_item_fields(line_items, doc_type)
         return header, line_items
 
     def _extract_line_items(self, text: str, doc_type: str) -> List[Dict]:
