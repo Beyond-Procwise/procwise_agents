@@ -974,8 +974,8 @@ class DataExtractionAgent(BaseAgent):
         self, header: Dict[str, str], doc_type: str, conn=None
     ) -> None:
         table_map = {
-            "Invoice": ("proc", "invoice", "invoice_id"),
-            "Purchase_Order": ("proc", "purchase_order", "po_id"),
+            "Invoice": ("proc", "invoice_agent", "invoice_id"),
+            "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
         }
         target = table_map.get(doc_type)
         if not target:
@@ -1057,10 +1057,10 @@ class DataExtractionAgent(BaseAgent):
         conn=None,
     ) -> None:
         table_map = {
-            "Invoice": ("proc", "invoice_line_items", "invoice_id", "line_no"),
+            "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
             "Purchase_Order": (
                 "proc",
-                "purchase_order_line_items",
+                "po_line_items_agent",
                 "po_id",
                 "line_number",
             ),
