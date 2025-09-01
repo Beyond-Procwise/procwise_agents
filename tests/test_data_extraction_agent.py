@@ -111,10 +111,10 @@ def test_contextual_field_normalisation():
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
 
-    header = {"invoice_total": "100", "vendor": "Acme"}
+    header = {"invoice_total": "100", "to": "Acme"}
     normalised_header = agent._normalize_header_fields(header, "Invoice")
     assert normalised_header["invoice_amount"] == "100"
-    assert normalised_header["vendor_name"] == "Acme"
+    assert normalised_header["supplier_id"] == "Acme"
 
     items = [{"description": "Widget", "qty": "2", "price": "5"}]
     normalised_items = agent._normalize_line_item_fields(items, "Invoice")
