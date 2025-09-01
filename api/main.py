@@ -23,7 +23,7 @@ from agents.email_drafting_agent import EmailDraftingAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
-from api.routers import workflows, system
+from api.routers import workflows, system, run
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -63,6 +63,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 app.include_router(workflows.router)
 app.include_router(system.router)
+app.include_router(run.router)
 
 @app.get("/", tags=["General"])
 def read_root(): return {"message": "Welcome to the ProcWise Agentic System API"}
