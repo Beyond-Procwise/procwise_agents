@@ -99,6 +99,18 @@ def _maybe_decompress(content: bytes) -> bytes:
     return content
 
 
+def _dict_to_text(data: Dict[str, Any]) -> str:
+    """Convert a dictionary into a simple ``key: value`` text block.
+
+    Using plain text instead of JSON improves semantic retrieval accuracy
+    because embedding models typically perform better on natural language
+    compared to structured representations.
+    """
+    return "\n".join(
+        f"{k}: {v}" for k, v in data.items() if v not in (None, "")
+    )
+
+
 class DataExtractionAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
@@ -408,12 +420,46 @@ class DataExtractionAgent(BaseAgent):
             "quote_id": ["quote number", "quote id"],
             "vendor_name": ["vendor", "supplier", "from"],
             "supplier_id": ["supplier id", "supplier number"],
-            "total_amount": ["total amount", "grand total", "total"],
+            "buyer_id": ["buyer id", "buyer number"],
+            "requisition_id": ["requisition id", "requisition number"],
+            "requested_by": ["requested by", "requester"],
+            "requested_date": ["requested date", "request date"],
             "invoice_date": ["invoice date"],
             "due_date": ["due date"],
+            "invoice_paid_date": ["paid date", "payment date", "invoice paid date"],
+            "payment_terms": ["payment terms", "terms"],
             "currency": ["currency"],
+            "invoice_amount": ["invoice amount", "amount due"],
+            "total_amount": ["total amount", "grand total", "total"],
             "tax_percent": ["tax rate", "tax percent"],
             "tax_amount": ["tax amount", "tax"],
+            "invoice_total_incl_tax": [
+                "total including tax",
+                "total incl tax",
+                "total amount incl tax",
+            ],
+            "exchange_rate_to_usd": ["exchange rate", "exchange rate to usd"],
+            "converted_amount_usd": ["usd amount", "amount usd", "converted amount usd"],
+            "country": ["country"],
+            "region": ["region"],
+            "invoice_status": ["invoice status", "status"],
+            "ai_flag_required": ["ai flag required", "ai flag"],
+            "trigger_type": ["trigger type"],
+            "trigger_context_description": ["trigger context", "context description"],
+            "created_date": ["created date", "creation date"],
+            "order_date": ["order date", "po date"],
+            "expected_delivery_date": ["expected delivery date", "delivery date"],
+            "ship_to_country": ["ship to country", "shipping country"],
+            "delivery_region": ["delivery region", "region"],
+            "incoterm": ["incoterm"],
+            "incoterm_responsibility": ["incoterm responsibility", "incoterm resp"],
+            "delivery_address_line1": ["delivery address line1", "address line 1"],
+            "delivery_address_line2": ["delivery address line2", "address line 2"],
+            "delivery_city": ["delivery city", "city"],
+            "postal_code": ["postal code", "postcode", "zip"],
+            "default_currency": ["default currency"],
+            "po_status": ["po status", "status"],
+            "contract_id": ["contract id", "contract number"],
         }
         header: Dict[str, str] = {}
         for field, synonyms in field_synonyms.items():
@@ -456,8 +502,13 @@ class DataExtractionAgent(BaseAgent):
             "Extract header details from the following procurement document.\n"
             "Return JSON with any of these keys if matching or present: "
             "invoice_id, po_id, supplier_id, buyer_id, requisition_id, requested_by, "
-            "requested_date, invoice_date, due_date, currency, invoice_amount, tax_percent, "
-            "tax_amount, invoice_total_incl_tax.\n"
+            "requested_date, invoice_date, due_date, invoice_paid_date, payment_terms, "
+            "currency, invoice_amount, tax_percent, tax_amount, invoice_total_incl_tax, "
+            "exchange_rate_to_usd, converted_amount_usd, country, region, invoice_status, "
+            "ai_flag_required, trigger_type, trigger_context_description, created_date, "
+            "order_date, expected_delivery_date, ship_to_country, delivery_region, incoterm, "
+            "incoterm_responsibility, total_amount, delivery_address_line1, delivery_address_line2, "
+            "delivery_city, postal_code, default_currency, po_status, contract_id.\n"
             f"Text:\n{text[:2000]}"
         )
         try:  # pragma: no cover - network call
@@ -610,6 +661,8 @@ class DataExtractionAgent(BaseAgent):
         normalised: Dict[str, Any] = {}
         for key, value in header.items():
             normalised[mapping.get(key, key)] = value
+        if normalised.get("vendor_name") and not normalised.get("supplier_id"):
+            normalised["supplier_id"] = normalised["vendor_name"]
         return normalised
 
     def _normalize_line_item_fields(
@@ -779,7 +832,7 @@ class DataExtractionAgent(BaseAgent):
 
         # Header payload -------------------------------------------------
         if header:
-            header_text = json.dumps(header, default=str)
+            header_text = _dict_to_text(header)
             vec = self.agent_nick.embedding_model.encode(
                 [header_text], normalize_embeddings=True, show_progress_bar=False
             )[0]
@@ -798,7 +851,7 @@ class DataExtractionAgent(BaseAgent):
 
         # Line item payloads --------------------------------------------
         for idx, item in enumerate(line_items, start=1):
-            item_text = json.dumps(item, default=str)
+            item_text = _dict_to_text(item)
             vec = self.agent_nick.embedding_model.encode(
                 [item_text], normalize_embeddings=True, show_progress_bar=False
             )[0]
@@ -1152,9 +1205,11 @@ class DataExtractionAgent(BaseAgent):
                     for k, v in payload.items():
                         val = self._sanitize_value(v, k)
                         if k in numeric_fields:
-                            if isinstance(val, str):
+                            if val in (None, ""):
+                                continue
+                            if not isinstance(val, (int, float)):
                                 val = self._clean_numeric(val)
-                            if val is None or not isinstance(val, (int, float)):
+                            if val in (None, "") or not isinstance(val, (int, float)):
                                 logger.warning(
                                     "Dropping field %s due to non-numeric value. Payload: %s", k, payload
                                 )
