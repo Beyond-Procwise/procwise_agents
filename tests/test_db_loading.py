@@ -64,16 +64,16 @@ def test_load_policies_from_db():
     assert policies[2]["policyName"] == "Example"
 
 
-def test_invalid_prompt_json_is_ignored():
+def test_invalid_prompt_json_is_wrapped():
     rows = [(99, "not-json")]
     orchestrator = make_orchestrator(rows)
     prompts = orchestrator._load_prompts()
-    assert 99 not in prompts
+    assert prompts[99]["template"] == "not-json"
 
 
-def test_invalid_policy_json_is_ignored():
+def test_invalid_policy_json_is_wrapped():
     rows = [(99, "not-json")]
     orchestrator = make_orchestrator(rows)
     policies = orchestrator._load_policies()
-    assert 99 not in policies
+    assert policies[99]["description"] == "not-json"
 

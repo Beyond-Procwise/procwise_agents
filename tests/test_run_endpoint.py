@@ -63,7 +63,7 @@ def test_run_endpoint_process_id_executes_flow():
     assert data["status"] == "completed"
 
     prs = orchestrator.agent_nick.process_routing_service
-    assert prs.status_updates == [(5, 1), (5, 2)]
+    assert prs.status_updates == [(5, 1), (5, 1)]
     assert prs.details_updates[0]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
 

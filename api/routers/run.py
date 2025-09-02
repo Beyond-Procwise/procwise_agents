@@ -55,5 +55,5 @@ def run_agents(
         final = updated_flow.get("status")
     else:
         final = "failed"
-    prs.update_process_status(req.process_id, 2 if final != "failed" else 3)
+    prs.update_process_status(req.process_id, 1 if final != "failed" else -1)
     return {"status": final}

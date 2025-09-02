@@ -203,7 +203,7 @@ def mine_opportunities(
             status="completed",
             action_id=action_id,
         )
-        prs.update_process_status(process_id, 2)
+        prs.update_process_status(process_id, 1)
         return result
     except Exception as exc:  # pragma: no cover - defensive
         prs.log_action(
@@ -213,7 +213,7 @@ def mine_opportunities(
             status="failed",
             action_id=action_id,
         )
-        prs.update_process_status(process_id, 0)
+        prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -262,7 +262,7 @@ async def extract_documents(
                 status="completed",
                 action_id=action_id,
             )
-            prs.update_process_status(process_id, 2)
+            prs.update_process_status(process_id, 1)
         except Exception as exc:  # pragma: no cover - network/runtime
             prs.log_action(
                 process_id=process_id,
@@ -271,7 +271,7 @@ async def extract_documents(
                 status="failed",
                 action_id=action_id,
             )
-            prs.update_process_status(process_id, 0)
+            prs.update_process_status(process_id, -1)
 
     asyncio.create_task(run_flow())
     return {"status": "process started", "process_id": process_id}
