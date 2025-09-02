@@ -154,25 +154,6 @@ class ProcessRoutingService:
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS proc.action (
-                            id INTEGER NOT NULL DEFAULT nextval('proc.action_id_seq'),
-                            action_id VARCHAR(100),
-                            process_id VARCHAR(100),
-                            run_id VARCHAR(100),
-                            agent_type VARCHAR(50),
-                            process_output TEXT,
-                            status VARCHAR(50),
-                            action_desc TEXT,
-                            action_date TIMESTAMP WITHOUT TIME ZONE,
-                            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                            CONSTRAINT action_pkey PRIMARY KEY (id)
-                        )
-                        """
-                    )
-
                     if not action_id:
                         action_id = str(uuid.uuid4())
                         run_id = run_id or str(uuid.uuid4())
