@@ -81,7 +81,7 @@ class RAGAgent(BaseAgent):
     "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
     "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
     "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
-    "8) Keep the answer concise (aim for one short paragraph, up to ~250 words).\n\n"
+    "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
     f"RETRIEVED CONTENT:\n{context}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
 )
         else:

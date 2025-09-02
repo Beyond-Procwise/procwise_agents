@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     ses_smtp_port: int = Field(default=587, env="SES_SMTP_PORT")
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
 
-    extraction_model: str = "mistral"
+    extraction_model: str = "llama3.2"
     embedding_model: str = "all-roberta-large-v1"
     vector_size: int = 1024
 
