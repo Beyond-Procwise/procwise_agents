@@ -303,14 +303,22 @@ class DataExtractionAgent(BaseAgent):
 
         text = self._extract_text(file_bytes, object_key)
 
-        # Determine the document type up-front so downstream logic can be
-        # content-aware.  Only purchase orders and invoices are structured; all
-        # other documents are merely vectorized for retrieval.
+        # ------------------------------------------------------------------
+        # Step 1 – vectorise the raw document prior to any understanding so the
+        # original content is always searchable.
+        # ------------------------------------------------------------------
+        self._vectorize_document(text, None, "raw", None, object_key)
+
+        # ------------------------------------------------------------------
+        # Step 2 – derive context from the text to classify the document and
+        # extract structured values.
+        # ------------------------------------------------------------------
         doc_type = self._classify_doc_type(text)
 
         if doc_type in {"Purchase_Order", "Invoice"}:
             header, line_items = self._extract_structured_data(text, doc_type)
             header["doc_type"] = doc_type
+            header = self._sanitize_party_names(header)
             pk_value = (
                 header.get("invoice_id")
                 or header.get("po_id")
@@ -318,23 +326,12 @@ class DataExtractionAgent(BaseAgent):
             )
             if not header.get("vendor_name"):
                 vendor_guess = self._infer_vendor_name(text, object_key)
-                if vendor_guess:
+                if vendor_guess and "purchase" not in vendor_guess.lower():
                     header["vendor_name"] = vendor_guess
-            if not header.get("supplier_id"):
+            if not header.get("supplier_id") and header.get("vendor_name"):
                 header["supplier_id"] = header.get("vendor_name")
         else:
             header, line_items, pk_value = {"doc_type": doc_type}, [], None
-
-        product_type = self._classify_product_type(line_items) if line_items else None
-
-        # Always vectorize the raw document text, even when structured parsing fails
-        self._vectorize_document(
-            text,
-            pk_value,
-            doc_type,
-            product_type,
-            object_key,
-        )
 
         if header and pk_value:
             data = {
@@ -789,6 +786,24 @@ class DataExtractionAgent(BaseAgent):
             normalised["supplier_id"] = normalised["vendor_name"]
         return normalised
 
+    def _sanitize_party_names(self, header: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure vendor and supplier fields contain meaningful values.
+
+        Some documents include boilerplate phrases such as "Purchase Order"
+        which can be incorrectly captured as a vendor or supplier name during
+        naive parsing.  This helper strips such occurrences and guarantees that
+        ``supplier_id`` mirrors ``vendor_name`` when a separate identifier is
+        absent.
+        """
+
+        for field in ("vendor_name", "supplier_id", "supplier_name"):
+            val = header.get(field)
+            if val and "purchase" in str(val).lower():
+                header[field] = ""
+        if header.get("vendor_name") and not header.get("supplier_id"):
+            header["supplier_id"] = header["vendor_name"]
+        return header
+
     def _normalize_line_item_fields(
         self, items: List[Dict[str, Any]], doc_type: str
     ) -> List[Dict[str, Any]]:
@@ -995,26 +1010,6 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             pass
         return []
-
-    def _classify_product_type(self, line_items: List[Dict]) -> str:
-        descriptions = "\n- ".join(
-            item.get("description")
-            or item.get("item_description")
-            or ""
-            for item in line_items
-            if item
-        )
-        if not descriptions.strip():
-            return "General Goods"
-        prompt = (
-            "Classify these procurement items into a broad category (e.g., IT Hardware, Office Supplies).\n"
-            f"Items:\n- {descriptions}\nRespond with JSON {{\"product_category\": \"<category>\"}}"
-        )
-        try:  # pragma: no cover - network call
-            response = self.call_ollama(prompt, model=self.extraction_model, format="json")
-            return json.loads(response.get("response", "{}")).get("product_category", "General Goods")
-        except Exception:
-            return "General Goods"
 
     def _vectorize_document(
         self,
