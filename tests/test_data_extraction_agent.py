@@ -176,3 +176,26 @@ def test_po_line_items_unit_mapping(monkeypatch):
     assert "proc.po_line_items_agent" in insert_sql
     assert "unit_of_measue" in insert_sql
     assert "pcs" in params
+
+
+def test_extract_header_with_ner(monkeypatch):
+    """Ensure NER-based extraction supplements header parsing."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    sample_entities = [
+        {"entity_group": "ORG", "word": "ACME Corp"},
+        {"entity_group": "DATE", "word": "2024-01-01"},
+        {"entity_group": "MONEY", "word": "$100"},
+    ]
+
+    monkeypatch.setattr(
+        "agents.data_extraction_agent.extract_entities", lambda text: sample_entities
+    )
+
+    header = agent._extract_header_with_ner("Invoice from ACME Corp dated 2024-01-01 total $100")
+
+    assert header["vendor_name"] == "ACME Corp"
+    assert header["invoice_date"] == "2024-01-01"
+    assert header["invoice_total_incl_tax"] == 100.0

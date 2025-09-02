@@ -9,6 +9,7 @@ pymupdf
 python-dateutil
 qdrant-client
 sentence-transformers
+transformers
 pandas
 tiktoken
 unstructured[local-inference]
