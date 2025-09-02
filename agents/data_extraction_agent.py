@@ -1,5 +1,4 @@
 from __future__ import annotations
-import json
 import logging
 import re
 import uuid
@@ -8,7 +7,6 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 import gzip
 import concurrent.futures
-import ollama
 import pdfplumber
 import pandas as pd
 import numpy as np
@@ -193,7 +191,7 @@ def _normalize_point_id(raw_id: str) -> int | str:
 def _normalize_label(value: Any) -> str:
     """Return a lowercase label for ``doc_type``/``product_type`` fields.
 
-    Upstream LLM responses may occasionally return lists or other unexpected
+    Upstream responses may occasionally return lists or other unexpected
     types.  This helper safely converts those to a deterministic lowercase
     string so downstream processing is robust.
     """
@@ -316,7 +314,7 @@ class DataExtractionAgent(BaseAgent):
         doc_type = self._classify_doc_type(text)
 
         if doc_type in {"Purchase_Order", "Invoice"}:
-            header, line_items = self._extract_structured_data(text, doc_type)
+            header, line_items = self._extract_structured_data(text, file_bytes, doc_type)
             header["doc_type"] = doc_type
             header = self._sanitize_party_names(header)
             pk_value = (
@@ -340,7 +338,7 @@ class DataExtractionAgent(BaseAgent):
                 "validation": {
                     "is_valid": True,
                     "confidence_score": 1.0,
-                    "notes": "llm parser",
+                    "notes": "python parser",
                 },
             }
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
@@ -613,26 +611,6 @@ class DataExtractionAgent(BaseAgent):
         else:
             header["doc_type"] = self._classify_doc_type(text)
 
-        prompt = (
-            "Extract header details from the following procurement document.\n"
-            "Return JSON with any of these keys if matching or present: "
-            "invoice_id, po_id, supplier_id, buyer_id, requisition_id, requested_by, "
-            "requested_date, invoice_date, due_date, invoice_paid_date, payment_terms, "
-            "currency, invoice_amount, tax_percent, tax_amount, invoice_total_incl_tax, "
-            "exchange_rate_to_usd, converted_amount_usd, country, region, invoice_status, "
-            "ai_flag_required, trigger_type, trigger_context_description, created_date, "
-            "order_date, expected_delivery_date, ship_to_country, delivery_region, incoterm, "
-            "incoterm_responsibility, total_amount, delivery_address_line1, delivery_address_line2, "
-            "delivery_city, postal_code, default_currency, po_status, contract_id.\n"
-            f"Text:\n{text[:2000]}"
-        )
-        try:  # pragma: no cover - network call
-            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
-            llm_header = json.loads(resp.get("response", "{}"))
-            header.update({k: v for k, v in llm_header.items() if v})
-        except Exception:
-            pass
-
         numeric_fields = {
             "total_amount",
             "tax_percent",
@@ -654,19 +632,17 @@ class DataExtractionAgent(BaseAgent):
         return header
 
     def _classify_doc_type(self, text: str) -> str:
-        """Use the LLM to infer the document type when heuristics fail."""
-        prompt = (
-            "Identify the document type from the text. Possible values: "
-            "invoice, purchase_order, quote, user_agreement, supplier_data, procurement_insight.\n"
-            "Respond with JSON {\"doc_type\": \"<type>\"}.\n"
-            f"Text snippet:\n{text[:1000]}"
-        )
-        try:  # pragma: no cover - network call
-            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
-            doc_type = json.loads(resp.get("response", "{}")).get("doc_type", "other")
-            return doc_type.replace(" ", "_").title()
-        except Exception:
-            return "Other"
+        """Classify the document type using keyword heuristics only."""
+        snippet = text[:1000].lower()
+        if "purchase order" in snippet or re.search(r"\bpo\b", snippet):
+            return "Purchase_Order"
+        if "invoice" in snippet:
+            return "Invoice"
+        if "quote" in snippet:
+            return "Quote"
+        if "contract" in snippet:
+            return "Contract"
+        return "Other"
 
     def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
         """Best-effort vendor/supplier name extraction.
@@ -757,7 +733,7 @@ class DataExtractionAgent(BaseAgent):
         return line_items
 
     def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
-        """Map LLM-extracted header keys to canonical column names."""
+        """Map extracted header keys to canonical column names."""
         alias_map = {
             "Invoice": {
                 "invoice_total": "invoice_amount",
@@ -834,18 +810,9 @@ class DataExtractionAgent(BaseAgent):
         return normalised_items
 
     def _extract_structured_data(
-        self, text: str, doc_type: str
+        self, text: str, file_bytes: bytes, doc_type: str
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Parse header and line items using JSON conversion with LLM fallback.
-
-        Extraction quality varies greatly across document formats.  We first
-        attempt a lightweight regex-based conversion via
-        :func:`convert_document_to_json`.  When that approach fails to produce
-        meaningful results (e.g. for scanned PDFs), we fall back to the more
-        expensive LLM-driven ``_context_based_extraction``.  The combined
-        approach dramatically improves accuracy of both header fields and line
-        items while keeping simple cases fast.
-        """
+        """Parse header and line items using pure Python heuristics."""
 
         data = convert_document_to_json(text, doc_type)
         header = self._normalize_header_fields(data.get("header_data", {}), doc_type)
@@ -853,185 +820,19 @@ class DataExtractionAgent(BaseAgent):
             data.get("line_items", []), doc_type
         )
 
-        # Fallback to context-based extraction when information is missing.
-        if not header or not line_items:
-            ctx_header, ctx_items = self._context_based_extraction(text, doc_type)
-            if not header:
-                header = ctx_header
-            if not line_items:
-                line_items = ctx_items
+        parsed_header = self._parse_header(text)
+        parsed_header.update(header)
+        header = parsed_header
+
+        if not line_items:
+            extracted = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+            line_items = self._normalize_line_item_fields(extracted, doc_type)
 
         header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
         return header, line_items
 
-    def _context_based_extraction(
-        self, text: str, doc_type: str
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Use the LLM to extract header fields and line items purely from text."""
-        schema = {
-            "Invoice": {
-                "header": [
-                    "invoice_id",
-                    "po_id",
-                    "supplier_id",
-                    "buyer_id",
-                    "requisition_id",
-                    "requested_by",
-                    "requested_date",
-                    "invoice_date",
-                    "due_date",
-                    "invoice_paid_date",
-                    "payment_terms",
-                    "currency",
-                    "invoice_amount",
-                    "tax_percent",
-                    "tax_amount",
-                    "invoice_total_incl_tax",
-                    "exchange_rate_to_usd",
-                    "converted_amount_usd",
-                    "country",
-                    "region",
-                    "invoice_status",
-                    "ai_flag_required",
-                    "trigger_type",
-                    "trigger_context_description",
-                    "created_date",
-                ],
-                "line_items": [
-                    "invoice_line_id",
-                    "invoice_id",
-                    "line_no",
-                    "item_id",
-                    "item_description",
-                    "quantity",
-                    "unit_of_measure",
-                    "unit_price",
-                    "line_amount",
-                    "tax_percent",
-                    "tax_amount",
-                    "total_amount_incl_tax",
-                    "po_id",
-                    "delivery_date",
-                    "country",
-                    "region",
-                    "created_date",
-                    "created_by",
-                    "last_modified_by",
-                    "last_modified_date",
-                ],
-            },
-            "Purchase_Order": {
-                "header": [
-                    "po_id",
-                    "supplier_id",
-                    "buyer_id",
-                    "requisition_id",
-                    "requested_by",
-                    "requested_date",
-                    "currency",
-                    "order_date",
-                    "expected_delivery_date",
-                    "ship_to_country",
-                    "delivery_region",
-                    "incoterm",
-                    "incoterm_responsibility",
-                    "total_amount",
-                    "delivery_address_line1",
-                    "delivery_address_line2",
-                    "delivery_city",
-                    "postal_code",
-                    "default_currency",
-                    "po_status",
-                    "payment_terms",
-                    "exchange_rate_to_usd",
-                    "converted_amount_usd",
-                    "ai_flag_required",
-                    "trigger_type",
-                    "trigger_context_description",
-                    "created_date",
-                    "created_by",
-                    "last_modified_by",
-                    "last_modified_date",
-                    "contract_id",
-                ],
-                "line_items": [
-                    "po_line_id",
-                    "po_id",
-                    "line_number",
-                    "item_id",
-                    "item_description",
-                    "quantity",
-                    "unit_price",
-                    "unit_of_measure",
-                    "currency",
-                    "line_total",
-                    "tax_percent",
-                    "tax_amount",
-                    "total_amount",
-                    "created_date",
-                    "created_by",
-                    "last_modified_by",
-                    "last_modified_date",
-                ],
-            },
-        }
-        fields = schema.get(doc_type)
-        if not fields:
-            return {}, []
-        prompt = (
-            f"You are a procurement data extraction agent. "
-            f"The supplier name may appear as vendor, recipient or after 'TO'. "
-            f"Extract data from this {doc_type.replace('_', ' ').lower()} and respond in JSON. "
-            "Use two keys: 'header' and 'line_items'. "
-            f"'header' must contain: {fields['header']}. "
-            f"'line_items' is a list of objects with: {fields['line_items']}. "
-            "Use null when a value is missing.\n"
-            f"Text:\n{text[:6000]}"
-        )
-        try:  # pragma: no cover - network call
-            resp = self.call_ollama(prompt, model=self.extraction_model, format="json")
-            data = json.loads(resp.get("response", "{}")) or {}
-            header = data.get("header", {}) or {}
-            line_items = data.get("line_items", []) or []
-        except Exception:
-            header, line_items = {}, []
-        return header, line_items
 
-    def _extract_line_items(self, text: str, doc_type: str) -> List[Dict]:
-        """Use the LLM to extract line items from a document."""
-        if doc_type == "Invoice":
-            prompt = (
-                "Extract line items from the following invoice. "
-                "Return JSON with a list under the key 'line_items' where each item has "
-                "line_no, item_id, item_description, quantity, unit_of_measure, unit_price, "
-                "line_amount, tax_percent, tax_amount, total_amount_incl_tax.\n"
-                f"Text:\n{text[:4000]}"
-            )
-        elif doc_type == "Purchase_Order":
-            prompt = (
-                "Extract line items from the following purchase order. "
-                "Return JSON with a list under the key 'line_items' where each item has "
-                "line_number, item_id, item_description, quantity, unit_price, "
-                "unit_of_measure, currency, line_total, tax_percent, tax_amount, "
-                "total_amount.\n"
-                f"Text:\n{text[:4000]}"
-            )
-        else:
-            prompt = (
-                f"Extract line items from the following {doc_type}. "
-                "Return JSON with a list under the key 'line_items'.\n"
-                f"Text:\n{text[:4000]}"
-            )
-        try:  # pragma: no cover - network call
-            response = self.call_ollama(prompt, model=self.extraction_model, format="json")
-            data = json.loads(response.get("response", "{}"))
-            items = data.get("line_items", [])
-            if isinstance(items, list):
-                return items
-        except Exception:
-            pass
-        return []
 
     def _vectorize_document(
         self,
