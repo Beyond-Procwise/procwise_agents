@@ -7,12 +7,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 from pathlib import Path
+import os
 
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is enabled when available
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.getenv("CUDA_VISIBLE_DEVICES", "0"))
 
 
 class Orchestrator:
@@ -128,9 +133,14 @@ class Orchestrator:
                     )
                     rows = cursor.fetchall()
                     for pid, desc in rows:
-                        if desc:
-                            value = desc
-                        else:
+                        if not desc:
+                            continue
+                        try:
+                            value = json.loads(desc) if isinstance(desc, str) else desc
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Invalid JSON for prompt %s: %s", pid, desc
+                            )
                             continue
                         prompts[int(pid)] = value
             if prompts:
@@ -162,9 +172,14 @@ class Orchestrator:
                     )
                     rows = cursor.fetchall()
                     for pid, desc in rows:
-                        if desc:
-                            value = desc
-                        else:
+                        if not desc:
+                            continue
+                        try:
+                            value = json.loads(desc) if isinstance(desc, str) else desc
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Invalid JSON for policy %s: %s", pid, desc
+                            )
                             continue
                         policies[int(pid)] = value
             if policies:
