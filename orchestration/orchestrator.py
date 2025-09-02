@@ -110,7 +110,36 @@ class Orchestrator:
         return {str(item["agentId"]): item["agentType"] for item in data}
 
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
-        """Load prompt templates keyed by ``promptId``."""
+        """Load prompt templates keyed by ``promptId``.
+
+        Primary source is ``proc.prompt`` table where ``prompts_desc`` contains
+        the JSON template.  If the database lookup fails or returns no rows the
+        method falls back to the local ``prompts/prompts.json`` file so tests can
+        run without a database.
+        """
+
+        prompts: Dict[int, Dict[str, Any]] = {}
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT prompt_id, prompts_desc FROM proc.prompt"
+                        " WHERE prompts_desc IS NOT NULL"
+                    )
+                    rows = cursor.fetchall()
+                    for pid, desc in rows:
+                        if desc:
+                            value = (
+                                json.loads(desc)
+                                if isinstance(desc, (str, bytes, bytearray))
+                                else desc
+                            )
+                            prompts[int(pid)] = value
+            if prompts:
+                return prompts
+        except Exception:  # pragma: no cover - defensive fall back
+            logger.exception("Failed to load prompts from DB, falling back to file")
+
         path = Path(__file__).resolve().parents[1] / "prompts" / "prompts.json"
         with path.open() as f:
             data = json.load(f)
@@ -118,9 +147,36 @@ class Orchestrator:
         return {int(t["promptId"]): t for t in templates if "promptId" in t}
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
-        """Aggregate all policy definitions and assign simple numeric IDs."""
-        policy_dir = Path(__file__).resolve().parents[1] / "policies"
+        """Aggregate policy definitions keyed by their ID.
+
+        Policies are primarily loaded from ``proc.policy`` where ``policy_desc``
+        stores the JSON definition.  A file-system fallback is provided for
+        environments without database access (e.g. unit tests).
+        """
+
         policies: Dict[int, Dict[str, Any]] = {}
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT policy_id, policy_desc FROM proc.policy"
+                        " WHERE policy_desc IS NOT NULL"
+                    )
+                    rows = cursor.fetchall()
+                    for pid, desc in rows:
+                        if desc:
+                            value = (
+                                json.loads(desc)
+                                if isinstance(desc, (str, bytes, bytearray))
+                                else desc
+                            )
+                            policies[int(pid)] = value
+            if policies:
+                return policies
+        except Exception:  # pragma: no cover - defensive fall back
+            logger.exception("Failed to load policies from DB, falling back to files")
+
+        policy_dir = Path(__file__).resolve().parents[1] / "policies"
         idx = 1
         for file in sorted(policy_dir.glob("*.json")):
             with file.open() as f:
