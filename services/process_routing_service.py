@@ -59,24 +59,6 @@ class ProcessRoutingService:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        CREATE TABLE IF NOT EXISTS proc.routing (
-                            process_id INTEGER NOT NULL DEFAULT nextval('proc.process_process_id_seq'),
-                            process_name TEXT NOT NULL,
-                            process_details JSONB,
-                            process_status INTEGER NOT NULL DEFAULT 1,
-                            created_on TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                            created_by TEXT,
-                            modified_on TIMESTAMP WITHOUT TIME ZONE,
-                            modified_by TEXT,
-                            user_id TEXT,
-                            user_name TEXT,
-                            CONSTRAINT process_pkey PRIMARY KEY (process_id)
-                        )
-                        """
-                    )
-
-                    cursor.execute(
-                        """
                         INSERT INTO proc.routing
                             (process_name, process_details, process_status, created_by, user_id, user_name)
                         VALUES (%s, %s, %s, %s, %s, %s)
@@ -112,7 +94,10 @@ class ProcessRoutingService:
                     )
                     row = cursor.fetchone()
                     if row and row[0]:
-                        return json.loads(row[0])
+                        value = row[0]
+                        if isinstance(value, (str, bytes, bytearray)):
+                            return json.loads(value)
+                        return value
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed to fetch process %s: %s", process_id, exc)
         return None
