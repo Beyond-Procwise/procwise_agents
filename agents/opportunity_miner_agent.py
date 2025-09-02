@@ -125,16 +125,17 @@ class OpportunityMinerAgent(BaseAgent):
     TABLES = list(TABLE_MAP.keys())
 
     def _ingest_data(self) -> Dict[str, pd.DataFrame]:
-        """Fetch required tables from the database or fall back to mock data."""
+        """Fetch required tables from the database.
+
+        The agent now strictly relies on live data from the procurement schema
+        so that findings always reflect the most recent state.  Unit tests may
+        monkeypatch this method with ``_mock_data`` if needed.
+        """
 
         dfs: Dict[str, pd.DataFrame] = {}
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                for table, sql_name in self.TABLE_MAP.items():
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
-        except Exception as exc:  # pragma: no cover - database is optional for tests
-            logger.warning("Using mock data for opportunity mining: %s", exc)
-            dfs = self._mock_data()
+        with self.agent_nick.get_db_connection() as conn:
+            for table, sql_name in self.TABLE_MAP.items():
+                dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
         return dfs
 
     def _mock_data(self) -> Dict[str, pd.DataFrame]:
