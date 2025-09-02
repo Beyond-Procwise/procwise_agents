@@ -75,13 +75,15 @@ class BaseAgent:
         every agent invocation is captured in the database regardless of how it
         is triggered.
         """
+        start_ts = datetime.utcnow()
         try:
             result = self.run(context)
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("%s execution failed: %s", self.__class__.__name__, exc)
             result = AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+        end_ts = datetime.utcnow()
 
-        status = 1 if result.status == AgentStatus.SUCCESS else 0
+        status = result.status.value
         process_id = self.agent_nick.process_routing_service.log_process(
             process_name=self.__class__.__name__,
             process_details={"input": context.input_data, "output": result.data},
@@ -92,6 +94,10 @@ class BaseAgent:
             run_id = self.agent_nick.process_routing_service.log_run_detail(
                 process_id=process_id,
                 process_status=status,
+                process_details={"input": context.input_data, "output": result.data},
+                process_start_ts=start_ts,
+                process_end_ts=end_ts,
+                triggered_by=context.user_id,
             )
             self.agent_nick.process_routing_service.log_action(
                 process_id=process_id,
