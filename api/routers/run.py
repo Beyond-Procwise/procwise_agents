@@ -49,13 +49,11 @@ def run_agents(
         raise HTTPException(status_code=409, detail="Process not in saved status")
 
     prs.update_process_status(req.process_id, 1)
-    result = orchestrator.execute_agent_flow(details)
-    if isinstance(result, dict):
-        details["status"] = (
-            "completed" if result.get("status") != "failed" else "failed"
-        )
-        prs.update_process_details(req.process_id, details)
-    prs.update_process_status(
-        req.process_id, 2 if result.get("status") != "failed" else 3
-    )
-    return result
+    updated_flow = orchestrator.execute_agent_flow(details)
+    if isinstance(updated_flow, dict):
+        prs.update_process_details(req.process_id, updated_flow)
+        final = updated_flow.get("status")
+    else:
+        final = "failed"
+    prs.update_process_status(req.process_id, 2 if final != "failed" else 3)
+    return {"status": final}

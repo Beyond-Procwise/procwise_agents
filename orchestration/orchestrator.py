@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 # Ensure GPU is enabled when available
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.getenv("CUDA_VISIBLE_DEVICES", "0"))
+os.environ.setdefault("OLLAMA_USE_GPU", "1")
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 class Orchestrator:
@@ -212,6 +215,16 @@ class Orchestrator:
         prompts = self._load_prompts()
         policies = self._load_policies()
 
+        used_ids: set[str] = set()
+
+        def _new_id() -> str:
+            """Generate a unique workflow id for each node."""
+            candidate = str(uuid.uuid4())
+            while candidate in used_ids:
+                candidate = str(uuid.uuid4())
+            used_ids.add(candidate)
+            return candidate
+
         def _run(node: Dict[str, Any]):
             required_fields = ["status", "agent_type", "agent_property"]
             for field in required_fields:
@@ -246,7 +259,7 @@ class Orchestrator:
                 policy_objs.append(policies[pid])
 
             context = AgentContext(
-                workflow_id=str(uuid.uuid4()),
+                workflow_id=_new_id(),
                 agent_id=agent_key,
                 user_id=self.settings.script_user,
                 input_data={
@@ -264,16 +277,16 @@ class Orchestrator:
             )
 
             if result and result.status == AgentStatus.SUCCESS and node.get("onSuccess"):
-                return _run(node["onSuccess"])
-            if result and result.status == AgentStatus.FAILED and node.get("onFailure"):
-                return _run(node["onFailure"])
+                result = _run(node["onSuccess"])
+            elif result and result.status == AgentStatus.FAILED and node.get("onFailure"):
+                result = _run(node["onFailure"])
             return result
 
         final = _run(flow)
-        final_status = (
+        flow["status"] = (
             "completed" if final and final.status == AgentStatus.SUCCESS else "failed"
         )
-        return {"status": final_status}
+        return flow
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:
         """Validate workflow against policies"""
