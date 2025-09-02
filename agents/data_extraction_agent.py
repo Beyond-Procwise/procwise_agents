@@ -1063,14 +1063,15 @@ class DataExtractionAgent(BaseAgent):
         doc_type: str,
         pk_value: str,
     ) -> None:
-        """Embed header and line items for fine-grained retrieval.
+        """Embed structured line-item content for retrieval.
 
-        Each header and line item is converted to a compact text form and
-        embedded individually. This allows downstream retrieval to surface
-        specific fields (e.g. a single line item) rather than only the full
-        document chunk. Embeddings are stored in the same Qdrant collection
-        as the full document vectors, tagged with a ``data_type`` payload so
-        callers can filter as needed.
+        Header details are intentionally **not** stored in the vector database;
+        only line items are embedded so that question answering retrieves the
+        most relevant transactional information without unnecessary metadata.
+        Each line item is converted to a compact text form and embedded
+        individually.  Embeddings are stored in the same Qdrant collection as the
+        full document vectors and tagged with a ``data_type`` payload so callers
+        can filter as needed.
         """
 
         if not pk_value:
@@ -1078,25 +1079,6 @@ class DataExtractionAgent(BaseAgent):
 
         self.agent_nick._initialize_qdrant_collection()
         points: List[models.PointStruct] = []
-
-        # Header payload -------------------------------------------------
-        if header:
-            header_text = _dict_to_text(header)
-            vec = self.agent_nick.embedding_model.encode(
-                [header_text], normalize_embeddings=True, show_progress_bar=False
-            )[0]
-            points.append(
-                models.PointStruct(
-                    id=_normalize_point_id(f"{pk_value}_header"),
-                    vector=vec.tolist(),
-                    payload={
-                        "record_id": pk_value,
-                        "document_type": _normalize_label(doc_type),
-                        "data_type": "header",
-                        "content": header_text,
-                    },
-                )
-            )
 
         # Line item payloads --------------------------------------------
         for idx, item in enumerate(line_items, start=1):
