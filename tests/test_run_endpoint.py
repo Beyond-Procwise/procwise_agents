@@ -30,6 +30,9 @@ class DummyPRS:
     def update_process_details(self, process_id, details, **kwargs):
         self.details_updates.append(details)
 
+    def log_run_detail(self, **kwargs):
+        return kwargs.get("run_id", "r1")
+
 
 class DummyOrchestrator:
     def __init__(self, prs=None):

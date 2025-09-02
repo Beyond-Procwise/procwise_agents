@@ -23,6 +23,9 @@ class DummyPRS:
         self.logged.append(kwargs)
         return kwargs.get("action_id", "a1")
 
+    def log_run_detail(self, **kwargs):
+        return kwargs.get("run_id", "r1")
+
     def update_process_status(self, *args, **kwargs):
         pass
 

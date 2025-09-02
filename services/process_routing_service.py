@@ -246,9 +246,12 @@ class ProcessRoutingService:
     def log_run_detail(
         self,
         process_id: int,
-        process_status: int,
+        process_status: str,
         run_id: Optional[str] = None,
-        created_by: Optional[str] = None,
+        process_details: Optional[Dict[str, Any]] = None,
+        process_start_ts: Optional[datetime] = None,
+        process_end_ts: Optional[datetime] = None,
+        triggered_by: Optional[str] = None,
     ) -> Optional[str]:
         """Record a single execution run in ``proc.routing_run_details``.
 
@@ -257,31 +260,55 @@ class ProcessRoutingService:
         process_id:
             Identifier returned by :meth:`log_process`.
         process_status:
-            Non-zero for success, zero for failure.
+            Descriptive status such as ``"success"`` or ``"failed"``.
         run_id:
             Optional external run identifier. A UUID4 is generated when
             omitted so that related records (e.g. actions) can be linked.
-        created_by:
+        process_details:
+            Arbitrary payload describing the run inputs or outputs.
+        process_start_ts / process_end_ts:
+            Timestamps marking the execution window. If both are supplied the
+            ``duration`` field will be calculated automatically.
+        triggered_by:
             Username responsible for the run; defaults to the framework's
             ``script_user`` setting.
         """
 
         run_id = run_id or str(uuid.uuid4())
-        status_value = 1 if bool(process_status) else 0
+        process_start_ts = process_start_ts or datetime.utcnow()
+        process_end_ts = process_end_ts or datetime.utcnow()
+        duration = (
+            process_end_ts - process_start_ts
+            if process_end_ts and process_start_ts
+            else None
+        )
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        INSERT INTO proc.routing_run_details
-                            (run_id, process_id, process_status, created_by)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO proc.routing_run_details (
+                            runid,
+                            process_id,
+                            process_details,
+                            process_status,
+                            process_start_ts,
+                            process_end_ts,
+                            triggered_by,
+                            duration
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             run_id,
-                            process_id,
-                            status_value,
-                            created_by or self.settings.script_user,
+                            str(process_id),
+                            self._safe_dumps(process_details)
+                            if process_details is not None
+                            else None,
+                            process_status,
+                            process_start_ts,
+                            process_end_ts,
+                            triggered_by or self.settings.script_user,
+                            duration,
                         ),
                     )
                     conn.commit()
@@ -289,7 +316,7 @@ class ProcessRoutingService:
                         "Logged run %s for process %s with status %s",
                         run_id,
                         process_id,
-                        status_value,
+                        process_status,
                     )
                     return run_id
         except Exception as exc:  # pragma: no cover - defensive
