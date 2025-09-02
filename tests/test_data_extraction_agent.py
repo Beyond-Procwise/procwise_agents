@@ -2,7 +2,7 @@ import os
 import sys
 from types import SimpleNamespace
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents.data_extraction_agent import DataExtractionAgent
 
@@ -68,11 +68,15 @@ def test_non_structured_docs_are_vectorized(monkeypatch):
     monkeypatch.setattr(agent, "_extract_text", lambda b, k: "contract text")
     monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Contract")
     monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: captured.setdefault("persist", True))
-    monkeypatch.setattr(agent, "_vectorize_document", lambda text, pk, dt, pt, key: captured.setdefault("doc_type", dt))
+
+    def fake_vectorize(text, pk, dt, pt, key):
+        captured.setdefault("doc_types", []).append(dt)
+
+    monkeypatch.setattr(agent, "_vectorize_document", fake_vectorize)
 
     res = agent._process_single_document("doc.pdf")
 
-    assert captured.get("doc_type") == "Contract"
+    assert captured.get("doc_types", [])[0] == "raw"
     assert "persist" not in captured  # should not attempt DB insert
     assert res["id"] == "doc.pdf"
     assert res["doc_type"] == "Contract"
