@@ -129,12 +129,10 @@ class Orchestrator:
                     rows = cursor.fetchall()
                     for pid, desc in rows:
                         if desc:
-                            value = (
-                                json.loads(desc)
-                                if isinstance(desc, (str, bytes, bytearray))
-                                else desc
-                            )
-                            prompts[int(pid)] = value
+                            value = desc
+                        else:
+                            continue
+                        prompts[int(pid)] = value
             if prompts:
                 return prompts
         except Exception:  # pragma: no cover - defensive fall back
@@ -159,18 +157,16 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc FROM proc.policy"
-                        " WHERE policy_desc IS NOT NULL"
+                        "SELECT policy_id, policy_details FROM proc.policy"
+                        " WHERE policy_details IS NOT NULL"
                     )
                     rows = cursor.fetchall()
                     for pid, desc in rows:
                         if desc:
-                            value = (
-                                json.loads(desc)
-                                if isinstance(desc, (str, bytes, bytearray))
-                                else desc
-                            )
-                            policies[int(pid)] = value
+                            value = desc
+                        else:
+                            continue
+                        policies[int(pid)] = value
             if policies:
                 return policies
         except Exception:  # pragma: no cover - defensive fall back

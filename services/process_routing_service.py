@@ -204,14 +204,19 @@ class ProcessRoutingService:
             )
             return None
 
+    # python
     def update_process_status(
-        self,
-        process_id: int,
-        process_status: int,
-        modified_by: Optional[str] = None,
+            self,
+            process_id: int,
+            process_status: int,
+            modified_by: Optional[str] = None,
     ) -> None:
-        """Update the status of an existing process routing entry."""
+        """Update the status of an existing process routing entry.
+
+        Maps `process_status` to 1 (passed) or 0 (failed) before persisting.
+        """
         try:
+            status_value = 1 if bool(process_status) else 0
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
@@ -223,9 +228,10 @@ class ProcessRoutingService:
                         WHERE process_id = %s
                         """,
                         (
-                            process_status,
+                            status_value,
                             modified_by or self.settings.script_user,
                             process_id,
+
                         ),
                     )
                     conn.commit()
