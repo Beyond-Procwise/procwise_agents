@@ -112,7 +112,7 @@ def execute_agent(
             status="completed",
             action_id=action_id,
         )
-        prs.update_process_status(process_id, 2)
+        prs.update_process_status(process_id, 1)
         return result
     except Exception as exc:  # pragma: no cover - defensive
         prs.log_action(
@@ -122,5 +122,5 @@ def execute_agent(
             status="failed",
             action_id=action_id,
         )
-        prs.update_process_status(process_id, 0)
+        prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))

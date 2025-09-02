@@ -144,7 +144,7 @@ class Orchestrator:
                             logger.warning(
                                 "Invalid JSON for prompt %s: %s", pid, desc
                             )
-                            continue
+                            value = {"promptId": pid, "template": str(desc)}
                         prompts[int(pid)] = value
             if prompts:
                 return prompts
@@ -183,7 +183,7 @@ class Orchestrator:
                             logger.warning(
                                 "Invalid JSON for policy %s: %s", pid, desc
                             )
-                            continue
+                            value = {"policyId": pid, "description": str(desc)}
                         policies[int(pid)] = value
             if policies:
                 return policies

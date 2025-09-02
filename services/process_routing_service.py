@@ -139,6 +139,41 @@ class ProcessRoutingService:
                 "Failed to update details for process %s: %s", process_id, exc
             )
 
+    def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
+        """Update process status in ``proc.routing``.
+
+        Only ``1`` (success) and ``-1`` (failure) are valid. Any other value
+        is coerced to ``-1`` if negative or ``1`` if positive."""
+        if status not in (1, -1):
+            coerced = 1 if status > 0 else -1
+            logger.warning(
+                "Updated process %s to invalid status %s - coercing to %s",
+                process_id, status, coerced,
+            )
+            status = coerced
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE proc.routing
+                        SET process_status = %s,
+                            modified_on = CURRENT_TIMESTAMP,
+                            modified_by = %s
+                        WHERE process_id = %s
+                        """,
+                        (status, modified_by or self.settings.script_user, process_id),
+                    )
+                    conn.commit()
+                    logger.info(
+                        "Updated process %s to status %s", process_id, status
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Failed to update status for process %s: %s", process_id, exc
+            )
+
+
     def log_action(
         self,
         process_id: int,
