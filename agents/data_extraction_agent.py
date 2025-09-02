@@ -1320,11 +1320,6 @@ class DataExtractionAgent(BaseAgent):
                     (schema, table),
                 )
                 columns = [r[0] for r in cur.fetchall()]
-                # Remove existing rows to avoid stale line items lingering
-                cur.execute(
-                    f"DELETE FROM {schema}.{table} WHERE {fk_col} = %s",
-                    (pk_value,),
-                )
                 numeric_fields = {
                     "quantity",
                     "unit_price",
@@ -1376,9 +1371,17 @@ class DataExtractionAgent(BaseAgent):
                                 continue
                             val = float(val)
                         sanitized[k] = val
+
                     cols = ", ".join(sanitized.keys())
                     placeholders = ", ".join(["%s"] * len(sanitized))
+                    update_cols = ", ".join(
+                        f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in {fk_col, line_no_col}
+                    )
                     sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
+                    if update_cols:
+                        sql += f" ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
+                    else:
+                        sql += f" ON CONFLICT ({fk_col}, {line_no_col}) DO NOTHING"
                     cur.execute(sql, list(sanitized.values()))
             if close_conn:
                 conn.commit()

@@ -48,26 +48,30 @@ class ProcessRoutingService:
         self,
         process_name: str,
         process_details: Dict[str, Any],
-        process_status: int = 1,
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> Optional[int]:
-        """Insert a process routing record and return the new process_id."""
+        """Insert a process routing record and return the new ``process_id``.
+
+        The ``proc.routing`` table now serves as a high level catalogue of
+        processes and their associated metadata.  Per-run status tracking is
+        handled by ``proc.routing_run_details`` via :meth:`log_run_detail`.
+        """
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
                         INSERT INTO proc.routing
-                            (process_name, process_details, process_status, created_by, user_id, user_name)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (process_name, process_details, created_by, user_id, user_name)
+                        VALUES (%s, %s, %s, %s, %s)
                         RETURNING process_id
                         """,
                         (
                             process_name,
                             self._safe_dumps(process_details),
-                            process_status,
                             created_by or self.settings.script_user,
                             user_id,
                             user_name,
@@ -204,41 +208,57 @@ class ProcessRoutingService:
             )
             return None
 
-    # python
-    def update_process_status(
-            self,
-            process_id: int,
-            process_status: int,
-            modified_by: Optional[str] = None,
-    ) -> None:
-        """Update the status of an existing process routing entry.
+    def log_run_detail(
+        self,
+        process_id: int,
+        process_status: int,
+        run_id: Optional[str] = None,
+        created_by: Optional[str] = None,
+    ) -> Optional[str]:
+        """Record a single execution run in ``proc.routing_run_details``.
 
-        Maps `process_status` to 1 (passed) or 0 (failed) before persisting.
+        Parameters
+        ----------
+        process_id:
+            Identifier returned by :meth:`log_process`.
+        process_status:
+            Non-zero for success, zero for failure.
+        run_id:
+            Optional external run identifier. A UUID4 is generated when
+            omitted so that related records (e.g. actions) can be linked.
+        created_by:
+            Username responsible for the run; defaults to the framework's
+            ``script_user`` setting.
         """
+
+        run_id = run_id or str(uuid.uuid4())
+        status_value = 1 if bool(process_status) else 0
         try:
-            status_value = 1 if bool(process_status) else 0
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        UPDATE proc.routing
-                        SET process_status = %s,
-                            modified_on = CURRENT_TIMESTAMP,
-                            modified_by = %s
-                        WHERE process_id = %s
+                        INSERT INTO proc.routing_run_details
+                            (run_id, process_id, process_status, created_by)
+                        VALUES (%s, %s, %s, %s)
                         """,
                         (
-                            status_value,
-                            modified_by or self.settings.script_user,
+                            run_id,
                             process_id,
-
+                            status_value,
+                            created_by or self.settings.script_user,
                         ),
                     )
                     conn.commit()
                     logger.info(
-                        "Updated process %s to status %s", process_id, process_status
+                        "Logged run %s for process %s with status %s",
+                        run_id,
+                        process_id,
+                        status_value,
                     )
+                    return run_id
         except Exception as exc:  # pragma: no cover - defensive
             logger.error(
-                "Failed to update process %s: %s", process_id, exc
+                "Failed to log run for process %s: %s", process_id, exc
             )
+            return None

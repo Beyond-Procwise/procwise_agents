@@ -28,12 +28,17 @@ class RAGAgent(BaseAgent):
         self,
         query: str,
         user_id: str,
+        session_id: str | None = None,
         top_k: int = 5,
         doc_type: str | None = None,
         product_type: str | None = None,
     ):
-        """Answer questions while maintaining chat history."""
-        print(f"RAGAgent received query: '{query}' for user: '{user_id}'")
+        """Answer questions while maintaining (but not utilising) chat history."""
+
+        print(
+            f"RAGAgent received query: '{query}' for user: '{user_id}'"
+            + (f" in session '{session_id}'" if session_id else "")
+        )
 
         must: list[models.FieldCondition] = []
         if doc_type:
@@ -60,44 +65,47 @@ class RAGAgent(BaseAgent):
                     search_hits.append(h)
                     seen_ids.add(h.id)
 
-        if search_hits:
-            reranked = self._rerank(query, search_hits, top_k)
-            if not reranked:
-                return {"answer": "I could not find any relevant documents to answer your question."}
-            context = "".join(
-                f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
-                f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
-                for hit in reranked
-            )
-            rag_prompt = (
-    "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
-    "the USER QUESTION. if required use external knowledge beyond the context only related to procurement process.\n\n"
-    "Instructions:\n"
-    "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
-    "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"
-    "3) If the context does not contain the answer, return exactly the following string (no extra text):\n"
-    "   I could not find any relevant information in the provided documents.\n"
-    "4) For any factual claims or new information derived from the retrieved content, append an inline citation immediately after the claim in this format: [Document ID: <id>] or for multiple documents [Document IDs: id1,id2].\n"
-    "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
-    "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
-    "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
-    "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
-    f"RETRIEVED CONTENT:\n{context}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
-)
-        else:
-            history = self._load_chat_history(user_id)
-            if not history:
-                return {"answer": "I could not find any relevant documents or prior conversation to answer your question."}
-            history_context = "\n".join(
-                [f"Previous Q: {h['query']}\nPrevious A: {h['answer']}" for h in history]
-            )
-            context = history_context
-            rag_prompt = (
-                "You are a helpful procurement assistant.\n"
-                "Use the chat history to answer the user's question when no documents are found.\n"
-                f"CHAT HISTORY:\n{history_context}\n"
-                f"USER QUESTION: {query}\nANSWER:"
-            )
+        if not search_hits:
+            answer = "I could not find any relevant documents to answer your question."
+            history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
+            history.append({"query": query, "answer": answer})
+            if session_id:
+                self._save_chat_history(user_id, history, session_id)
+            else:
+                self._save_chat_history(user_id, history)
+            return {"answer": answer, "follow_up_questions": [], "retrieved_documents": []}
+
+        reranked = self._rerank(query, search_hits, top_k)
+        if not reranked:
+            answer = "I could not find any relevant documents to answer your question."
+            history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
+            history.append({"query": query, "answer": answer})
+            if session_id:
+                self._save_chat_history(user_id, history, session_id)
+            else:
+                self._save_chat_history(user_id, history)
+            return {"answer": answer, "follow_up_questions": [], "retrieved_documents": []}
+
+        context = "".join(
+            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
+            f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
+            for hit in reranked
+        )
+        rag_prompt = (
+            "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
+            "the USER QUESTION. if required use external knowledge beyond the context only related to procurement process.\n\n"
+            "Instructions:\n"
+            "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
+            "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"
+            "3) If the context does not contain the answer, return exactly the following string (no extra text):\n"
+            "   I could not find any relevant information in the provided documents.\n"
+            "4) For any factual claims or new information derived from the retrieved content, append an inline citation immediately after the claim in this format: [Document ID: <id>] or for multiple documents [Document IDs: id1,id2].\n"
+            "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
+            "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
+            "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
+            "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
+            f"RETRIEVED CONTENT:\n{context}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
+        )
 
         # Generate answer and follow-up suggestions in parallel
         answer_future = self._executor.submit(
@@ -109,9 +117,12 @@ class RAGAgent(BaseAgent):
         followups = follow_future.result()
         answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
 
-        history = self._load_chat_history(user_id)
+        history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
         history.append({"query": query, "answer": answer})
-        self._save_chat_history(user_id, history)
+        if session_id:
+            self._save_chat_history(user_id, history, session_id)
+        else:
+            self._save_chat_history(user_id, history)
 
         return {
             "answer": answer,
@@ -163,26 +174,37 @@ class RAGAgent(BaseAgent):
         questions = resp.get("response", "").strip().splitlines()
         return [q for q in questions if q]
 
-    def _load_chat_history(self, user_id: str) -> list:
-        history_key = f"chat_history/{user_id}.json"
+    def _load_chat_history(self, user_id: str, session_id: str | None = None) -> list:
+        history_key = (
+            f"chat_history/{user_id}/{session_id}.json" if session_id else f"chat_history/{user_id}.json"
+        )
         try:
             s3_object = self.agent_nick.s3_client.get_object(
                 Bucket=self.settings.s3_bucket_name, Key=history_key
             )
             history = json.loads(s3_object["Body"].read().decode("utf-8"))
-            print(f"Loaded {len(history)} items from chat history for user '{user_id}'.")
+            print(
+                f"Loaded {len(history)} items from chat history for user '{user_id}'"
+                + (f" session '{session_id}'" if session_id else "")
+                + "."
+            )
             return history
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
                 print(
-                    f"No chat history found for user '{user_id}'. Starting new session."
+                    f"No chat history found for user '{user_id}'"
+                    + (f" session '{session_id}'" if session_id else "")
+                    + ". Starting new session."
                 )
                 return []
-            else:
-                raise
+            raise
 
-    def _save_chat_history(self, user_id: str, history: list):
-        history_key = f"chat_history/{user_id}.json"
+    def _save_chat_history(
+        self, user_id: str, history: list, session_id: str | None = None
+    ) -> None:
+        history_key = (
+            f"chat_history/{user_id}/{session_id}.json" if session_id else f"chat_history/{user_id}.json"
+        )
         bucket_name = getattr(self.settings, "s3_bucket_name", None)
         if not bucket_name:
             print(
@@ -196,7 +218,9 @@ class RAGAgent(BaseAgent):
                 Body=json.dumps(history, indent=2),
             )
             print(
-                f"Saved chat history for user '{user_id}' in bucket '{bucket_name}'."
+                f"Saved chat history for user '{user_id}'"
+                + (f" session '{session_id}'" if session_id else "")
+                + f" in bucket '{bucket_name}'."
             )
         except ClientError as e:
             error_code = e.response["Error"].get("Code", "Unknown")

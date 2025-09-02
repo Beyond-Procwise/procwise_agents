@@ -85,17 +85,21 @@ class BaseAgent:
         process_id = self.agent_nick.process_routing_service.log_process(
             process_name=self.__class__.__name__,
             process_details={"input": context.input_data, "output": result.data},
-            process_status=status,
             user_id=context.user_id,
             user_name=self.agent_nick.settings.script_user,
         )
         if process_id is not None:
+            run_id = self.agent_nick.process_routing_service.log_run_detail(
+                process_id=process_id,
+                process_status=status,
+            )
             self.agent_nick.process_routing_service.log_action(
                 process_id=process_id,
                 agent_type=self.__class__.__name__,
                 action_desc=context.input_data,
                 process_output=result.data,
                 status="completed" if result.status == AgentStatus.SUCCESS else "failed",
+                run_id=run_id,
             )
         return result
 
