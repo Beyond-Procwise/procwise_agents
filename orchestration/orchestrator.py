@@ -282,10 +282,19 @@ class Orchestrator:
                 result = _run(node["onFailure"])
             return result
 
-        final = _run(flow)
-        flow["status"] = (
-            "completed" if final and final.status == AgentStatus.SUCCESS else "failed"
-        )
+        # Execute the first node in the flow.  Each node updates its own
+        # ``status`` field and recursively processes child nodes based on the
+        # success or failure of the current agent.  Previously the top-level
+        # flow ``status`` was overwritten with the result of the *last* agent
+        # executed.  This meant that if the first agent failed but a child
+        # agent succeeded, the overall flow incorrectly appeared successful.
+        #
+        # The workflow semantics require that the status of the initial agent
+        # determines the overall flow status.  Subsequent agents should update
+        # only their own nodes.  We therefore execute the flow and return it
+        # without replacing the root node's status based on downstream
+        # results.
+        _run(flow)
         return flow
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:
