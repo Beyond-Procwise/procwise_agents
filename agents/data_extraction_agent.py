@@ -36,6 +36,7 @@ import torch
 from datetime import datetime, timedelta
 from dateutil import parser
 from agents.document_jsonifier import convert_document_to_json
+from utils.nlp import extract_entities
 
 
 def _get_easyocr_reader():
@@ -629,6 +630,39 @@ class DataExtractionAgent(BaseAgent):
                 num = self._clean_numeric(header[field])
                 header[field] = int(num) if num is not None else None
 
+        # Enhance extraction with NLP-based entity recognition.  Any values
+        # already present take precedence over NER results.
+        ner_header = self._extract_header_with_ner(text)
+        for key, value in ner_header.items():
+            header.setdefault(key, value)
+
+        return header
+
+    def _extract_header_with_ner(self, text: str) -> Dict[str, Any]:
+        """Supplement header parsing using a lightweight NER model.
+
+        Named-entity recognition helps identify vendor names, dates and
+        monetary amounts that might not be captured by the heuristic
+        approach.  The function returns only a subset of fields to keep the
+        logic simple while improving accuracy.
+        """
+
+        entities = extract_entities(text)
+        header: Dict[str, Any] = {}
+        for ent in entities:
+            label = ent.get("entity_group")
+            word = ent.get("word", "").strip()
+            if not word:
+                continue
+            if label == "ORG" and "vendor_name" not in header:
+                header["vendor_name"] = word
+            elif label == "DATE":
+                if "invoice_date" not in header:
+                    header["invoice_date"] = word
+                elif "due_date" not in header:
+                    header["due_date"] = word
+            elif label == "MONEY" and "invoice_total_incl_tax" not in header:
+                header["invoice_total_incl_tax"] = self._clean_numeric(word)
         return header
 
     def _classify_doc_type(self, text: str) -> str:
