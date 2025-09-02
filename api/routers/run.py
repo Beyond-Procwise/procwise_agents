@@ -62,6 +62,7 @@ class RunRequest(BaseModel):
     execution.
     """
 
+    process_id: Optional[int] = None
     workflow: Optional[str] = None
     payload: Dict[str, Any] = {}
     user_id: Optional[str] = None
@@ -74,13 +75,33 @@ def run_agents(
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ):
     """Execute a workflow using the orchestrator."""
+    prs = getattr(orchestrator.agent_nick, "process_routing_service", None)
+
+    if req.process_id is not None:
+        if not prs:
+            raise HTTPException(
+                status_code=503, detail="Process routing service is not available."
+            )
+        details = prs.get_process_details(req.process_id)
+        if details is None:
+            raise HTTPException(status_code=404, detail="Process not found")
+        prs.update_process_status(req.process_id, 1)
+        result = orchestrator.execute_agent_flow(details)
+        if isinstance(result, dict):
+            details["status"] = result.get("status", details.get("status"))
+            prs.update_process_details(req.process_id, details)
+        prs.update_process_status(
+            req.process_id, 2 if result.get("status") != "failed" else 3
+        )
+        return result
+
     # When an agent flow is supplied we validate and execute it using the
     # orchestrator.  Otherwise fall back to the legacy ``workflow`` based
     # execution path.
     if req.agent_flow is not None:
         return orchestrator.execute_agent_flow(req.agent_flow.model_dump())
-    if not req.workflow:
+    if req.workflow is None:
         raise HTTPException(
-            status_code=400, detail="Either workflow or agent_flow must be provided"
+            status_code=400, detail="Either process_id, workflow or agent_flow must be provided"
         )
     return orchestrator.execute_workflow(req.workflow, req.payload, user_id=req.user_id)

@@ -101,6 +101,55 @@ class ProcessRoutingService:
             logger.error("Failed to log process %s: %s", process_name, exc)
             return None
 
+    def get_process_details(self, process_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch the ``process_details`` blob for a given ``process_id``."""
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT process_details FROM proc.routing WHERE process_id = %s",
+                        (process_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        return json.loads(row[0])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Failed to fetch process %s: %s", process_id, exc)
+        return None
+
+    def update_process_details(
+        self,
+        process_id: int,
+        process_details: Dict[str, Any],
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Persist updated ``process_details`` for a process."""
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE proc.routing
+                        SET process_details = %s,
+                            modified_on = CURRENT_TIMESTAMP,
+                            modified_by = %s
+                        WHERE process_id = %s
+                        """,
+                        (
+                            self._safe_dumps(process_details),
+                            modified_by or self.settings.script_user,
+                            process_id,
+                        ),
+                    )
+                    conn.commit()
+                    logger.info(
+                        "Updated process %s details", process_id
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Failed to update details for process %s: %s", process_id, exc
+            )
+
     def log_action(
         self,
         process_id: int,
