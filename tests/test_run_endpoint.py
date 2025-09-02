@@ -37,6 +37,10 @@ class DummyOrchestrator:
             },
         }
 
+    def execute_agent_flow(self, flow):
+        # Simple echo implementation for testing
+        return {"status": "validated", "plan": [flow]}
+
 
 def test_run_endpoint_executes_workflow():
     app = FastAPI()
@@ -53,3 +57,28 @@ def test_run_endpoint_executes_workflow():
     assert data["result"]["echo"]["foo"] == "bar"
     assert data["result"]["workflow"] == "test"
     assert data["result"]["user"] == "u1"
+
+
+def test_run_endpoint_validates_agent_flow():
+    app = FastAPI()
+    app.include_router(run_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    client = TestClient(app)
+
+    flow = {
+        "status": "saved",
+        "agent_type": "1",
+        "agent_property": {"llm": "mistral", "prompts": [1], "policies": [2]},
+        "onSuccess": {
+            "status": "saved",
+            "agent_type": "2",
+            "agent_property": {"llm": "phi", "prompts": [3], "policies": [4]},
+        },
+    }
+
+    resp = client.post("/run", json={"agent_flow": flow})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "validated"
+    assert data["plan"][0]["agent_type"] == "1"
