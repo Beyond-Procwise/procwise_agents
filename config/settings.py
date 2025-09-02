@@ -34,8 +34,13 @@ class Settings(BaseSettings):
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
 
     extraction_model: str = "llama3.2"
-    embedding_model: str = "all-roberta-large-v1"
-    vector_size: int = 1024
+    # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
+    # embeddings tailored for question/answer style retrieval.  Its
+    # dimensionality (768) is smaller than ``all-roberta-large-v1`` which
+    # reduces storage requirements while typically yielding better recall for
+    # RAG workflows.
+    embedding_model: str = "multi-qa-mpnet-base-dot-v1"
+    vector_size: int = 768
 
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']

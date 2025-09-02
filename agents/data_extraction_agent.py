@@ -836,10 +836,32 @@ class DataExtractionAgent(BaseAgent):
     def _extract_structured_data(
         self, text: str, doc_type: str
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Parse header and line items using JSON conversion submodule."""
+        """Parse header and line items using JSON conversion with LLM fallback.
+
+        Extraction quality varies greatly across document formats.  We first
+        attempt a lightweight regex-based conversion via
+        :func:`convert_document_to_json`.  When that approach fails to produce
+        meaningful results (e.g. for scanned PDFs), we fall back to the more
+        expensive LLM-driven ``_context_based_extraction``.  The combined
+        approach dramatically improves accuracy of both header fields and line
+        items while keeping simple cases fast.
+        """
+
         data = convert_document_to_json(text, doc_type)
         header = self._normalize_header_fields(data.get("header_data", {}), doc_type)
-        line_items = self._normalize_line_item_fields(data.get("line_items", []), doc_type)
+        line_items = self._normalize_line_item_fields(
+            data.get("line_items", []), doc_type
+        )
+
+        # Fallback to context-based extraction when information is missing.
+        if not header or not line_items:
+            ctx_header, ctx_items = self._context_based_extraction(text, doc_type)
+            if not header:
+                header = ctx_header
+            if not line_items:
+                line_items = ctx_items
+
+        header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
         return header, line_items
 
@@ -1107,18 +1129,36 @@ class DataExtractionAgent(BaseAgent):
                 wait=True,
             )
 
-    def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
-        """Whitespace-aware text chunking with configurable overlap.
+    def _chunk_text(self, text: str, max_tokens: int = 256, overlap: int = 20) -> List[str]:
+        """Token-aware text chunking with graceful degradation.
 
-        A small overlap between chunks helps the retriever maintain context
-        around boundaries which in turn improves answer quality.
+        The original implementation used character counts which could split
+        tokens awkwardly and lead to sub‑optimal embeddings.  We now prefer a
+        token-based approach using ``tiktoken`` when available.  When the
+        library is missing the function falls back to a whitespace-normalised
+        character strategy so behaviour remains robust in minimal
+        environments.
         """
+
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return []
 
-        step = max_chars - overlap if max_chars > overlap else max_chars
-        return [text[i : i + max_chars] for i in range(0, len(text), step)]
+        try:  # pragma: no cover - optional dependency
+            import tiktoken
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            tokens = enc.encode(text)
+            step = max_tokens - overlap if max_tokens > overlap else max_tokens
+            chunks = []
+            for i in range(0, len(tokens), step):
+                chunk_tokens = tokens[i : i + max_tokens]
+                chunks.append(enc.decode(chunk_tokens))
+            return chunks
+        except Exception:
+            max_chars = max_tokens
+            step = max_chars - overlap if max_chars > overlap else max_chars
+            return [text[i : i + max_chars] for i in range(0, len(text), step)]
 
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:
         """Best-effort parsing of free-form numeric strings.

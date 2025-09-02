@@ -10,6 +10,7 @@ python-dateutil
 qdrant-client
 sentence-transformers
 pandas
+tiktoken
 unstructured[local-inference]
 pdf2image
 pytesseract
