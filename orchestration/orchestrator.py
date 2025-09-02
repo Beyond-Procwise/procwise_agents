@@ -4,6 +4,9 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import re
+from pathlib import Path
 
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
@@ -99,29 +102,50 @@ class Orchestrator:
             logger.error(f"Workflow {workflow_id} failed: {e}")
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
+    def _load_agent_definitions(self) -> Dict[str, str]:
+        """Return mapping of agent_id to agent type string."""
+        path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
+        with path.open() as f:
+            data = json.load(f)
+        return {str(item["agentId"]): item["agentType"] for item in data}
+
+    def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
+        """Load prompt templates keyed by ``promptId``."""
+        path = Path(__file__).resolve().parents[1] / "prompts" / "prompts.json"
+        with path.open() as f:
+            data = json.load(f)
+        templates = data.get("templates", [])
+        return {int(t["promptId"]): t for t in templates if "promptId" in t}
+
+    def _load_policies(self) -> Dict[int, Dict[str, Any]]:
+        """Aggregate all policy definitions and assign simple numeric IDs."""
+        policy_dir = Path(__file__).resolve().parents[1] / "policies"
+        policies: Dict[int, Dict[str, Any]] = {}
+        idx = 1
+        for file in sorted(policy_dir.glob("*.json")):
+            with file.open() as f:
+                items = json.load(f)
+            for item in items:
+                policies[idx] = item
+                idx += 1
+        return policies
+
+    @staticmethod
+    def _resolve_agent_name(agent_type: str) -> str:
+        """Convert class-like agent names to registry keys."""
+        name = re.sub(r"(?<!^)(?=[A-Z])", "_", agent_type).lower()
+        if name.endswith("_agent"):
+            name = name[:-6]
+        return name
+
     def execute_agent_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and prepare execution plan for a dynamic agent flow.
+        """Execute a dynamic agent flow based on process details."""
 
-        Parameters
-        ----------
-        flow:
-            Nested dictionary describing the agent orchestration tree.  The
-            structure is expected to mirror the JSON supplied to the ``/run``
-            endpoint and include keys such as ``status``, ``agent_type``,
-            ``agent_property`` (with ``llm``, ``prompts`` and ``policies``),
-            and optional ``onSuccess``/``onFailure`` branches.
+        agent_defs = self._load_agent_definitions()
+        prompts = self._load_prompts()
+        policies = self._load_policies()
 
-        Returns
-        -------
-        Dict[str, Any]
-            A simple plan of the agents encountered during traversal.  This
-            is a placeholder for more advanced orchestration logic and allows
-            the API to confirm that the supplied structure is well-formed.
-        """
-
-        plan: List[Dict[str, Any]] = []
-
-        def _traverse(node: Dict[str, Any]) -> None:
+        def _run(node: Dict[str, Any]):
             required_fields = ["status", "agent_type", "agent_property"]
             for field in required_fields:
                 if field not in node:
@@ -132,22 +156,57 @@ class Orchestrator:
                 if field not in props:
                     raise ValueError(f"Missing property '{field}' in agent node")
 
-            plan.append(
-                {
-                    "agent_type": node["agent_type"],
+            agent_type_id = str(node["agent_type"])
+            agent_class = agent_defs.get(agent_type_id)
+            if not agent_class:
+                raise ValueError(f"Unknown agent_type '{agent_type_id}'")
+
+            agent_key = self._resolve_agent_name(agent_class)
+            agent = self.agents.get(agent_key) or self.agents.get(agent_class)
+            if not agent:
+                raise ValueError(f"Agent '{agent_class}' not registered")
+
+            prompt_objs = []
+            for pid in props.get("prompts", []):
+                if pid not in prompts:
+                    raise ValueError(f"Unknown prompt id '{pid}'")
+                prompt_objs.append(prompts[pid])
+
+            policy_objs = []
+            for pid in props.get("policies", []):
+                if pid not in policies:
+                    raise ValueError(f"Unknown policy id '{pid}'")
+                policy_objs.append(policies[pid])
+
+            context = AgentContext(
+                workflow_id=str(uuid.uuid4()),
+                agent_id=agent_key,
+                user_id=self.settings.script_user,
+                input_data={
                     "llm": props.get("llm"),
-                    "prompts": props.get("prompts", []),
-                    "policies": props.get("policies", []),
-                }
+                    "prompts": prompt_objs,
+                    "policies": policy_objs,
+                },
             )
 
-            if node.get("onSuccess"):
-                _traverse(node["onSuccess"])
-            if node.get("onFailure"):
-                _traverse(node["onFailure"])
+            result = agent.execute(context)
+            node["status"] = (
+                "completed"
+                if result and result.status == AgentStatus.SUCCESS
+                else "failed"
+            )
 
-        _traverse(flow)
-        return {"status": "validated", "plan": plan}
+            if result and result.status == AgentStatus.SUCCESS and node.get("onSuccess"):
+                return _run(node["onSuccess"])
+            if result and result.status == AgentStatus.FAILED and node.get("onFailure"):
+                return _run(node["onFailure"])
+            return result
+
+        final = _run(flow)
+        final_status = (
+            "completed" if final and final.status == AgentStatus.SUCCESS else "failed"
+        )
+        return {"status": final_status}
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:
         """Validate workflow against policies"""
