@@ -52,8 +52,9 @@ class Orchestrator:
         """Backward compatible alias for :meth:`execute_extraction_flow`."""
         return self.execute_extraction_flow(s3_prefix, s3_object_key)
 
-    def execute_workflow(self, workflow_name: str, input_data: Dict,
-                         user_id: str = None) -> Dict:
+    def execute_workflow(
+        self, workflow_name: str, input_data: Dict, user_id: str = None
+    ) -> Dict:
         """Execute a complete workflow"""
         workflow_id = str(uuid.uuid4())
         logger.info(f"Starting workflow {workflow_name} with ID {workflow_id}")
@@ -64,58 +65,103 @@ class Orchestrator:
                 workflow_id=workflow_id,
                 agent_id=workflow_name,
                 user_id=user_id or self.settings.script_user,
-                input_data=input_data
+                input_data=input_data,
             )
 
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
                 return {
-                    'status': 'blocked',
-                    'reason': 'Policy validation failed',
-                    'workflow_id': workflow_id
+                    "status": "blocked",
+                    "reason": "Policy validation failed",
+                    "workflow_id": workflow_id,
                 }
 
             # Execute workflow based on type
-            if workflow_name == 'document_extraction':
+            if workflow_name == "document_extraction":
                 result = self._execute_extraction_workflow(context)
-            elif workflow_name == 'supplier_ranking':
+            elif workflow_name == "supplier_ranking":
                 result = self._execute_ranking_workflow(context)
-            elif workflow_name == 'quote_evaluation':
+            elif workflow_name == "quote_evaluation":
                 result = self._execute_quote_workflow(context)
-            elif workflow_name == 'opportunity_mining':
+            elif workflow_name == "opportunity_mining":
                 result = self._execute_opportunity_workflow(context)
             else:
                 result = self._execute_generic_workflow(workflow_name, context)
 
             return {
-                'status': 'completed',
-                'workflow_id': workflow_id,
-                'result': result,
-                'execution_path': context.routing_history
+                "status": "completed",
+                "workflow_id": workflow_id,
+                "result": result,
+                "execution_path": context.routing_history,
             }
 
         except Exception as e:
             logger.error(f"Workflow {workflow_id} failed: {e}")
-            return {
-                'status': 'failed',
-                'workflow_id': workflow_id,
-                'error': str(e)
-            }
+            return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
+
+    def execute_agent_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and prepare execution plan for a dynamic agent flow.
+
+        Parameters
+        ----------
+        flow:
+            Nested dictionary describing the agent orchestration tree.  The
+            structure is expected to mirror the JSON supplied to the ``/run``
+            endpoint and include keys such as ``status``, ``agent_type``,
+            ``agent_property`` (with ``llm``, ``prompts`` and ``policies``),
+            and optional ``onSuccess``/``onFailure`` branches.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A simple plan of the agents encountered during traversal.  This
+            is a placeholder for more advanced orchestration logic and allows
+            the API to confirm that the supplied structure is well-formed.
+        """
+
+        plan: List[Dict[str, Any]] = []
+
+        def _traverse(node: Dict[str, Any]) -> None:
+            required_fields = ["status", "agent_type", "agent_property"]
+            for field in required_fields:
+                if field not in node:
+                    raise ValueError(f"Missing field '{field}' in agent node")
+
+            props = node.get("agent_property", {})
+            for field in ["llm", "prompts", "policies"]:
+                if field not in props:
+                    raise ValueError(f"Missing property '{field}' in agent node")
+
+            plan.append(
+                {
+                    "agent_type": node["agent_type"],
+                    "llm": props.get("llm"),
+                    "prompts": props.get("prompts", []),
+                    "policies": props.get("policies", []),
+                }
+            )
+
+            if node.get("onSuccess"):
+                _traverse(node["onSuccess"])
+            if node.get("onFailure"):
+                _traverse(node["onFailure"])
+
+        _traverse(flow)
+        return {"status": "validated", "plan": plan}
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:
         """Validate workflow against policies"""
-        if workflow_name == 'supplier_ranking':
+        if workflow_name == "supplier_ranking":
             return True
         validation_result = self.policy_engine.validate_workflow(
-                    workflow_name,
-                    context.user_id,
-                    context.input_data)
-        return validation_result.get('allowed', True)
+            workflow_name, context.user_id, context.input_data
+        )
+        return validation_result.get("allowed", True)
 
     def _execute_extraction_workflow(self, context: AgentContext) -> Dict:
         """Execute document extraction workflow"""
         # Step 1: Extract documents
-        extraction_result = self._execute_agent('data_extraction', context)
+        extraction_result = self._execute_agent("data_extraction", context)
 
         if extraction_result.status != AgentStatus.SUCCESS:
             return extraction_result.data
@@ -123,44 +169,35 @@ class Orchestrator:
         # Step 2: Process next agents in parallel if enabled
         if self.settings.parallel_processing and extraction_result.next_agents:
             results = self._execute_parallel_agents(
-                extraction_result.next_agents,
-                context,
-                extraction_result.pass_fields
+                extraction_result.next_agents, context, extraction_result.pass_fields
             )
         else:
             results = self._execute_sequential_agents(
-                extraction_result.next_agents,
-                context,
-                extraction_result.pass_fields
+                extraction_result.next_agents, context, extraction_result.pass_fields
             )
 
-        return {
-            'extraction': extraction_result.data,
-            'downstream_results': results
-        }
+        return {"extraction": extraction_result.data, "downstream_results": results}
 
     def _execute_ranking_workflow(self, context: AgentContext) -> Dict:
         """Execute supplier ranking workflow"""
         # Get supplier data first
-        context.input_data['supplier_data'] = self.query_engine.fetch_supplier_data(
+        context.input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
             context.input_data
         )
 
         # Execute ranking
-        ranking_result = self._execute_agent('supplier_ranking', context)
+        ranking_result = self._execute_agent("supplier_ranking", context)
 
         # Process opportunities if found
-        if 'OpportunityMinerAgent' in ranking_result.next_agents:
+        if "OpportunityMinerAgent" in ranking_result.next_agents:
             opp_context = self._create_child_context(
-                context,
-                'opportunity_miner',
-                ranking_result.pass_fields
+                context, "opportunity_miner", ranking_result.pass_fields
             )
-            opp_result = self._execute_agent('opportunity_miner', opp_context)
+            opp_result = self._execute_agent("opportunity_miner", opp_context)
 
             return {
-                'ranking': ranking_result.data,
-                'opportunities': opp_result.data if opp_result else None
+                "ranking": ranking_result.data,
+                "opportunities": opp_result.data if opp_result else None,
             }
 
         return ranking_result.data
@@ -168,15 +205,13 @@ class Orchestrator:
     def _execute_quote_workflow(self, context: AgentContext) -> Dict:
         """Execute quote evaluation workflow"""
         # Execute quote evaluation
-        quote_result = self._execute_agent('quote_evaluation', context)
+        quote_result = self._execute_agent("quote_evaluation", context)
 
         # Check if negotiation needed
-        if quote_result.data.get('negotiation_required'):
+        if quote_result.data.get("negotiation_required"):
             # Prepare negotiation
             neg_context = self._create_child_context(
-                context,
-                'negotiation',
-                quote_result.pass_fields
+                context, "negotiation", quote_result.pass_fields
             )
             # Would execute negotiation agent here
 
@@ -185,30 +220,32 @@ class Orchestrator:
     def _execute_opportunity_workflow(self, context: AgentContext) -> Dict:
         """Execute opportunity mining workflow"""
         # Execute opportunity mining
-        opp_result = self._execute_agent('opportunity_miner', context)
+        opp_result = self._execute_agent("opportunity_miner", context)
 
         # Check for discrepancies
-        if opp_result.data.get('total_savings_potential', 0) > 10000:
+        if opp_result.data.get("total_savings_potential", 0) > 10000:
             disc_context = self._create_child_context(
-                context,
-                'discrepancy_detection',
-                opp_result.pass_fields
+                context, "discrepancy_detection", opp_result.pass_fields
             )
-            disc_result = self._execute_agent('discrepancy_detection', disc_context)
+            disc_result = self._execute_agent("discrepancy_detection", disc_context)
 
             return {
-                'opportunities': opp_result.data,
-                'discrepancies': disc_result.data if disc_result else None
+                "opportunities": opp_result.data,
+                "discrepancies": disc_result.data if disc_result else None,
             }
 
         return opp_result.data
 
-    def _execute_generic_workflow(self, workflow_name: str, context: AgentContext) -> Dict:
+    def _execute_generic_workflow(
+        self, workflow_name: str, context: AgentContext
+    ) -> Dict:
         """Execute generic workflow based on routing rules"""
         results = {}
         current_agents = [workflow_name]
         depth = 0
-        max_depth = self.routing_model.get('global_settings', {}).get('max_chain_depth', 10)
+        max_depth = self.routing_model.get("global_settings", {}).get(
+            "max_chain_depth", 10
+        )
 
         while current_agents and depth < max_depth:
             next_agents = []
@@ -239,16 +276,21 @@ class Orchestrator:
 
         return agent.execute(context)
 
-    def _execute_parallel_agents(self, agents: List[str], context: AgentContext,
-                                 pass_fields: Dict) -> Dict:
+    def _execute_parallel_agents(
+        self, agents: List[str], context: AgentContext, pass_fields: Dict
+    ) -> Dict:
         """Execute agents in parallel"""
         results = {}
         futures = {}
 
         for agent_name in agents:
             if agent_name in self.agents:
-                child_context = self._create_child_context(context, agent_name, pass_fields)
-                future = self.executor.submit(self._execute_agent, agent_name, child_context)
+                child_context = self._create_child_context(
+                    context, agent_name, pass_fields
+                )
+                future = self.executor.submit(
+                    self._execute_agent, agent_name, child_context
+                )
                 futures[future] = agent_name
 
         for future in as_completed(futures):
@@ -258,18 +300,21 @@ class Orchestrator:
                 results[agent_name] = result.data if result else None
             except Exception as e:
                 logger.error(f"Parallel execution failed for {agent_name}: {e}")
-                results[agent_name] = {'error': str(e)}
+                results[agent_name] = {"error": str(e)}
 
         return results
 
-    def _execute_sequential_agents(self, agents: List[str], context: AgentContext,
-                                   pass_fields: Dict) -> Dict:
+    def _execute_sequential_agents(
+        self, agents: List[str], context: AgentContext, pass_fields: Dict
+    ) -> Dict:
         """Execute agents sequentially"""
         results = {}
 
         for agent_name in agents:
             if agent_name in self.agents:
-                child_context = self._create_child_context(context, agent_name, pass_fields)
+                child_context = self._create_child_context(
+                    context, agent_name, pass_fields
+                )
                 result = self._execute_agent(agent_name, child_context)
                 results[agent_name] = result.data if result else None
 
@@ -279,8 +324,9 @@ class Orchestrator:
 
         return results
 
-    def _create_child_context(self, parent_context: AgentContext,
-                              agent_name: str, pass_fields: Dict) -> AgentContext:
+    def _create_child_context(
+        self, parent_context: AgentContext, agent_name: str, pass_fields: Dict
+    ) -> AgentContext:
         """Create child context for agent execution"""
         return AgentContext(
             workflow_id=parent_context.workflow_id,
@@ -288,5 +334,5 @@ class Orchestrator:
             user_id=parent_context.user_id,
             input_data={**parent_context.input_data, **pass_fields},
             parent_agent=parent_context.agent_id,
-            routing_history=parent_context.routing_history.copy()
+            routing_history=parent_context.routing_history.copy(),
         )
