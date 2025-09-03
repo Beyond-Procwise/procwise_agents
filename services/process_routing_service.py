@@ -54,9 +54,10 @@ class ProcessRoutingService:
     ) -> Optional[int]:
         """Insert a process routing record and return the new ``process_id``.
 
-        The ``proc.routing`` table now serves as a high level catalogue of
-        processes and their associated metadata.  Per-run status tracking is
-        handled by ``proc.routing_run_details`` via :meth:`log_run_detail`.
+        The ``proc.routing`` table now serves as both the catalogue of
+        processes and the repository for individual run details.  Per-run
+        status tracking is handled directly in this table via
+        :meth:`log_run_detail`.
         """
 
         try:
@@ -253,7 +254,7 @@ class ProcessRoutingService:
         process_end_ts: Optional[datetime] = None,
         triggered_by: Optional[str] = None,
     ) -> Optional[str]:
-        """Record a single execution run in ``proc.routing_run_details``.
+        """Record a single execution run in ``proc.routing``.
 
         Parameters
         ----------
@@ -287,7 +288,7 @@ class ProcessRoutingService:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        INSERT INTO proc.routing_run_details (
+                        INSERT INTO proc.routing (
                             runid,
                             process_id,
                             process_details,
