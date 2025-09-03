@@ -63,9 +63,17 @@ def test_run_endpoint_process_id_executes_flow():
     resp = client.post("/run", json={"process_id": 5})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "completed"
+    assert data["status"] == "started"
 
     prs = orchestrator.agent_nick.process_routing_service
+    # Wait for background thread to update status and details
+    import time
+
+    for _ in range(50):
+        if prs.status_updates == [(5, 1), (5, 1)] and prs.details_updates:
+            break
+        time.sleep(0.01)
+
     assert prs.status_updates == [(5, 1), (5, 1)]
     assert prs.details_updates[0]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
@@ -111,7 +119,14 @@ def test_run_endpoint_updates_nested_statuses_independently():
     resp = client.post("/run", json={"process_id": 9})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "completed"
+    assert data["status"] == "started"
+
+    import time
+
+    for _ in range(50):
+        if prs.details_updates:
+            break
+        time.sleep(0.01)
 
     saved = prs.details_updates[0]
     assert saved["status"] == "completed"

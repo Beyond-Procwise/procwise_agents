@@ -62,6 +62,11 @@ class ProcessRoutingService:
         or :meth:`log_run_detail`.
         """
 
+        # ``process_status`` is mandatory in ``proc.routing``. Default to ``0``
+        # (started) whenever a caller does not explicitly provide a value to
+        # avoid ``NULL`` constraint violations.
+        process_status = 0 if process_status is None else process_status
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:

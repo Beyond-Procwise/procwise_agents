@@ -93,6 +93,7 @@ class BaseAgent:
             process_details={"input": context.input_data, "output": result.data},
             user_id=context.user_id,
             user_name=self.agent_nick.settings.script_user,
+            process_status=0,
         )
         if process_id is not None:
             run_id = self.agent_nick.process_routing_service.log_run_detail(
