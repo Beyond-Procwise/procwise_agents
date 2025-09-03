@@ -289,7 +289,7 @@ class ProcessRoutingService:
                     cursor.execute(
                         """
                         INSERT INTO proc.routing (
-                            runid,
+                            id-,
                             process_id,
                             process_details,
                             process_status,
