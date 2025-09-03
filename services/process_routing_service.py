@@ -248,22 +248,56 @@ class ProcessRoutingService:
             return None
 
     def log_run_detail(
-        self,
-        process_id: int,
-        process_status: str,
-        run_id: Optional[str] = None,
-        process_details: Optional[Dict[str, Any]] = None,
-        process_start_ts: Optional[datetime] = None,
-        process_end_ts: Optional[datetime] = None,
-        triggered_by: Optional[str] = None,
+            self,
+            process_id: int,
+            process_status: str,
+            run_id: Optional[str] = None,
+            process_details: Optional[Dict[str, Any]] = None,
+            process_start_ts: Optional[datetime] = None,
+            process_end_ts: Optional[datetime] = None,
+            triggered_by: Optional[str] = None,
     ) -> Optional[str]:
-        """Update ``proc.routing`` with run metadata for an execution.
+        """Update `proc.routing` with run metadata for an execution.
 
         The new schema stores a single record per process. Execution run
-        information is persisted as ``raw_data`` and status as an integer.
-        ``run_id`` is still returned so that related tables (e.g. ``proc.action``)
+        information is persisted as `raw_data` (JSON) and status as an integer.
+        `run_id` is still returned so that related tables (e.g. `proc.action`)
         can reference the run.
+
+        Behaviour changes:
+        - Kicking off (started/validated-like states) maps to `process_status = 0`.
+        - Success maps to `1`, failure to `-1`.
+        - `process_details` is updated to include per-agent subcategory `status`
+          values using the textual states: `started`, `validated`, `completed`.
         """
+
+        def _annotate_process_details(details: Optional[Dict[str, Any]], status_text: str) -> Dict[str, Any]:
+            """Ensure `details` is a dict and annotate agent sub-entries with status_text.
+
+            Heuristics:
+            - If `details` has an `agents` key with a list of dicts, set each agent['status'].
+            - Otherwise, for any nested dict values, set their 'status'.
+            - Fallback: set top-level `details['status']`.
+            """
+            details = details.copy() if isinstance(details, dict) else {}
+            agents = details.get("agents")
+            if isinstance(agents, list):
+                for a in agents:
+                    if isinstance(a, dict):
+                        a["status"] = status_text
+                details["agents"] = agents
+                return details
+
+            updated = False
+            for k, v in details.items():
+                if isinstance(v, dict):
+                    v["status"] = status_text
+                    updated = True
+
+            if not updated:
+                details["status"] = status_text
+
+            return details
 
         run_id = run_id or str(uuid.uuid4())
         process_start_ts = process_start_ts or datetime.utcnow()
@@ -273,14 +307,42 @@ class ProcessRoutingService:
             if process_end_ts and process_start_ts
             else None
         )
-        # Coerce textual statuses to the integer mapping expected by the table
-        status_int = 1 if str(process_status).lower() in ("1", "success", "completed") else -1
+
+        # Normalize textual input
+        ps = str(process_status).lower() if process_status is not None else ""
+
+        # Determine integer status:
+        # - kickoff/ongoing -> 0
+        # - success -> 1
+        # - failure/unknown -> -1
+        success_vals = ("1", "success", "completed", "done")
+        kickoff_vals = ("started", "running", "in_progress", "validating")
+        if ps in success_vals:
+            status_int = 1
+        elif ps in kickoff_vals:
+            status_int = 0
+        else:
+            status_int = -1
+
+        # Map textual status for raw payload with three distinct states
+        if ps == "started":
+            status_text = "started"
+        elif ps in ("running", "in_progress", "validating"):
+            status_text = "validated"
+        elif ps in success_vals:
+            status_text = "completed"
+        else:
+            status_text = "failed" if status_int < 0 else "completed"
+
+        # Annotate process_details per-agent with the derived textual status
+        annotated_details = _annotate_process_details(process_details, status_text)
 
         raw_payload = {
             "run_id": run_id,
             "process_start_ts": process_start_ts.isoformat(),
             "process_end_ts": process_end_ts.isoformat(),
             "duration": duration.total_seconds() if duration else None,
+            "status": status_text,
             "triggered_by": triggered_by or self.settings.script_user,
         }
 
@@ -299,7 +361,7 @@ class ProcessRoutingService:
                         """,
                         (
                             status_int,
-                            self._safe_dumps(process_details) if process_details is not None else None,
+                            self._safe_dumps(annotated_details) if annotated_details is not None else None,
                             self._safe_dumps(raw_payload),
                             triggered_by or self.settings.script_user,
                             process_id,
