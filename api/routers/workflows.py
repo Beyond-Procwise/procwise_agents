@@ -229,7 +229,7 @@ async def extract_documents(
             "s3_prefix": req.s3_prefix,
             "s3_object_key": req.s3_object_key,
         },
-        process_status=1,
+        # process_status=1,
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")

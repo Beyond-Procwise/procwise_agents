@@ -1,7 +1,9 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-
+import threading
+import asyncio
+import inspect
 from orchestration.orchestrator import Orchestrator
 from utils.gpu import configure_gpu
 
@@ -48,12 +50,32 @@ def run_agents(
     if details.get("status") != "saved":
         raise HTTPException(status_code=409, detail="Process not in saved status")
 
+    # mark as started and run the long-running execution in background
     prs.update_process_status(req.process_id, 1)
-    updated_flow = orchestrator.execute_agent_flow(details)
-    if isinstance(updated_flow, dict):
-        prs.update_process_details(req.process_id, updated_flow)
-        final = updated_flow.get("status")
-    else:
-        final = "failed"
-    prs.update_process_status(req.process_id, 1 if final != "failed" else -1)
-    return {"status": final}
+
+    def _background_run(details_obj, process_id):
+        try:
+            result = orchestrator.execute_agent_flow(details_obj)
+            if inspect.iscoroutine(result):
+                result = asyncio.run(result)
+            if isinstance(result, dict):
+                try:
+                    prs.update_process_details(process_id, result)
+                except Exception:
+                    pass
+                final = result.get("status")
+            else:
+                final = "failed"
+            prs.update_process_status(process_id, 1 if final != "failed" else -1)
+        except Exception:
+            try:
+                prs.update_process_status(process_id, -1)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_background_run, args=(details, req.process_id), daemon=True)
+    t.start()
+
+    return {"status": "started"}
+
+

@@ -46,5 +46,18 @@
     "agentType": "ApprovalsAgent",
     "description": "Determines approval decisions based on policy thresholds.",
     "dependencies": ["policy_engine"]
+  },
+  {
+    "agentId": 9,
+    "agentType": "QuoteEvaluationAgent",
+    "description": "Evaluates supplier quotes against historical data and policies.",
+    "dependencies": ["policy_engine", "db_client"]
+  },
+  {
+      "agentId": 10,
+      "agentType": "ContractAnalysisAgent",
+      "description": "Analyzes contracts to extract key terms and clauses.",
+      "dependencies": ["prompt_engine"]
   }
+
 ]
