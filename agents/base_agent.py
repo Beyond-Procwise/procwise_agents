@@ -63,7 +63,11 @@ class BaseAgent:
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
-        logger.info(f"Initialized agent: {self.__class__.__name__}")
+        # Ensure GPU environment variables are set for all agents
+        self.device = configure_gpu()
+        logger.info(
+            f"Initialized agent: {self.__class__.__name__} on device {self.device}"
+        )
 
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")

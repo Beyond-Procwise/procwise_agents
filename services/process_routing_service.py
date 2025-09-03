@@ -254,25 +254,12 @@ class ProcessRoutingService:
         process_end_ts: Optional[datetime] = None,
         triggered_by: Optional[str] = None,
     ) -> Optional[str]:
-        """Record a single execution run in ``proc.routing``.
+        """Update ``proc.routing`` with run metadata for an execution.
 
-        Parameters
-        ----------
-        process_id:
-            Identifier returned by :meth:`log_process`.
-        process_status:
-            Descriptive status such as ``"success"`` or ``"failed"``.
-        run_id:
-            Optional external run identifier. A UUID4 is generated when
-            omitted so that related records (e.g. actions) can be linked.
-        process_details:
-            Arbitrary payload describing the run inputs or outputs.
-        process_start_ts / process_end_ts:
-            Timestamps marking the execution window. If both are supplied the
-            ``duration`` field will be calculated automatically.
-        triggered_by:
-            Username responsible for the run; defaults to the framework's
-            ``script_user`` setting.
+        The new schema stores a single record per process. Execution run
+        information is persisted as ``raw_data`` and status as an integer.
+        ``run_id`` is still returned so that related tables (e.g. ``proc.action``)
+        can reference the run.
         """
 
         run_id = run_id or str(uuid.uuid4())
@@ -283,41 +270,44 @@ class ProcessRoutingService:
             if process_end_ts and process_start_ts
             else None
         )
+        # Coerce textual statuses to the integer mapping expected by the table
+        status_int = 1 if str(process_status).lower() in ("1", "success", "completed") else -1
+
+        raw_payload = {
+            "run_id": run_id,
+            "process_start_ts": process_start_ts.isoformat(),
+            "process_end_ts": process_end_ts.isoformat(),
+            "duration": duration.total_seconds() if duration else None,
+            "triggered_by": triggered_by or self.settings.script_user,
+        }
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        INSERT INTO proc.routing (
-                            run_id,
-                            process_id,
-                            process_details,
-                            process_status,
-                            process_start_ts,
-                            process_end_ts,
-                            triggered_by,
-                            duration
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        UPDATE proc.routing
+                        SET process_status = %s,
+                            process_details = %s,
+                            raw_data = %s,
+                            modified_on = CURRENT_TIMESTAMP,
+                            modified_by = %s
+                        WHERE process_id = %s
                         """,
                         (
-                            run_id,
-                            str(process_id),
-                            self._safe_dumps(process_details)
-                            if process_details is not None
-                            else None,
-                            process_status,
-                            process_start_ts,
-                            process_end_ts,
+                            status_int,
+                            self._safe_dumps(process_details) if process_details is not None else None,
+                            self._safe_dumps(raw_payload),
                             triggered_by or self.settings.script_user,
-                            duration,
+                            process_id,
                         ),
                     )
                     conn.commit()
                     logger.info(
-                        "Logged run %s for process %s with status %s",
+                        "Recorded run %s for process %s with status %s",
                         run_id,
                         process_id,
-                        process_status,
+                        status_int,
                     )
                     return run_id
         except Exception as exc:  # pragma: no cover - defensive
