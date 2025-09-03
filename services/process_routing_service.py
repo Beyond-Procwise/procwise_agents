@@ -51,13 +51,15 @@ class ProcessRoutingService:
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
         created_by: Optional[str] = None,
+        process_status: Optional[int] = None,
     ) -> Optional[int]:
         """Insert a process routing record and return the new ``process_id``.
 
         The ``proc.routing`` table now serves as both the catalogue of
-        processes and the repository for individual run details.  Per-run
-        status tracking is handled directly in this table via
-        :meth:`log_run_detail`.
+        processes and the repository for individual run details.  An initial
+        ``process_status`` may be supplied to seed the run state, while
+        subsequent status updates are handled via :meth:`update_process_status`
+        or :meth:`log_run_detail`.
         """
 
         try:
@@ -66,8 +68,8 @@ class ProcessRoutingService:
                     cursor.execute(
                         """
                         INSERT INTO proc.routing
-                            (process_name, process_details, created_by, user_id, user_name)
-                        VALUES (%s, %s, %s, %s, %s)
+                            (process_name, process_details, created_by, user_id, user_name, process_status)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                         RETURNING process_id
                         """,
                         (
@@ -76,6 +78,7 @@ class ProcessRoutingService:
                             created_by or self.settings.script_user,
                             user_id,
                             user_name,
+                            process_status,
                         ),
                     )
                     process_id = cursor.fetchone()[0]
