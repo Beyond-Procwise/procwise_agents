@@ -180,7 +180,6 @@ def mine_opportunities(
     process_id = prs.log_process(
         process_name="opportunity_mining",
         process_details=req.model_dump(),
-        process_status=1,
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")

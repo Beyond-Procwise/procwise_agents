@@ -94,7 +94,6 @@ def execute_agent(
     process_id = prs.log_process(
         process_name=req.agent_type,
         process_details=req.payload,
-        process_status=1,
     )
     action_id = prs.log_action(
         process_id=process_id,

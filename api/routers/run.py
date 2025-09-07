@@ -50,8 +50,7 @@ def run_agents(
     if details.get("status") != "saved":
         raise HTTPException(status_code=409, detail="Process not in saved status")
 
-    # mark as started and run the long-running execution in background
-    prs.update_process_status(req.process_id, 1)
+    # Run the long-running execution in background
 
     def _background_run(details_obj, process_id):
         try:
