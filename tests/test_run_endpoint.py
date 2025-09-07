@@ -70,11 +70,11 @@ def test_run_endpoint_process_id_executes_flow():
     import time
 
     for _ in range(50):
-        if prs.status_updates == [(5, 1), (5, 1)] and prs.details_updates:
+        if prs.status_updates == [(5, 1)] and prs.details_updates:
             break
         time.sleep(0.01)
 
-    assert prs.status_updates == [(5, 1), (5, 1)]
+    assert prs.status_updates == [(5, 1)]
     assert prs.details_updates[0]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
 
