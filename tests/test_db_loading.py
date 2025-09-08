@@ -59,7 +59,7 @@ def make_orchestrator(rows, agent_rows):
 
 def test_load_prompts_from_db():
     prompt_rows = [(1, "hello", "{1}")]
-    agent_rows = [(1, "AgentOne", {"info": "x"})]
+    agent_rows = [(1, "AgentOne")]
     orchestrator = make_orchestrator(prompt_rows, agent_rows)
     prompts = orchestrator._load_prompts()
     assert prompts[1]["template"] == "hello"
@@ -68,7 +68,7 @@ def test_load_prompts_from_db():
 
 def test_load_policies_from_db():
     policy_rows = [(2, "Example policy", "{1}")]
-    agent_rows = [(1, "AgentOne", {"info": "x"})]
+    agent_rows = [(1, "AgentOne")]
     orchestrator = make_orchestrator(policy_rows, agent_rows)
     policies = orchestrator._load_policies()
     assert policies[2]["description"] == "Example policy"

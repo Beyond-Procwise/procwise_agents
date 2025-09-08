@@ -120,7 +120,7 @@ class Orchestrator:
     def _get_agent_details(self, conn, agent_spec) -> List[Dict[str, Any]]:
         """Resolve agent information for identifiers from policy tables.
 
-        The ``policy_linked_agents`` column in the database stores one or more
+        The ``linked_agents`` column in the database stores one or more
         numeric ``agent_type`` identifiers in a PostgreSQL-style array string
         such as ``"{1,2}"``.  This helper extracts the integers, validates them
         against ``proc.agent`` and returns basic agent metadata.
@@ -132,7 +132,7 @@ class Orchestrator:
 
         placeholders = ",".join(["%s"] * len(ids))
         query = (
-            "SELECT agent_type, agent_name, agent_details FROM proc.agent "
+            "SELECT agent_type, agent_name FROM proc.agent "
             f"WHERE agent_type IN ({placeholders})"
         )
         try:
@@ -147,7 +147,6 @@ class Orchestrator:
             {
                 "agent_type": row[0],
                 "agent_name": row[1],
-                "agent_details": row[2],
             }
             for row in rows
         ]
@@ -156,8 +155,8 @@ class Orchestrator:
         """Load prompt templates keyed by ``promptId``.
 
         The ``prompts_desc`` field in ``proc.prompt`` stores free-form text
-        rather than JSON.  Each row may also reference one or more linked agents
-        via ``policy_linked_agents`` which are resolved into agent metadata.
+        rather than JSON.  Each row may also reference one or more linked
+        agents via ``linked_agents`` which are resolved into agent metadata.
         A file-system fallback is used when the database is unavailable.
         """
 
@@ -166,7 +165,7 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT prompt_id, prompts_desc, policy_linked_agents"
+                        "SELECT prompt_id, prompts_desc, linked_agents"
                         " FROM proc.prompt WHERE prompts_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
@@ -195,8 +194,8 @@ class Orchestrator:
 
         The ``policy_desc`` column in ``proc.policy`` contains plain text
         descriptions.  Like prompts, policies may reference agents via
-        ``policy_linked_agents``.  When database access fails a fallback to
-        bundled JSON policy files is performed.
+        ``linked_agents``.  When database access fails a fallback to bundled
+        JSON policy files is performed.
         """
 
         policies: Dict[int, Dict[str, Any]] = {}
@@ -204,7 +203,7 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc, policy_linked_agents"
+                        "SELECT policy_id, policy_desc, linked_agents"
                         " FROM proc.policy WHERE policy_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
