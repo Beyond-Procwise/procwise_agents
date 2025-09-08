@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -83,3 +84,77 @@ def test_convert_agents_to_flow_builds_tree():
     assert flow["agent_type"] == "1"
     assert flow["onSuccess"]["agent_type"] == "2"
     assert flow["onFailure"]["agent_type"] == "3"
+
+
+class FetchCursor:
+    def __init__(self, proc_details, agent_rows, prompt_rows, policy_rows):
+        self.proc_details = proc_details
+        self.agent_rows = agent_rows
+        self.prompt_rows = prompt_rows
+        self.policy_rows = policy_rows
+        self.query = ""
+
+    def execute(self, sql, params=None):
+        self.query = sql
+
+    def fetchone(self):
+        if "FROM proc.routing" in self.query:
+            return [json.dumps(self.proc_details)]
+        return None
+
+    def fetchall(self):
+        if "FROM proc.agent" in self.query:
+            return self.agent_rows
+        if "FROM proc.prompt" in self.query:
+            return self.prompt_rows
+        if "FROM proc.policy" in self.query:
+            return self.policy_rows
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
+
+class FetchConn:
+    def __init__(self, proc_details, agent_rows, prompt_rows, policy_rows):
+        self.proc_details = proc_details
+        self.agent_rows = agent_rows
+        self.prompt_rows = prompt_rows
+        self.policy_rows = policy_rows
+
+    def cursor(self):
+        return FetchCursor(
+            self.proc_details, self.agent_rows, self.prompt_rows, self.policy_rows
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
+
+def test_get_process_details_enriches_agent_data():
+    proc_details = {
+        "status": "saved",
+        "agent_type": "admin_supplier_ranking_123",
+        "agent_property": {"llm": None, "prompts": [], "policies": []},
+    }
+    conn = FetchConn(
+        proc_details,
+        [("admin_supplier_ranking", "SupplierRankingAgent")],
+        [(1, "{admin_supplier_ranking}")],
+        [(2, "{admin_supplier_ranking}")],
+    )
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    details = prs.get_process_details(1)
+    assert details["agent_type"] == "SupplierRankingAgent"
+    assert details["agent_property"]["prompts"] == [1]
+    assert details["agent_property"]["policies"] == [2]

@@ -3,6 +3,7 @@ import logging
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
+import re
 
 import pandas as pd
 import numpy as np
@@ -121,6 +122,53 @@ class ProcessRoutingService:
 
         return build(root_name)
 
+    # ------------------------------------------------------------------
+    # Metadata enrichment
+    # ------------------------------------------------------------------
+    def _load_agent_links(self):
+        """Fetch agent definitions and their linked prompts/policies."""
+
+        agent_defs: Dict[str, str] = {}
+        prompt_map: Dict[str, list[int]] = {}
+        policy_map: Dict[str, list[int]] = {}
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT agent_type, agent_name FROM proc.agent")
+                    agent_defs = {str(r[0]): r[1] for r in cursor.fetchall()}
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT prompt_id, prompt_linked_agents FROM proc.prompt"
+                    )
+                    for pid, linked in cursor.fetchall():
+                        for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
+                            prompt_map.setdefault(key, []).append(int(pid))
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT policy_id, policy_linked_agents FROM proc.policy"
+                    )
+                    for pid, linked in cursor.fetchall():
+                        for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
+                            policy_map.setdefault(key, []).append(int(pid))
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load agent linkage metadata")
+        return agent_defs, prompt_map, policy_map
+
+    def _enrich_node(self, node, agent_defs, prompt_map, policy_map):
+        """Recursively normalise agent types and attach prompt/policy IDs."""
+
+        if not isinstance(node, dict):
+            return
+        raw_type = str(node.get("agent_type", ""))
+        base_key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw_type)
+        node["agent_type"] = agent_defs.get(base_key, agent_defs.get(raw_type, raw_type))
+        props = node.setdefault("agent_property", {"llm": None, "prompts": [], "policies": []})
+        props["prompts"] = prompt_map.get(base_key, [])
+        props["policies"] = policy_map.get(base_key, [])
+        for branch in ["onSuccess", "onFailure", "onCompletion"]:
+            if branch in node:
+                self._enrich_node(node[branch], agent_defs, prompt_map, policy_map)
+
     def log_process(
         self,
         process_name: str,
@@ -190,6 +238,8 @@ class ProcessRoutingService:
                         details = self.normalize_process_details(value)
                         if "agent_type" not in details and "agents" in details:
                             details = self.convert_agents_to_flow(details)
+                        agent_defs, prompt_map, policy_map = self._load_agent_links()
+                        self._enrich_node(details, agent_defs, prompt_map, policy_map)
                         return details
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed to fetch process %s: %s", process_id, exc)
