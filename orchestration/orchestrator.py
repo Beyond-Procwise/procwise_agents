@@ -111,10 +111,31 @@ class Orchestrator:
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
     def _load_agent_definitions(self) -> Dict[str, str]:
-        """Return mapping of agent_id to agent type string."""
+        """Return mapping of ``agent_type`` identifiers to agent class names.
+
+        The primary source of truth is the ``proc.agent`` table where
+        ``agent_type`` uniquely identifies an agent implementation.  When a
+        database connection isn't available the method falls back to the
+        bundled ``agent_definitions.json`` file which mirrors the same
+        structure.
+        """
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT agent_type, agent_name FROM proc.agent")
+                    rows = cursor.fetchall()
+                if rows:
+                    return {str(row[0]): row[1] for row in rows}
+        except Exception:  # pragma: no cover - defensive fall back
+            logger.exception(
+                "Failed to load agent definitions from DB, falling back to file"
+            )
+
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
         with path.open() as f:
             data = json.load(f)
+        # ``agentId`` in the JSON corresponds to ``agent_type`` in the DB.
         return {str(item["agentId"]): item["agentType"] for item in data}
 
     def _get_agent_details(self, conn, agent_spec) -> List[Dict[str, Any]]:
