@@ -5,8 +5,12 @@ from orchestration.orchestrator import Orchestrator
 
 
 class DummyCursor:
-    def __init__(self, rows):
+    """Cursor that returns rows based on the executed query."""
+
+    def __init__(self, rows, agent_rows):
         self._rows = rows
+        self._agent_rows = agent_rows
+        self.query = ""
 
     def __enter__(self):
         return self
@@ -18,12 +22,15 @@ class DummyCursor:
         self.query = query
 
     def fetchall(self):
+        if "FROM proc.agent" in self.query:
+            return self._agent_rows
         return self._rows
 
 
 class DummyConn:
-    def __init__(self, rows):
+    def __init__(self, rows, agent_rows):
         self._rows = rows
+        self._agent_rows = agent_rows
 
     def __enter__(self):
         return self
@@ -32,12 +39,12 @@ class DummyConn:
         pass
 
     def cursor(self):
-        return DummyCursor(self._rows)
+        return DummyCursor(self._rows, self._agent_rows)
 
 
-def make_orchestrator(rows):
+def make_orchestrator(rows, agent_rows):
     def get_conn():
-        return DummyConn(rows)
+        return DummyConn(rows, agent_rows)
 
     agent_nick = SimpleNamespace(
         settings=SimpleNamespace(script_user="tester", max_workers=1),
@@ -51,29 +58,19 @@ def make_orchestrator(rows):
 
 
 def test_load_prompts_from_db():
-    rows = [(1, json.dumps({"promptId": 1, "content": "hello"}))]
-    orchestrator = make_orchestrator(rows)
+    prompt_rows = [(1, "hello", "{1}")]
+    agent_rows = [(1, "AgentOne", {"info": "x"})]
+    orchestrator = make_orchestrator(prompt_rows, agent_rows)
     prompts = orchestrator._load_prompts()
-    assert prompts[1]["content"] == "hello"
+    assert prompts[1]["template"] == "hello"
+    assert prompts[1]["agents"][0]["agent_name"] == "AgentOne"
 
 
 def test_load_policies_from_db():
-    rows = [(2, json.dumps({"policyName": "Example"}))]
-    orchestrator = make_orchestrator(rows)
+    policy_rows = [(2, "Example policy", "{1}")]
+    agent_rows = [(1, "AgentOne", {"info": "x"})]
+    orchestrator = make_orchestrator(policy_rows, agent_rows)
     policies = orchestrator._load_policies()
-    assert policies[2]["policyName"] == "Example"
-
-
-def test_invalid_prompt_json_is_wrapped():
-    rows = [(99, "not-json")]
-    orchestrator = make_orchestrator(rows)
-    prompts = orchestrator._load_prompts()
-    assert prompts[99]["template"] == "not-json"
-
-
-def test_invalid_policy_json_is_wrapped():
-    rows = [(99, "not-json")]
-    orchestrator = make_orchestrator(rows)
-    policies = orchestrator._load_policies()
-    assert policies[99]["description"] == "not-json"
+    assert policies[2]["description"] == "Example policy"
+    assert policies[2]["agents"][0]["agent_name"] == "AgentOne"
 

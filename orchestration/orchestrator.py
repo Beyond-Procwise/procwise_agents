@@ -117,13 +117,48 @@ class Orchestrator:
             data = json.load(f)
         return {str(item["agentId"]): item["agentType"] for item in data}
 
+    def _get_agent_details(self, conn, agent_spec) -> List[Dict[str, Any]]:
+        """Resolve agent information for identifiers from policy tables.
+
+        The ``policy_linked_agents`` column in the database stores one or more
+        numeric ``agent_type`` identifiers in a PostgreSQL-style array string
+        such as ``"{1,2}"``.  This helper extracts the integers, validates them
+        against ``proc.agent`` and returns basic agent metadata.
+        """
+
+        ids = [int(i) for i in re.findall(r"\d+", str(agent_spec or ""))]
+        if not ids:
+            return []
+
+        placeholders = ",".join(["%s"] * len(ids))
+        query = (
+            "SELECT agent_type, agent_name, agent_details FROM proc.agent "
+            f"WHERE agent_type IN ({placeholders})"
+        )
+        try:
+            with conn.cursor() as c:
+                c.execute(query, tuple(ids))
+                rows = c.fetchall()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to resolve agent details for %s", agent_spec)
+            return []
+
+        return [
+            {
+                "agent_type": row[0],
+                "agent_name": row[1],
+                "agent_details": row[2],
+            }
+            for row in rows
+        ]
+
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
         """Load prompt templates keyed by ``promptId``.
 
-        Primary source is ``proc.prompt`` table where ``prompts_desc`` contains
-        the JSON template.  If the database lookup fails or returns no rows the
-        method falls back to the local ``prompts/prompts.json`` file so tests can
-        run without a database.
+        The ``prompts_desc`` field in ``proc.prompt`` stores free-form text
+        rather than JSON.  Each row may also reference one or more linked agents
+        via ``policy_linked_agents`` which are resolved into agent metadata.
+        A file-system fallback is used when the database is unavailable.
         """
 
         prompts: Dict[int, Dict[str, Any]] = {}
@@ -131,21 +166,19 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT prompt_id, prompts_desc FROM proc.prompt"
-                        " WHERE prompts_desc IS NOT NULL"
+                        "SELECT prompt_id, prompts_desc, policy_linked_agents"
+                        " FROM proc.prompt WHERE prompts_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
-                    for pid, desc in rows:
-                        if not desc:
-                            continue
-                        try:
-                            value = json.loads(desc) if isinstance(desc, str) else desc
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                "Invalid JSON for prompt %s: %s", pid, desc
-                            )
-                            value = {"promptId": pid, "template": str(desc)}
-                        prompts[int(pid)] = value
+                for pid, desc, linked in rows:
+                    if not desc:
+                        continue
+                    value = {
+                        "promptId": int(pid),
+                        "template": str(desc),
+                        "agents": self._get_agent_details(conn, linked),
+                    }
+                    prompts[int(pid)] = value
             if prompts:
                 return prompts
         except Exception:  # pragma: no cover - defensive fall back
@@ -160,9 +193,10 @@ class Orchestrator:
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
 
-        Policies are primarily loaded from ``proc.policy`` where ``policy_desc``
-        stores the JSON definition.  A file-system fallback is provided for
-        environments without database access (e.g. unit tests).
+        The ``policy_desc`` column in ``proc.policy`` contains plain text
+        descriptions.  Like prompts, policies may reference agents via
+        ``policy_linked_agents``.  When database access fails a fallback to
+        bundled JSON policy files is performed.
         """
 
         policies: Dict[int, Dict[str, Any]] = {}
@@ -170,21 +204,19 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_details FROM proc.policy"
-                        " WHERE policy_details IS NOT NULL"
+                        "SELECT policy_id, policy_desc, policy_linked_agents"
+                        " FROM proc.policy WHERE policy_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
-                    for pid, desc in rows:
-                        if not desc:
-                            continue
-                        try:
-                            value = json.loads(desc) if isinstance(desc, str) else desc
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                "Invalid JSON for policy %s: %s", pid, desc
-                            )
-                            value = {"policyId": pid, "description": str(desc)}
-                        policies[int(pid)] = value
+                for pid, desc, linked in rows:
+                    if not desc:
+                        continue
+                    value = {
+                        "policyId": int(pid),
+                        "description": str(desc),
+                        "agents": self._get_agent_details(conn, linked),
+                    }
+                    policies[int(pid)] = value
             if policies:
                 return policies
         except Exception:  # pragma: no cover - defensive fall back
