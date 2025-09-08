@@ -44,6 +44,37 @@ class ProcessRoutingService:
         """JSON dump that tolerates DataFrames and other complex objects."""
         return json.dumps(data, default=cls._serialize)
 
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def normalize_process_details(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Ensure ``process_details`` conforms to the expected schema.
+
+        The schema is:
+
+        ``{"status": str, "agents": [{"agent": str, "dependencies": {"onSuccess": [],
+        "onFailure": [], "onCompletion": []}, "status": str, "agent_ref_id": str}]}``
+
+        Missing fields are populated with sensible defaults.
+        """
+        details = details.copy() if isinstance(details, dict) else {}
+        details.setdefault("status", "")
+        agents = []
+        for agent in details.get("agents", []) or []:
+            if not isinstance(agent, dict):
+                continue
+            deps = agent.get("dependencies") or {}
+            deps.setdefault("onSuccess", [])
+            deps.setdefault("onFailure", [])
+            deps.setdefault("onCompletion", [])
+            agent["dependencies"] = deps
+            agent.setdefault("status", "saved")
+            agent.setdefault("agent_ref_id", str(uuid.uuid4()))
+            agents.append(agent)
+        details["agents"] = agents
+        return details
+
     def log_process(
         self,
         process_name: str,
@@ -79,7 +110,7 @@ class ProcessRoutingService:
                         """,
                         (
                             process_name,
-                            self._safe_dumps(process_details),
+                            self._safe_dumps(self.normalize_process_details(process_details)),
                             created_by or self.settings.script_user,
                             user_id,
                             user_name,
@@ -109,8 +140,8 @@ class ProcessRoutingService:
                     if row and row[0]:
                         value = row[0]
                         if isinstance(value, (str, bytes, bytearray)):
-                            return json.loads(value)
-                        return value
+                            value = json.loads(value)
+                        return self.normalize_process_details(value)
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed to fetch process %s: %s", process_id, exc)
         return None
@@ -134,7 +165,7 @@ class ProcessRoutingService:
                         WHERE process_id = %s
                         """,
                         (
-                            self._safe_dumps(process_details),
+                            self._safe_dumps(self.normalize_process_details(process_details)),
                             modified_by or self.settings.script_user,
                             process_id,
                         ),
@@ -284,7 +315,7 @@ class ProcessRoutingService:
             - Otherwise, for any nested dict values, set their 'status'.
             - Fallback: set top-level `details['status']`.
             """
-            details = details.copy() if isinstance(details, dict) else {}
+            details = self.normalize_process_details(details)
             agents = details.get("agents")
             if isinstance(agents, list):
                 for a in agents:
