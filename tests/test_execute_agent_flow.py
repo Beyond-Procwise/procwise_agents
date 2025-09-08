@@ -84,3 +84,31 @@ def test_execute_agent_flow_preserves_root_status_on_failure_chain():
 
     assert flow["status"] == "failed"
     assert flow["onFailure"]["status"] == "completed"
+
+
+def test_execute_agent_flow_ignores_agent_id_suffix():
+    agent = DummyAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"supplier_ranking": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "admin_supplier_ranking": "SupplierRankingAgent"
+    }
+    orchestrator._load_prompts = lambda: {1: {}}
+    orchestrator._load_policies = lambda: {1: {}}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "admin_supplier_ranking_000055_1757337997564",
+        "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    assert flow["status"] == "completed"
+    assert agent.ran is True

@@ -267,10 +267,16 @@ class Orchestrator:
                 if field not in props:
                     raise ValueError(f"Missing property '{field}' in agent node")
 
-            agent_type_id = str(node["agent_type"])
-            agent_class = agent_defs.get(agent_type_id)
+            agent_type_raw = str(node["agent_type"])
+            # Some process definitions append an ``agent_id`` and other
+            # numeric identifiers to the ``agent_type`` field
+            # (e.g. ``admin_supplier_ranking_000055_1757337997564``).  The
+            # orchestrator should resolve agents solely based on the
+            # ``agent_type`` prefix and ignore any trailing numeric suffixes.
+            agent_type_id = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", agent_type_raw)
+            agent_class = agent_defs.get(agent_type_id) or agent_defs.get(agent_type_raw)
             if not agent_class:
-                raise ValueError(f"Unknown agent_type '{agent_type_id}'")
+                raise ValueError(f"Unknown agent_type '{agent_type_raw}'")
 
             agent_key = self._resolve_agent_name(agent_class)
             agent = self.agents.get(agent_key) or self.agents.get(agent_class)
