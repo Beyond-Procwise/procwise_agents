@@ -75,6 +75,52 @@ class ProcessRoutingService:
         details["agents"] = agents
         return details
 
+    @staticmethod
+    def convert_agents_to_flow(details: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert legacy ``agents`` list into nested agent flow."""
+
+        agents = details.get("agents") or []
+        if not agents:
+            return details
+
+        agent_map = {
+            a.get("agent"): a
+            for a in agents
+            if isinstance(a, dict) and a.get("agent")
+        }
+
+        referenced: set[str] = set()
+        for a in agents:
+            deps = a.get("dependencies", {})
+            referenced.update(deps.get("onSuccess", []))
+            referenced.update(deps.get("onFailure", []))
+            referenced.update(deps.get("onCompletion", []))
+
+        roots = [name for name in agent_map if name not in referenced]
+        root_name = roots[0] if roots else next(iter(agent_map), None)
+        if not root_name:
+            return details
+
+        def build(name: str) -> Dict[str, Any]:
+            node = agent_map.get(name, {})
+            flow = {
+                "status": node.get("status", "saved"),
+                "agent_type": str(node.get("agent_type", node.get("agent", ""))),
+                "agent_property": node.get(
+                    "agent_property", {"llm": None, "prompts": [], "policies": []}
+                ),
+            }
+            deps = node.get("dependencies", {})
+            if deps.get("onSuccess"):
+                flow["onSuccess"] = build(deps["onSuccess"][0])
+            if deps.get("onFailure"):
+                flow["onFailure"] = build(deps["onFailure"][0])
+            if deps.get("onCompletion"):
+                flow["onCompletion"] = build(deps["onCompletion"][0])
+            return flow
+
+        return build(root_name)
+
     def log_process(
         self,
         process_name: str,
@@ -141,7 +187,10 @@ class ProcessRoutingService:
                         value = row[0]
                         if isinstance(value, (str, bytes, bytearray)):
                             value = json.loads(value)
-                        return self.normalize_process_details(value)
+                        details = self.normalize_process_details(value)
+                        if "agent_type" not in details and "agents" in details:
+                            details = self.convert_agents_to_flow(details)
+                        return details
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Failed to fetch process %s: %s", process_id, exc)
         return None
