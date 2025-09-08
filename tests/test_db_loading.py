@@ -74,3 +74,11 @@ def test_load_policies_from_db():
     assert policies[2]["description"] == "Example policy"
     assert policies[2]["agents"][0]["agent_name"] == "AgentOne"
 
+
+def test_load_agent_definitions_from_db():
+    agent_rows = [(1, "AgentOne"), (2, "AgentTwo")]
+    orchestrator = make_orchestrator([], agent_rows)
+    defs = orchestrator._load_agent_definitions()
+    assert defs["1"] == "AgentOne"
+    assert defs["2"] == "AgentTwo"
+
