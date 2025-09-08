@@ -141,35 +141,31 @@ class Orchestrator:
     def _get_agent_details(self, conn, agent_spec) -> List[Dict[str, Any]]:
         """Resolve agent information for identifiers from policy tables.
 
-        The ``linked_agents`` column in the database stores one or more
-        numeric ``agent_type`` identifiers in a PostgreSQL-style array string
-        such as ``"{1,2}"``.  This helper extracts the integers, validates them
-        against ``proc.agent`` and returns basic agent metadata.
+        The ``*_linked_agents`` columns expose agent *keys* (e.g.
+        ``"supplier_ranking"``) in a PostgreSQL-style array string such as
+        ``"{supplier_ranking,quote_evaluation}"``.  This helper extracts those
+        keys and returns basic metadata for each from ``proc.agent``.
         """
 
-        ids = [int(i) for i in re.findall(r"\d+", str(agent_spec or ""))]
-        if not ids:
+        keys = [k for k in re.findall(r"[A-Za-z0-9_]+", str(agent_spec or ""))]
+        if not keys:
             return []
 
-        placeholders = ",".join(["%s"] * len(ids))
+        placeholders = ",".join(["%s"] * len(keys))
         query = (
             "SELECT agent_type, agent_name FROM proc.agent "
             f"WHERE agent_type IN ({placeholders})"
         )
         try:
             with conn.cursor() as c:
-                c.execute(query, tuple(ids))
+                c.execute(query, tuple(keys))
                 rows = c.fetchall()
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to resolve agent details for %s", agent_spec)
             return []
 
         return [
-            {
-                "agent_type": row[0],
-                "agent_name": row[1],
-            }
-            for row in rows
+            {"agent_type": row[0], "agent_name": row[1]} for row in rows
         ]
 
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
@@ -186,7 +182,7 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT prompt_id, prompts_desc, linked_agents"
+                        "SELECT prompt_id, prompts_desc, prompt_linked_agents"
                         " FROM proc.prompt WHERE prompts_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
@@ -224,7 +220,7 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc, linked_agents"
+                        "SELECT policy_id, policy_desc, policy_linked_agents"
                         " FROM proc.policy WHERE policy_desc IS NOT NULL"
                     )
                     rows = cursor.fetchall()
