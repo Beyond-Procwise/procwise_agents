@@ -6,7 +6,10 @@ from typing import List
 from pydantic import BaseModel
 from services.model_selector import RAGPipeline
 
-class ChatMessage(BaseModel): query: str; answer: str
+
+class ChatMessage(BaseModel):
+    query: str
+    answer: str
 
 router = APIRouter(prefix="/system", tags=["System Information & History"])
 

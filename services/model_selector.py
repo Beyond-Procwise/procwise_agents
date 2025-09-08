@@ -30,10 +30,17 @@ class ChatHistoryManager:
         key = f"{self.prefix}{user_id}.json"
         try:
             obj = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
-            return json.loads(obj['Body'].read().decode('utf-8'))
+            history = json.loads(obj['Body'].read().decode('utf-8'))
+            # Ensure ``answer`` fields are always strings for API schemas.
+            for item in history:
+                ans = item.get("answer")
+                if isinstance(ans, list):
+                    item["answer"] = "\n".join(ans)
+            return history
         except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey': return []
-            logger.error(f"S3 get_object error for key {key}: {e}");
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                return []
+            logger.error(f"S3 get_object error for key {key}: {e}")
             raise
 
     def save_history(self, user_id: str, history: List):
