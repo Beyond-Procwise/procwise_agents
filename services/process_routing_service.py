@@ -136,20 +136,32 @@ class ProcessRoutingService:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT agent_type, agent_name FROM proc.agent")
                     agent_defs = {str(r[0]): r[1] for r in cursor.fetchall()}
+
+                def _record(map_obj: Dict[str, list[int]], raw: str, pid: int):
+                    base = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw)
+                    if base in agent_defs:
+                        map_obj.setdefault(base, []).append(int(pid))
+                    elif raw in agent_defs:
+                        map_obj.setdefault(raw, []).append(int(pid))
+                    else:
+                        logger.warning(
+                            "Agent type '%s' not found in definitions", raw
+                        )
+
                 with conn.cursor() as cursor:
                     cursor.execute(
                         "SELECT prompt_id, prompt_linked_agents FROM proc.prompt"
                     )
                     for pid, linked in cursor.fetchall():
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
-                            prompt_map.setdefault(key, []).append(int(pid))
+                            _record(prompt_map, key, pid)
                 with conn.cursor() as cursor:
                     cursor.execute(
                         "SELECT policy_id, policy_linked_agents FROM proc.policy"
                     )
                     for pid, linked in cursor.fetchall():
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
-                            policy_map.setdefault(key, []).append(int(pid))
+                            _record(policy_map, key, pid)
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load agent linkage metadata")
         return agent_defs, prompt_map, policy_map
