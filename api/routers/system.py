@@ -2,14 +2,17 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 import ollama
-from typing import List
+from typing import Any, Dict, List, Union
 from pydantic import BaseModel
 from services.model_selector import RAGPipeline
+from utils.gpu import configure_gpu
+
+configure_gpu()
 
 
 class ChatMessage(BaseModel):
     query: str
-    answer: str
+    answer: Union[str, Dict[str, Any], List[Any]]
 
 router = APIRouter(prefix="/system", tags=["System Information & History"])
 

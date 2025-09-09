@@ -6,7 +6,7 @@ import ollama
 import pdfplumber
 from io import BytesIO
 from botocore.exceptions import ClientError
-from typing import List, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
@@ -26,16 +26,17 @@ class ChatHistoryManager:
         self.bucket_name = bucket_name
         self.prefix = 'chat_history/'
 
-    def get_history(self, user_id: str) -> List:
+    def get_history(self, user_id: str) -> List[Dict[str, Any]]:
         key = f"{self.prefix}{user_id}.json"
         try:
             obj = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
-            history = json.loads(obj['Body'].read().decode('utf-8'))
-            # Ensure ``answer`` fields are always strings for API schemas.
+            history: List[Dict[str, Any]] = json.loads(obj['Body'].read().decode('utf-8'))
+            # Ensure answers are JSON-serialisable. Non-string primitives are cast to strings
+            # while structured data (dicts/lists) is preserved for downstream consumers.
             for item in history:
                 ans = item.get("answer")
-                if isinstance(ans, list):
-                    item["answer"] = "\n".join(ans)
+                if ans is not None and not isinstance(ans, (str, list, dict)):
+                    item["answer"] = str(ans)
             return history
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
