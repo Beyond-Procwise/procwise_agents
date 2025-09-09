@@ -43,8 +43,9 @@ class DummyOrchestrator:
             process_routing_service=prs or DummyPRS()
         )
 
-    def execute_agent_flow(self, flow):
+    def execute_agent_flow(self, flow, payload=None):
         self.received_flow = flow
+        self.received_payload = payload
         flow["status"] = "completed"
         return flow
 
@@ -63,7 +64,7 @@ def create_client_with_orchestrator(orchestrator):
 
 def test_run_endpoint_process_id_executes_flow():
     client, orchestrator = create_client()
-    resp = client.post("/run", json={"process_id": 5})
+    resp = client.post("/run", json={"process_id": 5, "payload": {"foo": "bar"}})
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "started"
@@ -84,6 +85,7 @@ def test_run_endpoint_process_id_executes_flow():
     assert prs.details_updates[1]["process_status"] == 1
     assert prs.details_updates[1]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
+    assert orchestrator.received_payload == {"foo": "bar"}
 
 
 def test_run_endpoint_updates_nested_statuses_independently():
@@ -106,8 +108,9 @@ def test_run_endpoint_updates_nested_statuses_independently():
             }
 
     class NestedOrchestrator(DummyOrchestrator):
-        def execute_agent_flow(self, flow):
+        def execute_agent_flow(self, flow, payload=None):
             self.received_flow = flow
+            self.received_payload = payload
             flow["status"] = "completed"
             flow["onSuccess"]["status"] = "completed"
             return flow

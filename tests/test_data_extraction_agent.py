@@ -105,9 +105,11 @@ def test_vectorize_structured_data_creates_points(monkeypatch):
     line_items = [{"item_id": "A1", "description": "Widget"}]
 
     agent._vectorize_structured_data(header, line_items, "Invoice", "1")
-
-    assert len(captured["points"]) == 1
-    assert captured["points"][0].payload["data_type"] == "line_item"
+    types = {p.payload["data_type"] for p in captured["points"]}
+    assert types == {"header", "line_item"}
+    # ensure points are associated with the same record id
+    for p in captured["points"]:
+        assert p.payload["record_id"] == "1"
 
 
 def test_contextual_field_normalisation():
