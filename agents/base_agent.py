@@ -83,7 +83,7 @@ class BaseAgent:
         try:
             result = self.run(context)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error("%s execution failed: %s", self.__class__.__name__, exc)
+            logger.exception("%s execution failed", self.__class__.__name__)
             result = AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
         end_ts = datetime.utcnow()
 
@@ -152,7 +152,7 @@ class BaseAgent:
                 **kwargs,
             )
         except Exception as exc:  # pragma: no cover - network / runtime issues
-            logger.error("Ollama call failed: %s", exc)
+            logger.exception("Ollama call failed")
             return {"response": "", "error": str(exc)}
 
 class AgentNick:

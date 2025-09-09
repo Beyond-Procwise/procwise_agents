@@ -243,8 +243,8 @@ class ProcessRoutingService:
                         "Logged process %s with id %s", process_name, process_id
                     )
                     return process_id
-        except Exception as exc:
-            logger.error("Failed to log process %s: %s", process_name, exc)
+        except Exception:
+            logger.exception("Failed to log process %s", process_name)
             return None
 
     def get_process_details(self, process_id: int) -> Optional[Dict[str, Any]]:
@@ -267,8 +267,8 @@ class ProcessRoutingService:
                         agent_defs, prompt_map, policy_map = self._load_agent_links()
                         self._enrich_node(details, agent_defs, prompt_map, policy_map)
                         return details
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("Failed to fetch process %s: %s", process_id, exc)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to fetch process %s", process_id)
         return None
 
     def update_process_details(
@@ -299,9 +299,9 @@ class ProcessRoutingService:
                     logger.info(
                         "Updated process %s details", process_id
                     )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(
-                "Failed to update details for process %s: %s", process_id, exc
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Failed to update details for process %s", process_id
             )
 
     def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
@@ -333,9 +333,9 @@ class ProcessRoutingService:
                     logger.info(
                         "Updated process %s to status %s", process_id, status
                     )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(
-                "Failed to update status for process %s: %s", process_id, exc
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Failed to update status for process %s", process_id
             )
 
 
@@ -402,9 +402,9 @@ class ProcessRoutingService:
                         status,
                     )
                     return action_id
-        except Exception as exc:
-            logger.error(
-                "Failed to log action for process %s: %s", process_id, exc
+        except Exception:
+            logger.exception(
+                "Failed to log action for process %s", process_id
             )
             return None
 
@@ -524,8 +524,8 @@ class ProcessRoutingService:
                         status_int,
                     )
                     return run_id
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(
-                "Failed to log run for process %s: %s", process_id, exc
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Failed to log run for process %s", process_id
             )
             return None
