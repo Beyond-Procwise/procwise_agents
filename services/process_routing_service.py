@@ -84,6 +84,30 @@ class ProcessRoutingService:
         return details
 
     @staticmethod
+    def _canonical_key(raw: str, agent_defs: Dict[str, str]) -> Optional[str]:
+        """Normalize a raw agent identifier to a known registry key.
+
+        Handles identifiers that include numeric suffixes or runtime prefixes
+        (e.g. ``admin_quote_agent_000067``) by stripping those decorations and
+        performing a best-effort match against the loaded agent definitions.
+        ``None`` is returned when no suitable match can be found.
+        """
+
+        if not raw:
+            return None
+        key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw)
+        key = re.sub(r"^(?:admin|user|service)_", "", key)
+        key = re.sub(r"_agent$", "", key)
+        if key in agent_defs:
+            return key
+        if raw in agent_defs:
+            return raw
+        for slug in agent_defs:
+            if slug in key or key in slug:
+                return slug
+        return None
+
+    @staticmethod
     def convert_agents_to_flow(details: Dict[str, Any]) -> Dict[str, Any]:
         """Convert legacy ``agents`` list into nested agent flow."""
 
@@ -159,12 +183,10 @@ class ProcessRoutingService:
         try:
             with self.agent_nick.get_db_connection() as conn:
                 def _record(map_obj: Dict[str, list[int]], raw: str, pid: int):
-                    base = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw)
-                    if base in agent_defs:
-                        map_obj.setdefault(base, []).append(int(pid))
-                    elif raw in agent_defs:
-                        map_obj.setdefault(raw, []).append(int(pid))
-                    else:
+                    slug = self._canonical_key(raw, agent_defs)
+                    if slug:
+                        map_obj.setdefault(slug, []).append(int(pid))
+                    else:  # pragma: no cover - defensive logging
                         logger.warning(
                             "Agent type '%s' not found in definitions", raw
                         )
@@ -195,8 +217,11 @@ class ProcessRoutingService:
         if not isinstance(node, dict):
             return
         raw_type = str(node.get("agent_type", ""))
-        base_key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw_type)
-        node["agent_type"] = agent_defs.get(base_key, agent_defs.get(raw_type, raw_type))
+        base_key = self._canonical_key(raw_type, agent_defs)
+        if base_key:
+            node["agent_type"] = agent_defs.get(base_key, raw_type)
+        else:
+            base_key = raw_type
         props = node.setdefault("agent_property", {"llm": None, "prompts": [], "policies": []})
         props["prompts"] = prompt_map.get(base_key, [])
         props["policies"] = policy_map.get(base_key, [])

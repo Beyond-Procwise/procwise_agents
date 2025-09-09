@@ -117,3 +117,31 @@ def test_execute_agent_flow_ignores_agent_id_suffix():
 
     assert flow["status"] == "completed"
     assert agent.ran is True
+
+
+def test_execute_agent_flow_handles_prefixed_agent_names():
+    agent = DummyAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"quote_evaluation": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "quote_evaluation": "QuoteEvaluationAgent"
+    }
+    orchestrator._load_prompts = lambda: {1: {}}
+    orchestrator._load_policies = lambda: {1: {}}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "admin_quote_agent_000067_1757404210002",
+        "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    assert flow["status"] == "completed"
+    assert agent.ran is True
