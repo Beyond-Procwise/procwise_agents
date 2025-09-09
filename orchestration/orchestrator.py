@@ -146,15 +146,27 @@ class Orchestrator:
 
         if not raw_key:
             return None
+
+        # Strip runtime suffixes/prefixes and normalise for comparison
         key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw_key)
         key = re.sub(r"^(?:admin|user|service)_", "", key)
         key = re.sub(r"_agent$", "", key)
-        if key in agent_defs:
-            return key
-        if raw_key in agent_defs:
-            return raw_key
+
+        key_lower = key.lower()
+        if key_lower in agent_defs:
+            return key_lower
+
+        raw_lower = raw_key.lower()
+        if raw_lower in agent_defs:
+            return raw_lower
+
+        # Attempt to resolve CamelCase class names into registry slugs
+        resolved = Orchestrator._resolve_agent_name(raw_key)
+        if resolved in agent_defs:
+            return resolved
+
         for slug in agent_defs:
-            if slug in key or key in slug:
+            if slug in key_lower or key_lower in slug:
                 return slug
         return None
 
