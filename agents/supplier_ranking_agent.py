@@ -43,7 +43,7 @@ class SupplierRankingAgent(BaseAgent):
             try:
                 df = pd.DataFrame(supplier_data)
             except Exception as e:
-                logger.error(f"Invalid supplier_data format: {e}")
+                logger.exception("Invalid supplier_data format")
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
@@ -178,5 +178,5 @@ class SupplierRankingAgent(BaseAgent):
             resp = self.call_ollama(prompt, model=self.settings.extraction_model)
             return resp.get('response', '').strip()
         except Exception as e:
-            logger.error(f"Justification generation failed: {e}")
+            logger.exception("Justification generation failed")
             return "Justification generation failed."
