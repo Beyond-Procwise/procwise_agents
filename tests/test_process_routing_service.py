@@ -87,9 +87,8 @@ def test_convert_agents_to_flow_builds_tree():
 
 
 class FetchCursor:
-    def __init__(self, proc_details, agent_rows, prompt_rows, policy_rows):
+    def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details
-        self.agent_rows = agent_rows
         self.prompt_rows = prompt_rows
         self.policy_rows = policy_rows
         self.query = ""
@@ -103,8 +102,6 @@ class FetchCursor:
         return None
 
     def fetchall(self):
-        if "FROM proc.agent" in self.query:
-            return self.agent_rows
         if "FROM proc.prompt" in self.query:
             return self.prompt_rows
         if "FROM proc.policy" in self.query:
@@ -119,16 +116,13 @@ class FetchCursor:
 
 
 class FetchConn:
-    def __init__(self, proc_details, agent_rows, prompt_rows, policy_rows):
+    def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details
-        self.agent_rows = agent_rows
         self.prompt_rows = prompt_rows
         self.policy_rows = policy_rows
 
     def cursor(self):
-        return FetchCursor(
-            self.proc_details, self.agent_rows, self.prompt_rows, self.policy_rows
-        )
+        return FetchCursor(self.proc_details, self.prompt_rows, self.policy_rows)
 
     def __enter__(self):
         return self
@@ -145,7 +139,6 @@ def test_get_process_details_enriches_agent_data():
     }
     conn = FetchConn(
         proc_details,
-        [("admin_supplier_ranking", "SupplierRankingAgent")],
         [(1, "{admin_supplier_ranking}")],
         [(2, "{admin_supplier_ranking}")],
     )

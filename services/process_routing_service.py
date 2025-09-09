@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 import re
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -131,12 +132,24 @@ class ProcessRoutingService:
         agent_defs: Dict[str, str] = {}
         prompt_map: Dict[str, list[int]] = {}
         policy_map: Dict[str, list[int]] = {}
+
+        # Load agent definitions from the bundled JSON file instead of the DB
+        path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
+        with path.open() as f:
+            data = json.load(f)
+        for item in data:
+            agent_class = item.get("agentType", "")
+            if not agent_class:
+                continue
+            slug = re.sub(r"(?<!^)(?=[A-Z])", "_", agent_class).lower()
+            if slug.endswith("_agent"):
+                slug = slug[:-6]
+            agent_defs[slug] = agent_class
+            agent_defs[f"admin_{slug}"] = agent_class
+            agent_defs[str(item.get("agentId"))] = agent_class
+
         try:
             with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT agent_type, agent_name FROM proc.agent")
-                    agent_defs = {str(r[0]): r[1] for r in cursor.fetchall()}
-
                 def _record(map_obj: Dict[str, list[int]], raw: str, pid: int):
                     base = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw)
                     if base in agent_defs:
@@ -155,6 +168,7 @@ class ProcessRoutingService:
                     for pid, linked in cursor.fetchall():
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
                             _record(prompt_map, key, pid)
+
                 with conn.cursor() as cursor:
                     cursor.execute(
                         "SELECT policy_id, policy_linked_agents FROM proc.policy"
@@ -164,6 +178,7 @@ class ProcessRoutingService:
                             _record(policy_map, key, pid)
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load agent linkage metadata")
+
         return agent_defs, prompt_map, policy_map
 
     def _enrich_node(self, node, agent_defs, prompt_map, policy_map):
