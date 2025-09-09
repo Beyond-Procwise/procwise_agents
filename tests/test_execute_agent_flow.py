@@ -27,9 +27,14 @@ def test_execute_agent_flow_runs_and_updates_status():
         routing_engine=SimpleNamespace(routing_model=None),
     )
     orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "data_extraction": "DataExtractionAgent"
+    }
+    orchestrator._load_prompts = lambda: {1: {}}
+    orchestrator._load_policies = lambda: {1: {}}
     flow = {
         "status": "saved",
-        "agent_type": "1",
+        "agent_type": "data_extraction",
         "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
     }
     result = orchestrator.execute_agent_flow(flow)
@@ -63,19 +68,19 @@ def test_execute_agent_flow_preserves_root_status_on_failure_chain():
 
     # Stub out lookups so our dummy agents are used
     orchestrator._load_agent_definitions = lambda: {
-        "1": "FirstAgent",
-        "2": "SecondAgent",
+        "first": "FirstAgent",
+        "second": "SecondAgent",
     }
     orchestrator._load_prompts = lambda: {1: {}}
     orchestrator._load_policies = lambda: {1: {}}
 
     flow = {
         "status": "saved",
-        "agent_type": "1",
+        "agent_type": "first",
         "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
         "onFailure": {
             "status": "saved",
-            "agent_type": "2",
+            "agent_type": "second",
             "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
         },
     }

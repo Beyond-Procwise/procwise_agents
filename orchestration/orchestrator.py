@@ -135,8 +135,23 @@ class Orchestrator:
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
         with path.open() as f:
             data = json.load(f)
-        # ``agentId`` in the JSON corresponds to ``agent_type`` in the DB.
-        return {str(item["agentId"]): item["agentType"] for item in data}
+
+        defs: Dict[str, str] = {}
+        for item in data:
+            agent_class = item.get("agentType", "")
+            if not agent_class:
+                continue
+            # Create lookups based on the ``agentType`` field rather than the
+            # legacy numeric ``agentId``.  This matches the values supplied in
+            # ``*_linked_agents`` columns where ``agent_type`` identifiers are
+            # stored.  Numeric IDs are retained only for backward
+            # compatibility.
+            slug = self._resolve_agent_name(agent_class)
+            defs[slug] = agent_class
+            defs[f"admin_{slug}"] = agent_class
+            defs[str(item.get("agentId"))] = agent_class
+
+        return defs
 
     def _get_agent_details(self, agent_spec) -> List[Dict[str, Any]]:
         """Resolve agent metadata for identifiers from policy tables.
