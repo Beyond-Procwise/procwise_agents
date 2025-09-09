@@ -5,11 +5,10 @@ from orchestration.orchestrator import Orchestrator
 
 
 class DummyCursor:
-    """Cursor that returns rows based on the executed query."""
+    """Cursor that returns preset rows for executed queries."""
 
-    def __init__(self, rows, agent_rows):
+    def __init__(self, rows):
         self._rows = rows
-        self._agent_rows = agent_rows
         self.query = ""
 
     def __enter__(self):
@@ -22,15 +21,12 @@ class DummyCursor:
         self.query = query
 
     def fetchall(self):
-        if "FROM proc.agent" in self.query:
-            return self._agent_rows
         return self._rows
 
 
 class DummyConn:
-    def __init__(self, rows, agent_rows):
+    def __init__(self, rows):
         self._rows = rows
-        self._agent_rows = agent_rows
 
     def __enter__(self):
         return self
@@ -39,12 +35,12 @@ class DummyConn:
         pass
 
     def cursor(self):
-        return DummyCursor(self._rows, self._agent_rows)
+        return DummyCursor(self._rows)
 
 
-def make_orchestrator(rows, agent_rows):
+def make_orchestrator(rows):
     def get_conn():
-        return DummyConn(rows, agent_rows)
+        return DummyConn(rows)
 
     agent_nick = SimpleNamespace(
         settings=SimpleNamespace(script_user="tester", max_workers=1),
@@ -58,27 +54,24 @@ def make_orchestrator(rows, agent_rows):
 
 
 def test_load_prompts_from_db():
-    prompt_rows = [(1, "hello", "{agent_one}")]
-    agent_rows = [("agent_one", "AgentOne")]
-    orchestrator = make_orchestrator(prompt_rows, agent_rows)
+    prompt_rows = [(1, "hello", "{supplier_ranking}")]
+    orchestrator = make_orchestrator(prompt_rows)
     prompts = orchestrator._load_prompts()
     assert prompts[1]["template"] == "hello"
-    assert prompts[1]["agents"][0]["agent_name"] == "AgentOne"
+    assert prompts[1]["agents"][0]["agent_name"] == "SupplierRankingAgent"
 
 
 def test_load_policies_from_db():
-    policy_rows = [(2, "Example policy", "{agent_one}")]
-    agent_rows = [("agent_one", "AgentOne")]
-    orchestrator = make_orchestrator(policy_rows, agent_rows)
+    policy_rows = [(2, "Example policy", "{supplier_ranking}")]
+    orchestrator = make_orchestrator(policy_rows)
     policies = orchestrator._load_policies()
     assert policies[2]["description"] == "Example policy"
-    assert policies[2]["agents"][0]["agent_name"] == "AgentOne"
+    assert policies[2]["agents"][0]["agent_name"] == "SupplierRankingAgent"
 
 
-def test_load_agent_definitions_from_db():
-    agent_rows = [("a1", "AgentOne"), ("a2", "AgentTwo")]
-    orchestrator = make_orchestrator([], agent_rows)
+def test_load_agent_definitions_from_file():
+    orchestrator = make_orchestrator([])
     defs = orchestrator._load_agent_definitions()
-    assert defs["a1"] == "AgentOne"
-    assert defs["a2"] == "AgentTwo"
+    assert defs["supplier_ranking"] == "SupplierRankingAgent"
+    assert defs["admin_supplier_ranking"] == "SupplierRankingAgent"
 

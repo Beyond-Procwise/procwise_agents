@@ -113,24 +113,12 @@ class Orchestrator:
     def _load_agent_definitions(self) -> Dict[str, str]:
         """Return mapping of ``agent_type`` identifiers to agent class names.
 
-        The primary source of truth is the ``proc.agent`` table where
-        ``agent_type`` uniquely identifies an agent implementation.  When a
-        database connection isn't available the method falls back to the
-        bundled ``agent_definitions.json`` file which mirrors the same
-        structure.
+        ``proc.agent`` is no longer consulted; instead the bundled
+        ``agent_definitions.json`` file acts as the sole source of truth for
+        agent metadata.  Each entry provides slug-based identifiers (e.g.
+        ``supplier_ranking`` and ``admin_supplier_ranking``) along with the
+        legacy numeric ``agentId`` for backward compatibility.
         """
-
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT agent_type, agent_name FROM proc.agent")
-                    rows = cursor.fetchall()
-                if rows:
-                    return {str(row[0]): row[1] for row in rows}
-        except Exception:  # pragma: no cover - defensive fall back
-            logger.exception(
-                "Failed to load agent definitions from DB, falling back to file"
-            )
 
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
         with path.open() as f:
