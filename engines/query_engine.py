@@ -34,3 +34,15 @@ class QueryEngine(BaseEngine):
                 FROM proc.supplier;"""
         with self.agent_nick.get_db_connection() as conn:
             return pd.read_sql(sql, conn)
+
+    def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
+        """Return invoice headers from ``proc.invoice_agent``."""
+        sql = "SELECT * FROM proc.invoice_agent;"
+        with self.agent_nick.get_db_connection() as conn:
+            return pd.read_sql(sql, conn)
+
+    def fetch_purchase_order_data(self, intent: dict | None = None) -> pd.DataFrame:
+        """Return purchase order headers from ``proc.purchase_order_agent``."""
+        sql = "SELECT * FROM proc.purchase_order_agent;"
+        with self.agent_nick.get_db_connection() as conn:
+            return pd.read_sql(sql, conn)

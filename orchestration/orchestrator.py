@@ -115,9 +115,9 @@ class Orchestrator:
 
         ``proc.agent`` is no longer consulted; instead the bundled
         ``agent_definitions.json`` file acts as the sole source of truth for
-        agent metadata.  Each entry provides slug-based identifiers (e.g.
-        ``supplier_ranking`` and ``admin_supplier_ranking``) along with the
-        legacy numeric ``agentId`` for backward compatibility.
+        agent metadata. Each entry provides slug-based identifiers (e.g.
+        ``supplier_ranking``) along with the legacy numeric ``agentId`` for
+        backward compatibility.
         """
 
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"

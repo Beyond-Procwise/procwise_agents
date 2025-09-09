@@ -102,14 +102,14 @@ def test_execute_agent_flow_ignores_agent_id_suffix():
     )
     orchestrator = Orchestrator(nick)
     orchestrator._load_agent_definitions = lambda: {
-        "admin_supplier_ranking": "SupplierRankingAgent"
+        "supplier_ranking": "SupplierRankingAgent"
     }
     orchestrator._load_prompts = lambda: {1: {}}
     orchestrator._load_policies = lambda: {1: {}}
 
     flow = {
         "status": "saved",
-        "agent_type": "admin_supplier_ranking_000055_1757337997564",
+        "agent_type": "supplier_ranking_000055_1757337997564",
         "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
     }
 

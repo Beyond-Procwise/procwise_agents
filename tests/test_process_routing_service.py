@@ -134,13 +134,13 @@ class FetchConn:
 def test_get_process_details_enriches_agent_data():
     proc_details = {
         "status": "saved",
-        "agent_type": "admin_supplier_ranking_123",
+        "agent_type": "supplier_ranking_123",
         "agent_property": {"llm": None, "prompts": [], "policies": []},
     }
     conn = FetchConn(
         proc_details,
-        [(1, "{admin_supplier_ranking}")],
-        [(2, "{admin_supplier_ranking}")],
+        [(1, "{supplier_ranking}")],
+        [(2, "{supplier_ranking}")],
     )
     agent = SimpleNamespace(
         get_db_connection=lambda: conn,
@@ -151,3 +151,4 @@ def test_get_process_details_enriches_agent_data():
     assert details["agent_type"] == "SupplierRankingAgent"
     assert details["agent_property"]["prompts"] == [1]
     assert details["agent_property"]["policies"] == [2]
+    assert details["process_status"] == 0

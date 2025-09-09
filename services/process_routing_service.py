@@ -62,6 +62,12 @@ class ProcessRoutingService:
         """
         details = details.copy() if isinstance(details, dict) else {}
         details.setdefault("status", "")
+        # Track high level run state separately from per-agent status.
+        # ``process_status`` mirrors the ``process_status`` column in the
+        # database and is used by the ``/run`` endpoint for real-time
+        # updates.  ``0`` indicates the run has started, ``1`` means
+        # success and ``-1`` a failure.
+        details.setdefault("process_status", 0)
         agents = []
         for agent in details.get("agents", []) or []:
             if not isinstance(agent, dict):
@@ -98,6 +104,9 @@ class ProcessRoutingService:
             referenced.update(deps.get("onFailure", []))
             referenced.update(deps.get("onCompletion", []))
 
+        # The starting node is the one that is never referenced in any other
+        # agent's dependency lists.  Dependencies denote downstream agents to
+        # invoke upon completion of the current agent.
         roots = [name for name in agent_map if name not in referenced]
         root_name = roots[0] if roots else next(iter(agent_map), None)
         if not root_name:

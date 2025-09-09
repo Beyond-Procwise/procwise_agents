@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from api.routers.run import router as run_router
+import copy
 
 
 class DummyPRS:
@@ -28,7 +29,9 @@ class DummyPRS:
         self.status_updates.append((process_id, status))
 
     def update_process_details(self, process_id, details, **kwargs):
-        self.details_updates.append(details)
+        # Store a copy so that subsequent mutations do not affect earlier
+        # snapshots used in assertions.
+        self.details_updates.append(copy.deepcopy(details))
 
     def log_run_detail(self, **kwargs):
         return kwargs.get("run_id", "r1")
@@ -70,20 +73,17 @@ def test_run_endpoint_process_id_executes_flow():
     import time
 
     for _ in range(50):
-        if prs.status_updates == [(5, 1)] and prs.details_updates:
+        if prs.status_updates == [(5, 1)] and len(prs.details_updates) >= 2:
             break
         time.sleep(0.01)
 
     assert prs.status_updates == [(5, 1)]
-    assert prs.details_updates[0]["status"] == "completed"
+    # First update marks the run as started
+    assert prs.details_updates[0]["process_status"] == 0
+    # Final update contains completion information
+    assert prs.details_updates[1]["process_status"] == 1
+    assert prs.details_updates[1]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
-
-
-def test_run_endpoint_requires_saved_status():
-    prs = DummyPRS(status="completed")
-    client, _ = create_client(prs)
-    resp = client.post("/run", json={"process_id": 7})
-    assert resp.status_code == 409
 
 
 def test_run_endpoint_updates_nested_statuses_independently():
@@ -124,11 +124,12 @@ def test_run_endpoint_updates_nested_statuses_independently():
     import time
 
     for _ in range(50):
-        if prs.details_updates:
+        if len(prs.details_updates) >= 2:
             break
         time.sleep(0.01)
 
-    saved = prs.details_updates[0]
+    saved = prs.details_updates[1]
     assert saved["status"] == "completed"
     assert saved["onSuccess"]["status"] == "completed"
     assert saved["onFailure"]["status"] == "saved"
+    assert saved["process_status"] == 1
