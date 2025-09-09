@@ -136,7 +136,6 @@ class Orchestrator:
             # compatibility.
             slug = self._resolve_agent_name(agent_class)
             defs[slug] = agent_class
-            defs[f"admin_{slug}"] = agent_class
             defs[str(item.get("agentId"))] = agent_class
 
         return defs

@@ -145,7 +145,6 @@ class ProcessRoutingService:
             if slug.endswith("_agent"):
                 slug = slug[:-6]
             agent_defs[slug] = agent_class
-            agent_defs[f"admin_{slug}"] = agent_class
             agent_defs[str(item.get("agentId"))] = agent_class
 
         try:
@@ -419,19 +418,7 @@ class ProcessRoutingService:
             process_end_ts: Optional[datetime] = None,
             triggered_by: Optional[str] = None,
     ) -> Optional[str]:
-        """Update `proc.routing` with run metadata for an execution.
 
-        The new schema stores a single record per process. Execution run
-        information is persisted as `raw_data` (JSON) and status as an integer.
-        `run_id` is still returned so that related tables (e.g. `proc.action`)
-        can reference the run.
-
-        Behaviour changes:
-        - Kicking off (started/validated-like states) maps to `process_status = 0`.
-        - Success maps to `1`, failure to `-1`.
-        - `process_details` is updated to include per-agent subcategory `status`
-          values using the textual states: `started`, `validated`, `completed`.
-        """
 
         def _annotate_process_details(details: Optional[Dict[str, Any]], status_text: str) -> Dict[str, Any]:
             """Ensure `details` is a dict and annotate agent sub-entries with status_text.
@@ -478,7 +465,7 @@ class ProcessRoutingService:
         # - success -> 1
         # - failure/unknown -> -1
         success_vals = ("1", "success", "completed", "done")
-        kickoff_vals = ("started", "running", "in_progress", "validating")
+        kickoff_vals = ("saved", "validated")
         if ps in success_vals:
             status_int = 1
         elif ps in kickoff_vals:
