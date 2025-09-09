@@ -50,8 +50,17 @@ def run_agents(
     details = prs.get_process_details(req.process_id)
     if details is None:
         raise HTTPException(status_code=404, detail="Process not found")
-    if details.get("status") != "saved":
-        raise HTTPException(status_code=409, detail="Process not in saved status")
+
+    # Mark the process as started (process_status=0) before kicking off the
+    # background execution so that callers can poll for progress in
+    # real-time.
+    details["process_status"] = 0
+    try:
+        prs.update_process_details(req.process_id, details)
+    except Exception:
+        logger.exception(
+            "Failed to mark process %s as started", req.process_id
+        )
 
     # Run the long-running execution in background
 
@@ -63,13 +72,14 @@ def run_agents(
                 result = asyncio.run(result)
             logger.debug("Execution result for process %s: %s", process_id, result)
             if isinstance(result, dict):
+                final = result.get("status")
+                result["process_status"] = 1 if final != "failed" else -1
                 try:
                     prs.update_process_details(process_id, result)
                 except Exception:
                     logger.exception(
                         "Failed to update process %s details", process_id
                     )
-                final = result.get("status")
             else:
                 final = "failed"
             prs.update_process_status(process_id, 1 if final != "failed" else -1)

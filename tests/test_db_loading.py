@@ -73,5 +73,5 @@ def test_load_agent_definitions_from_file():
     orchestrator = make_orchestrator([])
     defs = orchestrator._load_agent_definitions()
     assert defs["supplier_ranking"] == "SupplierRankingAgent"
-    assert defs["admin_supplier_ranking"] == "SupplierRankingAgent"
+    assert "admin_supplier_ranking" not in defs
 
