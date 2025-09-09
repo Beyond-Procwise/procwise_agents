@@ -140,6 +140,24 @@ class Orchestrator:
 
         return defs
 
+    @staticmethod
+    def _canonical_key(raw_key: str, agent_defs: Dict[str, str]) -> Optional[str]:
+        """Return the registry slug for a potentially decorated agent key."""
+
+        if not raw_key:
+            return None
+        key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw_key)
+        key = re.sub(r"^(?:admin|user|service)_", "", key)
+        key = re.sub(r"_agent$", "", key)
+        if key in agent_defs:
+            return key
+        if raw_key in agent_defs:
+            return raw_key
+        for slug in agent_defs:
+            if slug in key or key in slug:
+                return slug
+        return None
+
     def _get_agent_details(self, agent_spec) -> List[Dict[str, Any]]:
         """Resolve agent metadata for identifiers from policy tables.
 
@@ -157,11 +175,9 @@ class Orchestrator:
         agent_defs = self._load_agent_definitions()
         details: List[Dict[str, Any]] = []
         for key in keys:
-            # Normalize keys by stripping trailing numeric identifiers
-            agent_type_id = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", key)
-            agent_name = agent_defs.get(agent_type_id) or agent_defs.get(key)
-            if agent_name:
-                details.append({"agent_type": agent_type_id, "agent_name": agent_name})
+            slug = self._canonical_key(key, agent_defs)
+            if slug:
+                details.append({"agent_type": slug, "agent_name": agent_defs[slug]})
             else:  # pragma: no cover - defensive logging
                 logger.warning("Agent type '%s' not found in definitions", key)
         return details

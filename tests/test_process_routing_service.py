@@ -152,3 +152,24 @@ def test_get_process_details_enriches_agent_data():
     assert details["agent_property"]["prompts"] == [1]
     assert details["agent_property"]["policies"] == [2]
     assert details["process_status"] == 0
+
+
+def test_get_process_details_handles_prefixed_agent_names():
+    proc_details = {
+        "status": "saved",
+        "agent_type": "admin_quote_agent_000067_1757404210002",
+        "agent_property": {"llm": None, "prompts": [], "policies": []},
+    }
+    conn = FetchConn(proc_details, [], [])
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs._load_agent_links = lambda: (
+        {"quote_evaluation": "QuoteEvaluationAgent"},
+        {},
+        {},
+    )
+    details = prs.get_process_details(1)
+    assert details["agent_type"] == "QuoteEvaluationAgent"
