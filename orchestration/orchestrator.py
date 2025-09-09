@@ -8,10 +8,18 @@ import json
 import re
 from pathlib import Path
 import os
+from functools import lru_cache
+from jinja2 import Template
+
+try:  # Optional dependency for JSONPath mapping
+    from jsonpath_ng import parse as jsonpath_parse
+except Exception:  # pragma: no cover - library may be absent in tests
+    jsonpath_parse = None
 
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +35,13 @@ class Orchestrator:
     """Main orchestrator for managing agent workflows"""
 
     def __init__(self, agent_nick):
+        # Ensure GPU environment is initialised before any agent execution.
+        # ``configure_gpu`` is idempotent so repeated calls are safe and allow
+        # both the orchestrator and individual agents to run on the same
+        # device. This provides a centralised location for enabling GPU usage
+        # across the agentic framework.
+        configure_gpu()
+
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.agents = agent_nick.agents
@@ -110,14 +125,14 @@ class Orchestrator:
             logger.error(f"Workflow {workflow_id} failed: {e}")
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
-    def _load_agent_definitions(self) -> Dict[str, str]:
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _load_agent_definitions() -> Dict[str, str]:
         """Return mapping of ``agent_type`` identifiers to agent class names.
 
-        ``proc.agent`` is no longer consulted; instead the bundled
-        ``agent_definitions.json`` file acts as the sole source of truth for
-        agent metadata. Each entry provides slug-based identifiers (e.g.
-        ``supplier_ranking``) along with the legacy numeric ``agentId`` for
-        backward compatibility.
+        The JSON file is read once and cached for subsequent calls.  This
+        prevents repeated disk I/O when resolving linked agents from prompts or
+        policies, which can occur many times within a single workflow.
         """
 
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
@@ -134,7 +149,7 @@ class Orchestrator:
             # ``*_linked_agents`` columns where ``agent_type`` identifiers are
             # stored.  Numeric IDs are retained only for backward
             # compatibility.
-            slug = self._resolve_agent_name(agent_class)
+            slug = Orchestrator._resolve_agent_name(agent_class)
             defs[slug] = agent_class
             defs[str(item.get("agentId"))] = agent_class
 
@@ -282,8 +297,150 @@ class Orchestrator:
             name = name[:-6]
         return name
 
-    def execute_agent_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a dynamic agent flow based on process details."""
+    def execute_agent_flow(
+        self, flow: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Execute a flow either in new JSON form or legacy tree structure."""
+
+        if isinstance(flow, dict) and "entrypoint" in flow and "steps" in flow:
+            return self._execute_json_flow(flow, payload or {})
+
+        # Fallback to previous onSuccess/onFailure style graphs
+        return self._execute_legacy_flow(flow)
+
+    # ------------------------------------------------------------------
+    # New JSON flow executor
+    # ------------------------------------------------------------------
+
+    def _execute_json_flow(self, flow: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a flow defined with ``entrypoint`` and ``steps`` fields."""
+
+        steps = flow.get("steps", {})
+        entry = flow.get("entrypoint")
+        defaults = flow.get("defaults", {})
+        run_ctx: Dict[str, Any] = {"payload": payload}
+
+        def _render(value: Any) -> Any:
+            if isinstance(value, str):
+                try:
+                    rendered = Template(value).render(ctx=run_ctx, payload=payload)
+                    if rendered.isdigit():
+                        return int(rendered)
+                    try:
+                        return float(rendered)
+                    except ValueError:
+                        return rendered
+                except Exception:
+                    return value
+            if isinstance(value, dict):
+                return {k: _render(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_render(v) for v in value]
+            return value
+
+        def _extract(data: Dict[str, Any], expr: str) -> Any:
+            if jsonpath_parse:
+                try:
+                    matches = jsonpath_parse(expr).find(data)
+                    if matches:
+                        return matches[0].value
+                except Exception:  # pragma: no cover - invalid JSONPath
+                    return None
+            # Fallback: treat expression as dotted path
+            cur = data
+            for part in expr.lstrip("$").strip(".").split('.'):
+                if isinstance(cur, dict):
+                    cur = cur.get(part)
+                else:
+                    return None
+            return cur
+
+        def _assign(target: Dict[str, Any], path: str, value: Any) -> None:
+            keys = path.split('.')
+            cur = target
+            for key in keys[:-1]:
+                cur = cur.setdefault(key, {})
+            cur[keys[-1]] = value
+
+        queue: List[str] = [entry]
+        visited: set[str] = set()
+        flow_status = "completed"
+
+        while queue:
+            step_name = queue.pop(0)
+            step = steps.get(step_name)
+            if not step or step_name in visited:
+                continue
+            visited.add(step_name)
+
+            condition = step.get("condition")
+            if condition:
+                rendered = _render(condition)
+                if str(rendered).lower() in ("", "0", "false", "none"):
+                    next_steps = step.get("next", [])
+                    if isinstance(next_steps, str):
+                        next_steps = [next_steps]
+                    queue.extend(next_steps)
+                    continue
+
+            agent_key = step.get("agent")
+            agent = self.agents.get(agent_key)
+            if not agent:
+                raise ValueError(f"Agent '{agent_key}' not registered")
+
+            retries = int(step.get("retry", 0))
+            timeout = step.get("timeout_seconds")
+            on_error = step.get("on_error", "fail")
+
+            input_cfg = {**defaults.get("input", {}), **step.get("input", {})}
+            rendered_input = _render(input_cfg)
+
+            success = False
+            attempt = 0
+            result = None
+            while attempt <= retries and not success:
+                attempt += 1
+                context = AgentContext(
+                    workflow_id=str(uuid.uuid4()),
+                    agent_id=agent_key,
+                    user_id=self.settings.script_user,
+                    input_data=rendered_input,
+                )
+                try:
+                    if timeout:
+                        fut = self.executor.submit(agent.execute, context)
+                        result = fut.result(timeout=timeout)
+                    else:
+                        result = agent.execute(context)
+                    success = result and result.status == AgentStatus.SUCCESS
+                except Exception:  # pragma: no cover - execution error
+                    logger.exception("Agent %s execution failed", agent_key)
+                    success = False
+
+            if not success:
+                flow_status = "failed"
+                if on_error == "fail":
+                    return {"status": "failed", "ctx": run_ctx}
+
+            # Map outputs regardless of success; downstream may rely on partial data
+            outputs = step.get("outputs", {})
+            data = result.data if result and result.data else {}
+            for key, expr in outputs.items():
+                value = _extract(data, expr)
+                _assign(run_ctx, key, value)
+            if result and result.pass_fields:
+                for k, v in result.pass_fields.items():
+                    run_ctx[k] = v
+
+            next_steps = step.get("next", [])
+            if isinstance(next_steps, str):
+                next_steps = [next_steps]
+            queue.extend(next_steps)
+
+        return {"status": flow_status, "ctx": run_ctx}
+
+    def _execute_legacy_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute legacy tree-based flows with ``onSuccess``/``onFailure`` links."""
 
         prompts = self._load_prompts()
         policies = self._load_policies()
@@ -298,17 +455,15 @@ class Orchestrator:
             used_ids.add(candidate)
             return candidate
 
-        def _run(node: Dict[str, Any]):
+        def _run(node: Dict[str, Any], inherited: Optional[Dict[str, Any]] = None):
+            """Recursively execute nodes while propagating pass fields."""
+
             required_fields = ["status", "agent_type", "agent_property"]
             for field in required_fields:
                 if field not in node:
                     raise ValueError(f"Missing field '{field}' in agent node")
 
             props = node.get("agent_property", {})
-            for field in ["llm", "prompts", "policies"]:
-                if field not in props:
-                    raise ValueError(f"Missing property '{field}' in agent node")
-
             details = self._get_agent_details(node["agent_type"])
             if not details:
                 raise ValueError(f"Unknown agent_type '{node['agent_type']}'")
@@ -331,15 +486,22 @@ class Orchestrator:
                     raise ValueError(f"Unknown policy id '{pid}'")
                 policy_objs.append(policies[pid])
 
+            # Merge inherited pass fields with agent properties.  Any fields
+            # produced by upstream agents become part of the child's input
+            # data, enabling contextual chaining.
+            input_data = {**(inherited or {})}
+            if "llm" in props:
+                input_data["llm"] = props["llm"]
+            if prompt_objs:
+                input_data["prompts"] = prompt_objs
+            if policy_objs:
+                input_data["policies"] = policy_objs
+
             context = AgentContext(
                 workflow_id=_new_id(),
                 agent_id=agent_key,
                 user_id=self.settings.script_user,
-                input_data={
-                    "llm": props.get("llm"),
-                    "prompts": prompt_objs,
-                    "policies": policy_objs,
-                },
+                input_data=input_data,
             )
 
             result = agent.execute(context)
@@ -349,11 +511,17 @@ class Orchestrator:
                 else "failed"
             )
 
+            # Prepare fields for downstream nodes
+            next_fields = {**(inherited or {})}
+            if result and result.pass_fields:
+                next_fields.update(result.pass_fields)
+
             if result and result.status == AgentStatus.SUCCESS and node.get("onSuccess"):
-                result = _run(node["onSuccess"])
+                _run(node["onSuccess"], next_fields)
             elif result and result.status == AgentStatus.FAILED and node.get("onFailure"):
-                result = _run(node["onFailure"])
-            return result
+                _run(node["onFailure"], next_fields)
+
+            return node
 
         # Execute the first node in the flow.  Each node updates its own
         # ``status`` field and recursively processes child nodes based on the
@@ -461,27 +629,36 @@ class Orchestrator:
         self, workflow_name: str, context: AgentContext
     ) -> Dict:
         """Execute generic workflow based on routing rules"""
-        results = {}
+        results: Dict[str, Any] = {}
         current_agents = [workflow_name]
         depth = 0
         max_depth = self.routing_model.get("global_settings", {}).get(
             "max_chain_depth", 10
         )
+        pass_fields: Dict[str, Any] = {}
 
         while current_agents and depth < max_depth:
-            next_agents = []
+            next_agents: List[str] = []
 
             for agent_name in current_agents:
-                if agent_name in self.agents:
-                    result = self._execute_agent(agent_name, context)
-                    results[agent_name] = result.data
+                if agent_name not in self.agents:
+                    continue
 
-                    if result.next_agents:
-                        next_agents.extend(result.next_agents)
+                # Use a dedicated child context per agent so that routing
+                # history and agent identifiers remain accurate. Shared
+                # ``pass_fields`` are merged into the child's input data.
+                child_context = self._create_child_context(
+                    context, agent_name, pass_fields
+                )
+                result = self._execute_agent(agent_name, child_context)
+                results[agent_name] = result.data
 
-                    # Update context with pass fields
-                    if result.pass_fields:
-                        context.input_data.update(result.pass_fields)
+                if result.next_agents:
+                    next_agents.extend(result.next_agents)
+
+                # Merge fields to be passed to subsequent agents.
+                if result.pass_fields:
+                    pass_fields.update(result.pass_fields)
 
             current_agents = next_agents
             depth += 1
