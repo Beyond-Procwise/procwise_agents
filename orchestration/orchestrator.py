@@ -138,35 +138,31 @@ class Orchestrator:
         # ``agentId`` in the JSON corresponds to ``agent_type`` in the DB.
         return {str(item["agentId"]): item["agentType"] for item in data}
 
-    def _get_agent_details(self, conn, agent_spec) -> List[Dict[str, Any]]:
-        """Resolve agent information for identifiers from policy tables.
+    def _get_agent_details(self, agent_spec) -> List[Dict[str, Any]]:
+        """Resolve agent metadata for identifiers from policy tables.
 
         The ``*_linked_agents`` columns expose agent *keys* (e.g.
         ``"supplier_ranking"``) in a PostgreSQL-style array string such as
         ``"{supplier_ranking,quote_evaluation}"``.  This helper extracts those
-        keys and returns basic metadata for each from ``proc.agent``.
+        keys, verifies them against the agent definitions registry and returns
+        the canonical agent type for downstream use.
         """
 
         keys = [k for k in re.findall(r"[A-Za-z0-9_]+", str(agent_spec or ""))]
         if not keys:
             return []
 
-        placeholders = ",".join(["%s"] * len(keys))
-        query = (
-            "SELECT agent_type, agent_name FROM proc.agent "
-            f"WHERE agent_type IN ({placeholders})"
-        )
-        try:
-            with conn.cursor() as c:
-                c.execute(query, tuple(keys))
-                rows = c.fetchall()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to resolve agent details for %s", agent_spec)
-            return []
-
-        return [
-            {"agent_type": row[0], "agent_name": row[1]} for row in rows
-        ]
+        agent_defs = self._load_agent_definitions()
+        details: List[Dict[str, Any]] = []
+        for key in keys:
+            # Normalize keys by stripping trailing numeric identifiers
+            agent_type_id = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", key)
+            agent_name = agent_defs.get(agent_type_id) or agent_defs.get(key)
+            if agent_name:
+                details.append({"agent_type": agent_type_id, "agent_name": agent_name})
+            else:  # pragma: no cover - defensive logging
+                logger.warning("Agent type '%s' not found in definitions", key)
+        return details
 
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
         """Load prompt templates keyed by ``promptId``.
@@ -192,7 +188,7 @@ class Orchestrator:
                     value = {
                         "promptId": int(pid),
                         "template": str(desc),
-                        "agents": self._get_agent_details(conn, linked),
+                        "agents": self._get_agent_details(linked),
                     }
                     prompts[int(pid)] = value
             if prompts:
@@ -230,7 +226,7 @@ class Orchestrator:
                     value = {
                         "policyId": int(pid),
                         "description": str(desc),
-                        "agents": self._get_agent_details(conn, linked),
+                        "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value
             if policies:
@@ -259,7 +255,6 @@ class Orchestrator:
     def execute_agent_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a dynamic agent flow based on process details."""
 
-        agent_defs = self._load_agent_definitions()
         prompts = self._load_prompts()
         policies = self._load_policies()
 
@@ -284,17 +279,11 @@ class Orchestrator:
                 if field not in props:
                     raise ValueError(f"Missing property '{field}' in agent node")
 
-            agent_type_raw = str(node["agent_type"])
-            # Some process definitions append an ``agent_id`` and other
-            # numeric identifiers to the ``agent_type`` field
-            # (e.g. ``admin_supplier_ranking_000055_1757337997564``).  The
-            # orchestrator should resolve agents solely based on the
-            # ``agent_type`` prefix and ignore any trailing numeric suffixes.
-            agent_type_id = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", agent_type_raw)
-            agent_class = agent_defs.get(agent_type_id) or agent_defs.get(agent_type_raw)
-            if not agent_class:
-                raise ValueError(f"Unknown agent_type '{agent_type_raw}'")
-
+            details = self._get_agent_details(node["agent_type"])
+            if not details:
+                raise ValueError(f"Unknown agent_type '{node['agent_type']}'")
+            agent_class = details[0]["agent_name"]
+            node["agent_type"] = agent_class
             agent_key = self._resolve_agent_name(agent_class)
             agent = self.agents.get(agent_key) or self.agents.get(agent_class)
             if not agent:
