@@ -89,6 +89,22 @@ def test_quote_evaluation_handles_no_quotes(monkeypatch):
     assert "weights" in output.data
 
 
+def test_quote_evaluation_handles_no_quotes(monkeypatch):
+    """Agent should succeed gracefully when no quotes are found."""
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+    monkeypatch.setattr(agent, "_fetch_quotes", lambda *_, **__: [])
+    context = AgentContext(
+        workflow_id="wf_empty",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={},
+    )
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["quotes"] == []
+
+
 class DummyOrchestrator:
     def __init__(self, agent):
         self.agent = agent

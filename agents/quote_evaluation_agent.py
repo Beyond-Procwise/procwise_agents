@@ -42,11 +42,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 # downstream agents may still proceed with an empty result set.
                 return AgentOutput(
                     status=AgentStatus.SUCCESS,
-                    data={
-                        "quotes": [],
-                        "message": "No quotes found",
-                        "weights": weights,
-                    },
+                    data={"quotes": [], "message": "No quotes found"},
                 )
 
             simplified: List[Dict] = []

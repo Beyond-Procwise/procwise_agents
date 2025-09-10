@@ -321,6 +321,7 @@ class Orchestrator:
         run_ctx: Dict[str, Any] = {"payload": payload, "errors": {}}
         agent_defs = self._load_agent_definitions()
 
+
         def _render(value: Any) -> Any:
             if isinstance(value, str):
                 try:
@@ -394,6 +395,7 @@ class Orchestrator:
                 continue
             agent_key = slug or agent_key_raw
 
+
             retries = int(step.get("retry", 0))
             timeout = step.get("timeout_seconds")
             on_error = step.get("on_error", "fail")
@@ -422,7 +424,7 @@ class Orchestrator:
                 except Exception as exc:  # pragma: no cover - execution error
                     logger.exception("Agent %s execution failed", agent_key)
                     run_ctx["errors"][step_name] = str(exc)
-                    success = False
+            success = False
 
             if not success:
                 flow_status = "failed"
