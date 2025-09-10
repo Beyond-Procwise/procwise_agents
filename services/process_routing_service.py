@@ -5,12 +5,16 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 import re
 from pathlib import Path
+import os
 
 import pandas as pd
 import numpy as np
 from dataclasses import asdict, is_dataclass
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is enabled where available
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
 class ProcessRoutingService:
@@ -366,9 +370,19 @@ class ProcessRoutingService:
             return
 
         agents = details.get("agents", [])
-        for agent in agents:
-            if agent.get("agent") == agent_name:
-                agent["status"] = status
+        order = [a.get("agent") for a in agents]
+        if agent_name not in order:
+            logger.warning(
+                "Agent %s not found in process %s; skipping", agent_name, process_id
+            )
+            return
+        idx = order.index(agent_name)
+        for prev in agents[:idx]:
+            if prev.get("status") not in ("completed", "failed"):
+                raise ValueError(
+                    f"Cannot update {agent_name} before {prev.get('agent')} completes"
+                )
+        agents[idx]["status"] = status
 
         # Derive the overall workflow status based on individual agent states.
         statuses = [a.get("status") for a in agents]
@@ -376,8 +390,10 @@ class ProcessRoutingService:
             overall = "failed"
         elif statuses and all(s == "completed" for s in statuses):
             overall = "completed"
+        elif any(s != "saved" for s in statuses):
+            overall = "running"
         else:
-            overall = details.get("status", "saved") or "saved"
+            overall = "saved"
 
         details["agents"] = agents
         details["status"] = overall
