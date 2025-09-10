@@ -248,19 +248,42 @@ def test_update_agent_status_updates_overall_status():
 
     def upd_details(pid, details, modified_by=None):
         holder["value"] = json.loads(json.dumps(details))
-        conn.cursor_obj.params = [json.dumps(details)]
+
+    def upd_status(pid, status, modified_by=None, process_details=None):
+        holder["value"] = json.loads(json.dumps(process_details))
+        conn.cursor_obj.params = (status, json.dumps(process_details))
 
     prs.get_process_details = get_details
     prs.update_process_details = upd_details
+    prs.update_process_status = upd_status
 
     prs.update_agent_status(1, "A1", "completed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "saved"
+    assert holder["value"]["status"] == "saved"
 
     prs.update_agent_status(1, "A2", "completed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "completed"
+    assert holder["value"]["status"] == "completed"
+    assert conn.cursor_obj.params[0] == 1
 
     prs.update_agent_status(1, "A1", "failed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "failed"
+    assert holder["value"]["status"] == "failed"
+    assert conn.cursor_obj.params[0] == -1
+
+
+def test_update_process_status_updates_process_details():
+    initial = {"status": "saved", "agents": []}
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+
+    prs.update_process_status(1, 1)
+    params = conn.cursor_obj.params
+    assert params[0] == 1
+    stored = json.loads(params[1])
+    assert stored["status"] == "completed"
 
 
 def test_log_run_detail_keeps_agent_statuses():
