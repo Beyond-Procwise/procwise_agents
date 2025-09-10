@@ -62,11 +62,32 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         sender = data.get("sender", self.agent_nick.settings.ses_default_sender)
         attachments = data.get("attachments")
 
+        draft_only = data.get("draft_only", False)
+
         if not recipient:
+            html_body = ""
+            prompt = PROMPT_TEMPLATE.format(
+                supplier_contact_name=data.get("supplier_contact_name", "Supplier"),
+                submission_deadline=data.get("submission_deadline", ""),
+                category_manager_name=data.get("category_manager_name", ""),
+                category_manager_title=data.get("category_manager_title", ""),
+                category_manager_email=data.get("category_manager_email", ""),
+                your_name=data.get("your_name", ""),
+                your_title=data.get("your_title", ""),
+                your_company=data.get("your_company", ""),
+            )
             return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error="recipient not provided",
+                status=AgentStatus.SUCCESS,
+                data={
+                    "subject": subject,
+                    "body": html_body,
+                    "prompt": prompt,
+                    "recipient": None,
+                    "sender": sender,
+                    "attachments": attachments,
+                    "sent": False,
+                    "message": "recipient not provided",
+                },
             )
 
         fmt_args = {
@@ -93,12 +114,18 @@ Please complete the table in full to ensure your proposal can be evaluated accur
 
         prompt = PROMPT_TEMPLATE.format(**fmt_args)
 
-        success = self.email_service.send_email(
-            subject, html_body, recipient, sender, attachments
-        )
-        status = AgentStatus.SUCCESS if success else AgentStatus.FAILED
+        sent = False
+        if not draft_only:
+            try:
+                sent = self.email_service.send_email(
+                    subject, html_body, recipient, sender, attachments
+                )
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("failed to send email")
+        message = "email sent" if sent else "email drafted"
+
         return AgentOutput(
-            status=status,
+            status=AgentStatus.SUCCESS,
             data={
                 "subject": subject,
                 "body": html_body,
@@ -106,6 +133,8 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 "recipient": recipient,
                 "sender": sender,
                 "attachments": attachments,
+                "sent": sent,
+                "message": message,
             },
         )
 

@@ -25,10 +25,26 @@ class NegotiationAgent(BaseAgent):
         target_price = context.input_data.get("target_price")
 
         if supplier is None or current_offer is None or target_price is None:
+            """Gracefully handle missing negotiation inputs.
+
+            Some flows may branch to the negotiation agent even when the
+            necessary fields are absent (e.g. no quote returned).  Rather than
+            failing the workflow we return a success with an explanatory
+            message so downstream steps can decide how to proceed.
+            """
             return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error="missing required fields",
+                status=AgentStatus.SUCCESS,
+                data={
+                    "supplier": supplier,
+                    "counter_proposals": [],
+                    "strategy": None,
+                    "savings_score": 0.0,
+                    "decision_log": "no negotiation data provided",
+                    "message": "",
+                    "transcript": [],
+                    "references": [],
+                },
+                next_agents=[],
             )
 
         # Retrieve negotiation strategy from Postgres
