@@ -191,12 +191,12 @@ def test_update_agent_status_preserves_structure():
     )
     prs = ProcessRoutingService(agent)
     prs.get_process_details = lambda pid, **kwargs: initial
-    prs.update_agent_status(1, "A2", "running")
+    prs.update_agent_status(1, "A2", "validated")
     updated = json.loads(conn.cursor_obj.params[0])
-    assert updated["agents"][1]["status"] == "running"
+    assert updated["agents"][1]["status"] == "validated"
     assert updated["agents"][0]["status"] == "saved"
     assert updated["agents"][2]["dependencies"]["onFailure"] == ["A1"]
-    assert updated["status"] == 0
+    assert updated["status"] == "saved"
 
 
 
@@ -218,13 +218,49 @@ def test_update_agent_status_preserves_structure_scenario2():
     prs = ProcessRoutingService(agent)
     prs.get_process_details = lambda pid, **kwargs: initial
 
-    prs.update_agent_status(1, "A4", "running")
+    prs.update_agent_status(1, "A4", "validated")
     updated = json.loads(conn.cursor_obj.params[0])
-    assert updated["agents"][3]["status"] == "running"
+    assert updated["agents"][3]["status"] == "validated"
     assert updated["agents"][2]["dependencies"]["onSuccess"] == ["A1"]
     assert updated["agents"][3]["dependencies"]["onFailure"] == ["A1", "A2"]
-    assert updated["status"] == 0
+    assert updated["status"] == "saved"
 
+
+
+def test_update_agent_status_updates_overall_status():
+    initial = {
+        "status": "saved",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    holder = {"value": initial}
+
+    def get_details(pid, **kwargs):
+        return holder["value"]
+
+    def upd_details(pid, details, modified_by=None):
+        holder["value"] = json.loads(json.dumps(details))
+        conn.cursor_obj.params = [json.dumps(details)]
+
+    prs.get_process_details = get_details
+    prs.update_process_details = upd_details
+
+    prs.update_agent_status(1, "A1", "completed")
+    assert json.loads(conn.cursor_obj.params[0])["status"] == "saved"
+
+    prs.update_agent_status(1, "A2", "completed")
+    assert json.loads(conn.cursor_obj.params[0])["status"] == "completed"
+
+    prs.update_agent_status(1, "A1", "failed")
+    assert json.loads(conn.cursor_obj.params[0])["status"] == "failed"
 
 
 def test_log_run_detail_keeps_agent_statuses():
@@ -250,7 +286,7 @@ def test_log_run_detail_keeps_agent_statuses():
         triggered_by="tester",
     )
     updated = json.loads(conn.cursor_obj.params[1])
-    assert updated["status"] == 100
+    assert updated["status"] == "saved"
 
     assert updated["agents"][0]["status"] == "running"
     assert updated["agents"][1]["status"] == "saved"

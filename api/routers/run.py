@@ -53,10 +53,9 @@ def run_agents(
     if details is None:
         raise HTTPException(status_code=404, detail="Process not found")
 
-    # Initialise workflow progress to ``0`` before kicking off the background
-    # execution so that callers can poll for real-time updates.
-    details["status"] = 0
-
+    # Persist the initial details so that callers can poll for updates while
+    # the workflow executes. The top-level status remains ``saved`` until the
+    # entire flow succeeds or fails.
     try:
         prs.update_process_details(req.process_id, details)
     except Exception:
@@ -90,7 +89,7 @@ def run_agents(
             try:
                 prs.update_process_details(
                     process_id,
-                    {"status": 0, "error": str(exc)},
+                    {"status": "failed", "error": str(exc)},
                 )
             except Exception:
                 logger.exception(
