@@ -424,8 +424,6 @@ class Orchestrator:
                 except Exception as exc:  # pragma: no cover - execution error
                     logger.exception("Agent %s execution failed", agent_key)
                     run_ctx["errors"][step_name] = str(exc)
-            success = False
-
             if not success:
                 flow_status = "failed"
                 if on_error == "fail":

@@ -53,10 +53,9 @@ def run_agents(
     if details is None:
         raise HTTPException(status_code=404, detail="Process not found")
 
-    # Mark the process as started (process_status=0) before kicking off the
-    # background execution so that callers can poll for progress in
-    # real-time.
-    details["process_status"] = 0
+    # Mark the process as started before kicking off the background execution
+    # so that callers can poll for progress in real-time.
+    details["status"] = "started"
     try:
         prs.update_process_details(req.process_id, details)
     except Exception:
@@ -75,7 +74,6 @@ def run_agents(
             logger.debug("Execution result for process %s: %s", process_id, result)
             if isinstance(result, dict):
                 final = result.get("status")
-                result["process_status"] = 1 if final != "failed" else -1
                 try:
                     prs.update_process_details(process_id, result)
                 except Exception:

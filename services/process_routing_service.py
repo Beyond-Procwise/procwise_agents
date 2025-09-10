@@ -62,12 +62,6 @@ class ProcessRoutingService:
         """
         details = details.copy() if isinstance(details, dict) else {}
         details.setdefault("status", "")
-        # Track high level run state separately from per-agent status.
-        # ``process_status`` mirrors the ``process_status`` column in the
-        # database and is used by the ``/run`` endpoint for real-time
-        # updates.  ``0`` indicates the run has started, ``1`` means
-        # success and ``-1`` a failure.
-        details.setdefault("process_status", 0)
         agents = []
         for agent in details.get("agents", []) or []:
             if not isinstance(agent, dict):
@@ -338,6 +332,28 @@ class ProcessRoutingService:
                 "Failed to update details for process %s", process_id
             )
 
+    def update_agent_status(
+        self,
+        process_id: int,
+        agent_name: str,
+        status: str,
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Update the status for a specific agent within ``process_details``.
+
+        The overall structure of the ``process_details`` column is preserved by
+        normalising the payload and only mutating the targeted agent's
+        ``status`` field.
+        """
+        details = self.get_process_details(process_id) or {}
+        agents = details.get("agents", [])
+        for agent in agents:
+            if agent.get("agent") == agent_name:
+                agent["status"] = status
+                break
+        details["agents"] = agents
+        self.update_process_details(process_id, details, modified_by)
+
     def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
         """Update process status in ``proc.routing``.
 
@@ -455,31 +471,17 @@ class ProcessRoutingService:
 
 
         def _annotate_process_details(details: Optional[Dict[str, Any]], status_text: str) -> Dict[str, Any]:
-            """Ensure `details` is a dict and annotate agent sub-entries with status_text.
+            """Ensure `details` is a dict and annotate top-level status.
 
-            Heuristics:
-            - If `details` has an `agents` key with a list of dicts, set each agent['status'].
-            - Otherwise, for any nested dict values, set their 'status'.
-            - Fallback: set top-level `details['status']`.
+            ``process_details`` entries describe an entire workflow of agents
+            with nested dependencies.  Real-time status updates for individual
+            agents are handled elsewhere, so this helper should avoid mutating
+            those sub-entries.  Only the overall ``status`` field is adjusted
+            here to reflect the run's state while preserving the original
+            structure.
             """
             details = self.normalize_process_details(details)
-            agents = details.get("agents")
-            if isinstance(agents, list):
-                for a in agents:
-                    if isinstance(a, dict):
-                        a["status"] = status_text
-                details["agents"] = agents
-                return details
-
-            updated = False
-            for k, v in details.items():
-                if isinstance(v, dict):
-                    v["status"] = status_text
-                    updated = True
-
-            if not updated:
-                details["status"] = status_text
-
+            details["status"] = status_text
             return details
 
         run_id = run_id or str(uuid.uuid4())

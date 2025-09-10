@@ -80,9 +80,8 @@ def test_run_endpoint_process_id_executes_flow():
 
     assert prs.status_updates == [(5, 1)]
     # First update marks the run as started
-    assert prs.details_updates[0]["process_status"] == 0
+    assert prs.details_updates[0]["status"] == "started"
     # Final update contains completion information
-    assert prs.details_updates[1]["process_status"] == 1
     assert prs.details_updates[1]["status"] == "completed"
     assert orchestrator.received_flow["agent_type"] == "1"
     assert orchestrator.received_payload == {"foo": "bar"}
@@ -135,4 +134,3 @@ def test_run_endpoint_updates_nested_statuses_independently():
     assert saved["status"] == "completed"
     assert saved["onSuccess"]["status"] == "completed"
     assert saved["onFailure"]["status"] == "saved"
-    assert saved["process_status"] == 1
