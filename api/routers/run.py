@@ -2,6 +2,7 @@ import os
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from typing import Any, Dict, Optional
 import threading
 import asyncio
 import inspect
@@ -24,6 +25,7 @@ class RunRequest(BaseModel):
     """Request schema for the ``/run`` endpoint."""
 
     process_id: int
+    payload: Optional[Dict[str, Any]] = None
 
 
 def get_orchestrator(request: Request) -> Orchestrator:
@@ -64,10 +66,10 @@ def run_agents(
 
     # Run the long-running execution in background
 
-    def _background_run(details_obj, process_id):
+    def _background_run(details_obj, payload, process_id):
         logger.info("Starting background run for process %s", process_id)
         try:
-            result = orchestrator.execute_agent_flow(details_obj)
+            result = orchestrator.execute_agent_flow(details_obj, payload)
             if inspect.iscoroutine(result):
                 result = asyncio.run(result)
             logger.debug("Execution result for process %s: %s", process_id, result)
@@ -97,7 +99,7 @@ def run_agents(
                     "Failed to update process %s to failed status", process_id
                 )
 
-    t = threading.Thread(target=_background_run, args=(details, req.process_id), daemon=True)
+    t = threading.Thread(target=_background_run, args=(details, req.payload or {}, req.process_id), daemon=True)
     t.start()
 
     return {"status": "started"}

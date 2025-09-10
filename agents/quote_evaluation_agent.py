@@ -34,10 +34,11 @@ class QuoteEvaluationAgent(BaseAgent):
             )
 
             if not quotes:
+                # Absence of quotes should not be treated as a hard failure:
+                # downstream agents may still proceed with an empty result set.
                 return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={"message": "No quotes found"},
-                    error="No quotes to evaluate",
+                    status=AgentStatus.SUCCESS,
+                    data={"quotes": [], "message": "No quotes found"},
                 )
 
             simplified: List[Dict] = []
