@@ -87,10 +87,14 @@ def run_agents(
                 "Process %s raised an exception during execution", process_id
             )
             try:
-                prs.update_process_details(
-                    process_id,
-                    {"status": "failed", "error": str(exc)},
-                )
+                # Preserve the existing ``process_details`` structure while
+                # annotating the failure.  This ensures agent-level metadata
+                # remains intact for debugging or retries.
+                existing = prs.get_process_details(process_id, raw=True) or {}
+                existing["status"] = "failed"
+                existing["error"] = str(exc)
+                prs.update_process_details(process_id, existing)
+
             except Exception:
                 logger.exception(
                     "Failed to persist error details for process %s", process_id

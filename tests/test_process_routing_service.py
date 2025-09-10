@@ -267,7 +267,7 @@ def test_log_run_detail_keeps_agent_statuses():
     details = {
         "status": "",
         "agents": [
-            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "running", "agent_ref_id": "1"},
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "validated", "agent_ref_id": "1"},
             {"agent": "A2", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
         ],
     }
@@ -288,5 +288,5 @@ def test_log_run_detail_keeps_agent_statuses():
     updated = json.loads(conn.cursor_obj.params[1])
     assert updated["status"] == "saved"
 
-    assert updated["agents"][0]["status"] == "running"
+    assert updated["agents"][0]["status"] == "validated"
     assert updated["agents"][1]["status"] == "saved"

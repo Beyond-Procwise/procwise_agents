@@ -538,7 +538,10 @@ class Orchestrator:
                 input_data=input_data,
             )
             if prs and process_id is not None:
-                prs.update_agent_status(process_id, node.get("agent"), "running")
+                # Mark the agent as validated when execution begins to mirror
+                # the real-time status transitions expected by the workflow
+                # tracking requirements.
+                prs.update_agent_status(process_id, node.get("agent"), "validated")
 
             result = agent.execute(context)
             node["status"] = (

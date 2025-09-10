@@ -418,7 +418,7 @@ class ProcessRoutingService:
         agent_type: str,
         action_desc: Any,
         process_output: Optional[Any] = None,
-        status: str = "running",
+        status: str = "validated",
         action_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Optional[str]:
