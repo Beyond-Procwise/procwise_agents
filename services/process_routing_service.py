@@ -357,7 +357,14 @@ class ProcessRoutingService:
         normalising the payload and only mutating the targeted agent's
         ``status`` field.
         """
-        details = self.get_process_details(process_id, raw=True) or {}
+        details = self.get_process_details(process_id, raw=True)
+        if not details or "agents" not in details:
+            logger.warning(
+                "No process_details found for process %s; skipping agent status update",
+                process_id,
+            )
+            return
+
         agents = details.get("agents", [])
         for agent in agents:
             if agent.get("agent") == agent_name:

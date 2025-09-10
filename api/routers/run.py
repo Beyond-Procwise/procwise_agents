@@ -49,9 +49,15 @@ def run_agents(
             status_code=503, detail="Process routing service is not available."
         )
 
-    details = prs.get_process_details(req.process_id)
+    # Fetch raw ``process_details`` so that the original agent list structure
+    # is preserved in the routing table.  The returned object is converted to a
+    # runnable flow only for in-memory execution.
+    details = prs.get_process_details(req.process_id, raw=True)
     if details is None:
         raise HTTPException(status_code=404, detail="Process not found")
+    flow = prs.convert_agents_to_flow(details)
+    agent_defs, prompt_map, policy_map = prs._load_agent_links()
+    prs._enrich_node(flow, agent_defs, prompt_map, policy_map)
 
     # Persist the initial details so that callers can poll for updates while
     # the workflow executes. The top-level status remains ``saved`` until the
@@ -65,11 +71,11 @@ def run_agents(
 
     # Run the long-running execution in background
 
-    def _background_run(details_obj, payload, process_id):
+    def _background_run(flow_obj, payload, process_id):
         logger.info("Starting background run for process %s", process_id)
         try:
             result = orchestrator.execute_agent_flow(
-                details_obj, payload, process_id=process_id, prs=prs
+                flow_obj, payload, process_id=process_id, prs=prs
             )
             if inspect.iscoroutine(result):
                 result = asyncio.run(result)
@@ -106,7 +112,7 @@ def run_agents(
                     "Failed to update process %s to failed status", process_id
                 )
 
-    t = threading.Thread(target=_background_run, args=(details, req.payload or {}, req.process_id), daemon=True)
+    t = threading.Thread(target=_background_run, args=(flow, req.payload or {}, req.process_id), daemon=True)
     t.start()
 
     return {"status": "started"}
