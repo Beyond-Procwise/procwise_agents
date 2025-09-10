@@ -56,6 +56,7 @@ def run_agents(
     # Initialise workflow progress to ``0`` before kicking off the background
     # execution so that callers can poll for real-time updates.
     details["status"] = 0
+
     try:
         prs.update_process_details(req.process_id, details)
     except Exception:

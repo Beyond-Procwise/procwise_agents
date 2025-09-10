@@ -199,6 +199,7 @@ def test_update_agent_status_preserves_structure():
     assert updated["status"] == 0
 
 
+
 def test_update_agent_status_preserves_structure_scenario2():
     initial = {
         "status": "",
@@ -216,12 +217,14 @@ def test_update_agent_status_preserves_structure_scenario2():
     )
     prs = ProcessRoutingService(agent)
     prs.get_process_details = lambda pid, **kwargs: initial
+
     prs.update_agent_status(1, "A4", "running")
     updated = json.loads(conn.cursor_obj.params[0])
     assert updated["agents"][3]["status"] == "running"
     assert updated["agents"][2]["dependencies"]["onSuccess"] == ["A1"]
     assert updated["agents"][3]["dependencies"]["onFailure"] == ["A1", "A2"]
     assert updated["status"] == 0
+
 
 
 def test_log_run_detail_keeps_agent_statuses():
@@ -248,5 +251,6 @@ def test_log_run_detail_keeps_agent_statuses():
     )
     updated = json.loads(conn.cursor_obj.params[1])
     assert updated["status"] == 100
+
     assert updated["agents"][0]["status"] == "running"
     assert updated["agents"][1]["status"] == "saved"

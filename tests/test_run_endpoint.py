@@ -89,6 +89,7 @@ def test_run_endpoint_process_id_executes_flow():
     assert prs.status_updates == [(5, 1)]
     assert prs.details_updates[0]["status"] == 0
     assert prs.details_updates[1]["status"] == 100
+
     assert orchestrator.received_payload == {"foo": "bar"}
 
 

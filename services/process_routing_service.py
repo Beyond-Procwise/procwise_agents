@@ -365,6 +365,7 @@ class ProcessRoutingService:
         progress = int((completed / total) * 100) if total else 0
         details["agents"] = agents
         details["status"] = progress
+
         self.update_process_details(process_id, details, modified_by)
 
     def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
@@ -483,18 +484,19 @@ class ProcessRoutingService:
     ) -> Optional[str]:
 
 
-        def _annotate_process_details(details: Optional[Dict[str, Any]], status_progress: int) -> Dict[str, Any]:
-            """Ensure `details` is a dict and annotate top-level progress.
+      def _annotate_process_details(details: Optional[Dict[str, Any]], status_progress: int) -> Dict[str, Any]:
+          """Ensure `details` is a dict and annotate top-level progress.
 
-            ``process_details`` describe entire workflows with nested agent
-            dependencies.  Per-agent status updates are performed elsewhere, so
-            this helper only updates the overall numeric ``status`` field to
-            reflect the workflow's progress while preserving the existing
-            structure.
-            """
-            details = self.normalize_process_details(details)
-            details["status"] = status_progress
-            return details
+          ``process_details`` describe entire workflows with nested agent
+          dependencies.  Per-agent status updates are performed elsewhere, so
+          this helper only updates the overall numeric ``status`` field to
+          reflect the workflow's progress while preserving the existing
+          structure.
+          """
+          details = self.normalize_process_details(details)
+          details["status"] = status_progress
+
+          return details
 
         run_id = run_id or str(uuid.uuid4())
         process_start_ts = process_start_ts or datetime.utcnow()
