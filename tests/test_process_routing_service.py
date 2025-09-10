@@ -268,6 +268,7 @@ def test_update_agent_status_updates_overall_status():
     prs.update_agent_status(1, "A1", "completed")
     assert holder["value"]["status"] == "running"
 
+
     prs.update_agent_status(1, "A2", "completed")
     assert holder["value"]["status"] == "completed"
     assert conn.cursor_obj.params[0] == 1
@@ -294,7 +295,6 @@ def test_update_agent_status_enforces_sequence():
     prs.get_process_details = lambda pid, **kwargs: initial
     with pytest.raises(ValueError):
         prs.update_agent_status(1, "A2", "validated")
-
 
 def test_update_process_status_updates_process_details():
     initial = {"status": "saved", "agents": []}
