@@ -61,7 +61,11 @@ class ProcessRoutingService:
         Missing fields are populated with sensible defaults.
         """
         details = details.copy() if isinstance(details, dict) else {}
-        details.setdefault("status", "")
+        # Default the overall workflow status to ``saved`` when missing or
+        # empty so that callers can reason about progress using explicit
+        # textual states rather than numeric placeholders.
+        status = details.get("status")
+        details["status"] = status if status else "saved"
         agents = []
         for agent in details.get("agents", []) or []:
             if not isinstance(agent, dict):
@@ -355,16 +359,21 @@ class ProcessRoutingService:
         """
         details = self.get_process_details(process_id, raw=True) or {}
         agents = details.get("agents", [])
-        total = len(agents)
-        completed = 0
         for agent in agents:
             if agent.get("agent") == agent_name:
                 agent["status"] = status
-            if agent.get("status") in ("completed", "failed"):
-                completed += 1
-        progress = int((completed / total) * 100) if total else 0
+
+        # Derive the overall workflow status based on individual agent states.
+        statuses = [a.get("status") for a in agents]
+        if any(s == "failed" for s in statuses):
+            overall = "failed"
+        elif statuses and all(s == "completed" for s in statuses):
+            overall = "completed"
+        else:
+            overall = details.get("status", "saved") or "saved"
+
         details["agents"] = agents
-        details["status"] = progress
+        details["status"] = overall
 
         self.update_process_details(process_id, details, modified_by)
 
@@ -409,7 +418,7 @@ class ProcessRoutingService:
         agent_type: str,
         action_desc: Any,
         process_output: Optional[Any] = None,
-        status: str = "running",
+        status: str = "validated",
         action_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Optional[str]:
@@ -484,19 +493,15 @@ class ProcessRoutingService:
     ) -> Optional[str]:
 
 
-      def _annotate_process_details(details: Optional[Dict[str, Any]], status_progress: int) -> Dict[str, Any]:
-          """Ensure `details` is a dict and annotate top-level progress.
+        def _annotate_process_details(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            """Normalise ``details`` without altering workflow status.
 
-          ``process_details`` describe entire workflows with nested agent
-          dependencies.  Per-agent status updates are performed elsewhere, so
-          this helper only updates the overall numeric ``status`` field to
-          reflect the workflow's progress while preserving the existing
-          structure.
-          """
-          details = self.normalize_process_details(details)
-          details["status"] = status_progress
-
-          return details
+            The per-agent statuses are managed via :meth:`update_agent_status`.
+            When logging run details we simply ensure the payload adheres to the
+            expected schema while preserving any existing top-level ``status``
+            value so that the overall workflow state remains intact.
+            """
+            return self.normalize_process_details(details)
 
         run_id = run_id or str(uuid.uuid4())
         process_start_ts = process_start_ts or datetime.utcnow()
@@ -533,10 +538,8 @@ class ProcessRoutingService:
         else:
             status_text = "failed" if status_int < 0 else "completed"
 
-        status_progress = 100 if ps in success_vals else 0
-
-        # Annotate process_details per-agent with the derived numeric progress
-        annotated_details = _annotate_process_details(process_details, status_progress)
+        # Normalise process_details without mutating the existing workflow status
+        annotated_details = _annotate_process_details(process_details)
 
         raw_payload = {
             "run_id": run_id,

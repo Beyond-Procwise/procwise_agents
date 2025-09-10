@@ -417,7 +417,10 @@ class Orchestrator:
             attempt = 0
             result = None
             if prs and process_id is not None:
-                prs.update_agent_status(process_id, step_name, "running")
+                # Mark the agent as ``validated`` to indicate it has started
+                # execution. Downstream status transitions are handled once the
+                # agent completes.
+                prs.update_agent_status(process_id, step_name, "validated")
             while attempt <= retries and not success:
                 attempt += 1
                 context = AgentContext(
@@ -535,7 +538,10 @@ class Orchestrator:
                 input_data=input_data,
             )
             if prs and process_id is not None:
-                prs.update_agent_status(process_id, node.get("agent"), "running")
+                # Mark the agent as validated when execution begins to mirror
+                # the real-time status transitions expected by the workflow
+                # tracking requirements.
+                prs.update_agent_status(process_id, node.get("agent"), "validated")
 
             result = agent.execute(context)
             node["status"] = (

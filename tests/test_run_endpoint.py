@@ -13,7 +13,7 @@ import copy
 
 
 class DummyPRS:
-    def __init__(self, status=0):
+    def __init__(self, status="saved"):
         self.status_updates = []
         self.details_updates = []
         self.status = status
@@ -36,9 +36,13 @@ class DummyPRS:
         for agent in self.details["agents"]:
             if agent["agent"] == agent_name:
                 agent["status"] = status
-        completed = sum(1 for a in self.details["agents"] if a["status"] in ("completed", "failed"))
-        total = len(self.details["agents"])
-        self.details["status"] = int(completed / total * 100) if total else 0
+        statuses = [a["status"] for a in self.details["agents"]]
+        if any(s == "failed" for s in statuses):
+            self.details["status"] = "failed"
+        elif all(s == "completed" for s in statuses):
+            self.details["status"] = "completed"
+        else:
+            self.details["status"] = "saved"
         self.update_process_details(process_id, self.details)
 
     def log_run_detail(self, **kwargs):
@@ -87,8 +91,8 @@ def test_run_endpoint_process_id_executes_flow():
         time.sleep(0.01)
 
     assert prs.status_updates == [(5, 1)]
-    assert prs.details_updates[0]["status"] == 0
-    assert prs.details_updates[1]["status"] == 100
+    assert prs.details_updates[0]["status"] == "saved"
+    assert prs.details_updates[-1]["status"] == "completed"
 
     assert orchestrator.received_payload == {"foo": "bar"}
 
@@ -97,11 +101,11 @@ def test_run_endpoint_updates_nested_statuses_independently():
     class NestedPRS(DummyPRS):
         def get_process_details(self, process_id):
             return {
-                "status": 0,
+                "status": "saved",
                 "agent_type": "1",
                 "agent_property": {"llm": "mistral", "prompts": [1], "policies": [2]},
                 "onSuccess": {
-                    "status": 0,
+                    "status": "saved",
                     "agent_type": "1",
                     "agent_property": {"llm": "mistral", "prompts": [1], "policies": [2]},
                 },
@@ -118,8 +122,8 @@ def test_run_endpoint_updates_nested_statuses_independently():
             self.received_payload = payload
             if prs and process_id is not None:
                 prs.update_process_details(process_id, flow)
-                flow["status"] = 100
-                flow["onSuccess"]["status"] = 100
+                flow["status"] = "completed"
+                flow["onSuccess"]["status"] = "completed"
                 prs.update_process_details(process_id, flow)
             return {"status": 100, **flow}
 
@@ -140,6 +144,6 @@ def test_run_endpoint_updates_nested_statuses_independently():
         time.sleep(0.01)
 
     saved = prs.details_updates[-1]
-    assert saved["status"] == 100
-    assert saved["onSuccess"]["status"] == 100
+    assert saved["status"] == "completed"
+    assert saved["onSuccess"]["status"] == "completed"
     assert saved["onFailure"]["status"] == "saved"
