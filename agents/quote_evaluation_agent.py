@@ -28,6 +28,10 @@ class QuoteEvaluationAgent(BaseAgent):
                 or input_data.get("product_type")
                 or None
             )
+            weights = input_data.get(
+                "weights", {"price": 0.5, "delivery": 0.3, "risk": 0.2}
+            )
+
             quotes = self._fetch_quotes(
                 input_data.get("supplier_names", []),
                 product_category,
@@ -56,7 +60,7 @@ class QuoteEvaluationAgent(BaseAgent):
 
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data=self._to_native({"quotes": simplified}),
+                data=self._to_native({"quotes": simplified, "weights": weights}),
             )
         except Exception as exc:
             logger.error("QuoteEvaluationAgent error: %s", exc)

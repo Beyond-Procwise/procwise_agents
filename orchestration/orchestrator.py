@@ -318,7 +318,9 @@ class Orchestrator:
         steps = flow.get("steps", {})
         entry = flow.get("entrypoint")
         defaults = flow.get("defaults", {})
-        run_ctx: Dict[str, Any] = {"payload": payload}
+        run_ctx: Dict[str, Any] = {"payload": payload, "errors": {}}
+        agent_defs = self._load_agent_definitions()
+
 
         def _render(value: Any) -> Any:
             if isinstance(value, str):
@@ -383,10 +385,16 @@ class Orchestrator:
                     queue.extend(next_steps)
                     continue
 
-            agent_key = step.get("agent")
-            agent = self.agents.get(agent_key)
+            agent_key_raw = step.get("agent")
+            slug = self._canonical_key(agent_key_raw, agent_defs) or self._resolve_agent_name(agent_key_raw)
+            agent = self.agents.get(slug) or self.agents.get(agent_key_raw)
             if not agent:
-                raise ValueError(f"Agent '{agent_key}' not registered")
+                logger.error("Agent %s not registered", agent_key_raw)
+                run_ctx["errors"][step_name] = f"Agent '{agent_key_raw}' not registered"
+                flow_status = "failed"
+                continue
+            agent_key = slug or agent_key_raw
+
 
             retries = int(step.get("retry", 0))
             timeout = step.get("timeout_seconds")
@@ -413,9 +421,10 @@ class Orchestrator:
                     else:
                         result = agent.execute(context)
                     success = result and result.status == AgentStatus.SUCCESS
-                except Exception:  # pragma: no cover - execution error
+                except Exception as exc:  # pragma: no cover - execution error
                     logger.exception("Agent %s execution failed", agent_key)
-                    success = False
+                    run_ctx["errors"][step_name] = str(exc)
+            success = False
 
             if not success:
                 flow_status = "failed"
@@ -431,6 +440,8 @@ class Orchestrator:
             if result and result.pass_fields:
                 for k, v in result.pass_fields.items():
                     run_ctx[k] = v
+            if result and result.error:
+                run_ctx["errors"][step_name] = result.error
 
             next_steps = step.get("next", [])
             if isinstance(next_steps, str):

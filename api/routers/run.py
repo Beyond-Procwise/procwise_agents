@@ -88,10 +88,19 @@ def run_agents(
             logger.info(
                 "Completed process %s with final status %s", process_id, final
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Process %s raised an exception during execution", process_id
             )
+            try:
+                prs.update_process_details(
+                    process_id,
+                    {"status": "failed", "error": str(exc)},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist error details for process %s", process_id
+                )
             try:
                 prs.update_process_status(process_id, -1)
             except Exception:

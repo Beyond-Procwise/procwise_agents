@@ -69,6 +69,24 @@ def test_quote_evaluation_agent_run(monkeypatch):
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert output.data["quotes"][0]["total_spend"] == 1000
+    assert output.data["weights"]["price"] == 0.5
+
+
+def test_quote_evaluation_handles_no_quotes(monkeypatch):
+    """Agent should succeed gracefully when no quotes are found."""
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+    monkeypatch.setattr(agent, "_fetch_quotes", lambda *_, **__: [])
+    context = AgentContext(
+        workflow_id="wf_empty",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={},
+    )
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["quotes"] == []
+    assert "weights" in output.data
 
 
 def test_quote_evaluation_handles_no_quotes(monkeypatch):

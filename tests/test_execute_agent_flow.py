@@ -83,6 +83,29 @@ def test_execute_agent_flow_runs_and_updates_status():
     assert agent.ran is True
 
 
+def test_json_flow_handles_decorated_agent_names():
+    agent = DummyAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"quote_evaluation": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "quote_evaluation": "QuoteEvaluationAgent"
+    }
+    flow = {
+        "entrypoint": "step1",
+        "steps": {
+            "step1": {"agent": "user_quote_evaluation_agent_1"}
+        },
+    }
+    orchestrator.execute_agent_flow(flow)
+    assert agent.ran is True
+
+
 def test_execute_agent_flow_preserves_root_status_on_failure_chain():
     """If the first agent fails, the overall flow should remain failed even
     if a downstream agent succeeds."""
