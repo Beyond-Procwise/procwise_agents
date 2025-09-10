@@ -53,9 +53,10 @@ def run_agents(
     if details is None:
         raise HTTPException(status_code=404, detail="Process not found")
 
-    # Mark the process as started before kicking off the background execution
-    # so that callers can poll for progress in real-time.
-    details["status"] = "started"
+    # Initialise workflow progress to ``0`` before kicking off the background
+    # execution so that callers can poll for real-time updates.
+    details["status"] = 0
+
     try:
         prs.update_process_details(req.process_id, details)
     except Exception:
@@ -68,21 +69,17 @@ def run_agents(
     def _background_run(details_obj, payload, process_id):
         logger.info("Starting background run for process %s", process_id)
         try:
-            result = orchestrator.execute_agent_flow(details_obj, payload)
+            result = orchestrator.execute_agent_flow(
+                details_obj, payload, process_id=process_id, prs=prs
+            )
             if inspect.iscoroutine(result):
                 result = asyncio.run(result)
             logger.debug("Execution result for process %s: %s", process_id, result)
             if isinstance(result, dict):
                 final = result.get("status")
-                try:
-                    prs.update_process_details(process_id, result)
-                except Exception:
-                    logger.exception(
-                        "Failed to update process %s details", process_id
-                    )
             else:
-                final = "failed"
-            prs.update_process_status(process_id, 1 if final != "failed" else -1)
+                final = 0
+            prs.update_process_status(process_id, 1 if final == 100 else -1)
             logger.info(
                 "Completed process %s with final status %s", process_id, final
             )
@@ -93,7 +90,7 @@ def run_agents(
             try:
                 prs.update_process_details(
                     process_id,
-                    {"status": "failed", "error": str(exc)},
+                    {"status": 0, "error": str(exc)},
                 )
             except Exception:
                 logger.exception(
