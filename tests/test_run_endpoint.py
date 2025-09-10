@@ -109,6 +109,75 @@ def test_run_endpoint_process_id_executes_flow():
     assert orchestrator.received_payload == {"foo": "bar"}
 
 
+def test_run_endpoint_triggers_all_agents_and_updates_status():
+    class MultiPRS(DummyPRS):
+        def __init__(self):
+            super().__init__()
+            self.details = {
+                "status": "saved",
+                "agents": [
+                    {
+                        "agent": "A1",
+                        "status": "saved",
+                        "dependencies": {
+                            "onSuccess": ["A2"],
+                            "onFailure": [],
+                            "onCompletion": [],
+                        },
+                        "agent_ref_id": "1",
+                    },
+                    {
+                        "agent": "A2",
+                        "status": "saved",
+                        "dependencies": {
+                            "onSuccess": [],
+                            "onFailure": [],
+                            "onCompletion": [],
+                        },
+                        "agent_ref_id": "2",
+                    },
+                ],
+            }
+            self.agent_updates = []
+
+        def update_agent_status(self, process_id, agent_name, status, **kwargs):
+            self.agent_updates.append((process_id, agent_name, status))
+            super().update_agent_status(process_id, agent_name, status, **kwargs)
+
+    class MultiOrchestrator(DummyOrchestrator):
+        def execute_agent_flow(self, flow, payload=None, process_id=None, prs=None):
+            self.received_flow = flow
+            self.received_payload = payload
+            if prs and process_id is not None:
+                prs.update_agent_status(process_id, "A1", "completed")
+                prs.update_agent_status(process_id, "A2", "completed")
+            return {"status": 100}
+
+    prs = MultiPRS()
+    orchestrator = MultiOrchestrator(prs)
+    client, orchestrator = create_client_with_orchestrator(orchestrator)
+
+    resp = client.post("/run", json={"process_id": 42})
+    assert resp.status_code == 200
+
+    import time
+
+    for _ in range(50):
+        if prs.agent_updates == [
+            (42, "A1", "completed"),
+            (42, "A2", "completed"),
+        ] and prs.status_updates == [(42, 1)]:
+            break
+        time.sleep(0.01)
+
+    assert prs.agent_updates == [
+        (42, "A1", "completed"),
+        (42, "A2", "completed"),
+    ]
+    assert prs.details["status"] == "completed"
+    assert [a["status"] for a in prs.details["agents"]] == ["completed", "completed"]
+
+
 def test_run_endpoint_updates_nested_statuses_independently():
     class NestedPRS(DummyPRS):
         def get_process_details(self, process_id, raw=False):
