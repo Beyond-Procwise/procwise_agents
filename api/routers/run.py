@@ -94,6 +94,7 @@ def run_agents(
                 existing["status"] = "failed"
                 existing["error"] = str(exc)
                 prs.update_process_details(process_id, existing)
+
             except Exception:
                 logger.exception(
                     "Failed to persist error details for process %s", process_id
