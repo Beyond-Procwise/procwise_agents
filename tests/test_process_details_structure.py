@@ -13,7 +13,6 @@ def test_normalize_process_details_scenario1():
     details = ProcessRoutingService.normalize_process_details(raw)
 
     assert details["status"] == ""
-    assert details["process_status"] == 0
     assert len(details["agents"]) == 3
     assert details["agents"][0]["dependencies"] == {
         "onSuccess": [],
@@ -40,7 +39,6 @@ def test_normalize_process_details_scenario2():
     details = ProcessRoutingService.normalize_process_details(raw)
 
     assert details["status"] == "saved"
-    assert details["process_status"] == 0
     assert len(details["agents"]) == 4
     assert details["agents"][2]["dependencies"]["onSuccess"] == ["A1"]
     assert details["agents"][3]["dependencies"]["onFailure"] == ["A1", "A2"]

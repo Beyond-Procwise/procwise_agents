@@ -62,12 +62,6 @@ class ProcessRoutingService:
         """
         details = details.copy() if isinstance(details, dict) else {}
         details.setdefault("status", "")
-        # Track high level run state separately from per-agent status.
-        # ``process_status`` mirrors the ``process_status`` column in the
-        # database and is used by the ``/run`` endpoint for real-time
-        # updates.  ``0`` indicates the run has started, ``1`` means
-        # success and ``-1`` a failure.
-        details.setdefault("process_status", 0)
         agents = []
         for agent in details.get("agents", []) or []:
             if not isinstance(agent, dict):
@@ -139,6 +133,7 @@ class ProcessRoutingService:
         def build(name: str) -> Dict[str, Any]:
             node = agent_map.get(name, {})
             flow = {
+                "agent": name,
                 "status": node.get("status", "saved"),
                 "agent_type": str(node.get("agent_type", node.get("agent", ""))),
                 "agent_property": node.get(
@@ -281,8 +276,14 @@ class ProcessRoutingService:
             logger.exception("Failed to log process %s", process_name)
             return None
 
-    def get_process_details(self, process_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch the ``process_details`` blob for a given ``process_id``."""
+    def get_process_details(self, process_id: int, raw: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetch the ``process_details`` blob for a given ``process_id``.
+
+        When ``raw`` is ``True`` the stored JSON is returned without converting
+        the ``agents`` array into a nested flow or enriching agent metadata.
+        This is useful for direct mutations where the original structure must
+        be preserved (e.g. updating individual agent statuses).
+        """
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -296,10 +297,11 @@ class ProcessRoutingService:
                         if isinstance(value, (str, bytes, bytearray)):
                             value = json.loads(value)
                         details = self.normalize_process_details(value)
-                        if "agent_type" not in details and "agents" in details:
-                            details = self.convert_agents_to_flow(details)
-                        agent_defs, prompt_map, policy_map = self._load_agent_links()
-                        self._enrich_node(details, agent_defs, prompt_map, policy_map)
+                        if not raw:
+                            if "agent_type" not in details and "agents" in details:
+                                details = self.convert_agents_to_flow(details)
+                            agent_defs, prompt_map, policy_map = self._load_agent_links()
+                            self._enrich_node(details, agent_defs, prompt_map, policy_map)
                         return details
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to fetch process %s", process_id)
@@ -337,6 +339,33 @@ class ProcessRoutingService:
             logger.exception(
                 "Failed to update details for process %s", process_id
             )
+
+    def update_agent_status(
+        self,
+        process_id: int,
+        agent_name: str,
+        status: str,
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Update the status for a specific agent within ``process_details``.
+
+        The overall structure of the ``process_details`` column is preserved by
+        normalising the payload and only mutating the targeted agent's
+        ``status`` field.
+        """
+        details = self.get_process_details(process_id, raw=True) or {}
+        agents = details.get("agents", [])
+        total = len(agents)
+        completed = 0
+        for agent in agents:
+            if agent.get("agent") == agent_name:
+                agent["status"] = status
+            if agent.get("status") in ("completed", "failed"):
+                completed += 1
+        progress = int((completed / total) * 100) if total else 0
+        details["agents"] = agents
+        details["status"] = progress
+        self.update_process_details(process_id, details, modified_by)
 
     def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
         """Update process status in ``proc.routing``.
@@ -454,32 +483,17 @@ class ProcessRoutingService:
     ) -> Optional[str]:
 
 
-        def _annotate_process_details(details: Optional[Dict[str, Any]], status_text: str) -> Dict[str, Any]:
-            """Ensure `details` is a dict and annotate agent sub-entries with status_text.
+        def _annotate_process_details(details: Optional[Dict[str, Any]], status_progress: int) -> Dict[str, Any]:
+            """Ensure `details` is a dict and annotate top-level progress.
 
-            Heuristics:
-            - If `details` has an `agents` key with a list of dicts, set each agent['status'].
-            - Otherwise, for any nested dict values, set their 'status'.
-            - Fallback: set top-level `details['status']`.
+            ``process_details`` describe entire workflows with nested agent
+            dependencies.  Per-agent status updates are performed elsewhere, so
+            this helper only updates the overall numeric ``status`` field to
+            reflect the workflow's progress while preserving the existing
+            structure.
             """
             details = self.normalize_process_details(details)
-            agents = details.get("agents")
-            if isinstance(agents, list):
-                for a in agents:
-                    if isinstance(a, dict):
-                        a["status"] = status_text
-                details["agents"] = agents
-                return details
-
-            updated = False
-            for k, v in details.items():
-                if isinstance(v, dict):
-                    v["status"] = status_text
-                    updated = True
-
-            if not updated:
-                details["status"] = status_text
-
+            details["status"] = status_progress
             return details
 
         run_id = run_id or str(uuid.uuid4())
@@ -517,8 +531,10 @@ class ProcessRoutingService:
         else:
             status_text = "failed" if status_int < 0 else "completed"
 
-        # Annotate process_details per-agent with the derived textual status
-        annotated_details = _annotate_process_details(process_details, status_text)
+        status_progress = 100 if ps in success_vals else 0
+
+        # Annotate process_details per-agent with the derived numeric progress
+        annotated_details = _annotate_process_details(process_details, status_progress)
 
         raw_payload = {
             "run_id": run_id,

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -151,7 +152,6 @@ def test_get_process_details_enriches_agent_data():
     assert details["agent_type"] == "SupplierRankingAgent"
     assert details["agent_property"]["prompts"] == [1]
     assert details["agent_property"]["policies"] == [2]
-    assert details["process_status"] == 0
 
 
 def test_get_process_details_handles_prefixed_agent_names():
@@ -173,3 +173,80 @@ def test_get_process_details_handles_prefixed_agent_names():
     )
     details = prs.get_process_details(1)
     assert details["agent_type"] == "QuoteEvaluationAgent"
+
+
+def test_update_agent_status_preserves_structure():
+    initial = {
+        "status": "",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+            {"agent": "A3", "dependencies": {"onSuccess": [], "onFailure": ["A1"], "onCompletion": []}, "status": "saved", "agent_ref_id": "3"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+    prs.update_agent_status(1, "A2", "running")
+    updated = json.loads(conn.cursor_obj.params[0])
+    assert updated["agents"][1]["status"] == "running"
+    assert updated["agents"][0]["status"] == "saved"
+    assert updated["agents"][2]["dependencies"]["onFailure"] == ["A1"]
+    assert updated["status"] == 0
+
+
+def test_update_agent_status_preserves_structure_scenario2():
+    initial = {
+        "status": "",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+            {"agent": "A3", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "3"},
+            {"agent": "A4", "dependencies": {"onSuccess": [], "onFailure": ["A1", "A2"], "onCompletion": []}, "status": "saved", "agent_ref_id": "4"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+    prs.update_agent_status(1, "A4", "running")
+    updated = json.loads(conn.cursor_obj.params[0])
+    assert updated["agents"][3]["status"] == "running"
+    assert updated["agents"][2]["dependencies"]["onSuccess"] == ["A1"]
+    assert updated["agents"][3]["dependencies"]["onFailure"] == ["A1", "A2"]
+    assert updated["status"] == 0
+
+
+def test_log_run_detail_keeps_agent_statuses():
+    details = {
+        "status": "",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "running", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.log_run_detail(
+        process_id=1,
+        process_status="success",
+        process_details=details,
+        process_start_ts=datetime.utcnow(),
+        process_end_ts=datetime.utcnow(),
+        triggered_by="tester",
+    )
+    updated = json.loads(conn.cursor_obj.params[1])
+    assert updated["status"] == 100
+    assert updated["agents"][0]["status"] == "running"
+    assert updated["agents"][1]["status"] == "saved"

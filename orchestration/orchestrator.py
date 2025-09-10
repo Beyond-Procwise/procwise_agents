@@ -298,21 +298,31 @@ class Orchestrator:
         return name
 
     def execute_agent_flow(
-        self, flow: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
+        self,
+        flow: Dict[str, Any],
+        payload: Optional[Dict[str, Any]] = None,
+        process_id: Optional[int] = None,
+        prs: Any = None,
     ) -> Dict[str, Any]:
         """Execute a flow either in new JSON form or legacy tree structure."""
 
         if isinstance(flow, dict) and "entrypoint" in flow and "steps" in flow:
-            return self._execute_json_flow(flow, payload or {})
+            return self._execute_json_flow(flow, payload or {}, process_id, prs)
 
         # Fallback to previous onSuccess/onFailure style graphs
-        return self._execute_legacy_flow(flow)
+        return self._execute_legacy_flow(flow, process_id, prs)
 
     # ------------------------------------------------------------------
     # New JSON flow executor
     # ------------------------------------------------------------------
 
-    def _execute_json_flow(self, flow: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_json_flow(
+        self,
+        flow: Dict[str, Any],
+        payload: Dict[str, Any],
+        process_id: Optional[int] = None,
+        prs: Any = None,
+    ) -> Dict[str, Any]:
         """Execute a flow defined with ``entrypoint`` and ``steps`` fields."""
 
         steps = flow.get("steps", {})
@@ -366,7 +376,7 @@ class Orchestrator:
 
         queue: List[str] = [entry]
         visited: set[str] = set()
-        flow_status = "completed"
+        flow_status = 100
 
         while queue:
             step_name = queue.pop(0)
@@ -391,7 +401,7 @@ class Orchestrator:
             if not agent:
                 logger.error("Agent %s not registered", agent_key_raw)
                 run_ctx["errors"][step_name] = f"Agent '{agent_key_raw}' not registered"
-                flow_status = "failed"
+                flow_status = 0
                 continue
             agent_key = slug or agent_key_raw
 
@@ -406,6 +416,8 @@ class Orchestrator:
             success = False
             attempt = 0
             result = None
+            if prs and process_id is not None:
+                prs.update_agent_status(process_id, step_name, "running")
             while attempt <= retries and not success:
                 attempt += 1
                 context = AgentContext(
@@ -424,12 +436,18 @@ class Orchestrator:
                 except Exception as exc:  # pragma: no cover - execution error
                     logger.exception("Agent %s execution failed", agent_key)
                     run_ctx["errors"][step_name] = str(exc)
-            success = False
-
             if not success:
-                flow_status = "failed"
+                flow_status = 0
                 if on_error == "fail":
-                    return {"status": "failed", "ctx": run_ctx}
+                    if prs and process_id is not None:
+                        prs.update_agent_status(process_id, step_name, "failed")
+                    return {"status": 0, "ctx": run_ctx}
+            if prs and process_id is not None:
+                prs.update_agent_status(
+                    process_id,
+                    step_name,
+                    "completed" if success else "failed",
+                )
 
             # Map outputs regardless of success; downstream may rely on partial data
             outputs = step.get("outputs", {})
@@ -450,7 +468,9 @@ class Orchestrator:
 
         return {"status": flow_status, "ctx": run_ctx}
 
-    def _execute_legacy_flow(self, flow: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_legacy_flow(
+        self, flow: Dict[str, Any], process_id: Optional[int] = None, prs: Any = None
+    ) -> Dict[str, Any]:
         """Execute legacy tree-based flows with ``onSuccess``/``onFailure`` links."""
 
         prompts = self._load_prompts()
@@ -514,6 +534,8 @@ class Orchestrator:
                 user_id=self.settings.script_user,
                 input_data=input_data,
             )
+            if prs and process_id is not None:
+                prs.update_agent_status(process_id, node.get("agent"), "running")
 
             result = agent.execute(context)
             node["status"] = (
@@ -521,6 +543,12 @@ class Orchestrator:
                 if result and result.status == AgentStatus.SUCCESS
                 else "failed"
             )
+            if prs and process_id is not None:
+                prs.update_agent_status(
+                    process_id,
+                    node.get("agent"),
+                    "completed" if result and result.status == AgentStatus.SUCCESS else "failed",
+                )
 
             # Prepare fields for downstream nodes
             next_fields = {**(inherited or {})}
@@ -547,6 +575,7 @@ class Orchestrator:
         # without replacing the root node's status based on downstream
         # results.
         _run(flow)
+        flow["status"] = 100 if flow.get("status") != "failed" else 0
         return flow
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:

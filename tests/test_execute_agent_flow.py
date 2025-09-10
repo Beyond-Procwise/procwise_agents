@@ -43,7 +43,7 @@ def test_json_flow_executes_steps_with_context_mapping():
     }
 
     result = orchestrator.execute_agent_flow(flow, {"value": 1})
-    assert result["status"] == "completed"
+    assert result["status"] == 100
     assert result["ctx"]["calc"] == 1
     assert result["ctx"]["final"] == 2
 
@@ -78,8 +78,8 @@ def test_execute_agent_flow_runs_and_updates_status():
         "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
     }
     result = orchestrator.execute_agent_flow(flow)
-    assert result["status"] == "completed"
-    assert flow["status"] == "completed"
+    assert result["status"] == 100
+    assert flow["status"] == 100
     assert agent.ran is True
 
 
@@ -150,7 +150,7 @@ def test_execute_agent_flow_preserves_root_status_on_failure_chain():
 
     orchestrator.execute_agent_flow(flow)
 
-    assert flow["status"] == "failed"
+    assert flow["status"] == 0
     assert flow["onFailure"]["status"] == "completed"
 
 
@@ -178,7 +178,7 @@ def test_execute_agent_flow_ignores_agent_id_suffix():
 
     orchestrator.execute_agent_flow(flow)
 
-    assert flow["status"] == "completed"
+    assert flow["status"] == 100
     assert agent.ran is True
 
 
@@ -206,7 +206,7 @@ def test_execute_agent_flow_handles_prefixed_agent_names():
 
     orchestrator.execute_agent_flow(flow)
 
-    assert flow["status"] == "completed"
+    assert flow["status"] == 100
     assert agent.ran is True
 
 
@@ -259,7 +259,7 @@ def test_execute_agent_flow_passes_fields_to_children():
 
     orchestrator.execute_agent_flow(flow)
 
-    assert flow["status"] == "completed"
+    assert flow["status"] == 100
     assert child.seen == "value"
 
 
@@ -287,5 +287,5 @@ def test_execute_agent_flow_accepts_class_name():
 
     orchestrator.execute_agent_flow(flow)
 
-    assert flow["status"] == "completed"
+    assert flow["status"] == 100
     assert agent.ran is True
