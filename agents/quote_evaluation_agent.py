@@ -28,16 +28,25 @@ class QuoteEvaluationAgent(BaseAgent):
                 or input_data.get("product_type")
                 or None
             )
+            weights = input_data.get(
+                "weights", {"price": 0.5, "delivery": 0.3, "risk": 0.2}
+            )
+
             quotes = self._fetch_quotes(
                 input_data.get("supplier_names", []),
                 product_category,
             )
 
             if not quotes:
+                # Absence of quotes should not be treated as a hard failure:
+                # downstream agents may still proceed with an empty result set.
                 return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={"message": "No quotes found"},
-                    error="No quotes to evaluate",
+                    status=AgentStatus.SUCCESS,
+                    data={
+                        "quotes": [],
+                        "message": "No quotes found",
+                        "weights": weights,
+                    },
                 )
 
             simplified: List[Dict] = []
@@ -55,7 +64,7 @@ class QuoteEvaluationAgent(BaseAgent):
 
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data=self._to_native({"quotes": simplified}),
+                data=self._to_native({"quotes": simplified, "weights": weights}),
             )
         except Exception as exc:
             logger.error("QuoteEvaluationAgent error: %s", exc)

@@ -920,34 +920,50 @@ class DataExtractionAgent(BaseAgent):
         doc_type: str,
         pk_value: str,
     ) -> None:
-        """Embed structured line-item content for retrieval.
+        """Embed header and line-item content for retrieval.
 
-        Header details are intentionally **not** stored in the vector database;
-        only line items are embedded so that question answering retrieves the
-        most relevant transactional information without unnecessary metadata.
-        Each line item is converted to a compact text form and embedded
-        individually.  Embeddings are stored in the same Qdrant collection as the
-        full document vectors and tagged with a ``data_type`` payload so callers
-        can filter as needed.
+        Procurement workflows often require question answering over both
+        transaction headers (e.g. invoice dates, vendor names) and individual
+        line items.  Earlier revisions only vectorised line items which limited
+        the RAG agent's ability to answer header-level queries.  We now embed
+        a compact text representation of the header alongside each line item.
+        Points are tagged with a ``data_type`` so callers can filter as needed.
         """
 
         if not pk_value:
             return
 
         self.agent_nick._initialize_qdrant_collection()
-        points: List[models.PointStruct] = []
+
+        texts: List[str] = []
+        meta: List[Tuple[str, Dict[str, Any]]] = []
+
+        # Header payload -------------------------------------------------
+        header_text = _dict_to_text(header)
+        if header_text:
+            texts.append(header_text)
+            meta.append(
+                (
+                    _normalize_point_id(f"{pk_value}_header"),
+                    {
+                        "record_id": pk_value,
+                        "document_type": _normalize_label(doc_type),
+                        "data_type": "header",
+                        "content": header_text,
+                    },
+                )
+            )
 
         # Line item payloads --------------------------------------------
         for idx, item in enumerate(line_items, start=1):
             item_text = _dict_to_text(item)
-            vec = self.agent_nick.embedding_model.encode(
-                [item_text], normalize_embeddings=True, show_progress_bar=False
-            )[0]
-            points.append(
-                models.PointStruct(
-                    id=_normalize_point_id(f"{pk_value}_line_{idx}"),
-                    vector=vec.tolist(),
-                    payload={
+            if not item_text:
+                continue
+            texts.append(item_text)
+            meta.append(
+                (
+                    _normalize_point_id(f"{pk_value}_line_{idx}"),
+                    {
                         "record_id": pk_value,
                         "document_type": _normalize_label(doc_type),
                         "data_type": "line_item",
@@ -957,12 +973,22 @@ class DataExtractionAgent(BaseAgent):
                 )
             )
 
-        if points:
-            self.agent_nick.qdrant_client.upsert(
-                collection_name=self.settings.qdrant_collection_name,
-                points=points,
-                wait=True,
-            )
+        if not texts:
+            return
+
+        vectors = self.agent_nick.embedding_model.encode(
+            texts, normalize_embeddings=True, show_progress_bar=False
+        )
+        points = [
+            models.PointStruct(id=pid, vector=vec.tolist(), payload=payload)
+            for (pid, payload), vec in zip(meta, vectors)
+        ]
+
+        self.agent_nick.qdrant_client.upsert(
+            collection_name=self.settings.qdrant_collection_name,
+            points=points,
+            wait=True,
+        )
 
     def _chunk_text(self, text: str, max_tokens: int = 256, overlap: int = 20) -> List[str]:
         """Token-aware text chunking with graceful degradation.

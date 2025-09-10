@@ -8,6 +8,46 @@ from orchestration.orchestrator import Orchestrator
 from agents.base_agent import AgentOutput, AgentStatus
 
 
+class EchoAgent:
+    def execute(self, context):
+        return AgentOutput(status=AgentStatus.SUCCESS, data={"result": context.input_data.get("number")})
+
+
+def test_json_flow_executes_steps_with_context_mapping():
+    agent = EchoAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"echo": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+
+    flow = {
+        "entrypoint": "step1",
+        "steps": {
+            "step1": {
+                "agent": "echo",
+                "input": {"number": "{{ payload.value }}"},
+                "outputs": {"calc": "$.result"},
+                "next": "step2",
+            },
+            "step2": {
+                "agent": "echo",
+                "condition": "{{ ctx.calc == 1 }}",
+                "input": {"number": "{{ ctx.calc + 1 }}"},
+                "outputs": {"final": "$.result"},
+            },
+        },
+    }
+
+    result = orchestrator.execute_agent_flow(flow, {"value": 1})
+    assert result["status"] == "completed"
+    assert result["ctx"]["calc"] == 1
+    assert result["ctx"]["final"] == 2
+
+
 class DummyAgent:
     def __init__(self):
         self.ran = False
@@ -40,6 +80,29 @@ def test_execute_agent_flow_runs_and_updates_status():
     result = orchestrator.execute_agent_flow(flow)
     assert result["status"] == "completed"
     assert flow["status"] == "completed"
+    assert agent.ran is True
+
+
+def test_json_flow_handles_decorated_agent_names():
+    agent = DummyAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"quote_evaluation": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "quote_evaluation": "QuoteEvaluationAgent"
+    }
+    flow = {
+        "entrypoint": "step1",
+        "steps": {
+            "step1": {"agent": "user_quote_evaluation_agent_1"}
+        },
+    }
+    orchestrator.execute_agent_flow(flow)
     assert agent.ran is True
 
 
@@ -145,6 +208,59 @@ def test_execute_agent_flow_handles_prefixed_agent_names():
 
     assert flow["status"] == "completed"
     assert agent.ran is True
+
+
+def test_execute_agent_flow_passes_fields_to_children():
+    class ParentAgent:
+        def execute(self, context):
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={},
+                pass_fields={"shared": "value"},
+            )
+
+    class ChildAgent:
+        def __init__(self):
+            self.seen = None
+
+        def execute(self, context):  # pragma: no cover - simple stub
+            self.seen = context.input_data.get("shared")
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    parent = ParentAgent()
+    child = ChildAgent()
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"parent": parent, "child": child},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "parent": "ParentAgent",
+        "child": "ChildAgent",
+    }
+    orchestrator._load_prompts = lambda: {}
+    orchestrator._load_policies = lambda: {}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "parent",
+        "agent_property": {},
+        "onSuccess": {
+            "status": "saved",
+            "agent_type": "child",
+            "agent_property": {},
+        },
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    assert flow["status"] == "completed"
+    assert child.seen == "value"
 
 
 def test_execute_agent_flow_accepts_class_name():
