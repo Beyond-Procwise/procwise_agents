@@ -22,7 +22,7 @@ class DummyPRS:
             "agents": [{"agent": "A1", "status": "saved", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "agent_ref_id": "1"}],
         }
 
-    def get_process_details(self, process_id):
+    def get_process_details(self, process_id, raw=False):
         return copy.deepcopy(self.details)
 
     def update_process_status(self, process_id, status, **kwargs):
@@ -47,6 +47,17 @@ class DummyPRS:
 
     def log_run_detail(self, **kwargs):
         return kwargs.get("run_id", "r1")
+
+    def convert_agents_to_flow(self, details):
+        from services.process_routing_service import ProcessRoutingService
+
+        return ProcessRoutingService.convert_agents_to_flow(details)
+
+    def _load_agent_links(self):
+        return {}, {}, {}
+
+    def _enrich_node(self, node, agent_defs, prompt_map, policy_map):
+        return None
 
 
 class DummyOrchestrator:
@@ -91,6 +102,7 @@ def test_run_endpoint_process_id_executes_flow():
         time.sleep(0.01)
 
     assert prs.status_updates == [(5, 1)]
+    assert "agents" in prs.details_updates[0]
     assert prs.details_updates[0]["status"] == "saved"
     assert prs.details_updates[-1]["status"] == "completed"
 
@@ -99,7 +111,7 @@ def test_run_endpoint_process_id_executes_flow():
 
 def test_run_endpoint_updates_nested_statuses_independently():
     class NestedPRS(DummyPRS):
-        def get_process_details(self, process_id):
+        def get_process_details(self, process_id, raw=False):
             return {
                 "status": "saved",
                 "agent_type": "1",
