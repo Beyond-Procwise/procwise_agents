@@ -5,12 +5,16 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 import re
 from pathlib import Path
+import os
 
 import pandas as pd
 import numpy as np
 from dataclasses import asdict, is_dataclass
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is enabled where available
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
 class ProcessRoutingService:
@@ -366,9 +370,19 @@ class ProcessRoutingService:
             return
 
         agents = details.get("agents", [])
-        for agent in agents:
-            if agent.get("agent") == agent_name:
-                agent["status"] = status
+        order = [a.get("agent") for a in agents]
+        if agent_name not in order:
+            logger.warning(
+                "Agent %s not found in process %s; skipping", agent_name, process_id
+            )
+            return
+        idx = order.index(agent_name)
+        for prev in agents[:idx]:
+            if prev.get("status") not in ("completed", "failed"):
+                raise ValueError(
+                    f"Cannot update {agent_name} before {prev.get('agent')} completes"
+                )
+        agents[idx]["status"] = status
 
         # Derive the overall workflow status based on individual agent states.
         statuses = [a.get("status") for a in agents]
@@ -376,16 +390,35 @@ class ProcessRoutingService:
             overall = "failed"
         elif statuses and all(s == "completed" for s in statuses):
             overall = "completed"
+        elif any(s != "saved" for s in statuses):
+            overall = "running"
         else:
-            overall = details.get("status", "saved") or "saved"
+            overall = "saved"
 
         details["agents"] = agents
         details["status"] = overall
 
-        self.update_process_details(process_id, details, modified_by)
+        # Persist the updated details and synchronise the top-level
+        # ``process_status`` flag when the workflow reaches a terminal state.
+        if overall in ("completed", "failed"):
+            numeric = 1 if overall == "completed" else -1
+            self.update_process_status(
+                process_id,
+                numeric,
+                modified_by,
+                details,
+            )
+        else:
+            self.update_process_details(process_id, details, modified_by)
 
-    def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
-        """Update process status in ``proc.routing``.
+    def update_process_status(
+        self,
+        process_id: int,
+        status: int,
+        modified_by: Optional[str] = None,
+        process_details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update process status in ``proc.routing`` and keep ``process_details`` in sync.
 
         Only ``1`` (success) and ``-1`` (failure) are valid. Any other value
         is coerced to ``-1`` if negative or ``1`` if positive."""
@@ -396,6 +429,9 @@ class ProcessRoutingService:
                 process_id, status, coerced,
             )
             status = coerced
+        # Ensure the ``process_details`` blob reflects the new status.
+        details = process_details or self.get_process_details(process_id, raw=True) or {}
+        details["status"] = "completed" if status == 1 else "failed"
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -403,11 +439,17 @@ class ProcessRoutingService:
                         """
                         UPDATE proc.routing
                         SET process_status = %s,
+                            process_details = %s,
                             modified_on = CURRENT_TIMESTAMP,
                             modified_by = %s
                         WHERE process_id = %s
                         """,
-                        (status, modified_by or self.settings.script_user, process_id),
+                        (
+                            status,
+                            self._safe_dumps(self.normalize_process_details(details)),
+                            modified_by or self.settings.script_user,
+                            process_id,
+                        ),
                     )
                     conn.commit()
                     logger.info(
