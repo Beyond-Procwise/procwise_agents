@@ -378,9 +378,12 @@ class ProcessRoutingService:
             return
         idx = order.index(agent_name)
         for prev in agents[:idx]:
-            if prev.get("status") not in ("completed", "failed"):
+            # Allow downstream agents to start once predecessors have at least
+            # begun execution. Only agents still in the ``saved`` state are
+            # considered incomplete for ordering purposes.
+            if prev.get("status") == "saved":
                 raise ValueError(
-                    f"Cannot update {agent_name} before {prev.get('agent')} completes"
+                    f"Cannot update {agent_name} before {prev.get('agent')} starts"
                 )
         agents[idx]["status"] = status
 
