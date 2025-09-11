@@ -1,6 +1,6 @@
 import logging
 import smtplib
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -22,7 +22,7 @@ class EmailService:
         self,
         subject: str,
         body: str,
-        recipient: str,
+        recipients: Union[str, Iterable[str]],
         sender: str,
         attachments: Optional[List[Tuple[bytes, str]]] = None,
     ) -> bool:
@@ -35,7 +35,11 @@ class EmailService:
         msg = MIMEMultipart()
         msg["Subject"] = subject
         msg["From"] = sender
-        msg["To"] = recipient
+        if isinstance(recipients, str):
+            recipient_list = [recipients]
+        else:
+            recipient_list = list(recipients)
+        msg["To"] = ", ".join(recipient_list)
         msg.attach(MIMEText(body, "html"))
 
         if attachments:
@@ -57,7 +61,7 @@ class EmailService:
                 server.login(
                     self.settings.ses_smtp_user, self.settings.ses_smtp_password
                 )
-                server.sendmail(sender, [recipient], msg.as_string())
+                server.sendmail(sender, recipient_list, msg.as_string())
             return True
         except Exception as exc:  # pragma: no cover - network/runtime
             self.logger.error("Email send failed: %s", exc)

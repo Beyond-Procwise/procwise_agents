@@ -38,10 +38,19 @@ class PolicyEngine(BaseEngine):
         policy checks and are allowed by default.
         """
         if workflow_name == 'supplier_ranking':
+            criteria = input_data.get('criteria')
+            if not criteria:
+                weight_policy = next(
+                    (p for p in self.supplier_policies if p.get('policyName') == 'WeightAllocationPolicy'),
+                    {},
+                )
+                criteria = list(
+                    weight_policy.get('details', {}).get('rules', {}).get('default_weights', {}).keys()
+                )
             intent = {
                 'template_id': 'rank_by_criteria',
                 'parameters': {
-                    'criteria': input_data.get('criteria')
+                    'criteria': criteria
                 }
             }
             allowed, reason, _ = self.validate_and_apply(intent)

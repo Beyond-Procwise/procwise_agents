@@ -19,7 +19,7 @@ class DummyNick:
 
 def test_opportunity_miner_returns_findings(monkeypatch):
     nick = DummyNick()
-    agent = OpportunityMinerAgent(nick)
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
 
     # Avoid file system writes during tests
     monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
@@ -37,6 +37,26 @@ def test_opportunity_miner_returns_findings(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     assert output.data["opportunity_count"] >= 0
     assert isinstance(output.data["findings"], list)
+
+
+def test_supplier_consolidation_sets_supplier_id(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
+
+    context = AgentContext(
+        workflow_id="wf2",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    sc = [f for f in output.data["findings"] if f["detector_type"] == "Supplier Consolidation"]
+    assert sc and sc[0]["supplier_id"] is not None
 
 
 def test_opportunity_miner_handles_missing_columns(monkeypatch):

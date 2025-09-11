@@ -34,12 +34,12 @@ def test_email_drafting_agent(monkeypatch):
 
     sent = {}
 
-    def fake_send(subject, body, recipient, sender, attachments=None):
+    def fake_send(subject, body, recipients, sender, attachments=None):
         sent.update(
             {
                 "subject": subject,
                 "body": body,
-                "recipient": recipient,
+                "recipients": recipients,
                 "sender": sender,
                 "attachments": attachments,
             }
@@ -53,7 +53,7 @@ def test_email_drafting_agent(monkeypatch):
         agent_id="email_drafting",
         user_id="u1",
         input_data={
-            "recipient": "to@example.com",
+            "recipients": ["to@example.com", "cc@example.com"],
             "supplier_contact_name": "John",
             "submission_deadline": "01/01/2025",
             "category_manager_name": "Cat",
@@ -71,6 +71,10 @@ def test_email_drafting_agent(monkeypatch):
     assert "<html>" in sent["body"]
     assert sent["subject"] == "Request for Quotation (RFQ) – Office Furniture"
     assert sent["attachments"] == [(b"data", "file.txt")]
+    assert sent["recipients"] == ["to@example.com", "cc@example.com"]
+    assert output.data["sent"] is True
+    assert output.data["body"] == sent["body"]
+    assert output.data["recipients"] == ["to@example.com", "cc@example.com"]
     assert "Request for Quotation (RFQ) – Office Furniture" in output.data["prompt"]
     assert "Deadline for submission: 01/01/2025" in output.data["prompt"]
 
@@ -84,7 +88,8 @@ def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
         agent_id="email_drafting",
         user_id="u1",
         input_data={
-            "recipient": "to@example.com",
+            "recipients": ["to@example.com"],
+
             "body": "<p>{{ summary }}</p>",
             "summary": "All good",
         },

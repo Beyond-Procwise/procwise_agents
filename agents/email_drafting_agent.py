@@ -60,13 +60,15 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         subject = data.get(
             "subject", "Request for Quotation (RFQ) – Office Furniture"
         )
-        recipient = data.get("recipient")
+        recipients = data.get("recipients") or data.get("recipient")
+        if isinstance(recipients, str):
+            recipients = [recipients]
         sender = data.get("sender", self.agent_nick.settings.ses_default_sender)
         attachments = data.get("attachments")
 
         draft_only = data.get("draft_only", False)
 
-        if not recipient:
+        if not recipients:
             html_body = ""
             prompt = PROMPT_TEMPLATE.format(
                 supplier_contact_name=data.get("supplier_contact_name", "Supplier"),
@@ -84,7 +86,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                     "subject": subject,
                     "body": html_body,
                     "prompt": prompt,
-                    "recipient": None,
+                    "recipients": None,
                     "sender": sender,
                     "attachments": attachments,
                     "sent": False,
@@ -112,10 +114,10 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         prompt = PROMPT_TEMPLATE.format(**fmt_args)
 
         sent = False
-        if not draft_only:
+        if not draft_only and recipients:
             try:
                 sent = self.email_service.send_email(
-                    subject, html_body, recipient, sender, attachments
+                    subject, html_body, recipients, sender, attachments
                 )
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to send email")
@@ -127,7 +129,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 "subject": subject,
                 "body": html_body,
                 "prompt": prompt,
-                "recipient": recipient,
+                "recipients": recipients,
                 "sender": sender,
                 "attachments": attachments,
                 "sent": sent,
