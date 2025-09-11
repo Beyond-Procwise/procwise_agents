@@ -16,5 +16,6 @@ unstructured[local-inference]
 pdf2image
 pytesseract
 easyocr
+jinja2
 faiss-cpu
 rank-bm25

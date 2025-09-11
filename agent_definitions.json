@@ -11,12 +11,7 @@
     "description": "Ranks suppliers based on policies and performance data.",
     "dependencies": ["prompt_engine", "policy_engine", "query_engine"]
   },
-  {
-    "agentId": 3,
-    "agentType": "RAGAgent (via RAGPipeline)",
-    "description": "Answers user questions based on vectorized documents.",
-    "dependencies": ["qdrant_client", "embedding_model", "chat_history_manager"]
-  },
+
   {
     "agentId": 4,
     "agentType": "OpportunityMinerAgent",
@@ -52,12 +47,6 @@
     "agentType": "QuoteEvaluationAgent",
     "description": "Evaluates supplier quotes against historical data and policies.",
     "dependencies": ["policy_engine", "db_client"]
-  },
-  {
-      "agentId": 10,
-      "agentType": "ContractAnalysisAgent",
-      "description": "Analyzes contracts to extract key terms and clauses.",
-      "dependencies": ["prompt_engine"]
   }
 
 ]
