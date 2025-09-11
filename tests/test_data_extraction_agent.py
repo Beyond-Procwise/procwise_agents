@@ -363,3 +363,4 @@ def test_classify_doc_type_llm_fallback(monkeypatch):
 
     # Text deliberately avoids any predefined keywords so the LLM is used.
     assert agent._classify_doc_type("Memorandum of understanding") == "Contract"
+

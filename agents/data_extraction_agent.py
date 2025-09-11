@@ -309,6 +309,7 @@ class DataExtractionAgent(BaseAgent):
                     error=err,
                 )
 
+
             mismatches = discrepancy_result.data.get("mismatches", [])
             summary = {
                 "documents_provided": len(docs),
@@ -319,6 +320,7 @@ class DataExtractionAgent(BaseAgent):
             if mismatches:
                 data["mismatches"] = mismatches
             return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
