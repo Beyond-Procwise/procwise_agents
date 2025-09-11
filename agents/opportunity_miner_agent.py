@@ -498,13 +498,18 @@ class OpportunityMinerAgent(BaseAgent):
     def _detect_demand_aggregation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
         po = tables.get("purchase_orders", pd.DataFrame())
-        required_po = {"supplier_id", "total_amount_gbp"}
+        required_po = {"supplier_id", "po_id", "total_amount_gbp"}
         if po.empty or not required_po.issubset(po.columns):
             return findings
-        grouped = po.groupby("supplier_id")["total_amount_gbp"].sum().reset_index()
-        cond = grouped["total_amount_gbp"] < 500  # small spend could be aggregated
+
+        grouped = (
+            po.groupby("supplier_id")
+            .agg(total_spend_gbp=("total_amount_gbp", "sum"), po_ids=("po_id", list))
+            .reset_index()
+        )
+        cond = grouped["total_spend_gbp"] < 500  # small spend could be aggregated
         for _, row in grouped[cond].iterrows():
-            savings = row["total_amount_gbp"] * 0.05  # placeholder saving
+            savings = row["total_spend_gbp"] * 0.05  # placeholder saving
             findings.append(
                 self._build_finding(
                     "Demand Aggregation",
@@ -512,8 +517,8 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     None,
                     savings,
-                    {"total_spend_gbp": row["total_amount_gbp"]},
-                    [],
+                    {"total_spend_gbp": row["total_spend_gbp"]},
+                    list(row.get("po_ids", [])),
                 )
             )
         return findings
@@ -544,11 +549,13 @@ class OpportunityMinerAgent(BaseAgent):
     def _detect_supplier_consolidation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
         ct = tables.get("contracts", pd.DataFrame())
-        required_ct = {"spend_category", "supplier_id"}
+        required_ct = {"spend_category", "supplier_id", "contract_id"}
         if ct.empty or not required_ct.issubset(ct.columns):
             return findings
         supplier_counts = (
-            ct.groupby("spend_category")["supplier_id"].nunique().reset_index(name="supplier_count")
+            ct.groupby("spend_category")
+            .agg(supplier_count=("supplier_id", "nunique"), contract_ids=("contract_id", list))
+            .reset_index()
         )
         cond = supplier_counts["supplier_count"] > 1
         for _, row in supplier_counts[cond].iterrows():
@@ -561,7 +568,7 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     savings,
                     {"supplier_count": row["supplier_count"]},
-                    [],
+                    list(row.get("contract_ids", [])),
                 )
             )
         return findings
