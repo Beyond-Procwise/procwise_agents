@@ -294,10 +294,45 @@ async def draft_email(
         "sender": sender,
         "body": body,
     }
-    result = await run_in_threadpool(
-        orchestrator.execute_workflow, "email_drafting", input_data
+    prs = orchestrator.agent_nick.process_routing_service
+    process_id = prs.log_process(
+        process_name="email_drafting", process_details=input_data
     )
-    return result
+    if process_id is None:
+        raise HTTPException(status_code=500, detail="Failed to log process")
+
+    action_id = prs.log_action(
+        process_id=process_id,
+        agent_type="email_drafting",
+        action_desc=input_data,
+        status="started",
+    )
+
+    try:
+        result = await run_in_threadpool(
+            orchestrator.execute_workflow, "email_drafting", input_data
+        )
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_drafting",
+            action_desc=input_data,
+            process_output=result,
+            status="completed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, 1)
+    except Exception as exc:  # pragma: no cover - network/runtime
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_drafting",
+            action_desc=str(exc),
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, -1)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {**result, "action_id": action_id}
 
 
 @router.post("/negotiate")

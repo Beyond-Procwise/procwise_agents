@@ -119,6 +119,39 @@ def test_convert_agents_to_flow_respects_list_order():
     assert flow["onSuccess"]["agent"] == "A2"
 
 
+def test_convert_agents_to_flow_handles_reverse_dependencies():
+    details = {
+        "status": "saved",
+        "agents": [
+            {
+                "agent": "A1",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                "dependencies": {},
+            },
+            {
+                "agent": "A2",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                # Declares dependency on A1's success
+                "dependencies": {"onSuccess": ["A1"]},
+            },
+            {
+                "agent": "A3",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                # Runs when A2 fails
+                "dependencies": {"onFailure": ["A2"]},
+            },
+        ],
+    }
+
+    flow = ProcessRoutingService.convert_agents_to_flow(details)
+    assert flow["agent"] == "A1"
+    assert flow["onSuccess"]["agent"] == "A2"
+    assert flow["onSuccess"]["onFailure"]["agent"] == "A3"
+
+
 class FetchCursor:
     def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details

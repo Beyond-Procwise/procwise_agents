@@ -126,6 +126,15 @@ class ProcessRoutingService:
             if isinstance(a, dict) and a.get("agent")
         }
 
+        def _find_dependent(name: str, dep_key: str) -> Optional[int]:
+            """Return the index of the agent that lists ``name`` as a dependency."""
+
+            for i, agent in enumerate(agents):
+                deps = (agent.get("dependencies") or {}).get(dep_key, [])
+                if name in deps:
+                    return i
+            return None
+
         def build_from_index(idx: int, visited: Optional[set[int]] = None) -> Dict[str, Any]:
             visited = visited or set()
             if idx in visited:
@@ -142,22 +151,30 @@ class ProcessRoutingService:
                 ),
             }
             deps = node.get("dependencies", {})
-            # Honour explicit dependencies when present; otherwise fall back to
-            # the next agent in the list to preserve the authored order.
-            if deps.get("onSuccess"):
+
+            # Determine next agents by finding nodes that depend on the current
+            # one. Fall back to the current node's forward references for
+            # backward compatibility, then to sequential ordering.
+            nxt = _find_dependent(name, "onSuccess")
+            if nxt is None and deps.get("onSuccess"):
                 nxt = name_to_idx.get(deps["onSuccess"][0])
-                if nxt is not None and nxt not in visited:
-                    flow["onSuccess"] = build_from_index(nxt, visited.copy())
+            if nxt is not None and nxt not in visited:
+                flow["onSuccess"] = build_from_index(nxt, visited.copy())
             elif idx + 1 < len(agents) and (idx + 1) not in visited:
                 flow["onSuccess"] = build_from_index(idx + 1, visited.copy())
-            if deps.get("onFailure"):
+
+            nxt = _find_dependent(name, "onFailure")
+            if nxt is None and deps.get("onFailure"):
                 nxt = name_to_idx.get(deps["onFailure"][0])
-                if nxt is not None and nxt not in visited:
-                    flow["onFailure"] = build_from_index(nxt, visited.copy())
-            if deps.get("onCompletion"):
+            if nxt is not None and nxt not in visited:
+                flow["onFailure"] = build_from_index(nxt, visited.copy())
+
+            nxt = _find_dependent(name, "onCompletion")
+            if nxt is None and deps.get("onCompletion"):
                 nxt = name_to_idx.get(deps["onCompletion"][0])
-                if nxt is not None and nxt not in visited:
-                    flow["onCompletion"] = build_from_index(nxt, visited.copy())
+            if nxt is not None and nxt not in visited:
+                flow["onCompletion"] = build_from_index(nxt, visited.copy())
+
             return flow
 
         # Always start from the first agent as defined in the list to ensure

@@ -75,6 +75,25 @@ def test_email_drafting_agent(monkeypatch):
     assert "Deadline for submission: 01/01/2025" in output.data["prompt"]
 
 
+def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+    monkeypatch.setattr(agent, "email_service", DummyEmailService())
+    context = AgentContext(
+        workflow_id="wf3",
+        agent_id="email_drafting",
+        user_id="u1",
+        input_data={
+            "recipient": "to@example.com",
+            "body": "<p>{{ summary }}</p>",
+            "summary": "All good",
+        },
+    )
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS
+    assert "<p>All good</p>" in output.data["body"]
+
+
 def test_email_drafting_handles_missing_recipient(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
