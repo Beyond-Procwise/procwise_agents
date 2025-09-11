@@ -115,7 +115,9 @@ class OpportunityMinerAgent(BaseAgent):
     # ``proc.contracts`` and ``proc.supplier``.
     TABLE_MAP = {
         "purchase_orders": "proc.purchase_order_agent",
+        "purchase_order_lines": "proc.po_line_items_agent",
         "invoices": "proc.invoice_agent",
+        "invoice_lines": "proc.invoice_line_items_agent",
         "contracts": "proc.contracts",
         # "price_benchmarks": "price_benchmarks",
         # "indices": "indices",
@@ -173,6 +175,35 @@ class OpportunityMinerAgent(BaseAgent):
             ]
         )
 
+        purchase_order_lines = pd.DataFrame(
+            [
+                {
+                    "po_line_id": "POL1",
+                    "po_id": "PO1",
+                    "item_id": "IT1",
+                    "quantity": 10,
+                    "unit_price": 10.0,
+                    "line_total": 100.0,
+                    "currency": "GBP",
+                }
+            ]
+        )
+
+        invoice_lines = pd.DataFrame(
+            [
+                {
+                    "invoice_line_id": "INVL1",
+                    "invoice_id": "INV1",
+                    "po_id": "PO1",
+                    "item_id": "IT1",
+                    "quantity": 10,
+                    "unit_price": 11.0,
+                    "line_amount": 110.0,
+                    "currency": "GBP",
+                }
+            ]
+        )
+
         contracts = pd.DataFrame(
             [
                 {
@@ -221,7 +252,9 @@ class OpportunityMinerAgent(BaseAgent):
 
         return {
             "purchase_orders": purchase_orders,
+            "purchase_order_lines": purchase_order_lines,
             "invoices": invoices,
+            "invoice_lines": invoice_lines,
             "contracts": contracts,
             "indices": indices,
             "shipments": shipments,
@@ -263,8 +296,20 @@ class OpportunityMinerAgent(BaseAgent):
                     df[f"{col}_gbp"] = df[col] * rate_col
             return df
 
-        tables["purchase_orders"] = convert(tables.get("purchase_orders", pd.DataFrame()), ["total_amount"])
-        tables["invoices"] = convert(tables.get("invoices", pd.DataFrame()), ["invoice_amount", "invoice_total_incl_tax"])
+        tables["purchase_orders"] = convert(
+            tables.get("purchase_orders", pd.DataFrame()), ["total_amount"]
+        )
+        tables["purchase_order_lines"] = convert(
+            tables.get("purchase_order_lines", pd.DataFrame()),
+            ["unit_price", "line_total", "tax_amount", "total_amount"],
+        )
+        tables["invoices"] = convert(
+            tables.get("invoices", pd.DataFrame()), ["invoice_amount", "invoice_total_incl_tax"]
+        )
+        tables["invoice_lines"] = convert(
+            tables.get("invoice_lines", pd.DataFrame()),
+            ["unit_price", "line_amount", "tax_amount", "total_amount_incl_tax"],
+        )
         tables["contracts"] = convert(tables.get("contracts", pd.DataFrame()), ["total_contract_value"])
         tables["shipments"] = convert(tables.get("shipments", pd.DataFrame()), ["logistics_cost"])
         return tables
@@ -305,18 +350,25 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _detect_unit_price_vs_benchmark(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
         po = tables.get("purchase_orders", pd.DataFrame())
         bm = tables.get("price_benchmarks", pd.DataFrame())
-        required_po = {"item_id", "unit_price_gbp"}
+        required_lines = {"po_id", "item_id", "unit_price_gbp", "quantity"}
+        required_po = {"po_id", "supplier_id"}
         required_bm = {"item_id", "benchmark_price_gbp"}
         if (
-            po.empty
+            po_lines.empty
+            or po.empty
             or bm.empty
+            or not required_lines.issubset(po_lines.columns)
             or not required_po.issubset(po.columns)
             or not required_bm.issubset(bm.columns)
         ):
             return findings
-        merged = po.merge(bm, on="item_id", suffixes=("_po", "_bm"))
+        merged = (
+            po_lines.merge(po[list(required_po)], on="po_id", how="left")
+            .merge(bm, on="item_id", suffixes=("", "_bm"))
+        )
         merged["variance"] = merged["unit_price_gbp"] - merged["benchmark_price_gbp"]
         cond = merged["variance"] > 0
         for _, row in merged[cond].iterrows():
@@ -325,10 +377,13 @@ class OpportunityMinerAgent(BaseAgent):
                 self._build_finding(
                     "Unit Price vs Benchmark",
                     row.get("supplier_id"),
-                    row.get("category_id"),
+                    None,
                     row.get("item_id"),
                     savings,
-                    {"unit_price_gbp": row["unit_price_gbp"], "benchmark_price_gbp": row["benchmark_price_gbp"]},
+                    {
+                        "unit_price_gbp": row["unit_price_gbp"],
+                        "benchmark_price_gbp": row["benchmark_price_gbp"],
+                    },
                     [row.get("po_id")],
                 )
             )
@@ -376,18 +431,25 @@ class OpportunityMinerAgent(BaseAgent):
     def _detect_po_invoice_discrepancy(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
         po = tables.get("purchase_orders", pd.DataFrame())
-        inv = tables.get("invoices", pd.DataFrame())
-        required_po = {"po_id", "total_amount_gbp", "supplier_id"}
-        required_inv = {"po_id", "invoice_amount_gbp"}
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        inv_lines = tables.get("invoice_lines", pd.DataFrame())
+        required_po = {"po_id", "supplier_id"}
+        required_po_lines = {"po_id", "line_total_gbp"}
+        required_inv_lines = {"po_id", "line_amount_gbp"}
         if (
             po.empty
-            or inv.empty
+            or po_lines.empty
+            or inv_lines.empty
             or not required_po.issubset(po.columns)
-            or not required_inv.issubset(inv.columns)
+            or not required_po_lines.issubset(po_lines.columns)
+            or not required_inv_lines.issubset(inv_lines.columns)
         ):
             return findings
-        merged = po.merge(inv, on="po_id", suffixes=("_po", "_inv"))
-        merged["amount_diff"] = merged["invoice_amount_gbp"] - merged["total_amount_gbp"]
+        po_sum = po_lines.groupby("po_id")["line_total_gbp"].sum().reset_index(name="po_total_gbp")
+        inv_sum = inv_lines.groupby("po_id")["line_amount_gbp"].sum().reset_index(name="inv_total_gbp")
+        merged = po_sum.merge(inv_sum, on="po_id", how="outer").fillna(0.0)
+        merged = merged.merge(po[list(required_po)], on="po_id", how="left")
+        merged["amount_diff"] = merged["inv_total_gbp"] - merged["po_total_gbp"]
         cond = merged["amount_diff"] != 0
         for _, row in merged[cond].iterrows():
             impact = row["amount_diff"]
@@ -399,7 +461,7 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     impact,
                     {"amount_diff": row["amount_diff"]},
-                    [row.get("po_id"), row.get("invoice_id")],
+                    [row.get("po_id")],
                 )
             )
         return findings
@@ -436,13 +498,18 @@ class OpportunityMinerAgent(BaseAgent):
     def _detect_demand_aggregation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
         po = tables.get("purchase_orders", pd.DataFrame())
-        required_po = {"supplier_id", "total_amount_gbp"}
+        required_po = {"supplier_id", "po_id", "total_amount_gbp"}
         if po.empty or not required_po.issubset(po.columns):
             return findings
-        grouped = po.groupby("supplier_id")["total_amount_gbp"].sum().reset_index()
-        cond = grouped["total_amount_gbp"] < 500  # small spend could be aggregated
+
+        grouped = (
+            po.groupby("supplier_id")
+            .agg(total_spend_gbp=("total_amount_gbp", "sum"), po_ids=("po_id", list))
+            .reset_index()
+        )
+        cond = grouped["total_spend_gbp"] < 500  # small spend could be aggregated
         for _, row in grouped[cond].iterrows():
-            savings = row["total_amount_gbp"] * 0.05  # placeholder saving
+            savings = row["total_spend_gbp"] * 0.05  # placeholder saving
             findings.append(
                 self._build_finding(
                     "Demand Aggregation",
@@ -450,8 +517,8 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     None,
                     savings,
-                    {"total_spend_gbp": row["total_amount_gbp"]},
-                    [],
+                    {"total_spend_gbp": row["total_spend_gbp"]},
+                    list(row.get("po_ids", [])),
                 )
             )
         return findings
@@ -482,11 +549,13 @@ class OpportunityMinerAgent(BaseAgent):
     def _detect_supplier_consolidation(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
         ct = tables.get("contracts", pd.DataFrame())
-        required_ct = {"spend_category", "supplier_id"}
+        required_ct = {"spend_category", "supplier_id", "contract_id"}
         if ct.empty or not required_ct.issubset(ct.columns):
             return findings
         supplier_counts = (
-            ct.groupby("spend_category")["supplier_id"].nunique().reset_index(name="supplier_count")
+            ct.groupby("spend_category")
+            .agg(supplier_count=("supplier_id", "nunique"), contract_ids=("contract_id", list))
+            .reset_index()
         )
         cond = supplier_counts["supplier_count"] > 1
         for _, row in supplier_counts[cond].iterrows():
@@ -499,7 +568,7 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     savings,
                     {"supplier_count": row["supplier_count"]},
-                    [],
+                    list(row.get("contract_ids", [])),
                 )
             )
         return findings
