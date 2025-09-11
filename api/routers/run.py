@@ -94,16 +94,15 @@ def run_agents(
             )
             try:
                 # Preserve the existing ``process_details`` structure while
-                # annotating the failure.  This ensures agent-level metadata
-                # remains intact for debugging or retries.
+                # marking the workflow as failed so agent metadata remains
+                # intact for debugging or retries.
                 existing = prs.get_process_details(process_id, raw=True) or {}
                 existing["status"] = "failed"
-                existing["error"] = str(exc)
                 prs.update_process_details(process_id, existing)
 
             except Exception:
                 logger.exception(
-                    "Failed to persist error details for process %s", process_id
+                    "Failed to persist failure details for process %s", process_id
                 )
             try:
                 prs.update_process_status(process_id, -1)

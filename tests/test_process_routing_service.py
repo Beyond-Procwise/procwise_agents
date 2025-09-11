@@ -3,8 +3,12 @@ import sys
 import json
 from datetime import datetime
 from types import SimpleNamespace
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# Enable GPU for tests
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from services.process_routing_service import ProcessRoutingService
 
@@ -85,6 +89,34 @@ def test_convert_agents_to_flow_builds_tree():
     assert flow["agent_type"] == "1"
     assert flow["onSuccess"]["agent_type"] == "2"
     assert flow["onFailure"]["agent_type"] == "3"
+
+
+def test_convert_agents_to_flow_respects_list_order():
+    """Even when dependencies reference upstream agents, the first listed
+    agent should remain the starting point of the flow."""
+
+    details = {
+        "status": "saved",
+        "agents": [
+            {
+                "agent": "A1",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                "dependencies": {},
+            },
+            {
+                "agent": "A2",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                # Incorrectly points back to the first agent
+                "dependencies": {"onSuccess": ["A1"]},
+            },
+        ],
+    }
+
+    flow = ProcessRoutingService.convert_agents_to_flow(details)
+    assert flow["agent"] == "A1"
+    assert flow["onSuccess"]["agent"] == "A2"
 
 
 class FetchCursor:
@@ -191,12 +223,13 @@ def test_update_agent_status_preserves_structure():
     )
     prs = ProcessRoutingService(agent)
     prs.get_process_details = lambda pid, **kwargs: initial
+    prs.update_agent_status(1, "A1", "completed")
     prs.update_agent_status(1, "A2", "validated")
     updated = json.loads(conn.cursor_obj.params[0])
     assert updated["agents"][1]["status"] == "validated"
-    assert updated["agents"][0]["status"] == "saved"
+    assert updated["agents"][0]["status"] == "completed"
     assert updated["agents"][2]["dependencies"]["onFailure"] == ["A1"]
-    assert updated["status"] == "saved"
+    assert updated["status"] == "running"
 
 
 
@@ -218,12 +251,15 @@ def test_update_agent_status_preserves_structure_scenario2():
     prs = ProcessRoutingService(agent)
     prs.get_process_details = lambda pid, **kwargs: initial
 
+    prs.update_agent_status(1, "A1", "completed")
+    prs.update_agent_status(1, "A2", "completed")
+    prs.update_agent_status(1, "A3", "completed")
     prs.update_agent_status(1, "A4", "validated")
     updated = json.loads(conn.cursor_obj.params[0])
     assert updated["agents"][3]["status"] == "validated"
     assert updated["agents"][2]["dependencies"]["onSuccess"] == ["A1"]
     assert updated["agents"][3]["dependencies"]["onFailure"] == ["A1", "A2"]
-    assert updated["status"] == "saved"
+    assert updated["status"] == "running"
 
 
 
@@ -248,19 +284,81 @@ def test_update_agent_status_updates_overall_status():
 
     def upd_details(pid, details, modified_by=None):
         holder["value"] = json.loads(json.dumps(details))
-        conn.cursor_obj.params = [json.dumps(details)]
+
+    def upd_status(pid, status, modified_by=None, process_details=None):
+        holder["value"] = json.loads(json.dumps(process_details))
+        conn.cursor_obj.params = (status, json.dumps(process_details))
 
     prs.get_process_details = get_details
     prs.update_process_details = upd_details
+    prs.update_process_status = upd_status
 
     prs.update_agent_status(1, "A1", "completed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "saved"
+    assert holder["value"]["status"] == "running"
 
     prs.update_agent_status(1, "A2", "completed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "completed"
+    assert holder["value"]["status"] == "completed"
+    assert conn.cursor_obj.params[0] == 1
 
     prs.update_agent_status(1, "A1", "failed")
-    assert json.loads(conn.cursor_obj.params[0])["status"] == "failed"
+    assert holder["value"]["status"] == "failed"
+    assert conn.cursor_obj.params[0] == -1
+
+
+def test_update_agent_status_enforces_sequence():
+    initial = {
+        "status": "saved",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+    with pytest.raises(ValueError):
+        prs.update_agent_status(1, "A2", "validated")
+
+
+def test_update_agent_status_allows_when_previous_started():
+    initial = {
+        "status": "saved",
+        "agents": [
+            {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "validated", "agent_ref_id": "1"},
+            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+    prs.update_agent_status(1, "A2", "validated")
+    updated = json.loads(conn.cursor_obj.params[0])
+    assert updated["agents"][1]["status"] == "validated"
+
+
+def test_update_process_status_updates_process_details():
+    initial = {"status": "saved", "agents": []}
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+
+    prs.update_process_status(1, 1)
+    params = conn.cursor_obj.params
+    assert params[0] == 1
+    stored = json.loads(params[1])
+    assert stored["status"] == "completed"
 
 
 def test_log_run_detail_keeps_agent_statuses():

@@ -5,12 +5,16 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 import re
 from pathlib import Path
+import os
 
 import pandas as pd
 import numpy as np
 from dataclasses import asdict, is_dataclass
 
 logger = logging.getLogger(__name__)
+
+# Ensure GPU is enabled where available
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
 class ProcessRoutingService:
@@ -113,47 +117,53 @@ class ProcessRoutingService:
         if not agents:
             return details
 
-        agent_map = {
-            a.get("agent"): a
-            for a in agents
+        # Maintain the original list order so that workflows run sequentially
+        # when dependency metadata is missing or mis-specified.  Each agent is
+        # indexed for quick lookups when explicit dependencies are provided.
+        name_to_idx = {
+            a.get("agent"): i
+            for i, a in enumerate(agents)
             if isinstance(a, dict) and a.get("agent")
         }
 
-        referenced: set[str] = set()
-        for a in agents:
-            deps = a.get("dependencies", {})
-            referenced.update(deps.get("onSuccess", []))
-            referenced.update(deps.get("onFailure", []))
-            referenced.update(deps.get("onCompletion", []))
-
-        # The starting node is the one that is never referenced in any other
-        # agent's dependency lists.  Dependencies denote downstream agents to
-        # invoke upon completion of the current agent.
-        roots = [name for name in agent_map if name not in referenced]
-        root_name = roots[0] if roots else next(iter(agent_map), None)
-        if not root_name:
-            return details
-
-        def build(name: str) -> Dict[str, Any]:
-            node = agent_map.get(name, {})
+        def build_from_index(idx: int, visited: Optional[set[int]] = None) -> Dict[str, Any]:
+            visited = visited or set()
+            if idx in visited:
+                return {}
+            visited.add(idx)
+            node = agents[idx]
+            name = node.get("agent")
             flow = {
                 "agent": name,
                 "status": node.get("status", "saved"),
-                "agent_type": str(node.get("agent_type", node.get("agent", ""))),
+                "agent_type": str(node.get("agent_type", name or "")),
                 "agent_property": node.get(
                     "agent_property", {"llm": None, "prompts": [], "policies": []}
                 ),
             }
             deps = node.get("dependencies", {})
+            # Honour explicit dependencies when present; otherwise fall back to
+            # the next agent in the list to preserve the authored order.
             if deps.get("onSuccess"):
-                flow["onSuccess"] = build(deps["onSuccess"][0])
+                nxt = name_to_idx.get(deps["onSuccess"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onSuccess"] = build_from_index(nxt, visited.copy())
+            elif idx + 1 < len(agents) and (idx + 1) not in visited:
+                flow["onSuccess"] = build_from_index(idx + 1, visited.copy())
             if deps.get("onFailure"):
-                flow["onFailure"] = build(deps["onFailure"][0])
+                nxt = name_to_idx.get(deps["onFailure"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onFailure"] = build_from_index(nxt, visited.copy())
             if deps.get("onCompletion"):
-                flow["onCompletion"] = build(deps["onCompletion"][0])
+                nxt = name_to_idx.get(deps["onCompletion"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onCompletion"] = build_from_index(nxt, visited.copy())
             return flow
 
-        return build(root_name)
+        # Always start from the first agent as defined in the list to ensure
+        # determinism even when dependency links form a cycle or point
+        # backwards.
+        return build_from_index(0)
 
     # ------------------------------------------------------------------
     # Metadata enrichment
@@ -366,9 +376,22 @@ class ProcessRoutingService:
             return
 
         agents = details.get("agents", [])
-        for agent in agents:
-            if agent.get("agent") == agent_name:
-                agent["status"] = status
+        order = [a.get("agent") for a in agents]
+        if agent_name not in order:
+            logger.warning(
+                "Agent %s not found in process %s; skipping", agent_name, process_id
+            )
+            return
+        idx = order.index(agent_name)
+        for prev in agents[:idx]:
+            # Allow downstream agents to start once predecessors have at least
+            # begun execution. Only agents still in the ``saved`` state are
+            # considered incomplete for ordering purposes.
+            if prev.get("status") == "saved":
+                raise ValueError(
+                    f"Cannot update {agent_name} before {prev.get('agent')} starts"
+                )
+        agents[idx]["status"] = status
 
         # Derive the overall workflow status based on individual agent states.
         statuses = [a.get("status") for a in agents]
@@ -376,16 +399,35 @@ class ProcessRoutingService:
             overall = "failed"
         elif statuses and all(s == "completed" for s in statuses):
             overall = "completed"
+        elif any(s != "saved" for s in statuses):
+            overall = "running"
         else:
-            overall = details.get("status", "saved") or "saved"
+            overall = "saved"
 
         details["agents"] = agents
         details["status"] = overall
 
-        self.update_process_details(process_id, details, modified_by)
+        # Persist the updated details and synchronise the top-level
+        # ``process_status`` flag when the workflow reaches a terminal state.
+        if overall in ("completed", "failed"):
+            numeric = 1 if overall == "completed" else -1
+            self.update_process_status(
+                process_id,
+                numeric,
+                modified_by,
+                details,
+            )
+        else:
+            self.update_process_details(process_id, details, modified_by)
 
-    def update_process_status(self, process_id: int, status: int, modified_by: Optional[str] = None) -> None:
-        """Update process status in ``proc.routing``.
+    def update_process_status(
+        self,
+        process_id: int,
+        status: int,
+        modified_by: Optional[str] = None,
+        process_details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update process status in ``proc.routing`` and keep ``process_details`` in sync.
 
         Only ``1`` (success) and ``-1`` (failure) are valid. Any other value
         is coerced to ``-1`` if negative or ``1`` if positive."""
@@ -396,6 +438,9 @@ class ProcessRoutingService:
                 process_id, status, coerced,
             )
             status = coerced
+        # Ensure the ``process_details`` blob reflects the new status.
+        details = process_details or self.get_process_details(process_id, raw=True) or {}
+        details["status"] = "completed" if status == 1 else "failed"
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -403,11 +448,17 @@ class ProcessRoutingService:
                         """
                         UPDATE proc.routing
                         SET process_status = %s,
+                            process_details = %s,
                             modified_on = CURRENT_TIMESTAMP,
                             modified_by = %s
                         WHERE process_id = %s
                         """,
-                        (status, modified_by or self.settings.script_user, process_id),
+                        (
+                            status,
+                            self._safe_dumps(self.normalize_process_details(details)),
+                            modified_by or self.settings.script_user,
+                            process_id,
+                        ),
                     )
                     conn.commit()
                     logger.info(
