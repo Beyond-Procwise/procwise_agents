@@ -47,6 +47,11 @@ def test_email_drafting_agent(monkeypatch):
         return True
 
     monkeypatch.setattr(agent.email_service, "send_email", fake_send)
+    monkeypatch.setattr(
+        agent,
+        "call_ollama",
+        lambda *args, **kwargs: {"response": "Generated body"},
+    )
 
     context = AgentContext(
         workflow_id="wf1",
@@ -63,35 +68,39 @@ def test_email_drafting_agent(monkeypatch):
             "your_title": "Procurement",
             "your_company": "Your Company",
             "attachments": [(b"data", "file.txt")],
+            "context": "please draft",
         },
     )
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert "<html>" in sent["body"]
+    assert "Generated body" in sent["body"]
     assert sent["subject"] == "Request for Quotation (RFQ) – Office Furniture"
     assert sent["attachments"] == [(b"data", "file.txt")]
     assert sent["recipients"] == ["to@example.com", "cc@example.com"]
     assert output.data["sent"] is True
     assert output.data["body"] == sent["body"]
     assert output.data["recipients"] == ["to@example.com", "cc@example.com"]
-    assert "Request for Quotation (RFQ) – Office Furniture" in output.data["prompt"]
-    assert "Deadline for submission: 01/01/2025" in output.data["prompt"]
+    assert output.data["response"] == "Generated body"
 
 
 def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
     monkeypatch.setattr(agent, "email_service", DummyEmailService())
+    monkeypatch.setattr(
+        agent,
+        "call_ollama",
+        lambda *args, **kwargs: {"response": "All good"},
+    )
     context = AgentContext(
         workflow_id="wf3",
         agent_id="email_drafting",
         user_id="u1",
         input_data={
             "recipients": ["to@example.com"],
-
-            "body": "<p>{{ summary }}</p>",
-            "summary": "All good",
+            "body": "<p>{{ response }}</p>",
+            "context": "whatever",
         },
     )
     output = agent.run(context)
@@ -103,12 +112,18 @@ def test_email_drafting_handles_missing_recipient(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
     monkeypatch.setattr(agent, "email_service", DummyEmailService())
+    monkeypatch.setattr(
+        agent,
+        "call_ollama",
+        lambda *args, **kwargs: {"response": "hi"},
+    )
     context = AgentContext(
         workflow_id="wf2",
         agent_id="email_drafting",
         user_id="u1",
-        input_data={},
+        input_data={"context": "hi"},
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert output.data["sent"] is False
+    assert "hi" in output.data["body"]

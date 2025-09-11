@@ -67,32 +67,8 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         attachments = data.get("attachments")
 
         draft_only = data.get("draft_only", False)
-
         if not recipients:
-            html_body = ""
-            prompt = PROMPT_TEMPLATE.format(
-                supplier_contact_name=data.get("supplier_contact_name", "Supplier"),
-                submission_deadline=data.get("submission_deadline", ""),
-                category_manager_name=data.get("category_manager_name", ""),
-                category_manager_title=data.get("category_manager_title", ""),
-                category_manager_email=data.get("category_manager_email", ""),
-                your_name=data.get("your_name", ""),
-                your_title=data.get("your_title", ""),
-                your_company=data.get("your_company", ""),
-            )
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={
-                    "subject": subject,
-                    "body": html_body,
-                    "prompt": prompt,
-                    "recipients": None,
-                    "sender": sender,
-                    "attachments": attachments,
-                    "sent": False,
-                    "message": "recipient not provided",
-                },
-            )
+            recipients = None
 
         fmt_args = {
             "supplier_contact_name": data.get("supplier_contact_name", "Supplier"),
@@ -105,11 +81,39 @@ Please complete the table in full to ensure your proposal can be evaluated accur
             "your_company": data.get("your_company", ""),
         }
 
+        # Generate an LLM response based on upstream context if provided.  The
+        # result is injected into the email body via the ``response`` variable.
+        context_text = (
+            data.get("previous_agent_output")
+            or data.get("context")
+            or data.get("summary")
+            or ""
+        )
+        llm_response = ""
+        if context_text:
+            try:
+                resp = self.call_ollama(
+                    messages=[
+                        {"role": "system", "content": "You are a helpful procurement assistant."},
+                        {"role": "user", "content": context_text},
+                    ]
+                )
+                llm_response = resp.get("response", "").strip()
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("failed to generate email body via LLM")
+
         # Allow a custom body template to be supplied via input data. When no
         # template is provided we fall back to the default HTML_TEMPLATE.
         body_template = data.get("body") or self.HTML_TEMPLATE
-        template_args = {**data, **fmt_args, "deadline": fmt_args["submission_deadline"]}
+        template_args = {
+            **data,
+            **fmt_args,
+            "deadline": fmt_args["submission_deadline"],
+            "response": llm_response,
+        }
         html_body = Template(body_template).render(**template_args)
+        if llm_response and "{{ response }}" not in body_template:
+            html_body = f"<p>{llm_response}</p>" + html_body
 
         prompt = PROMPT_TEMPLATE.format(**fmt_args)
 
@@ -121,7 +125,12 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 )
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to send email")
-        message = "email sent" if sent else "email drafted"
+        # Mark as sent when an LLM response has been generated and email dispatched.
+        sent = sent and bool(llm_response)
+        if recipients is None:
+            message = "recipient not provided"
+        else:
+            message = "email sent" if sent else "email drafted"
 
         return AgentOutput(
             status=AgentStatus.SUCCESS,
@@ -134,6 +143,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 "attachments": attachments,
                 "sent": sent,
                 "message": message,
+                "response": llm_response,
             },
         )
 

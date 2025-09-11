@@ -16,7 +16,13 @@ from orchestration.orchestrator import Orchestrator
 class DummyNick:
     def __init__(self):
         self.policy_engine = PolicyEngine()
-        self.settings = SimpleNamespace(extraction_model="llama3", script_user="tester")
+        self.settings = SimpleNamespace(
+            extraction_model="llama3", script_user="tester"
+        )
+        # Minimal query engine stub for agent initialisation
+        self.query_engine = SimpleNamespace(
+            fetch_supplier_data=lambda *_: []
+        )
 
 
 def test_top_n_parsed_from_query(monkeypatch):

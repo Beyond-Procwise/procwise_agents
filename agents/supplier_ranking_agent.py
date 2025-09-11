@@ -24,18 +24,33 @@ class SupplierRankingAgent(BaseAgent):
         self.prompt_library = self._load_json_file('prompts/SupplierRankingAgent_PromptLibrary.json')
         self.justification_template = self._load_json_file('prompts/Justification_Tag_Prompt_Template.json')
         self.policy_engine = agent_nick.policy_engine
+        # Allow the agent to fetch its own supplier data when invoked outside
+        # the standard workflow.
+        self.query_engine = agent_nick.query_engine
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("SupplierRankingAgent: Starting ranking...")
 
-        # 1. Load supplier_data from context
+        # 1. Load supplier_data from context or fetch dynamically
         supplier_data = context.input_data.get('supplier_data')
         if supplier_data is None:
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error='No supplier_data provided to SupplierRankingAgent'
-            )
+            try:
+                supplier_data = self.query_engine.fetch_supplier_data(
+                    context.input_data
+                )
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("Failed to fetch supplier data")
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="Failed to fetch supplier data",
+                )
+            if supplier_data is None:
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error='No supplier_data provided to SupplierRankingAgent'
+                )
         # Convert to DataFrame
         if isinstance(supplier_data, pd.DataFrame):
             df = supplier_data.copy()
