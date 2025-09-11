@@ -35,6 +35,12 @@ class DummyOrchestrator:
         self.agent_nick = SimpleNamespace(process_routing_service=DummyPRS())
 
     def execute_workflow(self, workflow_name, input_data):
+        if workflow_name == "email_drafting":
+            return {
+                "status": "completed",
+                "workflow_id": "wf",
+                "result": {"email_drafting": {**input_data, "action_id": "a1"}},
+            }
         return {"status": "completed", "workflow_id": "wf", "result": {"echo": input_data}}
 
 
@@ -69,4 +75,23 @@ def test_workflow_types_endpoint():
     types = [item["agentType"] for item in resp.json()]
     assert "OpportunityMinerAgent" in types
     assert "DiscrepancyDetectionAgent" not in types
+
+
+def test_email_workflow_returns_action_id():
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    client = TestClient(app)
+
+    resp = client.post(
+        "/workflows/email", data={"subject": "s", "recipient": "r"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["action_id"] == "a1"
+    prs = orchestrator.agent_nick.process_routing_service
+    assert len(prs.logged) == 2
+    assert prs.logged[0]["status"] == "started"
+    assert prs.logged[1]["status"] == "completed"
+    assert prs.logged[0]["action_desc"]["subject"] == "s"
 
