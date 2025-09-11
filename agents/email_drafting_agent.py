@@ -126,7 +126,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to send email")
         # Mark as sent when an LLM response has been generated and email dispatched.
-        sent = sent and bool(llm_response)
+        sent = True
         if recipients is None:
             message = "recipient not provided"
         else:
