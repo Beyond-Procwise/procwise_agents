@@ -117,47 +117,53 @@ class ProcessRoutingService:
         if not agents:
             return details
 
-        agent_map = {
-            a.get("agent"): a
-            for a in agents
+        # Maintain the original list order so that workflows run sequentially
+        # when dependency metadata is missing or mis-specified.  Each agent is
+        # indexed for quick lookups when explicit dependencies are provided.
+        name_to_idx = {
+            a.get("agent"): i
+            for i, a in enumerate(agents)
             if isinstance(a, dict) and a.get("agent")
         }
 
-        referenced: set[str] = set()
-        for a in agents:
-            deps = a.get("dependencies", {})
-            referenced.update(deps.get("onSuccess", []))
-            referenced.update(deps.get("onFailure", []))
-            referenced.update(deps.get("onCompletion", []))
-
-        # The starting node is the one that is never referenced in any other
-        # agent's dependency lists.  Dependencies denote downstream agents to
-        # invoke upon completion of the current agent.
-        roots = [name for name in agent_map if name not in referenced]
-        root_name = roots[0] if roots else next(iter(agent_map), None)
-        if not root_name:
-            return details
-
-        def build(name: str) -> Dict[str, Any]:
-            node = agent_map.get(name, {})
+        def build_from_index(idx: int, visited: Optional[set[int]] = None) -> Dict[str, Any]:
+            visited = visited or set()
+            if idx in visited:
+                return {}
+            visited.add(idx)
+            node = agents[idx]
+            name = node.get("agent")
             flow = {
                 "agent": name,
                 "status": node.get("status", "saved"),
-                "agent_type": str(node.get("agent_type", node.get("agent", ""))),
+                "agent_type": str(node.get("agent_type", name or "")),
                 "agent_property": node.get(
                     "agent_property", {"llm": None, "prompts": [], "policies": []}
                 ),
             }
             deps = node.get("dependencies", {})
+            # Honour explicit dependencies when present; otherwise fall back to
+            # the next agent in the list to preserve the authored order.
             if deps.get("onSuccess"):
-                flow["onSuccess"] = build(deps["onSuccess"][0])
+                nxt = name_to_idx.get(deps["onSuccess"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onSuccess"] = build_from_index(nxt, visited.copy())
+            elif idx + 1 < len(agents) and (idx + 1) not in visited:
+                flow["onSuccess"] = build_from_index(idx + 1, visited.copy())
             if deps.get("onFailure"):
-                flow["onFailure"] = build(deps["onFailure"][0])
+                nxt = name_to_idx.get(deps["onFailure"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onFailure"] = build_from_index(nxt, visited.copy())
             if deps.get("onCompletion"):
-                flow["onCompletion"] = build(deps["onCompletion"][0])
+                nxt = name_to_idx.get(deps["onCompletion"][0])
+                if nxt is not None and nxt not in visited:
+                    flow["onCompletion"] = build_from_index(nxt, visited.copy())
             return flow
 
-        return build(root_name)
+        # Always start from the first agent as defined in the list to ensure
+        # determinism even when dependency links form a cycle or point
+        # backwards.
+        return build_from_index(0)
 
     # ------------------------------------------------------------------
     # Metadata enrichment

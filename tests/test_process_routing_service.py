@@ -91,6 +91,34 @@ def test_convert_agents_to_flow_builds_tree():
     assert flow["onFailure"]["agent_type"] == "3"
 
 
+def test_convert_agents_to_flow_respects_list_order():
+    """Even when dependencies reference upstream agents, the first listed
+    agent should remain the starting point of the flow."""
+
+    details = {
+        "status": "saved",
+        "agents": [
+            {
+                "agent": "A1",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                "dependencies": {},
+            },
+            {
+                "agent": "A2",
+                "status": "saved",
+                "agent_property": {"llm": "m", "prompts": [], "policies": []},
+                # Incorrectly points back to the first agent
+                "dependencies": {"onSuccess": ["A1"]},
+            },
+        ],
+    }
+
+    flow = ProcessRoutingService.convert_agents_to_flow(details)
+    assert flow["agent"] == "A1"
+    assert flow["onSuccess"]["agent"] == "A2"
+
+
 class FetchCursor:
     def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details
