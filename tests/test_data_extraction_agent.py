@@ -265,6 +265,31 @@ def test_run_summarises_discrepancies(monkeypatch):
     assert summary["documents_with_discrepancies"] == 1
 
 
+def test_run_propagates_discrepancy_fail(monkeypatch):
+    docs = [{"id": "1", "doc_type": "Invoice"}]
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "_process_documents", lambda p, k: {"status": "completed", "details": docs}
+    )
+
+    def fake_run_disc(self, docs, ctx):
+        return AgentOutput(status=AgentStatus.FAILED, data={}, error="db down")
+
+    monkeypatch.setattr(DataExtractionAgent, "_run_discrepancy_detection", fake_run_disc)
+
+    ctx = AgentContext(
+        workflow_id="w1",
+        agent_id="data_extraction",
+        user_id="u1",
+        input_data={},
+    )
+    output = agent.run(ctx)
+    assert output.status is AgentStatus.FAILED
+    assert output.error == "db down"
+
+
 def test_llm_extract_structured_data(monkeypatch):
     """LLM fallback should populate fields when heuristics miss them."""
 
@@ -303,3 +328,39 @@ def test_llm_extract_structured_data(monkeypatch):
     assert header["invoice_id"] == "INV1"
     assert header["vendor_name"] == "ACME"
     assert items and items[0]["item_id"] == "A1"
+
+
+def test_classify_doc_type_keyword_scoring(monkeypatch):
+    """Keyword scoring should classify common documents without LLM calls."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    def fail_call(**kwargs):
+        raise AssertionError("LLM should not be used for obvious keywords")
+
+    monkeypatch.setattr(agent, "call_ollama", fail_call)
+
+    assert (
+        agent._classify_doc_type("Invoice number INV-1 for services rendered")
+        == "Invoice"
+    )
+    assert (
+        agent._classify_doc_type("PO number PO-2 to purchase goods")
+        == "Purchase_Order"
+    )
+
+
+def test_classify_doc_type_llm_fallback(monkeypatch):
+    """When no keywords are present an LLM is queried for classification."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "call_ollama", lambda **kwargs: {"response": "Contract"}
+    )
+
+    # Text deliberately avoids any predefined keywords so the LLM is used.
+    assert agent._classify_doc_type("Memorandum of understanding") == "Contract"
+

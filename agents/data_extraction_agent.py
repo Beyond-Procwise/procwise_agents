@@ -199,6 +199,29 @@ PRODUCT_KEYWORDS = {
     "office supplies": ["paper", "pen", "stapler", "notebook", "folder"],
 }
 
+# Keyword map used to infer the high level document type.  Instead of a
+# rigid series of ``if/elif`` checks this mapping allows the classifier to
+# score documents based on the presence of domain specific terminology.  New
+# document types can therefore be introduced by simply extending this
+# dictionary rather than modifying control flow.
+DOC_TYPE_KEYWORDS = {
+    "Invoice": ["invoice", "amount due", "bill"],
+    "Purchase_Order": ["purchase order", "po number", "purchase requisition"],
+    "Quote": ["quote", "quotation", "estimate"],
+    "Contract": ["contract", "agreement", "terms"],
+}
+
+# Regular expression patterns used to pull unique identifiers such as invoice
+# or PO numbers from free‑form text.  Keeping these patterns at module scope
+# avoids scattering hard coded values throughout the implementation and makes
+# it straightforward to tweak or extend the extraction logic.
+UNIQUE_ID_PATTERNS = {
+    "Invoice": r"invoice\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+    "Purchase_Order": r"(?:purchase order|po)\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+    "Quote": r"quote\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+    "Contract": r"contract\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+}
+
 
 def _normalize_point_id(raw_id: str) -> int | str:
     """Qdrant allows integer identifiers; strings are hashed deterministically."""
@@ -268,6 +291,25 @@ class DataExtractionAgent(BaseAgent):
             data = self._process_documents(s3_prefix, s3_object_key)
             docs = data.get("details", [])
             discrepancy_result = self._run_discrepancy_detection(docs, context)
+
+            # Propagate discrepancy-detection failures so that callers can
+            # distinguish validation problems from successfully audited
+            # documents.  Otherwise the summary below would misleadingly report
+            # all documents as valid when the validation step never ran.
+            if discrepancy_result.status != AgentStatus.SUCCESS:
+                err = discrepancy_result.error or "discrepancy detection failed"
+                data["summary"] = {
+                    "documents_provided": len(docs),
+                    "documents_valid": 0,
+                    "documents_with_discrepancies": len(docs),
+                }
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data=data,
+                    error=err,
+                )
+
+
             mismatches = discrepancy_result.data.get("mismatches", [])
             summary = {
                 "documents_provided": len(docs),
@@ -277,10 +319,8 @@ class DataExtractionAgent(BaseAgent):
             data["summary"] = summary
             if mismatches:
                 data["mismatches"] = mismatches
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=data,
-            )
+            return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
@@ -729,16 +769,44 @@ class DataExtractionAgent(BaseAgent):
         return header
 
     def _classify_doc_type(self, text: str) -> str:
-        """Classify the document type using keyword heuristics only."""
-        snippet = text[:1000].lower()
-        if "purchase order" in snippet or re.search(r"\bpo\b", snippet):
-            return "Purchase_Order"
-        if "invoice" in snippet:
-            return "Invoice"
-        if "quote" in snippet:
-            return "Quote"
-        if "contract" in snippet:
-            return "Contract"
+        """Infer the document type from content with an LLM fallback.
+
+        The method first scores the text against :data:`DOC_TYPE_KEYWORDS` so
+        that multiple hints within the document can contribute to the
+        classification.  When no clear winner emerges an inexpensive LLM call
+        is made to label the document, keeping the approach largely generic
+        while maintaining accuracy.
+        """
+
+        snippet = text[:2000].lower()
+        scores = {
+            dtype: sum(snippet.count(kw) for kw in kws)
+            for dtype, kws in DOC_TYPE_KEYWORDS.items()
+        }
+        best_type, best_score = max(scores.items(), key=lambda kv: kv[1])
+        if best_score > 0:
+            return best_type
+
+        prompt = (
+            "Classify the following document as Invoice, Purchase_Order, Quote,"
+            " Contract, or Other. Respond with only the label.\n\n" + snippet
+        )
+        try:
+            resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
+            label = resp.get("response", "").strip().lower()
+            for canonical in DOC_TYPE_KEYWORDS:
+                if canonical.replace("_", " ").lower() in label:
+                    return canonical
+            if "invoice" in label:
+                return "Invoice"
+            if "purchase" in label or "po" in label:
+                return "Purchase_Order"
+            if "quote" in label:
+                return "Quote"
+            if "contract" in label:
+                return "Contract"
+        except Exception:
+            pass
         return "Other"
 
     def _classify_product_type(self, text: str) -> str:
@@ -752,13 +820,7 @@ class DataExtractionAgent(BaseAgent):
 
     def _extract_unique_id(self, text: str, doc_type: str) -> str:
         """Extract a best-effort unique identifier such as invoice or PO number."""
-        patterns = {
-            "Invoice": r"invoice\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
-            "Purchase_Order": r"(?:purchase order|po)\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
-            "Quote": r"quote\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
-            "Contract": r"contract\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
-        }
-        pattern = patterns.get(doc_type)
+        pattern = UNIQUE_ID_PATTERNS.get(doc_type)
         if not pattern:
             return ""
         match = re.search(pattern, text, re.IGNORECASE)
