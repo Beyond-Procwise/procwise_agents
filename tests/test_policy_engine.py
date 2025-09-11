@@ -18,3 +18,9 @@ def test_invalid_criteria_blocked():
     engine = PolicyEngine()
     result = engine.validate_workflow('supplier_ranking', 'user1', {'criteria': ['unknown']})
     assert result['allowed'] is False
+
+
+def test_missing_criteria_defaults_to_policy_weights():
+    engine = PolicyEngine()
+    result = engine.validate_workflow('supplier_ranking', 'user1', {})
+    assert result['allowed'] is True

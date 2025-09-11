@@ -552,19 +552,40 @@ class OpportunityMinerAgent(BaseAgent):
         required_ct = {"spend_category", "supplier_id", "contract_id"}
         if ct.empty or not required_ct.issubset(ct.columns):
             return findings
+
         supplier_counts = (
             ct.groupby("spend_category")
-            .agg(supplier_count=("supplier_id", "nunique"), contract_ids=("contract_id", list))
+            .agg(
+                supplier_count=("supplier_id", "nunique"),
+                contract_ids=("contract_id", list),
+            )
             .reset_index()
         )
+
+        # Determine the top-spend supplier per category so that the resulting
+        # opportunity record references a real supplier identifier instead of
+        # ``null``.  ``total_contract_value`` is used as a proxy for spend.
+        spend = (
+            ct.groupby(["spend_category", "supplier_id"])["total_contract_value"]
+            .sum()
+            .reset_index()
+        )
+
         cond = supplier_counts["supplier_count"] > 1
         for _, row in supplier_counts[cond].iterrows():
+            cat = row.get("spend_category")
             savings = row["supplier_count"] * 10.0  # placeholder
+            top_row = (
+                spend[spend["spend_category"] == cat]
+                .sort_values("total_contract_value", ascending=False)
+                .head(1)
+            )
+            supplier_id = top_row["supplier_id"].iloc[0] if not top_row.empty else None
             findings.append(
                 self._build_finding(
                     "Supplier Consolidation",
-                    None,
-                    row.get("spend_category"),
+                    supplier_id,
+                    cat,
                     None,
                     savings,
                     {"supplier_count": row["supplier_count"]},

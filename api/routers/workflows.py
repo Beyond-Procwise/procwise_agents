@@ -282,22 +282,88 @@ async def extract_documents(
 @router.post("/email")
 async def draft_email(
     subject: str = Form(...),
-    recipient: str = Form(...),
+    recipients: str = Form(...),
     sender: Optional[str] = Form(None),
     body: Optional[str] = Form(None),
+    action_id: Optional[str] = Form(None),
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ):
     """Draft and send an email using the EmailDraftingAgent."""
+    recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
     input_data = {
         "subject": subject,
-        "recipient": recipient,
+        "recipients": recipient_list,
         "sender": sender,
         "body": body,
+        "action_id": action_id,
     }
-    result = await run_in_threadpool(
-        orchestrator.execute_workflow, "email_drafting", input_data
+    prs = orchestrator.agent_nick.process_routing_service
+
+    # Log the process with the expected schema so that the resulting entry in
+    # ``proc.routing`` always contains ``input``/``output`` sections.  The
+    # ``output`` fields are populated with placeholders and will be updated once
+    # the EmailDraftingAgent finishes execution.
+    initial_details = {
+        "input": input_data,
+        "agents": [],
+        "output": {
+            "body": "",
+            "sent": False,
+            "prompt": "",
+            "recipients": None,
+            "attachments": None,
+        },
+        "status": "saved",
+    }
+    process_id = prs.log_process(
+        process_name="email_drafting", process_details=initial_details
     )
-    return result
+    if process_id is None:
+        raise HTTPException(status_code=500, detail="Failed to log process")
+
+    action_id = prs.log_action(
+        process_id=process_id,
+        agent_type="email_drafting",
+        action_desc=input_data,
+        status="started",
+        action_id=action_id,
+    )
+
+    try:
+        result = await run_in_threadpool(
+            orchestrator.execute_workflow, "email_drafting", input_data
+        )
+
+        email_output = result.get("result", {}).get("email_drafting", {})
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_drafting",
+            action_desc=input_data,
+            process_output=result,
+            status="completed",
+            action_id=action_id,
+        )
+
+        final_details = {
+            "input": input_data,
+            "agents": [],
+            "output": email_output,
+            "status": "completed" if email_output.get("sent") else "failed",
+        }
+        prs.update_process_details(process_id, final_details)
+        prs.update_process_status(process_id, 1 if email_output.get("sent") else -1)
+    except Exception as exc:  # pragma: no cover - network/runtime
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_drafting",
+            action_desc=str(exc),
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, -1)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {**result, "action_id": action_id}
 
 
 @router.post("/negotiate")

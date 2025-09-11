@@ -11,6 +11,8 @@ import json
 import logging
 from pathlib import Path
 
+from jinja2 import Template
+
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_service import EmailService
 from utils.gpu import configure_gpu
@@ -58,13 +60,15 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         subject = data.get(
             "subject", "Request for Quotation (RFQ) – Office Furniture"
         )
-        recipient = data.get("recipient")
+        recipients = data.get("recipients") or data.get("recipient")
+        if isinstance(recipients, str):
+            recipients = [recipients]
         sender = data.get("sender", self.agent_nick.settings.ses_default_sender)
         attachments = data.get("attachments")
 
         draft_only = data.get("draft_only", False)
 
-        if not recipient:
+        if not recipients:
             html_body = ""
             prompt = PROMPT_TEMPLATE.format(
                 supplier_contact_name=data.get("supplier_contact_name", "Supplier"),
@@ -82,7 +86,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                     "subject": subject,
                     "body": html_body,
                     "prompt": prompt,
-                    "recipient": None,
+                    "recipients": None,
                     "sender": sender,
                     "attachments": attachments,
                     "sent": False,
@@ -101,24 +105,19 @@ Please complete the table in full to ensure your proposal can be evaluated accur
             "your_company": data.get("your_company", ""),
         }
 
-        html_body = self.HTML_TEMPLATE.format(
-            supplier_contact_name=fmt_args["supplier_contact_name"],
-            deadline=fmt_args["submission_deadline"],
-            category_manager_name=fmt_args["category_manager_name"],
-            category_manager_title=fmt_args["category_manager_title"],
-            category_manager_email=fmt_args["category_manager_email"],
-            your_name=fmt_args["your_name"],
-            your_title=fmt_args["your_title"],
-            your_company=fmt_args["your_company"],
-        )
+        # Allow a custom body template to be supplied via input data. When no
+        # template is provided we fall back to the default HTML_TEMPLATE.
+        body_template = data.get("body") or self.HTML_TEMPLATE
+        template_args = {**data, **fmt_args, "deadline": fmt_args["submission_deadline"]}
+        html_body = Template(body_template).render(**template_args)
 
         prompt = PROMPT_TEMPLATE.format(**fmt_args)
 
         sent = False
-        if not draft_only:
+        if not draft_only and recipients:
             try:
                 sent = self.email_service.send_email(
-                    subject, html_body, recipient, sender, attachments
+                    subject, html_body, recipients, sender, attachments
                 )
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to send email")
@@ -130,7 +129,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 "subject": subject,
                 "body": html_body,
                 "prompt": prompt,
-                "recipient": recipient,
+                "recipients": recipients,
                 "sender": sender,
                 "attachments": attachments,
                 "sent": sent,

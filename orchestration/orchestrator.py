@@ -634,7 +634,17 @@ class Orchestrator:
         # without replacing the root node's status based on downstream
         # results.
         _run(flow)
-        flow["status"] = 100 if flow.get("status") != "failed" else 0
+
+        def _contains_failure(node: Dict[str, Any]) -> bool:
+            if node.get("status") == "failed":
+                return True
+            for key in ("onSuccess", "onFailure", "onCompletion"):
+                child = node.get(key)
+                if isinstance(child, dict) and _contains_failure(child):
+                    return True
+            return False
+
+        flow["status"] = 0 if _contains_failure(flow) else 100
         return flow
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:

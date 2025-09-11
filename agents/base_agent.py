@@ -58,6 +58,7 @@ class AgentOutput:
     pass_fields: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     confidence: Optional[float] = None
+    action_id: Optional[str] = None
 
 class BaseAgent:
     def __init__(self, agent_nick):
@@ -79,6 +80,7 @@ class BaseAgent:
         every agent invocation is captured in the database regardless of how it
         is triggered.
         """
+        logger.info("%s: starting with input %s", self.__class__.__name__, context.input_data)
         start_ts = datetime.utcnow()
         try:
             result = self.run(context)
@@ -104,7 +106,7 @@ class BaseAgent:
                 process_end_ts=end_ts,
                 triggered_by=context.user_id,
             )
-            self.agent_nick.process_routing_service.log_action(
+            action_id = self.agent_nick.process_routing_service.log_action(
                 process_id=process_id,
                 agent_type=self.__class__.__name__,
                 action_desc=context.input_data,
@@ -112,6 +114,11 @@ class BaseAgent:
                 status="completed" if result.status == AgentStatus.SUCCESS else "failed",
                 run_id=run_id,
             )
+            result.action_id = action_id
+            result.data.setdefault("action_id", action_id)
+        logger.info(
+            "%s: completed with status %s", self.__class__.__name__, result.status.value
+        )
         return result
 
     # ------------------------------------------------------------------

@@ -154,6 +154,47 @@ def test_execute_agent_flow_preserves_root_status_on_failure_chain():
     assert flow["onFailure"]["status"] == "completed"
 
 
+def test_execute_agent_flow_returns_failure_if_any_step_fails():
+    class ConfigurableAgent:
+        def __init__(self, status):
+            self.status = status
+
+        def execute(self, context):  # pragma: no cover - simple stub
+            return AgentOutput(status=self.status, data={})
+
+    first = ConfigurableAgent(AgentStatus.SUCCESS)
+    second = ConfigurableAgent(AgentStatus.FAILED)
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"first": first, "second": second},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "first": "FirstAgent",
+        "second": "SecondAgent",
+    }
+    orchestrator._load_prompts = lambda: {1: {}}
+    orchestrator._load_policies = lambda: {1: {}}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "first",
+        "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
+        "onSuccess": {
+            "status": "saved",
+            "agent_type": "second",
+            "agent_property": {"llm": "m", "prompts": [1], "policies": [1]},
+        },
+    }
+
+    result = orchestrator.execute_agent_flow(flow)
+    assert result["status"] == 0
+
+
 def test_execute_agent_flow_ignores_agent_id_suffix():
     agent = DummyAgent()
     nick = SimpleNamespace(
