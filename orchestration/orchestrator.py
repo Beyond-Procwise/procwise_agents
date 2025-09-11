@@ -205,6 +205,37 @@ class Orchestrator:
         for slug in agent_defs:
             if slug in key_lower or key_lower in slug:
                 return slug
+
+        tokens: List[str] = []
+        for t in re.split(r"[_]+", key_lower):
+            if len(t) <= 2 or t in {"agent", "test", "keerthi", "admin", "user", "service"}:
+                continue
+            if t.endswith("s"):
+                t = t[:-1]
+            tokens.append(t)
+
+        for token in tokens:
+            for slug in agent_defs:
+                if token in slug or slug in token:
+                    return slug
+
+        # Fuzzy match individual tokens or the whole key to tolerate
+        # dynamically generated identifiers (e.g.
+        # ``keerthi_quotes_agent_test_0001``) and minor misspellings.
+        try:  # ``difflib`` is part of the stdlib
+            import difflib
+
+            tokens = re.split(r"[_]+", key_lower)
+            candidates = list(agent_defs.keys())
+            for token in tokens:
+                match = difflib.get_close_matches(token, candidates, n=1, cutoff=0.8)
+                if match:
+                    return match[0]
+            match = difflib.get_close_matches(key_lower, candidates, n=1, cutoff=0.6)
+            if match:
+                return match[0]
+        except Exception:  # pragma: no cover - extremely defensive
+            logger.exception("Fuzzy agent resolution failed for '%s'", raw_key)
         return None
 
     def _get_agent_details(self, agent_spec) -> List[Dict[str, Any]]:
