@@ -290,8 +290,9 @@ def test_run_propagates_discrepancy_fail(monkeypatch):
     assert output.error == "db down"
 
 
-def test_llm_extract_structured_data(monkeypatch):
-    """LLM fallback should populate fields when heuristics miss them."""
+def test_fill_missing_fields_with_llm(monkeypatch):
+    """LLM call fills only missing fields after heuristic parsing."""
+
 
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
@@ -363,4 +364,40 @@ def test_classify_doc_type_llm_fallback(monkeypatch):
 
     # Text deliberately avoids any predefined keywords so the LLM is used.
     assert agent._classify_doc_type("Memorandum of understanding") == "Contract"
+
+
+def test_classification_prompt_includes_context(monkeypatch):
+    """LLM classification prompt should include procurement context."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    captured = {}
+
+    def fake_call(prompt, model):
+        captured["prompt"] = prompt
+        return {"response": "Invoice"}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    agent._classify_doc_type("irrelevant text")
+    assert "buyer sends a purchase order" in captured["prompt"].lower()
+
+
+def test_fill_missing_fields_prompt_includes_context(monkeypatch):
+    """LLM field completion should receive doc-type specific context."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    captured = {}
+
+    def fake_call(prompt, model, format=None):
+        captured["prompt"] = prompt
+        return {"response": json.dumps({"header_data": {}, "line_items": []})}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    agent._fill_missing_fields_with_llm("text", "Invoice", {}, [])
+    assert "vendor sends an invoice" in captured["prompt"].lower()
 

@@ -199,6 +199,36 @@ PRODUCT_KEYWORDS = {
     "office supplies": ["paper", "pen", "stapler", "notebook", "folder"],
 }
 
+# Contextual descriptions for each document type.  These short notes help
+# LLM prompts remain aware of the real-world relationship between buyers and
+# vendors so extracted data aligns with procurement workflows.
+DOC_TYPE_CONTEXT = {
+    "Purchase_Order": (
+        "A buyer sends a purchase order (PO) to a seller to formally request"
+        " an order for specific goods or services from a vendor."
+    ),
+    "Invoice": (
+        "A vendor sends an invoice to a buyer to request payment for goods or"
+        " services provided. This document details the transaction and"
+        " creates a legal record for both parties."
+    ),
+    "Quote": (
+        "A vendor sends a quote to a potential buyer or client offering goods"
+        " or services at a specific price and under certain conditions before"
+        " a purchase is agreed."
+    ),
+    "Contract": (
+        "A contract is sent by the party proposing the agreement—often the"
+        " seller, service provider, or their representative—for review and"
+        " signature by the other parties."
+    ),
+}
+
+# Preformatted context string fed into LLM prompts.  Keeping it at module
+# scope allows tests to assert its presence without duplicating the full text.
+DOC_CONTEXT_TEXT = "\n".join(DOC_TYPE_CONTEXT.values())
+
+
 # Keyword map used to infer the high level document type.  Instead of a
 # rigid series of ``if/elif`` checks this mapping allows the classifier to
 # score documents based on the presence of domain specific terminology.  New
@@ -308,7 +338,6 @@ class DataExtractionAgent(BaseAgent):
                     data=data,
                     error=err,
                 )
-
 
             mismatches = discrepancy_result.data.get("mismatches", [])
             summary = {
@@ -789,7 +818,11 @@ class DataExtractionAgent(BaseAgent):
 
         prompt = (
             "Classify the following document as Invoice, Purchase_Order, Quote,"
-            " Contract, or Other. Respond with only the label.\n\n" + snippet
+            " Contract, or Other. Respond with only the label.\n\nContext:\n"
+            + DOC_CONTEXT_TEXT
+            + "\n\nDocument:\n"
+            + snippet
+
         )
         try:
             resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
@@ -1010,39 +1043,75 @@ class DataExtractionAgent(BaseAgent):
             extracted = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
             line_items = self._normalize_line_item_fields(extracted, doc_type)
 
-        # Augment with LLM extraction as a fallback when heuristics miss fields
-        llm_header, llm_items = self._llm_extract_structured_data(text, doc_type)
-        llm_header = self._normalize_header_fields(llm_header, doc_type)
-        for key, value in llm_header.items():
-            header.setdefault(key, value)
-        if not line_items and llm_items:
-            line_items = self._normalize_line_item_fields(llm_items, doc_type)
+        # Augment with a targeted LLM call for any fields still missing.  This
+        # keeps the extraction robust without depending entirely on the model.
+        header, line_items = self._fill_missing_fields_with_llm(
+            text, doc_type, header, line_items
+        )
+
 
         header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
         return header, line_items
 
-    def _llm_extract_structured_data(
-        self, text: str, doc_type: str
+    def _fill_missing_fields_with_llm(
+        self,
+        text: str,
+        doc_type: str,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Use an LLM to extract structured fields as a best-effort fallback."""
+        """Ask an LLM to supply only the fields still missing after heuristics."""
 
         schema = SCHEMA_MAP.get(doc_type, {})
         header_fields = list(schema.get("header", {}).keys())
-        line_fields = list(schema.get("line_items", {}).keys())
-        prompt = (
-            "Extract key fields from the following document. Return a JSON object with "
-            "'header_data' and 'line_items'. 'header_data' should include as many of "
-            f"{header_fields} as possible and 'line_items' should be a list of objects "
-            f"containing {line_fields}.\n\nDocument:\n{text}"
+        missing_header = [f for f in header_fields if not header.get(f)]
+        need_items = not line_items and schema.get("line_items")
+
+        if not missing_header and not need_items:
+            return header, line_items
+
+        prompt_parts = [
+            f"Document type: {doc_type}.",
+            DOC_TYPE_CONTEXT.get(doc_type, ""),
+            "Existing data:",
+            json.dumps({"header_data": header, "line_items": line_items}),
+            "From the document text below extract the missing header fields:",
+            ", ".join(missing_header) if missing_header else "none",
+        ]
+        if need_items:
+            line_fields = list(schema.get("line_items", {}).keys())
+            prompt_parts.append(
+                "Also extract line_items as a list of objects containing: "
+                + ", ".join(line_fields)
+            )
+        prompt_parts.append(
+            "Return JSON with keys 'header_data' and 'line_items'; use null when a value is unknown.\n\nDocument:\n"
+            + text
         )
-        response = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json")
+        prompt = "\n".join(prompt_parts)
+        response = self.call_ollama(
+        
+            prompt=prompt, model=self.extraction_model, format="json"
+        )
         try:
             payload = json.loads(response.get("response", "{}"))
-            header = payload.get("header_data", {}) or {}
-            line_items = payload.get("line_items", []) or []
         except Exception:
-            header, line_items = {}, []
+            payload = {}
+        llm_header = self._normalize_header_fields(
+            payload.get("header_data", {}), doc_type
+        )
+        for key, value in llm_header.items():
+            header.setdefault(key, value)
+
+        if need_items and payload.get("line_items"):
+            llm_items = self._normalize_line_item_fields(
+                payload.get("line_items", []), doc_type
+            )
+            if llm_items:
+                line_items = llm_items
+
+
         return header, line_items
 
 
