@@ -89,6 +89,7 @@ def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
         user_id="u1",
         input_data={
             "recipients": ["to@example.com"],
+
             "body": "<p>{{ summary }}</p>",
             "summary": "All good",
         },

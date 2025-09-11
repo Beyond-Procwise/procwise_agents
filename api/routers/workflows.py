@@ -317,6 +317,7 @@ async def draft_email(
     }
     process_id = prs.log_process(
         process_name="email_drafting", process_details=initial_details
+
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
@@ -327,6 +328,7 @@ async def draft_email(
         action_desc=input_data,
         status="started",
         action_id=action_id,
+
     )
 
     try:
@@ -335,6 +337,7 @@ async def draft_email(
         )
 
         email_output = result.get("result", {}).get("email_drafting", {})
+
         prs.log_action(
             process_id=process_id,
             agent_type="email_drafting",
@@ -352,6 +355,7 @@ async def draft_email(
         }
         prs.update_process_details(process_id, final_details)
         prs.update_process_status(process_id, 1 if email_output.get("sent") else -1)
+
     except Exception as exc:  # pragma: no cover - network/runtime
         prs.log_action(
             process_id=process_id,

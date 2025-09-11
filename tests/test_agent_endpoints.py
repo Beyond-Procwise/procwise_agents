@@ -58,6 +58,7 @@ class DummyOrchestrator:
         }
 
 
+
 def test_agent_execute_endpoint():
     app = FastAPI()
     app.include_router(agents_router)
@@ -112,6 +113,7 @@ def test_email_workflow_returns_action_id():
     assert data["result"]["email_drafting"]["sent"] is True
     assert data["result"]["email_drafting"]["body"] == "<p>generated</p>"
     assert data["result"]["email_drafting"]["recipients"] == ["r1", "r2"]
+
     prs = orchestrator.agent_nick.process_routing_service
     assert len(prs.logged) == 2
     assert prs.logged[0]["status"] == "started"
@@ -121,4 +123,5 @@ def test_email_workflow_returns_action_id():
     assert prs.updated_details["output"]["body"] == "<p>generated</p>"
     assert prs.updated_details["output"]["recipients"] == ["r1", "r2"]
     assert prs.updated_details["status"] == "completed"
+
 
