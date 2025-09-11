@@ -32,34 +32,48 @@ with PROMPT_PATH.open("r", encoding="utf-8") as fp:
 
 
 class EmailDraftingAgent(BaseAgent):
-    """Agent that drafts an HTML RFQ email and sends it via SES."""
+    """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
-    HTML_TEMPLATE = """<html><body>
-<p>Dear {supplier_contact_name},</p>
-<p>We are requesting a quotation for the following items/services as part of our sourcing process.
-Please complete the table in full to ensure your proposal can be evaluated accurately.</p>
-<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">
-<tr><th>Item ID</th><th>Description</th><th>UOM</th><th>Qty</th><th>Unit Price (Currency)</th><th>Extended Price</th><th>Delivery Lead Time (days)</th><th>Payment Terms (days)</th><th>Warranty / Support</th><th>Contract Ref</th><th>Comments</th></tr>
-<tr><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-</table>
-<p>Please confirm one of the following options:</p>
-<p>[ ] I accept Your Company’s Standard Terms &amp; Conditions (<a href=\"https://yourcompany.com/procurement-terms\">https://yourcompany.com/procurement-terms</a>)</p>
-<p>[ ] I wish to proceed under my current contract with Your Company: Contract Number [__________]</p>
-<p>Deadline for submission: {deadline}</p>
-<p>Please return the completed table and confirmation via reply to this email. For queries, contact {category_manager_name}, {category_manager_title}, {category_manager_email}.</p>
-<p>Thank you for your response. We look forward to your proposal.</p>
-<p>Kind regards,<br/>{your_name}<br/>{your_title}<br/>{your_company}</p>
-</body></html>"""
+    TEXT_TEMPLATE = (
+        "Dear {supplier_contact_name},\n\n"
+        "We are requesting a quotation for the following items/services as part of our sourcing process.\n"
+        "Please complete the table in full to ensure your proposal can be evaluated accurately.\n\n"
+        "Item ID | Description | UOM | Qty | Unit Price (Currency) | Extended Price | Delivery Lead Time (days) | Payment Terms (days) | Warranty / Support | Contract Ref | Comments\n"
+        "------- | ----------- | --- | --- | --------------------- | -------------- | ------------------------- | ------------------- | ----------------- | ------------ | --------\n"
+        "\n"
+        "Please confirm one of the following options:\n"
+        "[ ] I accept Your Company’s Standard Terms & Conditions (https://yourcompany.com/procurement-terms)\n"
+        "[ ] I wish to proceed under my current contract with Your Company: Contract Number [__________]\n"
+        "Deadline for submission: {deadline}\n"
+        "Please return the completed table and confirmation via reply to this email. For queries, contact {category_manager_name}, {category_manager_title}, {category_manager_email}.\n"
+        "Thank you for your response. We look forward to your proposal.\n\n"
+        "Kind regards,\n"
+        "{your_name}\n"
+        "{your_title}\n"
+        "{your_company}\n"
+    )
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.email_service = EmailService(agent_nick)
 
     def run(self, context: AgentContext) -> AgentOutput:
-        data = context.input_data
-        subject = data.get(
-            "subject", "Request for Quotation (RFQ) – Office Furniture"
-        )
+        data = dict(context.input_data)
+
+        # Merge any structured output from previous agents so that extracted
+        # variables can populate the email template automatically.
+        prev = data.get("previous_agent_output")
+        if isinstance(prev, dict):
+            data = {**prev, **data}
+        elif isinstance(prev, str):
+            try:
+                parsed = json.loads(prev)
+                if isinstance(parsed, dict):
+                    data = {**parsed, **data}
+            except Exception:  # pragma: no cover - best effort
+                logger.debug("previous_agent_output not JSON parsable")
+
+        subject = data.get("subject")
         recipients = data.get("recipients") or data.get("recipient")
         if isinstance(recipients, str):
             recipients = [recipients]
@@ -84,11 +98,32 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         # Generate an LLM response based on upstream context if provided.  The
         # result is injected into the email body via the ``response`` variable.
         context_text = (
-            data.get("previous_agent_output")
-            or data.get("context")
+            data.get("context")
             or data.get("summary")
             or ""
         )
+
+        # Generate a subject line if one was not supplied.
+        DEFAULT_SUBJECT = "Request for Quotation (RFQ) – Office Furniture"
+        if not subject:
+            subject = DEFAULT_SUBJECT
+            if context_text:
+                try:
+                    resp = self.call_ollama(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You write concise email subject lines for procurement RFQs.",
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Generate a subject line for the following request:\n{context_text}",
+                            },
+                        ]
+                    )
+                    subject = resp.get("response", "").strip() or DEFAULT_SUBJECT
+                except Exception:  # pragma: no cover - best effort
+                    logger.exception("failed to generate subject via LLM")
         llm_response = ""
         if context_text:
             try:
@@ -103,17 +138,17 @@ Please complete the table in full to ensure your proposal can be evaluated accur
                 logger.exception("failed to generate email body via LLM")
 
         # Allow a custom body template to be supplied via input data. When no
-        # template is provided we fall back to the default HTML_TEMPLATE.
-        body_template = data.get("body") or self.HTML_TEMPLATE
+        # template is provided we fall back to the default TEXT_TEMPLATE.
+        body_template = data.get("body") or self.TEXT_TEMPLATE
         template_args = {
             **data,
             **fmt_args,
             "deadline": fmt_args["submission_deadline"],
             "response": llm_response,
         }
-        html_body = Template(body_template).render(**template_args)
+        text_body = Template(body_template).render(**template_args)
         if llm_response and "{{ response }}" not in body_template:
-            html_body = f"<p>{llm_response}</p>" + html_body
+            text_body = f"{llm_response}\n\n" + text_body
 
         prompt = PROMPT_TEMPLATE.format(**fmt_args)
 
@@ -121,12 +156,10 @@ Please complete the table in full to ensure your proposal can be evaluated accur
         if not draft_only and recipients:
             try:
                 sent = self.email_service.send_email(
-                    subject, html_body, recipients, sender, attachments
+                    subject, text_body, recipients, sender, attachments
                 )
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to send email")
-        # Mark as sent when an LLM response has been generated and email dispatched.
-        sent = True
         if recipients is None:
             message = "recipient not provided"
         else:
@@ -136,7 +169,7 @@ Please complete the table in full to ensure your proposal can be evaluated accur
             status=AgentStatus.SUCCESS,
             data={
                 "subject": subject,
-                "body": html_body,
+                "body": text_body,
                 "prompt": prompt,
                 "recipients": recipients,
                 "sender": sender,

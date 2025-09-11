@@ -47,11 +47,11 @@ def test_email_drafting_agent(monkeypatch):
         return True
 
     monkeypatch.setattr(agent.email_service, "send_email", fake_send)
-    monkeypatch.setattr(
-        agent,
-        "call_ollama",
-        lambda *args, **kwargs: {"response": "Generated body"},
-    )
+    responses = iter([
+        {"response": "RFQ – Office Furniture"},
+        {"response": "Generated body"},
+    ])
+    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
 
     context = AgentContext(
         workflow_id="wf1",
@@ -75,7 +75,8 @@ def test_email_drafting_agent(monkeypatch):
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert "Generated body" in sent["body"]
-    assert sent["subject"] == "Request for Quotation (RFQ) – Office Furniture"
+    assert sent["subject"] == "RFQ – Office Furniture"
+    assert "<" not in sent["body"]
     assert sent["attachments"] == [(b"data", "file.txt")]
     assert sent["recipients"] == ["to@example.com", "cc@example.com"]
     assert output.data["sent"] is True
@@ -88,35 +89,36 @@ def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
     monkeypatch.setattr(agent, "email_service", DummyEmailService())
-    monkeypatch.setattr(
-        agent,
-        "call_ollama",
-        lambda *args, **kwargs: {"response": "All good"},
-    )
+    responses = iter([
+        {"response": "Subject"},
+        {"response": "All good"},
+    ])
+    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
     context = AgentContext(
         workflow_id="wf3",
         agent_id="email_drafting",
         user_id="u1",
         input_data={
             "recipients": ["to@example.com"],
-            "body": "<p>{{ response }}</p>",
+            "body": "{{ response }}",
             "context": "whatever",
         },
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert "<p>All good</p>" in output.data["body"]
+    assert output.data["body"] == "All good"
+    assert "<" not in output.data["body"]
 
 
 def test_email_drafting_handles_missing_recipient(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
     monkeypatch.setattr(agent, "email_service", DummyEmailService())
-    monkeypatch.setattr(
-        agent,
-        "call_ollama",
-        lambda *args, **kwargs: {"response": "hi"},
-    )
+    responses = iter([
+        {"response": "Subject"},
+        {"response": "hi"},
+    ])
+    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
     context = AgentContext(
         workflow_id="wf2",
         agent_id="email_drafting",
