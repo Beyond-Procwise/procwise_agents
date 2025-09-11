@@ -1,6 +1,9 @@
 import os
 import sys
+import json
 from types import SimpleNamespace
+
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -67,18 +70,24 @@ def test_non_structured_docs_are_vectorized(monkeypatch):
 
     monkeypatch.setattr(agent, "_extract_text", lambda b, k: "contract text")
     monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Contract")
+    monkeypatch.setattr(agent, "_classify_product_type", lambda t: "it hardware")
+    monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "C123")
     monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: captured.setdefault("persist", True))
 
     def fake_vectorize(text, pk, dt, pt, key):
-        captured.setdefault("doc_types", []).append(dt)
+        captured["doc_type"] = dt
+        captured["product_type"] = pt
+        captured["pk"] = pk
 
     monkeypatch.setattr(agent, "_vectorize_document", fake_vectorize)
 
     res = agent._process_single_document("doc.pdf")
 
-    assert captured.get("doc_types", [])[0] == "raw"
+    assert captured["doc_type"] == "Contract"
+    assert captured["product_type"] == "it hardware"
+    assert captured["pk"] == "C123"
     assert "persist" not in captured  # should not attempt DB insert
-    assert res["id"] == "doc.pdf"
+    assert res["id"] == "C123"
     assert res["doc_type"] == "Contract"
 
 
@@ -104,12 +113,13 @@ def test_vectorize_structured_data_creates_points(monkeypatch):
     header = {"invoice_id": "1", "vendor_name": "acme"}
     line_items = [{"item_id": "A1", "description": "Widget"}]
 
-    agent._vectorize_structured_data(header, line_items, "Invoice", "1")
+    agent._vectorize_structured_data(header, line_items, "Invoice", "1", "Hardware")
     types = {p.payload["data_type"] for p in captured["points"]}
     assert types == {"header", "line_item"}
     # ensure points are associated with the same record id
     for p in captured["points"]:
         assert p.payload["record_id"] == "1"
+        assert p.payload["product_type"] == "hardware"
 
 
 def test_contextual_field_normalisation():
@@ -201,3 +211,191 @@ def test_extract_header_with_ner(monkeypatch):
     assert header["vendor_name"] == "ACME Corp"
     assert header["invoice_date"] == "2024-01-01"
     assert header["invoice_total_incl_tax"] == 100.0
+
+
+def test_extract_unique_id():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+    text = "Invoice Number: INV-42"
+    assert agent._extract_unique_id(text, "Invoice") == "INV-42"
+
+
+def test_classify_product_type():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+    text = "Procurement of laptops and printers"
+    assert agent._classify_product_type(text) == "it hardware"
+
+
+def test_run_summarises_discrepancies(monkeypatch):
+    docs = [
+        {"id": "1", "doc_type": "Invoice"},
+        {"id": "2", "doc_type": "Invoice"},
+    ]
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "_process_documents", lambda p, k: {"status": "completed", "details": docs}
+    )
+
+    def fake_run_disc(self, docs, ctx):
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={
+                "mismatches": [
+                    {"doc_type": "Invoice", "id": "2", "checks": {"vendor_name": "missing"}}
+                ]
+            },
+        )
+
+    monkeypatch.setattr(DataExtractionAgent, "_run_discrepancy_detection", fake_run_disc)
+
+    ctx = AgentContext(
+        workflow_id="w1",
+        agent_id="data_extraction",
+        user_id="u1",
+        input_data={},
+    )
+    output = agent.run(ctx)
+    summary = output.data["summary"]
+    assert summary["documents_provided"] == 2
+    assert summary["documents_valid"] == 1
+    assert summary["documents_with_discrepancies"] == 1
+
+
+def test_run_propagates_discrepancy_fail(monkeypatch):
+    docs = [{"id": "1", "doc_type": "Invoice"}]
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "_process_documents", lambda p, k: {"status": "completed", "details": docs}
+    )
+
+    def fake_run_disc(self, docs, ctx):
+        return AgentOutput(status=AgentStatus.FAILED, data={}, error="db down")
+
+    monkeypatch.setattr(DataExtractionAgent, "_run_discrepancy_detection", fake_run_disc)
+
+    ctx = AgentContext(
+        workflow_id="w1",
+        agent_id="data_extraction",
+        user_id="u1",
+        input_data={},
+    )
+    output = agent.run(ctx)
+    assert output.status is AgentStatus.FAILED
+    assert output.error == "db down"
+
+
+def test_fill_missing_fields_with_llm(monkeypatch):
+    """LLM call fills only missing fields after heuristic parsing."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    # Heuristic extractors return nothing
+    monkeypatch.setattr(
+        "agents.data_extraction_agent.convert_document_to_json",
+        lambda text, dt: {"header_data": {}, "line_items": []},
+    )
+    monkeypatch.setattr(agent, "_parse_header", lambda text: {})
+    monkeypatch.setattr(
+        agent, "_extract_line_items_from_pdf_tables", lambda b, dt: []
+    )
+
+    llm_payload = {
+        "response": json.dumps(
+            {
+                "header_data": {"invoice_id": "INV1", "vendor_name": "ACME"},
+                "line_items": [
+                    {
+                        "item_id": "A1",
+                        "item_description": "Widget",
+                        "quantity": "1",
+                    }
+                ],
+            }
+        )
+    }
+    monkeypatch.setattr(agent, "call_ollama", lambda **kwargs: llm_payload)
+
+    header, items = agent._extract_structured_data(
+        "Invoice INV1 from ACME for 1 Widget", b"", "Invoice"
+    )
+    assert header["invoice_id"] == "INV1"
+    assert header["vendor_name"] == "ACME"
+    assert items and items[0]["item_id"] == "A1"
+
+
+def test_classify_doc_type_keyword_scoring(monkeypatch):
+    """Keyword scoring should classify common documents without LLM calls."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    def fail_call(**kwargs):
+        raise AssertionError("LLM should not be used for obvious keywords")
+
+    monkeypatch.setattr(agent, "call_ollama", fail_call)
+
+    assert (
+        agent._classify_doc_type("Invoice number INV-1 for services rendered")
+        == "Invoice"
+    )
+    assert (
+        agent._classify_doc_type("PO number PO-2 to purchase goods")
+        == "Purchase_Order"
+    )
+
+
+def test_classify_doc_type_llm_fallback(monkeypatch):
+    """When no keywords are present an LLM is queried for classification."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "call_ollama", lambda **kwargs: {"response": "Contract"}
+    )
+
+    # Text deliberately avoids any predefined keywords so the LLM is used.
+    assert agent._classify_doc_type("Memorandum of understanding") == "Contract"
+
+
+def test_classification_prompt_includes_context(monkeypatch):
+    """LLM classification prompt should include procurement context."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    captured = {}
+
+    def fake_call(prompt, model):
+        captured["prompt"] = prompt
+        return {"response": "Invoice"}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    agent._classify_doc_type("irrelevant text")
+    assert "buyer sends a purchase order" in captured["prompt"].lower()
+
+
+def test_fill_missing_fields_prompt_includes_context(monkeypatch):
+    """LLM field completion should receive doc-type specific context."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    captured = {}
+
+    def fake_call(prompt, model, format=None):
+        captured["prompt"] = prompt
+        return {"response": json.dumps({"header_data": {}, "line_items": []})}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    agent._fill_missing_fields_with_llm("text", "Invoice", {}, [])
+    assert "vendor sends an invoice" in captured["prompt"].lower()
