@@ -474,6 +474,12 @@ class Orchestrator:
                 # execution. Downstream status transitions are handled once the
                 # agent completes.
                 prs.update_agent_status(process_id, step_name, "validated")
+            logger.info(
+                "Executing step %s with agent %s and input %s",
+                step_name,
+                agent_key,
+                rendered_input,
+            )
             while attempt <= retries and not success:
                 attempt += 1
                 context = AgentContext(
@@ -492,6 +498,14 @@ class Orchestrator:
                 except Exception as exc:  # pragma: no cover - execution error
                     logger.exception("Agent %s execution failed", agent_key)
                     run_ctx["errors"][step_name] = str(exc)
+                finally:
+                    logger.info(
+                        "Step %s attempt %s completed with status %s and output %s",
+                        step_name,
+                        attempt,
+                        getattr(result, "status", None),
+                        getattr(result, "data", None),
+                    )
             if not success:
                 flow_status = 0
                 if on_error == "fail":
@@ -595,8 +609,16 @@ class Orchestrator:
                 # the real-time status transitions expected by the workflow
                 # tracking requirements.
                 prs.update_agent_status(process_id, node.get("agent"), "validated")
-
+            logger.info(
+                "Executing agent %s with input %s", agent_key, input_data
+            )
             result = agent.execute(context)
+            logger.info(
+                "Agent %s completed with status %s and output %s",
+                agent_key,
+                getattr(result, "status", None),
+                getattr(result, "data", None),
+            )
             node["status"] = (
                 "completed"
                 if result and result.status == AgentStatus.SUCCESS
