@@ -52,8 +52,30 @@ class Orchestrator:
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
 
     def execute_ranking_flow(self, query: str) -> Dict:
-        """Public wrapper for the supplier ranking workflow."""
-        return self.execute_workflow("supplier_ranking", {"query": query})
+        """Public wrapper for the supplier ranking workflow.
+
+        The policy engine requires ranking criteria to be supplied for
+        validation.  When only a free-text query is provided we attempt to
+        derive the criteria by matching known policy terms within the query.
+        If no explicit matches are found we fall back to the full set of
+        default policy criteria so that the workflow still proceeds with
+        reasonable defaults.
+        """
+
+        weight_policy = next(
+            (p for p in self.policy_engine.supplier_policies if p.get("policyName") == "WeightAllocationPolicy"),
+            {},
+        )
+        default_weights = (
+            weight_policy.get("details", {}).get("rules", {}).get("default_weights", {})
+        )
+        lower_query = query.lower()
+        criteria = [c for c in default_weights.keys() if c in lower_query] or list(
+            default_weights.keys()
+        )
+        intent = {"parameters": {"criteria": criteria}}
+        input_data = {"query": query, "criteria": criteria, "intent": intent}
+        return self.execute_workflow("supplier_ranking", input_data)
 
     def execute_ranking_workflow(self, query: str) -> Dict:
         """Backward compatible alias for :meth:`execute_ranking_flow`."""
@@ -585,9 +607,7 @@ class Orchestrator:
         return flow
 
     def _validate_workflow(self, workflow_name: str, context: AgentContext) -> bool:
-        """Validate workflow against policies"""
-        if workflow_name == "supplier_ranking":
-            return True
+        """Validate workflow against policies."""
         validation_result = self.policy_engine.validate_workflow(
             workflow_name, context.user_id, context.input_data
         )
