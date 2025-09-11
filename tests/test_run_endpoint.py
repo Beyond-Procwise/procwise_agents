@@ -228,3 +228,32 @@ def test_run_endpoint_updates_nested_statuses_independently():
     assert saved["status"] == "completed"
     assert saved["onSuccess"]["status"] == "completed"
     assert saved["onFailure"]["status"] == "saved"
+
+
+def test_run_endpoint_failure_does_not_inject_error():
+    class FailPRS(DummyPRS):
+        pass
+
+    class FailOrchestrator(DummyOrchestrator):
+        def execute_agent_flow(self, flow, payload=None, process_id=None, prs=None):
+            raise RuntimeError("boom")
+
+    prs = FailPRS()
+    orchestrator = FailOrchestrator(prs)
+    client, orchestrator = create_client_with_orchestrator(orchestrator)
+
+    resp = client.post("/run", json={"process_id": 7})
+    assert resp.status_code == 200
+
+    import time
+
+    for _ in range(50):
+        if prs.status_updates == [(7, -1)] and len(prs.details_updates) >= 2:
+            break
+        time.sleep(0.01)
+
+    assert prs.status_updates == [(7, -1)]
+    final = prs.details_updates[-1]
+    assert final["status"] == "failed"
+    assert "error" not in final
+    assert set(final.keys()) == {"status", "agents"}
