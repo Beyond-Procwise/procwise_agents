@@ -34,3 +34,18 @@ def test_get_agent_details_parses_array_string():
     details = orch._get_agent_details("{supplier_ranking,quote_evaluation}")
     types = {d["agent_type"] for d in details}
     assert {"supplier_ranking", "quote_evaluation"} <= types
+
+
+def test_canonical_key_fuzzy_matches_dynamic_ids():
+    orch = make_orchestrator()
+    defs = orch._load_agent_definitions()
+
+    slug_quotes = orch._canonical_key(
+        "keerthi_quotes_agent_test_000074_1757585776760", defs
+    )
+    slug_negotiation = orch._canonical_key(
+        "keerthi_negotitiation_test_000078_1757586202506", defs
+    )
+
+    assert slug_quotes == "quote_evaluation"
+    assert slug_negotiation == "negotiation"
