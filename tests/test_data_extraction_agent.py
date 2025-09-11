@@ -293,6 +293,7 @@ def test_run_propagates_discrepancy_fail(monkeypatch):
 def test_fill_missing_fields_with_llm(monkeypatch):
     """LLM call fills only missing fields after heuristic parsing."""
 
+
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
 
@@ -399,3 +400,4 @@ def test_fill_missing_fields_prompt_includes_context(monkeypatch):
 
     agent._fill_missing_fields_with_llm("text", "Invoice", {}, [])
     assert "vendor sends an invoice" in captured["prompt"].lower()
+

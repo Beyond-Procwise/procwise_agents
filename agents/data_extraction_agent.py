@@ -228,6 +228,7 @@ DOC_TYPE_CONTEXT = {
 # scope allows tests to assert its presence without duplicating the full text.
 DOC_CONTEXT_TEXT = "\n".join(DOC_TYPE_CONTEXT.values())
 
+
 # Keyword map used to infer the high level document type.  Instead of a
 # rigid series of ``if/elif`` checks this mapping allows the classifier to
 # score documents based on the presence of domain specific terminology.  New
@@ -348,6 +349,7 @@ class DataExtractionAgent(BaseAgent):
             if mismatches:
                 data["mismatches"] = mismatches
             return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
@@ -820,6 +822,7 @@ class DataExtractionAgent(BaseAgent):
             + DOC_CONTEXT_TEXT
             + "\n\nDocument:\n"
             + snippet
+
         )
         try:
             resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
@@ -951,19 +954,19 @@ class DataExtractionAgent(BaseAgent):
                 "invoice_total": "invoice_amount",
                 "total_amount": "invoice_amount",
                 "vendor": "vendor_name",
-                "supplier": "vendor_name",
-                "recipient": "vendor_name",
-                "to": "vendor_name",
-                "supplier_name": "vendor_name",
+                "supplier": "supplier_name",
+                "recipient": "receiver_name",
+                "to": "receiver_name",
+                "supplier_name": "supplier_name",
             },
             "Purchase_Order": {
                 "po_number": "po_id",
                 "purchase_order_id": "po_id",
                 "vendor": "vendor_name",
-                "supplier": "vendor_name",
-                "recipient": "vendor_name",
-                "to": "vendor_name",
-                "supplier_name": "vendor_name",
+                "supplier": "supplier_name",
+                "recipient": "receiver_name",
+                "to": "receiver_name",
+                "supplier_name": "supplier_name",
             },
         }
         mapping = alias_map.get(doc_type, {})
@@ -1046,6 +1049,7 @@ class DataExtractionAgent(BaseAgent):
             text, doc_type, header, line_items
         )
 
+
         header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
         return header, line_items
@@ -1106,6 +1110,7 @@ class DataExtractionAgent(BaseAgent):
             )
             if llm_items:
                 line_items = llm_items
+
 
         return header, line_items
 
