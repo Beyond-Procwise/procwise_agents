@@ -10,6 +10,7 @@ import concurrent.futures
 import pdfplumber
 import pandas as pd
 import numpy as np
+import json
 try:  # PyMuPDF is optional; handled gracefully if unavailable
     import fitz  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -57,6 +58,7 @@ from agents.base_agent import (
     AgentOutput,
     AgentStatus,
 )
+from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,24 @@ SCHEMA_MAP = {
     "Purchase_Order": {"header": PURCHASE_ORDER_SCHEMA, "line_items": PO_LINE_ITEMS_SCHEMA},
 }
 
+# Basic keyword mapping used to categorise documents by product type.  This
+# lightweight approach keeps the agent self-contained while still enabling RAG
+# consumers to filter by coarse domains such as IT hardware or office supplies.
+PRODUCT_KEYWORDS = {
+    "it hardware": [
+        "laptop",
+        "desktop",
+        "notebook",
+        "printer",
+        "server",
+        "monitor",
+        "keyboard",
+        "mouse",
+    ],
+    "it software": ["software", "license", "subscription", "saas"],
+    "office supplies": ["paper", "pen", "stapler", "notebook", "folder"],
+}
+
 
 def _normalize_point_id(raw_id: str) -> int | str:
     """Qdrant allows integer identifiers; strings are hashed deterministically."""
@@ -234,20 +254,58 @@ class DataExtractionAgent(BaseAgent):
     # Public API
     # ------------------------------------------------------------------
     def run(self, context: AgentContext) -> AgentOutput:
-        """Entry point used by the orchestrator."""
+        """Entry point used by the orchestrator.
+
+        In addition to extracting and vectorising document contents, this
+        method now invokes :class:`DiscrepancyDetectionAgent` to validate the
+        extracted records.  A summary of how many documents were processed and
+        how many passed validation is returned in the agent's output so that the
+        action record stored in ``proc.action`` captures this audit trail.
+        """
         try:
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
             data = self._process_documents(s3_prefix, s3_object_key)
+            docs = data.get("details", [])
+            discrepancy_result = self._run_discrepancy_detection(docs, context)
+            mismatches = discrepancy_result.data.get("mismatches", [])
+            summary = {
+                "documents_provided": len(docs),
+                "documents_valid": len(docs) - len(mismatches),
+                "documents_with_discrepancies": len(mismatches),
+            }
+            data["summary"] = summary
+            if mismatches:
+                data["mismatches"] = mismatches
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data=data,
-                next_agents=["discrepancy_detection"],
-                pass_fields={"extracted_docs": data.get("details", [])},
             )
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+
+    def _run_discrepancy_detection(
+        self, docs: List[Dict[str, Any]], context: AgentContext
+    ) -> AgentOutput:
+        """Validate extracted documents using the discrepancy agent.
+
+        This helper ensures the discrepancy detection step is executed within
+        the extraction workflow, allowing the final action log to capture how
+        many documents were processed accurately.
+        """
+        if not docs:
+            return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": []})
+        disc_agent = DiscrepancyDetectionAgent(self.agent_nick)
+        disc_context = AgentContext(
+            workflow_id=context.workflow_id,
+            agent_id="discrepancy_detection",
+            user_id=context.user_id,
+            input_data={"extracted_docs": docs},
+            parent_agent=context.agent_id,
+            routing_history=context.routing_history.copy(),
+        )
+        return disc_agent.execute(disc_context)
 
     def _process_documents(self, s3_prefix: str | None = None, s3_object_key: str | None = None) -> Dict:
         """Process documents stored under the given prefix.
@@ -301,27 +359,32 @@ class DataExtractionAgent(BaseAgent):
             return None
 
         text = self._extract_text(file_bytes, object_key)
-
-        # ------------------------------------------------------------------
-        # Step 1 – vectorise the raw document prior to any understanding so the
-        # original content is always searchable.
-        # ------------------------------------------------------------------
-        self._vectorize_document(text, None, "raw", None, object_key)
-
-        # ------------------------------------------------------------------
-        # Step 2 – derive context from the text to classify the document and
-        # extract structured values.
-        # ------------------------------------------------------------------
         doc_type = self._classify_doc_type(text)
+        product_type = self._classify_product_type(text)
+        unique_id = self._extract_unique_id(text, doc_type)
+        if not unique_id:
+            unique_id = self._infer_vendor_name(text, object_key)
+
+        # ------------------------------------------------------------------
+        # Embed the raw document with contextual tags so retrieval can filter by
+        # document and product type.
+        # ------------------------------------------------------------------
+        self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
 
         if doc_type in {"Purchase_Order", "Invoice"}:
             header, line_items = self._extract_structured_data(text, file_bytes, doc_type)
             header["doc_type"] = doc_type
+            header["product_type"] = product_type
+            if doc_type == "Invoice" and not header.get("invoice_id"):
+                header["invoice_id"] = unique_id
+            if doc_type == "Purchase_Order" and not header.get("po_id"):
+                header["po_id"] = unique_id
             header = self._sanitize_party_names(header)
             pk_value = (
                 header.get("invoice_id")
                 or header.get("po_id")
                 or header.get("quote_id")
+                or unique_id
             )
             if not header.get("vendor_name"):
                 vendor_guess = self._infer_vendor_name(text, object_key)
@@ -330,9 +393,9 @@ class DataExtractionAgent(BaseAgent):
             if not header.get("supplier_id") and header.get("vendor_name"):
                 header["supplier_id"] = header.get("vendor_name")
         else:
-            header, line_items, pk_value = {"doc_type": doc_type}, [], None
+            header, line_items, pk_value = {"doc_type": doc_type, "product_type": product_type}, [], unique_id
 
-        if header and pk_value:
+        if doc_type in {"Purchase_Order", "Invoice"} and header and pk_value:
             data = {
                 "header_data": header,
                 "line_items": line_items,
@@ -343,7 +406,7 @@ class DataExtractionAgent(BaseAgent):
                 },
             }
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
-            self._vectorize_structured_data(header, line_items, doc_type, pk_value)
+            self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
             doc_id = pk_value
         else:
             data = None
@@ -678,6 +741,29 @@ class DataExtractionAgent(BaseAgent):
             return "Contract"
         return "Other"
 
+    def _classify_product_type(self, text: str) -> str:
+        """Return a coarse product category based on simple keyword matching."""
+        snippet = text.lower()
+        for category, keywords in PRODUCT_KEYWORDS.items():
+            for kw in keywords:
+                if kw in snippet:
+                    return category
+        return "other"
+
+    def _extract_unique_id(self, text: str, doc_type: str) -> str:
+        """Extract a best-effort unique identifier such as invoice or PO number."""
+        patterns = {
+            "Invoice": r"invoice\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+            "Purchase_Order": r"(?:purchase order|po)\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+            "Quote": r"quote\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+            "Contract": r"contract\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+        }
+        pattern = patterns.get(doc_type)
+        if not pattern:
+            return ""
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
     def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
         """Best-effort vendor/supplier name extraction.
 
@@ -846,7 +932,7 @@ class DataExtractionAgent(BaseAgent):
     def _extract_structured_data(
         self, text: str, file_bytes: bytes, doc_type: str
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Parse header and line items using pure Python heuristics."""
+        """Parse header and line items using a hybrid heuristic/LLM approach."""
 
         data = convert_document_to_json(text, doc_type)
         header = self._normalize_header_fields(data.get("header_data", {}), doc_type)
@@ -862,8 +948,39 @@ class DataExtractionAgent(BaseAgent):
             extracted = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
             line_items = self._normalize_line_item_fields(extracted, doc_type)
 
+        # Augment with LLM extraction as a fallback when heuristics miss fields
+        llm_header, llm_items = self._llm_extract_structured_data(text, doc_type)
+        llm_header = self._normalize_header_fields(llm_header, doc_type)
+        for key, value in llm_header.items():
+            header.setdefault(key, value)
+        if not line_items and llm_items:
+            line_items = self._normalize_line_item_fields(llm_items, doc_type)
+
         header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
+        return header, line_items
+
+    def _llm_extract_structured_data(
+        self, text: str, doc_type: str
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Use an LLM to extract structured fields as a best-effort fallback."""
+
+        schema = SCHEMA_MAP.get(doc_type, {})
+        header_fields = list(schema.get("header", {}).keys())
+        line_fields = list(schema.get("line_items", {}).keys())
+        prompt = (
+            "Extract key fields from the following document. Return a JSON object with "
+            "'header_data' and 'line_items'. 'header_data' should include as many of "
+            f"{header_fields} as possible and 'line_items' should be a list of objects "
+            f"containing {line_fields}.\n\nDocument:\n{text}"
+        )
+        response = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json")
+        try:
+            payload = json.loads(response.get("response", "{}"))
+            header = payload.get("header_data", {}) or {}
+            line_items = payload.get("line_items", []) or []
+        except Exception:
+            header, line_items = {}, []
         return header, line_items
 
 
@@ -919,6 +1036,7 @@ class DataExtractionAgent(BaseAgent):
         line_items: List[Dict[str, Any]],
         doc_type: str,
         pk_value: str,
+        product_type: Any,
     ) -> None:
         """Embed header and line-item content for retrieval.
 
@@ -948,6 +1066,7 @@ class DataExtractionAgent(BaseAgent):
                     {
                         "record_id": pk_value,
                         "document_type": _normalize_label(doc_type),
+                        "product_type": _normalize_label(product_type),
                         "data_type": "header",
                         "content": header_text,
                     },
@@ -966,6 +1085,7 @@ class DataExtractionAgent(BaseAgent):
                     {
                         "record_id": pk_value,
                         "document_type": _normalize_label(doc_type),
+                        "product_type": _normalize_label(product_type),
                         "data_type": "line_item",
                         "line_number": idx,
                         "content": item_text,
@@ -1174,18 +1294,22 @@ class DataExtractionAgent(BaseAgent):
         line_schema = schemas.get("line_items", {})
 
         cast_header: Dict[str, Any] = {}
-        for k, sql_type in header_schema.items():
-            if k in header:
-                val = self._sanitize_value(header[k], k)
-                cast_header[k] = self._cast_sql_type(val, sql_type)
+        for k, v in header.items():
+            if k in header_schema:
+                val = self._sanitize_value(v, k)
+                cast_header[k] = self._cast_sql_type(val, header_schema[k])
+            else:
+                cast_header[k] = v
 
         cast_lines: List[Dict[str, Any]] = []
         for item in line_items:
             cast_item: Dict[str, Any] = {}
-            for k, sql_type in line_schema.items():
-                if k in item:
-                    val = self._sanitize_value(item[k], k)
-                    cast_item[k] = self._cast_sql_type(val, sql_type)
+            for k, v in item.items():
+                if k in line_schema:
+                    val = self._sanitize_value(v, k)
+                    cast_item[k] = self._cast_sql_type(val, line_schema[k])
+                else:
+                    cast_item[k] = v
             if cast_item:
                 cast_lines.append(cast_item)
 
