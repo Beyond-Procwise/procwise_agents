@@ -1492,7 +1492,21 @@ class DataExtractionAgent(BaseAgent):
         doc_type: str,
         pk_value: str,
     ) -> None:
-        """Persist extracted header and line items to PostgreSQL."""
+        """Persist extracted header and line items to PostgreSQL.
+
+        The input ``header`` and ``line_items`` are first normalised and cleaned
+        to strip unwanted characters (such as ``{``, ``|`` or ``?``) and to cast
+        values to the appropriate types defined in ``SCHEMA_MAP``.  Only after
+        this sanitisation step are the records inserted into the target tables.
+        """
+
+        # Ensure we persist only validated and sanitised data.  This also
+        # provides a safety net when ``_persist_to_postgres`` is invoked
+        # directly by other agents within the framework.
+        header, line_items = self._validate_and_cast(header, line_items, doc_type)
+        if isinstance(pk_value, str):
+            pk_value = self._clean_text(pk_value)
+
         try:
             conn = self.agent_nick.get_db_connection()
             with conn:
@@ -1502,6 +1516,50 @@ class DataExtractionAgent(BaseAgent):
                 )
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("Failed to persist %s data: %s", doc_type, exc)
+
+    def _has_unique_constraint(
+        self, cur, schema: str, table: str, columns: List[str]
+    ) -> bool:
+        """Check whether ``table`` has a unique/primary constraint on ``columns``.
+
+        Parameters
+        ----------
+        cur:
+            Active database cursor.
+        schema, table:
+            Table reference to inspect.
+        columns:
+            Ordered list of column names that should comprise the constraint.
+
+        Returns
+        -------
+        bool
+            ``True`` if a unique or primary key constraint exists exactly on the
+            provided ``columns`` (ignoring order), ``False`` otherwise.
+        """
+
+        if not columns:
+            return False
+        try:  # pragma: no cover - database introspection
+            cur.execute(
+                """
+                SELECT tc.constraint_name, array_agg(ccu.column_name ORDER BY ccu.column_name)
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.constraint_column_usage ccu
+                  ON tc.constraint_name = ccu.constraint_name
+                WHERE tc.table_schema=%s AND tc.table_name=%s
+                  AND tc.constraint_type IN ('UNIQUE','PRIMARY KEY')
+                GROUP BY tc.constraint_name
+                """,
+                (schema, table),
+            )
+            target = sorted(columns)
+            for _name, cols in cur.fetchall():
+                if sorted(cols) == target:
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _persist_header_to_postgres(
         self, header: Dict[str, str], doc_type: str, conn=None
@@ -1566,10 +1624,14 @@ class DataExtractionAgent(BaseAgent):
                     f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col
                 )
                 sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
-                if update_cols:
-                    sql = sql_base + f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
+                if self._has_unique_constraint(cur, schema, table, [pk_col]):
+                    if update_cols:
+                        sql = sql_base + f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
+                    else:
+                        sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
                 else:
-                    sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
+                    # Fallback when the expected unique constraint is missing.
+                    sql = sql_base + "ON CONFLICT DO NOTHING"
                 cur.execute(sql, list(payload.values()))
             if close_conn:
                 conn.commit()
@@ -1704,6 +1766,9 @@ class DataExtractionAgent(BaseAgent):
                         conflict_cols = ["po_line_id"]
                     else:
                         conflict_cols = [fk_col, line_no_col]
+
+                    if not self._has_unique_constraint(cur, schema, table, conflict_cols):
+                        conflict_cols = []
 
                     sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
                     if conflict_cols:

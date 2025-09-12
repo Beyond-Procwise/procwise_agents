@@ -173,6 +173,36 @@ def test_po_line_items_unit_mapping(monkeypatch):
         def close(self):
             pass
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
     nick = SimpleNamespace(
         get_db_connection=lambda: DummyConn(),
         settings=SimpleNamespace(extraction_model="m"),
@@ -400,4 +430,80 @@ def test_fill_missing_fields_prompt_includes_context(monkeypatch):
 
     agent._fill_missing_fields_with_llm("text", "Invoice", {}, [])
     assert "vendor sends an invoice" in captured["prompt"].lower()
+
+
+def test_persist_to_postgres_sanitizes_values(monkeypatch):
+    """Insertion into target tables should strip stray symbols from values."""
+
+    executed = {"header": None, "line": None}
+
+    class DummyCursor:
+        def __init__(self):
+            self.sql = ""
+            self.params = None
+
+        def execute(self, sql, params=None):
+            self.sql = sql.lower().strip()
+            self.params = params
+            if self.sql.startswith("insert into proc.invoice_agent"):
+                executed["header"] = params
+            elif self.sql.startswith("insert into proc.invoice_line_items_agent"):
+                executed["line"] = params
+
+        def fetchall(self):
+            if "information_schema.columns" in self.sql:
+                table = self.params[1] if self.params and len(self.params) > 1 else ""
+                if table == "invoice_agent":
+                    return [("invoice_id", "text"), ("supplier_id", "text")]
+                if table == "invoice_line_items_agent":
+                    return [
+                        ("invoice_line_id",),
+                        ("invoice_id",),
+                        ("line_no",),
+                        ("item_description",),
+                        ("quantity",),
+                    ]
+            if "table_constraints" in self.sql:
+                return []
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class InvoiceConn:
+        def cursor(self):
+            return DummyCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    nick = SimpleNamespace(
+        get_db_connection=lambda: InvoiceConn(),
+        settings=SimpleNamespace(extraction_model="m"),
+    )
+
+    agent = DataExtractionAgent(nick)
+
+    header = {"invoice_id": "INV{123}", "supplier_id": "ACME|Co"}
+    line_items = [{"item_description": "Widget?", "quantity": "2"}]
+
+    agent._persist_to_postgres(header, line_items, "Invoice", "INV{123}")
+
+    assert executed["header"] == ["INV123", "ACMECo"]
+    assert executed["line"] == ["INV123", 1, "INV123-1", "Widget", 2]
 
