@@ -1335,6 +1335,7 @@ class DataExtractionAgent(BaseAgent):
             # output (e.g. ``{``, ``|`` or ``?``) while preserving typical date
             # delimiters.
             value_str = re.sub(r"[^\w\s:/\-.]", " ", value_str)
+
             # Skip obviously non-date strings to avoid noisy warnings.
             if not any(ch.isdigit() for ch in value_str) and not re.search(
                 r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
