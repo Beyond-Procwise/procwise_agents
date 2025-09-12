@@ -1331,6 +1331,11 @@ class DataExtractionAgent(BaseAgent):
             value_str = str(value).strip()
             if not value_str:
                 return None
+            # Strip out stray special characters that often appear in OCR
+            # output (e.g. ``{``, ``|`` or ``?``) while preserving typical date
+            # delimiters.
+            value_str = re.sub(r"[^\w\s:/\-.]", " ", value_str)
+
             # Skip obviously non-date strings to avoid noisy warnings.
             if not any(ch.isdigit() for ch in value_str) and not re.search(
                 r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
@@ -1359,6 +1364,16 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             logger.debug("Unable to parse date value '%s'", value)
             return None
+
+    def _clean_text(self, value: str) -> str:
+        """Remove unwanted characters from free-form text values."""
+        if value is None:
+            return ""
+        # Allow alphanumerics, whitespace and common punctuation used in
+        # procurement documents. Everything else (such as ``{``, ``|`` or ``?``)
+        # is stripped to prevent polluting database fields.
+        cleaned = re.sub(r"[^\w\s\-.,:/@]", "", str(value))
+        return re.sub(r"\s+", " ", cleaned).strip()
 
     def _sanitize_value(self, value, key: Optional[str] = None):
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
@@ -1407,6 +1422,9 @@ class DataExtractionAgent(BaseAgent):
                     val = re.sub(r"[^A-Z]", "", val)
                     return val[:3] if val else None
                 return None
+        if isinstance(value, str):
+            cleaned = self._clean_text(value)
+            return cleaned or None
         return value
 
     def _cast_sql_type(self, value: Any, sql_type: str):
