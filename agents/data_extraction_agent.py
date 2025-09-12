@@ -62,6 +62,9 @@ from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
+# pdfminer can emit noisy warnings when encountering malformed PDFs; suppress
+# them to avoid cluttering logs during extraction runs.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 configure_gpu()
 
@@ -204,13 +207,14 @@ PRODUCT_KEYWORDS = {
 # vendors so extracted data aligns with procurement workflows.
 DOC_TYPE_CONTEXT = {
     "Purchase_Order": (
-        "A buyer sends a purchase order (PO) to a seller to formally request"
-        " an order for specific goods or services from a vendor."
+        "Purchase Order: A buyer sends a purchase order to a vendor to"
+        " procure goods or services. Once the vendor accepts, the PO"
+        " becomes a binding agreement."
     ),
     "Invoice": (
-        "A vendor sends an invoice to a buyer to request payment for goods or"
-        " services provided. This document details the transaction and"
-        " creates a legal record for both parties."
+        "Invoice: After fulfilling the PO, the vendor sends an invoice to the"
+        " buyer. The invoice details the goods/services delivered and"
+        " requests payment."
     ),
     "Quote": (
         "A vendor sends a quote to a potential buyer or client offering goods"
@@ -956,7 +960,7 @@ class DataExtractionAgent(BaseAgent):
                 "vendor": "vendor_name",
                 "supplier": "supplier_name",
                 "recipient": "receiver_name",
-                "to": "receiver_name",
+                "to": "supplier_id",
                 "supplier_name": "supplier_name",
             },
             "Purchase_Order": {
@@ -965,7 +969,7 @@ class DataExtractionAgent(BaseAgent):
                 "vendor": "vendor_name",
                 "supplier": "supplier_name",
                 "recipient": "receiver_name",
-                "to": "receiver_name",
+                "to": "supplier_id",
                 "supplier_name": "supplier_name",
             },
         }
@@ -1324,11 +1328,28 @@ class DataExtractionAgent(BaseAgent):
         parsing fails.
         """
         try:
-            value_str = str(value)
+            value_str = str(value).strip()
+            if not value_str:
+                return None
+            # Skip obviously non-date strings to avoid noisy warnings.
+            if not any(ch.isdigit() for ch in value_str) and not re.search(
+                r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
+                value_str,
+                re.I,
+            ):
+                return None
+            # Pull out a likely date substring from noisy text such as
+            # "INV NO. 039468 / 30 APRIL. 2024".
+            match_sub = re.search(
+                r"(\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{2,4}|\d{4}-\d{2}-\d{2})",
+                value_str,
+            )
+            if match_sub:
+                value_str = match_sub.group(1)
             # Some documents include a trailing dot after the month name,
-            # e.g. ``30 MARCH. 2024`` which confuses the parser.  Strip dots
+            # e.g. ``30 MARCH. 2024`` which confuses the parser. Strip dots
             # that directly follow a word token.
-            value_str = re.sub(r"([A-Za-z])\.", r"\1", value_str)
+            value_str = re.sub(r"([A-Za-z])\.\b", r"\1", value_str)
             match = re.match(r"(.+?)\s*\+\s*(\d+)\s*days", value_str, re.I)
             if match:
                 base = parser.parse(match.group(1), fuzzy=True)
@@ -1336,7 +1357,7 @@ class DataExtractionAgent(BaseAgent):
                 return (base + timedelta(days=offset)).date()
             return parser.parse(value_str, fuzzy=True).date()
         except Exception:
-            logger.warning("Unable to parse date value '%s'", value)
+            logger.debug("Unable to parse date value '%s'", value)
             return None
 
     def _sanitize_value(self, value, key: Optional[str] = None):
@@ -1658,11 +1679,23 @@ class DataExtractionAgent(BaseAgent):
                     update_cols = ", ".join(
                         f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in {fk_col, line_no_col}
                     )
-                    sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
-                    if update_cols:
-                        sql += f" ON CONFLICT ({fk_col}, {line_no_col}) DO UPDATE SET {update_cols}"
+                    conflict_cols: List[str]
+                    if doc_type == "Invoice" and "invoice_line_id" in columns:
+                        conflict_cols = ["invoice_line_id"]
+                    elif doc_type == "Purchase_Order" and "po_line_id" in columns:
+                        conflict_cols = ["po_line_id"]
                     else:
-                        sql += f" ON CONFLICT ({fk_col}, {line_no_col}) DO NOTHING"
+                        conflict_cols = [fk_col, line_no_col]
+
+                    sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
+                    if conflict_cols:
+                        target = ", ".join(conflict_cols)
+                        if update_cols:
+                            sql += f" ON CONFLICT ({target}) DO UPDATE SET {update_cols}"
+                        else:
+                            sql += f" ON CONFLICT ({target}) DO NOTHING"
+                    else:
+                        sql += " ON CONFLICT DO NOTHING"
                     cur.execute(sql, list(sanitized.values()))
             if close_conn:
                 conn.commit()

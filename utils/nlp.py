@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional
 from utils.gpu import configure_gpu
 
 try:  # ``transformers`` is optional at runtime
-    from transformers import pipeline  # type: ignore
+    from transformers import pipeline, logging as hf_logging  # type: ignore
+    hf_logging.set_verbosity_error()
 except Exception:  # pragma: no cover - optional dependency
     pipeline = None  # type: ignore
 
