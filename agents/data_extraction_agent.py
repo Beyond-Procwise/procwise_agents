@@ -11,69 +11,49 @@ import pdfplumber
 import pandas as pd
 import numpy as np
 import json
-try:  # PyMuPDF is optional; handled gracefully if unavailable
-    import fitz  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+
+try:
+    import fitz  # PyMuPDF (optional)
+except Exception:
     fitz = None
-try:  # Optional dependency for DOCX extraction
-    import docx  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+try:
+    import docx  # DOCX (optional)
+except Exception:
     docx = None
-try:  # Optional dependencies for image OCR
-    from PIL import Image, UnidentifiedImageError  # type: ignore
-    import pytesseract  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+try:
+    from PIL import Image, UnidentifiedImageError  # OCR (optional)
+    import pytesseract
+except Exception:
     Image = None
     pytesseract = None
     UnidentifiedImageError = Exception  # type: ignore
-try:  # Optional GPU-accelerated OCR
-    import easyocr  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+try:
+    import easyocr  # GPU OCR (optional)
+except Exception:
     easyocr = None
 _easyocr_reader = None
+
 from qdrant_client import models
 from sentence_transformers import util
 import torch
 from datetime import datetime, timedelta
 from dateutil import parser
+
 from agents.document_jsonifier import convert_document_to_json
 from utils.nlp import extract_entities
-
-
-def _get_easyocr_reader():
-    """Lazily initialise an EasyOCR reader if the library is installed."""
-    global _easyocr_reader
-    if easyocr is None:
-        return None
-    if _easyocr_reader is None:
-        try:
-            _easyocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
-        except Exception:  # pragma: no cover - optional dependency
-            _easyocr_reader = None
-    return _easyocr_reader
-
-from agents.base_agent import (
-    BaseAgent,
-    AgentContext,
-    AgentOutput,
-    AgentStatus,
-)
+from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
-# pdfminer can emit noisy warnings when encountering malformed PDFs; suppress
-# them to avoid cluttering logs during extraction runs.
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
-
 configure_gpu()
 
 HITL_CONFIDENCE_THRESHOLD = 0.85
 
 # ---------------------------------------------------------------------------
-# Database schema mappings used for validation and type casting
+# SCHEMAS
 # ---------------------------------------------------------------------------
-
 INVOICE_SCHEMA = {
     "invoice_id": "text",
     "po_id": "text",
@@ -184,60 +164,27 @@ SCHEMA_MAP = {
     "Purchase_Order": {"header": PURCHASE_ORDER_SCHEMA, "line_items": PO_LINE_ITEMS_SCHEMA},
 }
 
-# Basic keyword mapping used to categorise documents by product type.  This
-# lightweight approach keeps the agent self-contained while still enabling RAG
-# consumers to filter by coarse domains such as IT hardware or office supplies.
+# ---------------------------------------------------------------------------
+# DOC CONTEXT / KEYWORDS
+# ---------------------------------------------------------------------------
 PRODUCT_KEYWORDS = {
-    "it hardware": [
-        "laptop",
-        "desktop",
-        "notebook",
-        "printer",
-        "server",
-        "monitor",
-        "keyboard",
-        "mouse",
-    ],
+    "it hardware": ["laptop", "desktop", "notebook", "printer", "server", "monitor", "keyboard", "mouse"],
     "it software": ["software", "license", "subscription", "saas"],
     "office supplies": ["paper", "pen", "stapler", "notebook", "folder"],
 }
 
-# Contextual descriptions for each document type.  These short notes help
-# LLM prompts remain aware of the real-world relationship between buyers and
-# vendors so extracted data aligns with procurement workflows.
 DOC_TYPE_CONTEXT = {
-    "Purchase_Order": (
-        "Purchase Order: A buyer sends a purchase order to a vendor to"
-        " procure goods or services. Once the vendor accepts, the PO"
-        " becomes a binding agreement."
-    ),
-    "Invoice": (
-        "Invoice: After fulfilling the PO, the vendor sends an invoice to the"
-        " buyer. The invoice details the goods/services delivered and"
-        " requests payment."
-    ),
-    "Quote": (
-        "A vendor sends a quote to a potential buyer or client offering goods"
-        " or services at a specific price and under certain conditions before"
-        " a purchase is agreed."
-    ),
-    "Contract": (
-        "A contract is sent by the party proposing the agreement—often the"
-        " seller, service provider, or their representative—for review and"
-        " signature by the other parties."
-    ),
+    "Purchase_Order": ("Purchase Order: A buyer sends a purchase order to a vendor to procure goods or services. "
+                       "Once the vendor accepts, the PO becomes a binding agreement."),
+    "Invoice": ("Invoice: After fulfilling the PO, the vendor sends an invoice to the buyer. The invoice details the "
+                "goods/services delivered and requests payment."),
+    "Quote": ("A vendor sends a quote to a potential buyer or client offering goods or services at a specific price "
+              "and under certain conditions before a purchase is agreed."),
+    "Contract": ("A contract is sent by the party proposing the agreement—often the seller, service provider, or their "
+                 "representative—for review and signature by the other parties."),
 }
-
-# Preformatted context string fed into LLM prompts.  Keeping it at module
-# scope allows tests to assert its presence without duplicating the full text.
 DOC_CONTEXT_TEXT = "\n".join(DOC_TYPE_CONTEXT.values())
 
-
-# Keyword map used to infer the high level document type.  Instead of a
-# rigid series of ``if/elif`` checks this mapping allows the classifier to
-# score documents based on the presence of domain specific terminology.  New
-# document types can therefore be introduced by simply extending this
-# dictionary rather than modifying control flow.
 DOC_TYPE_KEYWORDS = {
     "Invoice": ["invoice", "amount due", "bill"],
     "Purchase_Order": ["purchase order", "po number", "purchase requisition"],
@@ -245,10 +192,6 @@ DOC_TYPE_KEYWORDS = {
     "Contract": ["contract", "agreement", "terms"],
 }
 
-# Regular expression patterns used to pull unique identifiers such as invoice
-# or PO numbers from free‑form text.  Keeping these patterns at module scope
-# avoids scattering hard coded values throughout the implementation and makes
-# it straightforward to tweak or extend the extraction logic.
 UNIQUE_ID_PATTERNS = {
     "Invoice": r"invoice\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
     "Purchase_Order": r"(?:purchase order|po)\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
@@ -256,32 +199,132 @@ UNIQUE_ID_PATTERNS = {
     "Contract": r"contract\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
 }
 
+# ---------------------------------------------------------------------------
+# NEW: robust alias maps + supplier profiles + totals stop
+# ---------------------------------------------------------------------------
+FIELD_ALIASES = {
+    "invoice_id": [r"\bInvoice\s*(?:No\.?|#|Number)\b", r"\bTax\s*Invoice\s*No\b", r"\bBill\s*No\b"],
+    "po_id": [r"\bPO\s*(?:No\.?|#|Number)\b", r"\bPurchase\s*Order\s*(?:No|Number)\b"],
+    "invoice_date": [r"\bInvoice\s*Date\b", r"\bInv\s*Date\b", r"\bBilling\s*Date\b"],
+    "due_date": [r"\bDue\s*Date\b", r"\bPayment\s*Due\b"],
+    "invoice_paid_date": [r"\bPaid\s*Date\b", r"\bPayment\s*Date\b"],
+    "payment_terms": [r"\bPayment\s*Terms\b", r"\bTerms\b"],
+    "currency": [r"\bCurrency\b"],
+    "invoice_amount": [r"\bAmount\s*Due\b", r"\bInvoice\s*Amount\b"],
+    "tax_percent": [r"\bTax\s*%\b", r"\bVAT\s*%\b", r"\bGST\s*%\b"],
+    "tax_amount": [r"\bTax\s*Amount\b", r"\bVAT\b", r"\bGST\b"],
+    "invoice_total_incl_tax": [r"\bGrand\s*Total\b", r"\bInvoice\s*Total\b", r"\bTotal\s*\(Incl\.?\s*Tax\)\b", r"\bTotal\s*Amount\b"],
+    "requested_date": [r"\bRequested\s*Date\b"],
+    "requested_by": [r"\bRequested\s*By\b", r"\bRequester\b"],
+    "buyer_id": [r"\bBuyer\s*(?:ID|No)\b"],
+    "supplier_id": [r"\bSupplier\s*(?:ID|No)\b"],
+    "country": [r"\bCountry\b"],
+    "region": [r"\bRegion\b"]
+}
+LINE_HEADERS_ALIASES = {
+    "line_no": [r"\bLine\s*#\b", r"\bLine\b", r"\bItem\s*#\b"],
+    "item_id": [r"\bItem\s*(?:Code|ID)\b", r"\bSKU\b", r"\bPart\s*No\b", r"\bProduct\s*Code\b"],
+    "item_description": [r"\bDescription\b", r"\bItem\s*Description\b"],
+    "quantity": [r"\bQty\b", r"\bQuantity\b"],
+    "unit_of_measure": [r"\bUOM\b", r"\bUnit\b", r"\bUnit\s*of\s*Measure\b"],
+    "unit_price": [r"\bUnit\s*Price\b", r"\bRate\b", r"\bPrice\b", r"\bUnit\s*Cost\b"],
+    "line_amount": [r"\bLine\s*Total\b", r"\bLine\s*Amount\b", r"\bAmount\b"],
+    "tax_percent": [r"\bTax\s*%\b", r"\bVAT\s*%\b"],
+    "tax_amount": [r"\bTax\s*Amt\b", r"\bTax\b", r"\bVAT\b"],
+    "total_amount_incl_tax": [r"\bTotal\b", r"\bTotal\s*Incl\s*Tax\b", r"\bGross\b"],
+    "currency": [r"\bCurrency\b"],
+    "line_total": [r"\bLine\s*Total\b", r"\bAmount\b", r"\bTotal\b"],
+    "total_amount": [r"\bTotal\b", r"\bTotal\s*Amount\b"]
+}
+TOTALS_STOP_WORDS = re.compile(r"\b(Subtotal|Tax|VAT|GST|Total|Amount\s*Due)\b", re.I)
+
+SUPPLIER_PROFILES = {
+    # Example profile – extend as you learn templates
+    "ACME-UK": {
+        "date_format_hint": "DD/MM/YYYY",
+        "currency_hint": "GBP",
+        "label_overrides": {
+            "invoice_total_incl_tax": [r"\bGrand\s*Total\b", r"\bTotal\s*Invoice\b"]
+        },
+        "table_header_regex": [r"^Line\s*#\s+Item\s+Description\s+Qty\s+Rate\s+Amount$"]
+    }
+}
+
+# ---------------------------------------------------------------------------
+# UTILS
+# ---------------------------------------------------------------------------
+def _get_easyocr_reader():
+    """Lazily initialise an EasyOCR reader if the library is installed."""
+    global _easyocr_reader
+    if easyocr is None:
+        return None
+    if _easyocr_reader is None:
+        try:
+            _easyocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
+        except Exception:
+            _easyocr_reader = None
+    return _easyocr_reader
+# === QDRANT: Idempotent collection initialization ===
+def _initialize_qdrant_collection_idempotent(
+    qdrant_client,
+    collection_name: str,
+    vector_size: int,
+    distance: str = "COSINE",
+) -> None:
+    """
+    Create the collection only if it doesn't already exist.
+    Works across qdrant-client versions. No-op if exists.
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse
+    try:
+        # Fast existence check:
+        try:
+            _ = qdrant_client.get_collection(collection_name)
+            return  # Already exists
+        except Exception:
+            # If get_collection not available/failed, list as fallback
+            try:
+                coll_list = qdrant_client.get_collections().collections
+                if any(getattr(c, "name", None) == collection_name for c in coll_list):
+                    return
+            except Exception:
+                # proceed to attempt creation
+                pass
+
+        # Create collection with correct Distance enum (uppercase)
+        qdrant_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(
+                size=int(vector_size),
+                distance=getattr(models.Distance, distance.upper()),
+            ),
+        )
+    except UnexpectedResponse as e:
+        # 409 Conflict (already exists) -> safe to ignore
+        if getattr(e, "status_code", None) == 409:
+            return
+        # Anything else: re-raise to be handled by caller
+        raise
+    except Exception:
+        # Quietly allow caller to attempt upsert (and handle 404 there)
+        import logging
+        logging.warning("Qdrant init skipped or failed (will handle on upsert).", exc_info=True)
 
 def _normalize_point_id(raw_id: str) -> int | str:
-    """Qdrant allows integer identifiers; strings are hashed deterministically."""
     if not isinstance(raw_id, str):
         raw_id = str(raw_id)
     if raw_id.isdigit():
         return int(raw_id)
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw_id))
 
-
 def _normalize_label(value: Any) -> str:
-    """Return a lowercase label for ``doc_type``/``product_type`` fields.
-
-    Upstream responses may occasionally return lists or other unexpected
-    types.  This helper safely converts those to a deterministic lowercase
-    string so downstream processing is robust.
-    """
     if isinstance(value, list):
         value = value[0] if value else ""
     if value is None:
         return ""
     return str(value).lower()
 
-
 def _maybe_decompress(content: bytes) -> bytes:
-    """Decompress gzip-compressed payloads if necessary."""
     try:
         if content[:2] == b"\x1f\x8b":
             return gzip.decompress(content)
@@ -289,36 +332,36 @@ def _maybe_decompress(content: bytes) -> bytes:
         logger.warning("Failed to decompress gzip content")
     return content
 
-
 def _dict_to_text(data: Dict[str, Any]) -> str:
-    """Convert a dictionary into a simple ``key: value`` text block.
+    return "\n".join(f"{k}: {v}" for k, v in data.items() if v not in (None, ""))
 
-    Using plain text instead of JSON improves semantic retrieval accuracy
-    because embedding models typically perform better on natural language
-    compared to structured representations.
-    """
-    return "\n".join(
-        f"{k}: {v}" for k, v in data.items() if v not in (None, "")
-    )
+# ---------------------------------------------------------------------------
+# NEW: Idempotent Qdrant collection initializer (fixes 409 Conflict)
+# ---------------------------------------------------------------------------
+def _initialize_qdrant_collection_idempotent(client, collection_name: str, vector_size: int, distance: str = "Cosine"):
+    """Create collection only if it doesn't already exist."""
+    try:
+        existing = [c.name for c in client.get_collections().collections]
+        if collection_name in existing:
+            return
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(size=vector_size, distance=getattr(models.Distance, distance)),
+        )
+    except Exception as e:
+        # Non-fatal; skip creation if race/exists, log for visibility
+        logger.warning(f"Qdrant init skipped or failed: {e}")
 
-
+# ---------------------------------------------------------------------------
+# AGENT
+# ---------------------------------------------------------------------------
 class DataExtractionAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.extraction_model = self.settings.extraction_model
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ============================ PUBLIC API ==============================
     def run(self, context: AgentContext) -> AgentOutput:
-        """Entry point used by the orchestrator.
-
-        In addition to extracting and vectorising document contents, this
-        method now invokes :class:`DiscrepancyDetectionAgent` to validate the
-        extracted records.  A summary of how many documents were processed and
-        how many passed validation is returned in the agent's output so that the
-        action record stored in ``proc.action`` captures this audit trail.
-        """
         try:
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
@@ -326,10 +369,6 @@ class DataExtractionAgent(BaseAgent):
             docs = data.get("details", [])
             discrepancy_result = self._run_discrepancy_detection(docs, context)
 
-            # Propagate discrepancy-detection failures so that callers can
-            # distinguish validation problems from successfully audited
-            # documents.  Otherwise the summary below would misleadingly report
-            # all documents as valid when the validation step never ran.
             if discrepancy_result.status != AgentStatus.SUCCESS:
                 err = discrepancy_result.error or "discrepancy detection failed"
                 data["summary"] = {
@@ -337,19 +376,14 @@ class DataExtractionAgent(BaseAgent):
                     "documents_valid": 0,
                     "documents_with_discrepancies": len(docs),
                 }
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data=data,
-                    error=err,
-                )
+                return AgentOutput(status=AgentStatus.FAILED, data=data, error=err)
 
             mismatches = discrepancy_result.data.get("mismatches", [])
-            summary = {
+            data["summary"] = {
                 "documents_provided": len(docs),
                 "documents_valid": len(docs) - len(mismatches),
                 "documents_with_discrepancies": len(mismatches),
             }
-            data["summary"] = summary
             if mismatches:
                 data["mismatches"] = mismatches
             return AgentOutput(status=AgentStatus.SUCCESS, data=data)
@@ -358,15 +392,7 @@ class DataExtractionAgent(BaseAgent):
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
 
-    def _run_discrepancy_detection(
-        self, docs: List[Dict[str, Any]], context: AgentContext
-    ) -> AgentOutput:
-        """Validate extracted documents using the discrepancy agent.
-
-        This helper ensures the discrepancy detection step is executed within
-        the extraction workflow, allowing the final action log to capture how
-        many documents were processed accurately.
-        """
+    def _run_discrepancy_detection(self, docs: List[Dict[str, Any]], context: AgentContext) -> AgentOutput:
         if not docs:
             return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": []})
         disc_agent = DiscrepancyDetectionAgent(self.agent_nick)
@@ -381,17 +407,6 @@ class DataExtractionAgent(BaseAgent):
         return disc_agent.execute(disc_context)
 
     def _process_documents(self, s3_prefix: str | None = None, s3_object_key: str | None = None) -> Dict:
-        """Process documents stored under the given prefix.
-
-        Parameters
-        ----------
-        s3_prefix: str | None
-            Optional folder prefix.  When ``None`` all prefixes configured in
-            ``settings.s3_prefixes`` are processed.
-        s3_object_key: str | None
-            When provided only that object is processed; useful for
-            re-processing a single document.
-        """
         results: List[Dict[str, str]] = []
         prefixes = [s3_prefix] if s3_prefix else self.settings.s3_prefixes
         keys: List[str] = []
@@ -407,9 +422,7 @@ class DataExtractionAgent(BaseAgent):
         supported_exts = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
         keys = [k for k in keys if os.path.splitext(k)[1].lower() in supported_exts]
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=os.cpu_count() or 4
-        ) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
             futures = [executor.submit(self._process_single_document, k) for k in keys]
             for fut in concurrent.futures.as_completed(futures):
                 res = fut.result()
@@ -423,25 +436,18 @@ class DataExtractionAgent(BaseAgent):
             return None
         logger.info("Processing %s", object_key)
         try:
-            obj = self.agent_nick.s3_client.get_object(
-                Bucket=self.settings.s3_bucket_name, Key=object_key
-            )
+            obj = self.agent_nick.s3_client.get_object(Bucket=self.settings.s3_bucket_name, Key=object_key)
             file_bytes = obj["Body"].read()
-        except Exception as exc:  # pragma: no cover - network failures
+        except Exception as exc:
             logger.error("Failed downloading %s: %s", object_key, exc)
             return None
 
         text = self._extract_text(file_bytes, object_key)
         doc_type = self._classify_doc_type(text)
         product_type = self._classify_product_type(text)
-        unique_id = self._extract_unique_id(text, doc_type)
-        if not unique_id:
-            unique_id = self._infer_vendor_name(text, object_key)
+        unique_id = self._extract_unique_id(text, doc_type) or self._infer_vendor_name(text, object_key)
 
-        # ------------------------------------------------------------------
-        # Embed the raw document with contextual tags so retrieval can filter by
-        # document and product type.
-        # ------------------------------------------------------------------
+        # Vectorize raw doc (idempotent collection init)
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
 
         if doc_type in {"Purchase_Order", "Invoice"}:
@@ -453,12 +459,7 @@ class DataExtractionAgent(BaseAgent):
             if doc_type == "Purchase_Order" and not header.get("po_id"):
                 header["po_id"] = unique_id
             header = self._sanitize_party_names(header)
-            pk_value = (
-                header.get("invoice_id")
-                or header.get("po_id")
-                or header.get("quote_id")
-                or unique_id
-            )
+            pk_value = header.get("invoice_id") or header.get("po_id") or header.get("quote_id") or unique_id
             if not header.get("vendor_name"):
                 vendor_guess = self._infer_vendor_name(text, object_key)
                 if vendor_guess and "purchase" not in vendor_guess.lower():
@@ -469,13 +470,17 @@ class DataExtractionAgent(BaseAgent):
             header, line_items, pk_value = {"doc_type": doc_type, "product_type": product_type}, [], unique_id
 
         if doc_type in {"Purchase_Order", "Invoice"} and header and pk_value:
+            ok = header.get("_validation", {}).get("ok", True)
+            conf = header.get("_validation", {}).get("confidence", 0.8)
+            notes = header.get("_validation", {}).get("notes", [])
+
             data = {
                 "header_data": header,
                 "line_items": line_items,
                 "validation": {
-                    "is_valid": True,
-                    "confidence_score": 1.0,
-                    "notes": "python parser",
+                    "is_valid": bool(ok),
+                    "confidence_score": float(conf),
+                    "notes": "; ".join(notes) if notes else "ok",
                 },
             }
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
@@ -485,43 +490,22 @@ class DataExtractionAgent(BaseAgent):
             data = None
             doc_id = pk_value or object_key
 
-        result = {
-            "object_key": object_key,
-            "id": doc_id,
-            "doc_type": doc_type or "",
-            "status": "success",
-        }
+        result = {"object_key": object_key, "id": doc_id, "doc_type": doc_type or "", "status": "success"}
         if data:
             result["data"] = data
         return result
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ============================ EXTRACTION HELPERS ======================
     def _extract_text_from_pdf(self, file_bytes: bytes) -> str:
-        """Extract text from PDF files with OCR and table awareness.
-
-        The routine first attempts layout aware extraction using
-        :mod:`pdfplumber`.  When a page contains no embedded text (e.g. a
-        scanned image) an OCR fallback via ``pytesseract`` is used.  Word level
-        coordinates are leveraged to separate left/right columns so that the
-        reading order is preserved for common two column layouts.  Basic table
-        extraction is also performed and appended line-wise to the output.
-        """
-
         file_bytes = _maybe_decompress(file_bytes)
         if not file_bytes.startswith(b"%PDF"):
-            logger.warning(
-                "Provided bytes do not look like a PDF; attempting image extraction"
-            )
+            logger.warning("Provided bytes do not look like a PDF; attempting image extraction")
             return self._extract_text_from_image(file_bytes, allow_pdf_fallback=False)
 
         lines: List[str] = []
-
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
-                    # Group words by their vertical position and side of page
                     words = page.extract_words() or []
                     row_dict: Dict[float, Dict[str, List[str]]] = {}
                     for word in words:
@@ -531,7 +515,6 @@ class DataExtractionAgent(BaseAgent):
                             row_dict[row_y] = {"left": [], "right": []}
                         side = "left" if x_center < page.width / 2 else "right"
                         row_dict[row_y][side].append(word["text"])
-
                     if row_dict:
                         for y in sorted(row_dict.keys()):
                             left_text = " ".join(row_dict[y]["left"]).strip()
@@ -540,49 +523,40 @@ class DataExtractionAgent(BaseAgent):
                                 lines.append(f"{left_text} | {right_text}".strip())
                             elif left_text:
                                 lines.append(left_text)
-
-                        # Append any detected tables as additional lines
                         for table in page.extract_tables() or []:
                             for row in table:
                                 row_text = " ".join(cell or "" for cell in row).strip()
                                 if row_text:
                                     lines.append(row_text)
                     else:
-                        # OCR fallback for scanned pages
+                        # OCR fallback
                         if easyocr is not None:
                             try:
                                 page_image = page.to_image(resolution=300).original
                                 img_arr = np.array(page_image)
                                 reader = _get_easyocr_reader()
                                 ocr_lines = reader.readtext(img_arr, detail=0, paragraph=True)
-                                lines.extend(
-                                    ln.strip() for ln in ocr_lines if ln.strip()
-                                )
-                            except Exception as ocr_exc:  # pragma: no cover - defensive
+                                lines.extend(ln.strip() for ln in ocr_lines if ln.strip())
+                            except Exception as ocr_exc:
                                 logger.warning("EasyOCR failed: %s", ocr_exc)
                         elif Image is not None and pytesseract is not None:
                             try:
                                 page_image = page.to_image(resolution=300).original
                                 ocr_text = pytesseract.image_to_string(page_image)
-                                lines.extend(
-                                    ln.strip() for ln in ocr_text.splitlines() if ln.strip()
-                                )
-                            except Exception as ocr_exc:  # pragma: no cover - defensive
+                                lines.extend(ln.strip() for ln in ocr_text.splitlines() if ln.strip())
+                            except Exception as ocr_exc:
                                 logger.warning("OCR failed: %s", ocr_exc)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             logger.warning("pdfplumber failed: %s", exc)
 
-        # Fallback to PyMuPDF if pdfplumber produced nothing
         if not lines and fitz is not None:
             try:
                 with fitz.open(stream=file_bytes, filetype="pdf") as doc:
                     text = "\n".join(page.get_text() for page in doc)
                     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc:
                 logger.error("PyMuPDF failed extracting text: %s", exc)
-                img_text = self._extract_text_from_image(
-                    file_bytes, allow_pdf_fallback=False
-                )
+                img_text = self._extract_text_from_image(file_bytes, allow_pdf_fallback=False)
                 return img_text
         elif not lines:
             logger.warning("No text extracted from PDF; PyMuPDF not installed")
@@ -591,19 +565,17 @@ class DataExtractionAgent(BaseAgent):
         return "\n".join(lines)
 
     def _extract_text_from_docx(self, file_bytes: bytes) -> str:
-        """Extract text from DOCX files using python-docx when available."""
         if docx is None:
             logger.warning("python-docx not installed; cannot extract DOCX text")
             return ""
         try:
             document = docx.Document(BytesIO(file_bytes))
             return "\n".join(par.text for par in document.paragraphs)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             logger.error("Failed extracting DOCX text: %s", exc)
             return ""
 
     def _extract_text_from_image(self, file_bytes: bytes, allow_pdf_fallback: bool = True) -> str:
-        """OCR text from image files using EasyOCR or pytesseract."""
         if Image is None:
             logger.warning("PIL not installed; cannot OCR image")
             return ""
@@ -611,13 +583,11 @@ class DataExtractionAgent(BaseAgent):
             img = Image.open(BytesIO(file_bytes))
         except UnidentifiedImageError:
             if allow_pdf_fallback:
-                logger.warning(
-                    "Provided bytes are not a valid image; attempting PDF extraction fallback",
-                )
+                logger.warning("Not a valid image; attempting PDF extraction fallback")
                 return self._extract_text_from_pdf(file_bytes)
             logger.warning("Provided bytes are not a valid image")
             return ""
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             logger.error("Failed OCR on image: %s", exc)
             return ""
         if easyocr is not None:
@@ -626,20 +596,18 @@ class DataExtractionAgent(BaseAgent):
                 reader = _get_easyocr_reader()
                 ocr_lines = reader.readtext(arr, detail=0, paragraph=True)
                 return "\n".join(ocr_lines)
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc:
                 logger.warning("EasyOCR failed: %s", exc)
         if pytesseract is not None:
             try:
                 return pytesseract.image_to_string(img)
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc:
                 logger.error("Failed OCR on image: %s", exc)
                 return ""
         logger.warning("pytesseract not installed; cannot OCR image")
         return ""
 
-
     def _extract_text(self, file_bytes: bytes, object_key: str) -> str:
-        """Route to appropriate extractor based on file extension."""
         ext = os.path.splitext(object_key)[1].lower()
         if ext == ".pdf":
             return self._extract_text_from_pdf(file_bytes)
@@ -650,139 +618,201 @@ class DataExtractionAgent(BaseAgent):
         logger.warning("Unsupported document type '%s' for %s", ext, object_key)
         return ""
 
-
-    def _parse_header(self, text: str) -> Dict[str, str]:
-        """Use semantic similarity to locate common header fields."""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return {}
-
+    # ============================ NEW LAYOUT HELPERS ======================
+    def _extract_layout_blocks(self, file_bytes: bytes) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
         try:
-            line_vecs = self.agent_nick.embedding_model.encode(
-                lines, convert_to_tensor=True, show_progress_bar=False
-            )
-        except Exception:
-            return {}
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                for pageno, page in enumerate(pdf.pages, start=1):
+                    words = page.extract_words() or []
+                    for w in words:
+                        blocks.append({
+                            "text": w.get("text", "").strip(),
+                            "x0": w.get("x0", 0.0),
+                            "y0": w.get("top", 0.0),
+                            "x1": w.get("x1", 0.0),
+                            "y1": w.get("bottom", 0.0),
+                            "page": pageno,
+                            "width": page.width,
+                            "height": page.height,
+                        })
+        except Exception as exc:
+            logger.debug("Layout extraction failed: %s", exc)
+        return blocks
 
-        field_synonyms = {
-            "invoice_id": ["invoice number", "invoice id", "invoice no"],
-            "po_id": ["purchase order", "po number", "po id"],
-            "quote_id": ["quote number", "quote id"],
-            "vendor_name": ["vendor", "supplier", "from"],
-            "supplier_id": ["supplier id", "supplier number"],
-            "buyer_id": ["buyer id", "buyer number"],
-            "requisition_id": ["requisition id", "requisition number"],
-            "requested_by": ["requested by", "requester"],
-            "requested_date": ["requested date", "request date"],
-            "invoice_date": ["invoice date"],
-            "due_date": ["due date"],
-            "invoice_paid_date": ["paid date", "payment date", "invoice paid date"],
-            "payment_terms": ["payment terms", "terms"],
-            "currency": ["currency"],
-            "invoice_amount": ["invoice amount", "amount due"],
-            "total_amount": ["total amount", "grand total", "total"],
-            "tax_percent": ["tax rate", "tax percent"],
-            "tax_amount": ["tax amount", "tax"],
-            "invoice_total_incl_tax": [
-                "total including tax",
-                "total incl tax",
-                "total amount incl tax",
-            ],
-            "exchange_rate_to_usd": ["exchange rate", "exchange rate to usd"],
-            "converted_amount_usd": ["usd amount", "amount usd", "converted amount usd"],
-            "country": ["country"],
-            "region": ["region"],
-            "invoice_status": ["invoice status", "status"],
-            "ai_flag_required": ["ai flag required", "ai flag"],
-            "trigger_type": ["trigger type"],
-            "trigger_context_description": ["trigger context", "context description"],
-            "created_date": ["created date", "creation date"],
-            "order_date": ["order date", "po date"],
-            "expected_delivery_date": ["expected delivery date", "delivery date"],
-            "ship_to_country": ["ship to country", "shipping country"],
-            "delivery_region": ["delivery region", "region"],
-            "incoterm": ["incoterm"],
-            "incoterm_responsibility": ["incoterm responsibility", "incoterm resp"],
-            "delivery_address_line1": ["delivery address line1", "address line 1"],
-            "delivery_address_line2": ["delivery address line2", "address line 2"],
-            "delivery_city": ["delivery city", "city"],
-            "postal_code": ["postal code", "postcode", "zip"],
-            "default_currency": ["default currency"],
-            "po_status": ["po status", "status"],
-            "contract_id": ["contract id", "contract number"],
-        }
-        header: Dict[str, str] = {}
-        for field, synonyms in field_synonyms.items():
+    def _nearest_value_by_label(self, blocks: List[Dict[str, Any]], label_res: List[str], search_dx: float = 180.0, search_dy: float = 45.0) -> Optional[str]:
+        if not blocks:
+            return None
+        patterns = [re.compile(pat, re.I) for pat in label_res]
+        candidates = []
+        for b in blocks:
+            bt = b["text"]
+            if not bt:
+                continue
+            if any(p.search(bt) for p in patterns):
+                x0, y0 = b["x1"], b["y0"] - 4
+                x1, y1 = b["x1"] + search_dx, b["y0"] + search_dy
+                region_words = [w["text"] for w in blocks if (w["x0"] >= x0 and w["x1"] <= x1 and w["y0"] >= y0 and w["y1"] <= y1 and w["page"] == b["page"])]
+                text = " ".join(region_words).strip(" :#-")
+                if text:
+                    dist = min(abs((w["x0"] - x0)) + abs((w["y0"] - y0)) for w in blocks if w["text"] in region_words) if region_words else 1e9
+                    candidates.append((dist, text))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda z: z[0])
+        return candidates[0][1]
+
+    def _apply_supplier_profile_overrides(self, header: Dict[str, Any]) -> Dict[str, Any]:
+        key = (header.get("supplier_id") or header.get("vendor_name") or "").strip()
+        profile = SUPPLIER_PROFILES.get(key) if key else None
+        if not profile:
+            return header
+        overrides = profile.get("label_overrides") or {}
+        for fld, res in overrides.items():
+            if fld in FIELD_ALIASES:
+                FIELD_ALIASES[fld] = list(set(FIELD_ALIASES[fld] + res))
+        header.setdefault("_currency_hint", profile.get("currency_hint"))
+        header.setdefault("_date_format_hint", profile.get("date_format_hint"))
+        return header
+
+    def _confidence_from_method(self, method: str) -> float:
+        base = {
+            "layout_label_proximity": 0.92,
+            "semantic_regex": 0.80,
+            "table_detector": 0.85,
+            "llm_fill": 0.70,
+            "ner": 0.60
+        }.get(method, 0.50)
+        return base
+
+    def _record_conf(self, conf: Dict[str, float], key: str, method: str, value_present: bool):
+        if not value_present:
+            return
+        conf[key] = max(conf.get(key, 0.0), self._confidence_from_method(method))
+
+    def _validate_business_rules(self, doc_type: str, header: Dict[str, Any], line_items: List[Dict[str, Any]]) -> Tuple[bool, float, List[str]]:
+        notes = []
+        conf = 0.0
+        if doc_type == "Invoice":
             try:
-                syn_vec = self.agent_nick.embedding_model.encode(
-                    synonyms, convert_to_tensor=True, show_progress_bar=False
-                )
-                field_vec = torch.mean(syn_vec, dim=0, keepdim=True)
-                sims = util.cos_sim(field_vec, line_vecs)[0]
-                score, idx = torch.max(sims, dim=0)
-                idx = int(idx.item())
+                la = sum(float(self._clean_numeric(li.get("line_amount") or 0) or 0) for li in line_items)
+                ta = sum(float(self._clean_numeric(li.get("tax_amount") or 0) or 0) for li in line_items)
+                total = self._clean_numeric(header.get("invoice_total_incl_tax"))
+                if total is not None:
+                    ok = abs((la + ta) - total) <= 0.02
+                    if ok:
+                        conf += 0.08
+                    else:
+                        notes.append("Line totals + tax do not match invoice_total_incl_tax (±0.02).")
+                else:
+                    notes.append("invoice_total_incl_tax missing.")
             except Exception:
-                continue
-            if score.item() < 0.5:
-                continue
-            candidate = lines[idx]
-            lower_candidate = candidate.lower()
-            value = candidate
-            for syn in synonyms:
-                syn_l = syn.lower()
-                if syn_l in lower_candidate:
-                    value = candidate[lower_candidate.index(syn_l) + len(syn_l) :]
-                    break
-            value = value.split(":")[-1].strip(" -#")
-            if field in {"total_amount", "tax_percent", "tax_amount"}:
-                header[field] = self._clean_numeric(value)
-            else:
-                header[field] = value
+                notes.append("Failed total reconciliation.")
+        try:
+            due = self._clean_date(header.get("due_date"))
+            paid = self._clean_date(header.get("invoice_paid_date"))
+            if due and not paid and due < datetime.utcnow().date():
+                header["invoice_status"] = header.get("invoice_status") or "Overdue"
+                conf += 0.02
+        except Exception:
+            pass
+        overall_ok = len([n for n in notes if "do not match" in n]) == 0
+        return overall_ok, min(1.0, conf), notes
 
+    # ============================ HEADER PARSING ==========================
+    def _parse_header(self, text: str, file_bytes: bytes | None = None) -> Dict[str, Any]:
+        header: Dict[str, Any] = {}
+        conf: Dict[str, float] = {}
+
+        # 1) Layout: label → proximity (precise)
+        blocks = self._extract_layout_blocks(file_bytes) if file_bytes else []
+        if blocks:
+            for field, regexes in FIELD_ALIASES.items():
+                val = self._nearest_value_by_label(blocks, regexes)
+                if val:
+                    if field in {"invoice_amount", "tax_amount", "tax_percent", "invoice_total_incl_tax"}:
+                        header[field] = self._clean_numeric(val)
+                    else:
+                        header[field] = val
+                    self._record_conf(conf, field, "layout_label_proximity", True)
+
+        # 2) Semantic fallback
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            try:
+                line_vecs = self.agent_nick.embedding_model.encode(lines, convert_to_tensor=True, show_progress_bar=False)
+                field_synonyms = {
+                    "invoice_id": ["invoice number", "invoice id", "invoice no"],
+                    "po_id": ["purchase order", "po number", "po id"],
+                    "requested_by": ["requested by", "requester"],
+                    "requested_date": ["requested date", "request date"],
+                    "invoice_date": ["invoice date"],
+                    "due_date": ["due date"],
+                    "invoice_paid_date": ["paid date", "payment date", "invoice paid date"],
+                    "payment_terms": ["payment terms", "terms"],
+                    "currency": ["currency"],
+                    "invoice_amount": ["invoice amount", "amount due"],
+                    "tax_percent": ["tax rate", "tax percent"],
+                    "tax_amount": ["tax amount", "tax"],
+                    "invoice_total_incl_tax": ["total including tax", "grand total", "invoice total", "total amount"],
+                    "country": ["country"],
+                    "region": ["region"],
+                }
+                for field, synonyms in field_synonyms.items():
+                    if field in header and header[field]:
+                        continue
+                    try:
+                        syn_vec = self.agent_nick.embedding_model.encode(synonyms, convert_to_tensor=True, show_progress_bar=False)
+                        field_vec = torch.mean(syn_vec, dim=0, keepdim=True)
+                        sims = util.cos_sim(field_vec, line_vecs)[0]
+                        score, idx = torch.max(sims, dim=0)
+                        idx = int(idx.item())
+                        if score.item() >= 0.52:
+                            candidate = lines[idx]
+                            lower_candidate = candidate.lower()
+                            value = candidate
+                            for syn in synonyms:
+                                syn_l = syn.lower()
+                                if syn_l in lower_candidate:
+                                    value = candidate[lower_candidate.index(syn_l) + len(syn_l):]
+                                    break
+                            value = value.split(":")[-1].strip(" -#")
+                            if field in {"invoice_amount", "tax_percent", "tax_amount", "invoice_total_incl_tax"}:
+                                header[field] = self._clean_numeric(value)
+                            else:
+                                header[field] = value
+                            self._record_conf(conf, field, "semantic_regex", True)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # 3) NER supplement
+        ner_header = self._extract_header_with_ner(text)
+        for k, v in ner_header.items():
+            header.setdefault(k, v)
+            if k in ner_header:
+                self._record_conf(conf, k, "ner", True)
+
+        # doc type
         if "invoice_id" in header:
             header["doc_type"] = "Invoice"
         elif "po_id" in header:
             header["doc_type"] = "Purchase_Order"
-        elif "quote_id" in header:
-            header["doc_type"] = "Quote"
         else:
             header["doc_type"] = self._classify_doc_type(text)
 
-        numeric_fields = {
-            "total_amount",
-            "tax_percent",
-            "tax_amount",
-            "invoice_amount",
-            "invoice_total_incl_tax",
-            "exchange_rate_to_usd",
-            "converted_amount_usd",
-        }
-        numeric_id_fields = {"buyer_id", "supplier_id", "requisition_id"}
-        for field in numeric_fields:
-            if field in header and header[field] is not None:
-                header[field] = self._clean_numeric(header[field])
-        for field in numeric_id_fields:
-            if field in header:
-                num = self._clean_numeric(header[field])
-                header[field] = int(num) if num is not None else None
+        # normalize numerics
+        for f in {"invoice_amount", "tax_percent", "tax_amount", "invoice_total_incl_tax", "exchange_rate_to_usd", "converted_amount_usd"}:
+            if f in header:
+                header[f] = self._clean_numeric(header[f])
 
-        # Enhance extraction with NLP-based entity recognition.  Any values
-        # already present take precedence over NER results.
-        ner_header = self._extract_header_with_ner(text)
-        for key, value in ner_header.items():
-            header.setdefault(key, value)
-
+        # supplier profile
+        header = self._apply_supplier_profile_overrides(header)
+        header["_field_confidence"] = conf
         return header
 
     def _extract_header_with_ner(self, text: str) -> Dict[str, Any]:
-        """Supplement header parsing using a lightweight NER model.
-
-        Named-entity recognition helps identify vendor names, dates and
-        monetary amounts that might not be captured by the heuristic
-        approach.  The function returns only a subset of fields to keep the
-        logic simple while improving accuracy.
-        """
-
         entities = extract_entities(text)
         header: Dict[str, Any] = {}
         for ent in entities:
@@ -801,158 +831,95 @@ class DataExtractionAgent(BaseAgent):
                 header["invoice_total_incl_tax"] = self._clean_numeric(word)
         return header
 
-    def _classify_doc_type(self, text: str) -> str:
-        """Infer the document type from content with an LLM fallback.
-
-        The method first scores the text against :data:`DOC_TYPE_KEYWORDS` so
-        that multiple hints within the document can contribute to the
-        classification.  When no clear winner emerges an inexpensive LLM call
-        is made to label the document, keeping the approach largely generic
-        while maintaining accuracy.
-        """
-
-        snippet = text[:2000].lower()
-        scores = {
-            dtype: sum(snippet.count(kw) for kw in kws)
-            for dtype, kws in DOC_TYPE_KEYWORDS.items()
-        }
-        best_type, best_score = max(scores.items(), key=lambda kv: kv[1])
-        if best_score > 0:
-            return best_type
-
-        prompt = (
-            "Classify the following document as Invoice, Purchase_Order, Quote,"
-            " Contract, or Other. Respond with only the label.\n\nContext:\n"
-            + DOC_CONTEXT_TEXT
-            + "\n\nDocument:\n"
-            + snippet
-
-        )
-        try:
-            resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
-            label = resp.get("response", "").strip().lower()
-            for canonical in DOC_TYPE_KEYWORDS:
-                if canonical.replace("_", " ").lower() in label:
-                    return canonical
-            if "invoice" in label:
-                return "Invoice"
-            if "purchase" in label or "po" in label:
-                return "Purchase_Order"
-            if "quote" in label:
-                return "Quote"
-            if "contract" in label:
-                return "Contract"
-        except Exception:
-            pass
-        return "Other"
-
-    def _classify_product_type(self, text: str) -> str:
-        """Return a coarse product category based on simple keyword matching."""
-        snippet = text.lower()
-        for category, keywords in PRODUCT_KEYWORDS.items():
-            for kw in keywords:
-                if kw in snippet:
-                    return category
-        return "other"
-
-    def _extract_unique_id(self, text: str, doc_type: str) -> str:
-        """Extract a best-effort unique identifier such as invoice or PO number."""
-        pattern = UNIQUE_ID_PATTERNS.get(doc_type)
-        if not pattern:
-            return ""
-        match = re.search(pattern, text, re.IGNORECASE)
-        return match.group(1).strip() if match else ""
-
-    def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
-        """Best-effort vendor/supplier name extraction.
-
-        Many procurement documents place the vendor name prominently in the
-        title or top header without an explicit label.  This helper searches the
-        first few lines for a candidate and falls back to the file name when
-        necessary.
-        """
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for line in lines[:5]:
-            if not re.search(r"(invoice|purchase order|quote|bill|statement)", line, re.I):
-                return line
-        if object_key:
-            base = object_key.split("/")[-1].rsplit(".", 1)[0]
-            token = re.split(r"[-_]", base)[0]
-            if token and not re.search(r"(invoice|po|purchase|quote)", token, re.I):
-                return token
-        return ""
-
-    def _extract_line_items_from_pdf_tables(
-        self, file_bytes: bytes, doc_type: str
-    ) -> List[Dict]:
-        """Extract line items by parsing tabular data directly from the PDF."""
-        if pdfplumber is None:
-            return []
-        line_items: List[Dict] = []
-        if doc_type == "Invoice":
-            column_synonyms = {
-                "item_id": ["item", "sku", "part", "product code"],
-                "item_description": ["description", "item description"],
-                "quantity": ["qty", "quantity"],
-                "unit_price": ["unit price", "price", "rate", "unit cost"],
-                "unit_of_measure": ["unit", "uom"],
-                "line_amount": ["line total", "line amount", "amount", "total"],
-                "tax_percent": ["tax %", "tax percent", "tax rate"],
-                "tax_amount": ["tax", "tax amount"],
-                "total_amount_incl_tax": ["total amount incl tax", "total with tax"],
-            }
-        else:  # Purchase orders and others
-            column_synonyms = {
-                "item_id": ["item", "sku", "part", "product code"],
-                "item_description": ["description", "item description"],
-                "quantity": ["qty", "quantity"],
-                "unit_price": ["unit price", "price", "rate", "unit cost"],
-                "unit_of_measure": ["unit", "uom"],
-                "currency": ["currency"],
-                "line_total": ["line total", "amount", "total"],
-                "tax_percent": ["tax %", "tax percent", "tax rate"],
-                "tax_amount": ["tax", "tax amount"],
-                "total_amount": ["total", "total amount", "total with tax"],
-            }
+    # ============================ LINE ITEMS ==============================
+    def _extract_line_items_from_pdf_tables(self, file_bytes: bytes, doc_type: str) -> List[Dict]:
+        items: List[Dict] = []
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
-                    for table in page.extract_tables() or []:
-                        df = pd.DataFrame(table).dropna(how="all")
-                        if df.empty:
-                            continue
-                        header = (
-                            df.iloc[0]
-                            .fillna("")
-                            .astype(str)
-                            .str.lower()
-                            .str.strip()
-                            .tolist()
-                        )
-                        col_map: Dict[int, str] = {}
-                        for idx, col in enumerate(header):
-                            for field, syns in column_synonyms.items():
-                                if any(syn in col for syn in syns):
-                                    col_map[idx] = field
-                                    break
-                        if len(col_map) < 2:
-                            continue
-                        for _, row in df.iloc[1:].iterrows():
-                            item: Dict[str, Any] = {}
-                            for idx, field in col_map.items():
-                                val = row.iloc[idx]
-                                if isinstance(val, str):
-                                    val = val.strip()
-                                if val not in (None, ""):
-                                    item[field] = val
-                            if item:
-                                line_items.append(item)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Table extraction failed: %s", exc)
-        return line_items
+                    words = page.extract_words() or []
+                    if not words:
+                        continue
+                    # find header row
+                    header_row = None
+                    for y in sorted(set(round(w["top"], 0) for w in words)):
+                        row_words = [w for w in words if round(w["top"], 0) == y]
+                        header_text = " ".join(w["text"].strip().lower() for w in row_words)
+                        hits = 0
+                        required = ["item_description", "quantity", "unit_price"]
+                        for req in required:
+                            aliases = LINE_HEADERS_ALIASES.get(req, [])
+                            if any(re.search(p, header_text, re.I) for p in aliases):
+                                hits += 1
+                        if hits >= 2:
+                            header_row = row_words
+                            break
+                    if not header_row:
+                        continue
 
+                    # columns spans
+                    header_spans: List[Tuple[float, float, str]] = []
+                    for logical_col, aliases in LINE_HEADERS_ALIASES.items():
+                        for w in header_row:
+                            txt = w["text"].lower()
+                            if any(re.search(p, txt, re.I) for p in aliases):
+                                header_spans.append((w["x0"], w["x1"], logical_col))
+                                break
+                    header_spans = sorted(header_spans, key=lambda t: (t[0] + t[1]) / 2.0)
+                    if not header_spans:
+                        continue
+
+                    # rows below header
+                    below_rows = [w for w in words if w["top"] > min(w["top"] for w in header_row) + 2]
+                    by_y: Dict[int, List[Dict[str, Any]]] = {}
+                    for w in below_rows:
+                        y = int(round(w["top"], 0))
+                        by_y.setdefault(y, []).append(w)
+
+                    pending_desc = None
+                    for y in sorted(by_y.keys()):
+                        row = by_y[y]
+                        row_text = " ".join(w["text"] for w in row).strip()
+                        if TOTALS_STOP_WORDS.search(row_text):
+                            break
+                        row_obj: Dict[str, Any] = {}
+                        for w in row:
+                            mid = (w["x0"] + w["x1"]) / 2.0
+                            best = None
+                            bestd = 1e9
+                            for (x0, x1, label) in header_spans:
+                                cx = (x0 + x1) / 2.0
+                                d = abs(mid - cx)
+                                if d < bestd:
+                                    bestd = d
+                                    best = label
+                            if best:
+                                row_obj.setdefault(best, [])
+                                row_obj[best].append(w["text"])
+                        row_obj = {k: " ".join(v).strip() for k, v in row_obj.items()}
+
+                        non_desc_keys = [k for k in row_obj.keys() if k != "item_description" and row_obj[k]]
+                        if ("item_description" in row_obj and row_obj.get("item_description") and not non_desc_keys):
+                            if items:
+                                items[-1]["item_description"] = f'{items[-1].get("item_description","")} {row_obj["item_description"]}'.strip()
+                            else:
+                                pending_desc = row_obj["item_description"]
+                            continue
+                        if pending_desc and "item_description" in row_obj:
+                            row_obj["item_description"] = f'{pending_desc} {row_obj["item_description"]}'.strip()
+                            pending_desc = None
+
+                        row_norm = self._normalize_line_item_fields([row_obj], doc_type)[0]
+                        for k in ["quantity", "unit_price", "line_amount", "tax_percent", "tax_amount", "total_amount_incl_tax", "line_total", "total_amount"]:
+                            if k in row_norm:
+                                row_norm[k] = self._clean_numeric(row_norm[k])
+                        items.append(row_norm)
+        except Exception as exc:
+            logger.warning("Layout line-item extraction failed: %s", exc)
+        return items
+
+    # ============================ STRUCTURED FLOW =========================
     def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
-        """Map extracted header keys to canonical column names."""
         alias_map = {
             "Invoice": {
                 "invoice_total": "invoice_amount",
@@ -982,15 +949,6 @@ class DataExtractionAgent(BaseAgent):
         return normalised
 
     def _sanitize_party_names(self, header: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure vendor and supplier fields contain meaningful values.
-
-        Some documents include boilerplate phrases such as "Purchase Order"
-        which can be incorrectly captured as a vendor or supplier name during
-        naive parsing.  This helper strips such occurrences and guarantees that
-        ``supplier_id`` mirrors ``vendor_name`` when a separate identifier is
-        absent.
-        """
-
         for field in ("vendor_name", "supplier_id", "supplier_name"):
             val = header.get(field)
             if val and "purchase" in str(val).lower():
@@ -999,10 +957,7 @@ class DataExtractionAgent(BaseAgent):
             header["supplier_id"] = header["vendor_name"]
         return header
 
-    def _normalize_line_item_fields(
-        self, items: List[Dict[str, Any]], doc_type: str
-    ) -> List[Dict[str, Any]]:
-        """Rename common line-item field variants based on document type."""
+    def _normalize_line_item_fields(self, items: List[Dict[str, Any]], doc_type: str) -> List[Dict[str, Any]]:
         alias_map = {
             "Invoice": {
                 "description": "item_description",
@@ -1028,113 +983,136 @@ class DataExtractionAgent(BaseAgent):
             normalised_items.append(normalised)
         return normalised_items
 
-    def _extract_structured_data(
-        self, text: str, file_bytes: bytes, doc_type: str
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Parse header and line items using a hybrid heuristic/LLM approach."""
-
+    def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        # seed via lightweight JSONifier
         data = convert_document_to_json(text, doc_type)
-        header = self._normalize_header_fields(data.get("header_data", {}), doc_type)
-        line_items = self._normalize_line_item_fields(
-            data.get("line_items", []), doc_type
-        )
+        header_seed = self._normalize_header_fields(data.get("header_data", {}), doc_type)
+        # NEW: layout-first header (conf map inside)
+        header_layout = self._parse_header(text, file_bytes)
+        header = {**header_layout, **header_seed}
+        # Lines: layout-based
+        line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
 
-        parsed_header = self._parse_header(text)
-        parsed_header.update(header)
-        header = parsed_header
-
-        if not line_items:
-            extracted = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
-            line_items = self._normalize_line_item_fields(extracted, doc_type)
-
-        # Augment with a targeted LLM call for any fields still missing.  This
-        # keeps the extraction robust without depending entirely on the model.
-        header, line_items = self._fill_missing_fields_with_llm(
-            text, doc_type, header, line_items
-        )
-
-
+        # LLM strict fill for missing
+        header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
         header = self._sanitize_party_names(header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
+
+        ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
+        field_conf = header.pop("_field_confidence", {})
+        base = np.mean(list(field_conf.values())) if field_conf else 0.75
+        overall_conf = float(min(1.0, base + conf_boost))
+        header["_validation"] = {"ok": ok, "notes": notes, "confidence": overall_conf, "field_confidence": field_conf}
         return header, line_items
 
-    def _fill_missing_fields_with_llm(
-        self,
-        text: str,
-        doc_type: str,
-        header: Dict[str, Any],
-        line_items: List[Dict[str, Any]],
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Ask an LLM to supply only the fields still missing after heuristics."""
-
+    def _fill_missing_fields_with_llm(self, text: str, doc_type: str, header: Dict[str, Any], line_items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         schema = SCHEMA_MAP.get(doc_type, {})
         header_fields = list(schema.get("header", {}).keys())
         missing_header = [f for f in header_fields if not header.get(f)]
-        need_items = not line_items and schema.get("line_items")
+        need_items = (not line_items) and bool(schema.get("line_items"))
 
         if not missing_header and not need_items:
             return header, line_items
 
-        prompt_parts = [
-            f"Document type: {doc_type}.",
-            DOC_TYPE_CONTEXT.get(doc_type, ""),
-            "Existing data:",
-            json.dumps({"header_data": header, "line_items": line_items}),
-            "From the document text below extract the missing header fields:",
-            ", ".join(missing_header) if missing_header else "none",
-        ]
+        prompt = (
+            f"You are an information extraction engine for {doc_type}. "
+            "Return ONLY valid JSON. Do not include explanations.\n"
+            "Rules:\n"
+            "- Fill ONLY the missing header fields listed below; leave others as provided.\n"
+            "- For dates, use YYYY-MM-DD.\n"
+            "- Currency must be a 3-letter ISO code.\n"
+            "- Numbers must be plain decimals without commas or symbols.\n"
+            "- If unknown, set null (do not guess).\n\n"
+            f"Missing header fields: {', '.join(missing_header) if missing_header else 'none'}\n"
+        )
         if need_items:
-            line_fields = list(schema.get("line_items", {}).keys())
-            prompt_parts.append(
-                "Also extract line_items as a list of objects containing: "
-                + ", ".join(line_fields)
-            )
-        prompt_parts.append(
-            "Return JSON with keys 'header_data' and 'line_items'; use null when a value is unknown.\n\nDocument:\n"
-            + text
-        )
-        prompt = "\n".join(prompt_parts)
-        response = self.call_ollama(
-        
-            prompt=prompt, model=self.extraction_model, format="json"
-        )
-        try:
-            payload = json.loads(response.get("response", "{}"))
-        except Exception:
-            payload = {}
-        llm_header = self._normalize_header_fields(
-            payload.get("header_data", {}), doc_type
-        )
-        for key, value in llm_header.items():
-            header.setdefault(key, value)
+            prompt += "Also extract 'line_items' as a list of objects. Include description/qty/price amounts when available.\n"
+        prompt += "\nExisting data:\n" + json.dumps({"header_data": header, "line_items": line_items}) + "\n\nDocument:\n" + text
 
-        if need_items and payload.get("line_items"):
-            llm_items = self._normalize_line_item_fields(
-                payload.get("line_items", []), doc_type
-            )
+        payload = {}
+        for _ in range(2):
+            try:
+                resp = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json", options={"temperature": 0})
+                payload = json.loads(resp.get("response", "{}"))
+                if isinstance(payload, dict) and "header_data" in payload and "line_items" in payload:
+                    break
+            except Exception:
+                continue
+
+        llm_header = self._normalize_header_fields(payload.get("header_data", {}), doc_type)
+        for key in missing_header:
+            if key in llm_header and llm_header[key] not in (None, "", []):
+                header[key] = llm_header[key]
+                header.setdefault("_field_confidence", {})[key] = self._confidence_from_method("llm_fill")
+
+        if need_items and isinstance(payload.get("line_items"), list) and payload["line_items"]:
+            llm_items = self._normalize_line_item_fields(payload["line_items"], doc_type)
             if llm_items:
                 line_items = llm_items
 
-
         return header, line_items
 
+    # ============================ VECTORIZING =============================
+    def _ensure_qdrant_collection(self) -> None:
+        """
+        Determine vector size reliably and ensure the Qdrant collection exists.
+        """
+        # Get target collection name
+        collection = self.settings.qdrant_collection_name
 
+        # Determine embedding dimension safely
+        dim = None
+        emb = getattr(self.agent_nick, "embedding_model", None)
+        if emb is not None:
+            # sentence-transformers usually has this:
+            get_dim = getattr(emb, "get_sentence_embedding_dimension", None)
+            if callable(get_dim):
+                try:
+                    dim = int(get_dim())
+                except Exception:
+                    dim = None
+            if dim is None:
+                # Fallback: encode a token and inspect shape
+                try:
+                    vec = emb.encode(["__dim_probe__"], normalize_embeddings=True, show_progress_bar=False)
+                    # vec shape: (1, D)
+                    dim = int(getattr(vec, "shape", [None, None])[1]) if hasattr(vec, "shape") else int(len(vec[0]))
+                except Exception:
+                    pass
+        if not dim:
+            # Sensible default if all else fails
+            dim = 768
+
+        # Initialize idempotently
+        _initialize_qdrant_collection_idempotent(
+            self.agent_nick.qdrant_client,
+            collection_name=collection,
+            vector_size=dim,
+            distance="COSINE",
+        )
 
     def _vectorize_document(
-        self,
-        full_text: str,
-        pk_value: str | None,
-        doc_type: Any,
-        product_type: Any,
-        object_key: str,
+            self,
+            full_text: str,
+            pk_value: str | None,
+            doc_type: Any,
+            product_type: Any,
+            object_key: str,
     ) -> None:
         """Store document chunks and metadata in the vector database."""
-        self.agent_nick._initialize_qdrant_collection()
-        chunks = self._chunk_text(full_text)
+        if not full_text:
+            return
 
-        # Batch encode the chunks so the GPU can be utilised efficiently.  The
-        # embedding model automatically uses the GPU when available via
-        # :func:`utils.gpu.configure_gpu`.
+        # Ensure collection exists (idempotent)
+        try:
+            self._ensure_qdrant_collection()
+        except Exception:
+            logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
+
+        chunks = self._chunk_text(full_text)
+        if not chunks:
+            return
+
         vectors = self.agent_nick.embedding_model.encode(
             chunks, normalize_embeddings=True, show_progress_bar=False
         )
@@ -1158,40 +1136,52 @@ class DataExtractionAgent(BaseAgent):
                 models.PointStruct(id=point_id, vector=vector.tolist(), payload=payload)
             )
 
-        if points:
+        if not points:
+            return
+
+        # Upsert with create-on-404 retry
+        try:
             self.agent_nick.qdrant_client.upsert(
                 collection_name=self.settings.qdrant_collection_name,
                 points=points,
                 wait=True,
             )
+        except Exception as e:
+            # If collection missing, create then retry once
+            msg = str(e)
+            if "doesn't exist" in msg or "does not exist" in msg or "Not found" in msg:
+                logger.info("Qdrant collection missing — creating and retrying upsert...")
+                self._ensure_qdrant_collection()
+                self.agent_nick.qdrant_client.upsert(
+                    collection_name=self.settings.qdrant_collection_name,
+                    points=points,
+                    wait=True,
+                )
+            else:
+                raise
 
     def _vectorize_structured_data(
-        self,
-        header: Dict[str, Any],
-        line_items: List[Dict[str, Any]],
-        doc_type: str,
-        pk_value: str,
-        product_type: Any,
+            self,
+            header: Dict[str, Any],
+            line_items: List[Dict[str, Any]],
+            doc_type: str,
+            pk_value: str,
+            product_type: Any,
     ) -> None:
-        """Embed header and line-item content for retrieval.
-
-        Procurement workflows often require question answering over both
-        transaction headers (e.g. invoice dates, vendor names) and individual
-        line items.  Earlier revisions only vectorised line items which limited
-        the RAG agent's ability to answer header-level queries.  We now embed
-        a compact text representation of the header alongside each line item.
-        Points are tagged with a ``data_type`` so callers can filter as needed.
-        """
-
+        """Embed header and line-item content for retrieval."""
         if not pk_value:
             return
 
-        self.agent_nick._initialize_qdrant_collection()
+        # Ensure collection exists (idempotent)
+        try:
+            self._ensure_qdrant_collection()
+        except Exception:
+            logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
 
         texts: List[str] = []
         meta: List[Tuple[str, Dict[str, Any]]] = []
 
-        # Header payload -------------------------------------------------
+        # Header payload
         header_text = _dict_to_text(header)
         if header_text:
             texts.append(header_text)
@@ -1208,7 +1198,7 @@ class DataExtractionAgent(BaseAgent):
                 )
             )
 
-        # Line item payloads --------------------------------------------
+        # Line item payloads
         for idx, item in enumerate(line_items, start=1):
             item_text = _dict_to_text(item)
             if not item_text:
@@ -1239,61 +1229,48 @@ class DataExtractionAgent(BaseAgent):
             for (pid, payload), vec in zip(meta, vectors)
         ]
 
-        self.agent_nick.qdrant_client.upsert(
-            collection_name=self.settings.qdrant_collection_name,
-            points=points,
-            wait=True,
-        )
+        # Upsert with create-on-404 retry
+        try:
+            self.agent_nick.qdrant_client.upsert(
+                collection_name=self.settings.qdrant_collection_name,
+                points=points,
+                wait=True,
+            )
+        except Exception as e:
+            msg = str(e)
+            if "doesn't exist" in msg or "does not exist" in msg or "Not found" in msg:
+                logger.info("Qdrant collection missing — creating and retrying upsert...")
+                self._ensure_qdrant_collection()
+                self.agent_nick.qdrant_client.upsert(
+                    collection_name=self.settings.qdrant_collection_name,
+                    points=points,
+                    wait=True,
+                )
+            else:
+                raise
 
+    # ============================ TEXT CHUNKING ===========================
     def _chunk_text(self, text: str, max_tokens: int = 256, overlap: int = 20) -> List[str]:
-        """Token-aware text chunking with graceful degradation.
-
-        The original implementation used character counts which could split
-        tokens awkwardly and lead to sub‑optimal embeddings.  We now prefer a
-        token-based approach using ``tiktoken`` when available.  When the
-        library is missing the function falls back to a whitespace-normalised
-        character strategy so behaviour remains robust in minimal
-        environments.
-        """
-
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return []
-
-        try:  # pragma: no cover - optional dependency
+        try:
             import tiktoken
-
             enc = tiktoken.get_encoding("cl100k_base")
             tokens = enc.encode(text)
             step = max_tokens - overlap if max_tokens > overlap else max_tokens
             chunks = []
             for i in range(0, len(tokens), step):
-                chunk_tokens = tokens[i : i + max_tokens]
+                chunk_tokens = tokens[i: i + max_tokens]
                 chunks.append(enc.decode(chunk_tokens))
             return chunks
         except Exception:
             max_chars = max_tokens
             step = max_chars - overlap if max_chars > overlap else max_chars
-            return [text[i : i + max_chars] for i in range(0, len(text), step)]
+            return [text[i: i + max_chars] for i in range(0, len(text), step)]
 
+    # ============================ NORMALIZE / VALIDATE ====================
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:
-        """Best-effort parsing of free-form numeric strings.
-
-        The helper is tolerant to common human formats such as ``20%``,
-        ``£1,200.50`` or ``(100)`` for negative numbers.  Any non-numeric
-        characters, including currency symbols and thousand separators, are
-        stripped before casting.
-
-        Parameters
-        ----------
-        value: str | int | float
-            Raw numeric value or string potentially containing decorations.
-
-        Returns
-        -------
-        Optional[float]
-            ``float`` representation if parsing succeeds otherwise ``None``.
-        """
         if value is None:
             return None
         if isinstance(value, (int, float)):
@@ -1310,8 +1287,6 @@ class DataExtractionAgent(BaseAgent):
         if not numbers:
             logger.debug("Unable to parse numeric value '%s'", value)
             return None
-        # When a percent sign is present the first number usually represents
-        # the percentage, otherwise the last number tends to be the amount.
         num_str = numbers[0] if "%" in value_str else numbers[-1]
         try:
             num = float(num_str)
@@ -1321,39 +1296,18 @@ class DataExtractionAgent(BaseAgent):
             return None
 
     def _clean_date(self, value: str) -> Optional[datetime.date]:
-        """Parse fuzzy or relative date strings.
-
-        Supports expressions like "Jan 15, 2024 + 30 days" by applying the
-        specified offset. Returns ``datetime.date`` objects or ``None`` when
-        parsing fails.
-        """
         try:
             value_str = str(value).strip()
             if not value_str:
                 return None
-            # Strip out stray special characters that often appear in OCR
-            # output (e.g. ``{``, ``|`` or ``?``) while preserving typical date
-            # delimiters.
             value_str = re.sub(r"[^\w\s:/\-.]", " ", value_str)
-
-            # Skip obviously non-date strings to avoid noisy warnings.
             if not any(ch.isdigit() for ch in value_str) and not re.search(
-                r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
-                value_str,
-                re.I,
+                r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", value_str, re.I,
             ):
                 return None
-            # Pull out a likely date substring from noisy text such as
-            # "INV NO. 039468 / 30 APRIL. 2024".
-            match_sub = re.search(
-                r"(\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{2,4}|\d{4}-\d{2}-\d{2})",
-                value_str,
-            )
+            match_sub = re.search(r"(\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{2,4}|\d{4}-\d{2}-\d{2})", value_str)
             if match_sub:
                 value_str = match_sub.group(1)
-            # Some documents include a trailing dot after the month name,
-            # e.g. ``30 MARCH. 2024`` which confuses the parser. Strip dots
-            # that directly follow a word token.
             value_str = re.sub(r"([A-Za-z])\.\b", r"\1", value_str)
             match = re.match(r"(.+?)\s*\+\s*(\d+)\s*days", value_str, re.I)
             if match:
@@ -1366,12 +1320,8 @@ class DataExtractionAgent(BaseAgent):
             return None
 
     def _clean_text(self, value: str) -> str:
-        """Remove unwanted characters from free-form text values."""
         if value is None:
             return ""
-        # Allow alphanumerics, whitespace and common punctuation used in
-        # procurement documents. Everything else (such as ``{``, ``|`` or ``?``)
-        # is stripped to prevent polluting database fields.
         cleaned = re.sub(r"[^\w\s\-.,:/@]", "", str(value))
         return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -1379,32 +1329,13 @@ class DataExtractionAgent(BaseAgent):
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none"}:
             return None
         numeric_fields = {
-            "quantity",
-            "unit_price",
-            "tax_percent",
-            "tax_amount",
-            "line_total",
-            "line_amount",
-            "total_with_tax",
-            "total_amount",
-            "total_amount_incl_tax",
-            "total",
-            "invoice_amount",
-            "invoice_total_incl_tax",
-            "exchange_rate_to_usd",
-            "converted_amount_usd",
+            "quantity", "unit_price", "tax_percent", "tax_amount", "line_total", "line_amount",
+            "total_with_tax", "total_amount", "total_amount_incl_tax", "total",
+            "invoice_amount", "invoice_total_incl_tax", "exchange_rate_to_usd", "converted_amount_usd",
         }
         date_fields = {
-            "invoice_date",
-            "due_date",
-            "po_date",
-            "requested_date",
-            "invoice_paid_date",
-            "delivery_date",
-            "order_date",
-            "expected_delivery_date",
-            "created_date",
-            "last_modified_date",
+            "invoice_date", "due_date", "po_date", "requested_date", "invoice_paid_date", "delivery_date",
+            "order_date", "expected_delivery_date", "created_date", "last_modified_date",
         }
         currency_fields = {"currency", "default_currency"}
         if key:
@@ -1428,7 +1359,6 @@ class DataExtractionAgent(BaseAgent):
         return value
 
     def _cast_sql_type(self, value: Any, sql_type: str):
-        """Cast ``value`` to a Python type based on a SQL type string."""
         if value is None:
             return None
         sql_type = sql_type.lower()
@@ -1452,13 +1382,7 @@ class DataExtractionAgent(BaseAgent):
             return None
         return value
 
-    def _validate_and_cast(
-        self,
-        header: Dict[str, Any],
-        line_items: List[Dict[str, Any]],
-        doc_type: str,
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Validate keys and cast values according to table schemas."""
+    def _validate_and_cast(self, header: Dict[str, Any], line_items: List[Dict[str, Any]], doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         schemas = SCHEMA_MAP.get(doc_type, {})
         header_schema = schemas.get("header", {})
         line_schema = schemas.get("line_items", {})
@@ -1485,24 +1409,8 @@ class DataExtractionAgent(BaseAgent):
 
         return cast_header, cast_lines
 
-    def _persist_to_postgres(
-        self,
-        header: Dict[str, str],
-        line_items: List[Dict],
-        doc_type: str,
-        pk_value: str,
-    ) -> None:
-        """Persist extracted header and line items to PostgreSQL.
-
-        The input ``header`` and ``line_items`` are first normalised and cleaned
-        to strip unwanted characters (such as ``{``, ``|`` or ``?``) and to cast
-        values to the appropriate types defined in ``SCHEMA_MAP``.  Only after
-        this sanitisation step are the records inserted into the target tables.
-        """
-
-        # Ensure we persist only validated and sanitised data.  This also
-        # provides a safety net when ``_persist_to_postgres`` is invoked
-        # directly by other agents within the framework.
+    # ============================ PERSISTENCE =============================
+    def _persist_to_postgres(self, header: Dict[str, str], line_items: List[Dict], doc_type: str, pk_value: str) -> None:
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
         if isinstance(pk_value, str):
             pk_value = self._clean_text(pk_value)
@@ -1511,36 +1419,14 @@ class DataExtractionAgent(BaseAgent):
             conn = self.agent_nick.get_db_connection()
             with conn:
                 self._persist_header_to_postgres(header, doc_type, conn)
-                self._persist_line_items_to_postgres(
-                    pk_value, line_items, doc_type, header, conn
-                )
-        except Exception as exc:  # pragma: no cover - database connectivity
+                self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header, conn)
+        except Exception as exc:
             logger.error("Failed to persist %s data: %s", doc_type, exc)
 
-    def _has_unique_constraint(
-        self, cur, schema: str, table: str, columns: List[str]
-    ) -> bool:
-        """Check whether ``table`` has a unique/primary constraint on ``columns``.
-
-        Parameters
-        ----------
-        cur:
-            Active database cursor.
-        schema, table:
-            Table reference to inspect.
-        columns:
-            Ordered list of column names that should comprise the constraint.
-
-        Returns
-        -------
-        bool
-            ``True`` if a unique or primary key constraint exists exactly on the
-            provided ``columns`` (ignoring order), ``False`` otherwise.
-        """
-
+    def _has_unique_constraint(self, cur, schema: str, table: str, columns: List[str]) -> bool:
         if not columns:
             return False
-        try:  # pragma: no cover - database introspection
+        try:
             cur.execute(
                 """
                 SELECT tc.constraint_name, array_agg(ccu.column_name ORDER BY ccu.column_name)
@@ -1561,9 +1447,7 @@ class DataExtractionAgent(BaseAgent):
             return False
         return False
 
-    def _persist_header_to_postgres(
-        self, header: Dict[str, str], doc_type: str, conn=None
-    ) -> None:
+    def _persist_header_to_postgres(self, header: Dict[str, str], doc_type: str, conn=None) -> None:
         table_map = {
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
@@ -1585,15 +1469,7 @@ class DataExtractionAgent(BaseAgent):
                 )
                 columns = {r[0]: r[1] for r in cur.fetchall()}
                 payload = {}
-                numeric_types = {
-                    "integer",
-                    "bigint",
-                    "smallint",
-                    "numeric",
-                    "decimal",
-                    "double precision",
-                    "real",
-                }
+                numeric_types = {"integer", "bigint", "smallint", "numeric", "decimal", "double precision", "real"}
                 for k, v in header.items():
                     if k not in columns:
                         continue
@@ -1611,18 +1487,14 @@ class DataExtractionAgent(BaseAgent):
                             if col_type in {"integer", "bigint", "smallint"}:
                                 sanitized = int(sanitized)
                         except (TypeError, ValueError):
-                            logger.warning(
-                                "Dropping %s due to type mismatch (%s)", k, v
-                            )
+                            logger.warning("Dropping %s due to type mismatch (%s)", k, v)
                             continue
                     payload[k] = sanitized
                 if not payload:
                     return
                 cols = ", ".join(payload.keys())
                 placeholders = ", ".join(["%s"] * len(payload))
-                update_cols = ", ".join(
-                    f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col
-                )
+                update_cols = ", ".join(f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col)
                 sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
                 if self._has_unique_constraint(cur, schema, table, [pk_col]):
                     if update_cols:
@@ -1630,12 +1502,11 @@ class DataExtractionAgent(BaseAgent):
                     else:
                         sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
                 else:
-                    # Fallback when the expected unique constraint is missing.
                     sql = sql_base + "ON CONFLICT DO NOTHING"
                 cur.execute(sql, list(payload.values()))
             if close_conn:
                 conn.commit()
-        except Exception as exc:  # pragma: no cover - database connectivity
+        except Exception as exc:
             logger.error("Failed to persist %s data: %s", doc_type, exc)
             if close_conn:
                 conn.rollback()
@@ -1643,22 +1514,10 @@ class DataExtractionAgent(BaseAgent):
             if close_conn:
                 conn.close()
 
-    def _persist_line_items_to_postgres(
-        self,
-        pk_value: str,
-        line_items: List[Dict],
-        doc_type: str,
-        header: Dict[str, str],
-        conn=None,
-    ) -> None:
+    def _persist_line_items_to_postgres(self, pk_value: str, line_items: List[Dict], doc_type: str, header: Dict[str, str], conn=None) -> None:
         table_map = {
             "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
-            "Purchase_Order": (
-                "proc",
-                "po_line_items_agent",
-                "po_id",
-                "line_number",
-            ),
+            "Purchase_Order": ("proc", "po_line_items_agent", "po_id", "line_number"),
         }
         field_map = {
             "Invoice": {
@@ -1703,15 +1562,8 @@ class DataExtractionAgent(BaseAgent):
                 )
                 columns = [r[0] for r in cur.fetchall()]
                 numeric_fields = {
-                    "quantity",
-                    "unit_price",
-                    "tax_percent",
-                    "tax_amount",
-                    "line_total",
-                    "line_amount",
-                    "total_with_tax",
-                    "total_amount_incl_tax",
-                    "total_amount",
+                    "quantity", "unit_price", "tax_percent", "tax_amount", "line_total", "line_amount",
+                    "total_with_tax", "total_amount_incl_tax", "total_amount",
                 }
                 for idx, item in enumerate(line_items, start=1):
                     line_key = "line_no" if line_no_col == "line_no" else "line_number"
@@ -1728,7 +1580,6 @@ class DataExtractionAgent(BaseAgent):
                         for extra in ["delivery_date", "country", "region"]:
                             if extra in columns and header.get(extra):
                                 payload[extra] = header.get(extra)
-                    # generate synthetic line identifiers when supported by the schema
                     if doc_type == "Purchase_Order" and "po_line_id" in columns:
                         payload.setdefault("po_line_id", f"{pk_value}-{line_value}")
                     if doc_type == "Invoice" and "invoice_line_id" in columns:
@@ -1747,42 +1598,35 @@ class DataExtractionAgent(BaseAgent):
                             if not isinstance(val, (int, float)):
                                 val = self._clean_numeric(val)
                             if val in (None, "") or not isinstance(val, (int, float)):
-                                logger.warning(
-                                    "Dropping field %s due to non-numeric value. Payload: %s", k, payload
-                                )
+                                logger.warning("Dropping field %s due to non-numeric value. Payload: %s", k, payload)
                                 continue
                             val = float(val)
                         sanitized[k] = val
 
                     cols = ", ".join(sanitized.keys())
                     placeholders = ", ".join(["%s"] * len(sanitized))
-                    update_cols = ", ".join(
-                        f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in {fk_col, line_no_col}
-                    )
-                    conflict_cols: List[str]
+                    update_cols = ", ".join(f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in {fk_col, line_no_col})
                     if doc_type == "Invoice" and "invoice_line_id" in columns:
                         conflict_cols = ["invoice_line_id"]
                     elif doc_type == "Purchase_Order" and "po_line_id" in columns:
                         conflict_cols = ["po_line_id"]
                     else:
                         conflict_cols = [fk_col, line_no_col]
-
                     if not self._has_unique_constraint(cur, schema, table, conflict_cols):
                         conflict_cols = []
-
                     sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
                     if conflict_cols:
-                        target = ", ".join(conflict_cols)
+                        target_cols = ", ".join(conflict_cols)
                         if update_cols:
-                            sql += f" ON CONFLICT ({target}) DO UPDATE SET {update_cols}"
+                            sql += f" ON CONFLICT ({target_cols}) DO UPDATE SET {update_cols}"
                         else:
-                            sql += f" ON CONFLICT ({target}) DO NOTHING"
+                            sql += f" ON CONFLICT ({target_cols}) DO NOTHING"
                     else:
                         sql += " ON CONFLICT DO NOTHING"
                     cur.execute(sql, list(sanitized.values()))
             if close_conn:
                 conn.commit()
-        except Exception as exc:  # pragma: no cover - database connectivity
+        except Exception as exc:
             logger.error("Failed to persist line items for %s: %s", doc_type, exc)
             if close_conn:
                 conn.rollback()
@@ -1790,6 +1634,61 @@ class DataExtractionAgent(BaseAgent):
             if close_conn:
                 conn.close()
 
+    # ============================ CLASSIFICATION ==========================
+    def _classify_doc_type(self, text: str) -> str:
+        snippet = text[:2000].lower()
+        scores = {dtype: sum(snippet.count(kw) for kw in kws) for dtype, kws in DOC_TYPE_KEYWORDS.items()}
+        best_type, best_score = max(scores.items(), key=lambda kv: kv[1])
+        if best_score > 0:
+            return best_type
+        prompt = ("Classify the following document as Invoice, Purchase_Order, Quote, Contract, or Other. "
+                  "Respond with only the label.\n\nContext:\n" + DOC_CONTEXT_TEXT + "\n\nDocument:\n" + snippet)
+        try:
+            resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
+            label = resp.get("response", "").strip().lower()
+            for canonical in DOC_TYPE_KEYWORDS:
+                if canonical.replace("_", " ").lower() in label:
+                    return canonical
+            if "invoice" in label:
+                return "Invoice"
+            if "purchase" in label or "po" in label:
+                return "Purchase_Order"
+            if "quote" in label:
+                return "Quote"
+            if "contract" in label:
+                return "Contract"
+        except Exception:
+            pass
+        return "Other"
+
+    def _classify_product_type(self, text: str) -> str:
+        snippet = text.lower()
+        for category, keywords in PRODUCT_KEYWORDS.items():
+            for kw in keywords:
+                if kw in snippet:
+                    return category
+        return "other"
+
+    def _extract_unique_id(self, text: str, doc_type: str) -> str:
+        pattern = UNIQUE_ID_PATTERNS.get(doc_type)
+        if not pattern:
+            return ""
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines[:5]:
+            if not re.search(r"(invoice|purchase order|quote|bill|statement)", line, re.I):
+                return line
+        if object_key:
+            base = object_key.split("/")[-1].rsplit(".", 1)[0]
+            token = re.split(r"[-_]", base)[0]
+            if token and not re.search(r"(invoice|po|purchase|quote)", token, re.I):
+                return token
+        return ""
+
+    # ============================ TRAIN (optional) =======================
     def train_extraction_model(
         self, training_data: List[Tuple[str, str]], epochs: int = 1
     ) -> Optional[str]:
