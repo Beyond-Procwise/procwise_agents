@@ -159,11 +159,79 @@ PO_LINE_ITEMS_SCHEMA = {
     "last_modified_date": "timestamp without time zone",
 }
 
+QUOTE_SCHEMA = {
+    "quote_id": "text",
+    "supplier_id": "text",
+    "buyer_id": "text",
+    "quote_date": "date",
+    "validity_date": "date",
+    "currency": "character varying(3)",
+    "total_amount": "numeric(18,2)",
+    "tax_percent": "numeric(5,2)",
+    "tax_amount": "numeric(18,2)",
+    "total_amount_incl_tax": "numeric(18,2)",
+    "po_id": "text",
+    "country": "text",
+    "region": "text",
+    "ai_flag_required": "character varying(5)",
+    "trigger_type": "character varying(30)",
+    "trigger_context_description": "text",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+}
+
+QUOTE_LINE_ITEMS_SCHEMA = {
+    "quote_line_id": "text",
+    "quote_id": "text",
+    "line_number": "integer",
+    "item_id": "text",
+    "item_description": "text",
+    "quantity": "integer",
+    "unit_of_measure": "text",
+    "unit_price": "numeric(18,2)",
+    "line_total": "numeric(18,2)",
+    "tax_percent": "numeric(5,2)",
+    "tax_amount": "numeric(18,2)",
+    "total_amount": "numeric(18,2)",
+    "currency": "character varying(3)",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+}
+
+CONTRACT_SCHEMA = {
+    "contract_id": "text",
+    "supplier_id": "text",
+    "buyer_id": "text",
+    "effective_date": "date",
+    "expiry_date": "date",
+    "currency": "character varying(3)",
+    "contract_value": "numeric(18,2)",
+    "governing_law": "text",
+    "jurisdiction": "text",
+    "renewal_terms": "text",
+    "termination_clause": "text",
+    "country": "text",
+    "region": "text",
+    "ai_flag_required": "character varying(5)",
+    "trigger_type": "character varying(30)",
+    "trigger_context_description": "text",
+    "created_date": "timestamp without time zone",
+    "created_by": "text",
+    "last_modified_by": "text",
+    "last_modified_date": "timestamp without time zone",
+}
+
+
 SCHEMA_MAP = {
     "Invoice": {"header": INVOICE_SCHEMA, "line_items": INVOICE_LINE_ITEMS_SCHEMA},
     "Purchase_Order": {"header": PURCHASE_ORDER_SCHEMA, "line_items": PO_LINE_ITEMS_SCHEMA},
+    "Quote": {"header": QUOTE_SCHEMA, "line_items": QUOTE_LINE_ITEMS_SCHEMA},
+    "Contract": {"header": CONTRACT_SCHEMA, "line_items": {}},  # no line items
 }
-
 # ---------------------------------------------------------------------------
 # DOC CONTEXT / KEYWORDS
 # ---------------------------------------------------------------------------
@@ -282,7 +350,7 @@ def _initialize_qdrant_collection_idempotent(
             _ = qdrant_client.get_collection(collection_name)
             return  # Already exists
         except Exception:
-            # If get_collection not available/failed, list as fallback
+            # If the get_collection not available/failed, list as fallback
             try:
                 coll_list = qdrant_client.get_collections().collections
                 if any(getattr(c, "name", None) == collection_name for c in coll_list):
@@ -450,24 +518,55 @@ class DataExtractionAgent(BaseAgent):
         # Vectorize raw doc (idempotent collection init)
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
 
-        if doc_type in {"Purchase_Order", "Invoice"}:
+        if doc_type in {"Purchase_Order", "Invoice", "Quote", "Contract"}:
             header, line_items = self._extract_structured_data(text, file_bytes, doc_type)
             header["doc_type"] = doc_type
             header["product_type"] = product_type
+
+            # Attach primary IDs if missing (from filename/body)
             if doc_type == "Invoice" and not header.get("invoice_id"):
                 header["invoice_id"] = unique_id
             if doc_type == "Purchase_Order" and not header.get("po_id"):
                 header["po_id"] = unique_id
+            if doc_type == "Quote" and not header.get("quote_id"):
+                header["quote_id"] = unique_id
+            if doc_type == "Contract" and not header.get("contract_id"):
+                header["contract_id"] = unique_id
+
+            # Party sanitization
             header = self._sanitize_party_names(header)
-            pk_value = header.get("invoice_id") or header.get("po_id") or header.get("quote_id") or unique_id
-            if not header.get("vendor_name"):
-                vendor_guess = self._infer_vendor_name(text, object_key)
-                if vendor_guess and "purchase" not in vendor_guess.lower():
-                    header["vendor_name"] = vendor_guess
+
+            pk_value = (
+                    header.get("invoice_id")
+                    or header.get("po_id")
+                    or header.get("quote_id")
+                    or header.get("contract_id")
+                    or unique_id
+            )
+
+            # Try to infer supplier_id from vendor_name where applicable
             if not header.get("supplier_id") and header.get("vendor_name"):
                 header["supplier_id"] = header.get("vendor_name")
+
+            data = {
+                "header_data": header,
+                "line_items": line_items,
+                "validation": {
+                    "is_valid": True,
+                    "confidence_score": 1.0,
+                    "notes": "python parser",
+                },
+            }
+
+            # Persist + vectorize for all four doc types (contracts have no line items schema; handled safely)
+            self._persist_to_postgres(header, line_items, doc_type, pk_value)
+            self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
+            doc_id = pk_value
         else:
+            # Other/unknown types
             header, line_items, pk_value = {"doc_type": doc_type, "product_type": product_type}, [], unique_id
+            data = None
+            doc_id = pk_value or object_key
 
         if doc_type in {"Purchase_Order", "Invoice"} and header and pk_value:
             ok = header.get("_validation", {}).get("ok", True)
@@ -983,6 +1082,24 @@ class DataExtractionAgent(BaseAgent):
             normalised_items.append(normalised)
         return normalised_items
 
+    def _enrich_contract_fields(self, text: str, header: Dict[str, Any]) -> Dict[str, Any]:
+        # Best-effort patterns
+        pairs = [
+            ("effective_date", r"\bEffective\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
+            ("expiry_date", r"\bExpiry|Expiration\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
+            ("governing_law", r"\bGoverning\s+Law[:\s]+([A-Za-z ,&]{3,})"),
+            ("jurisdiction", r"\bJurisdiction[:\s]+([A-Za-z ,&]{3,})"),
+            ("termination_clause", r"\bTermination\b.*"),
+        ]
+        low = text
+        for key, pat in pairs:
+            if header.get(key):
+                continue
+            m = re.search(pat, low, re.I)
+            if m:
+                header[key] = m.group(1).strip()
+        return header
+
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         # seed via lightweight JSONifier
         data = convert_document_to_json(text, doc_type)
@@ -996,6 +1113,8 @@ class DataExtractionAgent(BaseAgent):
         # LLM strict fill for missing
         header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
         header = self._sanitize_party_names(header)
+        if doc_type == "Contract":
+            header = self._enrich_contract_fields(text, header)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
         ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
@@ -1451,6 +1570,8 @@ class DataExtractionAgent(BaseAgent):
         table_map = {
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
+            "Quote": ("proc", "quote_agent", "quote_id"),
+            "Contract": ("proc", "contract_agent", "contract_id"),
         }
         target = table_map.get(doc_type)
         if not target:
@@ -1518,6 +1639,7 @@ class DataExtractionAgent(BaseAgent):
         table_map = {
             "Invoice": ("proc", "invoice_line_items_agent", "invoice_id", "line_no"),
             "Purchase_Order": ("proc", "po_line_items_agent", "po_id", "line_number"),
+            "Quote": ("proc", "quote_line_items_agent", "quote_id", "line_number"),
         }
         field_map = {
             "Invoice": {
@@ -1543,7 +1665,20 @@ class DataExtractionAgent(BaseAgent):
                 "tax_amount": "tax_amount",
                 "total_amount": "total_amount",
             },
+            "Quote": {
+                "item_id": "item_id",
+                "item_description": "item_description",
+                "quantity": "quantity",
+                "unit_of_measure": "unit_of_measure",
+                "unit_price": "unit_price",
+                "line_total": "line_total",
+                "tax_percent": "tax_percent",
+                "tax_amount": "tax_amount",
+                "total_amount": "total_amount",
+                "currency": "currency",
+            },
         }
+
         target = table_map.get(doc_type)
         field_map = field_map.get(doc_type, {})
         if not target or not line_items:
@@ -1584,6 +1719,8 @@ class DataExtractionAgent(BaseAgent):
                         payload.setdefault("po_line_id", f"{pk_value}-{line_value}")
                     if doc_type == "Invoice" and "invoice_line_id" in columns:
                         payload.setdefault("invoice_line_id", f"{pk_value}-{line_value}")
+                    if doc_type == "Quote" and "quote_line_id" in columns:
+                        payload.setdefault("quote_line_id", f"{pk_value}-{line_value}")
                     for col, source in field_map.items():
                         if col in payload:
                             continue
