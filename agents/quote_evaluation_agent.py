@@ -23,6 +23,7 @@ class QuoteEvaluationAgent(BaseAgent):
         """Fetch quotes and return only required commercial fields or compare RFQ responses."""
         try:
             input_data = context.input_data
+            logger.info("QuoteEvaluationAgent: starting with input %s", input_data)
             rfq_id = input_data.get("rfq_id")
             if rfq_id:
                 quotes = self._get_responses_from_db(rfq_id)
@@ -32,9 +33,11 @@ class QuoteEvaluationAgent(BaseAgent):
                 )
                 best = quotes_sorted[0] if quotes_sorted else None
                 next_agents = ["approvals"] if best else []
+                logger.info("QuoteEvaluationAgent: retrieved %d quotes for rfq %s", len(quotes_sorted), rfq_id)
                 return AgentOutput(
                     status=AgentStatus.SUCCESS,
                     data={"quotes": quotes_sorted, "best_quote": best},
+                    pass_fields={"quotes": quotes_sorted, "best_quote": best},
                     next_agents=next_agents,
                 )
 
@@ -51,6 +54,11 @@ class QuoteEvaluationAgent(BaseAgent):
                 input_data.get("supplier_names", []),
                 product_category,
             )
+            logger.info(
+                "QuoteEvaluationAgent: fetched %d quotes for category %s",
+                len(quotes),
+                product_category,
+            )
 
             if not quotes:
                 # Absence of quotes should not be treated as a hard failure:
@@ -58,6 +66,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 return AgentOutput(
                     status=AgentStatus.SUCCESS,
                     data={"quotes": [], "message": "No quotes found"},
+                    pass_fields={"quotes": []},
                 )
 
             simplified: List[Dict] = []
@@ -73,9 +82,12 @@ class QuoteEvaluationAgent(BaseAgent):
                     }
                 )
 
+            output_data = self._to_native({"quotes": simplified, "weights": weights})
+            logger.debug("QuoteEvaluationAgent output: %s", output_data)
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data=self._to_native({"quotes": simplified, "weights": weights}),
+                data=output_data,
+                pass_fields=output_data,
             )
         except Exception as exc:
             logger.error("QuoteEvaluationAgent error: %s", exc)
