@@ -76,9 +76,23 @@ class OpportunityMinerAgent(BaseAgent):
             findings.extend(self._detect_supplier_consolidation(tables))
 
             filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
+            self._load_supplier_risk_map()
+            for f in filtered:
+                f.candidate_suppliers = self._find_candidate_suppliers(f.item_id, f.supplier_id)
+
+            # compute weightage
+            total_impact = sum(f.financial_impact_gbp for f in filtered)
+            if total_impact > 0:
+                for f in filtered:
+                    risk = float(self._supplier_risk_map.get(f.supplier_id, 0.0))
+                    f.weightage = (f.financial_impact_gbp / total_impact) * (1.0 + risk)
+            else:
+                for f in filtered:
+                    f.weightage = 0.0
 
             self._output_excel(filtered)
             self._output_feed(filtered)
+
 
             data = {
                 "findings": [f.as_dict() for f in filtered],
@@ -644,36 +658,7 @@ class OpportunityMinerAgent(BaseAgent):
         grouped = candidates_df.groupby("supplier_id", as_index=False)["unit_price"].min()
         return [{"supplier_id": r["supplier_id"], "unit_price": float(r["unit_price"])} for _, r in grouped.iterrows()]
 
-    # --- Update to process() just after detecting and filtering findings ---
-    # replace the existing post-filter block with the following snippet inside process()
 
-    # after: filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
-
-    # populate candidate suppliers and supplier risk map
-    self._load_supplier_risk_map()
-    for f in filtered:
-        f.candidate_suppliers = self._find_candidate_suppliers(f.item_id, f.supplier_id)
-
-    # compute weightage
-    total_impact = sum(f.financial_impact_gbp for f in filtered)
-    if total_impact > 0:
-        for f in filtered:
-            risk = float(self._supplier_risk_map.get(f.supplier_id, 0.0))
-            f.weightage = (f.financial_impact_gbp / total_impact) * (1.0 + risk)
-    else:
-        for f in filtered:
-            f.weightage = 0.0
-
-    # outputs and payload
-    self._output_excel(filtered)
-    self._output_feed(filtered)
-
-    data = {
-        "findings": [f.as_dict() for f in filtered],
-        "opportunity_count": len(filtered),
-        "total_savings": sum(f.financial_impact_gbp for f in filtered),
-        "supplier_candidates": list({s["supplier_id"] for f in filtered for s in f.candidate_suppliers}),
-    }
     # ------------------------------------------------------------------
     # Output helpers
     # ------------------------------------------------------------------
