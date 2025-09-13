@@ -70,7 +70,23 @@ class SupplierRankingAgent(BaseAgent):
                 data={},
                 error='supplier_data is empty'
             )
-
+        candidate_ids = context.input_data.get("supplier_candidates")
+        if candidate_ids:
+            # normalize candidate_ids to a list
+            if not isinstance(candidate_ids, (list, set, tuple)):
+                try:
+                    candidate_ids = list(candidate_ids)
+                except Exception:
+                    candidate_ids = [candidate_ids]
+            candidate_set = set(candidate_ids)
+            # filter DataFrame to only candidate suppliers
+            if "supplier_id" not in df.columns:
+                logger.error("supplier_data does not contain 'supplier_id' column.")
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="supplier_data missing 'supplier_id' column"
+                )
         # 2. Determine criteria and weights
         intent = context.input_data.get('intent', {})
         requested = intent.get('parameters', {}).get('criteria', [])

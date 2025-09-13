@@ -1,28 +1,11 @@
-"""Opportunity Miner Agent.
-
-This agent implements a lightweight version of the functional
-requirements supplied in the task description.  It ingests procurement
-tables, performs basic validation and currency normalisation and then
-runs a set of seven fixed detectors.  Each detector produces a list of
-opportunities which are filtered using a global financial impact
-threshold before being written to Excel and a JSON feed that mimics the
-dashboard output.
-
-The implementation is intentionally simplified: the goal is to provide a
-clear, auditable pipeline that can be expanded upon.  The detectors use
-very small placeholder calculations so the agent can operate without a
-fully‑fledged dataset or database connection, making it suitable for the
-MVP and unit tests.
-"""
-
 from __future__ import annotations
 
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional,Any
 
 import pandas as pd
 
@@ -45,6 +28,8 @@ class Finding:
     calculation_details: Dict
     source_records: List[str]
     detected_on: datetime
+    weightage: float = 0.0
+    candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
@@ -594,6 +579,101 @@ class OpportunityMinerAgent(BaseAgent):
             )
         return findings
 
+    def _load_supplier_risk_map(self) -> Dict[str, float]:
+        """Load supplier risk scores from `proc.supplier` into a map: supplier_id -> risk_score."""
+        self._supplier_risk_map = {}
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                df = pd.read_sql(
+                    "SELECT supplier_id, COALESCE(risk_score, 0.0) AS risk_score FROM proc.supplier",
+                    conn,
+                )
+            if not df.empty:
+                self._supplier_risk_map = dict(zip(df["supplier_id"], df["risk_score"]))
+        except Exception:
+            self._supplier_risk_map = {}
+        return self._supplier_risk_map
+
+    def _find_candidate_suppliers(self, item_id: Optional[str], current_supplier_id: Optional[str]) -> List[
+        Dict[str, Any]]:
+        """
+        Query PO lines and invoice lines for other suppliers who sold the same item at a lower unit price.
+        Returns a list of dicts: { "supplier_id": "...", "unit_price": 5400.0 }
+        """
+        if not item_id:
+            return []
+
+        sql = """
+            SELECT supplier_id, COALESCE(unit_price_gbp, unit_price) AS unit_price
+            FROM proc.po_line_items_agent
+            WHERE item_id = %s AND supplier_id IS NOT NULL
+            UNION ALL
+            SELECT supplier_id, COALESCE(unit_price_gbp, unit_price) AS unit_price
+            FROM proc.invoice_line_items_agent
+            WHERE item_id = %s AND supplier_id IS NOT NULL
+        """
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                df = pd.read_sql(sql, conn, params=(item_id, item_id))
+        except Exception:
+            return []
+
+        if df.empty:
+            return []
+
+        df = df.dropna(subset=["supplier_id", "unit_price"])
+        if df.empty:
+            return []
+
+        # Determine the current supplier's unit price (min if multiple records)
+        cur_unit = None
+        if current_supplier_id is not None:
+            cur_rows = df[df["supplier_id"] == current_supplier_id]["unit_price"]
+            if not cur_rows.empty:
+                cur_unit = cur_rows.min()
+
+        # If we couldn't find a price for current supplier, set cur_unit high so we still return competitors
+        if cur_unit is None:
+            cur_unit = df["unit_price"].max() + 1.0
+
+        candidates_df = df[(df["unit_price"] < cur_unit) & (df["supplier_id"] != current_supplier_id)]
+        if candidates_df.empty:
+            return []
+
+        # For each supplier pick their best (lowest) unit price
+        grouped = candidates_df.groupby("supplier_id", as_index=False)["unit_price"].min()
+        return [{"supplier_id": r["supplier_id"], "unit_price": float(r["unit_price"])} for _, r in grouped.iterrows()]
+
+    # --- Update to process() just after detecting and filtering findings ---
+    # replace the existing post-filter block with the following snippet inside process()
+
+    # after: filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
+
+    # populate candidate suppliers and supplier risk map
+    self._load_supplier_risk_map()
+    for f in filtered:
+        f.candidate_suppliers = self._find_candidate_suppliers(f.item_id, f.supplier_id)
+
+    # compute weightage
+    total_impact = sum(f.financial_impact_gbp for f in filtered)
+    if total_impact > 0:
+        for f in filtered:
+            risk = float(self._supplier_risk_map.get(f.supplier_id, 0.0))
+            f.weightage = (f.financial_impact_gbp / total_impact) * (1.0 + risk)
+    else:
+        for f in filtered:
+            f.weightage = 0.0
+
+    # outputs and payload
+    self._output_excel(filtered)
+    self._output_feed(filtered)
+
+    data = {
+        "findings": [f.as_dict() for f in filtered],
+        "opportunity_count": len(filtered),
+        "total_savings": sum(f.financial_impact_gbp for f in filtered),
+        "supplier_candidates": list({s["supplier_id"] for f in filtered for s in f.candidate_suppliers}),
+    }
     # ------------------------------------------------------------------
     # Output helpers
     # ------------------------------------------------------------------

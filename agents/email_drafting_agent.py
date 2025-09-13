@@ -63,8 +63,11 @@ class EmailDraftingAgent(BaseAgent):
         # Merge any structured output from previous agents so that extracted
         # variables can populate the email template automatically.
         prev = data.get("previous_agent_output")
-        if isinstance(prev, dict):
-            data = {**prev, **data}
+        if isinstance(prev, str):
+            try:
+                prev = json.loads(prev)
+            except Exception:
+                prev = {}
         elif isinstance(prev, str):
             try:
                 parsed = json.loads(prev)
