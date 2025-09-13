@@ -46,8 +46,11 @@ async def lifespan(app: FastAPI):
             'DiscrepancyDetectionAgent': discrepancy_agent,
             'email_drafting': EmailDraftingAgent(agent_nick),
             'negotiation': NegotiationAgent(agent_nick),
+            'NegotiationAgent': NegotiationAgent(agent_nick),
             'approvals': ApprovalsAgent(agent_nick),
+            'ApprovalsAgent': ApprovalsAgent(agent_nick),
             'supplier_interaction': SupplierInteractionAgent(agent_nick),
+            'QuoteEvaluationAgent': QuoteEvaluationAgent(agent_nick),
         }
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)

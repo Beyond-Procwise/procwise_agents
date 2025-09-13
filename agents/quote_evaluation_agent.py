@@ -20,9 +20,24 @@ class QuoteEvaluationAgent(BaseAgent):
         return self.process(context)
 
     def process(self, context: AgentContext) -> AgentOutput:
-        """Fetch quotes and return only required commercial fields."""
+        """Fetch quotes and return only required commercial fields or compare RFQ responses."""
         try:
             input_data = context.input_data
+            rfq_id = input_data.get("rfq_id")
+            if rfq_id:
+                quotes = self._get_responses_from_db(rfq_id)
+                quotes_sorted = sorted(
+                    quotes,
+                    key=lambda q: (q.get("price", float("inf")), q.get("lead_time", "")),
+                )
+                best = quotes_sorted[0] if quotes_sorted else None
+                next_agents = ["approvals"] if best else []
+                return AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data={"quotes": quotes_sorted, "best_quote": best},
+                    next_agents=next_agents,
+                )
+
             product_category = (
                 input_data.get("product_category")
                 or input_data.get("product_type")
@@ -156,6 +171,23 @@ class QuoteEvaluationAgent(BaseAgent):
                 }
             )
         return quotes
+
+    def _get_responses_from_db(self, rfq_id: str) -> List[Dict]:
+        if not rfq_id:
+            return []
+        sql = (
+            "SELECT supplier_id, price, lead_time, response_text FROM proc.supplier_responses WHERE rfq_id = %s"
+        )
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                df = None
+                import pandas as pd
+
+                df = pd.read_sql(sql, conn, params=(rfq_id,))
+            return df.to_dict(orient="records") if df is not None else []
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("failed to fetch supplier responses")
+            return []
 
     def _to_native(self, obj):
         """Recursively convert numpy types to native Python types."""

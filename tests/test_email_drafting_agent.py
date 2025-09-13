@@ -15,51 +15,32 @@ from agents.base_agent import AgentContext, AgentStatus
 
 class DummyNick:
     def __init__(self):
-        self.settings = SimpleNamespace(ses_default_sender="sender@example.com", qdrant_collection_name="dummy", extraction_model="llama3", script_user="tester")
+        self.settings = SimpleNamespace(
+            ses_default_sender="sender@example.com",
+            qdrant_collection_name="dummy",
+            extraction_model="llama3",
+            script_user="tester",
+        )
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: None,
             log_action=lambda **_: None,
         )
-        self.ollama_options = lambda: {}
-
-
-class DummyEmailService:
-    def send_email(self, *args, **kwargs):
-        return True
 
 
 def test_email_drafting_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
 
-    sent = {}
+    captured = {}
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: captured.setdefault("drafts", []).append(draft))
 
-    def fake_send(subject, body, recipients, sender, attachments=None):
-        sent.update(
-            {
-                "subject": subject,
-                "body": body,
-                "recipients": recipients,
-                "sender": sender,
-                "attachments": attachments,
-            }
-        )
-        return True
-
-    monkeypatch.setattr(agent.email_service, "send_email", fake_send)
-    responses = iter([
-        {"response": "RFQ – Office Furniture"},
-        {"response": "Generated body"},
-    ])
-    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
-
+    ranking = [{"supplier_id": "S1", "supplier_name": "Acme"}]
     context = AgentContext(
         workflow_id="wf1",
         agent_id="email_drafting",
         user_id="u1",
         input_data={
-            "recipients": ["to@example.com", "cc@example.com"],
-            "supplier_contact_name": "John",
+            "ranking": ranking,
             "submission_deadline": "01/01/2025",
             "category_manager_name": "Cat",
             "category_manager_title": "Mgr",
@@ -67,65 +48,53 @@ def test_email_drafting_agent(monkeypatch):
             "your_name": "Buyer",
             "your_title": "Procurement",
             "your_company": "Your Company",
-            "attachments": [(b"data", "file.txt")],
-            "context": "please draft",
         },
     )
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert "Generated body" in sent["body"]
-    assert sent["subject"] == "RFQ – Office Furniture"
-    assert "<" not in sent["body"]
-    assert sent["attachments"] == [(b"data", "file.txt")]
-    assert sent["recipients"] == ["to@example.com", "cc@example.com"]
-    assert output.data["sent"] is True
-    assert output.data["body"] == sent["body"]
-    assert output.data["recipients"] == ["to@example.com", "cc@example.com"]
-    assert output.data["response"] == "Generated body"
+    assert output.data["drafts"]
+    draft = output.data["drafts"][0]
+    assert draft["supplier_id"] == "S1"
+    assert draft["rfq_id"].startswith("RFQ-")
+    assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
+    assert captured["drafts"][0] == draft
 
 
 def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "email_service", DummyEmailService())
-    responses = iter([
-        {"response": "Subject"},
-        {"response": "All good"},
-    ])
-    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+
+    ranking = [{"supplier_id": "S1", "supplier_name": "Bob"}]
     context = AgentContext(
         workflow_id="wf3",
         agent_id="email_drafting",
         user_id="u1",
         input_data={
-            "recipients": ["to@example.com"],
-            "body": "{{ response }}",
-            "context": "whatever",
+            "ranking": ranking,
+            "body": "Hello {{ supplier_contact_name }}",
         },
     )
+
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["body"] == "All good"
-    assert "<" not in output.data["body"]
+    assert "Hello Bob" in output.data["drafts"][0]["body"]
 
 
-def test_email_drafting_handles_missing_recipient(monkeypatch):
+def test_email_drafting_handles_missing_ranking(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "email_service", DummyEmailService())
-    responses = iter([
-        {"response": "Subject"},
-        {"response": "hi"},
-    ])
-    monkeypatch.setattr(agent, "call_ollama", lambda *a, **k: next(responses))
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+
     context = AgentContext(
         workflow_id="wf2",
         agent_id="email_drafting",
         user_id="u1",
-        input_data={"context": "hi"},
+        input_data={"body": "hi"},
     )
+
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["sent"] is False
-    assert "hi" in output.data["body"]
+    assert output.data["drafts"] == []
+

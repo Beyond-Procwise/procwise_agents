@@ -9,6 +9,8 @@ exposes this prompt in its output for downstream LLM usage.
 
 import json
 import logging
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from jinja2 import Template
@@ -58,128 +60,72 @@ class EmailDraftingAgent(BaseAgent):
         self.email_service = EmailService(agent_nick)
 
     def run(self, context: AgentContext) -> AgentOutput:
+        """Draft RFQ emails for each ranked supplier without sending."""
         data = dict(context.input_data)
-
-        # Merge any structured output from previous agents so that extracted
-        # variables can populate the email template automatically.
         prev = data.get("previous_agent_output")
         if isinstance(prev, str):
             try:
                 prev = json.loads(prev)
             except Exception:
                 prev = {}
-        elif isinstance(prev, str):
-            try:
-                parsed = json.loads(prev)
-                if isinstance(parsed, dict):
-                    data = {**parsed, **data}
-            except Exception:  # pragma: no cover - best effort
-                logger.debug("previous_agent_output not JSON parsable")
+        if isinstance(prev, dict):
+            data = {**prev, **data}
 
-        subject = data.get("subject")
-        recipients = data.get("recipients") or data.get("recipient")
-        if isinstance(recipients, str):
-            recipients = [recipients]
-        sender = data.get("sender", self.agent_nick.settings.ses_default_sender)
-        attachments = data.get("attachments")
+        ranking = data.get("ranking", [])
+        findings = data.get("findings", [])
+        drafts = []
 
-        draft_only = data.get("draft_only", False)
-        if not recipients:
-            recipients = None
+        for supplier in ranking:
+            supplier_id = supplier.get("supplier_id")
+            supplier_name = supplier.get("supplier_name", supplier_id)
+            rfq_id = f"RFQ-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
-        fmt_args = {
-            "supplier_contact_name": data.get("supplier_contact_name", "Supplier"),
-            "submission_deadline": data.get("submission_deadline", ""),
-            "category_manager_name": data.get("category_manager_name", ""),
-            "category_manager_title": data.get("category_manager_title", ""),
-            "category_manager_email": data.get("category_manager_email", ""),
-            "your_name": data.get("your_name", ""),
-            "your_title": data.get("your_title", ""),
-            "your_company": data.get("your_company", ""),
-        }
+            fmt_args = {
+                "supplier_contact_name": supplier_name or "Supplier",
+                "submission_deadline": data.get("submission_deadline", ""),
+                "category_manager_name": data.get("category_manager_name", ""),
+                "category_manager_title": data.get("category_manager_title", ""),
+                "category_manager_email": data.get("category_manager_email", ""),
+                "your_name": data.get("your_name", ""),
+                "your_title": data.get("your_title", ""),
+                "your_company": data.get("your_company", ""),
+            }
+            body_template = data.get("body") or self.TEXT_TEMPLATE
+            template_args = {**data, **fmt_args}
+            body = Template(body_template).render(**template_args)
+            body = f"<!-- RFQ-ID: {rfq_id} -->\n" + body
+            subject = f"RFQ {rfq_id} – Request for Quotation"
 
-        # Generate an LLM response based on upstream context if provided.  The
-        # result is injected into the email body via the ``response`` variable.
-        context_text = (
-            data.get("context")
-            or data.get("summary")
-            or ""
-        )
-
-        # Generate a subject line if one was not supplied.
-        DEFAULT_SUBJECT = "Request for Quotation (RFQ) – Office Furniture"
-        if not subject:
-            subject = DEFAULT_SUBJECT
-            if context_text:
-                try:
-                    resp = self.call_ollama(
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "You write concise email subject lines for procurement RFQs.",
-                            },
-                            {
-                                "role": "user",
-                                "content": f"Generate a subject line for the following request:\n{context_text}",
-                            },
-                        ]
-                    )
-                    subject = resp.get("response", "").strip() or DEFAULT_SUBJECT
-                except Exception:  # pragma: no cover - best effort
-                    logger.exception("failed to generate subject via LLM")
-        llm_response = ""
-        if context_text:
-            try:
-                resp = self.call_ollama(
-                    messages=[
-                        {"role": "system", "content": "You are a helpful procurement assistant."},
-                        {"role": "user", "content": context_text},
-                    ]
-                )
-                llm_response = resp.get("response", "").strip()
-            except Exception:  # pragma: no cover - best effort
-                logger.exception("failed to generate email body via LLM")
-
-        # Allow a custom body template to be supplied via input data. When no
-        # template is provided we fall back to the default TEXT_TEMPLATE.
-        body_template = data.get("body") or self.TEXT_TEMPLATE
-        template_args = {
-            **data,
-            **fmt_args,
-            "deadline": fmt_args["submission_deadline"],
-            "response": llm_response,
-        }
-        text_body = Template(body_template).render(**template_args)
-        if llm_response and "{{ response }}" not in body_template:
-            text_body = f"{llm_response}\n\n" + text_body
-
-        prompt = PROMPT_TEMPLATE.format(**fmt_args)
-
-        sent = False
-        if not draft_only and recipients:
-            try:
-                sent = self.email_service.send_email(
-                    subject, text_body, recipients, sender, attachments
-                )
-            except Exception:  # pragma: no cover - best effort
-                logger.exception("failed to send email")
-        if recipients is None:
-            message = "recipient not provided"
-        else:
-            message = "email sent" if sent else "email drafted"
-
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data={
+            draft = {
+                "supplier_id": supplier_id,
+                "rfq_id": rfq_id,
                 "subject": subject,
-                "body": text_body,
-                "prompt": prompt,
-                "recipients": recipients,
-                "sender": sender,
-                "attachments": attachments,
-                "sent": sent,
-                "message": message,
-                "response": llm_response,
-            },
-        )
+                "body": body,
+            }
+            drafts.append(draft)
+            self._store_draft(draft)
+
+        return AgentOutput(status=AgentStatus.SUCCESS, data={"drafts": drafts})
+
+    def _store_draft(self, draft: dict) -> None:
+        """Persist email draft to ``proc.draft_rfq_emails``."""
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proc.draft_rfq_emails
+                        (rfq_id, supplier_id, subject, body, created_on, sent)
+                        VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                        """,
+                        (
+                            draft["rfq_id"],
+                            draft["supplier_id"],
+                            draft["subject"],
+                            draft["body"],
+                        ),
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("failed to store RFQ draft")
 
