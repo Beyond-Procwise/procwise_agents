@@ -736,23 +736,29 @@ class Orchestrator:
         return quote_result.data
 
     def _execute_opportunity_workflow(self, context: AgentContext) -> Dict:
-        """Execute opportunity mining workflow"""
-        # Execute opportunity mining
+        """Execute opportunity to RFQ workflow"""
         opp_result = self._execute_agent("opportunity_miner", context)
+        results: Dict[str, Any] = {"opportunities": opp_result.data if opp_result else {}}
 
-        # Check for discrepancies
-        if opp_result.data.get("total_savings_potential", 0) > 10000:
-            disc_context = self._create_child_context(
-                context, "discrepancy_detection", opp_result.pass_fields
+        candidates = opp_result.data.get("supplier_candidates", []) if opp_result else []
+        if candidates:
+            rank_ctx = self._create_child_context(
+                context, "supplier_ranking", {"supplier_candidates": candidates}
             )
-            disc_result = self._execute_agent("discrepancy_detection", disc_context)
+            rank_res = self._execute_agent("supplier_ranking", rank_ctx)
+            results["ranking"] = rank_res.data if rank_res else {}
 
-            return {
-                "opportunities": opp_result.data,
-                "discrepancies": disc_result.data if disc_result else None,
+            email_input = {
+                "previous_agent_output": {
+                    "ranking": rank_res.data.get("ranking", []) if rank_res else [],
+                    "findings": opp_result.data.get("findings", []) if opp_result else [],
+                }
             }
+            email_ctx = self._create_child_context(context, "email_drafting", email_input)
+            email_res = self._execute_agent("email_drafting", email_ctx)
+            results["email_drafts"] = email_res.data if email_res else {}
 
-        return opp_result.data
+        return results
 
     def _execute_generic_workflow(
         self, workflow_name: str, context: AgentContext

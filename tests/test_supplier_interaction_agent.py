@@ -61,10 +61,16 @@ def test_supplier_interaction_agent():
         workflow_id='wf1',
         agent_id='supplier_interaction',
         user_id='u1',
-        input_data={'message': 'This is a new offer for your consideration', 'supplier_id': 's1'}
+        input_data={
+            'subject': 'Re: RFQ-20240101-abcd1234',
+            'message': 'Our price is 1500 with lead time 10 days',
+            'supplier_id': 's1',
+            'target_price': '1000',
+        }
     )
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data['routing_decision'] == 'NegotiationAgent'
     assert output.next_agents == ['NegotiationAgent']
+    assert output.data['price'] == 1500.0
+    assert output.data['lead_time'] == '10'

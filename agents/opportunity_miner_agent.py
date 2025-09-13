@@ -99,6 +99,14 @@ class OpportunityMinerAgent(BaseAgent):
                 "opportunity_count": len(filtered),
                 "total_savings": sum(f.financial_impact_gbp for f in filtered),
             }
+            # pass candidate supplier IDs to downstream agents
+            supplier_candidates = {
+                s["supplier_id"]
+                for f in filtered
+                for s in f.candidate_suppliers
+                if s.get("supplier_id")
+            }
+            data["supplier_candidates"] = list(supplier_candidates)
 
             return AgentOutput(status=AgentStatus.SUCCESS, data=data, confidence=1.0)
         except Exception as exc:  # pragma: no cover - defensive

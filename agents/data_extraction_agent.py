@@ -80,6 +80,7 @@ INVOICE_SCHEMA = {
     "trigger_type": "text",
     "trigger_context_description": "text",
     "created_date": "timestamp without time zone",
+    "vendor_name": "text",
 }
 
 INVOICE_LINE_ITEMS_SCHEMA = {
@@ -515,60 +516,40 @@ class DataExtractionAgent(BaseAgent):
         product_type = self._classify_product_type(text)
         unique_id = self._extract_unique_id(text, doc_type) or self._infer_vendor_name(text, object_key)
 
-        # Vectorize raw doc (idempotent collection init)
+        # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
+
+        header: Dict[str, Any] = {"doc_type": doc_type, "product_type": product_type}
+        line_items: List[Dict[str, Any]] = []
+        pk_value = unique_id
+        data: Optional[Dict[str, Any]] = None
 
         if doc_type in {"Purchase_Order", "Invoice", "Quote", "Contract"}:
             header, line_items = self._extract_structured_data(text, file_bytes, doc_type)
             header["doc_type"] = doc_type
             header["product_type"] = product_type
 
-            # Attach primary IDs if missing (from filename/body)
             if doc_type == "Invoice" and not header.get("invoice_id"):
                 header["invoice_id"] = unique_id
-            if doc_type == "Purchase_Order" and not header.get("po_id"):
+            elif doc_type == "Purchase_Order" and not header.get("po_id"):
                 header["po_id"] = unique_id
-            if doc_type == "Quote" and not header.get("quote_id"):
+            elif doc_type == "Quote" and not header.get("quote_id"):
                 header["quote_id"] = unique_id
-            if doc_type == "Contract" and not header.get("contract_id"):
+            elif doc_type == "Contract" and not header.get("contract_id"):
                 header["contract_id"] = unique_id
 
-            # Party sanitization
             header = self._sanitize_party_names(header)
-
             pk_value = (
-                    header.get("invoice_id")
-                    or header.get("po_id")
-                    or header.get("quote_id")
-                    or header.get("contract_id")
-                    or unique_id
+                header.get("invoice_id")
+                or header.get("po_id")
+                or header.get("quote_id")
+                or header.get("contract_id")
+                or unique_id
             )
 
-            # Try to infer supplier_id from vendor_name where applicable
             if not header.get("supplier_id") and header.get("vendor_name"):
                 header["supplier_id"] = header.get("vendor_name")
 
-            data = {
-                "header_data": header,
-                "line_items": line_items,
-                "validation": {
-                    "is_valid": True,
-                    "confidence_score": 1.0,
-                    "notes": "python parser",
-                },
-            }
-
-            # Persist + vectorize for all four doc types (contracts have no line items schema; handled safely)
-            self._persist_to_postgres(header, line_items, doc_type, pk_value)
-            self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
-            doc_id = pk_value
-        else:
-            # Other/unknown types
-            header, line_items, pk_value = {"doc_type": doc_type, "product_type": product_type}, [], unique_id
-            data = None
-            doc_id = pk_value or object_key
-
-        if doc_type in {"Purchase_Order", "Invoice"} and header and pk_value:
             ok = header.get("_validation", {}).get("ok", True)
             conf = header.get("_validation", {}).get("confidence", 0.8)
             notes = header.get("_validation", {}).get("notes", [])
@@ -582,14 +563,11 @@ class DataExtractionAgent(BaseAgent):
                     "notes": "; ".join(notes) if notes else "ok",
                 },
             }
+
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
             self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
-            doc_id = pk_value
-        else:
-            data = None
-            doc_id = pk_value or object_key
 
-        result = {"object_key": object_key, "id": doc_id, "doc_type": doc_type or "", "status": "success"}
+        result = {"object_key": object_key, "id": pk_value or object_key, "doc_type": doc_type or "", "status": "success"}
         if data:
             result["data"] = data
         return result
@@ -1133,8 +1111,9 @@ class DataExtractionAgent(BaseAgent):
         if not missing_header and not need_items:
             return header, line_items
 
+        context_hint = DOC_TYPE_CONTEXT.get(doc_type, "")
         prompt = (
-            f"You are an information extraction engine for {doc_type}. "
+            f"You are an information extraction engine for {doc_type}. {context_hint} "
             "Return ONLY valid JSON. Do not include explanations.\n"
             "Rules:\n"
             "- Fill ONLY the missing header fields listed below; leave others as provided.\n"
@@ -1151,7 +1130,7 @@ class DataExtractionAgent(BaseAgent):
         payload = {}
         for _ in range(2):
             try:
-                resp = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json", options={"temperature": 0})
+                resp = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json")
                 payload = json.loads(resp.get("response", "{}"))
                 if isinstance(payload, dict) and "header_data" in payload and "line_items" in payload:
                     break

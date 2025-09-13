@@ -43,8 +43,8 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
     assert payload["content"] == "hello world"
 
 
-def test_non_structured_docs_are_vectorized(monkeypatch):
-    """Documents other than POs or invoices should only be vectorized."""
+def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
+    """Contracts should be persisted and vectorized even without line items."""
 
     captured = {}
 
@@ -86,7 +86,7 @@ def test_non_structured_docs_are_vectorized(monkeypatch):
     assert captured["doc_type"] == "Contract"
     assert captured["product_type"] == "it hardware"
     assert captured["pk"] == "C123"
-    assert "persist" not in captured  # should not attempt DB insert
+    assert "persist" in captured  # should attempt DB insert
     assert res["id"] == "C123"
     assert res["doc_type"] == "Contract"
 
@@ -332,7 +332,7 @@ def test_fill_missing_fields_with_llm(monkeypatch):
         "agents.data_extraction_agent.convert_document_to_json",
         lambda text, dt: {"header_data": {}, "line_items": []},
     )
-    monkeypatch.setattr(agent, "_parse_header", lambda text: {})
+    monkeypatch.setattr(agent, "_parse_header", lambda text, file_bytes=None: {})
     monkeypatch.setattr(
         agent, "_extract_line_items_from_pdf_tables", lambda b, dt: []
     )

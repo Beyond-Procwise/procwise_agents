@@ -1,4 +1,5 @@
 import logging
+from typing import Dict
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
@@ -14,6 +15,21 @@ class ApprovalsAgent(BaseAgent):
         self.device = configure_gpu()
 
     def run(self, context: AgentContext) -> AgentOutput:
+        best = context.input_data.get("best_quote")
+        rfq_id = context.input_data.get("rfq_id")
+        if best and rfq_id:
+            price = best.get("price")
+            threshold = float(
+                getattr(self.agent_nick.settings, "approval_threshold", 10000)
+            )
+            approved = price is not None and float(price) <= threshold
+            self._store_approval(rfq_id, best, approved)
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"approved": approved, "best_quote": best},
+                next_agents=[],
+            )
+
         amount = context.input_data.get("amount")
         supplier_id = context.input_data.get("supplier_id")
         if amount is None:
@@ -61,3 +77,25 @@ class ApprovalsAgent(BaseAgent):
             },
             next_agents=[],
         )
+
+    def _store_approval(self, rfq_id: str, best: Dict, approved: bool) -> None:
+        if not rfq_id:
+            return
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proc.approvals (rfq_id, supplier_id, price, approved, created_on)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        """,
+                        (
+                            rfq_id,
+                            best.get("supplier_id"),
+                            best.get("price"),
+                            approved,
+                        ),
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("failed to store approval")

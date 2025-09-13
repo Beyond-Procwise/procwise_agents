@@ -9,8 +9,11 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 """
 from __future__ import annotations
 
+import logging
 import pandas as pd
 from .base_engine import BaseEngine
+
+logger = logging.getLogger(__name__)
 
 
 class QueryEngine(BaseEngine):
@@ -56,8 +59,7 @@ class QueryEngine(BaseEngine):
         LEFT JOIN inv ON s.supplier_id = inv.supplier_id
         """
         try:
-            # adapt this to how your code obtains DB connections
-            with self.get_connection() as conn:
+            with self.agent_nick.get_db_connection() as conn:
                 df = pd.read_sql(sql, conn)
             # drop duplicate supplier columns produced by s.* if needed
             if "supplier_id" in df.columns:

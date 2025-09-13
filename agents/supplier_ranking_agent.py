@@ -85,7 +85,14 @@ class SupplierRankingAgent(BaseAgent):
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
-                    error="supplier_data missing 'supplier_id' column"
+                    error="supplier_data missing 'supplier_id' column",
+                )
+            df = df[df["supplier_id"].isin(candidate_set)]
+            if df.empty:
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="No matching suppliers found for candidates",
                 )
         # 2. Determine criteria and weights
         intent = context.input_data.get('intent', {})
