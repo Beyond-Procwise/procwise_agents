@@ -94,6 +94,7 @@ class SupplierRankingAgent(BaseAgent):
                     data={},
                     error="No matching suppliers found for candidates",
                 )
+            logger.debug("SupplierRankingAgent: filtered candidates %s", list(candidate_set))
         # 2. Determine criteria and weights
         intent = context.input_data.get('intent', {})
         requested = intent.get('parameters', {}).get('criteria', [])
@@ -143,10 +144,12 @@ class SupplierRankingAgent(BaseAgent):
         )
 
         ranking = json.loads(top_df.to_json(orient='records'))
-        logger.info("SupplierRankingAgent: Ranking complete.")
+        logger.info("SupplierRankingAgent: Ranking complete with %d entries", len(ranking))
+        logger.debug("SupplierRankingAgent ranking: %s", ranking)
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={'ranking': ranking}
+            data={'ranking': ranking},
+            pass_fields={'ranking': ranking},
         )
 
     def _load_json_file(self, rel_path: str) -> dict:

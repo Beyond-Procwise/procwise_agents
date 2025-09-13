@@ -61,6 +61,7 @@ class EmailDraftingAgent(BaseAgent):
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
+        logger.info("EmailDraftingAgent starting with input %s", context.input_data)
         data = dict(context.input_data)
         prev = data.get("previous_agent_output")
         if isinstance(prev, str):
@@ -104,8 +105,14 @@ class EmailDraftingAgent(BaseAgent):
             }
             drafts.append(draft)
             self._store_draft(draft)
+            logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
 
-        return AgentOutput(status=AgentStatus.SUCCESS, data={"drafts": drafts})
+        logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={"drafts": drafts},
+            pass_fields={"drafts": drafts},
+        )
 
     def _store_draft(self, draft: dict) -> None:
         """Persist email draft to ``proc.draft_rfq_emails``."""

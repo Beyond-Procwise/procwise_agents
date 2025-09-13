@@ -20,6 +20,7 @@ class NegotiationAgent(BaseAgent):
         self.device = configure_gpu()
 
     def run(self, context: AgentContext) -> AgentOutput:
+        logger.info("NegotiationAgent starting with input %s", context.input_data)
         supplier = context.input_data.get("supplier")
         current_offer = context.input_data.get("current_offer")
         target_price = context.input_data.get("target_price")
@@ -34,9 +35,20 @@ class NegotiationAgent(BaseAgent):
             failing the workflow we return a success with an explanatory
             message so downstream steps can decide how to proceed.
             """
+            logger.warning("NegotiationAgent missing input data; skipping negotiation")
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={
+                    "supplier": supplier,
+                    "counter_proposals": [],
+                    "strategy": None,
+                    "savings_score": 0.0,
+                    "decision_log": "no negotiation data provided",
+                    "message": "",
+                    "transcript": [],
+                    "references": [],
+                },
+                pass_fields={
                     "supplier": supplier,
                     "counter_proposals": [],
                     "strategy": None,
@@ -70,8 +82,10 @@ class NegotiationAgent(BaseAgent):
             f"Craft a concise professional counter-proposal aiming for {target_price}."
         )
 
+        logger.debug("NegotiationAgent prompt: %s", prompt)
         response = self.call_ollama(prompt=prompt)
         message = response.get("response", "").strip()
+        logger.info("NegotiationAgent generated message: %s", message)
 
         # Retrieve relevant references from Qdrant
         references: list[str] = []
@@ -99,20 +113,23 @@ class NegotiationAgent(BaseAgent):
 
         self._store_session(rfq_id, supplier, round_no, target_price)
 
+        data = {
+            "supplier": supplier,
+            "rfq_id": rfq_id,
+            "round": round_no,
+            "counter_proposals": counter_options,
+            "strategy": strategy,
+            "savings_score": savings_score,
+            "decision_log": decision_log,
+            "message": message,
+            "transcript": [message],
+            "references": references,
+        }
+        logger.debug("NegotiationAgent output: %s", data)
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={
-                "supplier": supplier,
-                "rfq_id": rfq_id,
-                "round": round_no,
-                "counter_proposals": counter_options,
-                "strategy": strategy,
-                "savings_score": savings_score,
-                "decision_log": decision_log,
-                "message": message,
-                "transcript": [message],
-                "references": references,
-            },
+            data=data,
+            pass_fields=data,
             next_agents=["EmailDraftingAgent"],
         )
 

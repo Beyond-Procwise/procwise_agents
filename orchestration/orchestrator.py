@@ -723,17 +723,24 @@ class Orchestrator:
     def _execute_quote_workflow(self, context: AgentContext) -> Dict:
         """Execute quote evaluation workflow"""
         # Execute quote evaluation
+        logger.info("Quote workflow starting with input %s", context.input_data)
         quote_result = self._execute_agent("quote_evaluation", context)
 
-        # Check if negotiation needed
-        if quote_result.data.get("negotiation_required"):
-            # Prepare negotiation
-            neg_context = self._create_child_context(
-                context, "negotiation", quote_result.pass_fields
-            )
-            # Would execute negotiation agent here
+        results: Dict[str, Any] = dict(quote_result.data)
 
-        return quote_result.data
+        neg_fields = quote_result.pass_fields or {}
+        required = {"supplier", "current_offer", "target_price", "rfq_id"}
+        if required.issubset(neg_fields.keys()):
+            neg_context = self._create_child_context(context, "negotiation", neg_fields)
+            neg_res = self._execute_agent("negotiation", neg_context)
+            results["negotiation"] = neg_res.data if neg_res else {}
+        else:
+            logger.info(
+                "NegotiationAgent skipped due to missing fields: %s",
+                neg_fields.keys(),
+            )
+
+        return results
 
     def _execute_opportunity_workflow(self, context: AgentContext) -> Dict:
         """Execute opportunity to RFQ workflow"""
@@ -749,10 +756,8 @@ class Orchestrator:
             results["ranking"] = rank_res.data if rank_res else {}
 
             email_input = {
-                "previous_agent_output": {
-                    "ranking": rank_res.data.get("ranking", []) if rank_res else [],
-                    "findings": opp_result.data.get("findings", []) if opp_result else [],
-                }
+                "ranking": rank_res.data.get("ranking", []) if rank_res else [],
+                "findings": opp_result.data.get("findings", []) if opp_result else [],
             }
             email_ctx = self._create_child_context(context, "email_drafting", email_input)
             email_res = self._execute_agent("email_drafting", email_ctx)
