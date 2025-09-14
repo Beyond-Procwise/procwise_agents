@@ -10,10 +10,15 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 from __future__ import annotations
 
 import logging
+import os
+
 import pandas as pd
+
 from .base_engine import BaseEngine
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
 class QueryEngine(BaseEngine):
@@ -21,49 +26,82 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-    def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
-        """
-        Return a DataFrame with up-to-date supplier metrics by joining/aggregating
-        proc.purchase_order_agent and proc.invoice_agent. Columns include:
-        supplier_id, supplier_name, total_spend, po_spend, invoice_spend,
-        invoice_count, on_time_pct, and any base supplier fields.
-        """
-        sql = """
-        WITH po AS (
-            SELECT supplier_id,
-                   SUM(COALESCE(unit_price_gbp, unit_price) * COALESCE(quantity, 1)) AS po_spend
-            FROM proc.purchase_order_agent
-            WHERE supplier_id IS NOT NULL
-            GROUP BY supplier_id
-        ), inv AS (
-            SELECT supplier_id,
-                   SUM(COALESCE(unit_price_gbp, unit_price) * COALESCE(quantity, 1)) AS invoice_spend,
-                   COUNT(DISTINCT invoice_id) AS invoice_count,
-                   AVG(CASE WHEN on_time = TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
-            FROM proc.invoice_agent
-            WHERE supplier_id IS NOT NULL
-            GROUP BY supplier_id
-        )
-        SELECT
-            s.supplier_id,
-            s.supplier_name,
-            COALESCE(po.po_spend, 0.0) AS po_spend,
-            COALESCE(inv.invoice_spend, 0.0) AS invoice_spend,
-            COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
-            COALESCE(inv.invoice_count, 0) AS invoice_count,
-            COALESCE(inv.on_time_pct, 0.0) AS on_time_pct,
-            -- include other supplier fields if present
-            s.*
-        FROM proc.supplier s
-        LEFT JOIN po ON s.supplier_id = po.supplier_id
-        LEFT JOIN inv ON s.supplier_id = inv.supplier_id
+    def _price_expression(self, conn, schema: str, table: str) -> str:
+        """Return SQL snippet for the unit price column in ``table``.
+
+        Databases in different environments expose price information under
+        various column names. This helper inspects ``information_schema`` and
+        returns a suitable expression. If no price-related column is found a
+        constant ``0.0`` is returned to avoid runtime SQL errors.
         """
         try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    """,
+                    (schema, table),
+                )
+                cols = [r[0] for r in cur.fetchall()]
+
+            price_cols = [c for c in cols if "price" in c]
+            if "unit_price_gbp" in price_cols and "unit_price" in price_cols:
+                return "COALESCE(unit_price_gbp, unit_price)"
+            if "unit_price_gbp" in price_cols:
+                return "unit_price_gbp"
+            if "unit_price" in price_cols:
+                return "unit_price"
+            if price_cols:
+                # Use the first price-like column as a last resort
+                return price_cols[0]
+
+            logger.warning("no price column found on %s.%s; defaulting to zero", schema, table)
+        except Exception:
+            logger.exception("price column detection failed")
+        return "0.0"
+
+    def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
+        """Return up-to-date supplier metrics."""
+        try:
             with self.agent_nick.get_db_connection() as conn:
+                po_price = self._price_expression(conn, "proc", "purchase_order_agent")
+                inv_price = self._price_expression(conn, "proc", "invoice_agent")
+
+                sql = f"""
+                WITH po AS (
+                    SELECT supplier_id,
+                           SUM({po_price} * COALESCE(quantity, 1)) AS po_spend
+                    FROM proc.purchase_order_agent
+                    WHERE supplier_id IS NOT NULL
+                    GROUP BY supplier_id
+                ), inv AS (
+                    SELECT supplier_id,
+                           SUM({inv_price} * COALESCE(quantity, 1)) AS invoice_spend,
+                           COUNT(DISTINCT invoice_id) AS invoice_count,
+                           AVG(CASE WHEN on_time = TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
+                    FROM proc.invoice_agent
+                    WHERE supplier_id IS NOT NULL
+                    GROUP BY supplier_id
+                )
+                SELECT
+                    s.supplier_id,
+                    s.supplier_name,
+                    COALESCE(po.po_spend, 0.0) AS po_spend,
+                    COALESCE(inv.invoice_spend, 0.0) AS invoice_spend,
+                    COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
+                    COALESCE(inv.invoice_count, 0) AS invoice_count,
+                    COALESCE(inv.on_time_pct, 0.0) AS on_time_pct,
+                    -- include other supplier fields if present
+                    s.*
+                FROM proc.supplier s
+                LEFT JOIN po ON s.supplier_id = po.supplier_id
+                LEFT JOIN inv ON s.supplier_id = inv.supplier_id
+                """
                 df = pd.read_sql(sql, conn)
-            # drop duplicate supplier columns produced by s.* if needed
+
             if "supplier_id" in df.columns:
-                # keep one supplier_id column and ensure consistent dtypes
                 df["supplier_id"] = df["supplier_id"].astype(str)
             return df
         except Exception:
