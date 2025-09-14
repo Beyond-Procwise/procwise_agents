@@ -126,6 +126,9 @@ class NegotiationAgent(BaseAgent):
             "references": references,
         }
         logger.debug("NegotiationAgent output: %s", data)
+        logger.info(
+            "NegotiationAgent produced %d counter proposals", len(counter_options)
+        )
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=data,

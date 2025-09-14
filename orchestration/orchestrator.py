@@ -770,6 +770,8 @@ class Orchestrator:
             email_ctx = self._create_child_context(context, "email_drafting", email_input)
             email_res = self._execute_agent("email_drafting", email_ctx)
             results["email_drafts"] = email_res.data if email_res else {}
+        else:
+            logger.info("SupplierRankingAgent skipped due to empty candidate list")
 
         return results
 
