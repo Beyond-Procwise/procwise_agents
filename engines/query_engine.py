@@ -62,28 +62,64 @@ class QueryEngine(BaseEngine):
             logger.exception("price column detection failed")
         return "0.0"
 
+    def _quantity_expression(self, conn, schema: str, table: str) -> str:
+        """Return SQL snippet for the quantity column in ``table``.
+
+        Similar to :meth:`_price_expression`, this helper inspects the
+        ``information_schema`` to locate a column representing quantity or
+        count of items.  If no such column exists a constant ``1`` is
+        returned so that spend calculations still succeed without raising
+        a ``DatabaseError``.
+        """
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    """,
+                    (schema, table),
+                )
+                cols = [r[0] for r in cur.fetchall()]
+
+            qty_cols = [c for c in cols if "qty" in c or "quantity" in c]
+            if qty_cols:
+                # Use the first match and coalesce to 1 in case of NULLs
+                return f"COALESCE({qty_cols[0]}, 1)"
+
+            logger.warning("no quantity column found on %s.%s; defaulting to 1", schema, table)
+        except Exception:
+            logger.exception("quantity column detection failed")
+        return "1"
+
     def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
         """Return up-to-date supplier metrics."""
         try:
             with self.agent_nick.get_db_connection() as conn:
-                po_price = self._price_expression(conn, "proc", "purchase_order_agent")
-                inv_price = self._price_expression(conn, "proc", "invoice_agent")
+                # Line item tables carry the price/quantity information we need
+                po_price = self._price_expression(conn, "proc", "po_line_items_agent")
+                inv_price = self._price_expression(conn, "proc", "invoice_line_items_agent")
+                po_qty = self._quantity_expression(conn, "proc", "po_line_items_agent")
+                inv_qty = self._quantity_expression(conn, "proc", "invoice_line_items_agent")
 
                 sql = f"""
                 WITH po AS (
-                    SELECT supplier_id,
-                           SUM({po_price} * COALESCE(quantity, 1)) AS po_spend
-                    FROM proc.purchase_order_agent
-                    WHERE supplier_id IS NOT NULL
-                    GROUP BY supplier_id
+                    SELECT p.supplier_id,
+                           SUM({po_price} * {po_qty}) AS po_spend
+                    FROM proc.po_line_items_agent li
+                    JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
+                    WHERE p.supplier_id IS NOT NULL
+                    GROUP BY p.supplier_id
                 ), inv AS (
-                    SELECT supplier_id,
-                           SUM({inv_price} * COALESCE(quantity, 1)) AS invoice_spend,
-                           COUNT(DISTINCT invoice_id) AS invoice_count,
-                           AVG(CASE WHEN on_time = TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
-                    FROM proc.invoice_agent
-                    WHERE supplier_id IS NOT NULL
-                    GROUP BY supplier_id
+                    SELECT i.supplier_id,
+                           SUM({inv_price} * {inv_qty}) AS invoice_spend,
+                           COUNT(DISTINCT i.invoice_id) AS invoice_count,
+                           AVG(CASE WHEN i.on_time = TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
+                    FROM proc.invoice_agent i
+                    LEFT JOIN proc.invoice_line_items_agent li ON i.invoice_id = li.invoice_id
+                    WHERE i.supplier_id IS NOT NULL
+                    GROUP BY i.supplier_id
                 )
                 SELECT
                     s.supplier_id,
