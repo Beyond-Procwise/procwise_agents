@@ -514,12 +514,17 @@ class DataExtractionAgent(BaseAgent):
         text = self._extract_text(file_bytes, object_key)
         doc_type = self._classify_doc_type(text)
         product_type = self._classify_product_type(text)
-        unique_id = self._extract_unique_id(text, doc_type) or self._infer_vendor_name(text, object_key)
+        unique_id = self._extract_unique_id(text, doc_type)
+        vendor_name = self._infer_vendor_name(text, object_key)
+        if not unique_id:
+            unique_id = uuid.uuid4().hex[:8]
 
         # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
 
         header: Dict[str, Any] = {"doc_type": doc_type, "product_type": product_type}
+        if vendor_name:
+            header["vendor_name"] = vendor_name
         line_items: List[Dict[str, Any]] = []
         pk_value = unique_id
         data: Optional[Dict[str, Any]] = None
@@ -1532,6 +1537,7 @@ class DataExtractionAgent(BaseAgent):
         if pk_col and pk_value:
             header.setdefault(pk_col, pk_value)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
+        pk_value = header.get(pk_col, pk_value) if pk_col else pk_value
 
         try:
             conn = self.agent_nick.get_db_connection()
@@ -1816,7 +1822,10 @@ class DataExtractionAgent(BaseAgent):
         if not pattern:
             return ""
         match = re.search(pattern, text, re.IGNORECASE)
-        return match.group(1).strip() if match else ""
+        if not match:
+            return ""
+        candidate = re.sub(r"[^A-Za-z0-9-]", "", match.group(1))
+        return candidate[:32]
 
     def _infer_vendor_name(self, text: str, object_key: str | None = None) -> str:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
