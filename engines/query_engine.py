@@ -119,8 +119,14 @@ class QueryEngine(BaseEngine):
                 inv_price = self._price_expression(conn, "proc", "invoice_line_items_agent")
                 po_qty = self._quantity_expression(conn, "proc", "po_line_items_agent")
                 inv_qty = self._quantity_expression(conn, "proc", "invoice_line_items_agent")
-                on_time = self._boolean_expression(conn, "proc", "invoice_agent", ["on_time", "on_time_delivery"])
-
+                on_time_col = self._boolean_expression(
+                    conn, "proc", "supplier", [""delivery_lead_time_days","on_time", "on_time_delivery"]
+                )
+                on_time_expr = (
+                    on_time_col
+                    if on_time_col == "NULL"
+                    else f"s.{on_time_col}"
+                )
 
                 sql = f"""
                 WITH po AS (
@@ -133,8 +139,7 @@ class QueryEngine(BaseEngine):
                 ), inv AS (
                     SELECT i.supplier_id,
                            SUM({inv_price} * {inv_qty}) AS invoice_spend,
-                           COUNT(DISTINCT i.invoice_id) AS invoice_count,
-                           AVG(CASE WHEN {on_time} IS TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
+                           COUNT(DISTINCT i.invoice_id) AS invoice_count
                     FROM proc.invoice_agent i
                     LEFT JOIN proc.invoice_line_items_agent li ON i.invoice_id = li.invoice_id
                     WHERE i.supplier_id IS NOT NULL
@@ -147,7 +152,7 @@ class QueryEngine(BaseEngine):
                     COALESCE(inv.invoice_spend, 0.0) AS invoice_spend,
                     COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
                     COALESCE(inv.invoice_count, 0) AS invoice_count,
-                    COALESCE(inv.on_time_pct, 0.0) AS on_time_pct,
+                    CASE WHEN {on_time_expr} IS TRUE THEN 1.0 ELSE 0.0 END AS on_time_pct,
                     -- include other supplier fields if present
                     s.*
                 FROM proc.supplier s
