@@ -1465,6 +1465,17 @@ class DataExtractionAgent(BaseAgent):
                 num = self._clean_numeric(value)
                 if num is None:
                     return None
+                # Handle precision/scale limits like numeric(5,2)
+                m = re.match(r"numeric\((\d+),(\d+)\)", sql_type)
+                if m:
+                    precision, scale = map(int, m.groups())
+                    limit = 10 ** (precision - scale)
+                    if abs(num) >= limit:
+                        logger.warning(
+                            "Numeric overflow for value %s with type %s", value, sql_type
+                        )
+                        return None
+                    num = round(num, scale)
                 if sql_type in {"integer", "smallint"}:
                     return int(num)
                 return float(num)
@@ -1509,14 +1520,26 @@ class DataExtractionAgent(BaseAgent):
 
     # ============================ PERSISTENCE =============================
     def _persist_to_postgres(self, header: Dict[str, str], line_items: List[Dict], doc_type: str, pk_value: str) -> None:
-        header, line_items = self._validate_and_cast(header, line_items, doc_type)
+        pk_map = {
+            "Invoice": "invoice_id",
+            "Purchase_Order": "po_id",
+            "Quote": "quote_id",
+            "Contract": "contract_id",
+        }
         if isinstance(pk_value, str):
             pk_value = self._clean_text(pk_value)
+        pk_col = pk_map.get(doc_type)
+        if pk_col and pk_value:
+            header.setdefault(pk_col, pk_value)
+        header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
         try:
             conn = self.agent_nick.get_db_connection()
             with conn:
-                self._persist_header_to_postgres(header, doc_type, conn)
+                # Persist the header first; if it fails we do not attempt line items
+                if not self._persist_header_to_postgres(header, doc_type, conn):
+                    conn.rollback()
+                    return
                 self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header, conn)
         except Exception as exc:
             logger.error("Failed to persist %s data: %s", doc_type, exc)
@@ -1545,7 +1568,7 @@ class DataExtractionAgent(BaseAgent):
             return False
         return False
 
-    def _persist_header_to_postgres(self, header: Dict[str, str], doc_type: str, conn=None) -> None:
+    def _persist_header_to_postgres(self, header: Dict[str, str], doc_type: str, conn=None) -> bool:
         table_map = {
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
@@ -1554,7 +1577,7 @@ class DataExtractionAgent(BaseAgent):
         }
         target = table_map.get(doc_type)
         if not target:
-            return
+            return False
         schema, table, pk_col = target
         close_conn = False
         if conn is None:
@@ -1591,7 +1614,7 @@ class DataExtractionAgent(BaseAgent):
                             continue
                     payload[k] = sanitized
                 if not payload:
-                    return
+                    return False
                 cols = ", ".join(payload.keys())
                 placeholders = ", ".join(["%s"] * len(payload))
                 update_cols = ", ".join(f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col)
@@ -1606,10 +1629,12 @@ class DataExtractionAgent(BaseAgent):
                 cur.execute(sql, list(payload.values()))
             if close_conn:
                 conn.commit()
+            return True
         except Exception as exc:
             logger.error("Failed to persist %s data: %s", doc_type, exc)
             if close_conn:
                 conn.rollback()
+            return False
         finally:
             if close_conn:
                 conn.close()
