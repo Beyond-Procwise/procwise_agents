@@ -7,16 +7,29 @@ import re
 import pandas as pd
 import ollama
 
+from utils.gpu import configure_gpu
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+
+configure_gpu()
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 logger = logging.getLogger(__name__)
 
 
 class SupplierRankingAgent(BaseAgent):
-    """
-    Ranks suppliers based on provided criteria and data from QueryEngine.
-    Expects `supplier_data` in context.input_data as list of dicts or DataFrame.
+    """Rank suppliers based on criteria and supplier data.
+
+    The agent can operate standalone when given appropriate prompts that
+    include supplier information.  However, in a full workflow it is typically
+    invoked *after* the Opportunity Miner so that the ranked supplier list
+    aligns with candidates identified for a particular opportunity.  Running it
+    earlier may yield rankings for suppliers unrelated to the downstream
+    opportunity context.
+
+    Expects ``supplier_data`` in ``context.input_data`` as a list of dicts or a
+    ``DataFrame``.  If ``supplier_data`` is omitted, the agent will attempt to
+    fetch it via the ``QueryEngine``.  By default, the top three suppliers are
+    returned.
     """
 
     def __init__(self, agent_nick):
