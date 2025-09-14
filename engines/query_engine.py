@@ -120,7 +120,7 @@ class QueryEngine(BaseEngine):
                 po_qty = self._quantity_expression(conn, "proc", "po_line_items_agent")
                 inv_qty = self._quantity_expression(conn, "proc", "invoice_line_items_agent")
                 on_time_col = self._boolean_expression(
-                    conn, "proc", "supplier", ["on_time", "on_time_delivery"]
+                    conn, "proc", "supplier", [""delivery_lead_time_days","on_time", "on_time_delivery"]
                 )
                 on_time_expr = (
                     on_time_col
