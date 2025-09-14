@@ -1069,18 +1069,22 @@ class DataExtractionAgent(BaseAgent):
         # Best-effort patterns
         pairs = [
             ("effective_date", r"\bEffective\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
-            ("expiry_date", r"\bExpiry|Expiration\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
+            # Match both "Expiry Date" and "Expiration Date" while capturing the date portion
+            ("expiry_date", r"(?:\bExpiry|Expiration)\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
             ("governing_law", r"\bGoverning\s+Law[:\s]+([A-Za-z ,&]{3,})"),
             ("jurisdiction", r"\bJurisdiction[:\s]+([A-Za-z ,&]{3,})"),
-            ("termination_clause", r"\bTermination\b.*"),
+            # Capture the entire termination clause text if present
+            ("termination_clause", r"(\bTermination\b.*)"),
         ]
         low = text
         for key, pat in pairs:
             if header.get(key):
                 continue
-            m = re.search(pat, low, re.I)
+            # Allow dot to span newlines and avoid IndexError when pattern lacks groups
+            m = re.search(pat, low, re.I | re.S)
             if m:
-                header[key] = m.group(1).strip()
+                group_idx = 1 if m.lastindex else 0
+                header[key] = m.group(group_idx).strip()
         return header
 
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -1545,7 +1549,6 @@ class DataExtractionAgent(BaseAgent):
                 # Persist the header first; if it fails we do not attempt line items
                 if not self._persist_header_to_postgres(header, doc_type, conn):
                     conn.rollback()
-
                     return
                 self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header, conn)
         except Exception as exc:
