@@ -78,6 +78,8 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     monkeypatch.setattr(engine, "_price_expression", fake_price)
     monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
     monkeypatch.setattr(engine, "_boolean_expression", fake_bool)
+    monkeypatch.setattr(engine, "_price_expression", fake_price)
+    monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
 
     monkeypatch.setattr(pd, "read_sql", lambda sql, conn: pd.DataFrame({"supplier_id": []}))
 
@@ -88,6 +90,7 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     assert ("price", "proc", "invoice_line_items_agent") in calls
     assert ("qty", "proc", "invoice_line_items_agent") in calls
     assert ("bool", "proc", "invoice_agent") in calls
+
 
 
 class DummyContext:

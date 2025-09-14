@@ -121,6 +121,7 @@ class QueryEngine(BaseEngine):
                 inv_qty = self._quantity_expression(conn, "proc", "invoice_line_items_agent")
                 on_time = self._boolean_expression(conn, "proc", "invoice_agent", ["on_time", "on_time_delivery"])
 
+
                 sql = f"""
                 WITH po AS (
                     SELECT p.supplier_id,
