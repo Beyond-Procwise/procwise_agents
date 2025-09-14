@@ -39,7 +39,6 @@ def test_quantity_expression_defaults_to_one_when_missing():
     assert engine._quantity_expression(conn, "schema", "table", "li") == "1"
 
 
-
 def test_quantity_expression_detects_quantity_column():
     engine = QueryEngine(agent_nick=types.SimpleNamespace())
     conn = DummyConn(["quantity", "other"])
@@ -49,24 +48,11 @@ def test_quantity_expression_detects_quantity_column():
     )
 
 
-
-def test_boolean_expression_detects_column():
-    engine = QueryEngine(agent_nick=types.SimpleNamespace())
-    conn = DummyConn(["on_time", "other"])
-    assert engine._boolean_expression(conn, "schema", "table", ["on_time"]) == "on_time"
-
-
-def test_boolean_expression_defaults_to_null():
-    engine = QueryEngine(agent_nick=types.SimpleNamespace())
-    conn = DummyConn(["other"])
-    assert engine._boolean_expression(conn, "schema", "table", ["on_time"]) == "NULL"
-
-
 def test_fetch_supplier_data_uses_line_items(monkeypatch):
     calls = []
-    engine = QueryEngine(agent_nick=types.SimpleNamespace(
-        get_db_connection=lambda: DummyContext()
-    ))
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
 
     def fake_price(conn, schema, table, alias):
         calls.append(("price", schema, table, alias))
@@ -76,14 +62,17 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
         calls.append(("qty", schema, table, alias))
         return "1"
 
-    def fake_bool(conn, schema, table, candidates):
-        calls.append(("bool", schema, table))
-        return "NULL"
+    def fake_cols(conn, schema, table):
+        if (schema, table) == ("proc", "supplier"):
+            calls.append(("cols", schema, table))
+        return []
 
     monkeypatch.setattr(engine, "_price_expression", fake_price)
     monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
-    monkeypatch.setattr(engine, "_boolean_expression", fake_bool)
-    monkeypatch.setattr(pd, "read_sql", lambda sql, conn: pd.DataFrame({"supplier_id": []}))
+    monkeypatch.setattr(engine, "_get_columns", fake_cols)
+    monkeypatch.setattr(
+        pd, "read_sql", lambda sql, conn: pd.DataFrame({"supplier_id": []})
+    )
 
     engine.fetch_supplier_data()
 
@@ -91,7 +80,59 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     assert ("qty", "proc", "po_line_items_agent", "li") in calls
     assert ("price", "proc", "invoice_line_items_agent", "ili") in calls
     assert ("qty", "proc", "invoice_line_items_agent", "ili") in calls
-    assert ("bool", "proc", "supplier") in calls
+    assert ("cols", "proc", "supplier") in calls
+
+
+def test_fetch_supplier_data_uses_delivery_lead_time(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    monkeypatch.setattr(engine, "_price_expression", lambda *a, **k: "0")
+    monkeypatch.setattr(engine, "_quantity_expression", lambda *a, **k: "1")
+    monkeypatch.setattr(
+        engine,
+        "_get_columns",
+        lambda conn, schema, table: [
+            "delivery_lead_time_days",
+            "trading_name",
+            "legal_structure",
+        ],
+    )
+    captured = {}
+
+    def fake_read_sql(sql, conn):
+        captured["sql"] = sql
+        return pd.DataFrame({"supplier_id": []})
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
+
+    engine.fetch_supplier_data()
+
+    assert "delivery_lead_time_days" in captured["sql"]
+    assert "on_time_pct" in captured["sql"]
+    # ensure additional supplier fields are projected explicitly
+    assert "s.trading_name" in captured["sql"]
+    assert "s.legal_structure" in captured["sql"]
+
+
+def test_fetch_supplier_data_defaults_on_time_pct(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    monkeypatch.setattr(engine, "_price_expression", lambda *a, **k: "0")
+    monkeypatch.setattr(engine, "_quantity_expression", lambda *a, **k: "1")
+    monkeypatch.setattr(engine, "_get_columns", lambda conn, schema, table: [])
+    captured = {}
+
+    def fake_read_sql(sql, conn):
+        captured["sql"] = sql
+        return pd.DataFrame({"supplier_id": []})
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
+
+    engine.fetch_supplier_data()
+
+    assert "0.0 AS on_time_pct" in captured["sql"]
 
 
 class DummyContext:
