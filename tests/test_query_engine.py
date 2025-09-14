@@ -39,6 +39,7 @@ def test_quantity_expression_defaults_to_one_when_missing():
     assert engine._quantity_expression(conn, "schema", "table", "li") == "1"
 
 
+
 def test_quantity_expression_detects_quantity_column():
     engine = QueryEngine(agent_nick=types.SimpleNamespace())
     conn = DummyConn(["quantity", "other"])
@@ -46,6 +47,7 @@ def test_quantity_expression_detects_quantity_column():
         engine._quantity_expression(conn, "schema", "table", "li")
         == "COALESCE(li.quantity, 1)"
     )
+
 
 
 def test_boolean_expression_detects_column():
@@ -81,7 +83,6 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     monkeypatch.setattr(engine, "_price_expression", fake_price)
     monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
     monkeypatch.setattr(engine, "_boolean_expression", fake_bool)
-
     monkeypatch.setattr(pd, "read_sql", lambda sql, conn: pd.DataFrame({"supplier_id": []}))
 
     engine.fetch_supplier_data()

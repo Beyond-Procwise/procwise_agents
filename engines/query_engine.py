@@ -80,7 +80,7 @@ class QueryEngine(BaseEngine):
             logger.exception("price column detection failed")
         return "0.0"
 
-    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
+=    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
         """Return SQL snippet for the quantity column in ``table``.
 
         ``alias`` is applied to discovered columns to avoid ambiguity when the
@@ -154,6 +154,7 @@ class QueryEngine(BaseEngine):
                            COUNT(DISTINCT i.invoice_id) AS invoice_count
                     FROM proc.invoice_agent i
                     LEFT JOIN proc.invoice_line_items_agent ili ON i.invoice_id = ili.invoice_id
+
                     WHERE i.supplier_id IS NOT NULL
                     GROUP BY i.supplier_id
                 )
