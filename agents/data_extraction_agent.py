@@ -1520,15 +1520,26 @@ class DataExtractionAgent(BaseAgent):
 
     # ============================ PERSISTENCE =============================
     def _persist_to_postgres(self, header: Dict[str, str], line_items: List[Dict], doc_type: str, pk_value: str) -> None:
-        header, line_items = self._validate_and_cast(header, line_items, doc_type)
+        pk_map = {
+            "Invoice": "invoice_id",
+            "Purchase_Order": "po_id",
+            "Quote": "quote_id",
+            "Contract": "contract_id",
+        }
         if isinstance(pk_value, str):
             pk_value = self._clean_text(pk_value)
+        pk_col = pk_map.get(doc_type)
+        if pk_col and pk_value:
+            header.setdefault(pk_col, pk_value)
+        header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
         try:
             conn = self.agent_nick.get_db_connection()
             with conn:
                 # Persist the header first; if it fails we do not attempt line items
                 if not self._persist_header_to_postgres(header, doc_type, conn):
+                    conn.rollback()
+
                     return
                 self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header, conn)
         except Exception as exc:
