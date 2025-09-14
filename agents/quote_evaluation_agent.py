@@ -33,7 +33,11 @@ class QuoteEvaluationAgent(BaseAgent):
                 )
                 best = quotes_sorted[0] if quotes_sorted else None
                 next_agents = ["approvals"] if best else []
-                logger.info("QuoteEvaluationAgent: retrieved %d quotes for rfq %s", len(quotes_sorted), rfq_id)
+                logger.info(
+                    "QuoteEvaluationAgent: retrieved %d quotes for rfq %s",
+                    len(quotes_sorted),
+                    rfq_id,
+                )
                 return AgentOutput(
                     status=AgentStatus.SUCCESS,
                     data={"quotes": quotes_sorted, "best_quote": best},
@@ -84,6 +88,9 @@ class QuoteEvaluationAgent(BaseAgent):
 
             output_data = self._to_native({"quotes": simplified, "weights": weights})
             logger.debug("QuoteEvaluationAgent output: %s", output_data)
+            logger.info(
+                "QuoteEvaluationAgent returning %d simplified quotes", len(simplified)
+            )
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data=output_data,

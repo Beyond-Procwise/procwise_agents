@@ -61,6 +61,10 @@ class OpportunityMinerAgent(BaseAgent):
     # ------------------------------------------------------------------
     def process(self, context: AgentContext) -> AgentOutput:
         try:
+            logger.info(
+                "OpportunityMinerAgent starting processing with input %s",
+                context.input_data,
+            )
             tables = self._ingest_data()
             tables = self._validate_data(tables)
             tables = self._normalise_currency(tables)
@@ -74,6 +78,7 @@ class OpportunityMinerAgent(BaseAgent):
             findings.extend(self._detect_demand_aggregation(tables))
             findings.extend(self._detect_logistics_cost_outliers(tables))
             findings.extend(self._detect_supplier_consolidation(tables))
+            findings.extend(self._detect_supplier_price_difference(tables))
 
             filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
             self._load_supplier_risk_map()
@@ -115,6 +120,7 @@ class OpportunityMinerAgent(BaseAgent):
                 len(supplier_candidates),
             )
             logger.debug("OpportunityMinerAgent findings: %s", data["findings"])
+            logger.info("OpportunityMinerAgent finishing processing")
 
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
@@ -720,12 +726,11 @@ class OpportunityMinerAgent(BaseAgent):
         cond = supplier_counts["supplier_count"] > 1
         for _, row in supplier_counts[cond].iterrows():
             cat = row.get(cat_col)
-            savings = row["supplier_count"] * 10.0  # placeholder
-            top_row = (
-                spend[spend[cat_col] == cat]
-                .sort_values(value_col, ascending=False)
-                .head(1)
-            )
+            cat_spend = spend[spend[cat_col] == cat]
+            total_spend = cat_spend[value_col].sum()
+            top_row = cat_spend.sort_values(value_col, ascending=False).head(1)
+            max_spend = top_row[value_col].iloc[0] if not top_row.empty else 0.0
+            savings = total_spend - max_spend
             supplier_id = top_row["supplier_id"].iloc[0] if not top_row.empty else None
             findings.append(
                 self._build_finding(
@@ -734,10 +739,40 @@ class OpportunityMinerAgent(BaseAgent):
                     cat,
                     None,
                     savings,
-                    {"supplier_count": row["supplier_count"]},
+                    {"supplier_count": row["supplier_count"], "total_spend": total_spend},
                     list(row.get("contract_ids", [])),
                 )
             )
+        return findings
+
+    def _detect_supplier_price_difference(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
+        findings: List[Finding] = []
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        unit_col = (
+            "unit_price_gbp" if "unit_price_gbp" in po_lines.columns else "unit_price"
+        )
+        required = {"item_id", "supplier_id", unit_col, "quantity"}
+        if po_lines.empty or not required.issubset(po_lines.columns):
+            return findings
+
+        for item_id, group in po_lines.groupby("item_id"):
+            min_price = group[unit_col].min()
+            for _, row in group.iterrows():
+                price = row[unit_col]
+                qty = row.get("quantity", 1)
+                if price > min_price:
+                    savings = (price - min_price) * qty
+                    findings.append(
+                        self._build_finding(
+                            "Supplier Price Difference",
+                            row.get("supplier_id"),
+                            None,
+                            item_id,
+                            savings,
+                            {"unit_price": price, "min_price": min_price},
+                            [row.get("po_id")],
+                        )
+                    )
         return findings
 
     def _load_supplier_risk_map(self) -> Dict[str, float]:
