@@ -80,7 +80,7 @@ class QueryEngine(BaseEngine):
             logger.exception("price column detection failed")
         return "0.0"
 
-=    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
+    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
         """Return SQL snippet for the quantity column in ``table``.
 
         ``alias`` is applied to discovered columns to avoid ambiguity when the
