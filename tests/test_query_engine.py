@@ -45,6 +45,18 @@ def test_quantity_expression_detects_quantity_column():
     assert engine._quantity_expression(conn, "schema", "table") == "COALESCE(quantity, 1)"
 
 
+def test_boolean_expression_detects_column():
+    engine = QueryEngine(agent_nick=types.SimpleNamespace())
+    conn = DummyConn(["on_time", "other"])
+    assert engine._boolean_expression(conn, "schema", "table", ["on_time"]) == "on_time"
+
+
+def test_boolean_expression_defaults_to_null():
+    engine = QueryEngine(agent_nick=types.SimpleNamespace())
+    conn = DummyConn(["other"])
+    assert engine._boolean_expression(conn, "schema", "table", ["on_time"]) == "NULL"
+
+
 def test_fetch_supplier_data_uses_line_items(monkeypatch):
     calls = []
     engine = QueryEngine(agent_nick=types.SimpleNamespace(
@@ -59,6 +71,13 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
         calls.append(("qty", schema, table))
         return "1"
 
+    def fake_bool(conn, schema, table, candidates):
+        calls.append(("bool", schema, table))
+        return "NULL"
+
+    monkeypatch.setattr(engine, "_price_expression", fake_price)
+    monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
+    monkeypatch.setattr(engine, "_boolean_expression", fake_bool)
     monkeypatch.setattr(engine, "_price_expression", fake_price)
     monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
 
@@ -70,6 +89,8 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     assert ("qty", "proc", "po_line_items_agent") in calls
     assert ("price", "proc", "invoice_line_items_agent") in calls
     assert ("qty", "proc", "invoice_line_items_agent") in calls
+    assert ("bool", "proc", "invoice_agent") in calls
+
 
 
 class DummyContext:
