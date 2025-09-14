@@ -82,8 +82,18 @@ class EmailDraftingAgent(BaseAgent):
             rfq_id = f"RFQ-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
             fmt_args = {
-                "supplier_contact_name": supplier_name or "Supplier",
-                "submission_deadline": data.get("submission_deadline", ""),
+                # Prefer explicit contact details from the ranking entry when
+                # available, falling back to the supplier name or a generic
+                # placeholder. This ensures each draft is personalised.
+                "supplier_contact_name": supplier.get("contact_name")
+                or supplier_name
+                or "Supplier",
+                "supplier_company": supplier_name or supplier_id or "",
+                "supplier_contact_email": supplier.get("contact_email", ""),
+                # Deadline can be provided under different keys; support both
+                # for flexibility.
+                "deadline": data.get("deadline")
+                or data.get("submission_deadline", ""),
                 "category_manager_name": data.get("category_manager_name", ""),
                 "category_manager_title": data.get("category_manager_title", ""),
                 "category_manager_email": data.get("category_manager_email", ""),
@@ -93,7 +103,16 @@ class EmailDraftingAgent(BaseAgent):
             }
             body_template = data.get("body") or self.TEXT_TEMPLATE
             template_args = {**data, **fmt_args}
-            body = Template(body_template).render(**template_args)
+            # Support both Jinja-style (``{{ var }}``) and Python ``str.format``
+            # placeholders in templates so that legacy prompt files continue to
+            # render correctly.
+            if "{{" in body_template or "{%" in body_template:
+                body = Template(body_template).render(**template_args)
+            else:
+                try:
+                    body = body_template.format(**template_args)
+                except KeyError:
+                    body = body_template
             body = f"<!-- RFQ-ID: {rfq_id} -->\n" + body
             subject = f"RFQ {rfq_id} – Request for Quotation"
 

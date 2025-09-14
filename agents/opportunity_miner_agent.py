@@ -508,15 +508,24 @@ class OpportunityMinerAgent(BaseAgent):
         po = tables.get("purchase_orders", pd.DataFrame())
         po_lines = tables.get("purchase_order_lines", pd.DataFrame())
         inv_lines = tables.get("invoice_lines", pd.DataFrame())
+
+        category_col = (
+            "category_id"
+            if "category_id" in po.columns
+            else ("spend_category" if "spend_category" in po.columns else None)
+        )
         required_po = {"po_id", "supplier_id"}
+        if category_col:
+            required_po.add(category_col)
+
         line_total_col = (
             "line_total_gbp" if "line_total_gbp" in po_lines.columns else "line_total"
         )
         line_amount_col = (
             "line_amount_gbp" if "line_amount_gbp" in inv_lines.columns else "line_amount"
         )
-        required_po_lines = {"po_id", line_total_col}
-        required_inv_lines = {"po_id", line_amount_col}
+        required_po_lines = {"po_id", "item_id", line_total_col}
+        required_inv_lines = {"po_id", "item_id", line_amount_col}
         if (
             po.empty
             or po_lines.empty
@@ -533,14 +542,25 @@ class OpportunityMinerAgent(BaseAgent):
             line_amount_col,
         )
 
+        # Aggregate totals at ``po_id`` + ``item_id`` granularity so that each
+        # finding can reference the affected item and supplier.  When purchase
+        # orders span multiple categories the ``category_id`` (or
+        # ``spend_category``) is derived from the parent PO record.
         po_sum = (
-            po_lines.groupby("po_id")[line_total_col].sum().reset_index(name="po_total")
+            po_lines.groupby(["po_id", "item_id"])[line_total_col]
+            .sum()
+            .reset_index(name="po_total")
         )
         inv_sum = (
-            inv_lines.groupby("po_id")[line_amount_col].sum().reset_index(name="inv_total")
+            inv_lines.groupby(["po_id", "item_id"])[line_amount_col]
+            .sum()
+            .reset_index(name="inv_total")
         )
-        merged = po_sum.merge(inv_sum, on="po_id", how="outer").fillna(0.0)
-        merged = merged.merge(po[list(required_po)], on="po_id", how="left")
+        merged = (
+            po_sum.merge(inv_sum, on=["po_id", "item_id"], how="outer")
+            .fillna(0.0)
+            .merge(po[list(required_po)], on="po_id", how="left")
+        )
         merged["amount_diff"] = merged["inv_total"] - merged["po_total"]
         cond = merged["amount_diff"] != 0
         for _, row in merged[cond].iterrows():
@@ -549,8 +569,8 @@ class OpportunityMinerAgent(BaseAgent):
                 self._build_finding(
                     "PO↔Invoice Discrepancy",
                     row.get("supplier_id"),
-                    None,
-                    None,
+                    row.get(category_col) if category_col else None,
+                    row.get("item_id"),
                     impact,
                     {
                         "amount_diff": row["amount_diff"],

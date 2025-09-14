@@ -463,7 +463,15 @@ class Orchestrator:
             timeout = step.get("timeout_seconds")
             on_error = step.get("on_error", "fail")
 
-            input_cfg = {**defaults.get("input", {}), **step.get("input", {})}
+            # Merge the global payload with any default or step-specific input
+            # so that agents receive the full context when an explicit ``input``
+            # section is omitted.  Step definitions override defaults, which in
+            # turn override the payload values.
+            input_cfg = {
+                **(payload or {}),
+                **defaults.get("input", {}),
+                **step.get("input", {}),
+            }
             rendered_input = _render(input_cfg)
 
             success = False

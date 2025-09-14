@@ -48,6 +48,35 @@ def test_json_flow_executes_steps_with_context_mapping():
     assert result["ctx"]["final"] == 2
 
 
+def test_json_flow_inherits_payload_when_input_missing():
+    class EchoAgent:
+        def __init__(self):
+            self.received = None
+
+        def execute(self, context):
+            self.received = context.input_data
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    agent = EchoAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"echo": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+
+    flow = {
+        "entrypoint": "step1",
+        "steps": {"step1": {"agent": "echo"}},
+    }
+
+    payload = {"foo": "bar"}
+    orchestrator.execute_agent_flow(flow, payload)
+    assert agent.received == payload
+
+
 class DummyAgent:
     def __init__(self):
         self.ran = False
