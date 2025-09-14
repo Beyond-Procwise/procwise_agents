@@ -26,7 +26,7 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-    def _price_expression(self, conn, schema: str, table: str) -> str:
+=    def _price_expression(self, conn, schema: str, table: str) -> str:
         """Return SQL snippet for the unit price column in ``table``.
 
         Databases in different environments expose price information under
