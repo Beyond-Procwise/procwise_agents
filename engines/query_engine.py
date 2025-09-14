@@ -10,15 +10,15 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 from __future__ import annotations
 
 import logging
-import os
-
 import pandas as pd
 
 from .base_engine import BaseEngine
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# Ensure GPU-related environment variables are set even for DB-heavy agents.
+configure_gpu()
 
 
 class QueryEngine(BaseEngine):
@@ -26,13 +26,13 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-=    def _price_expression(self, conn, schema: str, table: str) -> str:
-        """Return SQL snippet for the unit price column in ``table``.
+    def _get_columns(self, conn, schema: str, table: str) -> list[str]:
+        """Return list of column names for ``schema.table``.
 
-        Databases in different environments expose price information under
-        various column names. This helper inspects ``information_schema`` and
-        returns a suitable expression. If no price-related column is found a
-        constant ``0.0`` is returned to avoid runtime SQL errors.
+        Accessing ``information_schema`` can raise errors when databases are
+        unavailable or the caller lacks permissions.  In those situations an
+        empty list is returned so that callers can gracefully fall back to
+        safe defaults instead of propagating the failure to SQL execution.
         """
         try:
             with conn.cursor() as cur:
@@ -44,46 +44,118 @@ class QueryEngine(BaseEngine):
                     """,
                     (schema, table),
                 )
-                cols = [r[0] for r in cur.fetchall()]
+                return [r[0] for r in cur.fetchall()]
+        except Exception:
+            logger.exception("column introspection failed for %s.%s", schema, table)
+            return []
 
-            price_cols = [c for c in cols if "price" in c]
+    def _price_expression(self, conn, schema: str, table: str, alias: str) -> str:
+        """Return SQL snippet for the unit price column in ``table``.
+
+        ``alias`` is applied to any discovered column names so that the returned
+        expression can safely be embedded into queries that join multiple tables
+        which might expose similarly named fields, avoiding "ambiguous column"
+        errors in PostgreSQL.
+
+        Databases in different environments expose price information under
+        various column names. This helper inspects ``information_schema`` and
+        returns a suitable expression. If no price-related column is found a
+        constant ``0.0`` is returned to avoid runtime SQL errors.
+        """
+        cols = self._get_columns(conn, schema, table)
+        price_cols = [c for c in cols if "price" in c]
+        try:
             if "unit_price_gbp" in price_cols and "unit_price" in price_cols:
-                return "COALESCE(unit_price_gbp, unit_price)"
+                return f"COALESCE({alias}.unit_price_gbp, {alias}.unit_price)"
             if "unit_price_gbp" in price_cols:
-                return "unit_price_gbp"
+                return f"{alias}.unit_price_gbp"
             if "unit_price" in price_cols:
-                return "unit_price"
+                return f"{alias}.unit_price"
             if price_cols:
                 # Use the first price-like column as a last resort
-                return price_cols[0]
+                return f"{alias}.{price_cols[0]}"
 
             logger.warning("no price column found on %s.%s; defaulting to zero", schema, table)
         except Exception:
             logger.exception("price column detection failed")
         return "0.0"
 
+    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
+        """Return SQL snippet for the quantity column in ``table``.
+
+        ``alias`` is applied to discovered columns to avoid ambiguity when the
+        target table is joined with other tables exposing a column of the same
+        name. If no quantity column exists a constant ``1`` is returned so that
+        spend calculations still succeed without raising a ``DatabaseError``.
+        """
+        cols = self._get_columns(conn, schema, table)
+        try:
+            qty_cols = [c for c in cols if "qty" in c or "quantity" in c]
+            if qty_cols:
+                # Use the first match and coalesce to 1 in case of NULLs
+                return f"COALESCE({alias}.{qty_cols[0]}, 1)"
+
+            logger.warning("no quantity column found on %s.%s; defaulting to 1", schema, table)
+        except Exception:
+            logger.exception("quantity column detection failed")
+        return "1"
+
+    def _boolean_expression(self, conn, schema: str, table: str, candidates: list[str]) -> str:
+        """Return first matching boolean column or ``NULL`` if none found."""
+        cols = self._get_columns(conn, schema, table)
+        for cand in candidates:
+            if cand in cols:
+                return cand
+        logger.warning(
+            "no %s column found on %s.%s; defaulting to NULL",
+            "/".join(candidates),
+            schema,
+            table,
+        )
+        return "NULL"
+
     def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
         """Return up-to-date supplier metrics."""
         try:
             with self.agent_nick.get_db_connection() as conn:
-                po_price = self._price_expression(conn, "proc", "purchase_order_agent")
-                inv_price = self._price_expression(conn, "proc", "invoice_agent")
+                # Line item tables carry the price/quantity information we need
+                po_price = self._price_expression(
+                    conn, "proc", "po_line_items_agent", "li"
+                )
+                inv_price = self._price_expression(
+                    conn, "proc", "invoice_line_items_agent", "ili"
+                )
+                po_qty = self._quantity_expression(
+                    conn, "proc", "po_line_items_agent", "li"
+                )
+                inv_qty = self._quantity_expression(
+                    conn, "proc", "invoice_line_items_agent", "ili"
+                )
+                on_time_col = self._boolean_expression(
+                    conn, "proc", "supplier", ["on_time", "on_time_delivery"]
+                )
+                on_time_expr = (
+                    on_time_col
+                    if on_time_col == "NULL"
+                    else f"s.{on_time_col}"
+                )
 
                 sql = f"""
                 WITH po AS (
-                    SELECT supplier_id,
-                           SUM({po_price} * COALESCE(quantity, 1)) AS po_spend
-                    FROM proc.purchase_order_agent
-                    WHERE supplier_id IS NOT NULL
-                    GROUP BY supplier_id
+                    SELECT p.supplier_id,
+                           SUM({po_price} * {po_qty}) AS po_spend
+                    FROM proc.po_line_items_agent li
+                    JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
+                    WHERE p.supplier_id IS NOT NULL
+                    GROUP BY p.supplier_id
                 ), inv AS (
-                    SELECT supplier_id,
-                           SUM({inv_price} * COALESCE(quantity, 1)) AS invoice_spend,
-                           COUNT(DISTINCT invoice_id) AS invoice_count,
-                           AVG(CASE WHEN on_time = TRUE THEN 1.0 ELSE 0.0 END) AS on_time_pct
-                    FROM proc.invoice_agent
-                    WHERE supplier_id IS NOT NULL
-                    GROUP BY supplier_id
+                    SELECT i.supplier_id,
+                           SUM({inv_price} * {inv_qty}) AS invoice_spend,
+                           COUNT(DISTINCT i.invoice_id) AS invoice_count
+                    FROM proc.invoice_agent i
+                    LEFT JOIN proc.invoice_line_items_agent ili ON i.invoice_id = ili.invoice_id
+                    WHERE i.supplier_id IS NOT NULL
+                    GROUP BY i.supplier_id
                 )
                 SELECT
                     s.supplier_id,
@@ -92,7 +164,7 @@ class QueryEngine(BaseEngine):
                     COALESCE(inv.invoice_spend, 0.0) AS invoice_spend,
                     COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
                     COALESCE(inv.invoice_count, 0) AS invoice_count,
-                    COALESCE(inv.on_time_pct, 0.0) AS on_time_pct,
+                    CASE WHEN {on_time_expr} IS TRUE THEN 1.0 ELSE 0.0 END AS on_time_pct,
                     -- include other supplier fields if present
                     s.*
                 FROM proc.supplier s
@@ -104,9 +176,10 @@ class QueryEngine(BaseEngine):
             if "supplier_id" in df.columns:
                 df["supplier_id"] = df["supplier_id"].astype(str)
             return df
-        except Exception:
+        except Exception as exc:
+            # Surface the original exception so callers can handle it explicitly
             logger.exception("fetch_supplier_data failed")
-            return None
+            raise RuntimeError("fetch_supplier_data failed") from exc
 
     def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return invoice headers from ``proc.invoice_agent``."""
