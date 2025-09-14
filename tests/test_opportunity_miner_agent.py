@@ -59,6 +59,27 @@ def test_supplier_consolidation_sets_supplier_id(monkeypatch):
     assert sc and sc[0]["supplier_id"] is not None
 
 
+def test_po_invoice_discrepancy_includes_item_and_supplier(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
+
+    context = AgentContext(
+        workflow_id="wf3",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    findings = [f for f in output.data["findings"] if f["detector_type"] == "PO↔Invoice Discrepancy"]
+    assert findings and findings[0]["supplier_id"] is not None
+    assert findings[0]["item_id"] is not None
+
+
 def test_opportunity_miner_handles_missing_columns(monkeypatch):
     nick = DummyNick()
     agent = OpportunityMinerAgent(nick)
