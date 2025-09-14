@@ -26,37 +26,48 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-    def _has_column(self, conn, schema: str, table: str, column: str) -> bool:
-        """Return ``True`` if the given column exists on the table."""
+=    def _price_expression(self, conn, schema: str, table: str) -> str:
+        """Return SQL snippet for the unit price column in ``table``.
+
+        Databases in different environments expose price information under
+        various column names. This helper inspects ``information_schema`` and
+        returns a suitable expression. If no price-related column is found a
+        constant ``0.0`` is returned to avoid runtime SQL errors.
+        """
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT 1
+                    SELECT column_name
                     FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s AND column_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                     """,
-                    (schema, table, column),
+                    (schema, table),
                 )
-                return cur.fetchone() is not None
+                cols = [r[0] for r in cur.fetchall()]
+
+            price_cols = [c for c in cols if "price" in c]
+            if "unit_price_gbp" in price_cols and "unit_price" in price_cols:
+                return "COALESCE(unit_price_gbp, unit_price)"
+            if "unit_price_gbp" in price_cols:
+                return "unit_price_gbp"
+            if "unit_price" in price_cols:
+                return "unit_price"
+            if price_cols:
+                # Use the first price-like column as a last resort
+                return price_cols[0]
+
+            logger.warning("no price column found on %s.%s; defaulting to zero", schema, table)
         except Exception:
-            logger.exception("column existence check failed")
-            return False
+            logger.exception("price column detection failed")
+        return "0.0"
 
     def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
         """Return up-to-date supplier metrics."""
         try:
             with self.agent_nick.get_db_connection() as conn:
-                po_price = (
-                    "COALESCE(unit_price_gbp, unit_price)"
-                    if self._has_column(conn, "proc", "purchase_order_agent", "unit_price_gbp")
-                    else "unit_price"
-                )
-                inv_price = (
-                    "COALESCE(unit_price_gbp, unit_price)"
-                    if self._has_column(conn, "proc", "invoice_agent", "unit_price_gbp")
-                    else "unit_price"
-                )
+                po_price = self._price_expression(conn, "proc", "purchase_order_agent")
+                inv_price = self._price_expression(conn, "proc", "invoice_agent")
 
                 sql = f"""
                 WITH po AS (
