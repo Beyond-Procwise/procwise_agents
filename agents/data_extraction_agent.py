@@ -1539,6 +1539,7 @@ class DataExtractionAgent(BaseAgent):
                 # Persist the header first; if it fails we do not attempt line items
                 if not self._persist_header_to_postgres(header, doc_type, conn):
                     conn.rollback()
+
                     return
                 self._persist_line_items_to_postgres(pk_value, line_items, doc_type, header, conn)
         except Exception as exc:
