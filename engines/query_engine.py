@@ -10,15 +10,15 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 from __future__ import annotations
 
 import logging
-import os
-
 import pandas as pd
 
 from .base_engine import BaseEngine
+from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# Ensure GPU-related environment variables are set even for DB-heavy agents.
+configure_gpu()
 
 
 class QueryEngine(BaseEngine):
@@ -26,7 +26,7 @@ class QueryEngine(BaseEngine):
         super().__init__()
         self.agent_nick = agent_nick
 
-=    def _price_expression(self, conn, schema: str, table: str) -> str:
+    def _price_expression(self, conn, schema: str, table: str) -> str:
         """Return SQL snippet for the unit price column in ``table``.
 
         Databases in different environments expose price information under
@@ -104,9 +104,10 @@ class QueryEngine(BaseEngine):
             if "supplier_id" in df.columns:
                 df["supplier_id"] = df["supplier_id"].astype(str)
             return df
-        except Exception:
+        except Exception as exc:
+            # Surface the original exception so callers can handle it explicitly
             logger.exception("fetch_supplier_data failed")
-            return None
+            raise RuntimeError("fetch_supplier_data failed") from exc
 
     def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return invoice headers from ``proc.invoice_agent``."""
