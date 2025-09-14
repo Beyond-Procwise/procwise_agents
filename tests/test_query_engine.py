@@ -36,13 +36,18 @@ class DummyConn:
 def test_quantity_expression_defaults_to_one_when_missing():
     engine = QueryEngine(agent_nick=types.SimpleNamespace())
     conn = DummyConn(["supplier_id"])  # no quantity column
-    assert engine._quantity_expression(conn, "schema", "table") == "1"
+    assert engine._quantity_expression(conn, "schema", "table", "li") == "1"
+
 
 
 def test_quantity_expression_detects_quantity_column():
     engine = QueryEngine(agent_nick=types.SimpleNamespace())
     conn = DummyConn(["quantity", "other"])
-    assert engine._quantity_expression(conn, "schema", "table") == "COALESCE(quantity, 1)"
+    assert (
+        engine._quantity_expression(conn, "schema", "table", "li")
+        == "COALESCE(li.quantity, 1)"
+    )
+
 
 
 def test_boolean_expression_detects_column():
@@ -63,12 +68,12 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
         get_db_connection=lambda: DummyContext()
     ))
 
-    def fake_price(conn, schema, table):
-        calls.append(("price", schema, table))
+    def fake_price(conn, schema, table, alias):
+        calls.append(("price", schema, table, alias))
         return "0"
 
-    def fake_qty(conn, schema, table):
-        calls.append(("qty", schema, table))
+    def fake_qty(conn, schema, table, alias):
+        calls.append(("qty", schema, table, alias))
         return "1"
 
     def fake_bool(conn, schema, table, candidates):
@@ -78,18 +83,15 @@ def test_fetch_supplier_data_uses_line_items(monkeypatch):
     monkeypatch.setattr(engine, "_price_expression", fake_price)
     monkeypatch.setattr(engine, "_quantity_expression", fake_qty)
     monkeypatch.setattr(engine, "_boolean_expression", fake_bool)
-
-
     monkeypatch.setattr(pd, "read_sql", lambda sql, conn: pd.DataFrame({"supplier_id": []}))
 
     engine.fetch_supplier_data()
 
-    assert ("price", "proc", "po_line_items_agent") in calls
-    assert ("qty", "proc", "po_line_items_agent") in calls
-    assert ("price", "proc", "invoice_line_items_agent") in calls
-    assert ("qty", "proc", "invoice_line_items_agent") in calls
+    assert ("price", "proc", "po_line_items_agent", "li") in calls
+    assert ("qty", "proc", "po_line_items_agent", "li") in calls
+    assert ("price", "proc", "invoice_line_items_agent", "ili") in calls
+    assert ("qty", "proc", "invoice_line_items_agent", "ili") in calls
     assert ("bool", "proc", "supplier") in calls
-
 
 
 class DummyContext:

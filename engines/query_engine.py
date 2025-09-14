@@ -49,8 +49,13 @@ class QueryEngine(BaseEngine):
             logger.exception("column introspection failed for %s.%s", schema, table)
             return []
 
-    def _price_expression(self, conn, schema: str, table: str) -> str:
+    def _price_expression(self, conn, schema: str, table: str, alias: str) -> str:
         """Return SQL snippet for the unit price column in ``table``.
+
+        ``alias`` is applied to any discovered column names so that the returned
+        expression can safely be embedded into queries that join multiple tables
+        which might expose similarly named fields, avoiding "ambiguous column"
+        errors in PostgreSQL.
 
         Databases in different environments expose price information under
         various column names. This helper inspects ``information_schema`` and
@@ -61,35 +66,34 @@ class QueryEngine(BaseEngine):
         price_cols = [c for c in cols if "price" in c]
         try:
             if "unit_price_gbp" in price_cols and "unit_price" in price_cols:
-                return "COALESCE(unit_price_gbp, unit_price)"
+                return f"COALESCE({alias}.unit_price_gbp, {alias}.unit_price)"
             if "unit_price_gbp" in price_cols:
-                return "unit_price_gbp"
+                return f"{alias}.unit_price_gbp"
             if "unit_price" in price_cols:
-                return "unit_price"
+                return f"{alias}.unit_price"
             if price_cols:
                 # Use the first price-like column as a last resort
-                return price_cols[0]
+                return f"{alias}.{price_cols[0]}"
 
             logger.warning("no price column found on %s.%s; defaulting to zero", schema, table)
         except Exception:
             logger.exception("price column detection failed")
         return "0.0"
 
-    def _quantity_expression(self, conn, schema: str, table: str) -> str:
+=    def _quantity_expression(self, conn, schema: str, table: str, alias: str) -> str:
         """Return SQL snippet for the quantity column in ``table``.
 
-        Similar to :meth:`_price_expression`, this helper inspects the
-        ``information_schema`` to locate a column representing quantity or
-        count of items.  If no such column exists a constant ``1`` is
-        returned so that spend calculations still succeed without raising
-        a ``DatabaseError``.
+        ``alias`` is applied to discovered columns to avoid ambiguity when the
+        target table is joined with other tables exposing a column of the same
+        name. If no quantity column exists a constant ``1`` is returned so that
+        spend calculations still succeed without raising a ``DatabaseError``.
         """
         cols = self._get_columns(conn, schema, table)
         try:
             qty_cols = [c for c in cols if "qty" in c or "quantity" in c]
             if qty_cols:
                 # Use the first match and coalesce to 1 in case of NULLs
-                return f"COALESCE({qty_cols[0]}, 1)"
+                return f"COALESCE({alias}.{qty_cols[0]}, 1)"
 
             logger.warning("no quantity column found on %s.%s; defaulting to 1", schema, table)
         except Exception:
@@ -115,12 +119,20 @@ class QueryEngine(BaseEngine):
         try:
             with self.agent_nick.get_db_connection() as conn:
                 # Line item tables carry the price/quantity information we need
-                po_price = self._price_expression(conn, "proc", "po_line_items_agent")
-                inv_price = self._price_expression(conn, "proc", "invoice_line_items_agent")
-                po_qty = self._quantity_expression(conn, "proc", "po_line_items_agent")
-                inv_qty = self._quantity_expression(conn, "proc", "invoice_line_items_agent")
+                po_price = self._price_expression(
+                    conn, "proc", "po_line_items_agent", "li"
+                )
+                inv_price = self._price_expression(
+                    conn, "proc", "invoice_line_items_agent", "ili"
+                )
+                po_qty = self._quantity_expression(
+                    conn, "proc", "po_line_items_agent", "li"
+                )
+                inv_qty = self._quantity_expression(
+                    conn, "proc", "invoice_line_items_agent", "ili"
+                )
                 on_time_col = self._boolean_expression(
-                    conn, "proc", "supplier", ["delivery_lead_time_days","on_time", "on_time_delivery"]
+                    conn, "proc", "supplier", ["on_time", "on_time_delivery"]
                 )
                 on_time_expr = (
                     on_time_col
@@ -141,7 +153,8 @@ class QueryEngine(BaseEngine):
                            SUM({inv_price} * {inv_qty}) AS invoice_spend,
                            COUNT(DISTINCT i.invoice_id) AS invoice_count
                     FROM proc.invoice_agent i
-                    LEFT JOIN proc.invoice_line_items_agent li ON i.invoice_id = li.invoice_id
+                    LEFT JOIN proc.invoice_line_items_agent ili ON i.invoice_id = ili.invoice_id
+
                     WHERE i.supplier_id IS NOT NULL
                     GROUP BY i.supplier_id
                 )
