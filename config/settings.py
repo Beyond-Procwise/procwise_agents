@@ -3,7 +3,7 @@
 import os
 from pydantic_settings import BaseSettings
 from pydantic import Field
-from typing import List
+from typing import List, Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ENV_FILE_PATH = os.path.join(PROJECT_ROOT, '.env')
@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     )
     ses_smtp_port: int = Field(default=587, env="SES_SMTP_PORT")
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
+    ses_inbound_bucket: Optional[str] = Field(default=None, env="SES_INBOUND_BUCKET")
+    ses_inbound_prefix: str = Field(default="ses/inbound/", env="SES_INBOUND_PREFIX")
+    ses_region: Optional[str] = Field(default=None, env="SES_REGION")
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
