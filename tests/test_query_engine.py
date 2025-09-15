@@ -139,6 +139,107 @@ def test_fetch_supplier_data_defaults_on_time_pct(monkeypatch):
     assert "0.0 AS on_time_pct" in captured["sql"]
 
 
+def test_fetch_procurement_flow_builds_expected_query(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    captured = {}
+
+    def fake_read_sql(sql, conn):
+        captured["sql"] = sql
+        return pd.DataFrame()
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
+
+    engine.fetch_procurement_flow()
+
+    sql = captured["sql"]
+    for table in [
+        "proc.contracts",
+        "proc.supplier",
+        "proc.purchase_order_agent",
+        "proc.po_line_items_agent",
+        "proc.invoice_agent",
+        "proc.invoice_line_items_agent",
+        "proc.cat_product_mapping",
+    ]:
+        assert table in sql
+
+
+def test_fetch_procurement_flow_embeds_summary(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    sample_df = pd.DataFrame(
+        {
+            "supplier_id": [1],
+            "supplier_name": ["Acme"],
+            "po_id": [10],
+            "po_line_id": [100],
+            "item_description": ["Widget"],
+            "product": ["Widget"],
+            "category_level_1": ["Goods"],
+            "category_level_2": ["Hardware"],
+            "category_level_3": ["Components"],
+            "category_level_4": ["Widgets"],
+            "category_level_5": ["Widget Type"],
+            "invoice_id": [20],
+            "invoice_line_id": [200],
+        }
+    )
+    monkeypatch.setattr(pd, "read_sql", lambda sql, conn: sample_df)
+
+    called = {}
+
+    def fake_embed(df):
+        called["df"] = df
+
+    monkeypatch.setattr(engine, "_embed_procurement_summary", fake_embed)
+
+    engine.fetch_procurement_flow(embed=True)
+
+    assert called["df"].equals(sample_df)
+
+
+def test_train_procurement_context_embeds_schema(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+
+    # stub column discovery
+    monkeypatch.setattr(
+        engine,
+        "_get_columns",
+        lambda conn, schema, table: [f"{table}_c1", f"{table}_c2"],
+    )
+
+    captured = {}
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def upsert_texts(self, texts, metadata=None):
+            captured["texts"] = texts
+            captured["metadata"] = metadata
+
+    def fake_flow(self, embed=False):
+        captured["embed"] = embed
+        return pd.DataFrame()
+
+    monkeypatch.setattr(QueryEngine, "fetch_procurement_flow", fake_flow)
+
+    import services.rag_service as rag_module
+
+    monkeypatch.setattr(rag_module, "RAGService", DummyRAG)
+
+    engine.train_procurement_context()
+
+    assert "contracts_c1" in captured["texts"][0]
+    assert captured["metadata"]["record_id"] == "procurement_schema"
+    assert captured["embed"] is True
+
+
 class DummyContext:
     def __enter__(self):
         return None

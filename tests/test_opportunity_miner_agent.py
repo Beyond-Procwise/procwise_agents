@@ -122,3 +122,33 @@ def test_opportunity_miner_handles_none_payment_terms(monkeypatch):
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
+
+
+def test_opportunity_miner_trains_when_possible(monkeypatch):
+    class NickWithQE(DummyNick):
+        def __init__(self):
+            super().__init__()
+            self.trained = False
+
+            def train():
+                self.trained = True
+
+            self.query_engine = SimpleNamespace(train_procurement_context=train)
+
+    nick = NickWithQE()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    agent.run(context)
+
+    assert nick.trained is True

@@ -266,3 +266,160 @@ class QueryEngine(BaseEngine):
         sql = "SELECT * FROM proc.purchase_order_agent;"
         with self.agent_nick.get_db_connection() as conn:
             return pd.read_sql(sql, conn)
+
+    def fetch_procurement_flow(self, embed: bool = False) -> pd.DataFrame:
+        """Return enriched procurement data across multiple tables.
+
+        The query implements the following flow:
+
+        1. Retrieve ``supplier_id`` values from ``proc.contracts`` and join
+           them with ``proc.supplier`` to obtain ``supplier_name``.
+        2. Match the resulting ``supplier_name`` values against the
+           ``supplier_id`` column on ``proc.purchase_order_agent``.
+        3. For the matching purchase orders, collect line items and invoices
+           via ``po_id`` joins (``proc.po_line_items_agent`` and
+           ``proc.invoice_agent``).
+        4. Intelligently map purchase order line items to canonical product
+           and category information from ``proc.cat_product_mapping`` using a
+           fuzzy match between ``item_description`` and the mapping table's
+           ``product`` field. All category levels ``1``‑``5`` are returned.
+        5. Map invoices to ``proc.invoice_line_items_agent`` via ``invoice_id``.
+
+        When ``embed`` is ``True`` a human‑readable summary of the returned
+        rows is generated and upserted into the vector database so downstream
+        RAG agents can reason over the procurement flow.
+
+        Returns
+        -------
+        pandas.DataFrame
+            A table containing supplier, purchase order, line item, category
+            and invoice references for downstream agents.
+        """
+
+        sql = """
+            WITH contract_supplier AS (
+                SELECT c.supplier_id, s.supplier_name
+                FROM proc.contracts c
+                JOIN proc.supplier s ON c.supplier_id = s.supplier_id
+            ),
+            po AS (
+                SELECT p.po_id,
+                       cs.supplier_id,
+                       cs.supplier_name
+                FROM proc.purchase_order_agent p
+                JOIN contract_supplier cs ON p.supplier_id = cs.supplier_name
+            ),
+            po_items AS (
+                SELECT li.po_id,
+                       li.po_line_id,
+                       li.item_description,
+                       cpm.product,
+                       cpm.category_level_1,
+                       cpm.category_level_2,
+                       cpm.category_level_3,
+                       cpm.category_level_4,
+                       cpm.category_level_5
+                FROM proc.po_line_items_agent li
+                LEFT JOIN LATERAL (
+                    SELECT product,
+                           category_level_1,
+                           category_level_2,
+                           category_level_3,
+                           category_level_4,
+                           category_level_5
+                    FROM proc.cat_product_mapping cpm
+                    ORDER BY similarity(li.item_description, cpm.product) DESC
+                    LIMIT 1
+                ) cpm ON TRUE
+            ),
+            inv AS (
+                SELECT ia.invoice_id, ia.po_id
+                FROM proc.invoice_agent ia
+            )
+            SELECT
+                po.supplier_id,
+                po.supplier_name,
+                po.po_id,
+                pli.po_line_id,
+                pli.item_description,
+                pli.product,
+                pli.category_level_1,
+                pli.category_level_2,
+                pli.category_level_3,
+                pli.category_level_4,
+                pli.category_level_5,
+                inv.invoice_id,
+                ili.invoice_line_id
+            FROM po
+            LEFT JOIN po_items pli ON po.po_id = pli.po_id
+            LEFT JOIN inv ON po.po_id = inv.po_id
+            LEFT JOIN proc.invoice_line_items_agent ili
+                ON inv.invoice_id = ili.invoice_id
+        """
+
+        with self.agent_nick.get_db_connection() as conn:
+            df = pd.read_sql(sql, conn)
+
+        if embed and not df.empty:
+            self._embed_procurement_summary(df)
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Procurement summarisation helpers
+    # ------------------------------------------------------------------
+    def _embed_procurement_summary(self, df: pd.DataFrame) -> None:
+        """Create a textual summary of ``df`` and upsert it via ``RAGService``."""
+        from services.rag_service import RAGService
+
+        summaries = []
+        for row in df.itertuples(index=False):
+            categories = " > ".join(
+                [
+                    getattr(row, f"category_level_{i}")
+                    for i in range(1, 6)
+                    if getattr(row, f"category_level_{i}")
+                ]
+            )
+            summaries.append(
+                f"Supplier {row.supplier_name} (ID {row.supplier_id}) has purchase order "
+                f"{row.po_id} item '{row.item_description}' mapped to product {row.product} "
+                f"under categories {categories} with invoice {row.invoice_id} "
+                f"line {row.invoice_line_id}."
+            )
+
+        rag = RAGService(self.agent_nick)
+        rag.upsert_texts(summaries, metadata={"record_id": "procurement_flow"})
+
+    # ------------------------------------------------------------------
+    # Agent training helpers
+    # ------------------------------------------------------------------
+    def train_procurement_context(self) -> pd.DataFrame:
+        """Embed contract/supplier schemas and procurement flow for agent training.
+
+        The returned DataFrame mirrors :meth:`fetch_procurement_flow` so
+        callers can optionally reuse the joined data in their own logic.
+        """
+
+        from services.rag_service import RAGService
+
+        with self.agent_nick.get_db_connection() as conn:
+            contract_cols = self._get_columns(conn, "proc", "contracts")
+            supplier_cols = self._get_columns(conn, "proc", "supplier")
+
+        texts = []
+        if contract_cols:
+            texts.append(
+                "Contracts table columns: " + ", ".join(contract_cols)
+            )
+        if supplier_cols:
+            texts.append(
+                "Supplier table columns: " + ", ".join(supplier_cols)
+            )
+
+        if texts:
+            rag = RAGService(self.agent_nick)
+            rag.upsert_texts(texts, metadata={"record_id": "procurement_schema"})
+
+        # Reuse procurement flow embedding for richer training data
+        return self.fetch_procurement_flow(embed=True)
