@@ -61,7 +61,7 @@ class RAGService:
             record_id = metadata.get("record_id", str(uuid.uuid4()))
             for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
                 payload = {"content": chunk, "chunk_id": idx, **metadata}
-                point_id = f"{record_id}_{idx}"
+                point_id = self._build_point_id(record_id, idx)
                 vec = np.array(vector, dtype="float32")
                 points.append(
                     models.PointStruct(id=point_id, vector=vec.tolist(), payload=payload)
@@ -87,6 +87,22 @@ class RAGService:
                 points=points,
                 wait=True,
             )
+
+    def _build_point_id(self, record_id: str, chunk_idx: int) -> str:
+        """Create a Qdrant-compatible point ID for the given record chunk."""
+
+        namespace_uuid = self._normalise_uuid(record_id)
+        chunk_uuid = uuid.uuid5(namespace_uuid, str(chunk_idx))
+        return str(chunk_uuid)
+
+    @staticmethod
+    def _normalise_uuid(value: str) -> uuid.UUID:
+        """Return a UUID, deriving one deterministically when needed."""
+
+        try:
+            return uuid.UUID(str(value))
+        except (ValueError, AttributeError, TypeError):
+            return uuid.uuid5(uuid.NAMESPACE_URL, str(value))
 
     # ------------------------------------------------------------------
     # Retrieval helpers

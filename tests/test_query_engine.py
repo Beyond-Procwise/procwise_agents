@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from engines.query_engine import QueryEngine
+from engines.query_engine import PROCUREMENT_CATEGORY_FIELDS, QueryEngine
 
 
 class DummyCursor:
@@ -143,17 +143,44 @@ def test_fetch_procurement_flow_builds_expected_query(monkeypatch):
     engine = QueryEngine(
         agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
     )
-    captured = {}
+    queries = []
+
+    base_df = pd.DataFrame(
+        {
+            "supplier_id": [1],
+            "supplier_name": ["Acme"],
+            "po_id": [10],
+            "po_line_id": [100],
+            "item_description": ["Widget"],
+            "invoice_id": [20],
+            "invoice_line_id": [200],
+        }
+    )
+    category_df = pd.DataFrame(
+        {
+            "product": ["Widget"],
+            "category_level_1": ["Goods"],
+            "category_level_2": ["Hardware"],
+            "category_level_3": ["Components"],
+            "category_level_4": ["Widgets"],
+            "category_level_5": ["Widget Type"],
+        }
+    )
 
     def fake_read_sql(sql, conn):
-        captured["sql"] = sql
-        return pd.DataFrame()
+        queries.append(sql)
+        if "proc.cat_product_mapping" in sql:
+            return category_df
+        return base_df
 
     monkeypatch.setattr(pd, "read_sql", fake_read_sql)
 
-    engine.fetch_procurement_flow()
+    df = engine.fetch_procurement_flow()
 
-    sql = captured["sql"]
+    assert queries, "No SQL queries captured"
+    assert any("proc.cat_product_mapping" in q for q in queries)
+
+    main_query = next(q for q in queries if "proc.cat_product_mapping" not in q)
     for table in [
         "proc.contracts",
         "proc.supplier",
@@ -161,33 +188,45 @@ def test_fetch_procurement_flow_builds_expected_query(monkeypatch):
         "proc.po_line_items_agent",
         "proc.invoice_agent",
         "proc.invoice_line_items_agent",
-        "proc.cat_product_mapping",
     ]:
-        assert table in sql
+        assert table in main_query
+
+    assert not df.empty
+    assert df.loc[0, "product"] == "Widget"
 
 
 def test_fetch_procurement_flow_embeds_summary(monkeypatch):
     engine = QueryEngine(
         agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
     )
-    sample_df = pd.DataFrame(
+    base_df = pd.DataFrame(
         {
             "supplier_id": [1],
             "supplier_name": ["Acme"],
             "po_id": [10],
             "po_line_id": [100],
             "item_description": ["Widget"],
+            "invoice_id": [20],
+            "invoice_line_id": [200],
+        }
+    )
+    category_df = pd.DataFrame(
+        {
             "product": ["Widget"],
             "category_level_1": ["Goods"],
             "category_level_2": ["Hardware"],
             "category_level_3": ["Components"],
             "category_level_4": ["Widgets"],
             "category_level_5": ["Widget Type"],
-            "invoice_id": [20],
-            "invoice_line_id": [200],
         }
     )
-    monkeypatch.setattr(pd, "read_sql", lambda sql, conn: sample_df)
+
+    def fake_read_sql(sql, conn):
+        if "proc.cat_product_mapping" in sql:
+            return category_df
+        return base_df
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
 
     called = {}
 
@@ -198,7 +237,46 @@ def test_fetch_procurement_flow_embeds_summary(monkeypatch):
 
     engine.fetch_procurement_flow(embed=True)
 
-    assert called["df"].equals(sample_df)
+    expected_df = base_df.copy()
+    for field in PROCUREMENT_CATEGORY_FIELDS:
+        expected_df[field] = category_df.loc[0, field]
+
+    pd.testing.assert_frame_equal(
+        called["df"].reset_index(drop=True),
+        expected_df.reset_index(drop=True),
+        check_like=True,
+    )
+
+
+def test_fetch_procurement_flow_handles_missing_category_mapping(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+
+    base_df = pd.DataFrame(
+        {
+            "supplier_id": [1],
+            "supplier_name": ["Acme"],
+            "po_id": [10],
+            "po_line_id": [100],
+            "item_description": ["Widget"],
+            "invoice_id": [20],
+            "invoice_line_id": [200],
+        }
+    )
+    empty_category_df = pd.DataFrame(columns=PROCUREMENT_CATEGORY_FIELDS)
+
+    def fake_read_sql(sql, conn):
+        if "proc.cat_product_mapping" in sql:
+            return empty_category_df
+        return base_df
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
+
+    df = engine.fetch_procurement_flow()
+
+    for field in PROCUREMENT_CATEGORY_FIELDS:
+        assert df[field].isna().all()
 
 
 def test_train_procurement_context_embeds_schema(monkeypatch):
