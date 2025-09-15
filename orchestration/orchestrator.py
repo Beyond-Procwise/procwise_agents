@@ -109,11 +109,13 @@ class Orchestrator:
 
         try:
             # Create initial context
+            enriched_input: Dict[str, Any] = {**(input_data or {})}
+            enriched_input.setdefault("workflow", workflow_name)
             context = AgentContext(
                 workflow_id=workflow_id,
                 agent_id=workflow_name,
                 user_id=user_id or self.settings.script_user,
-                input_data=input_data,
+                input_data=enriched_input,
             )
 
             # Validate against policies
