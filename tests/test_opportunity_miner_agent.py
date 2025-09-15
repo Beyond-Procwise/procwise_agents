@@ -1,7 +1,9 @@
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any, Dict, Optional
 
+import pandas as pd
 import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -17,138 +19,380 @@ class DummyNick:
         self.settings = SimpleNamespace(script_user="tester")
 
 
-def test_opportunity_miner_returns_findings(monkeypatch):
+def _sample_tables() -> Dict[str, Any]:
+    purchase_orders = pd.DataFrame(
+        [
+            {
+                "po_id": "PO000001",
+                "supplier_id": "SI0001",
+                "currency": "GBP",
+                "total_amount": 100.0,
+                "payment_terms": "15",
+                "contract_id": "CO000001",
+            },
+            {
+                "po_id": "PO000002",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "total_amount": 80.0,
+                "payment_terms": "30",
+                "contract_id": "CO000002",
+            },
+            {
+                "po_id": "PO000003",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "total_amount": 150.0,
+                "payment_terms": "45",
+                "contract_id": None,
+            },
+        ]
+    )
+
+    invoices = pd.DataFrame(
+        [
+            {
+                "invoice_id": "IN000001",
+                "po_id": "PO000001",
+                "supplier_id": "SI0001",
+                "currency": "GBP",
+                "invoice_amount": 110.0,
+                "invoice_total_incl_tax": 110.0,
+                "payment_terms": "15",
+            },
+            {
+                "invoice_id": "IN000002",
+                "po_id": "PO000002",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "invoice_amount": 96.0,
+                "invoice_total_incl_tax": 96.0,
+                "payment_terms": "30",
+            },
+        ]
+    )
+
+    purchase_order_lines = pd.DataFrame(
+        [
+            {
+                "po_line_id": "POL000001",
+                "po_id": "PO000001",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 10,
+                "unit_price": 10.0,
+                "line_amount": 100.0,
+                "total_amount_incl_tax": 100.0,
+                "currency": "GBP",
+            },
+            {
+                "po_line_id": "POL000002",
+                "po_id": "PO000002",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 5,
+                "unit_price": 12.0,
+                "line_amount": 60.0,
+                "total_amount_incl_tax": 60.0,
+                "currency": "GBP",
+            },
+            {
+                "po_line_id": "POL000003",
+                "po_id": "PO000003",
+                "item_id": "ITM-002",
+                "item_description": "Adhoc Consulting",
+                "quantity": 3,
+                "unit_price": 50.0,
+                "line_amount": 150.0,
+                "total_amount_incl_tax": 150.0,
+                "currency": "GBP",
+            },
+        ]
+    )
+
+    invoice_lines = pd.DataFrame(
+        [
+            {
+                "invoice_line_id": "INL000001",
+                "invoice_id": "IN000001",
+                "po_id": "PO000001",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 10,
+                "unit_price": 11.0,
+                "line_amount": 110.0,
+                "total_amount_incl_tax": 110.0,
+                "currency": "GBP",
+            },
+            {
+                "invoice_line_id": "INL000002",
+                "invoice_id": "IN000002",
+                "po_id": "PO000002",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 5,
+                "unit_price": 13.0,
+                "line_amount": 65.0,
+                "total_amount_incl_tax": 65.0,
+                "currency": "GBP",
+            },
+        ]
+    )
+
+    contracts = pd.DataFrame(
+        [
+            {
+                "contract_id": "CO000001",
+                "contract_title": "Contract 1",
+                "contract_type": "Services",
+                "supplier_id": "SI0001",
+                "buyer_org_id": "BUY1",
+                "contract_start_date": pd.Timestamp("2024-01-01"),
+                "contract_end_date": pd.Timestamp("2024-09-30"),
+                "currency": "GBP",
+                "total_contract_value": 100.0,
+                "spend_category": "CatA",
+                "payment_terms": "15",
+            },
+            {
+                "contract_id": "CO000002",
+                "contract_title": "Contract 2",
+                "contract_type": "Goods",
+                "supplier_id": "SI0002",
+                "buyer_org_id": "BUY1",
+                "contract_start_date": pd.Timestamp("2024-01-01"),
+                "contract_end_date": pd.Timestamp("2024-12-31"),
+                "currency": "GBP",
+                "total_contract_value": 300.0,
+                "spend_category": "CatA",
+                "payment_terms": "30",
+            },
+        ]
+    )
+
+    indices = pd.DataFrame(
+        [
+            {
+                "index_name": "FX_GBP",
+                "value": 1.0,
+                "effective_date": "2024-01-01",
+                "currency": "GBP",
+            }
+        ]
+    )
+
+    shipments = pd.DataFrame(
+        [
+            {
+                "shipment_id": "SH1",
+                "po_id": "PO1",
+                "logistics_cost": 5.0,
+                "currency": "GBP",
+                "delivery_date": "2024-01-10",
+            }
+        ]
+    )
+
+    supplier_master = pd.DataFrame(
+        [
+            {
+                "supplier_id": "SI0001",
+                "supplier_name": "Supplier One",
+                "risk_score": 0.8,
+            },
+            {
+                "supplier_id": "SI0002",
+                "supplier_name": "Supplier Two",
+                "risk_score": 0.2,
+            },
+            {
+                "supplier_id": "SI0003",
+                "supplier_name": "Supplier Three",
+                "risk_score": 0.65,
+            },
+        ]
+    )
+
+    return {
+        "purchase_orders": purchase_orders,
+        "purchase_order_lines": purchase_order_lines,
+        "invoices": invoices,
+        "invoice_lines": invoice_lines,
+        "contracts": contracts,
+        "indices": indices,
+        "shipments": shipments,
+        "supplier_master": supplier_master,
+    }
+
+
+def create_agent(monkeypatch, tables: Optional[Dict[str, Any]] = None):
     nick = DummyNick()
     agent = OpportunityMinerAgent(nick, min_financial_impact=0)
-
-    # Avoid file system writes during tests
     monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
     monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
+    data = tables if tables is not None else _sample_tables()
+    monkeypatch.setattr(
+        agent,
+        "_ingest_data",
+        lambda: {name: df.copy() for name, df in data.items()},
+    )
+    return agent
 
-    context = AgentContext(
-        workflow_id="wf1",
+
+def build_context(workflow: str, conditions: Optional[Dict[str, Any]]) -> AgentContext:
+    return AgentContext(
+        workflow_id="wf-test",
         agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+        user_id="tester",
+        input_data={"workflow": workflow, "conditions": conditions or {}},
+    )
+
+
+def test_missing_workflow_blocks_detection(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = AgentContext(
+        workflow_id="wf-missing",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={"conditions": {}},
     )
 
     output = agent.run(context)
+
+    assert output.status == AgentStatus.FAILED
+    assert output.data["blocked_reason"]
+    assert output.data["policy_events"]
+
+
+def test_price_variance_detection_generates_finding(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["opportunity_count"] >= 0
-    assert isinstance(output.data["findings"], list)
+    pb = [f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"]
+    assert pb
+    assert pb[0]["supplier_name"] == "Supplier One"
+    assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
-def test_supplier_consolidation_sets_supplier_id(monkeypatch):
-    nick = DummyNick()
-    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
-
-    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
-    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
-
-    context = AgentContext(
-        workflow_id="wf2",
-        agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "volume_consolidation_check", {"minimum_volume_gbp": 50}
     )
 
     output = agent.run(context)
-    sc = [f for f in output.data["findings"] if f["detector_type"] == "Supplier Consolidation"]
-    assert sc and sc[0]["supplier_id"] is not None
+
+    vc = [f for f in output.data["findings"] if f["detector_type"] == "Volume Consolidation"]
+    assert vc
+    assert all(f["supplier_id"] for f in vc)
 
 
-def test_po_invoice_discrepancy_includes_item_and_supplier(monkeypatch):
-    nick = DummyNick()
-    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
-
-    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
-    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
-
-    context = AgentContext(
-        workflow_id="wf3",
-        agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+def test_supplier_risk_alert_threshold(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "supplier_risk_check",
+        {"risk_threshold": 0.5, "risk_weight": 1000},
     )
 
     output = agent.run(context)
-    findings = [f for f in output.data["findings"] if f["detector_type"] == "PO↔Invoice Discrepancy"]
-    assert findings and findings[0]["supplier_id"] is not None
-    assert findings[0]["item_id"] is not None
+
+    alerts = [f for f in output.data["findings"] if f["detector_type"] == "Supplier Risk Alert"]
+    assert alerts
+    assert alerts[0]["supplier_id"] == "SI0001"
+    assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
-def test_opportunity_miner_handles_missing_columns(monkeypatch):
-    nick = DummyNick()
-    agent = OpportunityMinerAgent(nick)
-
-    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
-    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-
-    mock_tables = agent._mock_data()
-    mock_tables["purchase_orders"] = mock_tables["purchase_orders"][["po_id", "supplier_id", "currency"]]
-    monkeypatch.setattr(agent, "_ingest_data", lambda: mock_tables)
-
-    context = AgentContext(
-        workflow_id="wf1",
-        agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+def test_maverick_spend_detection_flags_po(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "maverick_spend_check", {"minimum_value_gbp": 120}
     )
 
     output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
+
+    findings = [
+        f for f in output.data["findings"] if f["detector_type"] == "Maverick Spend Detection"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0002"
 
 
-def test_opportunity_miner_handles_none_payment_terms(monkeypatch):
-    nick = DummyNick()
-    agent = OpportunityMinerAgent(nick)
-
-    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
-    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-
-    mock_tables = agent._mock_data()
-    mock_tables["invoices"].loc[0, "payment_terms"] = None
-    monkeypatch.setattr(agent, "_ingest_data", lambda: mock_tables)
-
-    context = AgentContext(
-        workflow_id="wf1",
-        agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+def test_category_overspend_detection(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "category_overspend_check", {"category_budgets": {"CatA": 90}}
     )
 
     output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
+
+    overspend = [
+        f for f in output.data["findings"] if f["detector_type"] == "Category Overspend"
+    ]
+    assert overspend
+    assert overspend[0]["supplier_id"] == "SI0001"
 
 
-def test_opportunity_miner_trains_when_possible(monkeypatch):
-    class NickWithQE(DummyNick):
-        def __init__(self):
-            super().__init__()
-            self.trained = False
-
-            def train():
-                self.trained = True
-
-            self.query_engine = SimpleNamespace(train_procurement_context=train)
-
-    nick = NickWithQE()
-    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
-
-    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
-    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    monkeypatch.setattr(agent, "_ingest_data", agent._mock_data)
-
-    context = AgentContext(
-        workflow_id="wf1",
-        agent_id="opportunity_miner",
-        user_id="u1",
-        input_data={},
+def test_unused_contract_value_detection(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "unused_contract_value_check", {"minimum_unused_value_gbp": 50}
     )
 
-    agent.run(context)
+    output = agent.run(context)
 
-    assert nick.trained is True
+    unused = [
+        f for f in output.data["findings"] if f["detector_type"] == "Unused Contract Value"
+    ]
+    assert unused
+    assert unused[0]["supplier_id"] == "SI0002"
+    assert unused[0]["supplier_name"] == "Supplier Two"
+
+
+def test_esg_opportunity_creates_event(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "esg_opportunity_check",
+        {
+            "esg_scores": [{"supplier_id": "SI0003", "score": 0.9}],
+            "incumbent_score": 0.6,
+            "esg_threshold": 0.8,
+            "estimated_switch_savings_gbp": 2000,
+            "category_id": "CatA",
+        },
+    )
+
+    output = agent.run(context)
+
+    esg = [f for f in output.data["findings"] if f["detector_type"] == "ESG Opportunity"]
+    assert esg
+    assert esg[0]["supplier_id"] == "SI0003"
+    assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
+
+
+def test_inflation_passthrough_detection(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "inflation_passthrough_check",
+        {"market_inflation_pct": 0.02, "tolerance_pct": 0.0},
+    )
+
+    output = agent.run(context)
+
+    inflation = [
+        f for f in output.data["findings"] if f["detector_type"] == "Inflation Pass-Through"
+    ]
+    assert inflation
+    assert inflation[0]["supplier_id"] == "SI0001"
