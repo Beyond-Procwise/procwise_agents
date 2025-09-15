@@ -80,6 +80,59 @@ def test_po_invoice_discrepancy_includes_item_and_supplier(monkeypatch):
     assert findings[0]["item_id"] is not None
 
 
+def test_contract_supplier_enrichment_includes_supplier_name(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    tables = agent._mock_data()
+    monkeypatch.setattr(agent, "_ingest_data", lambda: tables)
+
+    context = AgentContext(
+        workflow_id="wf_contract_supplier",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    findings = [
+        f for f in output.data["findings"] if f["detector_type"] == "Contract Value Overrun"
+    ]
+    assert findings, "Expected Contract Value Overrun finding"
+    assert findings[0]["supplier_id"] == "S1"
+    assert findings[0]["supplier_name"] == "Supplier One"
+
+
+def test_all_supplier_ids_reference_master_data(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    tables = agent._mock_data()
+    master_ids = set(tables["supplier_master"]["supplier_id"])
+
+    def _ingest_copy():
+        return {name: df.copy() for name, df in tables.items()}
+
+    monkeypatch.setattr(agent, "_ingest_data", _ingest_copy)
+
+    context = AgentContext(
+        workflow_id="wf_supplier_master",
+        agent_id="opportunity_miner",
+        user_id="u1",
+        input_data={},
+    )
+
+    output = agent.run(context)
+    for finding in output.data["findings"]:
+        supplier_id = finding.get("supplier_id")
+        if supplier_id:
+            assert supplier_id in master_ids
+
+
 def test_opportunity_miner_handles_missing_columns(monkeypatch):
     nick = DummyNick()
     agent = OpportunityMinerAgent(nick)
