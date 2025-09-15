@@ -182,15 +182,21 @@ class QueryEngine(BaseEngine):
 
                 supplier_cols = self._get_columns(conn, "proc", "supplier")
 
-                # Build expression for on-time performance using the numeric
-                # delivery lead time column if present. Non-existent columns
-                # result in a constant 0.0 to keep the query resilient across
-                # database variants.
+                # Build expression for on-time performance using the delivery
+                # lead-time column if present. The column is stored as
+                # ``VARCHAR`` in some databases, so we defensively cast only
+                # when the value looks numeric to avoid ``DatatypeMismatch``
+                # errors.  Non-existent columns result in a constant ``0.0`` to
+                # keep the query resilient across database variants.
                 if "delivery_lead_time_days" in supplier_cols:
                     on_time_expr = (
-                        "CASE WHEN s.delivery_lead_time_days IS NOT NULL "
-                        "AND s.delivery_lead_time_days <= 0 "
-                        "THEN 1.0 ELSE 0.0 END AS on_time_pct"
+                        "CASE "
+                        "WHEN s.delivery_lead_time_days ~ '^-?\\d+(\\.\\d+)?$' "
+                        "THEN CASE "
+                        "WHEN s.delivery_lead_time_days::numeric <= 0 "
+                        "THEN 1.0 ELSE 0.0 END "
+                        "ELSE 0.0 END AS on_time_pct"
+
                     )
                 else:
                     on_time_expr = "0.0 AS on_time_pct"
