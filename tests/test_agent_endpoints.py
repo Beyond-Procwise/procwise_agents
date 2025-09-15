@@ -43,8 +43,15 @@ class DummyOrchestrator:
             output = {
                 **input_data,
                 "action_id": input_data.get("action_id", "a1"),
-                "body": "<p>generated</p>",
-                "sent": True,
+                "body": input_data.get("body", "<p>generated</p>"),
+                "sent": False,
+                "drafts": [
+                    {
+                        "rfq_id": "RFQ-123",
+                        "action_id": input_data.get("action_id", "a1"),
+                        "sent_status": False,
+                    }
+                ],
             }
             return {
                 "status": "completed",
@@ -105,14 +112,17 @@ def test_email_workflow_returns_action_id():
             "subject": "s",
             "recipients": "r1,r2",
             "action_id": "a1",
+            "body": "<!-- RFQ-ID: RFQ-123 --><p>generated</p>",
         },
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["action_id"] == "a1"
     assert data["result"]["email_drafting"]["sent"] is True
-    assert data["result"]["email_drafting"]["body"] == "<p>generated</p>"
+    assert data["result"]["email_drafting"]["body"].endswith("<p>generated</p>")
     assert data["result"]["email_drafting"]["recipients"] == ["r1", "r2"]
+    drafts = data["result"]["email_drafting"]["drafts"]
+    assert drafts[0]["sent_status"] is True
 
     prs = orchestrator.agent_nick.process_routing_service
     assert len(prs.logged) == 2
@@ -120,8 +130,9 @@ def test_email_workflow_returns_action_id():
     assert prs.logged[1]["status"] == "completed"
     assert prs.logged[0]["action_desc"]["subject"] == "s"
     assert prs.updated_details["output"]["sent"] is True
-    assert prs.updated_details["output"]["body"] == "<p>generated</p>"
+    assert prs.updated_details["output"]["body"].endswith("<p>generated</p>")
     assert prs.updated_details["output"]["recipients"] == ["r1", "r2"]
+    assert prs.updated_details["output"]["drafts"][0]["sent_status"] is True
     assert prs.updated_details["status"] == "completed"
 
 
