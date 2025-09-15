@@ -113,6 +113,7 @@ def test_fetch_supplier_data_uses_delivery_lead_time(monkeypatch):
     # ensure string values are guarded by a numeric regex and cast
     assert "~ '^-?\\d+(\\.\\d+)?$'" in captured["sql"]
     assert "::numeric" in captured["sql"]
+
     # ensure additional supplier fields are projected explicitly
     assert "s.trading_name" in captured["sql"]
     assert "s.legal_structure" in captured["sql"]

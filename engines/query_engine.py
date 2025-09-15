@@ -196,6 +196,7 @@ class QueryEngine(BaseEngine):
                         "WHEN s.delivery_lead_time_days::numeric <= 0 "
                         "THEN 1.0 ELSE 0.0 END "
                         "ELSE 0.0 END AS on_time_pct"
+
                     )
                 else:
                     on_time_expr = "0.0 AS on_time_pct"
