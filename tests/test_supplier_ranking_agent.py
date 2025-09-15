@@ -89,3 +89,38 @@ def test_execute_ranking_flow_extracts_criteria_from_query():
 
     assert result["status"] == "completed"
     assert nick.policy_engine.last_input["criteria"] == ["price"]
+
+
+def test_supplier_ranking_trains_when_possible(monkeypatch):
+    class Nick(DummyNick):
+        def __init__(self):
+            super().__init__()
+            self.trained = False
+
+            def train():
+                self.trained = True
+
+            self.query_engine = SimpleNamespace(
+                fetch_supplier_data=lambda *_: pd.DataFrame(
+                    {"supplier_name": ["S1"], "price": [1]}
+                ),
+                train_procurement_context=train,
+            )
+
+    nick = Nick()
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="supplier_ranking",
+        user_id="u1",
+        input_data={
+            "intent": {"parameters": {"criteria": ["price"]}},
+            "query": "Rank suppliers by price",
+        },
+    )
+
+    agent.run(context)
+
+    assert nick.trained is True

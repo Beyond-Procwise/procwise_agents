@@ -2,10 +2,6 @@ import os
 import sys
 from types import SimpleNamespace
 
-import os
-import sys
-from types import SimpleNamespace
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.rag_service import RAGService
@@ -50,6 +46,22 @@ def test_upsert_and_search():
     assert hits[0].payload["record_id"] == "test"
     # ensure local indexes were used without calling qdrant search
     assert not nick.qdrant_client.search_calls
+
+
+def test_upsert_gpu_fallback(monkeypatch, caplog):
+    monkeypatch.delattr("services.rag_service.faiss.StandardGpuResources", raising=False)
+    nick = SimpleNamespace(
+        device="cuda",
+        settings=SimpleNamespace(qdrant_collection_name="c", reranker_model="x"),
+        qdrant_client=DummyQdrant(),
+        embedding_model=DummyEmbed(),
+    )
+    rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
+    with caplog.at_level("WARNING"):
+        rag.upsert_texts(["gpu fallback"], {"record_id": "gpu"})
+    assert "falling back to CPU index" in caplog.text
+    hits = rag.search("gpu")
+    assert hits[0].payload["record_id"] == "gpu"
 
 
 def test_pipeline_answer_returns_documents(monkeypatch):

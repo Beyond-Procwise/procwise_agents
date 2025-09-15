@@ -1,3 +1,4 @@
+import logging
 import os
 import uuid
 from typing import List, Dict, Optional
@@ -10,6 +11,9 @@ from qdrant_client import models
 from utils.gpu import configure_gpu
 
 configure_gpu()
+
+
+logger = logging.getLogger(__name__)
 
 
 class RAGService:
@@ -72,9 +76,7 @@ class RAGService:
             dim = len(self._doc_vectors[0])
             if self._faiss_index is None:
                 index = faiss.IndexFlatIP(dim)
-                if self.agent_nick.device == "cuda":
-                    res = faiss.StandardGpuResources()
-                    index = faiss.index_cpu_to_gpu(res, 0, index)
+                index = self._maybe_init_gpu_index(index)
                 self._faiss_index = index
             self._faiss_index.add(np.vstack(self._doc_vectors))
             self._bm25 = BM25Okapi(self._bm25_corpus)
@@ -164,3 +166,38 @@ class RAGService:
             scores = scores.tolist()
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         return [h for h, _ in ranked[:top_k]]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _maybe_init_gpu_index(self, index: "faiss.Index"):
+        """Attempt to move ``index`` to GPU when available.
+
+        FAISS exposes GPU helpers only in GPU-enabled builds. Some
+        environments (including CI or developer laptops) only have the CPU
+        variant installed; attempting to access ``StandardGpuResources`` in
+        those cases raises :class:`AttributeError`. To keep the agentic
+        workflow robust we detect this condition and gracefully fall back to
+        the CPU index while logging the reason.
+        """
+
+        if getattr(self.agent_nick, "device", "cpu") != "cuda":
+            return index
+
+        if not hasattr(faiss, "StandardGpuResources"):
+            logger.warning(
+                "FAISS GPU resources are unavailable in this environment; "
+                "falling back to CPU index."
+            )
+            return index
+
+        try:  # pragma: no cover - depends on GPU libraries
+            resources = faiss.StandardGpuResources()
+            return faiss.index_cpu_to_gpu(resources, 0, index)
+        except Exception as exc:  # pragma: no cover - hardware specific
+            logger.warning(
+                "Failed to initialise FAISS GPU resources, falling back to CPU "
+                "index: %s",
+                exc,
+            )
+            return index
