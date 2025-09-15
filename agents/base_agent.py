@@ -117,6 +117,10 @@ class BaseAgent:
             )
             result.action_id = action_id
             result.data.setdefault("action_id", action_id)
+            drafts = result.data.get("drafts")
+            if isinstance(drafts, list):
+                for draft in drafts:
+                    draft.setdefault("action_id", action_id)
         logger.info(
             "%s: completed with status %s", self.__class__.__name__, result.status.value
         )
