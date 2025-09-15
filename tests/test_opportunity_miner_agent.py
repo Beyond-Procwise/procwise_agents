@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+import pandas as pd
 import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -18,12 +19,236 @@ class DummyNick:
         self.settings = SimpleNamespace(script_user="tester")
 
 
+def _sample_tables() -> Dict[str, Any]:
+    purchase_orders = pd.DataFrame(
+        [
+            {
+                "po_id": "PO000001",
+                "supplier_id": "SI0001",
+                "currency": "GBP",
+                "total_amount": 100.0,
+                "payment_terms": "15",
+                "contract_id": "CO000001",
+            },
+            {
+                "po_id": "PO000002",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "total_amount": 80.0,
+                "payment_terms": "30",
+                "contract_id": "CO000002",
+            },
+            {
+                "po_id": "PO000003",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "total_amount": 150.0,
+                "payment_terms": "45",
+                "contract_id": None,
+            },
+        ]
+    )
+
+    invoices = pd.DataFrame(
+        [
+            {
+                "invoice_id": "IN000001",
+                "po_id": "PO000001",
+                "supplier_id": "SI0001",
+                "currency": "GBP",
+                "invoice_amount": 110.0,
+                "invoice_total_incl_tax": 110.0,
+                "payment_terms": "15",
+            },
+            {
+                "invoice_id": "IN000002",
+                "po_id": "PO000002",
+                "supplier_id": "SI0002",
+                "currency": "GBP",
+                "invoice_amount": 96.0,
+                "invoice_total_incl_tax": 96.0,
+                "payment_terms": "30",
+            },
+        ]
+    )
+
+    purchase_order_lines = pd.DataFrame(
+        [
+            {
+                "po_line_id": "POL000001",
+                "po_id": "PO000001",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 10,
+                "unit_price": 10.0,
+                "line_amount": 100.0,
+                "total_amount_incl_tax": 100.0,
+                "currency": "GBP",
+            },
+            {
+                "po_line_id": "POL000002",
+                "po_id": "PO000002",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 5,
+                "unit_price": 12.0,
+                "line_amount": 60.0,
+                "total_amount_incl_tax": 60.0,
+                "currency": "GBP",
+            },
+            {
+                "po_line_id": "POL000003",
+                "po_id": "PO000003",
+                "item_id": "ITM-002",
+                "item_description": "Adhoc Consulting",
+                "quantity": 3,
+                "unit_price": 50.0,
+                "line_amount": 150.0,
+                "total_amount_incl_tax": 150.0,
+                "currency": "GBP",
+            },
+        ]
+    )
+
+    invoice_lines = pd.DataFrame(
+        [
+            {
+                "invoice_line_id": "INL000001",
+                "invoice_id": "IN000001",
+                "po_id": "PO000001",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 10,
+                "unit_price": 11.0,
+                "line_amount": 110.0,
+                "total_amount_incl_tax": 110.0,
+                "currency": "GBP",
+            },
+            {
+                "invoice_line_id": "INL000002",
+                "invoice_id": "IN000002",
+                "po_id": "PO000002",
+                "item_id": "ITM-001",
+                "item_description": "Logistics Support",
+                "quantity": 5,
+                "unit_price": 13.0,
+                "line_amount": 65.0,
+                "total_amount_incl_tax": 65.0,
+                "currency": "GBP",
+            },
+        ]
+    )
+
+    contracts = pd.DataFrame(
+        [
+            {
+                "contract_id": "CO000001",
+                "contract_title": "Contract 1",
+                "contract_type": "Services",
+                "supplier_id": "SI0001",
+                "buyer_org_id": "BUY1",
+                "contract_start_date": pd.Timestamp("2024-01-01"),
+                "contract_end_date": pd.Timestamp("2024-09-30"),
+                "currency": "GBP",
+                "total_contract_value": 100.0,
+                "spend_category": "CatA",
+                "payment_terms": "15",
+            },
+            {
+                "contract_id": "CO000002",
+                "contract_title": "Contract 2",
+                "contract_type": "Goods",
+                "supplier_id": "SI0002",
+                "buyer_org_id": "BUY1",
+                "contract_start_date": pd.Timestamp("2024-01-01"),
+                "contract_end_date": pd.Timestamp("2024-12-31"),
+                "currency": "GBP",
+                "total_contract_value": 300.0,
+                "spend_category": "CatA",
+                "payment_terms": "30",
+            },
+        ]
+    )
+
+    indices = pd.DataFrame(
+        [
+            {
+                "index_name": "FX_GBP",
+                "value": 1.0,
+                "effective_date": "2024-01-01",
+                "currency": "GBP",
+            }
+        ]
+    )
+
+    shipments = pd.DataFrame(
+        [
+            {
+                "shipment_id": "SH1",
+                "po_id": "PO1",
+                "logistics_cost": 5.0,
+                "currency": "GBP",
+                "delivery_date": "2024-01-10",
+            }
+        ]
+    )
+
+    supplier_master = pd.DataFrame(
+        [
+            {
+                "supplier_id": "SI0001",
+                "supplier_name": "Supplier One",
+                "risk_score": 0.8,
+            },
+            {
+                "supplier_id": "SI0002",
+                "supplier_name": "Supplier Two",
+                "risk_score": 0.2,
+            },
+            {
+                "supplier_id": "SI0003",
+                "supplier_name": "Supplier Three",
+                "risk_score": 0.65,
+            },
+        ]
+    )
+
+    return {
+        "purchase_orders": purchase_orders,
+        "purchase_order_lines": purchase_order_lines,
+        "invoices": invoices,
+        "invoice_lines": invoice_lines,
+        "contracts": contracts,
+        "indices": indices,
+        "shipments": shipments,
+        "supplier_master": supplier_master,
+    }
+
+    assert output.status == AgentStatus.FAILED
+    assert output.data["blocked_reason"]
+    assert output.data["policy_events"]
+
+
+def test_price_variance_detection_generates_finding(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
 def create_agent(monkeypatch, tables: Optional[Dict[str, Any]] = None):
     nick = DummyNick()
     agent = OpportunityMinerAgent(nick, min_financial_impact=0)
     monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
     monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
-    data = tables if tables is not None else agent._mock_data()
+    data = tables if tables is not None else _sample_tables()
     monkeypatch.setattr(
         agent,
         "_ingest_data",
@@ -84,6 +309,7 @@ def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "volume_consolidation_check", {"minimum_volume_gbp": 50}
+
     )
 
     output = agent.run(context)
@@ -98,6 +324,7 @@ def test_supplier_risk_alert_threshold(monkeypatch):
     context = build_context(
         "supplier_risk_check",
         {"risk_threshold": 0.5, "risk_weight": 1000},
+
     )
 
     output = agent.run(context)
@@ -112,6 +339,7 @@ def test_maverick_spend_detection_flags_po(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "maverick_spend_check", {"minimum_value_gbp": 120}
+
     )
 
     output = agent.run(context)
@@ -142,6 +370,7 @@ def test_unused_contract_value_detection(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "unused_contract_value_check", {"minimum_unused_value_gbp": 50}
+
     )
 
     output = agent.run(context)

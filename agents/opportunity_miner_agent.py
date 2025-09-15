@@ -212,7 +212,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         The agent now strictly relies on live data from the procurement schema
         so that findings always reflect the most recent state.  Unit tests may
-        monkeypatch this method with ``_mock_data`` if needed.
+        monkeypatch this method to return deterministic fixtures.
         """
 
         dfs: Dict[str, pd.DataFrame] = {}
@@ -220,219 +220,6 @@ class OpportunityMinerAgent(BaseAgent):
             for table, sql_name in self.TABLE_MAP.items():
                 dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
         return dfs
-
-    def _mock_data(self) -> Dict[str, pd.DataFrame]:
-        """Return a minimal in-memory dataset used for unit tests and demos."""
-
-        # All values already in GBP for simplicity
-        purchase_orders = pd.DataFrame(
-            [
-                {
-                    "po_id": "PO000001",
-                    "supplier_id": "SI0001",
-                    "currency": "GBP",
-                    "total_amount": 100.0,
-                    "payment_terms": "15",
-                    "exchange_rate_to_usd": 1.3,
-                    "converted_amount_usd": 130.0,
-                    "contract_id": "CO000001",
-                },
-                {
-                    "po_id": "PO000002",
-                    "supplier_id": "SI0002",
-                    "currency": "GBP",
-                    "total_amount": 80.0,
-                    "payment_terms": "30",
-                    "exchange_rate_to_usd": 1.3,
-                    "converted_amount_usd": 104.0,
-                    "contract_id": "CO000002",
-                },
-                {
-                    "po_id": "PO000003",
-                    "supplier_id": "SI0002",
-                    "currency": "GBP",
-                    "total_amount": 150.0,
-                    "payment_terms": "45",
-                    "exchange_rate_to_usd": 1.3,
-                    "converted_amount_usd": 195.0,
-                    "contract_id": None,
-                },
-            ]
-        )
-
-        invoices = pd.DataFrame(
-            [
-                {
-                    "invoice_id": "IN000001",
-                    "po_id": "PO000001",
-                    "supplier_id": "SI0001",
-                    "currency": "GBP",
-                    "invoice_amount": 110.0,
-                    "invoice_total_incl_tax": 110.0,
-                    "payment_terms": "15",
-                    "exchange_rate_to_usd": 1.3,
-                    "converted_amount_usd": 143.0,
-                },
-                {
-                    "invoice_id": "IN000002",
-                    "po_id": "PO000002",
-                    "supplier_id": "SI0002",
-                    "currency": "GBP",
-                    "invoice_amount": 96.0,
-                    "invoice_total_incl_tax": 96.0,
-                    "payment_terms": "30",
-                    "exchange_rate_to_usd": 1.3,
-                    "converted_amount_usd": 124.8,
-                },
-            ]
-        )
-
-        purchase_order_lines = pd.DataFrame(
-            [
-                {
-                    "po_line_id": "POL000001",
-                    "po_id": "PO000001",
-                    "item_id": "ITM-001",
-                    "item_description": "Logistics Support",
-                    "quantity": 10,
-                    "unit_price": 10.0,
-                    "line_amount": 100.0,
-                    "total_amount_incl_tax": 100.0,
-                    "currency": "GBP",
-                },
-                {
-                    "po_line_id": "POL000002",
-                    "po_id": "PO000002",
-                    "item_id": "ITM-001",
-                    "item_description": "Logistics Support",
-                    "quantity": 5,
-                    "unit_price": 12.0,
-                    "line_amount": 60.0,
-                    "total_amount_incl_tax": 60.0,
-                    "currency": "GBP",
-                },
-                {
-                    "po_line_id": "POL000003",
-                    "po_id": "PO000003",
-                    "item_id": "ITM-002",
-                    "item_description": "Adhoc Consulting",
-                    "quantity": 3,
-                    "unit_price": 50.0,
-                    "line_amount": 150.0,
-                    "total_amount_incl_tax": 150.0,
-                    "currency": "GBP",
-                },
-            ]
-        )
-
-        invoice_lines = pd.DataFrame(
-            [
-                {
-                    "invoice_line_id": "INL000001",
-                    "invoice_id": "IN000001",
-                    "po_id": "PO000001",
-                    "item_id": "ITM-001",
-                    "item_description": "Logistics Support",
-                    "quantity": 10,
-                    "unit_price": 11.0,
-                    "line_amount": 110.0,
-                    "total_amount_incl_tax": 110.0,
-                    "currency": "GBP",
-                },
-                {
-                    "invoice_line_id": "INL000002",
-                    "invoice_id": "IN000002",
-                    "po_id": "PO000002",
-                    "item_id": "ITM-001",
-                    "item_description": "Logistics Support",
-                    "quantity": 5,
-                    "unit_price": 13.0,
-                    "line_amount": 65.0,
-                    "total_amount_incl_tax": 65.0,
-                    "currency": "GBP",
-                },
-            ]
-        )
-
-        contracts = pd.DataFrame(
-            [
-                {
-                    "contract_id": "CO000001",
-                    "contract_title": "Contract 1",
-                    "contract_type": "Services",
-                    "supplier_id": "SI0001",
-                    "buyer_org_id": "BUY1",
-                    "contract_start_date": pd.Timestamp("2024-01-01"),
-                    "contract_end_date": pd.Timestamp("2024-09-30"),
-                    "currency": "GBP",
-                    "total_contract_value": 100.0,
-                    "spend_category": "CatA",
-                    "payment_terms": "15",
-                },
-                {
-                    "contract_id": "CO000002",
-                    "contract_title": "Contract 2",
-                    "contract_type": "Goods",
-                    "supplier_id": "SI0002",
-                    "buyer_org_id": "BUY1",
-                    "contract_start_date": pd.Timestamp("2024-01-01"),
-                    "contract_end_date": pd.Timestamp("2024-12-31"),
-                    "currency": "GBP",
-                    "total_contract_value": 300.0,
-                    "spend_category": "CatA",
-                    "payment_terms": "30",
-                },
-            ]
-        )
-
-        indices = pd.DataFrame(
-            [
-                {"index_name": "FX_GBP", "value": 1.0, "effective_date": "2024-01-01", "currency": "GBP"}
-            ]
-        )
-
-        shipments = pd.DataFrame(
-            [
-                {
-                    "shipment_id": "SH1",
-                    "po_id": "PO1",
-                    "logistics_cost": 5.0,
-                    "currency": "GBP",
-                    "delivery_date": "2024-01-10",
-                }
-            ]
-        )
-
-        supplier_master = pd.DataFrame(
-            [
-                {
-                    "supplier_id": "SI0001",
-                    "supplier_name": "Supplier One",
-                    "risk_score": 0.8,
-                },
-                {
-                    "supplier_id": "SI0002",
-                    "supplier_name": "Supplier Two",
-                    "risk_score": 0.2,
-                },
-                {
-                    "supplier_id": "SI0003",
-                    "supplier_name": "Supplier Three",
-                    "risk_score": 0.65,
-                },
-            ]
-        )
-
-        return {
-            "purchase_orders": purchase_orders,
-            "purchase_order_lines": purchase_order_lines,
-            "invoices": invoices,
-            "invoice_lines": invoice_lines,
-            "contracts": contracts,
-            "indices": indices,
-            "shipments": shipments,
-            "supplier_master": supplier_master,
-        }
 
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Basic validation ensuring required columns exist and dropping nulls."""
@@ -576,7 +363,6 @@ class OpportunityMinerAgent(BaseAgent):
             len(self._invoice_supplier_map),
             len(self._contract_supplier_map),
         )
-
 
     def _normalise_currency(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Convert all monetary values to GBP using simple FX mapping."""
@@ -1147,6 +933,7 @@ class OpportunityMinerAgent(BaseAgent):
         return findings
 
     def _policy_volume_consolidation(
+
         self,
         tables: Dict[str, pd.DataFrame],
         input_data: Dict[str, Any],
@@ -1868,6 +1655,7 @@ class OpportunityMinerAgent(BaseAgent):
             inv_summary.groupby(["supplier_id", "item_id"], as_index=False)
             .agg(agg_map)
             .rename(columns={inv_price_col: "invoice_avg_price"})
+
         )
         if qty_col and qty_col in inv_group.columns:
             inv_group = inv_group.rename(columns={qty_col: "total_qty"})
