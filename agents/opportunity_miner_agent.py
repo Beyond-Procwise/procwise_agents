@@ -844,7 +844,7 @@ class OpportunityMinerAgent(BaseAgent):
             query_parts = [p for p in [f.supplier_id, f.category_id, f.item_id] if p]
             if not query_parts:
                 continue
-            hits = self.vector_search(" ".join(query_parts), top_k=3)
+            hits = self.vector_search(" ".join(map(str, query_parts)), top_k=3)
             f.context_documents = [h.payload for h in hits]
 
     def _find_candidate_suppliers(

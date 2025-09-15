@@ -1018,6 +1018,13 @@ class DataExtractionAgent(BaseAgent):
 
     # ============================ STRUCTURED FLOW =========================
     def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
+        if isinstance(header, str):
+            try:
+                header = json.loads(header)
+            except Exception:
+                header = {}
+        elif not isinstance(header, dict):
+            header = {}
         alias_map = {
             "Invoice": {
                 "invoice_total": "invoice_amount",
@@ -1093,6 +1100,13 @@ class DataExtractionAgent(BaseAgent):
         mapping = alias_map.get(doc_type, {})
         normalised_items: List[Dict[str, Any]] = []
         for item in items:
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except Exception:
+                    continue
+            if not isinstance(item, dict):
+                continue
             normalised: Dict[str, Any] = {}
             for key, value in item.items():
                 normalised[mapping.get(key, key)] = value
@@ -1352,6 +1366,13 @@ class DataExtractionAgent(BaseAgent):
 
         # Line item payloads
         for idx, item in enumerate(line_items, start=1):
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except Exception:
+                    continue
+            if not isinstance(item, dict):
+                continue
             item_text = _dict_to_text(item)
             if not item_text:
                 continue
