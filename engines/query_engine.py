@@ -21,6 +21,64 @@ logger = logging.getLogger(__name__)
 configure_gpu()
 
 
+# Columns expected on ``proc.supplier``. The list mirrors the schema so that the
+# query can explicitly project each field rather than relying on ``s.*`` which
+# tends to be brittle across database revisions.
+SUPPLIER_FIELDS = [
+    "supplier_id",
+    "supplier_name",
+    "trading_name",
+    "supplier_type",
+    "legal_structure",
+    "tax_id",
+    "vat_number",
+    "duns_number",
+    "parent_company_id",
+    "registered_country",
+    "registration_number",
+    "is_preferred_supplier",
+    "risk_score",
+    "credit_limit_amount",
+    "esg_cert_iso14001",
+    "esg_cert_sa8000",
+    "esg_cert_ecovadis",
+    "diversity_women_owned",
+    "diversity_minority_owned",
+    "diversity_veteran_owned",
+    "insurance_coverage_type",
+    "insurance_coverage_amount",
+    "insurance_expiry_date",
+    "bank_name",
+    "bank_account_number",
+    "bank_swift",
+    "bank_iban",
+    "default_currency",
+    "incoterms",
+    "delivery_lead_time_days",
+    "address_line1",
+    "address_line2",
+    "city",
+    "postal_code",
+    "country",
+    "website_url",
+    "edi_enabled",
+    "api_enabled",
+    "ariba_integrated",
+    "contact_name_1",
+    "contact_role_1",
+    "contact_email_1",
+    "contact_phone_1",
+    "contact_name_2",
+    "contact_role_2",
+    "contact_email_2",
+    "contact_phone_2",
+    "created_date",
+    "created_by",
+    "last_modified_by",
+    "last_modified_date",
+]
+
+
 class QueryEngine(BaseEngine):
     def __init__(self, agent_nick):
         super().__init__()
@@ -75,7 +133,9 @@ class QueryEngine(BaseEngine):
                 # Use the first price-like column as a last resort
                 return f"{alias}.{price_cols[0]}"
 
-            logger.warning("no price column found on %s.%s; defaulting to zero", schema, table)
+            logger.warning(
+                "no price column found on %s.%s; defaulting to zero", schema, table
+            )
         except Exception:
             logger.exception("price column detection failed")
         return "0.0"
@@ -95,24 +155,12 @@ class QueryEngine(BaseEngine):
                 # Use the first match and coalesce to 1 in case of NULLs
                 return f"COALESCE({alias}.{qty_cols[0]}, 1)"
 
-            logger.warning("no quantity column found on %s.%s; defaulting to 1", schema, table)
+            logger.warning(
+                "no quantity column found on %s.%s; defaulting to 1", schema, table
+            )
         except Exception:
             logger.exception("quantity column detection failed")
         return "1"
-
-    def _boolean_expression(self, conn, schema: str, table: str, candidates: list[str]) -> str:
-        """Return first matching boolean column or ``NULL`` if none found."""
-        cols = self._get_columns(conn, schema, table)
-        for cand in candidates:
-            if cand in cols:
-                return cand
-        logger.warning(
-            "no %s column found on %s.%s; defaulting to NULL",
-            "/".join(candidates),
-            schema,
-            table,
-        )
-        return "NULL"
 
     def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
         """Return up-to-date supplier metrics."""
@@ -131,13 +179,39 @@ class QueryEngine(BaseEngine):
                 inv_qty = self._quantity_expression(
                     conn, "proc", "invoice_line_items_agent", "ili"
                 )
-                on_time_col = self._boolean_expression(
-                    conn, "proc", "supplier", ["on_time", "on_time_delivery"]
-                )
-                on_time_expr = (
-                    on_time_col
-                    if on_time_col == "NULL"
-                    else f"s.{on_time_col}"
+
+                supplier_cols = self._get_columns(conn, "proc", "supplier")
+
+                # Build expression for on-time performance using the delivery
+                # lead-time column if present. The column is stored as
+                # ``VARCHAR`` in some databases, so we defensively cast only
+                # when the value looks numeric to avoid ``DatatypeMismatch``
+                # errors.  Non-existent columns result in a constant ``0.0`` to
+                # keep the query resilient across database variants.
+                if "delivery_lead_time_days" in supplier_cols:
+                    on_time_expr = (
+                        "CASE "
+                        "WHEN s.delivery_lead_time_days ~ '^-?\\d+(\\.\\d+)?$' "
+                        "THEN CASE "
+                        "WHEN s.delivery_lead_time_days::numeric <= 0 "
+                        "THEN 1.0 ELSE 0.0 END "
+                        "ELSE 0.0 END AS on_time_pct"
+                    )
+                else:
+                    on_time_expr = "0.0 AS on_time_pct"
+
+                # Select only supplier fields that actually exist in the
+                # database. ``supplier_id`` and ``supplier_name`` are already
+                # projected earlier in the query, so they are skipped here to
+                # avoid duplicate columns in the result set.
+                additional = [
+                    f"s.{c}" for c in SUPPLIER_FIELDS
+                    if c in supplier_cols and c not in {"supplier_id", "supplier_name"}
+                ]
+                additional_fields = (
+                    ",\n                    " + ",\n                    ".join(additional)
+                    if additional
+                    else ""
                 )
 
                 sql = f"""
@@ -165,9 +239,7 @@ class QueryEngine(BaseEngine):
                     COALESCE(inv.invoice_spend, 0.0) AS invoice_spend,
                     COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
                     COALESCE(inv.invoice_count, 0) AS invoice_count,
-                    CASE WHEN {on_time_expr} IS TRUE THEN 1.0 ELSE 0.0 END AS on_time_pct,
-                    -- include other supplier fields if present
-                    s.*
+                    {on_time_expr}{additional_fields}
                 FROM proc.supplier s
                 LEFT JOIN po ON s.supplier_id = po.supplier_id
                 LEFT JOIN inv ON s.supplier_id = inv.supplier_id
