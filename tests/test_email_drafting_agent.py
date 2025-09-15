@@ -60,7 +60,7 @@ def test_email_drafting_agent(monkeypatch):
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
     assert "Dear Acme," in draft["body"]
     assert "Deadline for submission: 01/01/2025" in draft["body"]
-    assert draft["sent_status"] is True
+    assert draft["sent_status"] is False
     assert draft["recipient"] == "sender@example.com"
     assert captured["drafts"][0] == draft
 

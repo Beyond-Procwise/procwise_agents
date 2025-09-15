@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
@@ -36,6 +37,55 @@ def get_rag_pipeline(request: Request) -> RAGPipeline:
     if not pipeline:
         raise HTTPException(status_code=503, detail="RAG Pipeline service is not available.")
     return pipeline
+
+
+RFQ_ID_PATTERN = re.compile(r"<!--\s*RFQ-ID:\s*([A-Za-z0-9_-]+)\s*-->")
+
+
+def _extract_rfq_id(body: Optional[str]) -> Optional[str]:
+    if not body:
+        return None
+    match = RFQ_ID_PATTERN.search(body)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _mark_drafts_as_sent(
+    email_output: Dict[str, Any],
+    action_id: Optional[str],
+    rfq_id: Optional[str],
+) -> bool:
+    drafts = email_output.get("drafts")
+    if not isinstance(drafts, list):
+        return False
+
+    updated = False
+    for draft in drafts:
+        if not isinstance(draft, dict):
+            continue
+
+        draft_action_id = draft.get("action_id")
+        if action_id and draft_action_id and draft_action_id != action_id:
+            continue
+
+        draft_rfq_id = draft.get("rfq_id")
+        if rfq_id:
+            if draft_rfq_id and draft_rfq_id != rfq_id:
+                continue
+            if not draft_rfq_id:
+                draft["rfq_id"] = rfq_id
+
+        if draft.get("sent_status") is True:
+            continue
+
+        draft["sent_status"] = True
+        updated = True
+
+    if updated and email_output.get("sent") is not True:
+        email_output["sent"] = True
+
+    return updated
 
 
 class AskRequest(BaseModel):
@@ -297,6 +347,7 @@ async def draft_email(
         "body": body,
         "action_id": action_id,
     }
+    rfq_id = _extract_rfq_id(body)
     prs = orchestrator.agent_nick.process_routing_service
 
     # Log the process with the expected schema so that the resulting entry in
@@ -337,6 +388,7 @@ async def draft_email(
         )
 
         email_output = result.get("result", {}).get("email_drafting", {})
+        _mark_drafts_as_sent(email_output, action_id, rfq_id)
 
         prs.log_action(
             process_id=process_id,
@@ -347,14 +399,22 @@ async def draft_email(
             action_id=action_id,
         )
 
+        sent_flag = bool(email_output.get("sent"))
+        if not sent_flag:
+            drafts = email_output.get("drafts") or []
+            sent_flag = any(
+                isinstance(draft, dict) and draft.get("sent_status") is True
+                for draft in drafts
+            )
+
         final_details = {
             "input": input_data,
             "agents": [],
             "output": email_output,
-            "status": "completed" if email_output.get("sent") else "failed",
+            "status": "completed" if sent_flag else "failed",
         }
         prs.update_process_details(process_id, final_details)
-        prs.update_process_status(process_id, 1 if email_output.get("sent") else -1)
+        prs.update_process_status(process_id, 1 if sent_flag else -1)
 
     except Exception as exc:  # pragma: no cover - network/runtime
         prs.log_action(

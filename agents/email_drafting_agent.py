@@ -121,7 +121,7 @@ class EmailDraftingAgent(BaseAgent):
                 "rfq_id": rfq_id,
                 "subject": subject,
                 "body": body,
-                "sent_status": True,
+                "sent_status": False,
                 "recipient": self.agent_nick.settings.ses_default_sender,
             }
             drafts.append(draft)
