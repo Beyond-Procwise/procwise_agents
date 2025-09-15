@@ -68,7 +68,12 @@ def test_quote_evaluation_agent_run(monkeypatch):
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["quotes"][0]["total_spend"] == 1000
+    quotes = output.data["quotes"]
+    weighting = quotes[0]
+    assert weighting["name"] == "weighting"
+    assert weighting["total_spend"] == output.data["weights"]["price"]
+    supplier_a = next(q for q in quotes if q["name"] == "Supplier A")
+    assert supplier_a["total_spend"] == 1000
     assert output.data["weights"]["price"] == 0.5
 
 
@@ -85,11 +90,14 @@ def test_quote_evaluation_handles_no_quotes(monkeypatch):
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["quotes"] == []
-    assert "weights" in output.data
+    weighting = output.data["quotes"][0]
+    assert weighting["name"] == "weighting"
+    assert weighting["total_spend"] == output.data["weights"]["price"]
+    assert len(output.data["quotes"]) == 1
+    assert output.data["weights"]["price"] == 0.5
 
 
-def test_quote_evaluation_handles_no_quotes(monkeypatch):
+def test_quote_evaluation_handles_no_quotes_message(monkeypatch):
     """Agent should succeed gracefully when no quotes are found."""
     nick = DummyNick()
     agent = QuoteEvaluationAgent(nick)
@@ -102,7 +110,8 @@ def test_quote_evaluation_handles_no_quotes(monkeypatch):
     )
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["quotes"] == []
+    assert output.data["quotes"][0]["name"] == "weighting"
+    assert output.data.get("message") == "No quotes found"
 
 
 class DummyOrchestrator:
@@ -131,7 +140,9 @@ def test_quote_evaluation_endpoint(monkeypatch):
     client = TestClient(app)
     resp = client.post("/workflows/quotes/evaluate", json={})
     assert resp.status_code == 200
-    assert resp.json()["result"]["quotes"][1]["unit_price"] == 12
+    quotes = resp.json()["result"]["quotes"]
+    supplier_b = next(q for q in quotes if q["name"] == "Supplier B")
+    assert supplier_b["unit_price"] == 12
 
 
 def test_fetch_quotes_from_qdrant():
