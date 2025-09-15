@@ -66,6 +66,12 @@ class OpportunityMinerAgent(BaseAgent):
                 "OpportunityMinerAgent starting processing with input %s",
                 context.input_data,
             )
+            qe = getattr(self.agent_nick, "query_engine", None)
+            if qe and hasattr(qe, "train_procurement_context"):
+                try:
+                    qe.train_procurement_context()
+                except Exception:  # pragma: no cover - best effort
+                    logger.exception("Failed to train procurement context")
             tables = self._ingest_data()
             tables = self._validate_data(tables)
             tables = self._normalise_currency(tables)
