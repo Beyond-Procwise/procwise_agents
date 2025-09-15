@@ -1,6 +1,8 @@
 import logging
 import re
 import imaplib
+import time
+import os
 from email import message_from_bytes
 from typing import Dict, Optional
 
@@ -16,6 +18,7 @@ class SupplierInteractionAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
+        os.environ.setdefault("PROCWISE_DEVICE", self.device)
 
     RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}")
 
@@ -25,12 +28,24 @@ class SupplierInteractionAgent(BaseAgent):
         if action == "poll":
             count = self.poll_mailbox()
             return AgentOutput(status=AgentStatus.SUCCESS, data={"polled": count})
+        if action == "monitor":
+            interval = int(context.input_data.get("interval", 30))
+            duration = int(context.input_data.get("duration", 300))
+            count = self.monitor_inbox(interval=interval, duration=duration)
+            return AgentOutput(status=AgentStatus.SUCCESS, data={"monitored": count})
 
         subject = context.input_data.get("subject", "")
         body = context.input_data.get("message") or context.input_data.get("body", "")
         supplier_id = context.input_data.get("supplier_id")
+        if not supplier_id:
+            candidates = context.input_data.get("supplier_candidates", [])
+            supplier_id = candidates[0] if candidates else None
         if not body:
             return AgentOutput(status=AgentStatus.FAILED, data={}, error="message not provided")
+
+        # Retrieve related documents from the vector database for additional context
+        context_hits = self.vector_search(body, top_k=3)
+        related_docs = [h.payload for h in context_hits]
 
         rfq_id = self._extract_rfq_id(subject + " " + body)
         parsed = self._parse_response(body)
@@ -45,7 +60,7 @@ class SupplierInteractionAgent(BaseAgent):
 
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={"rfq_id": rfq_id, "supplier_id": supplier_id, **parsed},
+            data={"rfq_id": rfq_id, "supplier_id": supplier_id, **parsed, "related_documents": related_docs},
             next_agents=next_agent,
         )
 
@@ -78,6 +93,22 @@ class SupplierInteractionAgent(BaseAgent):
         except Exception:  # pragma: no cover - best effort
             logger.exception("mailbox polling failed")
         return processed
+
+    def monitor_inbox(self, interval: int = 30, duration: int = 300) -> int:
+        """Continuously poll the inbox for a given duration.
+
+        Args:
+            interval: Seconds between polls.
+            duration: Total time to monitor in seconds.
+        Returns:
+            Total number of messages processed.
+        """
+        end_time = time.time() + duration
+        total = 0
+        while time.time() < end_time:
+            total += self.poll_mailbox()
+            time.sleep(interval)
+        return total
 
     def _extract_rfq_id(self, text: str) -> Optional[str]:
         match = self.RFQ_PATTERN.search(text)

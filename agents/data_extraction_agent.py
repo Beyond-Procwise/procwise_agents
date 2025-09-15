@@ -205,21 +205,28 @@ QUOTE_LINE_ITEMS_SCHEMA = {
 
 CONTRACT_SCHEMA = {
     "contract_id": "text",
+    "contract_title": "text",
+    "contract_type": "text",
     "supplier_id": "text",
-    "buyer_id": "text",
-    "effective_date": "date",
-    "expiry_date": "date",
-    "currency": "character varying(3)",
-    "contract_value": "numeric(18,2)",
-    "governing_law": "text",
+    "buyer_org_id": "text",
+    "contract_start_date": "date",
+    "contract_end_date": "date",
+    "currency": "text",
+    "total_contract_value": "numeric(18,2)",
+    "spend_category": "text",
+    "business_unit_id": "text",
+    "cost_centre_id": "text",
+    "is_amendment": "text",
+    "parent_contract_id": "text",
+    "auto_renew_flag": "text",
+    "renewal_term": "text",
+    "contract_lifecycle_status": "text",
     "jurisdiction": "text",
-    "renewal_terms": "text",
-    "termination_clause": "text",
-    "country": "text",
-    "region": "text",
-    "ai_flag_required": "character varying(5)",
-    "trigger_type": "character varying(30)",
-    "trigger_context_description": "text",
+    "governing_law": "text",
+    "contract_signatory_name": "text",
+    "contract_signatory_role": "text",
+    "payment_terms": "text",
+    "risk_assessment_completed": "text",
     "created_date": "timestamp without time zone",
     "created_by": "text",
     "last_modified_by": "text",
@@ -518,6 +525,15 @@ class DataExtractionAgent(BaseAgent):
         vendor_name = self._infer_vendor_name(text, object_key)
         if not unique_id:
             unique_id = uuid.uuid4().hex[:8]
+
+        # Consult vector database for related documents to leverage prior context
+        similar_docs = self.vector_search(text, top_k=1)
+        if similar_docs:
+            logger.debug(
+                "Found similar document %s while processing %s",
+                similar_docs[0].id,
+                object_key,
+            )
 
         # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
@@ -1002,6 +1018,13 @@ class DataExtractionAgent(BaseAgent):
 
     # ============================ STRUCTURED FLOW =========================
     def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
+        if isinstance(header, str):
+            try:
+                header = json.loads(header)
+            except Exception:
+                header = {}
+        elif not isinstance(header, dict):
+            header = {}
         alias_map = {
             "Invoice": {
                 "invoice_total": "invoice_amount",
@@ -1020,6 +1043,24 @@ class DataExtractionAgent(BaseAgent):
                 "recipient": "receiver_name",
                 "to": "supplier_id",
                 "supplier_name": "supplier_name",
+            },
+            "Contract": {
+                "title": "contract_title",
+                "contract name": "contract_title",
+                "start date": "contract_start_date",
+                "effective date": "contract_start_date",
+                "end date": "contract_end_date",
+                "expiry date": "contract_end_date",
+                "expiration date": "contract_end_date",
+                "supplier": "supplier_id",
+                "vendor": "supplier_id",
+                "category": "spend_category",
+                "business unit": "business_unit_id",
+                "cost center": "cost_centre_id",
+                "signatory": "contract_signatory_name",
+                "signatory name": "contract_signatory_name",
+                "signatory role": "contract_signatory_role",
+                "payment terms": "payment_terms",
             },
         }
         mapping = alias_map.get(doc_type, {})
@@ -1059,6 +1100,13 @@ class DataExtractionAgent(BaseAgent):
         mapping = alias_map.get(doc_type, {})
         normalised_items: List[Dict[str, Any]] = []
         for item in items:
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except Exception:
+                    continue
+            if not isinstance(item, dict):
+                continue
             normalised: Dict[str, Any] = {}
             for key, value in item.items():
                 normalised[mapping.get(key, key)] = value
@@ -1066,21 +1114,32 @@ class DataExtractionAgent(BaseAgent):
         return normalised_items
 
     def _enrich_contract_fields(self, text: str, header: Dict[str, Any]) -> Dict[str, Any]:
-        # Best-effort patterns
+        # Best-effort patterns for common contract fields
         pairs = [
-            ("effective_date", r"\bEffective\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
-            # Match both "Expiry Date" and "Expiration Date" while capturing the date portion
-            ("expiry_date", r"(?:\bExpiry|Expiration)\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})"),
+            (
+                "contract_start_date",
+                r"\b(?:Effective|Start)\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})",
+            ),
+            (
+                "contract_end_date",
+                r"(?:\bExpiry|Expiration|End)\s+Date[:\s]+([A-Za-z0-9,/\- ]{4,})",
+            ),
             ("governing_law", r"\bGoverning\s+Law[:\s]+([A-Za-z ,&]{3,})"),
             ("jurisdiction", r"\bJurisdiction[:\s]+([A-Za-z ,&]{3,})"),
-            # Capture the entire termination clause text if present
-            ("termination_clause", r"(\bTermination\b.*)"),
+            (
+                "contract_signatory_name",
+                r"\bSigned\s+by[:\s]+([A-Za-z ,.'-]{3,})",
+            ),
+            ("contract_signatory_role", r"\bTitle[:\s]+([A-Za-z ,.'-]{3,})"),
+            (
+                "payment_terms",
+                r"\bPayment\s+Terms[:\s]+([A-Za-z0-9 ,.'-]{3,})",
+            ),
         ]
         low = text
         for key, pat in pairs:
             if header.get(key):
                 continue
-            # Allow dot to span newlines and avoid IndexError when pattern lacks groups
             m = re.search(pat, low, re.I | re.S)
             if m:
                 group_idx = 1 if m.lastindex else 0
@@ -1307,6 +1366,13 @@ class DataExtractionAgent(BaseAgent):
 
         # Line item payloads
         for idx, item in enumerate(line_items, start=1):
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except Exception:
+                    continue
+            if not isinstance(item, dict):
+                continue
             item_text = _dict_to_text(item)
             if not item_text:
                 continue
@@ -1583,7 +1649,7 @@ class DataExtractionAgent(BaseAgent):
             "Invoice": ("proc", "invoice_agent", "invoice_id"),
             "Purchase_Order": ("proc", "purchase_order_agent", "po_id"),
             "Quote": ("proc", "quote_agent", "quote_id"),
-            "Contract": ("proc", "contract_agent", "contract_id"),
+            "Contract": ("proc", "contracts", "contract_id"),
         }
         target = table_map.get(doc_type)
         if not target:
