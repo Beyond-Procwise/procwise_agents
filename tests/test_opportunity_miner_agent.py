@@ -224,6 +224,24 @@ def _sample_tables() -> Dict[str, Any]:
         "supplier_master": supplier_master,
     }
 
+    assert output.status == AgentStatus.FAILED
+    assert output.data["blocked_reason"]
+    assert output.data["policy_events"]
+
+
+def test_price_variance_detection_generates_finding(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
 
 def create_agent(monkeypatch, tables: Optional[Dict[str, Any]] = None):
     nick = DummyNick()
@@ -291,6 +309,7 @@ def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "volume_consolidation_check", {"minimum_volume_gbp": 50}
+
     )
 
     output = agent.run(context)
@@ -305,6 +324,7 @@ def test_supplier_risk_alert_threshold(monkeypatch):
     context = build_context(
         "supplier_risk_check",
         {"risk_threshold": 0.5, "risk_weight": 1000},
+
     )
 
     output = agent.run(context)
@@ -319,6 +339,7 @@ def test_maverick_spend_detection_flags_po(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "maverick_spend_check", {"minimum_value_gbp": 120}
+
     )
 
     output = agent.run(context)
@@ -349,6 +370,7 @@ def test_unused_contract_value_detection(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
         "unused_contract_value_check", {"minimum_unused_value_gbp": 50}
+
     )
 
     output = agent.run(context)

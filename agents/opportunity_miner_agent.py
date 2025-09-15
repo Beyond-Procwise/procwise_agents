@@ -259,6 +259,7 @@ class OpportunityMinerAgent(BaseAgent):
                 for _, row in df.iterrows():
                     supplier_id = row["supplier_id"]
                     lookup[supplier_id] = row.get("supplier_name") or None
+
         self._supplier_lookup = lookup
         logger.debug("Loaded %d suppliers from master data", len(self._supplier_lookup))
 
@@ -748,6 +749,7 @@ class OpportunityMinerAgent(BaseAgent):
         invoice_supplier_map = getattr(self, "_invoice_supplier_map", {})
         invoice_po_map = getattr(self, "_invoice_po_map", {})
 
+
         def _lookup(df: pd.DataFrame, key_col: str, val_col: str, key: str) -> Optional[str]:
             try:
                 if df.empty or key_col not in df.columns or val_col not in df.columns:
@@ -840,6 +842,7 @@ class OpportunityMinerAgent(BaseAgent):
                         )
                     if candidate_cat:
                         f.category_id = str(candidate_cat)
+
                 if src_key and not f.item_id:
                     f.item_id = (
                         _lookup(po_lines, "po_id", "item_id", src_key)
@@ -930,6 +933,7 @@ class OpportunityMinerAgent(BaseAgent):
         return findings
 
     def _policy_volume_consolidation(
+
         self,
         tables: Dict[str, pd.DataFrame],
         input_data: Dict[str, Any],
@@ -1651,6 +1655,7 @@ class OpportunityMinerAgent(BaseAgent):
             inv_summary.groupby(["supplier_id", "item_id"], as_index=False)
             .agg(agg_map)
             .rename(columns={inv_price_col: "invoice_avg_price"})
+
         )
         if qty_col and qty_col in inv_group.columns:
             inv_group = inv_group.rename(columns={qty_col: "total_qty"})
