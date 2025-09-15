@@ -10,6 +10,8 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 from __future__ import annotations
 
 import logging
+from difflib import SequenceMatcher
+
 import pandas as pd
 
 from .base_engine import BaseEngine
@@ -77,6 +79,18 @@ SUPPLIER_FIELDS = [
     "last_modified_by",
     "last_modified_date",
 ]
+
+
+PROCUREMENT_CATEGORY_FIELDS = [
+    "product",
+    "category_level_1",
+    "category_level_2",
+    "category_level_3",
+    "category_level_4",
+    "category_level_5",
+]
+
+_PRODUCT_SIMILARITY_THRESHOLD = 0.35
 
 
 class QueryEngine(BaseEngine):
@@ -307,30 +321,7 @@ class QueryEngine(BaseEngine):
                        cs.supplier_id,
                        cs.supplier_name
                 FROM proc.purchase_order_agent p
-                JOIN contract_supplier cs ON p.supplier_id = cs.supplier_name
-            ),
-            po_items AS (
-                SELECT li.po_id,
-                       li.po_line_id,
-                       li.item_description,
-                       cpm.product,
-                       cpm.category_level_1,
-                       cpm.category_level_2,
-                       cpm.category_level_3,
-                       cpm.category_level_4,
-                       cpm.category_level_5
-                FROM proc.po_line_items_agent li
-                LEFT JOIN LATERAL (
-                    SELECT product,
-                           category_level_1,
-                           category_level_2,
-                           category_level_3,
-                           category_level_4,
-                           category_level_5
-                    FROM proc.cat_product_mapping cpm
-                    ORDER BY similarity(li.item_description, cpm.product) DESC
-                    LIMIT 1
-                ) cpm ON TRUE
+                JOIN contract_supplier cs ON p.supplier_id = cs.supplier_id
             ),
             inv AS (
                 SELECT ia.invoice_id, ia.po_id
@@ -340,28 +331,101 @@ class QueryEngine(BaseEngine):
                 po.supplier_id,
                 po.supplier_name,
                 po.po_id,
-                pli.po_line_id,
-                pli.item_description,
-                pli.product,
-                pli.category_level_1,
-                pli.category_level_2,
-                pli.category_level_3,
-                pli.category_level_4,
-                pli.category_level_5,
+                li.po_line_id,
+                li.item_description,
                 inv.invoice_id,
                 ili.invoice_line_id
             FROM po
-            LEFT JOIN po_items pli ON po.po_id = pli.po_id
+            LEFT JOIN proc.po_line_items_agent li ON po.po_id = li.po_id
             LEFT JOIN inv ON po.po_id = inv.po_id
             LEFT JOIN proc.invoice_line_items_agent ili
                 ON inv.invoice_id = ili.invoice_id
         """
 
+        category_sql = """
+            SELECT
+                product,
+                category_level_1,
+                category_level_2,
+                category_level_3,
+                category_level_4,
+                category_level_5
+            FROM proc.cat_product_mapping
+        """
+
         with self.agent_nick.get_db_connection() as conn:
             df = pd.read_sql(sql, conn)
+            category_df = pd.read_sql(category_sql, conn)
+
+        df = self._assign_procurement_categories(df, category_df)
 
         if embed and not df.empty:
             self._embed_procurement_summary(df)
+
+        return df
+
+    def _assign_procurement_categories(
+        self, df: pd.DataFrame, category_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Map ``item_description`` entries to the closest product categories."""
+
+        if df is None:
+            return pd.DataFrame(columns=PROCUREMENT_CATEGORY_FIELDS)
+
+        for field in PROCUREMENT_CATEGORY_FIELDS:
+            if field not in df.columns:
+                df[field] = pd.NA
+
+        if df.empty or category_df.empty:
+            return df
+
+        mapping_rows = []
+        for row in category_df.itertuples(index=False, name="CategoryRow"):
+            product = getattr(row, "product", None)
+            if product is None:
+                continue
+
+            product_str = str(product).strip()
+            if not product_str:
+                continue
+
+            mapping_rows.append((product_str.lower(), row))
+
+        if not mapping_rows:
+            return df
+
+        matched_rows = []
+        descriptions = df.get("item_description", pd.Series(dtype="object")).fillna("")
+
+        for description in descriptions:
+            description_str = str(description).strip()
+            if not description_str:
+                matched_rows.append(None)
+                continue
+
+            desc_key = description_str.lower()
+            best_score = 0.0
+            best_row = None
+
+            for product_key, mapping_row in mapping_rows:
+                score = SequenceMatcher(None, desc_key, product_key).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_row = mapping_row
+
+            if best_score >= _PRODUCT_SIMILARITY_THRESHOLD:
+                matched_rows.append(best_row)
+            else:
+                matched_rows.append(None)
+
+        for field in PROCUREMENT_CATEGORY_FIELDS:
+            values = []
+            for match in matched_rows:
+                if match is None:
+                    values.append(None)
+                else:
+                    values.append(getattr(match, field, None))
+            df[field] = values
 
         return df
 
