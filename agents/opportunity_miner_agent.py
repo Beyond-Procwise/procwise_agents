@@ -472,6 +472,7 @@ class OpportunityMinerAgent(BaseAgent):
                 for _, row in df.iterrows():
                     supplier_id = row["supplier_id"]
                     lookup[supplier_id] = row.get("supplier_name") or None
+
         self._supplier_lookup = lookup
         logger.debug("Loaded %d suppliers from master data", len(self._supplier_lookup))
 
@@ -575,6 +576,7 @@ class OpportunityMinerAgent(BaseAgent):
             len(self._invoice_supplier_map),
             len(self._contract_supplier_map),
         )
+
 
     def _normalise_currency(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Convert all monetary values to GBP using simple FX mapping."""
@@ -961,6 +963,7 @@ class OpportunityMinerAgent(BaseAgent):
         invoice_supplier_map = getattr(self, "_invoice_supplier_map", {})
         invoice_po_map = getattr(self, "_invoice_po_map", {})
 
+
         def _lookup(df: pd.DataFrame, key_col: str, val_col: str, key: str) -> Optional[str]:
             try:
                 if df.empty or key_col not in df.columns or val_col not in df.columns:
@@ -1053,6 +1056,7 @@ class OpportunityMinerAgent(BaseAgent):
                         )
                     if candidate_cat:
                         f.category_id = str(candidate_cat)
+
                 if src_key and not f.item_id:
                     f.item_id = (
                         _lookup(po_lines, "po_id", "item_id", src_key)

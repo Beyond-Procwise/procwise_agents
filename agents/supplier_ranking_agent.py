@@ -6,7 +6,7 @@ import logging
 import re
 import pandas as pd
 import ollama
-
+import warnings
 from utils.gpu import configure_gpu
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
@@ -15,6 +15,12 @@ configure_gpu()
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 logger = logging.getLogger(__name__)
 
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="pandas only supports SQLAlchemy connectable",
+        category=UserWarning,
+    )
 
 class SupplierRankingAgent(BaseAgent):
     """Rank suppliers based on criteria and supplier data.
