@@ -1,5 +1,6 @@
 import os
 import sys
+import uuid
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -42,6 +43,9 @@ def test_upsert_and_search():
     rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
     rag.upsert_texts(["hello world"], {"record_id": "test"})
     assert nick.qdrant_client.upserts  # ensure upsert called
+    point_ids = [p.id for p in nick.qdrant_client.upserts[0]["points"]]
+    for pid in point_ids:
+        uuid.UUID(str(pid))
     hits = rag.search("hello")
     assert hits[0].payload["record_id"] == "test"
     # ensure local indexes were used without calling qdrant search
