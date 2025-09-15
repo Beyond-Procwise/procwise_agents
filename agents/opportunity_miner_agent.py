@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional,Any
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -28,6 +28,7 @@ class Finding:
     calculation_details: Dict
     source_records: List[str]
     detected_on: datetime
+    supplier_name: Optional[str] = None
     weightage: float = 0.0
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
     context_documents: List[Dict[str, Any]] = field(default_factory=list)
@@ -44,6 +45,8 @@ class OpportunityMinerAgent(BaseAgent):
     def __init__(self, agent_nick, min_financial_impact: float = 100.0) -> None:
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
+        self._supplier_lookup: Dict[str, Optional[str]] = {}
+        self._contract_supplier_map: Dict[str, str] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -74,6 +77,7 @@ class OpportunityMinerAgent(BaseAgent):
                     logger.exception("Failed to train procurement context")
             tables = self._ingest_data()
             tables = self._validate_data(tables)
+            self._build_supplier_lookup(tables)
             tables = self._normalise_currency(tables)
             tables = self._apply_index_adjustment(tables)
 
@@ -308,6 +312,46 @@ class OpportunityMinerAgent(BaseAgent):
             logger.debug("Table %s columns: %s", name, list(tables[name].columns))
         return tables
 
+    def _build_supplier_lookup(self, tables: Dict[str, pd.DataFrame]) -> None:
+        """Build helper maps to resolve supplier metadata from ``proc.supplier``."""
+
+        supplier_master = tables.get("supplier_master", pd.DataFrame())
+        lookup: Dict[str, Optional[str]] = {}
+        if not supplier_master.empty and "supplier_id" in supplier_master.columns:
+            df = supplier_master.dropna(subset=["supplier_id"]).copy()
+            if not df.empty:
+                df["supplier_id"] = df["supplier_id"].astype(str)
+                name_col = "supplier_name" if "supplier_name" in df.columns else None
+                if name_col:
+                    df[name_col] = df[name_col].where(~df[name_col].isna(), None)
+                for _, row in df.iterrows():
+                    supplier_id = row["supplier_id"]
+                    supplier_name = None
+                    if name_col and row.get(name_col) is not None:
+                        supplier_name = str(row[name_col])
+                    lookup[supplier_id] = supplier_name
+        self._supplier_lookup = lookup
+        logger.debug("Loaded %d suppliers from master data", len(self._supplier_lookup))
+
+        contracts = tables.get("contracts", pd.DataFrame())
+        contract_map: Dict[str, str] = {}
+        required_contract_cols = {"contract_id", "supplier_id"}
+        if not contracts.empty and required_contract_cols.issubset(contracts.columns):
+            df = contracts.dropna(subset=list(required_contract_cols)).copy()
+            if not df.empty:
+                df["contract_id"] = df["contract_id"].astype(str)
+                df["supplier_id"] = df["supplier_id"].astype(str)
+                for _, row in df.iterrows():
+                    supplier_id = row["supplier_id"]
+                    if self._supplier_lookup and supplier_id not in self._supplier_lookup:
+                        continue
+                    contract_map[row["contract_id"]] = supplier_id
+        self._contract_supplier_map = contract_map
+        logger.debug(
+            "Mapped %d contracts to supplier IDs using validated supplier data",
+            len(self._contract_supplier_map),
+        )
+
     def _normalise_currency(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Convert all monetary values to GBP using simple FX mapping."""
 
@@ -422,6 +466,8 @@ class OpportunityMinerAgent(BaseAgent):
         contracts = tables.get("contracts", pd.DataFrame())
         quotes = tables.get("quotes", pd.DataFrame())
         quote_lines = tables.get("quote_lines", pd.DataFrame())
+        supplier_lookup = getattr(self, "_supplier_lookup", {})
+        contract_supplier_map = getattr(self, "_contract_supplier_map", {})
 
         def _lookup(df: pd.DataFrame, key_col: str, val_col: str, key: str) -> Optional[str]:
             try:
@@ -432,28 +478,44 @@ class OpportunityMinerAgent(BaseAgent):
             except Exception:
                 return None
 
+        def _clean_supplier(value: Optional[str]) -> Optional[str]:
+            if value is None:
+                return None
+            supplier_id = str(value)
+            if supplier_lookup and supplier_id not in supplier_lookup:
+                logger.debug(
+                    "Supplier ID %s not found in supplier master; ignoring", supplier_id
+                )
+                return None
+            return supplier_id
+
         for f in findings:
+            f.supplier_id = _clean_supplier(f.supplier_id)
             for src in f.source_records:
-                if not f.supplier_id:
-                    f.supplier_id = (
-                        _lookup(po, "po_id", "supplier_id", src)
-                        or _lookup(contracts, "contract_id", "supplier_id", src)
-                        or _lookup(quotes, "quote_id", "supplier_id", src)
-                        or f.supplier_id
+                src_key = str(src) if src is not None else None
+                if src_key and not f.supplier_id:
+                    candidate = (
+                        contract_supplier_map.get(src_key)
+                        or _lookup(po, "po_id", "supplier_id", src_key)
+                        or _lookup(contracts, "contract_id", "supplier_id", src_key)
+                        or _lookup(quotes, "quote_id", "supplier_id", src_key)
                     )
-                if not f.category_id:
+                    f.supplier_id = _clean_supplier(candidate)
+                if src_key and not f.category_id:
                     f.category_id = (
-                        _lookup(po, "po_id", "spend_category", src)
-                        or _lookup(contracts, "contract_id", "spend_category", src)
+                        _lookup(po, "po_id", "spend_category", src_key)
+                        or _lookup(contracts, "contract_id", "spend_category", src_key)
                         or f.category_id
                     )
-                if not f.item_id:
+                if src_key and not f.item_id:
                     f.item_id = (
-                        _lookup(po_lines, "po_id", "item_id", src)
-                        or _lookup(inv_lines, "invoice_id", "item_id", src)
-                        or _lookup(quote_lines, "quote_id", "item_id", src)
+                        _lookup(po_lines, "po_id", "item_id", src_key)
+                        or _lookup(inv_lines, "invoice_id", "item_id", src_key)
+                        or _lookup(quote_lines, "quote_id", "item_id", src_key)
                         or f.item_id
                     )
+            if f.supplier_id and supplier_lookup:
+                f.supplier_name = supplier_lookup.get(f.supplier_id)
         return findings
 
     def _detect_unit_price_vs_benchmark(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
@@ -936,6 +998,23 @@ class OpportunityMinerAgent(BaseAgent):
             {"supplier_id": r["supplier_id"], "unit_price": float(r["unit_price"])}
             for _, r in grouped.iterrows()
         ]
+        supplier_lookup = getattr(self, "_supplier_lookup", {})
+        if supplier_lookup:
+            filtered: List[Dict[str, Any]] = []
+            for candidate in result:
+                supplier_id = str(candidate.get("supplier_id"))
+                if supplier_id not in supplier_lookup:
+                    logger.debug(
+                        "Candidate supplier %s missing from supplier master; skipping",
+                        supplier_id,
+                    )
+                    continue
+                candidate["supplier_id"] = supplier_id
+                supplier_name = supplier_lookup.get(supplier_id)
+                if supplier_name:
+                    candidate["supplier_name"] = supplier_name
+                filtered.append(candidate)
+            result = filtered
         logger.debug("_find_candidate_suppliers found %d candidates", len(result))
         return result
 
