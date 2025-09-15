@@ -30,6 +30,7 @@ class Finding:
     detected_on: datetime
     weightage: float = 0.0
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
+    context_documents: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
@@ -79,13 +80,14 @@ class OpportunityMinerAgent(BaseAgent):
             findings.extend(self._detect_logistics_cost_outliers(tables))
             findings.extend(self._detect_supplier_consolidation(tables))
             findings.extend(self._detect_supplier_price_difference(tables))
-
+            findings = self._enrich_findings(findings, tables)
             filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
             self._load_supplier_risk_map()
             for f in filtered:
                 f.candidate_suppliers = self._find_candidate_suppliers(
                     f.item_id, f.supplier_id, f.source_records
                 )
+            self._attach_vector_context(filtered)
 
             # compute weightage
             total_impact = sum(f.financial_impact_gbp for f in filtered)
@@ -145,6 +147,8 @@ class OpportunityMinerAgent(BaseAgent):
         "invoices": "proc.invoice_agent",
         "invoice_lines": "proc.invoice_line_items_agent",
         "contracts": "proc.contracts",
+        "quotes": "proc.quote_agent",
+        "quote_lines": "proc.quote_line_items_agent",
         # "price_benchmarks": "price_benchmarks",
         # "indices": "indices",
         # "shipments": "shipments",
@@ -401,6 +405,50 @@ class OpportunityMinerAgent(BaseAgent):
             impact,
         )
         return finding
+
+    def _enrich_findings(
+        self, findings: List[Finding], tables: Dict[str, pd.DataFrame]
+    ) -> List[Finding]:
+        """Fill in missing supplier/category/item IDs using live tables."""
+        po = tables.get("purchase_orders", pd.DataFrame())
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        inv_lines = tables.get("invoice_lines", pd.DataFrame())
+        contracts = tables.get("contracts", pd.DataFrame())
+        quotes = tables.get("quotes", pd.DataFrame())
+        quote_lines = tables.get("quote_lines", pd.DataFrame())
+
+        def _lookup(df: pd.DataFrame, key_col: str, val_col: str, key: str) -> Optional[str]:
+            try:
+                if df.empty or key_col not in df.columns or val_col not in df.columns:
+                    return None
+                match = df[df[key_col].astype(str) == str(key)][val_col].dropna()
+                return str(match.iloc[0]) if not match.empty else None
+            except Exception:
+                return None
+
+        for f in findings:
+            for src in f.source_records:
+                if not f.supplier_id:
+                    f.supplier_id = (
+                        _lookup(po, "po_id", "supplier_id", src)
+                        or _lookup(contracts, "contract_id", "supplier_id", src)
+                        or _lookup(quotes, "quote_id", "supplier_id", src)
+                        or f.supplier_id
+                    )
+                if not f.category_id:
+                    f.category_id = (
+                        _lookup(po, "po_id", "spend_category", src)
+                        or _lookup(contracts, "contract_id", "spend_category", src)
+                        or f.category_id
+                    )
+                if not f.item_id:
+                    f.item_id = (
+                        _lookup(po_lines, "po_id", "item_id", src)
+                        or _lookup(inv_lines, "invoice_id", "item_id", src)
+                        or _lookup(quote_lines, "quote_id", "item_id", src)
+                        or f.item_id
+                    )
+        return findings
 
     def _detect_unit_price_vs_benchmark(self, tables: Dict[str, pd.DataFrame]) -> List[Finding]:
         findings: List[Finding] = []
@@ -789,6 +837,15 @@ class OpportunityMinerAgent(BaseAgent):
         except Exception:
             self._supplier_risk_map = {}
         return self._supplier_risk_map
+
+    def _attach_vector_context(self, findings: List[Finding]) -> None:
+        """Enrich findings with related documents from the vector store."""
+        for f in findings:
+            query_parts = [p for p in [f.supplier_id, f.category_id, f.item_id] if p]
+            if not query_parts:
+                continue
+            hits = self.vector_search(" ".join(query_parts), top_k=3)
+            f.context_documents = [h.payload for h in hits]
 
     def _find_candidate_suppliers(
         self,

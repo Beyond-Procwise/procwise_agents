@@ -66,6 +66,7 @@ class BaseAgent:
         self.settings = agent_nick.settings
         # Ensure GPU environment variables are set for all agents
         self.device = configure_gpu()
+        os.environ.setdefault("PROCWISE_DEVICE", self.device)
         logger.info(
             f"Initialized agent: {self.__class__.__name__} on device {self.device}"
         )
@@ -161,6 +162,29 @@ class BaseAgent:
         except Exception as exc:  # pragma: no cover - network / runtime issues
             logger.exception("Ollama call failed")
             return {"response": "", "error": str(exc)}
+
+    def vector_search(self, query: str, top_k: int = 5):
+        """Search the vector database for similar content.
+
+        Falls back gracefully when vector infrastructure is unavailable.
+        """
+        client = getattr(self.agent_nick, "qdrant_client", None)
+        embedder = getattr(self.agent_nick, "embedding_model", None)
+        collection = getattr(self.settings, "qdrant_collection_name", None)
+        if not all([client, embedder, collection]) or not hasattr(client, "search"):
+            return []
+        try:
+            vec = embedder.encode(query, normalize_embeddings=True).tolist()
+            return client.search(
+                collection_name=collection,
+                query_vector=vec,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("vector search failed")
+            return []
 
 class AgentNick:
     def __init__(self):
