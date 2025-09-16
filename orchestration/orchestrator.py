@@ -50,6 +50,7 @@ class Orchestrator:
 
     WORKFLOW_DEFAULT_CONDITIONS = {
         "contract_expiry_check": {"negotiation_window_days": 90},
+
     }
 
     def __init__(self, agent_nick):
@@ -418,6 +419,7 @@ class Orchestrator:
             if current is None or (isinstance(current, str) and not current.strip()):
                 conditions[field] = value
 
+
     def _default_workflow_for_agent(self, agent_key: Any) -> Optional[str]:
         """Return an implicit workflow for agents with legacy defaults."""
 
@@ -483,6 +485,7 @@ class Orchestrator:
                 if normalised and normalised != candidate:
                     alias_applied = True
                 candidate = normalised or candidate
+
 
         if candidate:
             input_data["workflow"] = candidate

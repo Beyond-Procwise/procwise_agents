@@ -429,7 +429,6 @@ def test_execute_legacy_flow_defaults_workflow_for_opportunity_miner():
     assert captured["input"]["workflow"] == "contract_expiry_check"
     assert captured["input"].get("conditions", {}).get("negotiation_window_days") == 90
 
-
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
         "status": "saved",
