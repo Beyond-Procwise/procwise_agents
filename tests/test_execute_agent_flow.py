@@ -5,7 +5,7 @@ from types import SimpleNamespace
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from orchestration.orchestrator import Orchestrator
-from agents.base_agent import AgentOutput, AgentStatus
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
 class EchoAgent:
@@ -359,3 +359,130 @@ def test_execute_agent_flow_accepts_class_name():
 
     assert flow["status"] == 100
     assert agent.ran is True
+
+
+def test_execute_legacy_flow_injects_workflow_metadata():
+    captured = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = context.input_data
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    agent = CaptureAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {}
+    orchestrator._load_policies = lambda: {}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "opportunity_miner",
+        "agent_property": {"workflow": "price_variance_check"},
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    assert captured["input"]["workflow"] == "price_variance_check"
+
+
+def test_execute_workflow_promotes_falsy_workflow_value():
+    captured = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = context.input_data
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"supplier_candidates": []},
+            )
+
+    policy_engine = SimpleNamespace(
+        validate_workflow=lambda *args, **kwargs: {"allowed": True}
+    )
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": CaptureAgent()},
+        policy_engine=policy_engine,
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+
+    result = orchestrator.execute_workflow("opportunity_mining", {"workflow": None})
+
+    assert result["status"] == "completed"
+    assert captured["input"]["workflow"] == "opportunity_mining"
+
+
+def test_create_child_context_preserves_parent_workflow():
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+
+    parent = AgentContext(
+        workflow_id="wf-id",
+        agent_id="root",
+        user_id="tester",
+        input_data={"workflow": "price_variance_check"},
+    )
+
+    child = orchestrator._create_child_context(
+        parent,
+        "child_agent",
+        {"workflow": None, "extra": "value"},
+    )
+
+    assert child.input_data["workflow"] == "price_variance_check"
+    assert child.input_data["extra"] == "value"
+
+
+def test_json_flow_uses_flow_level_workflow_hint():
+    captured = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = context.input_data
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": CaptureAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {}
+    orchestrator._load_policies = lambda: {}
+
+    flow = {
+        "workflow": "price_variance_check",
+        "entrypoint": "start",
+        "steps": {
+            "start": {
+                "agent": "opportunity_miner",
+            }
+        },
+    }
+
+    orchestrator.execute_agent_flow(flow, {})
+
+    assert captured["input"]["workflow"] == "price_variance_check"
