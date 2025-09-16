@@ -83,7 +83,9 @@ class QuoteEvaluationAgent(BaseAgent):
             supplier_ids_filter = ranking_ids or explicit_supplier_ids
             supplier_tokens = self._merge_supplier_tokens(
                 supplier_names_filter, supplier_ids_filter
+
             )
+            supplier_filter = ranking_suppliers or explicit_suppliers
 
             quotes = self._fetch_quotes(
                 supplier_names_filter,
@@ -92,6 +94,7 @@ class QuoteEvaluationAgent(BaseAgent):
             )
             if supplier_tokens:
                 quotes = self._filter_quotes_by_suppliers(quotes, supplier_tokens)
+
             if ranking_suppliers:
                 quotes = self._order_quotes_by_rank(
                     quotes, ranking_suppliers, limit=3
@@ -490,6 +493,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 continue
             suppliers.append({"name": supplier_name, "supplier_id": supplier_id})
             if limit and len(suppliers) >= limit:
+
                 break
         return suppliers
 
@@ -532,6 +536,7 @@ class QuoteEvaluationAgent(BaseAgent):
         quotes: List[Dict],
         supplier_order: List[Dict[str, Optional[str]]],
         limit: int = 3,
+
     ) -> List[Dict]:
         """Order and limit quotes based on supplier ranking."""
 
@@ -573,6 +578,7 @@ class QuoteEvaluationAgent(BaseAgent):
             if quote_key:
                 seen_suppliers.add(quote_key)
             prioritized.append(chosen)
+
             if limit and len(prioritized) >= limit:
                 break
 

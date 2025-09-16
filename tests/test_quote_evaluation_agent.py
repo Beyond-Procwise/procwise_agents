@@ -127,6 +127,7 @@ def test_quote_evaluation_limits_to_ranked_suppliers(monkeypatch):
     def mock_fetch(supplier_names, supplier_ids=None, product_category=None):
         captured["supplier_names"] = supplier_names
         captured["supplier_ids"] = supplier_ids
+
         return [
             {
                 "quote_id": "Q1",
