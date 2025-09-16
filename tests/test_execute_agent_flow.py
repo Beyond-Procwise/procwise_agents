@@ -291,7 +291,6 @@ def test_ranking_workflow_runs_full_supplier_flow():
     class StubQuoteAgent:
         def __init__(self):
             self.ranking_seen = None
-
             self.category_seen = None
 
 

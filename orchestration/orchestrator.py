@@ -962,7 +962,6 @@ class Orchestrator:
 
         results["ranking"] = ranking_result.data or {}
 
-
         if ranking_result.status != AgentStatus.SUCCESS:
             return results
 
@@ -1099,7 +1098,6 @@ class Orchestrator:
                 pass_fields["ranking"] = ranking_payload
             if category_hint and "product_category" not in pass_fields:
                 pass_fields["product_category"] = category_hint
-
 
             if ranking_payload and "quote_evaluation" in self.agents:
                 quote_ctx = self._create_child_context(

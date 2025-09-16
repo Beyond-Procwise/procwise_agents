@@ -98,6 +98,8 @@ class QuoteEvaluationAgent(BaseAgent):
                 supplier_ids_filter,
             )
 
+            retrieval_strategy = "ranked_suppliers"
+
             db_quotes = self._fetch_quotes_from_database(
                 supplier_names_filter,
                 supplier_ids_filter,
@@ -115,17 +117,75 @@ class QuoteEvaluationAgent(BaseAgent):
                     len(db_quotes),
                     len(vector_quotes),
                 )
-            if supplier_tokens:
-                quotes = self._filter_quotes_by_suppliers(quotes, supplier_tokens)
 
-            if ranking_suppliers:
+            if not quotes and product_category:
+                supplier_filters_present = bool(
+                    supplier_names_filter or supplier_ids_filter
+                )
+                if supplier_filters_present:
+                    supplier_fallback_db = self._fetch_quotes_from_database(
+                        supplier_names_filter,
+                        supplier_ids_filter,
+                        product_category=None,
+                    )
+                    supplier_fallback_vector = self._fetch_quotes(
+                        supplier_names_filter,
+                        supplier_ids_filter,
+                        product_category=None,
+                    )
+                    supplier_fallback = self._merge_quote_sources(
+                        supplier_fallback_db, supplier_fallback_vector
+                    )
+                    if supplier_fallback:
+                        retrieval_strategy = "supplier_fallback"
+                        quotes = supplier_fallback
+                        logger.info(
+                            "QuoteEvaluationAgent: widened search for suppliers %s/%s produced %d quotes",
+                            supplier_names_filter,
+                            supplier_ids_filter,
+                            len(quotes),
+                        )
+                if not quotes:
+                    category_fallback_db = self._fetch_quotes_from_database(
+                        [], [], product_category=product_category
+                    )
+                    category_fallback_vector = self._fetch_quotes(
+                        [], [], product_category
+                    )
+                    category_fallback = self._merge_quote_sources(
+                        category_fallback_db, category_fallback_vector
+                    )
+                    if category_fallback:
+                        retrieval_strategy = "category_fallback"
+                        quotes = category_fallback
+                        logger.info(
+                            "QuoteEvaluationAgent: broadened to category '%s' and retrieved %d quotes",
+                            product_category,
+                            len(quotes),
+                        )
+
+            filtered_quotes = quotes
+
+            if supplier_tokens:
+                filtered_quotes = self._filter_quotes_by_suppliers(
+                    quotes, supplier_tokens
+                )
+                if filtered_quotes or retrieval_strategy != "category_fallback":
+                    quotes = filtered_quotes
+                elif not filtered_quotes and retrieval_strategy == "category_fallback":
+                    logger.info(
+                        "QuoteEvaluationAgent: retaining category fallback quotes after supplier filter removed all results"
+                    )
+
+            if ranking_suppliers and retrieval_strategy != "category_fallback":
                 quotes = self._order_quotes_by_rank(
                     quotes, ranking_suppliers, limit=3
                 )
             logger.info(
-                "QuoteEvaluationAgent: fetched %d quotes for category %s",
+                "QuoteEvaluationAgent: fetched %d quotes for category %s using %s",
                 len(quotes),
                 product_category,
+                retrieval_strategy,
             )
 
             standardized_quotes = self._standardize_quotes(
@@ -140,6 +200,7 @@ class QuoteEvaluationAgent(BaseAgent):
                         "quotes": standardized_quotes,
                         "weights": combined_weight,
                         "message": "No quotes found",
+                        "retrieval_strategy": retrieval_strategy,
                     }
                 )
                 return AgentOutput(
@@ -149,7 +210,11 @@ class QuoteEvaluationAgent(BaseAgent):
                 )
 
             output_data = self._to_native(
-                {"quotes": standardized_quotes, "weights": combined_weight}
+                {
+                    "quotes": standardized_quotes,
+                    "weights": combined_weight,
+                    "retrieval_strategy": retrieval_strategy,
+                }
             )
             logger.debug("QuoteEvaluationAgent output: %s", output_data)
             logger.info(
@@ -413,10 +478,14 @@ class QuoteEvaluationAgent(BaseAgent):
             token = str(product_category).strip().lower()
             category_token = token or None
 
-        enriched: List[Dict] = []
+        matched_quotes: List[Dict] = []
+        unmatched_quotes: List[Dict] = []
+
         for quote in quote_records:
             quote_id = quote.get("quote_id")
             items = line_map.get(quote_id, [])
+
+            matched = False
 
             if category_token:
                 matched = any(
@@ -424,11 +493,10 @@ class QuoteEvaluationAgent(BaseAgent):
                     or category_token == str(item.get("item_id", "")).lower()
                     for item in items
                 )
-                if not matched:
-                    continue
 
             quote["line_items"] = items
             quote["line_items_count"] = len(items)
+            quote["category_match"] = bool(matched)
 
             if items:
                 if not quote.get("currency"):
@@ -462,7 +530,19 @@ class QuoteEvaluationAgent(BaseAgent):
 
                 quote.setdefault("volume", len(items))
 
-            enriched.append(quote)
+            target = matched_quotes if matched else unmatched_quotes
+            target.append(quote)
+
+        enriched = matched_quotes + unmatched_quotes
+
+        if category_token:
+            logger.debug(
+                "QuoteEvaluationAgent: %d of %d quotes matched category token '%s'",
+                len(matched_quotes),
+                len(enriched),
+                category_token,
+            )
+
 
         logger.debug(
             "QuoteEvaluationAgent: retrieved %d quotes from database", len(enriched)
@@ -564,6 +644,8 @@ class QuoteEvaluationAgent(BaseAgent):
             "total_line_amount": QuoteEvaluationAgent._coalesce(
                 quote, ["total_line_amount"], 0
             ),
+            "category_match": bool(quote.get("category_match")),
+
             "buyer_id": QuoteEvaluationAgent._coalesce(
                 quote, ["buyer_id"], None, strip_strings=True
             ),

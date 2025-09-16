@@ -62,6 +62,56 @@ def _mock_quotes(*args, **kwargs):
     ]
 
 
+class QuoteCursorStub:
+    def __init__(self, connection):
+        self.connection = connection
+        self.description = []
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        self.connection.queries.append((sql, params))
+        if "FROM proc.quote_agent" in sql:
+            self._rows = self.connection.quotes
+            self.description = [(col,) for col in self.connection.quote_columns]
+        elif "FROM proc.quote_line_items_agent" in sql:
+            self._rows = self.connection.lines
+            self.description = [(col,) for col in self.connection.line_columns]
+        else:
+            self._rows = []
+            self.description = []
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class QuoteConnectionStub:
+    def __init__(self, quotes, lines, quote_cols, line_cols):
+        self.quotes = quotes
+        self.lines = lines
+        self.quote_columns = quote_cols
+        self.line_columns = line_cols
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def cursor(self):
+        return QuoteCursorStub(self)
+
+
+def build_quote_connection(quotes, lines, quote_columns, line_columns):
+    return QuoteConnectionStub(quotes, lines, quote_columns, line_columns)
+
+
 def test_quote_evaluation_agent_run(monkeypatch):
     nick = DummyNick()
     agent = QuoteEvaluationAgent(nick)
@@ -465,51 +515,10 @@ def test_fetch_quotes_from_database_enriches_results():
         "currency",
     ]
 
-    class DummyCursor:
-        def __init__(self, connection):
-            self.connection = connection
-            self.description = []
-            self._rows = []
+    connection = build_quote_connection(
+        quote_rows, line_rows, quote_columns, line_columns
+    )
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def execute(self, sql, params=None):
-            self.connection.queries.append((sql, params))
-            if "FROM proc.quote_agent" in sql:
-                self._rows = self.connection.quotes
-                self.description = [(col,) for col in self.connection.quote_columns]
-            elif "FROM proc.quote_line_items_agent" in sql:
-                self._rows = self.connection.lines
-                self.description = [(col,) for col in self.connection.line_columns]
-            else:
-                self._rows = []
-                self.description = []
-
-        def fetchall(self):
-            return list(self._rows)
-
-    class DummyConnection:
-        def __init__(self, quotes, lines, quote_cols, line_cols):
-            self.quotes = quotes
-            self.lines = lines
-            self.quote_columns = quote_cols
-            self.line_columns = line_cols
-            self.queries = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def cursor(self):
-            return DummyCursor(self)
-
-    connection = DummyConnection(quote_rows, line_rows, quote_columns, line_columns)
     nick.get_db_connection = lambda: connection
 
     agent = QuoteEvaluationAgent(nick)
@@ -523,7 +532,106 @@ def test_fetch_quotes_from_database_enriches_results():
     assert record["avg_unit_price"] == pytest.approx(12.0)
     assert record["total_line_amount"] == pytest.approx(120.0)
     assert record["total_amount"] == Decimal("120.00")
+    assert record["category_match"] is False
     assert connection.queries[0][0].strip().startswith("SELECT")
+
+
+def test_fetch_quotes_from_database_retains_quotes_when_category_misses():
+    nick = DummyNick()
+
+    quote_rows = [
+        (
+            "Q1",
+            "S1",
+            "Supplier One",
+            "B1",
+            date(2024, 5, 1),
+            date(2024, 6, 1),
+            "USD",
+            Decimal("120.00"),
+            Decimal("5.00"),
+            Decimal("6.00"),
+            Decimal("126.00"),
+            "PO1",
+            "US",
+            "NA",
+            "NO",
+            "AUTO",
+            "Widget contract",
+            datetime(2024, 5, 1, 10, 0, 0),
+            "tester",
+            "tester",
+            datetime(2024, 5, 2, 10, 0, 0),
+        )
+    ]
+    line_rows = [
+        (
+            "Q1",
+            "QL1",
+            1,
+            "I1",
+            "Widget Basic",
+            10,
+            "EA",
+            Decimal("12.00"),
+            Decimal("120.00"),
+            Decimal("5.00"),
+            Decimal("6.00"),
+            Decimal("126.00"),
+            "USD",
+        )
+    ]
+    quote_columns = [
+        "quote_id",
+        "supplier_id",
+        "supplier_name",
+        "buyer_id",
+        "quote_date",
+        "validity_date",
+        "currency",
+        "total_amount",
+        "tax_percent",
+        "tax_amount",
+        "total_amount_incl_tax",
+        "po_id",
+        "country",
+        "region",
+        "ai_flag_required",
+        "trigger_type",
+        "trigger_context_description",
+        "created_date",
+        "created_by",
+        "last_modified_by",
+        "last_modified_date",
+    ]
+    line_columns = [
+        "quote_id",
+        "quote_line_id",
+        "line_number",
+        "item_id",
+        "item_description",
+        "quantity",
+        "unit_of_measure",
+        "unit_price",
+        "line_total",
+        "tax_percent",
+        "tax_amount",
+        "total_amount",
+        "currency",
+    ]
+
+    connection = build_quote_connection(
+        quote_rows, line_rows, quote_columns, line_columns
+    )
+    nick.get_db_connection = lambda: connection
+
+    agent = QuoteEvaluationAgent(nick)
+    quotes = agent._fetch_quotes_from_database(
+        ["Supplier One"], ["S1"], product_category="Raw Materials"
+    )
+
+    assert len(quotes) == 1
+    assert quotes[0]["category_match"] is False
 
 
 def test_quote_evaluation_uses_supplier_candidates(monkeypatch):
@@ -559,6 +667,93 @@ def test_quote_evaluation_uses_supplier_candidates(monkeypatch):
     assert captured_db["ids"] == ["S10", "S20"]
     assert captured_vector["ids"] == ["S10", "S20"]
     assert output.data.get("message") == "No quotes found"
+
+
+def test_quote_evaluation_supplier_fallback(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    db_calls = []
+
+    def mock_db_fetch(names, ids, product_category=None):
+        db_calls.append((tuple(names), tuple(ids), product_category))
+        if product_category is None and list(ids) == ["S1"]:
+            return [
+                {
+                    "quote_id": "QF1",
+                    "supplier_id": "S1",
+                    "supplier_name": "Supplier One",
+                    "total_amount": 100,
+                    "line_items": [],
+                    "line_items_count": 0,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(agent, "_fetch_quotes_from_database", mock_db_fetch)
+    monkeypatch.setattr(agent, "_fetch_quotes", lambda *_, **__: [])
+
+    context = AgentContext(
+        workflow_id="wf_supplier_fallback",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={
+            "product_category": "Raw",
+            "ranking": [{"supplier_name": "Supplier One", "supplier_id": "S1"}],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["retrieval_strategy"] == "supplier_fallback"
+    supplier_entries = [q for q in output.data["quotes"] if q["name"] == "Supplier One"]
+    assert supplier_entries
+    assert any(call[2] is None for call in db_calls)
+
+
+def test_quote_evaluation_category_fallback_retained(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    db_calls = []
+
+    def mock_db_fetch(names, ids, product_category=None):
+        db_calls.append((tuple(names), tuple(ids), product_category))
+        if not names and not ids and product_category == "Raw Materials":
+            return [
+                {
+                    "quote_id": "QCAT",
+                    "supplier_id": "S99",
+                    "supplier_name": "Category Supplier",
+                    "total_amount": 250,
+                    "line_items": [],
+                    "line_items_count": 0,
+                    "category_match": True,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(agent, "_fetch_quotes_from_database", mock_db_fetch)
+    monkeypatch.setattr(agent, "_fetch_quotes", lambda *_, **__: [])
+
+    context = AgentContext(
+        workflow_id="wf_category_fallback",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={
+            "product_category": "Raw Materials",
+            "ranking": [{"supplier_name": "Supplier One", "supplier_id": "S1"}],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["retrieval_strategy"] == "category_fallback"
+    supplier_names = {q["name"] for q in output.data["quotes"]}
+    assert "Category Supplier" in supplier_names
+    assert any(call[0] == tuple() and call[2] == "Raw Materials" for call in db_calls)
 
 
 def test_process_handles_empty_product_type(monkeypatch):
