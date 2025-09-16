@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from qdrant_client import models
@@ -50,23 +50,44 @@ class QuoteEvaluationAgent(BaseAgent):
                 or input_data.get("product_type")
                 or None
             )
-            weights = dict(
-                input_data.get(
-                    "weights", {"price": 0.5, "delivery": 0.3, "risk": 0.2}
-                )
+            raw_weights = input_data.get(
+                "weights", {"price": 0.5, "delivery": 0.3, "risk": 0.2}
             )
+            if isinstance(raw_weights, dict):
+                weights = dict(raw_weights)
+            else:
+                weights = {"value": raw_weights}
+            combined_weight = self._combine_weight_values(weights)
+            weight_metadata = {
+                "tenure": weights.get("tenure"),
+                "volume": weights.get("volume"),
+            }
+
+            ranking_suppliers = self._extract_ranked_suppliers(input_data, limit=3)
+            explicit_suppliers = self._ensure_sequence(
+                input_data.get("supplier_names", [])
+            )
+            supplier_filter = ranking_suppliers or explicit_suppliers
 
             quotes = self._fetch_quotes(
-                input_data.get("supplier_names", []),
+                supplier_filter,
                 product_category,
             )
+            if supplier_filter:
+                quotes = self._filter_quotes_by_suppliers(quotes, supplier_filter)
+            if ranking_suppliers:
+                quotes = self._order_quotes_by_rank(
+                    quotes, ranking_suppliers, limit=3
+                )
             logger.info(
                 "QuoteEvaluationAgent: fetched %d quotes for category %s",
                 len(quotes),
                 product_category,
             )
 
-            standardized_quotes = self._standardize_quotes(quotes, weights)
+            standardized_quotes = self._standardize_quotes(
+                quotes, combined_weight, weight_metadata
+            )
 
             if not quotes:
                 # Absence of quotes should not be treated as a hard failure:
@@ -74,7 +95,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 empty_payload = self._to_native(
                     {
                         "quotes": standardized_quotes,
-                        "weights": weights,
+                        "weights": combined_weight,
                         "message": "No quotes found",
                     }
                 )
@@ -85,7 +106,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 )
 
             output_data = self._to_native(
-                {"quotes": standardized_quotes, "weights": weights}
+                {"quotes": standardized_quotes, "weights": combined_weight}
             )
             logger.debug("QuoteEvaluationAgent output: %s", output_data)
             logger.info(
@@ -177,6 +198,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 {
                     "quote_id": payload.get("quote_id", point.id),
                     "supplier_name": payload.get("supplier_name", ""),
+                    "supplier_id": payload.get("supplier_id"),
                     "total_spend": payload.get("total_spend", payload.get("total_amount", 0)),
                     "tenure": payload.get("tenure"),
                     "total_cost": payload.get("total_cost", payload.get("total_amount", 0)),
@@ -193,27 +215,35 @@ class QuoteEvaluationAgent(BaseAgent):
         return quotes
 
     def _standardize_quotes(
-        self, quotes: List[Dict], weights: Dict
+        self,
+        quotes: List[Dict],
+        combined_weight: float,
+        weight_metadata: Dict,
     ) -> List[Dict]:
         """Produce the standard quote comparison output structure."""
 
-        standardized: List[Dict] = [self._build_weighting_entry(weights)]
+        standardized: List[Dict] = [
+            self._build_weighting_entry(combined_weight, weight_metadata)
+        ]
         for quote in quotes:
             standardized.append(self._standardize_quote(quote))
         return standardized
 
     @staticmethod
-    def _build_weighting_entry(weights: Dict) -> Dict:
+    def _build_weighting_entry(
+        combined_weight: float, metadata: Optional[Dict]
+    ) -> Dict:
         """Create the leading weighting row for the comparison table."""
 
+        meta = metadata or {}
         return {
             "name": "weighting",
-            "total_spend": weights.get("price", 0),
-            "total_cost": weights.get("delivery", 0),
-            "unit_price": weights.get("risk", 0),
+            "total_spend": combined_weight,
+            "total_cost": 0,
+            "unit_price": 0,
             "quote_file_s3_path": None,
-            "tenure": weights.get("tenure"),
-            "volume": weights.get("volume", 0),
+            "tenure": meta.get("tenure"),
+            "volume": meta.get("volume", 0),
         }
 
     @staticmethod
@@ -234,6 +264,9 @@ class QuoteEvaluationAgent(BaseAgent):
 
         return {
             "name": str(supplier_name),
+            "supplier_id": QuoteEvaluationAgent._coalesce(
+                quote, ["supplier_id"], None, strip_strings=True
+            ),
             "total_spend": QuoteEvaluationAgent._coalesce(
                 quote, ["total_spend", "total_amount"], 0
             ),
@@ -302,4 +335,177 @@ class QuoteEvaluationAgent(BaseAgent):
         if isinstance(obj, np.generic):
             return obj.item()
         return obj
+
+    @staticmethod
+    def _combine_weight_values(weights: Dict) -> float:
+        """Aggregate multi-factor weights into a single numeric value."""
+
+        if not isinstance(weights, dict):
+            try:
+                return float(weights)
+            except (TypeError, ValueError):
+                return 0.0
+
+        total = 0.0
+        for key in ("price", "delivery", "risk", "value"):
+            value = weights.get(key)
+            try:
+                total += float(value)
+            except (TypeError, ValueError):
+                continue
+
+        if total:
+            return total
+
+        numeric_values: List[float] = []
+        for key, value in weights.items():
+            if key in {"tenure", "volume"}:
+                continue
+            try:
+                numeric_values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return sum(numeric_values)
+
+    @staticmethod
+    def _ensure_sequence(value: Any) -> List[str]:
+        """Normalise supplier inputs into a clean list of strings."""
+
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            sequence = value
+        else:
+            sequence = [value]
+        normalised: List[str] = []
+        for item in sequence:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                normalised.append(text)
+        return normalised
+
+    @staticmethod
+    def _extract_ranked_suppliers(
+        input_data: Dict, limit: int = 3
+    ) -> List[str]:
+        """Return ordered supplier identifiers from ranking payloads."""
+
+        ranking = input_data.get("ranking")
+        if not ranking:
+            return []
+        if isinstance(ranking, dict):
+            ranking_list = ranking.get("ranking")
+            if isinstance(ranking_list, list):
+                ranking = ranking_list
+            else:
+                return []
+        if not isinstance(ranking, list):
+            return []
+
+        suppliers: List[str] = []
+        for entry in ranking:
+            if not isinstance(entry, dict):
+                continue
+            candidate = None
+            for key in ("supplier_name", "name", "supplier", "supplier_id"):
+                candidate = entry.get(key)
+                if candidate:
+                    break
+            if not candidate:
+                continue
+            text = str(candidate).strip()
+            if not text:
+                continue
+            suppliers.append(text)
+            if len(suppliers) >= limit:
+                break
+        return suppliers
+
+    @staticmethod
+    def _normalize_supplier_identifier(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        return text or None
+
+    def _filter_quotes_by_suppliers(
+        self, quotes: List[Dict], suppliers: List[str]
+    ) -> List[Dict]:
+        """Restrict quotes to those whose supplier matches the provided list."""
+
+        normalized_targets = {
+            token
+            for supplier in suppliers
+            if (token := self._normalize_supplier_identifier(supplier))
+        }
+        if not normalized_targets:
+            return quotes
+
+        filtered: List[Dict] = []
+        for quote in quotes:
+            identifiers = (
+                quote.get("supplier_name"),
+                quote.get("supplier_id"),
+                quote.get("name"),
+            )
+            for identifier in identifiers:
+                norm_identifier = self._normalize_supplier_identifier(identifier)
+                if norm_identifier and norm_identifier in normalized_targets:
+                    filtered.append(quote)
+                    break
+        return filtered
+
+    def _order_quotes_by_rank(
+        self, quotes: List[Dict], supplier_order: List[str], limit: int = 3
+    ) -> List[Dict]:
+        """Order and limit quotes based on supplier ranking."""
+
+        if not supplier_order:
+            return quotes[:limit] if limit else quotes
+
+        normalized_order = [
+            token
+            for supplier in supplier_order
+            if (token := self._normalize_supplier_identifier(supplier))
+        ]
+        prioritized: List[Dict] = []
+        seen = set()
+        for target in normalized_order:
+            supplier_quotes = [
+                quote
+                for quote in quotes
+                if target
+                in {
+                    self._normalize_supplier_identifier(quote.get("supplier_name")),
+                    self._normalize_supplier_identifier(quote.get("supplier_id")),
+                    self._normalize_supplier_identifier(quote.get("name")),
+                }
+            ]
+            if not supplier_quotes:
+                continue
+            supplier_quotes.sort(key=self._quote_priority)
+            if target in seen:
+                continue
+            prioritized.append(supplier_quotes[0])
+            seen.add(target)
+            if limit and len(prioritized) >= limit:
+                break
+
+        if limit:
+            return prioritized[:limit]
+        return prioritized
+
+    @staticmethod
+    def _quote_priority(quote: Dict) -> float:
+        """Provide a deterministic ordering for supplier quotes."""
+
+        for key in ("total_cost", "total_spend", "unit_price"):
+            value = quote.get(key)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return float("inf")
 
