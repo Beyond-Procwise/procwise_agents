@@ -1,7 +1,8 @@
 import logging
+import re
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 from qdrant_client import models
@@ -84,30 +85,32 @@ class QuoteEvaluationAgent(BaseAgent):
                 input_data.get("supplier_candidates", [])
             )
 
-            supplier_names_filter = self._merge_supplier_tokens(
+            raw_supplier_names = self._merge_supplier_tokens(
                 ranking_names,
                 explicit_suppliers,
             )
-            supplier_ids_filter = self._merge_supplier_tokens(
+            raw_supplier_ids = self._merge_supplier_tokens(
                 ranking_ids,
                 explicit_supplier_ids,
                 candidate_supplier_ids,
             )
+            supplier_name_queries = self._expand_supplier_names(raw_supplier_names)
+            supplier_id_queries = self._expand_supplier_ids(raw_supplier_ids)
             supplier_tokens = self._merge_supplier_tokens(
-                supplier_names_filter,
-                supplier_ids_filter,
+                raw_supplier_names,
+                raw_supplier_ids,
             )
 
             retrieval_strategy = "ranked_suppliers"
 
             db_quotes = self._fetch_quotes_from_database(
-                supplier_names_filter,
-                supplier_ids_filter,
+                supplier_name_queries,
+                supplier_id_queries,
                 product_category=product_category,
             )
             vector_quotes = self._fetch_quotes(
-                supplier_names_filter,
-                supplier_ids_filter,
+                supplier_name_queries,
+                supplier_id_queries,
                 product_category,
             )
             quotes = self._merge_quote_sources(db_quotes, vector_quotes)
@@ -120,17 +123,17 @@ class QuoteEvaluationAgent(BaseAgent):
 
             if not quotes and product_category:
                 supplier_filters_present = bool(
-                    supplier_names_filter or supplier_ids_filter
+                    supplier_name_queries or supplier_id_queries
                 )
                 if supplier_filters_present:
                     supplier_fallback_db = self._fetch_quotes_from_database(
-                        supplier_names_filter,
-                        supplier_ids_filter,
+                        supplier_name_queries,
+                        supplier_id_queries,
                         product_category=None,
                     )
                     supplier_fallback_vector = self._fetch_quotes(
-                        supplier_names_filter,
-                        supplier_ids_filter,
+                        supplier_name_queries,
+                        supplier_id_queries,
                         product_category=None,
                     )
                     supplier_fallback = self._merge_quote_sources(
@@ -141,8 +144,8 @@ class QuoteEvaluationAgent(BaseAgent):
                         quotes = supplier_fallback
                         logger.info(
                             "QuoteEvaluationAgent: widened search for suppliers %s/%s produced %d quotes",
-                            supplier_names_filter,
-                            supplier_ids_filter,
+                            raw_supplier_names,
+                            raw_supplier_ids,
                             len(quotes),
                         )
                 if not quotes:
@@ -853,6 +856,76 @@ class QuoteEvaluationAgent(BaseAgent):
                 merged.append(text)
         return merged
 
+    def _expand_supplier_names(self, names: List[str]) -> List[str]:
+        """Generate query variants for supplier names to improve lookups."""
+
+        expanded: List[str] = []
+        seen: Set[str] = set()
+        for name in names:
+            for variant in self._supplier_query_variants(name):
+                key = variant.strip()
+                if not key:
+                    continue
+                lowered = key.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                expanded.append(key)
+        return expanded
+
+    def _expand_supplier_ids(self, supplier_ids: List[str]) -> List[str]:
+        """Return supplier id variants that cover common case permutations."""
+
+        expanded: List[str] = []
+        seen: Set[str] = set()
+        for identifier in supplier_ids:
+            if identifier is None:
+                continue
+            text = str(identifier).strip()
+            if not text:
+                continue
+            variants = {text, text.lower(), text.upper()}
+            for variant in variants:
+                candidate = variant.strip()
+                if not candidate:
+                    continue
+                lowered = candidate.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                expanded.append(candidate)
+        return expanded
+
+    @staticmethod
+    def _supplier_query_variants(name: Any) -> List[str]:
+        """Return expanded supplier name variants for database/vector filters."""
+
+        if name is None:
+            return []
+        base = str(name).strip()
+        if not base:
+            return []
+
+        variants: Set[str] = {base}
+        ampersand = base.replace("&", " and ")
+        variants.add(ampersand)
+        normalised_space = re.sub(r"\s+", " ", base)
+        if normalised_space:
+            variants.add(normalised_space)
+        punctuation_smoothed = re.sub(r"[\.,;:/\\\-]+", " ", ampersand)
+        punctuation_smoothed = re.sub(r"\s+", " ", punctuation_smoothed).strip()
+        if punctuation_smoothed:
+            variants.add(punctuation_smoothed)
+
+        final: Set[str] = set()
+        for variant in variants:
+            if not variant:
+                continue
+            final.add(variant)
+            final.add(variant.lower())
+            final.add(variant.upper())
+        return [value for value in final if value]
+
     @staticmethod
     def _extract_ranked_suppliers(
         input_data: Dict, limit: int = 3
@@ -896,37 +969,90 @@ class QuoteEvaluationAgent(BaseAgent):
         return suppliers
 
     @staticmethod
-    def _normalize_supplier_identifier(value: Any) -> Optional[str]:
+    def _supplier_identifier_variants(value: Any) -> Set[str]:
         if value is None:
+            return set()
+        text = str(value).strip()
+        if not text:
+            return set()
+
+        lowered = text.lower()
+        variants: Set[str] = {lowered}
+        collapsed = re.sub(r"[^a-z0-9]+", "", lowered)
+        if collapsed:
+            variants.add(collapsed)
+        spaced = re.sub(r"[^a-z0-9]+", " ", lowered)
+        spaced = re.sub(r"\s+", " ", spaced).strip()
+        if spaced:
+            variants.add(spaced)
+        if "&" in lowered:
+            replaced = lowered.replace("&", "and")
+            variants.add(replaced)
+            replaced_spaced = re.sub(r"[^a-z0-9]+", " ", replaced)
+            replaced_spaced = re.sub(r"\s+", " ", replaced_spaced).strip()
+            if replaced_spaced:
+                variants.add(replaced_spaced)
+        return {variant for variant in variants if variant}
+
+    @staticmethod
+    def _normalize_supplier_identifier(value: Any) -> Optional[str]:
+        variants = QuoteEvaluationAgent._supplier_identifier_variants(value)
+        if not variants:
             return None
-        text = str(value).strip().lower()
-        return text or None
+        return sorted(variants)[0]
+
+    @staticmethod
+    def _quote_identifier_values(quote: Dict) -> List[Any]:
+        identifiers: List[Any] = []
+        for key in (
+            "supplier_id",
+            "supplier_name",
+            "name",
+            "supplier",
+            "vendor",
+            "vendor_name",
+            "supplier_code",
+        ):
+            if key in quote:
+                identifiers.append(quote.get(key))
+        metadata = quote.get("metadata")
+        if isinstance(metadata, dict):
+            for key in (
+                "supplier_id",
+                "supplier_name",
+                "vendor_name",
+                "supplier_code",
+                "name",
+            ):
+                if key in metadata:
+                    identifiers.append(metadata.get(key))
+        extras = quote.get("identifiers")
+        if isinstance(extras, (list, tuple, set)):
+            identifiers.extend(extras)
+        return identifiers
+
+    def _quote_identifier_variants(self, quote: Dict) -> Set[str]:
+        variants: Set[str] = set()
+        for identifier in self._quote_identifier_values(quote):
+            variants.update(self._supplier_identifier_variants(identifier))
+        return variants
 
     def _filter_quotes_by_suppliers(
         self, quotes: List[Dict], suppliers: List[str]
     ) -> List[Dict]:
         """Restrict quotes to those whose supplier matches the provided list."""
 
-        normalized_targets = {
-            token
-            for supplier in suppliers
-            if (token := self._normalize_supplier_identifier(supplier))
-        }
-        if not normalized_targets:
+        target_variants: Set[str] = set()
+        for supplier in suppliers:
+            target_variants.update(self._supplier_identifier_variants(supplier))
+        if not target_variants:
             return quotes
 
         filtered: List[Dict] = []
         for quote in quotes:
-            identifiers = (
-                quote.get("supplier_name"),
-                quote.get("supplier_id"),
-                quote.get("name"),
-            )
-            for identifier in identifiers:
-                norm_identifier = self._normalize_supplier_identifier(identifier)
-                if norm_identifier and norm_identifier in normalized_targets:
-                    filtered.append(quote)
-                    break
+            quote_variants = self._quote_identifier_variants(quote)
+            if quote_variants & target_variants:
+                filtered.append(quote)
         return filtered
 
     def _order_quotes_by_rank(
@@ -942,27 +1068,23 @@ class QuoteEvaluationAgent(BaseAgent):
             return quotes[:limit] if limit else quotes
 
         prioritized: List[Dict] = []
-        seen_suppliers = set()
+        seen_suppliers: Set[str] = set()
         for supplier in supplier_order:
             if not isinstance(supplier, dict):
                 continue
 
-            candidate_tokens = [
-                token
-                for key in ("supplier_id", "name")
-                if (token := self._normalize_supplier_identifier(supplier.get(key)))
-            ]
-            if not candidate_tokens:
+            candidate_variants: Set[str] = set()
+            for key in ("supplier_id", "name", "supplier_name"):
+                candidate_variants.update(
+                    self._supplier_identifier_variants(supplier.get(key))
+                )
+            if not candidate_variants:
                 continue
 
             supplier_quotes = []
             for quote in quotes:
-                identifiers = [
-                    self._normalize_supplier_identifier(quote.get("supplier_id")),
-                    self._normalize_supplier_identifier(quote.get("supplier_name")),
-                    self._normalize_supplier_identifier(quote.get("name")),
-                ]
-                if any(token and token in candidate_tokens for token in identifiers):
+                quote_variants = self._quote_identifier_variants(quote)
+                if quote_variants & candidate_variants:
                     supplier_quotes.append(quote)
 
             if not supplier_quotes:
@@ -980,15 +1102,17 @@ class QuoteEvaluationAgent(BaseAgent):
             if limit and len(prioritized) >= limit:
                 break
 
+        if not prioritized:
+            return quotes[:limit] if limit else quotes
         if limit:
             return prioritized[:limit]
         return prioritized
 
     def _quote_key(self, quote: Dict) -> Optional[str]:
         for key in ("supplier_id", "supplier_name", "name"):
-            identifier = self._normalize_supplier_identifier(quote.get(key))
-            if identifier:
-                return identifier
+            variants = sorted(self._supplier_identifier_variants(quote.get(key)))
+            if variants:
+                return variants[0]
         return None
 
     @staticmethod

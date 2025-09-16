@@ -3,6 +3,7 @@ import sys
 from datetime import date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Dict, List
 
 import pytest
 
@@ -240,16 +241,16 @@ def test_quote_evaluation_limits_to_ranked_suppliers(monkeypatch):
 
     output = agent.run(context)
 
-    assert captured_db["supplier_names"] == [
-        "Supplier C",
-        "Supplier A",
-        "Supplier B",
+    assert [name.lower() for name in captured_db["supplier_names"]] == [
+        "supplier c",
+        "supplier a",
+        "supplier b",
     ]
     assert captured_db["supplier_ids"] == []
-    assert captured["supplier_names"] == [
-        "Supplier C",
-        "Supplier A",
-        "Supplier B",
+    assert [name.lower() for name in captured["supplier_names"]] == [
+        "supplier c",
+        "supplier a",
+        "supplier b",
     ]
     assert captured.get("supplier_ids") == []
 
@@ -317,12 +318,115 @@ def test_quote_evaluation_uses_supplier_ids(monkeypatch):
     output = agent.run(context)
 
     assert captured_db["supplier_names"] == []
-    assert captured_db["supplier_ids"] == ["S100", "S200", "S300"]
+    assert [sid.lower() for sid in captured_db["supplier_ids"]] == [
+        "s100",
+        "s200",
+        "s300",
+    ]
     assert captured["supplier_names"] == []
-    assert captured["supplier_ids"] == ["S100", "S200", "S300"]
+    assert [sid.lower() for sid in captured["supplier_ids"]] == [
+        "s100",
+        "s200",
+        "s300",
+    ]
 
     names = [q["name"] for q in output.data["quotes"] if q["name"] != "weighting"]
     assert names == ["Beta Manufacturing", "Alpha Supplies", "Gamma Goods"]
+
+
+def test_quote_evaluation_matches_supplier_name_variants(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    captured: Dict[str, List[str]] = {}
+
+    def mock_db_fetch(supplier_names, supplier_ids, product_category=None):
+        captured["db_supplier_names"] = supplier_names
+        captured["db_supplier_ids"] = supplier_ids
+        return []
+
+    def mock_fetch(supplier_names, supplier_ids=None, product_category=None):
+        captured["vector_supplier_names"] = supplier_names
+        captured["vector_supplier_ids"] = supplier_ids or []
+        return [
+            {
+                "quote_id": "Q-ACME-1",
+                "supplier_name": "ACME INC",
+                "supplier_id": "ACME-01",
+                "total_cost": 150,
+                "unit_price": 5,
+            },
+            {
+                "quote_id": "Q-OTHER",
+                "supplier_name": "Other Supplier",
+                "supplier_id": "OTH-99",
+                "total_cost": 240,
+                "unit_price": 12,
+            },
+        ]
+
+    monkeypatch.setattr(agent, "_fetch_quotes_from_database", mock_db_fetch)
+    monkeypatch.setattr(agent, "_fetch_quotes", mock_fetch)
+
+    ranking = [{"supplier_name": "Acme, Inc."}]
+
+    context = AgentContext(
+        workflow_id="wf_alias",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={"ranking": ranking},
+    )
+
+    output = agent.run(context)
+
+    assert any(
+        name.lower() == "acme inc" for name in captured["vector_supplier_names"]
+    )
+    names = [q["name"] for q in output.data["quotes"] if q["name"] != "weighting"]
+    assert names == ["ACME INC"]
+
+
+def test_quote_evaluation_matches_metadata_vendor_name(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    monkeypatch.setattr(agent, "_fetch_quotes_from_database", lambda *_, **__: [])
+
+    def mock_fetch(supplier_names, supplier_ids=None, product_category=None):
+        return [
+            {
+                "quote_id": "Q-META-1",
+                "metadata": {"vendor_name": "Beta Manufacturing"},
+                "total_cost": 180,
+                "unit_price": 9,
+            },
+            {
+                "quote_id": "Q-META-2",
+                "metadata": {"vendor_name": "Other Supplier"},
+                "total_cost": 220,
+                "unit_price": 11,
+            },
+        ]
+
+    monkeypatch.setattr(agent, "_fetch_quotes", mock_fetch)
+
+    ranking = [{"supplier_name": "Beta Manufacturing"}]
+
+    context = AgentContext(
+        workflow_id="wf_meta",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={"ranking": ranking},
+    )
+
+    output = agent.run(context)
+
+    quote_ids = [
+        q.get("quote_id")
+        for q in output.data["quotes"]
+        if q.get("quote_id") and q["name"] != "weighting"
+    ]
+    assert quote_ids == ["Q-META-1"]
 
 
 class DummyOrchestrator:
@@ -664,8 +768,8 @@ def test_quote_evaluation_uses_supplier_candidates(monkeypatch):
     output = agent.run(context)
 
     assert output.status == AgentStatus.SUCCESS
-    assert captured_db["ids"] == ["S10", "S20"]
-    assert captured_vector["ids"] == ["S10", "S20"]
+    assert [sid.lower() for sid in captured_db["ids"]] == ["s10", "s20"]
+    assert [sid.lower() for sid in captured_vector["ids"]] == ["s10", "s20"]
     assert output.data.get("message") == "No quotes found"
 
 
@@ -677,7 +781,8 @@ def test_quote_evaluation_supplier_fallback(monkeypatch):
 
     def mock_db_fetch(names, ids, product_category=None):
         db_calls.append((tuple(names), tuple(ids), product_category))
-        if product_category is None and list(ids) == ["S1"]:
+        normalised_ids = {str(identifier).lower() for identifier in ids}
+        if product_category is None and normalised_ids == {"s1"}:
             return [
                 {
                     "quote_id": "QF1",

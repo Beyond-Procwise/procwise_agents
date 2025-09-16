@@ -17,6 +17,7 @@ from agents.base_agent import AgentNick
 from agents.data_extraction_agent import DataExtractionAgent
 from agents.supplier_ranking_agent import SupplierRankingAgent
 from agents.quote_evaluation_agent import QuoteEvaluationAgent
+from agents.quote_comparison_agent import QuoteComparisonAgent
 from agents.opportunity_miner_agent import OpportunityMinerAgent
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from agents.email_drafting_agent import EmailDraftingAgent
@@ -38,17 +39,21 @@ async def lifespan(app: FastAPI):
     try:
         agent_nick = AgentNick()
         discrepancy_agent = DiscrepancyDetectionAgent(agent_nick)
+        quote_evaluation_agent = QuoteEvaluationAgent(agent_nick)
+        quote_comparison_agent = QuoteComparisonAgent(agent_nick)
         agent_nick.agents = {
             'data_extraction': DataExtractionAgent(agent_nick),
             'supplier_ranking': SupplierRankingAgent(agent_nick),
-            'quote_evaluation': QuoteEvaluationAgent(agent_nick),
+            'quote_evaluation': quote_evaluation_agent,
             'opportunity_miner': OpportunityMinerAgent(agent_nick),
             'DiscrepancyDetectionAgent': discrepancy_agent,
             'email_drafting': EmailDraftingAgent(agent_nick),
             'NegotiationAgent': NegotiationAgent(agent_nick),
             'ApprovalsAgent': ApprovalsAgent(agent_nick),
             'supplier_interaction': SupplierInteractionAgent(agent_nick),
-            'QuoteEvaluationAgent': QuoteEvaluationAgent(agent_nick),
+            'QuoteEvaluationAgent': quote_evaluation_agent,
+            'quote_comparison': quote_comparison_agent,
+            'QuoteComparisonAgent': quote_comparison_agent,
         }
         agent_nick.email_watcher = SESEmailWatcher(
             agent_nick,
