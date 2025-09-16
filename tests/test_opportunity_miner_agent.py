@@ -315,7 +315,46 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     pb = [f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"]
     assert pb
     assert pb[0]["supplier_name"] == "Supplier One"
+    directory = output.data.get("supplier_directory")
+    assert directory
+    assert any(
+        entry["supplier_id"] == "SI0001" and entry.get("supplier_name") == "Supplier One"
+        for entry in directory
+    )
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
+
+
+def test_candidate_supplier_lookup_uses_original_item(monkeypatch):
+    agent = create_agent(monkeypatch)
+    calls: list[Any] = []
+
+    def fake_find(item_id, supplier_id, sources):  # pragma: no cover - simple stub
+        calls.append(item_id)
+        return []
+
+    monkeypatch.setattr(agent, "_find_candidate_suppliers", fake_find)
+
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert calls
+    assert all(call == "ITM-001" for call in calls)
+    finding = next(
+        f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"
+    )
+    assert finding["item_id"] == "Logistics Support"
+    assert finding.get("item_reference") == "ITM-001"
 
 
 def test_min_financial_impact_override_filters_findings(monkeypatch):

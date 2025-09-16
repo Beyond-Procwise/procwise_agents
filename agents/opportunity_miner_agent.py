@@ -34,6 +34,7 @@ class Finding:
     weightage: float = 0.0
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
     context_documents: List[Dict[str, Any]] = field(default_factory=list)
+    item_reference: Optional[str] = None
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
@@ -248,8 +249,14 @@ class OpportunityMinerAgent(BaseAgent):
             ]
             self._load_supplier_risk_map()
             for f in filtered:
+                candidate_item = f.item_reference or f.item_id
+                if not candidate_item and isinstance(f.calculation_details, dict):
+                    candidate_item = (
+                        f.calculation_details.get("item_reference")
+                        or f.calculation_details.get("item_id")
+                    )
                 f.candidate_suppliers = self._find_candidate_suppliers(
-                    f.item_id, f.supplier_id, f.source_records
+                    candidate_item, f.supplier_id, f.source_records
                 )
             self._attach_vector_context(filtered)
 
@@ -277,12 +284,45 @@ class OpportunityMinerAgent(BaseAgent):
             }
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
-                s["supplier_id"]
+                str(s["supplier_id"]).strip()
                 for f in filtered
                 for s in f.candidate_suppliers
-                if s.get("supplier_id")
+                if s.get("supplier_id") and str(s["supplier_id"]).strip()
             }
             data["supplier_candidates"] = list(supplier_candidates)
+
+            directory_map: Dict[str, Dict[str, Any]] = {}
+
+            def _register_supplier(supplier_id: Optional[str], supplier_name: Optional[str]) -> None:
+                if not supplier_id:
+                    return
+                sid = str(supplier_id).strip()
+                if not sid:
+                    return
+                entry = directory_map.setdefault(sid, {"supplier_id": sid})
+                if supplier_name and not entry.get("supplier_name"):
+                    entry["supplier_name"] = str(supplier_name).strip()
+
+            for f in filtered:
+                _register_supplier(f.supplier_id, f.supplier_name)
+                for candidate in f.candidate_suppliers:
+                    _register_supplier(
+                        candidate.get("supplier_id"), candidate.get("supplier_name")
+                    )
+
+            lookup = getattr(self, "_supplier_lookup", {})
+            if lookup:
+                for sid, entry in directory_map.items():
+                    if entry.get("supplier_name"):
+                        continue
+                    supplier_name = lookup.get(sid)
+                    if supplier_name:
+                        entry["supplier_name"] = supplier_name
+
+            if directory_map:
+                data["supplier_directory"] = sorted(
+                    directory_map.values(), key=lambda entry: entry["supplier_id"]
+                )
             data["notifications"] = sorted(notifications)
             logger.info(
                 "OpportunityMinerAgent produced %d findings and %d candidate suppliers",
@@ -894,6 +934,7 @@ class OpportunityMinerAgent(BaseAgent):
             calculation_details=details,
             source_records=sources,
             detected_on=datetime.utcnow(),
+            item_reference=item_id,
         )
 
         logger.debug(
@@ -1121,6 +1162,8 @@ class OpportunityMinerAgent(BaseAgent):
                 continue
 
             original_item = finding.item_id
+            if original_item and not finding.item_reference:
+                finding.item_reference = str(original_item)
             description = None
             if original_item:
                 description = _resolve(

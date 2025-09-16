@@ -934,6 +934,14 @@ class Orchestrator:
                     )
 
 
+            supplier_directory = (
+                (opp_result.pass_fields or {}).get("supplier_directory")
+                or opp_result.data.get("supplier_directory")
+                or []
+            )
+            if supplier_directory:
+                input_data["supplier_directory"] = supplier_directory
+
             supplier_candidates_raw = (
                 (opp_result.pass_fields or {}).get("supplier_candidates")
                 or opp_result.data.get("supplier_candidates")
@@ -989,6 +997,11 @@ class Orchestrator:
             return results
 
         pass_fields: Dict[str, Any] = dict(ranking_result.pass_fields or {})
+        if (
+            "supplier_directory" not in pass_fields
+            and "supplier_directory" in input_data
+        ):
+            pass_fields["supplier_directory"] = input_data["supplier_directory"]
         if supplier_candidates and "supplier_candidates" not in pass_fields:
             pass_fields["supplier_candidates"] = supplier_candidates
 
