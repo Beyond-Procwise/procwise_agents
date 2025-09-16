@@ -2343,13 +2343,22 @@ class OpportunityMinerAgent(BaseAgent):
             return []
 
         sql = """
-            SELECT supplier_id, COALESCE(unit_price_gbp, unit_price) AS unit_price
-            FROM proc.po_line_items_agent
-            WHERE item_id = %s AND supplier_id IS NOT NULL
+            WITH po_suppliers AS (
+                SELECT p.supplier_id,
+                       COALESCE(li.unit_price_gbp, li.unit_price) AS unit_price
+                FROM proc.po_line_items_agent li
+                JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
+                WHERE li.item_id = %s AND p.supplier_id IS NOT NULL
+            ), invoice_suppliers AS (
+                SELECT ia.supplier_id,
+                       COALESCE(ili.unit_price_gbp, ili.unit_price) AS unit_price
+                FROM proc.invoice_line_items_agent ili
+                JOIN proc.invoice_agent ia ON ia.invoice_id = ili.invoice_id
+                WHERE ili.item_id = %s AND ia.supplier_id IS NOT NULL
+            )
+            SELECT supplier_id, unit_price FROM po_suppliers
             UNION ALL
-            SELECT supplier_id, COALESCE(unit_price_gbp, unit_price) AS unit_price
-            FROM proc.invoice_line_items_agent
-            WHERE item_id = %s AND supplier_id IS NOT NULL
+            SELECT supplier_id, unit_price FROM invoice_suppliers
         """
         try:
             df = self._read_sql(sql, params=(item_id, item_id))
