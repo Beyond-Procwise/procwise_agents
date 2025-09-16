@@ -3,10 +3,12 @@
 import boto3
 import logging
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote_plus
 
 import psycopg2
 from qdrant_client import QdrantClient, models
@@ -198,6 +200,7 @@ class AgentNick:
         self.device = configure_gpu()
         os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
         os.environ.setdefault("OMP_NUM_THREADS", "8")
+        self._db_engine = None
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.s3_client = boto3.client('s3')
@@ -214,6 +217,61 @@ class AgentNick:
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    def get_db_engine(self):
+        """Return a cached SQLAlchemy engine when available.
+
+        The procurement platform increasingly relies on pandas for analytic
+        workloads. pandas issues warnings when supplied with bare DBAPI
+        connections, so we lazily construct a SQLAlchemy engine and reuse it
+        across calls.  If SQLAlchemy is unavailable or engine creation fails we
+        fall back to the existing psycopg2 connection workflow.
+        """
+
+        if self._db_engine is False:
+            return None
+        if self._db_engine is not None:
+            return self._db_engine
+
+        try:  # Import lazily so tests without SQLAlchemy continue to run
+            from sqlalchemy import create_engine
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.debug("SQLAlchemy unavailable for engine creation: %s", exc)
+            self._db_engine = False
+            return None
+
+        try:
+            user = quote_plus(getattr(self.settings, "db_user", ""))
+            password = quote_plus(getattr(self.settings, "db_password", ""))
+            host = getattr(self.settings, "db_host", "localhost")
+            port = getattr(self.settings, "db_port", 5432)
+            dbname = getattr(self.settings, "db_name", "postgres")
+            uri = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+            self._db_engine = create_engine(uri, pool_pre_ping=True)
+        except Exception as exc:  # pragma: no cover - connection misconfig
+            logger.warning("Failed to create SQLAlchemy engine: %s", exc)
+            self._db_engine = False
+            return None
+
+        return self._db_engine
+
+    @contextmanager
+    def pandas_connection(self):
+        """Yield an object suitable for :func:`pandas.read_sql` calls."""
+
+        engine = self.get_db_engine()
+        if engine is not None:
+            yield engine
+            return
+
+        conn = self.get_db_connection()
+        try:
+            yield conn
+        finally:  # pragma: no cover - defensive cleanup
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Failed to close DB connection")
 
     def ollama_options(self) -> Dict[str, Any]:
         """Return default options for Ollama requests respecting GPU availability."""

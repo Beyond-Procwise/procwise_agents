@@ -109,11 +109,13 @@ class Orchestrator:
 
         try:
             # Create initial context
+            enriched_input: Dict[str, Any] = {**(input_data or {})}
+            enriched_input.setdefault("workflow", workflow_name)
             context = AgentContext(
                 workflow_id=workflow_id,
                 agent_id=workflow_name,
                 user_id=user_id or self.settings.script_user,
-                input_data=input_data,
+                input_data=enriched_input,
             )
 
             # Validate against policies
@@ -601,10 +603,16 @@ class Orchestrator:
             input_data = {**(inherited or {})}
             if "llm" in props:
                 input_data["llm"] = props["llm"]
+            for key, value in props.items():
+                if key in {"llm", "prompts", "policies"}:
+                    continue
+                input_data.setdefault(key, value)
             if prompt_objs:
                 input_data["prompts"] = prompt_objs
             if policy_objs:
                 input_data["policies"] = policy_objs
+            if node.get("workflow") and not input_data.get("workflow"):
+                input_data["workflow"] = node["workflow"]
 
             context = AgentContext(
                 workflow_id=_new_id(),
