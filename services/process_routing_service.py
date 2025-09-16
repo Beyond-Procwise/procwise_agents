@@ -1,7 +1,7 @@
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import re
 from pathlib import Path
@@ -48,7 +48,43 @@ class ProcessRoutingService:
     @classmethod
     def _safe_dumps(cls, data: Any) -> str:
         """JSON dump that tolerates DataFrames and other complex objects."""
-        return json.dumps(data, default=cls._serialize)
+        # First perform a best-effort sanitisation pass to replace NaN/NaT
+        # values (which are invalid JSON tokens like ``NaN``) with ``null``
+        # so PostgreSQL accepts the payload when inserting into ``json``/``jsonb``
+        # columns. We also convert pandas structures and numpy scalars to
+        # plain Python types.
+        def _sanitize(obj: Any):
+            # Handle pandas DataFrame / Series directly
+            if isinstance(obj, pd.DataFrame):
+                return obj.to_dict(orient="records")
+            if isinstance(obj, pd.Series):
+                return obj.to_dict()
+            # Numpy scalar -> native
+            if isinstance(obj, np.generic):
+                return obj.item()
+            # Dataclasses -> dict
+            if is_dataclass(obj):
+                return _sanitize(asdict(obj))
+            # None
+            if obj is None:
+                return None
+            # Pandas/Numpy NA-like values -> None
+            try:
+                if pd.isna(obj):
+                    return None
+            except Exception:
+                pass
+            # Dicts and iterables
+            if isinstance(obj, dict):
+                return {str(k): _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple, set)):
+                return [_sanitize(v) for v in obj]
+            # Fallback for other types: leave as-is and let json.dumps handle
+            return obj
+
+        sanitized = _sanitize(data)
+        # Use our serializer for remaining complex objects (if any)
+        return json.dumps(sanitized, default=cls._serialize, ensure_ascii=False)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -565,7 +601,7 @@ class ProcessRoutingService:
                                 self._safe_dumps(process_output) if process_output is not None else None,
                                 status,
                                 action_desc if isinstance(action_desc, str) else self._safe_dumps(action_desc),
-                                datetime.utcnow(),
+                                datetime.now(timezone.utc),
                             ),
                         )
                     else:
@@ -620,8 +656,8 @@ class ProcessRoutingService:
             return self.normalize_process_details(details)
 
         run_id = run_id or str(uuid.uuid4())
-        process_start_ts = process_start_ts or datetime.utcnow()
-        process_end_ts = process_end_ts or datetime.utcnow()
+        process_start_ts = process_start_ts or datetime.now(timezone.utc)
+        process_end_ts = process_end_ts or datetime.now(timezone.utc)
         duration = (
             process_end_ts - process_start_ts
             if process_end_ts and process_start_ts
