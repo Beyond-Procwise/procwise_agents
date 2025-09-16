@@ -305,6 +305,29 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
+def test_min_financial_impact_override_filters_findings(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+    context.input_data["min_financial_impact"] = 50.0
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["opportunity_count"] == 0
+    assert output.data["findings"] == []
+    assert output.data["min_financial_impact"] == 50.0
+
+
 def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
