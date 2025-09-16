@@ -1,4 +1,6 @@
 import logging
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -78,20 +80,41 @@ class QuoteEvaluationAgent(BaseAgent):
             explicit_supplier_ids = self._ensure_sequence(
                 input_data.get("supplier_ids", [])
             )
-
-            supplier_names_filter = ranking_names or explicit_suppliers
-            supplier_ids_filter = ranking_ids or explicit_supplier_ids
-            supplier_tokens = self._merge_supplier_tokens(
-                supplier_names_filter, supplier_ids_filter
-
+            candidate_supplier_ids = self._ensure_sequence(
+                input_data.get("supplier_candidates", [])
             )
-            supplier_filter = ranking_suppliers or explicit_suppliers
 
-            quotes = self._fetch_quotes(
+            supplier_names_filter = self._merge_supplier_tokens(
+                ranking_names,
+                explicit_suppliers,
+            )
+            supplier_ids_filter = self._merge_supplier_tokens(
+                ranking_ids,
+                explicit_supplier_ids,
+                candidate_supplier_ids,
+            )
+            supplier_tokens = self._merge_supplier_tokens(
+                supplier_names_filter,
+                supplier_ids_filter,
+            )
+
+            db_quotes = self._fetch_quotes_from_database(
+                supplier_names_filter,
+                supplier_ids_filter,
+                product_category=product_category,
+            )
+            vector_quotes = self._fetch_quotes(
                 supplier_names_filter,
                 supplier_ids_filter,
                 product_category,
             )
+            quotes = self._merge_quote_sources(db_quotes, vector_quotes)
+            if db_quotes or vector_quotes:
+                logger.info(
+                    "QuoteEvaluationAgent: sourced %d database quotes and %d vector quotes",
+                    len(db_quotes),
+                    len(vector_quotes),
+                )
             if supplier_tokens:
                 quotes = self._filter_quotes_by_suppliers(quotes, supplier_tokens)
 
@@ -262,6 +285,190 @@ class QuoteEvaluationAgent(BaseAgent):
             )
         return quotes
 
+    def _fetch_quotes_from_database(
+        self,
+        supplier_names: List[str],
+        supplier_ids: List[str],
+        product_category: Optional[str] = None,
+    ) -> List[Dict]:
+        """Fetch quotes and detailed line information directly from Postgres."""
+
+        connection_factory = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(connection_factory):
+            return []
+
+        try:
+            with connection_factory() as conn:
+                with conn.cursor() as cursor:
+                    where_clauses: List[str] = []
+                    params: List[Any] = []
+                    if supplier_ids:
+                        where_clauses.append("q.supplier_id = ANY(%s)")
+                        params.append(supplier_ids)
+                    if supplier_names:
+                        lowered = [name.lower() for name in supplier_names]
+                        where_clauses.append(
+                            "LOWER(COALESCE(s.supplier_name, q.supplier_id)) = ANY(%s)"
+                        )
+                        params.append(lowered)
+
+                    where_sql = ""
+                    if where_clauses:
+                        where_sql = "WHERE " + " OR ".join(f"({clause})" for clause in where_clauses)
+
+                    params.append(50)
+                    cursor.execute(
+                        f"""
+                        SELECT
+                            q.quote_id,
+                            q.supplier_id,
+                            COALESCE(s.supplier_name, q.supplier_id) AS supplier_name,
+                            q.buyer_id,
+                            q.quote_date,
+                            q.validity_date,
+                            q.currency,
+                            q.total_amount,
+                            q.tax_percent,
+                            q.tax_amount,
+                            q.total_amount_incl_tax,
+                            q.po_id,
+                            q.country,
+                            q.region,
+                            q.ai_flag_required,
+                            q.trigger_type,
+                            q.trigger_context_description,
+                            q.created_date,
+                            q.created_by,
+                            q.last_modified_by,
+                            q.last_modified_date
+                        FROM proc.quote_agent AS q
+                        LEFT JOIN proc.supplier AS s ON s.supplier_id = q.supplier_id
+                        {where_sql}
+                        ORDER BY q.quote_date DESC NULLS LAST,
+                                 q.created_date DESC NULLS LAST,
+                                 q.quote_id
+                        LIMIT %s
+                        """,
+                        tuple(params),
+                    )
+                    quote_rows = cursor.fetchall()
+                    description = cursor.description or []
+                    quote_columns = [desc[0] for desc in description]
+
+                if not quote_rows:
+                    return []
+
+                quote_records = [dict(zip(quote_columns, row)) for row in quote_rows]
+                quote_ids = [
+                    quote.get("quote_id")
+                    for quote in quote_records
+                    if quote.get("quote_id")
+                ]
+                if not quote_ids:
+                    return quote_records
+
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            quote_id,
+                            quote_line_id,
+                            line_number,
+                            item_id,
+                            item_description,
+                            quantity,
+                            unit_of_measure,
+                            unit_price,
+                            line_total,
+                            tax_percent,
+                            tax_amount,
+                            total_amount,
+                            currency
+                        FROM proc.quote_line_items_agent
+                        WHERE quote_id = ANY(%s)
+                        ORDER BY quote_id, line_number
+                        """,
+                        (quote_ids,),
+                    )
+                    line_rows = cursor.fetchall()
+                    description = cursor.description or []
+                    line_columns = [desc[0] for desc in description]
+
+        except Exception:  # pragma: no cover - database connectivity
+            logger.exception("QuoteEvaluationAgent failed to fetch quotes from database")
+            return []
+
+        line_map: Dict[Any, List[Dict]] = {}
+        for row in line_rows:
+            if not line_columns:
+                continue
+            record = dict(zip(line_columns, row))
+            quote_id = record.get("quote_id")
+            if quote_id is None:
+                continue
+            line_map.setdefault(quote_id, []).append(record)
+
+        category_token = None
+        if product_category:
+            token = str(product_category).strip().lower()
+            category_token = token or None
+
+        enriched: List[Dict] = []
+        for quote in quote_records:
+            quote_id = quote.get("quote_id")
+            items = line_map.get(quote_id, [])
+
+            if category_token:
+                matched = any(
+                    category_token in str(item.get("item_description", "")).lower()
+                    or category_token == str(item.get("item_id", "")).lower()
+                    for item in items
+                )
+                if not matched:
+                    continue
+
+            quote["line_items"] = items
+            quote["line_items_count"] = len(items)
+
+            if items:
+                if not quote.get("currency"):
+                    currency = next(
+                        (item.get("currency") for item in items if item.get("currency")),
+                        None,
+                    )
+                    if currency:
+                        quote["currency"] = currency
+
+                totals: List[float] = []
+                for item in items:
+                    if item.get("line_total") is not None:
+                        totals.append(self._to_float(item.get("line_total")))
+                    elif item.get("total_amount") is not None:
+                        totals.append(self._to_float(item.get("total_amount")))
+                if totals:
+                    quote["total_line_amount"] = sum(totals)
+                    quote.setdefault("total_amount", quote["total_line_amount"])
+                    quote.setdefault("total_cost", quote.get("total_amount"))
+
+                unit_prices = [
+                    self._to_float(item.get("unit_price"))
+                    for item in items
+                    if item.get("unit_price") is not None
+                ]
+                if unit_prices:
+                    avg_price = sum(unit_prices) / len(unit_prices)
+                    quote["avg_unit_price"] = avg_price
+                    quote.setdefault("unit_price", avg_price)
+
+                quote.setdefault("volume", len(items))
+
+            enriched.append(quote)
+
+        logger.debug(
+            "QuoteEvaluationAgent: retrieved %d quotes from database", len(enriched)
+        )
+        return enriched
+
     def _standardize_quotes(
         self,
         quotes: List[Dict],
@@ -310,6 +517,10 @@ class QuoteEvaluationAgent(BaseAgent):
             else:
                 supplier_name = "Unknown supplier"
 
+        line_items = quote.get("line_items")
+        if not isinstance(line_items, list):
+            line_items = []
+
         return {
             "name": str(supplier_name),
             "supplier_id": QuoteEvaluationAgent._coalesce(
@@ -332,6 +543,56 @@ class QuoteEvaluationAgent(BaseAgent):
             ),
             "volume": QuoteEvaluationAgent._coalesce(
                 quote, ["volume", "line_items_count"], 0
+            ),
+            "quote_id": QuoteEvaluationAgent._coalesce(
+                quote, ["quote_id"], None, strip_strings=True
+            ),
+            "currency": QuoteEvaluationAgent._coalesce(
+                quote, ["currency"], None, strip_strings=True
+            ),
+            "quote_date": QuoteEvaluationAgent._coalesce(
+                quote, ["quote_date"], None, strip_strings=False
+            ),
+            "validity_date": QuoteEvaluationAgent._coalesce(
+                quote, ["validity_date"], None, strip_strings=False
+            ),
+            "line_items": line_items,
+            "line_items_count": len(line_items),
+            "avg_unit_price": QuoteEvaluationAgent._coalesce(
+                quote, ["avg_unit_price", "unit_price"], 0
+            ),
+            "total_line_amount": QuoteEvaluationAgent._coalesce(
+                quote, ["total_line_amount"], 0
+            ),
+            "buyer_id": QuoteEvaluationAgent._coalesce(
+                quote, ["buyer_id"], None, strip_strings=True
+            ),
+            "country": QuoteEvaluationAgent._coalesce(
+                quote, ["country"], None, strip_strings=True
+            ),
+            "region": QuoteEvaluationAgent._coalesce(
+                quote, ["region"], None, strip_strings=True
+            ),
+            "po_id": QuoteEvaluationAgent._coalesce(
+                quote, ["po_id"], None, strip_strings=True
+            ),
+            "tax_percent": QuoteEvaluationAgent._coalesce(
+                quote, ["tax_percent"], 0
+            ),
+            "tax_amount": QuoteEvaluationAgent._coalesce(
+                quote, ["tax_amount"], 0
+            ),
+            "total_amount_incl_tax": QuoteEvaluationAgent._coalesce(
+                quote, ["total_amount_incl_tax"], 0
+            ),
+            "trigger_type": QuoteEvaluationAgent._coalesce(
+                quote, ["trigger_type"], None, strip_strings=True
+            ),
+            "trigger_context_description": QuoteEvaluationAgent._coalesce(
+                quote, ["trigger_context_description"], None, strip_strings=True
+            ),
+            "ai_flag_required": QuoteEvaluationAgent._coalesce(
+                quote, ["ai_flag_required"], None, strip_strings=True
             ),
         }
 
@@ -380,9 +641,64 @@ class QuoteEvaluationAgent(BaseAgent):
             return {k: self._to_native(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [self._to_native(v) for v in obj]
+        if isinstance(obj, Decimal):
+            try:
+                return float(obj)
+            except (TypeError, ValueError):
+                return 0.0
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
         if isinstance(obj, np.generic):
             return obj.item()
         return obj
+
+    def _merge_quote_sources(
+        self, primary: List[Dict], secondary: List[Dict]
+    ) -> List[Dict]:
+        """Combine quote collections while avoiding duplicate entries."""
+
+        merged: List[Dict] = []
+        seen: set[str] = set()
+
+        for quote in primary + secondary:
+            quote_id = quote.get("quote_id")
+            key: Optional[str]
+            if quote_id:
+                key = f"id:{str(quote_id).strip().lower()}"
+            else:
+                supplier_key = self._quote_key(quote)
+                cost_basis = quote.get("total_cost") or quote.get("total_amount")
+                try:
+                    cost_token = f"{float(cost_basis):.6f}"
+                except (TypeError, ValueError):
+                    cost_token = None
+                if supplier_key and cost_token:
+                    key = f"supplier:{supplier_key}:{cost_token}"
+                elif supplier_key:
+                    key = f"supplier:{supplier_key}"
+                else:
+                    key = None
+
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(quote)
+
+        return merged
+
+    def _to_float(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, Decimal):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _combine_weight_values(weights: Dict) -> float:

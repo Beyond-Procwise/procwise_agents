@@ -874,13 +874,14 @@ class Orchestrator:
         results: Dict[str, Any] = {}
         input_data = context.input_data
 
-        has_opportunity_payload = bool(
-            input_data.get("workflow") or input_data.get("conditions")
-        )
         should_run_opportunity = (
             "opportunity_miner" in self.agents
-            and has_opportunity_payload
             and not input_data.get("skip_opportunity_step", False)
+        )
+
+        supplier_candidates: List[str] = []
+        category_hint: Optional[str] = self._normalise_category(
+            input_data.get("product_category")
         )
 
         if should_run_opportunity:
@@ -894,19 +895,58 @@ class Orchestrator:
                 )
                 return results
 
-            supplier_candidates = (
+            opportunity_payload: Dict[str, Any] = {}
+            if opp_result:
+                opportunity_payload = dict(opp_result.pass_fields or {})
+                if not opportunity_payload:
+                    opportunity_payload = dict(opp_result.data or {})
+
+            derived_category = self._derive_product_category(opportunity_payload)
+            if derived_category:
+                category_hint = derived_category
+                if isinstance(results.get("opportunities"), dict):
+                    results["opportunities"].setdefault(
+                        "product_category", derived_category
+                    )
+
+            supplier_candidates_raw = (
                 (opp_result.pass_fields or {}).get("supplier_candidates")
                 or opp_result.data.get("supplier_candidates")
                 or []
             )
+            seen_candidates: set[str] = set()
+            for candidate in supplier_candidates_raw:
+                if candidate is None:
+                    continue
+                candidate_str = str(candidate).strip()
+                if not candidate_str or candidate_str in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_str)
+                supplier_candidates.append(candidate_str)
+
             if supplier_candidates:
-                ordered = list(dict.fromkeys(str(s) for s in supplier_candidates))
-                input_data["supplier_candidates"] = ordered
+                input_data["supplier_candidates"] = supplier_candidates
             else:
                 logger.info(
                     "OpportunityMinerAgent returned no supplier candidates; skipping ranking stage"
                 )
                 return results
+        else:
+            existing_candidates = input_data.get("supplier_candidates") or []
+            seen_candidates: set[str] = set()
+            for candidate in existing_candidates:
+                if candidate is None:
+                    continue
+                candidate_str = str(candidate).strip()
+                if not candidate_str or candidate_str in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_str)
+                supplier_candidates.append(candidate_str)
+            if supplier_candidates:
+                input_data["supplier_candidates"] = supplier_candidates
+
+        if category_hint and not input_data.get("product_category"):
+            input_data["product_category"] = category_hint
 
         # Get supplier data for ranking
         input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
@@ -914,23 +954,60 @@ class Orchestrator:
         )
 
         ranking_result = self._execute_agent("supplier_ranking", context)
-        results["ranking"] = ranking_result.data
+        if not ranking_result:
+            return results
 
-        downstream_agents = [
-            agent
-            for agent in (ranking_result.next_agents or [])
-            if agent != "OpportunityMinerAgent"
-        ]
+        results["ranking"] = ranking_result.data or {}
+
+        if ranking_result.status != AgentStatus.SUCCESS:
+            return results
+
+        pass_fields: Dict[str, Any] = dict(ranking_result.pass_fields or {})
+        if supplier_candidates and "supplier_candidates" not in pass_fields:
+            pass_fields["supplier_candidates"] = supplier_candidates
+
+        if category_hint and "product_category" not in pass_fields:
+            pass_fields["product_category"] = category_hint
+
+        ranking_payload = pass_fields.get("ranking")
+        if not ranking_payload:
+            ranking_payload = results["ranking"].get("ranking") if isinstance(results["ranking"], dict) else None
+            if ranking_payload:
+                pass_fields["ranking"] = ranking_payload
+
+        downstream_agents: List[str] = []
+        seen_downstream: set[str] = set()
+
+        def _normalise_agent(candidate: str) -> Optional[str]:
+            if not candidate:
+                return None
+            if candidate in self.agents:
+                return candidate
+            resolved = self._resolve_agent_name(candidate)
+            return resolved if resolved in self.agents else None
+
+        if ranking_payload and "quote_evaluation" in self.agents:
+            downstream_agents.append("quote_evaluation")
+            seen_downstream.add("quote_evaluation")
+
+        for agent in ranking_result.next_agents or []:
+            normalised = _normalise_agent(agent)
+            if not normalised or normalised == "opportunity_miner":
+                continue
+            if normalised not in seen_downstream:
+                downstream_agents.append(normalised)
+                seen_downstream.add(normalised)
 
         if downstream_agents:
             downstream_results: Dict[str, Any] = {}
-            pass_fields = ranking_result.pass_fields or {}
             for agent_name in downstream_agents:
                 child_ctx = self._create_child_context(context, agent_name, pass_fields)
                 agent_result = self._execute_agent(agent_name, child_ctx)
                 downstream_results[agent_name] = (
                     agent_result.data if agent_result else {}
                 )
+                if agent_result and agent_result.pass_fields:
+                    pass_fields.update(agent_result.pass_fields)
             results["downstream_results"] = downstream_results
 
         if should_run_opportunity or downstream_agents:
@@ -965,18 +1042,92 @@ class Orchestrator:
         opp_result = self._execute_agent("opportunity_miner", context)
         results: Dict[str, Any] = {"opportunities": opp_result.data if opp_result else {}}
 
-        candidates = opp_result.data.get("supplier_candidates", []) if opp_result else []
+        category_hint = self._normalise_category(
+            context.input_data.get("product_category")
+        )
+        if opp_result:
+            opportunity_payload: Dict[str, Any] = dict(opp_result.pass_fields or {})
+            if not opportunity_payload:
+                opportunity_payload = dict(opp_result.data or {})
+            derived_category = self._derive_product_category(opportunity_payload)
+            if derived_category:
+                category_hint = derived_category
+        if category_hint and isinstance(results.get("opportunities"), dict):
+            results["opportunities"].setdefault("product_category", category_hint)
+
+        candidates_raw = opp_result.data.get("supplier_candidates", []) if opp_result else []
+        seen_candidates: set[str] = set()
+        candidates: List[str] = []
+        for candidate in candidates_raw:
+            if candidate is None:
+                continue
+            candidate_str = str(candidate).strip()
+            if not candidate_str or candidate_str in seen_candidates:
+                continue
+            seen_candidates.add(candidate_str)
+            candidates.append(candidate_str)
+
         if candidates:
+            pass_payload: Dict[str, Any] = {"supplier_candidates": candidates}
             rank_ctx = self._create_child_context(
-                context, "supplier_ranking", {"supplier_candidates": candidates}
+                context, "supplier_ranking", pass_payload
+            )
+            rank_ctx.input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
+                rank_ctx.input_data
             )
             rank_res = self._execute_agent("supplier_ranking", rank_ctx)
             results["ranking"] = rank_res.data if rank_res else {}
 
+            ranking_payload = []
+            if rank_res:
+                ranking_payload = (
+                    (rank_res.pass_fields or {}).get("ranking")
+                    or (rank_res.data or {}).get("ranking")
+                    or []
+                )
+
+            pass_fields: Dict[str, Any] = dict((rank_res.pass_fields or {}) if rank_res else {})
+            if candidates and "supplier_candidates" not in pass_fields:
+                pass_fields["supplier_candidates"] = candidates
+            if ranking_payload and "ranking" not in pass_fields:
+                pass_fields["ranking"] = ranking_payload
+            if category_hint and "product_category" not in pass_fields:
+                pass_fields["product_category"] = category_hint
+
+            if ranking_payload and "quote_evaluation" in self.agents:
+                quote_ctx = self._create_child_context(
+                    context, "quote_evaluation", pass_fields
+                )
+                quote_res = self._execute_agent("quote_evaluation", quote_ctx)
+                if quote_res:
+                    results["quote_evaluation"] = quote_res.data or {}
+                    if quote_res.pass_fields:
+                        pass_fields.update(quote_res.pass_fields)
+
+                    if quote_res.next_agents:
+                        downstream: Dict[str, Any] = {}
+                        for agent_name in quote_res.next_agents:
+                            normalised = self._resolve_agent_name(agent_name)
+                            if normalised not in self.agents:
+                                continue
+                            if normalised in {"opportunity_miner", "supplier_ranking", "quote_evaluation"}:
+                                continue
+                            child_ctx = self._create_child_context(
+                                context, normalised, pass_fields
+                            )
+                            agent_res = self._execute_agent(normalised, child_ctx)
+                            downstream[normalised] = agent_res.data if agent_res else {}
+                            if agent_res and agent_res.pass_fields:
+                                pass_fields.update(agent_res.pass_fields)
+                        if downstream:
+                            results.setdefault("downstream_results", {}).update(downstream)
+
             email_input = {
-                "ranking": rank_res.data.get("ranking", []) if rank_res else [],
+                "ranking": ranking_payload,
                 "findings": opp_result.data.get("findings", []) if opp_result else [],
             }
+            if "quote_evaluation" in results:
+                email_input["quotes"] = results["quote_evaluation"].get("quotes")
             email_ctx = self._create_child_context(context, "email_drafting", email_input)
             email_res = self._execute_agent("email_drafting", email_ctx)
             results["email_drafts"] = email_res.data if email_res else {}
@@ -1081,6 +1232,80 @@ class Orchestrator:
                     pass_fields.update(result.pass_fields)
 
         return results
+
+    @staticmethod
+    def _normalise_category(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value)
+        except Exception:
+            return None
+        text = text.strip()
+        return text or None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _derive_product_category(self, opportunity_payload: Any) -> Optional[str]:
+        if not isinstance(opportunity_payload, dict):
+            return None
+
+        for key in (
+            "product_category",
+            "category_id",
+            "primary_category",
+            "spend_category",
+        ):
+            direct = self._normalise_category(opportunity_payload.get(key))
+            if direct:
+                return direct
+
+        conditions = opportunity_payload.get("conditions")
+        if isinstance(conditions, dict):
+            for key in ("product_category", "category_id"):
+                direct = self._normalise_category(conditions.get(key))
+                if direct:
+                    return direct
+
+        findings = opportunity_payload.get("findings")
+        if isinstance(findings, list):
+            category_totals: Dict[str, float] = {}
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                category = self._normalise_category(
+                    finding.get("category_id")
+                    or finding.get("spend_category")
+                    or finding.get("category")
+                    or finding.get("item_category")
+                )
+                if not category:
+                    continue
+                weight = finding.get("financial_impact_gbp")
+                if weight in (None, ""):
+                    for alt_key in (
+                        "potential_savings",
+                        "total_savings",
+                        "estimated_savings",
+                        "value",
+                        "impact",
+                    ):
+                        weight = finding.get(alt_key)
+                        if weight not in (None, ""):
+                            break
+                score = self._safe_float(weight)
+                if score <= 0.0:
+                    score = 1.0
+                category_totals[category] = category_totals.get(category, 0.0) + score
+            if category_totals:
+                return max(category_totals.items(), key=lambda item: (item[1], item[0]))[0]
+
+        return None
 
     def _create_child_context(
         self, parent_context: AgentContext, agent_name: str, pass_fields: Dict
