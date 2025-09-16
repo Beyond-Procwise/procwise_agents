@@ -263,7 +263,14 @@ def test_ranking_workflow_runs_full_supplier_flow():
                 {"category_id": "Raw Materials", "financial_impact_gbp": 1500.0},
                 {"category_id": "Services", "financial_impact_gbp": 500.0},
             ]
-            payload = {"supplier_candidates": ["S1", "S2"], "findings": findings}
+            payload = {
+                "supplier_candidates": ["S1", "S2"],
+                "findings": findings,
+                "supplier_directory": [
+                    {"supplier_id": "S1", "supplier_name": "Supplier S1"},
+                    {"supplier_id": "S2", "supplier_name": "Supplier S2"},
+                ],
+            }
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data=payload,
@@ -273,11 +280,14 @@ def test_ranking_workflow_runs_full_supplier_flow():
     class StubRankingAgent:
         def __init__(self):
             self.candidates = None
+            self.directory = None
 
         def execute(self, context):
             supplier_candidates = context.input_data.get("supplier_candidates")
+            directory = context.input_data.get("supplier_directory")
             executions.append(("supplier_ranking", supplier_candidates))
             self.candidates = supplier_candidates
+            self.directory = directory
             ranking = [
                 {"supplier_id": sid, "supplier_name": f"Supplier {sid}"}
                 for sid in supplier_candidates
@@ -344,6 +354,10 @@ def test_ranking_workflow_runs_full_supplier_flow():
         "quote_evaluation",
     ]
     assert ranking_agent.candidates == ["S1", "S2"]
+    assert ranking_agent.directory == [
+        {"supplier_id": "S1", "supplier_name": "Supplier S1"},
+        {"supplier_id": "S2", "supplier_name": "Supplier S2"},
+    ]
     assert quote_agent.ranking_seen[0]["supplier_id"] == "S1"
     assert quote_agent.category_seen == "Raw Materials"
 

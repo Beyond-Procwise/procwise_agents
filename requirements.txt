@@ -3,6 +3,7 @@ uvicorn
 pydantic-settings
 boto3
 psycopg2-binary
+sqlalchemy
 ollama
 pdfplumber
 pymupdf

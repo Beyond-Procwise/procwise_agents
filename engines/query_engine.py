@@ -274,7 +274,9 @@ class QueryEngine(BaseEngine):
                 df = pd.read_sql(sql, reader)
 
             if "supplier_id" in df.columns:
-                df["supplier_id"] = df["supplier_id"].astype(str)
+                df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
+            if "supplier_name" in df.columns:
+                df["supplier_name"] = df["supplier_name"].astype(str).str.strip()
             return df
         except Exception as exc:
             # Surface the original exception so callers can handle it explicitly

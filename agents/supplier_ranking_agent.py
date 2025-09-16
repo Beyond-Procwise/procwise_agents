@@ -81,7 +81,11 @@ class SupplierRankingAgent(BaseAgent):
                     error="Failed to fetch supplier data",
                 )
         try:
-            df = supplier_data.copy() if isinstance(supplier_data, pd.DataFrame) else pd.DataFrame(supplier_data)
+            df = (
+                supplier_data.copy()
+                if isinstance(supplier_data, pd.DataFrame)
+                else pd.DataFrame(supplier_data)
+            )
         except Exception:
             logger.exception("Invalid supplier_data format")
             return AgentOutput(
@@ -89,6 +93,11 @@ class SupplierRankingAgent(BaseAgent):
                 data={},
                 error="Failed to parse supplier_data into DataFrame",
             )
+
+        if "supplier_id" in df.columns:
+            df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
+        if "supplier_name" in df.columns:
+            df["supplier_name"] = df["supplier_name"].astype(str).str.strip()
 
         if df.empty:
             return AgentOutput(
@@ -99,7 +108,7 @@ class SupplierRankingAgent(BaseAgent):
 
         if "supplier_id" not in df.columns:
             if "supplier_name" in df.columns:
-                df["supplier_id"] = df["supplier_name"].astype(str)
+                df["supplier_id"] = df["supplier_name"].astype(str).str.strip()
                 logger.warning(
                     "supplier_data missing 'supplier_id'; derived IDs from supplier_name"
                 )
@@ -111,10 +120,25 @@ class SupplierRankingAgent(BaseAgent):
                     error="supplier_data missing 'supplier_id' column",
                 )
 
+        directory_entries = context.input_data.get("supplier_directory") or []
+        directory_map = {
+            str(entry.get("supplier_id")).strip(): entry.get("supplier_name")
+            for entry in directory_entries
+            if entry.get("supplier_id") is not None
+            and str(entry.get("supplier_id")).strip()
+        }
+
+        if directory_map and "supplier_id" in df.columns:
+            mapped_names = df["supplier_id"].map(directory_map)
+            if "supplier_name" in df.columns:
+                df["supplier_name"] = mapped_names.combine_first(df["supplier_name"])
+            else:
+                df["supplier_name"] = mapped_names
+
         candidate_ids = context.input_data.get("supplier_candidates")
         candidate_set = self._normalise_id_set(candidate_ids)
         if candidate_set:
-            df = df[df["supplier_id"].astype(str).isin(candidate_set)].copy()
+            df = df[df["supplier_id"].astype(str).str.strip().isin(candidate_set)].copy()
             if df.empty:
                 return AgentOutput(
                     status=AgentStatus.FAILED,
