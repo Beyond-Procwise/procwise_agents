@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import Counter, defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
@@ -71,12 +72,27 @@ class OpportunityMinerAgent(BaseAgent):
         return self.process(context)
 
     def _read_sql(self, query: str, params: Any = None) -> pd.DataFrame:
+        """Read a SQL query using a SQLAlchemy engine when available."""
+
+        engine = self.agent_nick.get_db_engine()
+        if engine is not None:
+            with engine.connect() as conn:
+                return pd.read_sql(query, conn, params=params)
+
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 return pd.read_sql(query, conn, params=params)
-        with self.agent_nick.get_db_connection() as conn:
-            return pd.read_sql(query, conn, params=params)
+
+        with closing(self.agent_nick.get_db_connection()) as conn:
+            with conn.cursor() as cursor:
+                if params is not None:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                return pd.DataFrame(rows, columns=columns)
 
     def _get_table_columns(self, schema: str, table: str) -> set[str]:
         """Return cached column names for ``schema.table``."""
@@ -317,15 +333,27 @@ class OpportunityMinerAgent(BaseAgent):
         """
 
         dfs: Dict[str, pd.DataFrame] = {}
+        engine = self.agent_nick.get_db_engine()
+        if engine is not None:
+            with engine.connect() as conn:
+                for table, sql_name in self.TABLE_MAP.items():
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+            return dfs
+
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 for table, sql_name in self.TABLE_MAP.items():
                     dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
-        else:
-            with self.agent_nick.get_db_connection() as conn:
-                for table, sql_name in self.TABLE_MAP.items():
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+            return dfs
+
+        with closing(self.agent_nick.get_db_connection()) as conn:
+            for table, sql_name in self.TABLE_MAP.items():
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT * FROM {sql_name}")
+                    rows = cursor.fetchall()
+                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                    dfs[table] = pd.DataFrame(rows, columns=columns)
         return dfs
 
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:

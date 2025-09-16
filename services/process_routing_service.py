@@ -1,7 +1,9 @@
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Optional
 import re
 from pathlib import Path
@@ -61,7 +63,18 @@ class ProcessRoutingService:
                 return obj.to_dict()
             # Numpy scalar -> native
             if isinstance(obj, np.generic):
-                return obj.item()
+                return _sanitize(obj.item())
+            # Decimal values should be converted to native python numbers and
+            # normalised when they represent non-finite values such as NaN or
+            # infinity which PostgreSQL refuses inside JSON payloads.
+            if isinstance(obj, Decimal):
+                if not obj.is_finite():
+                    return None
+                return _sanitize(float(obj))
+            # Basic python floats can still sneak in from math.nan or manual
+            # calculations outside of pandas/numpy.
+            if isinstance(obj, float) and not math.isfinite(obj):
+                return None
             # Dataclasses -> dict
             if is_dataclass(obj):
                 return _sanitize(asdict(obj))
@@ -84,7 +97,12 @@ class ProcessRoutingService:
 
         sanitized = _sanitize(data)
         # Use our serializer for remaining complex objects (if any)
-        return json.dumps(sanitized, default=cls._serialize, ensure_ascii=False)
+        return json.dumps(
+            sanitized,
+            default=cls._serialize,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
 
     # ------------------------------------------------------------------
     # Public helpers
