@@ -361,6 +361,33 @@ def test_contract_expiry_injects_default_window(monkeypatch):
     assert context.input_data["conditions"]["negotiation_window_days"] == 90
 
 
+def test_contract_expiry_fallback_surfaces_top_suppliers(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "contract_expiry_check",
+        {"reference_date": "2030-01-01", "negotiation_window_days": 30},
+    )
+    context.input_data["ranking"] = [
+        {"supplier_id": "SI0001", "final_score": 19.5, "justification": "Top"},
+        {"supplier_id": "SI0002", "final_score": 18.7, "justification": "Strong"},
+    ]
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Contract Expiry Opportunity - Portfolio"
+    ]
+    assert findings
+    assert all(
+        f["calculation_details"].get("analysis_type") == "contract_portfolio_fallback"
+        for f in findings
+    )
+    assert any(evt["status"] == "fallback" for evt in output.data["policy_events"])
+
+
 def test_supplier_risk_alert_threshold(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(

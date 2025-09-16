@@ -131,7 +131,10 @@ class EmailDraftingAgent(BaseAgent):
                 "sent_status": False,
                 "sender": self.agent_nick.settings.ses_default_sender,
                 "action_id": draft_action_id,
+
             }
+            if draft_action_id:
+                draft["action_id"] = draft_action_id
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
@@ -193,6 +196,7 @@ class EmailDraftingAgent(BaseAgent):
                         rfq_id TEXT NOT NULL,
                         supplier_id TEXT,
                         supplier_name TEXT,
+
                         subject TEXT NOT NULL,
                         body TEXT NOT NULL,
                         created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -203,6 +207,7 @@ class EmailDraftingAgent(BaseAgent):
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS supplier_name TEXT"
                 )
+
 
             self._draft_table_checked = True
 
