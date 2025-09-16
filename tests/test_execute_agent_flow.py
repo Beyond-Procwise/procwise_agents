@@ -396,6 +396,39 @@ def test_execute_legacy_flow_injects_workflow_metadata():
     assert captured["input"]["workflow"] == "price_variance_check"
 
 
+def test_execute_legacy_flow_defaults_workflow_for_opportunity_miner():
+    captured = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = context.input_data
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": CaptureAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {}
+    orchestrator._load_policies = lambda: {}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "opportunity_miner",
+        "agent_property": {},
+    }
+
+    orchestrator.execute_agent_flow(flow, {"ranking": []})
+
+    assert captured["input"]["workflow"] == "opportunity_mining"
+
+
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
         "status": "saved",
