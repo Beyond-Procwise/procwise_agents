@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
@@ -225,6 +226,7 @@ class OpportunityMinerAgent(BaseAgent):
             findings = handler(tables, context.input_data, notifications, policy_cfg)
 
             findings = self._enrich_findings(findings, tables)
+            findings = self._map_item_descriptions(findings, tables)
             filtered = [
                 f for f in findings if f.financial_impact_gbp >= min_impact_threshold
             ]
@@ -997,6 +999,131 @@ class OpportunityMinerAgent(BaseAgent):
                     )
             if f.supplier_id and supplier_lookup:
                 f.supplier_name = supplier_lookup.get(f.supplier_id)
+        return findings
+
+    def _map_item_descriptions(
+        self, findings: List[Finding], tables: Dict[str, pd.DataFrame]
+    ) -> List[Finding]:
+        """Replace ``item_id`` with the supplier specific item description.
+
+        The user requirement mandates that the ``item_id`` exposed to
+        downstream agents represents the supplier's product name as captured in
+        ``proc.po_line_items_agent``.  Findings frequently surface purchase
+        order identifiers or internal item codes which, while useful for audit
+        trails, are not human friendly.  This helper cross references purchase
+        order line items (and their parent purchase orders) to surface the
+        description most representative of the supplier's product catalogue.
+        The original identifier is retained in ``calculation_details`` under
+        ``item_reference`` so that analysts can still trace the source record.
+        """
+
+        if not findings:
+            return findings
+
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        purchase_orders = tables.get("purchase_orders", pd.DataFrame())
+        if (
+            po_lines.empty
+            or "po_id" not in po_lines.columns
+            or "item_description" not in po_lines.columns
+        ):
+            return findings
+        if purchase_orders.empty or "po_id" not in purchase_orders.columns:
+            return findings
+
+        try:
+            merged = po_lines.merge(
+                purchase_orders[["po_id", "supplier_id"]],
+                on="po_id",
+                how="left",
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to join purchase order lines for description mapping")
+            return findings
+
+        if merged.empty:
+            return findings
+
+        def _clean(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                if pd.isna(value):  # type: ignore[arg-type]
+                    return None
+            except Exception:
+                pass
+            text = str(value).strip()
+            return text or None
+
+        merged["supplier_id"] = merged["supplier_id"].map(_clean)
+        merged["po_id"] = merged["po_id"].map(_clean)
+        if "item_id" in merged.columns:
+            merged["item_id"] = merged["item_id"].map(_clean)
+        merged["item_description"] = merged["item_description"].map(_clean)
+        merged = merged.dropna(subset=["supplier_id", "item_description"])
+        if merged.empty:
+            return findings
+
+        supplier_item_desc: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+        supplier_po_desc: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+        supplier_desc: dict[str, Counter[str]] = defaultdict(Counter)
+
+        for row in merged.itertuples(index=False):
+            supplier_id = getattr(row, "supplier_id", None)
+            description = getattr(row, "item_description", None)
+            if not supplier_id or not description:
+                continue
+            supplier_desc[supplier_id][description] += 1
+            item_identifier = getattr(row, "item_id", None)
+            if item_identifier:
+                supplier_item_desc[(supplier_id, item_identifier)][description] += 1
+            po_identifier = getattr(row, "po_id", None)
+            if po_identifier:
+                supplier_po_desc[(supplier_id, po_identifier)][description] += 1
+
+        def _resolve(counter: Optional[Counter[str]]) -> Optional[str]:
+            if not counter:
+                return None
+            most_common = counter.most_common(1)
+            return most_common[0][0] if most_common else None
+
+        for finding in findings:
+            supplier_id = finding.supplier_id
+            if not supplier_id:
+                continue
+
+            original_item = finding.item_id
+            description = None
+            if original_item:
+                description = _resolve(
+                    supplier_item_desc.get((supplier_id, str(original_item).strip()))
+                )
+            if not description:
+                for src in finding.source_records:
+                    src_key = _clean(src)
+                    if not src_key:
+                        continue
+                    description = _resolve(
+                        supplier_po_desc.get((supplier_id, src_key))
+                    )
+                    if description:
+                        break
+            if not description:
+                description = _resolve(supplier_desc.get(supplier_id))
+
+            if not description:
+                continue
+
+            if (
+                original_item
+                and original_item != description
+                and isinstance(finding.calculation_details, dict)
+            ):
+                finding.calculation_details.setdefault("item_reference", original_item)
+            if isinstance(finding.calculation_details, dict):
+                finding.calculation_details.setdefault("item_description", description)
+            finding.item_id = description
+
         return findings
 
     def _policy_price_benchmark_variance(

@@ -1,19 +1,33 @@
-# ProcWise/agents/supplier_ranking_agent.py
+"""Supplier ranking agent implementing policy driven scoring and enrichment.
+
+This module fulfils the end-to-end supplier ranking requirements by
+combining data from the contract, purchase order, invoice and quote
+pipeline.  It consumes the supplier identifiers surfaced by the
+``OpportunityMinerAgent`` and produces a ranked list alongside rich supplier
+profiles that downstream agents – notably ``EmailDraftingAgent`` – can use to
+tailor communications.
+"""
+
+from __future__ import annotations
 
 import json
-import os
 import logging
+import os
 import re
+from collections import Counter
+from typing import Dict, Iterable, List, Optional
+
 import pandas as pd
-import ollama
-import warnings
+
 from utils.gpu import configure_gpu
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
-configure_gpu()
+# Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
+# injects a raw DB-API connection.  The behaviour is intentional for the
+# lightweight notebooks powering this exercise.
+import warnings
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-logger = logging.getLogger(__name__)
+configure_gpu()
 
 with warnings.catch_warnings():
     warnings.filterwarnings(
@@ -22,31 +36,28 @@ with warnings.catch_warnings():
         category=UserWarning,
     )
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+logger = logging.getLogger(__name__)
+
+
 class SupplierRankingAgent(BaseAgent):
-    """Rank suppliers based on criteria and supplier data.
-
-    The agent can operate standalone when given appropriate prompts that
-    include supplier information.  However, in a full workflow it is typically
-    invoked *after* the Opportunity Miner so that the ranked supplier list
-    aligns with candidates identified for a particular opportunity.  Running it
-    earlier may yield rankings for suppliers unrelated to the downstream
-    opportunity context.
-
-    Expects ``supplier_data`` in ``context.input_data`` as a list of dicts or a
-    ``DataFrame``.  If ``supplier_data`` is omitted, the agent will attempt to
-    fetch it via the ``QueryEngine``.  By default, the top three suppliers are
-    returned.
-    """
+    """Rank suppliers using procurement data, policies and contextual scores."""
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.prompt_library = self._load_json_file('prompts/SupplierRankingAgent_PromptLibrary.json')
-        self.justification_template = self._load_json_file('prompts/Justification_Tag_Prompt_Template.json')
+        self.prompt_library = self._load_json_file(
+            "prompts/SupplierRankingAgent_PromptLibrary.json"
+        )
+        self.justification_template = self._load_json_file(
+            "prompts/Justification_Tag_Prompt_Template.json"
+        )
         self.policy_engine = agent_nick.policy_engine
-        # Allow the agent to fetch its own supplier data when invoked outside
-        # the standard workflow.
         self.query_engine = agent_nick.query_engine
+        self._device = configure_gpu()
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("SupplierRankingAgent: Starting ranking...")
 
@@ -56,151 +67,484 @@ class SupplierRankingAgent(BaseAgent):
             except Exception:  # pragma: no cover - best effort
                 logger.exception("Failed to train procurement context")
 
-        # 1. Load supplier_data from context or fetch dynamically
-        supplier_data = context.input_data.get('supplier_data')
+        supplier_data = context.input_data.get("supplier_data")
         if supplier_data is None:
             try:
                 supplier_data = self.query_engine.fetch_supplier_data(
                     context.input_data
                 )
-            except Exception:  # pragma: no cover - best effort
+            except Exception:
                 logger.exception("Failed to fetch supplier data")
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
                     error="Failed to fetch supplier data",
                 )
-            if supplier_data is None:
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error='No supplier_data provided to SupplierRankingAgent'
-                )
-        # Convert to DataFrame
-        if isinstance(supplier_data, pd.DataFrame):
-            df = supplier_data.copy()
-        else:
-            try:
-                df = pd.DataFrame(supplier_data)
-            except Exception as e:
-                logger.exception("Invalid supplier_data format")
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error='Failed to parse supplier_data into DataFrame'
-                )
+        try:
+            df = supplier_data.copy() if isinstance(supplier_data, pd.DataFrame) else pd.DataFrame(supplier_data)
+        except Exception:
+            logger.exception("Invalid supplier_data format")
+            return AgentOutput(
+                status=AgentStatus.FAILED,
+                data={},
+                error="Failed to parse supplier_data into DataFrame",
+            )
+
         if df.empty:
             return AgentOutput(
                 status=AgentStatus.FAILED,
                 data={},
-                error='supplier_data is empty'
+                error="supplier_data is empty",
             )
-        candidate_ids = context.input_data.get("supplier_candidates")
-        if candidate_ids:
-            # normalize candidate_ids to a list
-            if not isinstance(candidate_ids, (list, set, tuple)):
-                try:
-                    candidate_ids = list(candidate_ids)
-                except Exception:
-                    candidate_ids = [candidate_ids]
-            candidate_set = set(candidate_ids)
-            # filter DataFrame to only candidate suppliers
-            if "supplier_id" not in df.columns:
-                logger.error("supplier_data does not contain 'supplier_id' column.")
+
+        if "supplier_id" not in df.columns:
+            if "supplier_name" in df.columns:
+                df["supplier_id"] = df["supplier_name"].astype(str)
+                logger.warning(
+                    "supplier_data missing 'supplier_id'; derived IDs from supplier_name"
+                )
+            else:
+                logger.error("supplier_data missing 'supplier_id' column")
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
                     error="supplier_data missing 'supplier_id' column",
                 )
-            df = df[df["supplier_id"].isin(candidate_set)]
+
+        candidate_ids = context.input_data.get("supplier_candidates")
+        candidate_set = self._normalise_id_set(candidate_ids)
+        if candidate_set:
+            df = df[df["supplier_id"].astype(str).isin(candidate_set)].copy()
             if df.empty:
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
                     error="No matching suppliers found for candidates",
                 )
-            logger.debug("SupplierRankingAgent: filtered candidates %s", list(candidate_set))
-        # 2. Determine criteria and weights
-        intent = context.input_data.get('intent', {})
-        requested = intent.get('parameters', {}).get('criteria', [])
+
+        tables = self._load_procurement_tables(candidate_set)
+        df = self._merge_supplier_metrics(df, tables)
+        profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
+
+        intent = context.input_data.get("intent", {})
+        requested = intent.get("parameters", {}).get("criteria", [])
         weight_policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'WeightAllocationPolicy'),
-            {}
+            (
+                p
+                for p in self.policy_engine.supplier_policies
+                if p["policyName"] == "WeightAllocationPolicy"
+            ),
+            {},
         )
-        default_weights = weight_policy.get('details', {}).get('rules', {}).get('default_weights', {})
+        default_weights = (
+            weight_policy.get("details", {})
+            .get("rules", {})
+            .get("default_weights", {})
+        )
         criteria = requested if requested else list(default_weights.keys())
-        weights = {c: default_weights.get(c, 0) for c in criteria if default_weights.get(c, 0) > 0}
+        weights = {
+            crit: default_weights.get(crit, 0.0)
+            for crit in criteria
+            if default_weights.get(crit, 0.0) > 0
+        }
 
-        # 3. Apply categorical scoring
+        df = self._prepare_scoring_columns(df, weights)
         scored_df = self._score_categorical_criteria(df, weights.keys())
-
-        # 4. Apply numeric normalization
         norm_policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'NormalizationDirectionPolicy'),
-            {}
+            (
+                p
+                for p in self.policy_engine.supplier_policies
+                if p["policyName"] == "NormalizationDirectionPolicy"
+            ),
+            {},
         )
-        direction_map = norm_policy.get('details', {}).get('rules', {})
+        direction_map = norm_policy.get("details", {}).get("rules", {})
         scored_df = self._normalize_numeric_scores(scored_df, direction_map)
 
-        # 5. Calculate final weighted score
-        scored_df['final_score'] = 0.0
-        for crit, w in weights.items():
-            col = f"{crit}_score"
-            if col in scored_df.columns:
-                scored_df['final_score'] += pd.to_numeric(scored_df[col].fillna(0), errors='coerce') * float(w)
+        scored_df["final_score"] = 0.0
+        for crit, weight in weights.items():
+            score_col = f"{crit}_score"
+            if score_col not in scored_df.columns:
+                logger.warning("Criterion column missing: %s", score_col)
+                continue
+            scored_df["final_score"] += (
+                pd.to_numeric(scored_df[score_col].fillna(0), errors="coerce")
+                * float(weight)
+            )
 
-            else:
-                logger.warning(f"Criterion column missing: {col}")
+        ranked_df = scored_df.sort_values(
+            by="final_score", ascending=False
+        ).reset_index(drop=True)
 
-        ranked_df = scored_df.sort_values(by='final_score', ascending=False).reset_index(drop=True)
-
-        # 6. Generate justifications for top-N and limit output
-        top_n = intent.get('parameters', {}).get('top_n')
+        top_n = intent.get("parameters", {}).get("top_n")
         if not top_n:
-            query_text = context.input_data.get('query', '')
-            match = re.search(r'top[-\s]*(\d+)', query_text, re.IGNORECASE)
+            query_text = context.input_data.get("query", "")
+            match = re.search(r"top[-\s]*(\d+)", query_text, re.IGNORECASE)
             top_n = int(match.group(1)) if match else 3
         top_n = max(1, min(int(top_n), len(ranked_df)))
 
         top_df = ranked_df.head(top_n).copy()
-        top_df['justification'] = top_df.apply(
-            lambda row: self._generate_justification(row, weights.keys()),
-            axis=1
+        top_df["justification"] = top_df.apply(
+            lambda row: self._generate_justification(row, weights.keys()), axis=1
         )
 
-        ranking = json.loads(top_df.to_json(orient='records'))
-        logger.info("SupplierRankingAgent: Ranking complete with %d entries", len(ranking))
-        logger.debug("SupplierRankingAgent ranking: %s", ranking)
+        ranking = [
+            self._prepare_ranking_entry(row, profiles.get(str(row.get("supplier_id"))), weights)
+            for _, row in top_df.iterrows()
+        ]
+
+        logger.info(
+            "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)
+        )
+
+        output_data = {
+            "ranking": ranking,
+            "supplier_profiles": profiles,
+        }
+        pass_fields = {
+            "ranking": ranking,
+            "supplier_profiles": profiles,
+        }
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={'ranking': ranking},
-            pass_fields={'ranking': ranking},
+            data=output_data,
+            pass_fields=pass_fields,
+            next_agents=["EmailDraftingAgent"],
         )
 
-    def _load_json_file(self, rel_path: str) -> dict:
-        path = os.path.join(PROJECT_ROOT, rel_path)
+    # ------------------------------------------------------------------
+    # Data loading helpers
+    # ------------------------------------------------------------------
+    def _normalise_id_set(self, ids: Optional[Iterable]) -> set[str]:
+        if not ids:
+            return set()
         try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.critical(f"Failed to load JSON at {path}: {e}")
-            raise
+            return {str(val).strip() for val in ids if str(val).strip()}
+        except Exception:
+            return {str(ids).strip()}
 
-    def _score_categorical_criteria(self, df: pd.DataFrame, criteria: list) -> pd.DataFrame:
+    def _load_procurement_tables(self, supplier_ids: Iterable[str]) -> Dict[str, pd.DataFrame]:
+        suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}
+        tables: Dict[str, pd.DataFrame] = {}
+        try:
+            tables["purchase_orders"] = self.query_engine.fetch_purchase_order_data()
+        except Exception:
+            logger.exception("Failed to load purchase orders")
+            tables["purchase_orders"] = pd.DataFrame()
+        try:
+            tables["invoices"] = self.query_engine.fetch_invoice_data()
+        except Exception:
+            logger.exception("Failed to load invoices")
+            tables["invoices"] = pd.DataFrame()
+
+        tables["po_lines"] = self._read_table("proc.po_line_items_agent")
+        tables["invoice_lines"] = self._read_table("proc.invoice_line_items_agent")
+        try:
+            flow = self.query_engine.fetch_procurement_flow(embed=False)
+        except Exception:
+            logger.exception("Failed to load procurement flow")
+            flow = pd.DataFrame()
+        if not flow.empty and suppliers:
+            flow = flow[flow.get("supplier_id").astype(str).isin(suppliers)]
+        tables["procurement_flow"] = flow
+        return tables
+
+    def _read_table(self, table: str) -> pd.DataFrame:
+        sql = f"SELECT * FROM {table}"
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
+        try:
+            if callable(pandas_conn):
+                with pandas_conn() as conn:
+                    return pd.read_sql(sql, conn)
+            with self.agent_nick.get_db_connection() as conn:
+                return pd.read_sql(sql, conn)
+        except Exception:
+            logger.exception("Failed to read table %s", table)
+            return pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Metric enrichment
+    # ------------------------------------------------------------------
+    def _merge_supplier_metrics(
+        self, df: pd.DataFrame, tables: Dict[str, pd.DataFrame]
+    ) -> pd.DataFrame:
+        if df.empty:
+            return df
+
+        po_summary = self._summarise_purchase_orders(tables.get("purchase_orders", pd.DataFrame()))
+        po_line_summary = self._summarise_po_lines(
+            tables.get("po_lines", pd.DataFrame()),
+            tables.get("purchase_orders", pd.DataFrame()),
+        )
+        invoice_summary = self._summarise_invoices(tables.get("invoices", pd.DataFrame()))
+        invoice_line_summary = self._summarise_invoice_lines(
+            tables.get("invoice_lines", pd.DataFrame()),
+            tables.get("invoices", pd.DataFrame()),
+        )
+
+        result = df.copy()
+        for summary in [po_summary, po_line_summary, invoice_summary, invoice_line_summary]:
+            if summary.empty:
+                continue
+            result = result.merge(summary, on="supplier_id", how="left")
+
+        for column in [
+            "po_total_value",
+            "po_line_spend",
+            "invoice_total_value",
+            "avg_unit_price",
+            "total_volume",
+            "avg_lead_time_days",
+        ]:
+            if column in result.columns:
+                result[column] = pd.to_numeric(result[column], errors="coerce")
+
+        if "total_spend" in result.columns:
+            spend_components = [
+                result.get("po_total_value"),
+                result.get("invoice_total_value"),
+                result.get("po_line_spend"),
+            ]
+            for comp in spend_components:
+                if comp is not None:
+                    result["total_spend"] = result["total_spend"].fillna(0) + comp.fillna(0)
+        else:
+            result["total_spend"] = 0.0
+            for comp in [
+                result.get("po_total_value"),
+                result.get("invoice_total_value"),
+                result.get("po_line_spend"),
+            ]:
+                if comp is not None:
+                    result["total_spend"] += comp.fillna(0)
+
+        if "avg_unit_price" not in result.columns:
+            result["avg_unit_price"] = pd.NA
+        if "avg_unit_price" in result.columns:
+            missing_price = result["avg_unit_price"].isna()
+            if "po_line_spend" in result.columns and "total_volume" in result.columns:
+                with pd.option_context("mode.use_inf_as_na", True):
+                    calculated = result["po_line_spend"].fillna(0) / result["total_volume"].replace(0, pd.NA)
+                result.loc[missing_price, "avg_unit_price"] = calculated[missing_price]
+
+        if "payment_terms" not in result.columns and "po_payment_terms" in result.columns:
+            result["payment_terms"] = result["po_payment_terms"]
+
+        return result
+
+    def _summarise_purchase_orders(self, po_df: pd.DataFrame) -> pd.DataFrame:
+        if po_df.empty or "supplier_id" not in po_df.columns:
+            return pd.DataFrame()
+        df = po_df.dropna(subset=["supplier_id"]).copy()
+        df["supplier_id"] = df["supplier_id"].astype(str)
+        value_col = "total_amount_gbp" if "total_amount_gbp" in df.columns else "total_amount"
+        if value_col in df.columns:
+            df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
+        else:
+            df[value_col] = 0.0
+
+        if "order_date" in df.columns:
+            df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        if "expected_delivery_date" in df.columns:
+            df["expected_delivery_date"] = pd.to_datetime(
+                df["expected_delivery_date"], errors="coerce"
+            )
+            df["lead_time_days"] = (
+                df["expected_delivery_date"] - df.get("order_date")
+            ).dt.days
+
+        agg = df.groupby("supplier_id").agg(
+            po_total_value=(value_col, "sum"),
+            po_count=("po_id", "nunique"),
+            po_payment_terms=("payment_terms", lambda s: self._mode_value(s)),
+            last_order_date=("order_date", "max"),
+            avg_lead_time_days=("lead_time_days", "mean"),
+        )
+        return agg.reset_index()
+
+    def _summarise_po_lines(
+        self, po_lines: pd.DataFrame, po_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        if po_lines.empty or "po_id" not in po_lines.columns:
+            return pd.DataFrame()
+        df = po_lines.copy()
+        if po_df.empty or "po_id" not in po_df.columns:
+            return pd.DataFrame()
+        merge_cols = ["po_id", "supplier_id"]
+        df = df.merge(po_df[merge_cols], on="po_id", how="left")
+        df = df.dropna(subset=["supplier_id"])
+        df["supplier_id"] = df["supplier_id"].astype(str)
+
+        for col in ["unit_price", "line_total", "quantity"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "line_total" not in df.columns:
+            df["line_total"] = df.get("unit_price", 0.0) * df.get("quantity", 0.0)
+
+        agg = df.groupby("supplier_id").agg(
+            po_line_spend=("line_total", "sum"),
+            avg_unit_price=("unit_price", "mean"),
+            total_volume=("quantity", "sum"),
+            catalog_items=("item_description", lambda s: self._top_values(s, limit=5)),
+        )
+        return agg.reset_index()
+
+    def _summarise_invoices(self, invoice_df: pd.DataFrame) -> pd.DataFrame:
+        if invoice_df.empty or "supplier_id" not in invoice_df.columns:
+            return pd.DataFrame()
+        df = invoice_df.dropna(subset=["supplier_id"]).copy()
+        df["supplier_id"] = df["supplier_id"].astype(str)
+        total_col = "invoice_total_incl_tax" if "invoice_total_incl_tax" in df.columns else "invoice_amount"
+        if total_col in df.columns:
+            df[total_col] = pd.to_numeric(df[total_col], errors="coerce").fillna(0.0)
+        else:
+            df[total_col] = 0.0
+        if "invoice_date" in df.columns:
+            df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
+        agg = df.groupby("supplier_id").agg(
+            invoice_total_value=(total_col, "sum"),
+            invoice_count=("invoice_id", "nunique"),
+            last_invoice_date=("invoice_date", "max"),
+        )
+        return agg.reset_index()
+
+    def _summarise_invoice_lines(
+        self, invoice_lines: pd.DataFrame, invoice_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        if invoice_lines.empty or "invoice_id" not in invoice_lines.columns:
+            return pd.DataFrame()
+        if invoice_df.empty or "invoice_id" not in invoice_df.columns:
+            return pd.DataFrame()
+        df = invoice_lines.merge(
+            invoice_df[["invoice_id", "supplier_id"]], on="invoice_id", how="left"
+        )
+        df = df.dropna(subset=["supplier_id"])
+        df["supplier_id"] = df["supplier_id"].astype(str)
+        if "total_amount_incl_tax" in df.columns:
+            df["total_amount_incl_tax"] = pd.to_numeric(
+                df["total_amount_incl_tax"], errors="coerce"
+            )
+        agg = df.groupby("supplier_id").agg(
+            invoice_item_count=("invoice_line_id", "nunique"),
+        )
+        return agg.reset_index()
+
+    # ------------------------------------------------------------------
+    # Profile construction
+    # ------------------------------------------------------------------
+    def _build_supplier_profiles(
+        self, tables: Dict[str, pd.DataFrame], supplier_ids: Iterable[str]
+    ) -> Dict[str, Dict]:
+        flow = tables.get("procurement_flow", pd.DataFrame())
+        if flow.empty:
+            return {}
+        flow = flow.dropna(subset=["supplier_id"]).copy()
+        flow["supplier_id"] = flow["supplier_id"].astype(str)
+        suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}
+        if suppliers:
+            flow = flow[flow["supplier_id"].isin(suppliers)]
+        if flow.empty:
+            return {}
+
+        profiles: Dict[str, Dict] = {}
+        for supplier_id, group in flow.groupby("supplier_id"):
+            descriptions = [
+                str(val).strip()
+                for val in group.get("item_description", pd.Series(dtype="object")).dropna()
+                if str(val).strip()
+            ]
+            description_counter = Counter(descriptions)
+            top_item = description_counter.most_common(1)[0][0] if description_counter else None
+            top_descriptions = [val for val, _ in description_counter.most_common(5)]
+
+            categories = {}
+            for level in range(1, 6):
+                col = f"category_level_{level}"
+                if col in group.columns:
+                    categories[col] = sorted(
+                        {
+                            str(val).strip()
+                            for val in group[col].dropna()
+                            if str(val).strip()
+                        }
+                    )
+
+            products = sorted(
+                {
+                    str(val).strip()
+                    for val in group.get("product", pd.Series(dtype="object")).dropna()
+                    if str(val).strip()
+                }
+            )
+
+            profile = {
+                "supplier_id": supplier_id,
+                "po_ids": sorted({str(val).strip() for val in group.get("po_id", pd.Series(dtype="object")).dropna()}),
+                "invoice_ids": sorted({str(val).strip() for val in group.get("invoice_id", pd.Series(dtype="object")).dropna()}),
+                "items": top_descriptions,
+                "primary_item": top_item,
+                "categories": categories,
+                "products": products,
+            }
+            profiles[supplier_id] = profile
+        return profiles
+
+    # ------------------------------------------------------------------
+    # Scoring helpers
+    # ------------------------------------------------------------------
+    def _prepare_scoring_columns(self, df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame:
+        result = df.copy()
+        if "price" in weights:
+            if "price" not in result.columns:
+                price_series = result.get("avg_unit_price")
+                result["price"] = (
+                    pd.to_numeric(price_series, errors="coerce") if price_series is not None else 0.0
+                )
+            else:
+                result["price"] = pd.to_numeric(result["price"], errors="coerce")
+        if "delivery" in weights:
+            if "delivery" not in result.columns:
+                delivery_source = result.get("avg_lead_time_days")
+                delivery_numeric = (
+                    pd.to_numeric(delivery_source, errors="coerce")
+                    if delivery_source is not None
+                    else pd.Series(0, index=result.index)
+                )
+                with pd.option_context("mode.use_inf_as_na", True):
+                    result["delivery"] = 1 / (delivery_numeric.abs() + 1)
+            else:
+                result["delivery"] = pd.to_numeric(result["delivery"], errors="coerce")
+        if "risk" in weights:
+            if "risk" not in result.columns:
+                risk = result.get("risk_score")
+                result["risk"] = (
+                    pd.to_numeric(risk, errors="coerce") if risk is not None else 0.0
+                )
+            else:
+                result["risk"] = pd.to_numeric(result["risk"], errors="coerce")
+        if "payment_terms" in weights and "payment_terms" not in result.columns:
+            result["payment_terms"] = result.get("po_payment_terms")
+        return result
+
+    def _score_categorical_criteria(self, df: pd.DataFrame, criteria: Iterable[str]) -> pd.DataFrame:
         out = df.copy()
         policy = next(
-            (p for p in self.policy_engine.supplier_policies if p['policyName'] == 'CategoricalScoringPolicy'),
-            None
+            (
+                p
+                for p in self.policy_engine.supplier_policies
+                if p["policyName"] == "CategoricalScoringPolicy"
+            ),
+            None,
         )
         if not policy:
             return out
-        rules = policy.get('details', {}).get('rules', {})
+        rules = policy.get("details", {}).get("rules", {})
         for crit in criteria:
             raw_col = crit
             score_col = f"{crit}_score"
             if raw_col in out.columns and crit in rules:
                 mapping = rules[crit]
-                out[score_col] = out[raw_col].map(mapping).fillna(mapping.get('default', 0))
+                out[score_col] = out[raw_col].map(mapping).fillna(mapping.get("default", 0))
         return out
 
     def _normalize_numeric_scores(self, df: pd.DataFrame, dirs: dict) -> pd.DataFrame:
@@ -210,19 +554,22 @@ class SupplierRankingAgent(BaseAgent):
             score_col = f"{crit}_score"
             if raw_col not in df.columns:
                 continue
-            vals = df[raw_col]
+            vals = pd.to_numeric(df[raw_col], errors="coerce")
+            if vals.isna().all():
+                out[score_col] = 0.0
+                continue
             min_v, max_v = vals.min(), vals.max()
             if max_v - min_v == 0:
                 out[score_col] = 10.0
             else:
-                range_diff = float(max_v - min_v)  # Convert to float to avoid integer division issues
-                if direction == 'lower_is_better':
+                range_diff = float(max_v - min_v)
+                if direction == "lower_is_better":
                     out[score_col] = 10 * (max_v - vals) / range_diff
                 else:
                     out[score_col] = 10 * (vals - min_v) / range_diff
         return out
 
-    def _generate_justification(self, row: pd.Series, criteria: list) -> str:
+    def _generate_justification(self, row: pd.Series, criteria: Iterable[str]) -> str:
         if not self.justification_template:
             return "No justification template available."
         breakdown = []
@@ -233,16 +580,80 @@ class SupplierRankingAgent(BaseAgent):
                 if isinstance(score_value, (int, float)):
                     breakdown.append(f"- {crit.replace('_', ' ').title()}: {score_value:.2f}")
                 else:
-                    logger.warning(f"Score value for {crit} is not numeric: {score_value}")
                     breakdown.append(f"- {crit.replace('_', ' ').title()}: N/A")
-        prompt = self.justification_template['prompt_template'].format(
-            supplier_name=row.get('supplier_name', 'Unknown'),
-            final_score=row.get('final_score', 0.0),
-            score_breakdown="\n".join(breakdown)
+        prompt = self.justification_template["prompt_template"].format(
+            supplier_name=row.get("supplier_name", "Unknown"),
+            final_score=row.get("final_score", 0.0),
+            score_breakdown="\n".join(breakdown),
         )
         try:
             resp = self.call_ollama(prompt, model=self.settings.extraction_model)
-            return resp.get('response', '').strip()
-        except Exception as e:
+            return resp.get("response", "").strip()
+        except Exception:
             logger.exception("Justification generation failed")
             return "Justification generation failed."
+
+    def _prepare_ranking_entry(
+        self, row: pd.Series, profile: Optional[Dict], weights: Dict[str, float]
+    ) -> Dict:
+        entry = {
+            "supplier_id": row.get("supplier_id"),
+            "supplier_name": row.get("supplier_name"),
+            "final_score": float(row.get("final_score", 0.0)),
+            "price_score": row.get("price_score"),
+            "delivery_score": row.get("delivery_score"),
+            "risk_score": row.get("risk_score"),
+            "payment_terms_score": row.get("payment_terms_score"),
+            "payment_terms": row.get("payment_terms"),
+            "avg_unit_price": row.get("avg_unit_price"),
+            "total_spend": row.get("total_spend"),
+            "po_count": row.get("po_count"),
+            "invoice_count": row.get("invoice_count"),
+            "lead_time_days": row.get("avg_lead_time_days"),
+            "justification": row.get("justification"),
+            "contact_name": row.get("contact_name_1"),
+            "contact_email": row.get("contact_email_1"),
+            "weights": weights,
+        }
+        if profile:
+            entry.update(
+                {
+                    "po_ids": profile.get("po_ids", []),
+                    "invoice_ids": profile.get("invoice_ids", []),
+                    "primary_item": profile.get("primary_item"),
+                    "items": profile.get("items", []),
+                    "categories": profile.get("categories", {}),
+                    "products": profile.get("products", []),
+                }
+            )
+        return entry
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+    def _mode_value(self, series: pd.Series) -> Optional[str]:
+        try:
+            cleaned = series.dropna().astype(str)
+            if cleaned.empty:
+                return None
+            return cleaned.mode().iloc[0]
+        except Exception:
+            return None
+
+    def _top_values(self, series: pd.Series, limit: int = 5) -> List[str]:
+        cleaned = [
+            str(val).strip()
+            for val in series.dropna()
+            if isinstance(val, str) and str(val).strip()
+        ]
+        counter = Counter(cleaned)
+        return [val for val, _ in counter.most_common(limit)]
+
+    def _load_json_file(self, rel_path: str) -> dict:
+        path = os.path.join(PROJECT_ROOT, rel_path)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:  # pragma: no cover - configuration error
+            logger.critical("Failed to load JSON at %s: %s", path, exc)
+            return {}
