@@ -291,13 +291,16 @@ def test_ranking_workflow_runs_full_supplier_flow():
     class StubQuoteAgent:
         def __init__(self):
             self.ranking_seen = None
+
             self.category_seen = None
+
 
         def execute(self, context):
             ranking = context.input_data.get("ranking")
             executions.append(("quote_evaluation", ranking))
             self.ranking_seen = ranking
             self.category_seen = context.input_data.get("product_category")
+
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={"quotes": ["Q1", "Q2"]},
@@ -344,6 +347,7 @@ def test_ranking_workflow_runs_full_supplier_flow():
     assert ranking_agent.candidates == ["S1", "S2"]
     assert quote_agent.ranking_seen[0]["supplier_id"] == "S1"
     assert quote_agent.category_seen == "Raw Materials"
+
     assert result["result"]["opportunities"]["supplier_candidates"] == ["S1", "S2"]
     assert result["result"]["opportunities"]["product_category"] == "Raw Materials"
     assert result["result"]["ranking"]["ranking"][0]["supplier_id"] == "S1"
