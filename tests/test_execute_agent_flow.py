@@ -253,6 +253,70 @@ def test_execute_agent_flow_ignores_agent_id_suffix():
     assert agent.ran is True
 
 
+def test_ranking_workflow_runs_opportunity_first_and_passes_candidates():
+    executions = []
+
+    class StubOpportunityAgent:
+        def execute(self, context):
+            executions.append(("opportunity_miner", context.input_data.get("workflow")))
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"supplier_candidates": ["S1", "S2"]},
+                pass_fields={"supplier_candidates": ["S1", "S2"]},
+            )
+
+    class StubRankingAgent:
+        def __init__(self):
+            self.candidates = None
+
+        def execute(self, context):
+            supplier_candidates = context.input_data.get("supplier_candidates")
+            executions.append(("supplier_ranking", supplier_candidates))
+            self.candidates = supplier_candidates
+            ranking = [{"supplier_id": sid} for sid in supplier_candidates]
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"ranking": ranking},
+                pass_fields={"ranking": ranking},
+            )
+
+    class AllowAllPolicy:
+        def validate_workflow(self, *args, **kwargs):
+            return {"allowed": True}
+
+    class StubQueryEngine:
+        def fetch_supplier_data(self, *_):
+            return [{"supplier_id": "S1"}, {"supplier_id": "S2"}]
+
+    ranking_agent = StubRankingAgent()
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={
+            "opportunity_miner": StubOpportunityAgent(),
+            "supplier_ranking": ranking_agent,
+        },
+        policy_engine=AllowAllPolicy(),
+        query_engine=StubQueryEngine(),
+        routing_engine=SimpleNamespace(routing_model={}),
+    )
+
+    orchestrator = Orchestrator(nick)
+    payload = {
+        "workflow": "contract_expiry_check",
+        "conditions": {"negotiation_window_days": 90},
+    }
+
+    result = orchestrator.execute_workflow("supplier_ranking", payload)
+
+    assert result["status"] == "completed"
+    assert executions[0][0] == "opportunity_miner"
+    assert executions[1][0] == "supplier_ranking"
+    assert ranking_agent.candidates == ["S1", "S2"]
+    assert result["result"]["opportunities"]["supplier_candidates"] == ["S1", "S2"]
+    assert result["result"]["ranking"]["ranking"][0]["supplier_id"] == "S1"
+
+
 def test_execute_agent_flow_handles_prefixed_agent_names():
     agent = DummyAgent()
     nick = SimpleNamespace(
