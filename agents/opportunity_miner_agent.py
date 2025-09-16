@@ -101,6 +101,10 @@ class OpportunityMinerAgent(BaseAgent):
             self._escalations = []
             notifications: set[str] = set()
 
+            min_impact_threshold = self._resolve_min_financial_impact(
+                context.input_data
+            )
+
             workflow_name = context.input_data.get("workflow")
             if not workflow_name:
                 message = "Mandatory orchestrator field 'workflow' is missing."
@@ -137,7 +141,9 @@ class OpportunityMinerAgent(BaseAgent):
             findings = handler(tables, context.input_data, notifications, policy_cfg)
 
             findings = self._enrich_findings(findings, tables)
-            filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
+            filtered = [
+                f for f in findings if f.financial_impact_gbp >= min_impact_threshold
+            ]
             self._load_supplier_risk_map()
             for f in filtered:
                 f.candidate_suppliers = self._find_candidate_suppliers(
@@ -163,6 +169,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "findings": [f.as_dict() for f in filtered],
                 "opportunity_count": len(filtered),
                 "total_savings": sum(f.financial_impact_gbp for f in filtered),
+                "min_financial_impact": min_impact_threshold,
                 "policy_events": self._event_log,
                 "escalations": self._escalations,
             }
@@ -533,6 +540,37 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _default_notifications(self, notifications: set[str]) -> None:
         notifications.update({"Negotiation", "Approvals", "CategoryManager"})
+
+    def _resolve_min_financial_impact(self, input_data: Dict[str, Any]) -> float:
+        """Determine the impact threshold for the current run.
+
+        The agent exposes ``min_financial_impact`` as an instance-level default
+        so that platform settings can cap noise.  Workflow callers may override
+        the threshold per run via ``input_data['min_financial_impact']``.  Any
+        malformed or negative value falls back to the configured default to
+        avoid silently discarding all findings.
+        """
+
+        value = input_data.get("min_financial_impact")
+        if value is None:
+            return self.min_financial_impact
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid min_financial_impact '%s'; using default %s",
+                value,
+                self.min_financial_impact,
+            )
+            return self.min_financial_impact
+        if threshold < 0:
+            logger.warning(
+                "Negative min_financial_impact %s provided; using default %s",
+                threshold,
+                self.min_financial_impact,
+            )
+            return self.min_financial_impact
+        return threshold
 
     def _get_policy_registry(self) -> Dict[str, Dict[str, Any]]:
         return {
