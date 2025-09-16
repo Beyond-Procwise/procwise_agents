@@ -518,6 +518,7 @@ def test_fetch_quotes_from_database_enriches_results():
     connection = build_quote_connection(
         quote_rows, line_rows, quote_columns, line_columns
     )
+
     nick.get_db_connection = lambda: connection
 
     agent = QuoteEvaluationAgent(nick)

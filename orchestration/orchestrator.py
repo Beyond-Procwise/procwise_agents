@@ -884,6 +884,7 @@ class Orchestrator:
             input_data.get("product_category")
         )
 
+
         if should_run_opportunity:
             opp_context = self._create_child_context(context, "opportunity_miner", {})
             opp_result = self._execute_agent("opportunity_miner", opp_context)
@@ -908,6 +909,7 @@ class Orchestrator:
                     results["opportunities"].setdefault(
                         "product_category", derived_category
                     )
+
 
             supplier_candidates_raw = (
                 (opp_result.pass_fields or {}).get("supplier_candidates")
@@ -948,6 +950,7 @@ class Orchestrator:
         if category_hint and not input_data.get("product_category"):
             input_data["product_category"] = category_hint
 
+
         # Get supplier data for ranking
         input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
             input_data
@@ -968,6 +971,7 @@ class Orchestrator:
 
         if category_hint and "product_category" not in pass_fields:
             pass_fields["product_category"] = category_hint
+
 
         ranking_payload = pass_fields.get("ranking")
         if not ranking_payload:
@@ -1054,6 +1058,7 @@ class Orchestrator:
                 category_hint = derived_category
         if category_hint and isinstance(results.get("opportunities"), dict):
             results["opportunities"].setdefault("product_category", category_hint)
+
 
         candidates_raw = opp_result.data.get("supplier_candidates", []) if opp_result else []
         seen_candidates: set[str] = set()

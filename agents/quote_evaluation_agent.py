@@ -99,6 +99,7 @@ class QuoteEvaluationAgent(BaseAgent):
             )
 
             retrieval_strategy = "ranked_suppliers"
+
             db_quotes = self._fetch_quotes_from_database(
                 supplier_names_filter,
                 supplier_ids_filter,
@@ -164,6 +165,7 @@ class QuoteEvaluationAgent(BaseAgent):
                         )
 
             filtered_quotes = quotes
+
             if supplier_tokens:
                 filtered_quotes = self._filter_quotes_by_suppliers(
                     quotes, supplier_tokens
@@ -478,11 +480,13 @@ class QuoteEvaluationAgent(BaseAgent):
 
         matched_quotes: List[Dict] = []
         unmatched_quotes: List[Dict] = []
+
         for quote in quote_records:
             quote_id = quote.get("quote_id")
             items = line_map.get(quote_id, [])
 
             matched = False
+
             if category_token:
                 matched = any(
                     category_token in str(item.get("item_description", "")).lower()
@@ -538,6 +542,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 len(enriched),
                 category_token,
             )
+
 
         logger.debug(
             "QuoteEvaluationAgent: retrieved %d quotes from database", len(enriched)
@@ -640,6 +645,7 @@ class QuoteEvaluationAgent(BaseAgent):
                 quote, ["total_line_amount"], 0
             ),
             "category_match": bool(quote.get("category_match")),
+
             "buyer_id": QuoteEvaluationAgent._coalesce(
                 quote, ["buyer_id"], None, strip_strings=True
             ),
