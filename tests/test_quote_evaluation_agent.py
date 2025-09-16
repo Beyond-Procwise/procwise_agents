@@ -2,6 +2,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
@@ -36,6 +38,7 @@ def _mock_quotes(*args, **kwargs):
         {
             "quote_id": "Q1",
             "supplier_name": "Supplier A",
+            "supplier_id": "S1",
             "total_spend": 1000,
             "tenure": "12 months",
             "total_cost": 1000,
@@ -46,6 +49,7 @@ def _mock_quotes(*args, **kwargs):
         {
             "quote_id": "Q2",
             "supplier_name": "Supplier B",
+            "supplier_id": "S2",
             "total_spend": 1200,
             "tenure": "12 months",
             "total_cost": 1200,
@@ -71,10 +75,10 @@ def test_quote_evaluation_agent_run(monkeypatch):
     quotes = output.data["quotes"]
     weighting = quotes[0]
     assert weighting["name"] == "weighting"
-    assert weighting["total_spend"] == output.data["weights"]["price"]
+    assert weighting["total_spend"] == pytest.approx(output.data["weights"])
     supplier_a = next(q for q in quotes if q["name"] == "Supplier A")
     assert supplier_a["total_spend"] == 1000
-    assert output.data["weights"]["price"] == 0.5
+    assert output.data["weights"] == pytest.approx(1.0)
 
 
 def test_quote_evaluation_handles_no_quotes(monkeypatch):
@@ -92,9 +96,9 @@ def test_quote_evaluation_handles_no_quotes(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     weighting = output.data["quotes"][0]
     assert weighting["name"] == "weighting"
-    assert weighting["total_spend"] == output.data["weights"]["price"]
+    assert weighting["total_spend"] == pytest.approx(output.data["weights"])
     assert len(output.data["quotes"]) == 1
-    assert output.data["weights"]["price"] == 0.5
+    assert output.data["weights"] == pytest.approx(1.0)
 
 
 def test_quote_evaluation_handles_no_quotes_message(monkeypatch):
@@ -112,6 +116,74 @@ def test_quote_evaluation_handles_no_quotes_message(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     assert output.data["quotes"][0]["name"] == "weighting"
     assert output.data.get("message") == "No quotes found"
+
+
+def test_quote_evaluation_limits_to_ranked_suppliers(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    captured = {}
+
+    def mock_fetch(supplier_names, product_category=None):
+        captured["supplier_names"] = supplier_names
+        return [
+            {
+                "quote_id": "Q1",
+                "supplier_name": "Supplier B",
+                "supplier_id": "S2",
+                "total_cost": 220,
+                "unit_price": 11,
+            },
+            {
+                "quote_id": "Q2",
+                "supplier_name": "Supplier A",
+                "supplier_id": "S1",
+                "total_cost": 180,
+                "unit_price": 9,
+            },
+            {
+                "quote_id": "Q3",
+                "supplier_name": "Supplier D",
+                "supplier_id": "S4",
+                "total_cost": 260,
+                "unit_price": 13,
+            },
+            {
+                "quote_id": "Q4",
+                "supplier_name": "Supplier C",
+                "supplier_id": "S3",
+                "total_cost": 200,
+                "unit_price": 10,
+            },
+        ]
+
+    monkeypatch.setattr(agent, "_fetch_quotes", mock_fetch)
+
+    ranking = [
+        {"supplier_name": "Supplier C", "final_score": 9.5},
+        {"supplier_name": "Supplier A", "final_score": 9.1},
+        {"supplier_name": "Supplier B", "final_score": 8.9},
+        {"supplier_name": "Supplier D", "final_score": 8.2},
+    ]
+
+    context = AgentContext(
+        workflow_id="wf_rank",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={"ranking": ranking},
+    )
+
+    output = agent.run(context)
+
+    assert captured["supplier_names"] == [
+        "Supplier C",
+        "Supplier A",
+        "Supplier B",
+    ]
+
+    names = [q["name"] for q in output.data["quotes"] if q["name"] != "weighting"]
+    assert names == ["Supplier C", "Supplier A", "Supplier B"]
+    assert len(names) == 3
 
 
 class DummyOrchestrator:
