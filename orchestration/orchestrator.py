@@ -110,7 +110,7 @@ class Orchestrator:
         try:
             # Create initial context
             enriched_input: Dict[str, Any] = {**(input_data or {})}
-            enriched_input.setdefault("workflow", workflow_name)
+            self._ensure_workflow_metadata(enriched_input, workflow_name)
             context = AgentContext(
                 workflow_id=workflow_id,
                 agent_id=workflow_name,
@@ -352,6 +352,42 @@ class Orchestrator:
             name = name[:-6]
         return name
 
+    @staticmethod
+    def _coerce_workflow_hint(value: Any) -> Optional[str]:
+        """Return a normalised workflow hint or ``None`` when unavailable."""
+
+        if value is None:
+            return None
+        if isinstance(value, str):
+            candidate = value.strip()
+        else:
+            candidate = str(value).strip()
+        return candidate or None
+
+    def _ensure_workflow_metadata(
+        self, input_data: Dict[str, Any], *hints: Any
+    ) -> None:
+        """Ensure agent input contains a usable ``workflow`` field.
+
+        Legacy flows and dynamic pass-through data occasionally provide the
+        ``workflow`` field with a ``None`` value, causing agents such as the
+        ``OpportunityMinerAgent`` to block execution.  This helper promotes the
+        first non-empty hint to ``input_data['workflow']`` and removes the field
+        entirely when no valid value can be resolved.
+        """
+
+        candidate = self._coerce_workflow_hint(input_data.get("workflow"))
+        if not candidate:
+            for hint in hints:
+                candidate = self._coerce_workflow_hint(hint)
+                if candidate:
+                    break
+
+        if candidate:
+            input_data["workflow"] = candidate
+        else:
+            input_data.pop("workflow", None)
+
     def execute_agent_flow(
         self,
         flow: Dict[str, Any],
@@ -475,6 +511,14 @@ class Orchestrator:
                 **step.get("input", {}),
             }
             rendered_input = _render(input_cfg)
+            default_input = defaults.get("input", {}) if isinstance(defaults, dict) else {}
+            self._ensure_workflow_metadata(
+                rendered_input,
+                step.get("workflow"),
+                default_input.get("workflow"),
+                payload.get("workflow") if isinstance(payload, dict) else None,
+                flow.get("workflow"),
+            )
 
             success = False
             attempt = 0
@@ -611,8 +655,12 @@ class Orchestrator:
                 input_data["prompts"] = prompt_objs
             if policy_objs:
                 input_data["policies"] = policy_objs
-            if node.get("workflow") and not input_data.get("workflow"):
-                input_data["workflow"] = node["workflow"]
+            self._ensure_workflow_metadata(
+                input_data,
+                props.get("workflow"),
+                (inherited or {}).get("workflow") if isinstance(inherited, dict) else None,
+                node.get("workflow"),
+            )
 
             context = AgentContext(
                 workflow_id=_new_id(),
@@ -884,11 +932,17 @@ class Orchestrator:
         self, parent_context: AgentContext, agent_name: str, pass_fields: Dict
     ) -> AgentContext:
         """Create child context for agent execution"""
+        child_input = {**parent_context.input_data, **pass_fields}
+        self._ensure_workflow_metadata(
+            child_input,
+            pass_fields.get("workflow") if isinstance(pass_fields, dict) else None,
+            parent_context.input_data.get("workflow"),
+        )
         return AgentContext(
             workflow_id=parent_context.workflow_id,
             agent_id=agent_name,
             user_id=parent_context.user_id,
-            input_data={**parent_context.input_data, **pass_fields},
+            input_data=child_input,
             parent_agent=parent_context.agent_id,
             routing_history=parent_context.routing_history.copy(),
         )
