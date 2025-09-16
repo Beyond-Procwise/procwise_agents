@@ -253,7 +253,7 @@ def test_execute_agent_flow_ignores_agent_id_suffix():
     assert agent.ran is True
 
 
-def test_ranking_workflow_runs_opportunity_first_and_passes_candidates():
+def test_ranking_workflow_runs_full_supplier_flow():
     executions = []
 
     class StubOpportunityAgent:
@@ -273,11 +273,28 @@ def test_ranking_workflow_runs_opportunity_first_and_passes_candidates():
             supplier_candidates = context.input_data.get("supplier_candidates")
             executions.append(("supplier_ranking", supplier_candidates))
             self.candidates = supplier_candidates
-            ranking = [{"supplier_id": sid} for sid in supplier_candidates]
+            ranking = [
+                {"supplier_id": sid, "supplier_name": f"Supplier {sid}"}
+                for sid in supplier_candidates
+            ]
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={"ranking": ranking},
                 pass_fields={"ranking": ranking},
+            )
+
+    class StubQuoteAgent:
+        def __init__(self):
+            self.ranking_seen = None
+
+        def execute(self, context):
+            ranking = context.input_data.get("ranking")
+            executions.append(("quote_evaluation", ranking))
+            self.ranking_seen = ranking
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"quotes": ["Q1", "Q2"]},
+                pass_fields={"quotes": ["Q1", "Q2"]},
             )
 
     class AllowAllPolicy:
@@ -289,12 +306,14 @@ def test_ranking_workflow_runs_opportunity_first_and_passes_candidates():
             return [{"supplier_id": "S1"}, {"supplier_id": "S2"}]
 
     ranking_agent = StubRankingAgent()
+    quote_agent = StubQuoteAgent()
 
     nick = SimpleNamespace(
         settings=SimpleNamespace(script_user="tester", max_workers=1),
         agents={
             "opportunity_miner": StubOpportunityAgent(),
             "supplier_ranking": ranking_agent,
+            "quote_evaluation": quote_agent,
         },
         policy_engine=AllowAllPolicy(),
         query_engine=StubQueryEngine(),
@@ -310,11 +329,19 @@ def test_ranking_workflow_runs_opportunity_first_and_passes_candidates():
     result = orchestrator.execute_workflow("supplier_ranking", payload)
 
     assert result["status"] == "completed"
-    assert executions[0][0] == "opportunity_miner"
-    assert executions[1][0] == "supplier_ranking"
+    assert [step[0] for step in executions] == [
+        "opportunity_miner",
+        "supplier_ranking",
+        "quote_evaluation",
+    ]
     assert ranking_agent.candidates == ["S1", "S2"]
+    assert quote_agent.ranking_seen[0]["supplier_id"] == "S1"
     assert result["result"]["opportunities"]["supplier_candidates"] == ["S1", "S2"]
     assert result["result"]["ranking"]["ranking"][0]["supplier_id"] == "S1"
+    assert result["result"]["downstream_results"]["quote_evaluation"]["quotes"] == [
+        "Q1",
+        "Q2",
+    ]
 
 
 def test_execute_agent_flow_handles_prefixed_agent_names():
