@@ -125,7 +125,37 @@ class ExtractRequest(BaseModel):
 class OpportunityMiningRequest(BaseModel):
     """Parameters for opportunity mining workflow."""
 
-    min_financial_impact: float = 100.0
+    workflow: str
+    conditions: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Policy specific parameters keyed by requirement name.",
+    )
+    min_financial_impact: float = Field(
+        default=100.0,
+        ge=0,
+        description="Minimum savings required for an opportunity to be returned.",
+    )
+
+    @field_validator("workflow", mode="before")
+    @classmethod
+    def _normalise_workflow(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("workflow is required")
+        if not isinstance(value, str):
+            value = str(value)
+        workflow = value.strip()
+        if not workflow:
+            raise ValueError("workflow must not be empty")
+        return workflow
+
+    @field_validator("conditions", mode="before")
+    @classmethod
+    def _default_conditions(cls, value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        raise ValueError("conditions must be a mapping of field names to values")
 
 
 class QuoteEvaluationRequest(BaseModel):
