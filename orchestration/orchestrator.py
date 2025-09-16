@@ -53,6 +53,18 @@ class Orchestrator:
 
     }
 
+    # Token level aliases help resolve historical agent identifiers that were
+    # generated dynamically (e.g. ``quotes_agent``) to their canonical
+    # registry entries. This keeps fuzzy matching deterministic even when new
+    # agents such as ``QuoteComparisonAgent`` introduce additional "quote"
+    # slugs into the registry.
+    AGENT_TOKEN_ALIASES = {
+        "quotes": "quote_evaluation",
+        "quote": "quote_evaluation",
+        "comparison": "quote_comparison",
+        "comparisons": "quote_comparison",
+    }
+
     def __init__(self, agent_nick):
         # Ensure GPU environment is initialised before any agent execution.
         # ``configure_gpu`` is idempotent so repeated calls are safe and allow
@@ -211,6 +223,17 @@ class Orchestrator:
         key = re.sub(r"_agent$", "", key)
 
         key_lower = key.lower()
+        tokens_raw = [t for t in re.split(r"[_]+", key_lower) if t]
+
+        for token in tokens_raw:
+            alias = Orchestrator.AGENT_TOKEN_ALIASES.get(token)
+            if alias and alias in agent_defs:
+                return alias
+            if token.endswith("s"):
+                singular = token[:-1]
+                alias = Orchestrator.AGENT_TOKEN_ALIASES.get(singular)
+                if alias and alias in agent_defs:
+                    return alias
         if key_lower in agent_defs:
             return key_lower
 
@@ -228,7 +251,7 @@ class Orchestrator:
                 return slug
 
         tokens: List[str] = []
-        for t in re.split(r"[_]+", key_lower):
+        for t in tokens_raw:
             if len(t) <= 2 or t in {"agent", "test", "keerthi", "admin", "user", "service"}:
                 continue
             if t.endswith("s"):
@@ -246,7 +269,7 @@ class Orchestrator:
         try:  # ``difflib`` is part of the stdlib
             import difflib
 
-            tokens = re.split(r"[_]+", key_lower)
+            tokens = tokens_raw or re.split(r"[_]+", key_lower)
             candidates = list(agent_defs.keys())
             for token in tokens:
                 match = difflib.get_close_matches(token, candidates, n=1, cutoff=0.8)
