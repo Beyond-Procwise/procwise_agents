@@ -133,6 +133,6 @@ def test_email_drafting_includes_action_ids(monkeypatch):
     assert drafts[0]["supplier_name"] == "Acme"
     assert drafts[1]["action_id"] == "email-action"
     assert drafts[1]["supplier_name"] == "Beta"
-    assert drafts[1]["action_id"] == "email-action"
+
     assert output.pass_fields["action_id"] == "email-action"
 

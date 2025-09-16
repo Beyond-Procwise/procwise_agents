@@ -66,8 +66,8 @@ def _mark_drafts_as_sent(
             continue
 
         draft_action_id = draft.get("action_id")
-        if action_id and draft_action_id and draft_action_id != action_id:
-            continue
+        if action_id and not draft_action_id:
+            draft["action_id"] = action_id
 
         draft_rfq_id = draft.get("rfq_id")
         if rfq_id:

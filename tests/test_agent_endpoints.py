@@ -65,6 +65,32 @@ class DummyOrchestrator:
         }
 
 
+class SupplierActionOrchestrator(DummyOrchestrator):
+    """Simulates drafts with supplier-specific action identifiers."""
+
+    def execute_workflow(self, workflow_name, input_data):
+        if workflow_name == "email_drafting":
+            output = {
+                **input_data,
+                "action_id": input_data.get("action_id", "wf-action"),
+                "body": input_data.get("body", "<p>generated</p>"),
+                "sent": False,
+                "drafts": [
+                    {
+                        "rfq_id": "RFQ-456",
+                        "action_id": "supplier-action-1",
+                        "sent_status": False,
+                    }
+                ],
+            }
+            return {
+                "status": "completed",
+                "workflow_id": "wf",
+                "result": {"email_drafting": output},
+            }
+        return super().execute_workflow(workflow_name, input_data)
+
+
 
 def test_agent_execute_endpoint():
     app = FastAPI()
@@ -132,6 +158,36 @@ def test_email_workflow_returns_action_id():
     assert prs.updated_details["output"]["sent"] is True
     assert prs.updated_details["output"]["body"].endswith("<p>generated</p>")
     assert prs.updated_details["output"]["recipients"] == ["r1", "r2"]
+    assert prs.updated_details["output"]["drafts"][0]["sent_status"] is True
+    assert prs.updated_details["status"] == "completed"
+
+
+def test_email_workflow_marks_supplier_specific_action_ids():
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = SupplierActionOrchestrator()
+    app.state.orchestrator = orchestrator
+    client = TestClient(app)
+
+    resp = client.post(
+        "/workflows/email",
+        data={
+            "subject": "supplier action",
+            "recipients": "buyer@example.com",
+            "action_id": "workflow-action",
+            "body": "<!-- RFQ-ID: RFQ-456 --><p>generated</p>",
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+
+    drafts = data["result"]["email_drafting"]["drafts"]
+    assert drafts[0]["action_id"] == "supplier-action-1"
+    assert drafts[0]["sent_status"] is True
+    assert data["result"]["email_drafting"]["sent"] is True
+
+    prs = orchestrator.agent_nick.process_routing_service
     assert prs.updated_details["output"]["drafts"][0]["sent_status"] is True
     assert prs.updated_details["status"] == "completed"
 
