@@ -77,6 +77,7 @@ class EmailDraftingAgent(BaseAgent):
 
         ranking = data.get("ranking", [])
         findings = data.get("findings", [])
+        default_action_id = data.get("action_id")
         drafts = []
 
         for supplier in ranking:
@@ -119,6 +120,8 @@ class EmailDraftingAgent(BaseAgent):
             body = f"<!-- RFQ-ID: {rfq_id} -->\n" + body
             subject = f"RFQ {rfq_id} – Request for Quotation"
 
+            draft_action_id = supplier.get("action_id") or default_action_id
+
             draft = {
                 "supplier_id": supplier_id,
                 "rfq_id": rfq_id,
@@ -127,15 +130,25 @@ class EmailDraftingAgent(BaseAgent):
                 "sent_status": False,
                 "sender": self.agent_nick.settings.ses_default_sender,
             }
+            if draft_action_id:
+                draft["action_id"] = draft_action_id
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
 
         logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
+        output_data = {"drafts": drafts}
+        if default_action_id:
+            output_data["action_id"] = default_action_id
+
+        pass_fields = {"drafts": drafts}
+        if default_action_id:
+            pass_fields["action_id"] = default_action_id
+
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={"drafts": drafts},
-            pass_fields={"drafts": drafts},
+            data=output_data,
+            pass_fields=pass_fields,
         )
 
     def _store_draft(self, draft: dict) -> None:
