@@ -19,6 +19,19 @@ class DummyNick:
         self.settings = SimpleNamespace(script_user="tester")
 
 
+def test_price_expression_falls_back_to_unit_price(monkeypatch):
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    monkeypatch.setattr(
+        agent, "_get_table_columns", lambda schema, table: {"unit_price"}
+    )
+
+    expr = agent._price_expression("proc", "po_line_items_agent", "li")
+    assert expr == "li.unit_price"
+
+
 def _sample_tables() -> Dict[str, Any]:
     purchase_orders = pd.DataFrame(
         [

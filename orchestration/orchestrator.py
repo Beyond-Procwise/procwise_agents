@@ -870,25 +870,71 @@ class Orchestrator:
 
     def _execute_ranking_workflow(self, context: AgentContext) -> Dict:
         """Execute supplier ranking workflow"""
-        # Get supplier data first
-        context.input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
-            context.input_data
+
+        results: Dict[str, Any] = {}
+        input_data = context.input_data
+
+        has_opportunity_payload = bool(
+            input_data.get("workflow") or input_data.get("conditions")
+        )
+        should_run_opportunity = (
+            "opportunity_miner" in self.agents
+            and has_opportunity_payload
+            and not input_data.get("skip_opportunity_step", False)
         )
 
-        # Execute ranking
-        ranking_result = self._execute_agent("supplier_ranking", context)
-
-        # Process opportunities if found
-        if "OpportunityMinerAgent" in ranking_result.next_agents:
-            opp_context = self._create_child_context(
-                context, "opportunity_miner", ranking_result.pass_fields
-            )
+        if should_run_opportunity:
+            opp_context = self._create_child_context(context, "opportunity_miner", {})
             opp_result = self._execute_agent("opportunity_miner", opp_context)
+            results["opportunities"] = opp_result.data if opp_result else {}
 
-            return {
-                "ranking": ranking_result.data,
-                "opportunities": opp_result.data if opp_result else None,
-            }
+            if not opp_result or opp_result.status != AgentStatus.SUCCESS:
+                logger.info(
+                    "OpportunityMinerAgent did not complete successfully; skipping ranking stage"
+                )
+                return results
+
+            supplier_candidates = (
+                (opp_result.pass_fields or {}).get("supplier_candidates")
+                or opp_result.data.get("supplier_candidates")
+                or []
+            )
+            if supplier_candidates:
+                ordered = list(dict.fromkeys(str(s) for s in supplier_candidates))
+                input_data["supplier_candidates"] = ordered
+            else:
+                logger.info(
+                    "OpportunityMinerAgent returned no supplier candidates; skipping ranking stage"
+                )
+                return results
+
+        # Get supplier data for ranking
+        input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
+            input_data
+        )
+
+        ranking_result = self._execute_agent("supplier_ranking", context)
+        results["ranking"] = ranking_result.data
+
+        downstream_agents = [
+            agent
+            for agent in (ranking_result.next_agents or [])
+            if agent != "OpportunityMinerAgent"
+        ]
+
+        if downstream_agents:
+            downstream_results: Dict[str, Any] = {}
+            pass_fields = ranking_result.pass_fields or {}
+            for agent_name in downstream_agents:
+                child_ctx = self._create_child_context(context, agent_name, pass_fields)
+                agent_result = self._execute_agent(agent_name, child_ctx)
+                downstream_results[agent_name] = (
+                    agent_result.data if agent_result else {}
+                )
+            results["downstream_results"] = downstream_results
+
+        if should_run_opportunity or downstream_agents:
+            return results
 
         return ranking_result.data
 

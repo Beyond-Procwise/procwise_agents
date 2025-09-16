@@ -55,6 +55,7 @@ class OpportunityMinerAgent(BaseAgent):
         self._supplier_risk_map: Dict[str, float] = {}
         self._event_log: List[Dict[str, Any]] = []
         self._escalations: List[Dict[str, Any]] = []
+        self._column_cache: Dict[str, set[str]] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -75,6 +76,81 @@ class OpportunityMinerAgent(BaseAgent):
                 return pd.read_sql(query, conn, params=params)
         with self.agent_nick.get_db_connection() as conn:
             return pd.read_sql(query, conn, params=params)
+
+    def _get_table_columns(self, schema: str, table: str) -> set[str]:
+        """Return cached column names for ``schema.table``."""
+
+        cache_key = f"{schema}.{table}"
+        if cache_key in self._column_cache:
+            return self._column_cache[cache_key]
+
+        columns: set[str] = set()
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if callable(get_conn):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                                SELECT column_name
+                                FROM information_schema.columns
+                                WHERE table_schema = %s AND table_name = %s
+                            """,
+                            (schema, table),
+                        )
+                        columns = {row[0] for row in cur.fetchall()}
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Column introspection failed for %s.%s", schema, table
+                )
+        self._column_cache[cache_key] = columns
+        return columns
+
+    def _price_expression(self, schema: str, table: str, alias: str) -> str:
+        """Return a resilient SQL expression for unit prices."""
+
+        query_engine = getattr(self.agent_nick, "query_engine", None)
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+
+        if (
+            callable(get_conn)
+            and query_engine is not None
+            and hasattr(query_engine, "_price_expression")
+        ):
+            try:
+                with get_conn() as conn:
+                    return query_engine._price_expression(  # type: ignore[attr-defined]
+                        conn, schema, table, alias
+                    )
+            except Exception:
+                logger.exception(
+                    "Falling back after price column detection failed for %s.%s",
+                    schema,
+                    table,
+                )
+
+        columns = self._get_table_columns(schema, table)
+        if "unit_price_gbp" in columns and "unit_price" in columns:
+            return f"COALESCE({alias}.unit_price_gbp, {alias}.unit_price)"
+        for candidate in (
+            "unit_price_gbp",
+            "unit_price",
+            "price_gbp",
+            "price",
+            "net_price_gbp",
+            "net_price",
+        ):
+            if candidate in columns:
+                return f"{alias}.{candidate}"
+        for column in columns:
+            if "price" in column:
+                return f"{alias}.{column}"
+        logger.warning(
+            "Unable to determine price column for %s.%s; defaulting to 0.0",
+            schema,
+            table,
+        )
+        return "0.0"
 
     # ------------------------------------------------------------------
     # Processing pipeline
@@ -2342,16 +2418,23 @@ class OpportunityMinerAgent(BaseAgent):
             logger.debug("_find_candidate_suppliers: no item_id available; skipping")
             return []
 
-        sql = """
+        po_price_expr = self._price_expression(
+            "proc", "po_line_items_agent", "li"
+        )
+        inv_price_expr = self._price_expression(
+            "proc", "invoice_line_items_agent", "ili"
+        )
+
+        sql = f"""
             WITH po_suppliers AS (
                 SELECT p.supplier_id,
-                       COALESCE(li.unit_price_gbp, li.unit_price) AS unit_price
+                       {po_price_expr} AS unit_price
                 FROM proc.po_line_items_agent li
                 JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
                 WHERE li.item_id = %s AND p.supplier_id IS NOT NULL
             ), invoice_suppliers AS (
                 SELECT ia.supplier_id,
-                       COALESCE(ili.unit_price_gbp, ili.unit_price) AS unit_price
+                       {inv_price_expr} AS unit_price
                 FROM proc.invoice_line_items_agent ili
                 JOIN proc.invoice_agent ia ON ia.invoice_id = ili.invoice_id
                 WHERE ili.item_id = %s AND ia.supplier_id IS NOT NULL
