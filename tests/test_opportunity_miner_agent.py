@@ -342,6 +342,25 @@ def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     assert all(f["supplier_id"] for f in vc)
 
 
+def test_contract_expiry_injects_default_window(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "contract_expiry_check", {"reference_date": "2024-07-02"}
+    )
+    context.input_data["conditions"].pop("negotiation_window_days", None)
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Contract Expiry Opportunity"
+    ]
+    assert findings
+    assert context.input_data["conditions"]["negotiation_window_days"] == 90
+
+
 def test_supplier_risk_alert_threshold(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(

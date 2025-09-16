@@ -41,7 +41,16 @@ class Orchestrator:
     # canonical fallback keeps those legacy flows operational while newer
     # definitions can continue to supply their own workflow names.
     WORKFLOW_DEFAULTS = {
-        "opportunity_miner": "opportunity_mining",
+        "opportunity_miner": "contract_expiry_check",
+    }
+
+    WORKFLOW_ALIASES = {
+        "opportunity_mining": "contract_expiry_check",
+    }
+
+    WORKFLOW_DEFAULT_CONDITIONS = {
+        "contract_expiry_check": {"negotiation_window_days": 90},
+
     }
 
     def __init__(self, agent_nick):
@@ -374,6 +383,43 @@ class Orchestrator:
             candidate = str(value).strip()
         return candidate or None
 
+    @classmethod
+    def _normalize_workflow_name(cls, workflow: Optional[str]) -> Optional[str]:
+        """Map legacy workflow names onto the current registry."""
+
+        if not workflow:
+            return None
+        candidate = str(workflow).strip()
+        if not candidate:
+            return None
+        mapped = cls.WORKFLOW_ALIASES.get(candidate.lower())
+        return mapped or candidate
+
+    @classmethod
+    def _workflow_has_defaults(cls, workflow: Optional[str]) -> bool:
+        if not workflow:
+            return False
+        return workflow.lower() in cls.WORKFLOW_DEFAULT_CONDITIONS
+
+    @classmethod
+    def _apply_default_conditions(cls, input_data: Dict[str, Any], workflow: Optional[str]) -> None:
+        """Ensure default condition payloads exist for known workflows."""
+
+        if not workflow:
+            return
+        defaults = cls.WORKFLOW_DEFAULT_CONDITIONS.get(workflow.lower())
+        if not defaults:
+            return
+        conditions = input_data.get("conditions")
+        if not isinstance(conditions, dict):
+            conditions = {}
+            input_data["conditions"] = conditions
+        for field, value in defaults.items():
+            current = conditions.get(field)
+            if current is None or (isinstance(current, str) and not current.strip()):
+                conditions[field] = value
+
+
     def _default_workflow_for_agent(self, agent_key: Any) -> Optional[str]:
         """Return an implicit workflow for agents with legacy defaults."""
 
@@ -413,8 +459,38 @@ class Orchestrator:
         if not candidate:
             candidate = self._default_workflow_for_agent(agent_key)
 
+        fallback_used = False
+        alias_applied = False
+
+        if candidate:
+            normalised = self._normalize_workflow_name(candidate)
+            if normalised and normalised != candidate:
+                alias_applied = True
+            candidate = normalised or candidate
+        else:
+            for hint in hints:
+                candidate = self._coerce_workflow_hint(hint)
+                if candidate:
+                    normalised = self._normalize_workflow_name(candidate)
+                    if normalised and normalised != candidate:
+                        alias_applied = True
+                    candidate = normalised or candidate
+                    break
+
+        if not candidate:
+            candidate = self._default_workflow_for_agent(agent_key)
+            if candidate:
+                fallback_used = True
+                normalised = self._normalize_workflow_name(candidate)
+                if normalised and normalised != candidate:
+                    alias_applied = True
+                candidate = normalised or candidate
+
+
         if candidate:
             input_data["workflow"] = candidate
+            if fallback_used or alias_applied or self._workflow_has_defaults(candidate):
+                self._apply_default_conditions(input_data, candidate)
         else:
             input_data.pop("workflow", None)
 
