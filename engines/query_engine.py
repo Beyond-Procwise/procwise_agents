@@ -10,6 +10,7 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 
 import pandas as pd
@@ -97,6 +98,16 @@ class QueryEngine(BaseEngine):
     def __init__(self, agent_nick):
         super().__init__()
         self.agent_nick = agent_nick
+
+    @contextmanager
+    def _pandas_reader(self):
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
+        if callable(pandas_conn):
+            with pandas_conn() as conn:
+                yield conn
+                return
+        with self.agent_nick.get_db_connection() as conn:
+            yield conn
 
     def _get_columns(self, conn, schema: str, table: str) -> list[str]:
         """Return list of column names for ``schema.table``.
@@ -259,7 +270,8 @@ class QueryEngine(BaseEngine):
                 LEFT JOIN po ON s.supplier_id = po.supplier_id
                 LEFT JOIN inv ON s.supplier_id = inv.supplier_id
                 """
-                df = pd.read_sql(sql, conn)
+            with self._pandas_reader() as reader:
+                df = pd.read_sql(sql, reader)
 
             if "supplier_id" in df.columns:
                 df["supplier_id"] = df["supplier_id"].astype(str)
@@ -272,13 +284,13 @@ class QueryEngine(BaseEngine):
     def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return invoice headers from ``proc.invoice_agent``."""
         sql = "SELECT * FROM proc.invoice_agent;"
-        with self.agent_nick.get_db_connection() as conn:
+        with self._pandas_reader() as conn:
             return pd.read_sql(sql, conn)
 
     def fetch_purchase_order_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return purchase order headers from ``proc.purchase_order_agent``."""
         sql = "SELECT * FROM proc.purchase_order_agent;"
-        with self.agent_nick.get_db_connection() as conn:
+        with self._pandas_reader() as conn:
             return pd.read_sql(sql, conn)
 
     def fetch_procurement_flow(self, embed: bool = False) -> pd.DataFrame:
@@ -353,7 +365,7 @@ class QueryEngine(BaseEngine):
             FROM proc.cat_product_mapping
         """
 
-        with self.agent_nick.get_db_connection() as conn:
+        with self._pandas_reader() as conn:
             df = pd.read_sql(sql, conn)
             category_df = pd.read_sql(category_sql, conn)
 

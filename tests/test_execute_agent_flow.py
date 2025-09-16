@@ -359,3 +359,37 @@ def test_execute_agent_flow_accepts_class_name():
 
     assert flow["status"] == 100
     assert agent.ran is True
+
+
+def test_execute_legacy_flow_injects_workflow_metadata():
+    captured = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = context.input_data
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    agent = CaptureAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": agent},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+    )
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {}
+    orchestrator._load_policies = lambda: {}
+
+    flow = {
+        "status": "saved",
+        "agent_type": "opportunity_miner",
+        "agent_property": {"workflow": "price_variance_check"},
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    assert captured["input"]["workflow"] == "price_variance_check"

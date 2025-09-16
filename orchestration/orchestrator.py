@@ -603,10 +603,16 @@ class Orchestrator:
             input_data = {**(inherited or {})}
             if "llm" in props:
                 input_data["llm"] = props["llm"]
+            for key, value in props.items():
+                if key in {"llm", "prompts", "policies"}:
+                    continue
+                input_data.setdefault(key, value)
             if prompt_objs:
                 input_data["prompts"] = prompt_objs
             if policy_objs:
                 input_data["policies"] = policy_objs
+            if node.get("workflow") and not input_data.get("workflow"):
+                input_data["workflow"] = node["workflow"]
 
             context = AgentContext(
                 workflow_id=_new_id(),

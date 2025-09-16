@@ -68,6 +68,14 @@ class OpportunityMinerAgent(BaseAgent):
         """Entry point for the orchestration layer."""
         return self.process(context)
 
+    def _read_sql(self, query: str, params: Any = None) -> pd.DataFrame:
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
+        if callable(pandas_conn):
+            with pandas_conn() as conn:
+                return pd.read_sql(query, conn, params=params)
+        with self.agent_nick.get_db_connection() as conn:
+            return pd.read_sql(query, conn, params=params)
+
     # ------------------------------------------------------------------
     # Processing pipeline
     # ------------------------------------------------------------------
@@ -216,9 +224,15 @@ class OpportunityMinerAgent(BaseAgent):
         """
 
         dfs: Dict[str, pd.DataFrame] = {}
-        with self.agent_nick.get_db_connection() as conn:
-            for table, sql_name in self.TABLE_MAP.items():
-                dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
+        if callable(pandas_conn):
+            with pandas_conn() as conn:
+                for table, sql_name in self.TABLE_MAP.items():
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+        else:
+            with self.agent_nick.get_db_connection() as conn:
+                for table, sql_name in self.TABLE_MAP.items():
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
         return dfs
 
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -1995,11 +2009,9 @@ class OpportunityMinerAgent(BaseAgent):
         """Load supplier risk scores from `proc.supplier` into a map: supplier_id -> risk_score."""
         self._supplier_risk_map = {}
         try:
-            with self.agent_nick.get_db_connection() as conn:
-                df = pd.read_sql(
-                    "SELECT supplier_id, COALESCE(risk_score, 0.0) AS risk_score FROM proc.supplier",
-                    conn,
-                )
+            df = self._read_sql(
+                "SELECT supplier_id, COALESCE(risk_score, 0.0) AS risk_score FROM proc.supplier"
+            )
             if not df.empty:
                 self._supplier_risk_map = dict(zip(df["supplier_id"], df["risk_score"]))
         except Exception:
@@ -2029,7 +2041,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         if not item_id and sources:
             try:
-                with self.agent_nick.get_db_connection() as conn:
+                with self.agent_nick.pandas_connection() as conn:
                     for src in sources:
                         df = pd.read_sql(
                             "SELECT item_id FROM proc.po_line_items_agent WHERE po_id = %s",
@@ -2067,8 +2079,7 @@ class OpportunityMinerAgent(BaseAgent):
             WHERE item_id = %s AND supplier_id IS NOT NULL
         """
         try:
-            with self.agent_nick.get_db_connection() as conn:
-                df = pd.read_sql(sql, conn, params=(item_id, item_id))
+            df = self._read_sql(sql, params=(item_id, item_id))
         except Exception:
             logger.exception("_find_candidate_suppliers query failed for item %s", item_id)
             return []
