@@ -124,11 +124,14 @@ class EmailDraftingAgent(BaseAgent):
 
             draft = {
                 "supplier_id": supplier_id,
+                "supplier_name": supplier_name,
                 "rfq_id": rfq_id,
                 "subject": subject,
                 "body": body,
                 "sent_status": False,
                 "sender": self.agent_nick.settings.ses_default_sender,
+                "action_id": draft_action_id,
+
             }
             if draft_action_id:
                 draft["action_id"] = draft_action_id
@@ -160,12 +163,13 @@ class EmailDraftingAgent(BaseAgent):
                     cur.execute(
                         """
                         INSERT INTO proc.draft_rfq_emails
-                        (rfq_id, supplier_id, subject, body, created_on, sent)
-                        VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                        (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), FALSE)
                         """,
                         (
                             draft["rfq_id"],
                             draft["supplier_id"],
+                            draft.get("supplier_name"),
                             draft["subject"],
                             draft["body"],
                         ),
@@ -191,6 +195,8 @@ class EmailDraftingAgent(BaseAgent):
                         id BIGSERIAL PRIMARY KEY,
                         rfq_id TEXT NOT NULL,
                         supplier_id TEXT,
+                        supplier_name TEXT,
+
                         subject TEXT NOT NULL,
                         body TEXT NOT NULL,
                         created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -198,6 +204,10 @@ class EmailDraftingAgent(BaseAgent):
                     )
                     """
                 )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS supplier_name TEXT"
+                )
+
 
             self._draft_table_checked = True
 

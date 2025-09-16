@@ -56,12 +56,15 @@ def test_email_drafting_agent(monkeypatch):
     assert output.data["drafts"]
     draft = output.data["drafts"][0]
     assert draft["supplier_id"] == "S1"
+    assert draft["supplier_name"] == "Acme"
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
     assert "Dear Acme," in draft["body"]
     assert "Deadline for submission: 01/01/2025" in draft["body"]
     assert draft["sent_status"] is False
     assert draft["sender"] == "sender@example.com"
+    assert "action_id" in draft
+    assert draft["action_id"] is None
     assert captured["drafts"][0] == draft
 
 
@@ -127,6 +130,9 @@ def test_email_drafting_includes_action_ids(monkeypatch):
     drafts = output.data["drafts"]
     assert output.data["action_id"] == "email-action"
     assert drafts[0]["action_id"] == "rank-1"
+    assert drafts[0]["supplier_name"] == "Acme"
+    assert drafts[1]["action_id"] == "email-action"
+    assert drafts[1]["supplier_name"] == "Beta"
     assert drafts[1]["action_id"] == "email-action"
     assert output.pass_fields["action_id"] == "email-action"
 
