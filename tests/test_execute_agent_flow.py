@@ -259,10 +259,15 @@ def test_ranking_workflow_runs_full_supplier_flow():
     class StubOpportunityAgent:
         def execute(self, context):
             executions.append(("opportunity_miner", context.input_data.get("workflow")))
+            findings = [
+                {"category_id": "Raw Materials", "financial_impact_gbp": 1500.0},
+                {"category_id": "Services", "financial_impact_gbp": 500.0},
+            ]
+            payload = {"supplier_candidates": ["S1", "S2"], "findings": findings}
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data={"supplier_candidates": ["S1", "S2"]},
-                pass_fields={"supplier_candidates": ["S1", "S2"]},
+                data=payload,
+                pass_fields=payload,
             )
 
     class StubRankingAgent:
@@ -287,10 +292,15 @@ def test_ranking_workflow_runs_full_supplier_flow():
         def __init__(self):
             self.ranking_seen = None
 
+            self.category_seen = None
+
+
         def execute(self, context):
             ranking = context.input_data.get("ranking")
             executions.append(("quote_evaluation", ranking))
             self.ranking_seen = ranking
+            self.category_seen = context.input_data.get("product_category")
+
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={"quotes": ["Q1", "Q2"]},
@@ -336,7 +346,10 @@ def test_ranking_workflow_runs_full_supplier_flow():
     ]
     assert ranking_agent.candidates == ["S1", "S2"]
     assert quote_agent.ranking_seen[0]["supplier_id"] == "S1"
+    assert quote_agent.category_seen == "Raw Materials"
+
     assert result["result"]["opportunities"]["supplier_candidates"] == ["S1", "S2"]
+    assert result["result"]["opportunities"]["product_category"] == "Raw Materials"
     assert result["result"]["ranking"]["ranking"][0]["supplier_id"] == "S1"
     assert result["result"]["downstream_results"]["quote_evaluation"]["quotes"] == [
         "Q1",

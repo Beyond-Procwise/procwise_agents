@@ -880,6 +880,10 @@ class Orchestrator:
         )
 
         supplier_candidates: List[str] = []
+        category_hint: Optional[str] = self._normalise_category(
+            input_data.get("product_category")
+        )
+
 
         if should_run_opportunity:
             opp_context = self._create_child_context(context, "opportunity_miner", {})
@@ -891,6 +895,21 @@ class Orchestrator:
                     "OpportunityMinerAgent did not complete successfully; skipping ranking stage"
                 )
                 return results
+
+            opportunity_payload: Dict[str, Any] = {}
+            if opp_result:
+                opportunity_payload = dict(opp_result.pass_fields or {})
+                if not opportunity_payload:
+                    opportunity_payload = dict(opp_result.data or {})
+
+            derived_category = self._derive_product_category(opportunity_payload)
+            if derived_category:
+                category_hint = derived_category
+                if isinstance(results.get("opportunities"), dict):
+                    results["opportunities"].setdefault(
+                        "product_category", derived_category
+                    )
+
 
             supplier_candidates_raw = (
                 (opp_result.pass_fields or {}).get("supplier_candidates")
@@ -928,6 +947,10 @@ class Orchestrator:
             if supplier_candidates:
                 input_data["supplier_candidates"] = supplier_candidates
 
+        if category_hint and not input_data.get("product_category"):
+            input_data["product_category"] = category_hint
+
+
         # Get supplier data for ranking
         input_data["supplier_data"] = self.query_engine.fetch_supplier_data(
             input_data
@@ -939,12 +962,17 @@ class Orchestrator:
 
         results["ranking"] = ranking_result.data or {}
 
+
         if ranking_result.status != AgentStatus.SUCCESS:
             return results
 
         pass_fields: Dict[str, Any] = dict(ranking_result.pass_fields or {})
         if supplier_candidates and "supplier_candidates" not in pass_fields:
             pass_fields["supplier_candidates"] = supplier_candidates
+
+        if category_hint and "product_category" not in pass_fields:
+            pass_fields["product_category"] = category_hint
+
 
         ranking_payload = pass_fields.get("ranking")
         if not ranking_payload:
@@ -1019,6 +1047,20 @@ class Orchestrator:
         opp_result = self._execute_agent("opportunity_miner", context)
         results: Dict[str, Any] = {"opportunities": opp_result.data if opp_result else {}}
 
+        category_hint = self._normalise_category(
+            context.input_data.get("product_category")
+        )
+        if opp_result:
+            opportunity_payload: Dict[str, Any] = dict(opp_result.pass_fields or {})
+            if not opportunity_payload:
+                opportunity_payload = dict(opp_result.data or {})
+            derived_category = self._derive_product_category(opportunity_payload)
+            if derived_category:
+                category_hint = derived_category
+        if category_hint and isinstance(results.get("opportunities"), dict):
+            results["opportunities"].setdefault("product_category", category_hint)
+
+
         candidates_raw = opp_result.data.get("supplier_candidates", []) if opp_result else []
         seen_candidates: set[str] = set()
         candidates: List[str] = []
@@ -1055,6 +1097,9 @@ class Orchestrator:
                 pass_fields["supplier_candidates"] = candidates
             if ranking_payload and "ranking" not in pass_fields:
                 pass_fields["ranking"] = ranking_payload
+            if category_hint and "product_category" not in pass_fields:
+                pass_fields["product_category"] = category_hint
+
 
             if ranking_payload and "quote_evaluation" in self.agents:
                 quote_ctx = self._create_child_context(
@@ -1194,6 +1239,80 @@ class Orchestrator:
                     pass_fields.update(result.pass_fields)
 
         return results
+
+    @staticmethod
+    def _normalise_category(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value)
+        except Exception:
+            return None
+        text = text.strip()
+        return text or None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _derive_product_category(self, opportunity_payload: Any) -> Optional[str]:
+        if not isinstance(opportunity_payload, dict):
+            return None
+
+        for key in (
+            "product_category",
+            "category_id",
+            "primary_category",
+            "spend_category",
+        ):
+            direct = self._normalise_category(opportunity_payload.get(key))
+            if direct:
+                return direct
+
+        conditions = opportunity_payload.get("conditions")
+        if isinstance(conditions, dict):
+            for key in ("product_category", "category_id"):
+                direct = self._normalise_category(conditions.get(key))
+                if direct:
+                    return direct
+
+        findings = opportunity_payload.get("findings")
+        if isinstance(findings, list):
+            category_totals: Dict[str, float] = {}
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                category = self._normalise_category(
+                    finding.get("category_id")
+                    or finding.get("spend_category")
+                    or finding.get("category")
+                    or finding.get("item_category")
+                )
+                if not category:
+                    continue
+                weight = finding.get("financial_impact_gbp")
+                if weight in (None, ""):
+                    for alt_key in (
+                        "potential_savings",
+                        "total_savings",
+                        "estimated_savings",
+                        "value",
+                        "impact",
+                    ):
+                        weight = finding.get(alt_key)
+                        if weight not in (None, ""):
+                            break
+                score = self._safe_float(weight)
+                if score <= 0.0:
+                    score = 1.0
+                category_totals[category] = category_totals.get(category, 0.0) + score
+            if category_totals:
+                return max(category_totals.items(), key=lambda item: (item[1], item[0]))[0]
+
+        return None
 
     def _create_child_context(
         self, parent_context: AgentContext, agent_name: str, pass_fields: Dict
