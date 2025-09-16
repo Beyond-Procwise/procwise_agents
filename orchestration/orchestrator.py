@@ -34,6 +34,16 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 class Orchestrator:
     """Main orchestrator for managing agent workflows"""
 
+    # Default workflow hints for agents that historically relied on implicit
+    # orchestration metadata.  Older process definitions for the opportunity
+    # miner never stored an explicit ``workflow`` value which meant the agent
+    # started failing once the policy checks were tightened.  Providing a
+    # canonical fallback keeps those legacy flows operational while newer
+    # definitions can continue to supply their own workflow names.
+    WORKFLOW_DEFAULTS = {
+        "opportunity_miner": "opportunity_mining",
+    }
+
     def __init__(self, agent_nick):
         # Ensure GPU environment is initialised before any agent execution.
         # ``configure_gpu`` is idempotent so repeated calls are safe and allow
@@ -364,8 +374,25 @@ class Orchestrator:
             candidate = str(value).strip()
         return candidate or None
 
+    def _default_workflow_for_agent(self, agent_key: Any) -> Optional[str]:
+        """Return an implicit workflow for agents with legacy defaults."""
+
+        if not agent_key:
+            return None
+
+        key = str(agent_key).strip()
+        if not key:
+            return None
+
+        slug = self._resolve_agent_name(key)
+        lower = key.lower()
+        for candidate in (slug, lower):
+            if candidate in self.WORKFLOW_DEFAULTS:
+                return self.WORKFLOW_DEFAULTS[candidate]
+        return None
+
     def _ensure_workflow_metadata(
-        self, input_data: Dict[str, Any], *hints: Any
+        self, input_data: Dict[str, Any], *hints: Any, agent_key: Optional[str] = None
     ) -> None:
         """Ensure agent input contains a usable ``workflow`` field.
 
@@ -382,6 +409,9 @@ class Orchestrator:
                 candidate = self._coerce_workflow_hint(hint)
                 if candidate:
                     break
+
+        if not candidate:
+            candidate = self._default_workflow_for_agent(agent_key)
 
         if candidate:
             input_data["workflow"] = candidate
@@ -518,6 +548,7 @@ class Orchestrator:
                 default_input.get("workflow"),
                 payload.get("workflow") if isinstance(payload, dict) else None,
                 flow.get("workflow"),
+                agent_key=agent_key,
             )
 
             success = False
@@ -660,6 +691,7 @@ class Orchestrator:
                 props.get("workflow"),
                 (inherited or {}).get("workflow") if isinstance(inherited, dict) else None,
                 node.get("workflow"),
+                agent_key=agent_key,
             )
 
             context = AgentContext(
@@ -937,6 +969,7 @@ class Orchestrator:
             child_input,
             pass_fields.get("workflow") if isinstance(pass_fields, dict) else None,
             parent_context.input_data.get("workflow"),
+            agent_key=agent_name,
         )
         return AgentContext(
             workflow_id=parent_context.workflow_id,
