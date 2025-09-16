@@ -56,12 +56,15 @@ def test_email_drafting_agent(monkeypatch):
     assert output.data["drafts"]
     draft = output.data["drafts"][0]
     assert draft["supplier_id"] == "S1"
+    assert draft["supplier_name"] == "Acme"
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
     assert "Dear Acme," in draft["body"]
     assert "Deadline for submission: 01/01/2025" in draft["body"]
     assert draft["sent_status"] is False
-    assert draft["recipient"] == "sender@example.com"
+    assert draft["sender"] == "sender@example.com"
+    assert "action_id" in draft
+    assert draft["action_id"] is None
     assert captured["drafts"][0] == draft
 
 
@@ -101,4 +104,34 @@ def test_email_drafting_handles_missing_ranking(monkeypatch):
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert output.data["drafts"] == []
+
+
+def test_email_drafting_includes_action_ids(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+
+    ranking = [
+        {"supplier_id": "S1", "supplier_name": "Acme", "action_id": "rank-1"},
+        {"supplier_id": "S2", "supplier_name": "Beta"},
+    ]
+    context = AgentContext(
+        workflow_id="wf4",
+        agent_id="email_drafting",
+        user_id="u1",
+        input_data={
+            "ranking": ranking,
+            "action_id": "email-action",
+        },
+    )
+
+    output = agent.run(context)
+    assert output.status == AgentStatus.SUCCESS
+    drafts = output.data["drafts"]
+    assert output.data["action_id"] == "email-action"
+    assert drafts[0]["action_id"] == "rank-1"
+    assert drafts[0]["supplier_name"] == "Acme"
+    assert drafts[1]["action_id"] == "email-action"
+    assert drafts[1]["supplier_name"] == "Beta"
+    assert output.pass_fields["action_id"] == "email-action"
 
