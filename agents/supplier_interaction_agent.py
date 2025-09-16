@@ -3,6 +3,7 @@ import re
 import imaplib
 import time
 import os
+from datetime import datetime, timedelta
 from email import message_from_bytes
 from typing import Dict, Optional
 
@@ -27,12 +28,31 @@ class SupplierInteractionAgent(BaseAgent):
         action = context.input_data.get("action")
         if action == "poll":
             count = self.poll_mailbox()
-            return AgentOutput(status=AgentStatus.SUCCESS, data={"polled": count})
+            payload = {"polled": count}
+            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
         if action == "monitor":
             interval = int(context.input_data.get("interval", 30))
             duration = int(context.input_data.get("duration", 300))
             count = self.monitor_inbox(interval=interval, duration=duration)
-            return AgentOutput(status=AgentStatus.SUCCESS, data={"monitored": count})
+            payload = {"monitored": count}
+            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
+        if action == "business_monitor":
+            start_hour = int(context.input_data.get("business_start_hour", 9))
+            end_hour = int(context.input_data.get("business_end_hour", 17))
+            interval = int(context.input_data.get("interval", 3600))
+            max_cycles = context.input_data.get("max_cycles")
+            try:
+                cycle_limit = int(max_cycles) if max_cycles is not None else None
+            except Exception:
+                cycle_limit = None
+            count = self.monitor_business_hours(
+                start_hour=start_hour,
+                end_hour=end_hour,
+                interval=interval,
+                max_cycles=cycle_limit,
+            )
+            payload = {"business_polls": count}
+            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
 
         subject = context.input_data.get("subject", "")
         body = context.input_data.get("message") or context.input_data.get("body", "")
@@ -58,9 +78,11 @@ class SupplierInteractionAgent(BaseAgent):
         else:
             next_agent = ["QuoteEvaluationAgent"]
 
+        payload = {"rfq_id": rfq_id, "supplier_id": supplier_id, **parsed, "related_documents": related_docs}
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={"rfq_id": rfq_id, "supplier_id": supplier_id, **parsed, "related_documents": related_docs},
+            data=payload,
+            pass_fields=payload,
             next_agents=next_agent,
         )
 
@@ -109,6 +131,52 @@ class SupplierInteractionAgent(BaseAgent):
             total += self.poll_mailbox()
             time.sleep(interval)
         return total
+
+    def monitor_business_hours(
+        self,
+        start_hour: int = 9,
+        end_hour: int = 17,
+        interval: int = 3600,
+        max_cycles: Optional[int] = None,
+    ) -> int:
+        """Monitor the mailbox once per hour during business hours."""
+
+        processed = 0
+        cycles = 0
+        interval = max(1, interval)
+        if end_hour <= start_hour:
+            end_hour = start_hour + 8
+
+        while True:
+            now = datetime.now()
+            current_hour = now.hour
+            if start_hour <= current_hour < end_hour:
+                processed += self.poll_mailbox()
+                cycles += 1
+                if max_cycles is not None and cycles >= max_cycles:
+                    break
+                time.sleep(interval)
+                continue
+
+            if current_hour >= end_hour:
+                break
+
+            next_start = now.replace(
+                hour=start_hour,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if current_hour >= end_hour:
+                next_start += timedelta(days=1)
+            elif current_hour < start_hour:
+                pass
+            else:
+                next_start = now + timedelta(seconds=interval)
+            sleep_seconds = max(0, (next_start - now).total_seconds())
+            time.sleep(min(interval, sleep_seconds))
+
+        return processed
 
     def _extract_rfq_id(self, text: str) -> Optional[str]:
         match = self.RFQ_PATTERN.search(text)
