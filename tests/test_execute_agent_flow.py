@@ -486,3 +486,4 @@ def test_json_flow_uses_flow_level_workflow_hint():
     orchestrator.execute_agent_flow(flow, {})
 
     assert captured["input"]["workflow"] == "price_variance_check"
+
