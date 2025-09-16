@@ -101,9 +101,9 @@ class EmailDraftingAgent(BaseAgent):
                 "category_manager_name": data.get("category_manager_name", ""),
                 "category_manager_title": data.get("category_manager_title", ""),
                 "category_manager_email": data.get("category_manager_email", ""),
-                "your_name": data.get("your_name", ""),
-                "your_title": data.get("your_title", ""),
-                "your_company": data.get("your_company", ""),
+                "your_name": "Nicholas Geelen",
+                "your_title": "CEO",
+                "your_company": "ProcWise Inc.",
             }
             body_template = data.get("body") or self.TEXT_TEMPLATE
             template_args = {**data, **fmt_args}
