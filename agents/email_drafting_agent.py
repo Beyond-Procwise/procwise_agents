@@ -9,6 +9,7 @@ exposes this prompt in its output for downstream LLM usage.
 
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,8 @@ class EmailDraftingAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.email_service = EmailService(agent_nick)
+        self._draft_table_checked = False
+        self._draft_table_lock = threading.Lock()
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
@@ -122,7 +125,7 @@ class EmailDraftingAgent(BaseAgent):
                 "subject": subject,
                 "body": body,
                 "sent_status": False,
-                "recipient": self.agent_nick.settings.ses_default_sender,
+                "sender": self.agent_nick.settings.ses_default_sender,
             }
             drafts.append(draft)
             self._store_draft(draft)
@@ -139,6 +142,7 @@ class EmailDraftingAgent(BaseAgent):
         """Persist email draft to ``proc.draft_rfq_emails``."""
         try:
             with self.agent_nick.get_db_connection() as conn:
+                self._ensure_table_exists(conn)
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -156,4 +160,31 @@ class EmailDraftingAgent(BaseAgent):
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store RFQ draft")
+
+    def _ensure_table_exists(self, conn) -> None:
+        """Create the backing draft table on demand."""
+        if self._draft_table_checked:
+            return
+
+        with self._draft_table_lock:
+            if self._draft_table_checked:
+                return
+
+            with conn.cursor() as cur:
+                cur.execute("CREATE SCHEMA IF NOT EXISTS proc")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS proc.draft_rfq_emails (
+                        id BIGSERIAL PRIMARY KEY,
+                        rfq_id TEXT NOT NULL,
+                        supplier_id TEXT,
+                        subject TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        sent BOOLEAN NOT NULL DEFAULT FALSE
+                    )
+                    """
+                )
+
+            self._draft_table_checked = True
 
