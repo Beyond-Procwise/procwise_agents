@@ -135,21 +135,53 @@ class ProcessRoutingService:
                     return i
             return None
 
-        def build_from_index(idx: int, visited: Optional[set[int]] = None) -> Dict[str, Any]:
+        def _normalise_workflow_hint(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                candidate = value.strip()
+            else:
+                candidate = str(value).strip()
+            return candidate or None
+
+        default_workflow = _normalise_workflow_hint(details.get("workflow"))
+
+        def build_from_index(
+            idx: int,
+            visited: Optional[set[int]] = None,
+            inherited_workflow: Optional[str] = None,
+        ) -> Dict[str, Any]:
             visited = visited or set()
             if idx in visited:
                 return {}
             visited.add(idx)
             node = agents[idx]
             name = node.get("agent")
+            raw_props = node.get(
+                "agent_property", {"llm": None, "prompts": [], "policies": []}
+            )
+            props = dict(raw_props)
+
+            workflow_hint = _normalise_workflow_hint(props.get("workflow"))
+            if not workflow_hint:
+                workflow_hint = _normalise_workflow_hint(node.get("workflow"))
+            if not workflow_hint:
+                workflow_hint = _normalise_workflow_hint(inherited_workflow)
+            if not workflow_hint:
+                workflow_hint = default_workflow
+            if workflow_hint:
+                props["workflow"] = workflow_hint
+            else:
+                props.pop("workflow", None)
+
             flow = {
                 "agent": name,
                 "status": node.get("status", "saved"),
                 "agent_type": str(node.get("agent_type", name or "")),
-                "agent_property": node.get(
-                    "agent_property", {"llm": None, "prompts": [], "policies": []}
-                ),
+                "agent_property": props,
             }
+            if workflow_hint:
+                flow["workflow"] = workflow_hint
             deps = node.get("dependencies", {})
 
             # Determine next agents by finding nodes that depend on the current
@@ -158,29 +190,38 @@ class ProcessRoutingService:
             nxt = _find_dependent(name, "onSuccess")
             if nxt is None and deps.get("onSuccess"):
                 nxt = name_to_idx.get(deps["onSuccess"][0])
+            inherited = workflow_hint or inherited_workflow
             if nxt is not None and nxt not in visited:
-                flow["onSuccess"] = build_from_index(nxt, visited.copy())
+                flow["onSuccess"] = build_from_index(
+                    nxt, visited.copy(), inherited
+                )
             elif idx + 1 < len(agents) and (idx + 1) not in visited:
-                flow["onSuccess"] = build_from_index(idx + 1, visited.copy())
+                flow["onSuccess"] = build_from_index(
+                    idx + 1, visited.copy(), inherited
+                )
 
             nxt = _find_dependent(name, "onFailure")
             if nxt is None and deps.get("onFailure"):
                 nxt = name_to_idx.get(deps["onFailure"][0])
             if nxt is not None and nxt not in visited:
-                flow["onFailure"] = build_from_index(nxt, visited.copy())
+                flow["onFailure"] = build_from_index(
+                    nxt, visited.copy(), inherited
+                )
 
             nxt = _find_dependent(name, "onCompletion")
             if nxt is None and deps.get("onCompletion"):
                 nxt = name_to_idx.get(deps["onCompletion"][0])
             if nxt is not None and nxt not in visited:
-                flow["onCompletion"] = build_from_index(nxt, visited.copy())
+                flow["onCompletion"] = build_from_index(
+                    nxt, visited.copy(), inherited
+                )
 
             return flow
 
         # Always start from the first agent as defined in the list to ensure
         # determinism even when dependency links form a cycle or point
         # backwards.
-        return build_from_index(0)
+        return build_from_index(0, inherited_workflow=default_workflow)
 
     # ------------------------------------------------------------------
     # Metadata enrichment

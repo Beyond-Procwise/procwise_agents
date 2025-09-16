@@ -101,6 +101,10 @@ class OpportunityMinerAgent(BaseAgent):
             self._escalations = []
             notifications: set[str] = set()
 
+            min_impact_threshold = self._resolve_min_financial_impact(
+                context.input_data
+            )
+
             workflow_name = context.input_data.get("workflow")
             if not workflow_name:
                 message = "Mandatory orchestrator field 'workflow' is missing."
@@ -108,7 +112,13 @@ class OpportunityMinerAgent(BaseAgent):
                 return self._blocked_output(message)
 
             policy_registry = self._get_policy_registry()
-            policy_cfg = policy_registry.get(workflow_name)
+            alias_map = {"opportunity_mining": "contract_expiry_check"}
+            lookup_name = workflow_name
+            mapped = alias_map.get(workflow_name.lower()) if isinstance(workflow_name, str) else None
+            if mapped:
+                lookup_name = mapped
+                context.input_data["workflow"] = lookup_name
+            policy_cfg = policy_registry.get(lookup_name)
             if policy_cfg is None:
                 message = f"Unsupported opportunity workflow '{workflow_name}'"
                 self._log_policy_event(
@@ -117,7 +127,9 @@ class OpportunityMinerAgent(BaseAgent):
                 return self._blocked_output(message)
 
             missing_fields = self._missing_required_fields(
-                context.input_data, policy_cfg.get("required_fields", [])
+                context.input_data,
+                policy_cfg.get("required_fields", []),
+                policy_cfg.get("default_conditions", {}),
             )
             if missing_fields:
                 message = (
@@ -137,7 +149,9 @@ class OpportunityMinerAgent(BaseAgent):
             findings = handler(tables, context.input_data, notifications, policy_cfg)
 
             findings = self._enrich_findings(findings, tables)
-            filtered = [f for f in findings if f.financial_impact_gbp >= self.min_financial_impact]
+            filtered = [
+                f for f in findings if f.financial_impact_gbp >= min_impact_threshold
+            ]
             self._load_supplier_risk_map()
             for f in filtered:
                 f.candidate_suppliers = self._find_candidate_suppliers(
@@ -163,6 +177,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "findings": [f.as_dict() for f in filtered],
                 "opportunity_count": len(filtered),
                 "total_savings": sum(f.financial_impact_gbp for f in filtered),
+                "min_financial_impact": min_impact_threshold,
                 "policy_events": self._event_log,
                 "escalations": self._escalations,
             }
@@ -461,18 +476,26 @@ class OpportunityMinerAgent(BaseAgent):
         )
 
     def _missing_required_fields(
-        self, input_data: Dict[str, Any], required_fields: Iterable[str]
+        self,
+        input_data: Dict[str, Any],
+        required_fields: Iterable[str],
+        defaults: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         if not required_fields:
             return []
         conditions = input_data.get("conditions")
         if not isinstance(conditions, dict):
-            return ["conditions"]
+            conditions = {}
+            input_data["conditions"] = conditions
         missing = []
         for field in required_fields:
             value = conditions.get(field)
             if value is None or (isinstance(value, str) and not value.strip()):
-                missing.append(field)
+                default_map = defaults or {}
+                if field in default_map and default_map[field] is not None:
+                    conditions[field] = default_map[field]
+                else:
+                    missing.append(field)
         return missing
 
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
@@ -534,6 +557,37 @@ class OpportunityMinerAgent(BaseAgent):
     def _default_notifications(self, notifications: set[str]) -> None:
         notifications.update({"Negotiation", "Approvals", "CategoryManager"})
 
+    def _resolve_min_financial_impact(self, input_data: Dict[str, Any]) -> float:
+        """Determine the impact threshold for the current run.
+
+        The agent exposes ``min_financial_impact`` as an instance-level default
+        so that platform settings can cap noise.  Workflow callers may override
+        the threshold per run via ``input_data['min_financial_impact']``.  Any
+        malformed or negative value falls back to the configured default to
+        avoid silently discarding all findings.
+        """
+
+        value = input_data.get("min_financial_impact")
+        if value is None:
+            return self.min_financial_impact
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid min_financial_impact '%s'; using default %s",
+                value,
+                self.min_financial_impact,
+            )
+            return self.min_financial_impact
+        if threshold < 0:
+            logger.warning(
+                "Negative min_financial_impact %s provided; using default %s",
+                threshold,
+                self.min_financial_impact,
+            )
+            return self.min_financial_impact
+        return threshold
+
     def _get_policy_registry(self) -> Dict[str, Dict[str, Any]]:
         return {
             "price_variance_check": {
@@ -558,6 +612,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "detector": "Contract Expiry Opportunity",
                 "required_fields": ["negotiation_window_days"],
                 "handler": self._policy_contract_expiry,
+                "default_conditions": {"negotiation_window_days": 90},
             },
             "supplier_risk_check": {
                 "policy_id": "oppfinderpolicy_005_supplier_risk_alert",
