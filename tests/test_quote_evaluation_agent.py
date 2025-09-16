@@ -124,8 +124,10 @@ def test_quote_evaluation_limits_to_ranked_suppliers(monkeypatch):
 
     captured = {}
 
-    def mock_fetch(supplier_names, product_category=None):
+    def mock_fetch(supplier_names, supplier_ids=None, product_category=None):
         captured["supplier_names"] = supplier_names
+        captured["supplier_ids"] = supplier_ids
+
         return [
             {
                 "quote_id": "Q1",
@@ -180,10 +182,68 @@ def test_quote_evaluation_limits_to_ranked_suppliers(monkeypatch):
         "Supplier A",
         "Supplier B",
     ]
+    assert captured.get("supplier_ids") == []
 
     names = [q["name"] for q in output.data["quotes"] if q["name"] != "weighting"]
     assert names == ["Supplier C", "Supplier A", "Supplier B"]
     assert len(names) == 3
+
+
+def test_quote_evaluation_uses_supplier_ids(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteEvaluationAgent(nick)
+
+    captured = {}
+
+    def mock_fetch(supplier_names, supplier_ids=None, product_category=None):
+        captured["supplier_names"] = supplier_names
+        captured["supplier_ids"] = supplier_ids
+        return [
+            {
+                "quote_id": "Q1",
+                "supplier_name": "Beta Manufacturing",
+                "supplier_id": "S100",
+                "total_cost": 180,
+                "unit_price": 9,
+            },
+            {
+                "quote_id": "Q2",
+                "supplier_name": "Alpha Supplies",
+                "supplier_id": "S200",
+                "total_cost": 220,
+                "unit_price": 11,
+            },
+            {
+                "quote_id": "Q3",
+                "supplier_name": "Gamma Goods",
+                "supplier_id": "S300",
+                "total_cost": 260,
+                "unit_price": 13,
+            },
+        ]
+
+    monkeypatch.setattr(agent, "_fetch_quotes", mock_fetch)
+
+    ranking = [
+        {"supplier_id": "S100", "final_score": 9.8},
+        {"supplier_id": "S200", "final_score": 9.0},
+        {"supplier_id": "S300", "final_score": 8.4},
+    ]
+
+    context = AgentContext(
+        workflow_id="wf_rank_ids",
+        agent_id="quote_evaluation",
+        user_id="u1",
+        input_data={"ranking": ranking},
+    )
+
+    output = agent.run(context)
+
+    assert captured["supplier_names"] == []
+    assert captured["supplier_ids"] == ["S100", "S200", "S300"]
+
+    names = [q["name"] for q in output.data["quotes"] if q["name"] != "weighting"]
+    assert names == ["Beta Manufacturing", "Alpha Supplies", "Gamma Goods"]
 
 
 class DummyOrchestrator:
@@ -284,7 +344,7 @@ def test_fetch_quotes_handles_missing_supplier_index(monkeypatch):
 
     nick.qdrant_client = FailingClient()
     agent = QuoteEvaluationAgent(nick)
-    quotes = agent._fetch_quotes(["Supplier A"], "")
+    quotes = agent._fetch_quotes(["Supplier A"], product_category="")
     assert quotes[0]["quote_id"] == "Q1"
     assert nick.qdrant_client.attempts == 2
     assert quotes[0]["quote_file_s3_path"] == "s3://bucket/q1.pdf"
@@ -294,8 +354,9 @@ def test_process_handles_empty_product_type(monkeypatch):
     nick = DummyNick()
     agent = QuoteEvaluationAgent(nick)
 
-    def capture_fetch(supplier_names, product_category=None):
+    def capture_fetch(supplier_names, supplier_ids=None, product_category=None):
         capture_fetch.captured = product_category
+        capture_fetch.captured_ids = supplier_ids
         return _mock_quotes()
 
     monkeypatch.setattr(agent, "_fetch_quotes", capture_fetch)

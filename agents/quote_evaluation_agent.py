@@ -64,17 +64,37 @@ class QuoteEvaluationAgent(BaseAgent):
             }
 
             ranking_suppliers = self._extract_ranked_suppliers(input_data, limit=3)
+            ranking_names = [
+                entry["name"] for entry in ranking_suppliers if entry.get("name")
+            ]
+            ranking_ids = [
+                entry["supplier_id"]
+                for entry in ranking_suppliers
+                if entry.get("supplier_id")
+            ]
             explicit_suppliers = self._ensure_sequence(
                 input_data.get("supplier_names", [])
+            )
+            explicit_supplier_ids = self._ensure_sequence(
+                input_data.get("supplier_ids", [])
+            )
+
+            supplier_names_filter = ranking_names or explicit_suppliers
+            supplier_ids_filter = ranking_ids or explicit_supplier_ids
+            supplier_tokens = self._merge_supplier_tokens(
+                supplier_names_filter, supplier_ids_filter
+
             )
             supplier_filter = ranking_suppliers or explicit_suppliers
 
             quotes = self._fetch_quotes(
-                supplier_filter,
+                supplier_names_filter,
+                supplier_ids_filter,
                 product_category,
             )
-            if supplier_filter:
-                quotes = self._filter_quotes_by_suppliers(quotes, supplier_filter)
+            if supplier_tokens:
+                quotes = self._filter_quotes_by_suppliers(quotes, supplier_tokens)
+
             if ranking_suppliers:
                 quotes = self._order_quotes_by_rank(
                     quotes, ranking_suppliers, limit=3
@@ -129,9 +149,12 @@ class QuoteEvaluationAgent(BaseAgent):
     def _fetch_quotes(
         self,
         supplier_names: List[str],
+        supplier_ids: Optional[List[str]] = None,
         product_category: Optional[str] = None,
     ) -> List[Dict]:
         """Fetch quotes from Qdrant vector database."""
+
+        supplier_ids = supplier_ids or []
 
         def ensure_index(field_name: str) -> None:
             try:
@@ -145,6 +168,8 @@ class QuoteEvaluationAgent(BaseAgent):
 
         if supplier_names:
             ensure_index("supplier_name")
+        if supplier_ids:
+            ensure_index("supplier_id")
         if product_category:
             ensure_index("product_category")
 
@@ -155,13 +180,31 @@ class QuoteEvaluationAgent(BaseAgent):
                     match=models.MatchValue(value="quote"),
                 )
             ]
-            if include_supplier and supplier_names:
-                filters.append(
-                    models.FieldCondition(
-                        key="supplier_name",
-                        match=models.MatchAny(any=supplier_names),
+            if include_supplier and (supplier_names or supplier_ids):
+                supplier_conditions: List[models.FieldCondition] = []
+                if supplier_names:
+                    supplier_conditions.append(
+                        models.FieldCondition(
+                            key="supplier_name",
+                            match=models.MatchAny(any=supplier_names),
+                        )
                     )
-                )
+                if supplier_ids:
+                    supplier_conditions.append(
+                        models.FieldCondition(
+                            key="supplier_id",
+                            match=models.MatchAny(any=supplier_ids),
+                        )
+                    )
+                if len(supplier_conditions) == 1:
+                    filters.append(supplier_conditions[0])
+                elif supplier_conditions:
+                    filters.append(
+                        models.Filter(
+                            should=supplier_conditions,
+                            must=[],
+                        )
+                    )
             if product_category:
                 filters.append(
                     models.FieldCondition(
@@ -181,6 +224,11 @@ class QuoteEvaluationAgent(BaseAgent):
 
         try:
             points, _ = qdrant_scroll(build_filter())
+            if not points and (supplier_names or supplier_ids):
+                logger.info(
+                    "QuoteEvaluationAgent: retrying quote fetch without supplier filter",
+                )
+                points, _ = qdrant_scroll(build_filter(include_supplier=False))
         except Exception as e:
             logger.warning(
                 "Primary quote fetch failed (%s). Retrying without supplier filter.", e
@@ -386,11 +434,32 @@ class QuoteEvaluationAgent(BaseAgent):
                 normalised.append(text)
         return normalised
 
+    def _merge_supplier_tokens(self, *sequences: List[str]) -> List[str]:
+        """Combine supplier identifiers while preserving order and removing duplicates."""
+
+        merged: List[str] = []
+        seen = set()
+        for sequence in sequences:
+            if not sequence:
+                continue
+            for item in sequence:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if not text:
+                    continue
+                normalised = self._normalize_supplier_identifier(text)
+                if not normalised or normalised in seen:
+                    continue
+                seen.add(normalised)
+                merged.append(text)
+        return merged
+
     @staticmethod
     def _extract_ranked_suppliers(
         input_data: Dict, limit: int = 3
-    ) -> List[str]:
-        """Return ordered supplier identifiers from ranking payloads."""
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return ordered supplier records from ranking payloads."""
 
         ranking = input_data.get("ranking")
         if not ranking:
@@ -404,22 +473,27 @@ class QuoteEvaluationAgent(BaseAgent):
         if not isinstance(ranking, list):
             return []
 
-        suppliers: List[str] = []
+        suppliers: List[Dict[str, Optional[str]]] = []
         for entry in ranking:
             if not isinstance(entry, dict):
                 continue
-            candidate = None
-            for key in ("supplier_name", "name", "supplier", "supplier_id"):
+            supplier_name = None
+            for key in ("supplier_name", "name", "supplier"):
                 candidate = entry.get(key)
-                if candidate:
+                if candidate and str(candidate).strip():
+                    supplier_name = str(candidate).strip()
                     break
-            if not candidate:
+            supplier_id = None
+            for key in ("supplier_id", "id", "supplier_code"):
+                candidate = entry.get(key)
+                if candidate and str(candidate).strip():
+                    supplier_id = str(candidate).strip()
+                    break
+            if not supplier_name and not supplier_id:
                 continue
-            text = str(candidate).strip()
-            if not text:
-                continue
-            suppliers.append(text)
-            if len(suppliers) >= limit:
+            suppliers.append({"name": supplier_name, "supplier_id": supplier_id})
+            if limit and len(suppliers) >= limit:
+
                 break
         return suppliers
 
@@ -458,44 +532,66 @@ class QuoteEvaluationAgent(BaseAgent):
         return filtered
 
     def _order_quotes_by_rank(
-        self, quotes: List[Dict], supplier_order: List[str], limit: int = 3
+        self,
+        quotes: List[Dict],
+        supplier_order: List[Dict[str, Optional[str]]],
+        limit: int = 3,
+
     ) -> List[Dict]:
         """Order and limit quotes based on supplier ranking."""
 
         if not supplier_order:
             return quotes[:limit] if limit else quotes
 
-        normalized_order = [
-            token
-            for supplier in supplier_order
-            if (token := self._normalize_supplier_identifier(supplier))
-        ]
         prioritized: List[Dict] = []
-        seen = set()
-        for target in normalized_order:
-            supplier_quotes = [
-                quote
-                for quote in quotes
-                if target
-                in {
-                    self._normalize_supplier_identifier(quote.get("supplier_name")),
-                    self._normalize_supplier_identifier(quote.get("supplier_id")),
-                    self._normalize_supplier_identifier(quote.get("name")),
-                }
+        seen_suppliers = set()
+        for supplier in supplier_order:
+            if not isinstance(supplier, dict):
+                continue
+
+            candidate_tokens = [
+                token
+                for key in ("supplier_id", "name")
+                if (token := self._normalize_supplier_identifier(supplier.get(key)))
             ]
+            if not candidate_tokens:
+                continue
+
+            supplier_quotes = []
+            for quote in quotes:
+                identifiers = [
+                    self._normalize_supplier_identifier(quote.get("supplier_id")),
+                    self._normalize_supplier_identifier(quote.get("supplier_name")),
+                    self._normalize_supplier_identifier(quote.get("name")),
+                ]
+                if any(token and token in candidate_tokens for token in identifiers):
+                    supplier_quotes.append(quote)
+
             if not supplier_quotes:
                 continue
+
             supplier_quotes.sort(key=self._quote_priority)
-            if target in seen:
+            chosen = supplier_quotes[0]
+            quote_key = self._quote_key(chosen)
+            if quote_key and quote_key in seen_suppliers:
                 continue
-            prioritized.append(supplier_quotes[0])
-            seen.add(target)
+            if quote_key:
+                seen_suppliers.add(quote_key)
+            prioritized.append(chosen)
+
             if limit and len(prioritized) >= limit:
                 break
 
         if limit:
             return prioritized[:limit]
         return prioritized
+
+    def _quote_key(self, quote: Dict) -> Optional[str]:
+        for key in ("supplier_id", "supplier_name", "name"):
+            identifier = self._normalize_supplier_identifier(quote.get(key))
+            if identifier:
+                return identifier
+        return None
 
     @staticmethod
     def _quote_priority(quote: Dict) -> float:
