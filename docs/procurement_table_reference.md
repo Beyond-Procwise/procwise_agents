@@ -145,7 +145,27 @@ last_modified_date timestamp DEFAULT CURRENT_TIMESTAMP,
 contract_id text,
 PRIMARY KEY (po_id)
 ```
-
+### `proc.po_line_items_agent`'
+```
+    po_id text COLLATE pg_catalog."default" NOT NULL,
+    po_line_id text COLLATE pg_catalog."default",
+    line_number integer,
+    item_id text COLLATE pg_catalog."default",
+    item_description text COLLATE pg_catalog."default",
+    quote_number text COLLATE pg_catalog."default",
+    quantity numeric(18,2),
+    unit_price numeric(18,2),
+    unit_of_measue text COLLATE pg_catalog."default",
+    currency character varying(3) COLLATE pg_catalog."default",
+    line_total numeric(18,2),
+    tax_percent smallint,
+    tax_amount numeric(18,2),
+    total_amount numeric(18,2),
+    created_date timestamp without time zone,
+    created_by text COLLATE pg_catalog."default",
+    last_modified_by text COLLATE pg_catalog."default",
+    last_modified_date timestamp without time zone,
+```
 ### `proc.invoice_agent`
 ```
 invoice_id text NOT NULL DEFAULT ('IN'::text || lpad((nextval('proc.inv_sequence_new'::regclass))::text, 6, '0')),
@@ -216,4 +236,49 @@ created_date timestamp DEFAULT CURRENT_TIMESTAMP,
 created_by varchar(100) DEFAULT CURRENT_USER,
 lastmodified_date timestamp DEFAULT CURRENT_TIMESTAMP,
 lastmodified_by varchar(100) DEFAULT CURRENT_USER
+```
+### `proc.quote_agent`
+```
+quote_id text COLLATE pg_catalog."default" NOT NULL,
+    supplier_id text COLLATE pg_catalog."default",
+    buyer_id text COLLATE pg_catalog."default",
+    quote_date date,
+    validity_date date,
+    currency character varying(3) COLLATE pg_catalog."default",
+    total_amount numeric(18,2),
+    tax_percent numeric(5,2),
+    tax_amount numeric(18,2),
+    total_amount_incl_tax numeric(18,2),
+    po_id text COLLATE pg_catalog."default",
+    country text COLLATE pg_catalog."default",
+    region text COLLATE pg_catalog."default",
+    ai_flag_required character varying(5) COLLATE pg_catalog."default",
+    trigger_type character varying(30) COLLATE pg_catalog."default",
+    trigger_context_description text COLLATE pg_catalog."default",
+    created_date timestamp without time zone DEFAULT now(),
+    created_by text COLLATE pg_catalog."default",
+    last_modified_by text COLLATE pg_catalog."default",
+    last_modified_date timestamp without time zone,
+    CONSTRAINT quote_agent_pkey PRIMARY KEY (quote_id)
+```
+### `proc.quote_line_items_agent`
+```
+quote_line_id text COLLATE pg_catalog."default" NOT NULL,
+    quote_id text COLLATE pg_catalog."default" NOT NULL,
+    line_number integer NOT NULL,
+    item_id text COLLATE pg_catalog."default",
+    item_description text COLLATE pg_catalog."default",
+    quantity integer,
+    unit_of_measure text COLLATE pg_catalog."default",
+    unit_price numeric(18,2),
+    line_total numeric(18,2),
+    tax_percent numeric(5,2),
+    tax_amount numeric(18,2),
+    total_amount numeric(18,2),
+    currency character varying(3) COLLATE pg_catalog."default",
+    created_date timestamp without time zone DEFAULT now(),
+    created_by text COLLATE pg_catalog."default",
+    last_modified_by text COLLATE pg_catalog."default",
+    last_modified_date timestamp without time zone,
+    CONSTRAINT quote_line_items_agent_pkey PRIMARY KEY (quote_line_id)
 ```
