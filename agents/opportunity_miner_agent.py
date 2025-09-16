@@ -1166,6 +1166,202 @@ class OpportunityMinerAgent(BaseAgent):
             )
         return findings
 
+    def _contract_portfolio_fallback(
+        self,
+        tables: Dict[str, pd.DataFrame],
+        detector: str,
+        reference_date: date,
+        ranking: Optional[Iterable[Dict[str, Any]]],
+        limit: int = 3,
+    ) -> List[Finding]:
+        contracts = tables.get("contracts", pd.DataFrame())
+        if contracts.empty or "supplier_id" not in contracts.columns or "contract_id" not in contracts.columns:
+            return []
+
+        df = contracts.dropna(subset=["supplier_id", "contract_id"]).copy()
+        if df.empty:
+            return []
+
+        df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
+        df["contract_id"] = df["contract_id"].astype(str).str.strip()
+        df = df[(df["supplier_id"] != "") & (df["contract_id"] != "")]
+        if df.empty:
+            return []
+
+        if self._supplier_lookup:
+            df = df[df["supplier_id"].isin(self._supplier_lookup)]
+            if df.empty:
+                return []
+
+        value_col = self._choose_first_column(
+            df,
+            [
+                "total_contract_value_gbp",
+                "total_contract_value",
+                "contract_value_gbp",
+                "contract_value",
+                "adjusted_price_gbp",
+                "adjusted_price",
+            ],
+        )
+        if value_col:
+            df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
+        else:
+            value_col = "__contract_value__"
+            df[value_col] = 0.0
+
+        if "contract_end_date" in df.columns:
+            end_dates = pd.to_datetime(df["contract_end_date"], errors="coerce").dt.date
+            df["contract_end_date"] = end_dates
+            if reference_date:
+                mask = end_dates.isna() | (end_dates >= reference_date)
+                if mask.any():
+                    df = df[mask].copy()
+
+        if df.empty:
+            return []
+
+        category_col = self._choose_first_column(df, ["category_id", "spend_category"])
+        group = df.groupby("supplier_id", dropna=True)
+        aggregated = group[value_col].sum().to_frame(name="total_value")
+        aggregated["contract_count"] = group["contract_id"].nunique()
+        aggregated["contract_ids"] = group["contract_id"].apply(
+            lambda s: sorted({str(v) for v in s.dropna().astype(str)})
+        )
+        if "contract_end_date" in df.columns:
+            def _next_expiry(series: pd.Series) -> Optional[date]:
+                dates = [d for d in series if isinstance(d, date)]
+                return min(dates) if dates else None
+
+            aggregated["next_expiry"] = group["contract_end_date"].apply(_next_expiry)
+
+        if category_col:
+            aggregated["primary_category"] = group[category_col].apply(
+                lambda s: s.dropna().astype(str).mode().iloc[0]
+                if not s.dropna().empty
+                else None
+            )
+
+        aggregated = aggregated.reset_index()
+
+        supplier_master = tables.get("supplier_master", pd.DataFrame())
+        if not supplier_master.empty and "supplier_id" in supplier_master.columns:
+            supplier_info = supplier_master.dropna(subset=["supplier_id"]).copy()
+            supplier_info["supplier_id"] = supplier_info["supplier_id"].astype(str).str.strip()
+            info_cols = [
+                col
+                for col in [
+                    "supplier_name",
+                    "supplier_type",
+                    "risk_score",
+                    "is_preferred_supplier",
+                    "registered_country",
+                    "default_currency",
+                ]
+                if col in supplier_info.columns
+            ]
+            if info_cols:
+                aggregated = aggregated.merge(
+                    supplier_info[["supplier_id"] + info_cols],
+                    on="supplier_id",
+                    how="left",
+                )
+
+        ranking_df = pd.DataFrame(list(ranking or []))
+        if not ranking_df.empty and "supplier_id" in ranking_df.columns:
+            ranking_df = ranking_df.dropna(subset=["supplier_id"]).copy()
+            ranking_df["supplier_id"] = ranking_df["supplier_id"].astype(str).str.strip()
+            rename_map = {
+                col: f"ranking_{col}"
+                for col in ["final_score", "justification", "risk_score", "total_spend"]
+                if col in ranking_df.columns
+            }
+            ranking_df = ranking_df.rename(columns=rename_map)
+            ranking_cols = [col for col in ranking_df.columns if col != "supplier_id"]
+            if ranking_cols:
+                aggregated = aggregated.merge(
+                    ranking_df[["supplier_id"] + ranking_cols].drop_duplicates("supplier_id"),
+                    on="supplier_id",
+                    how="left",
+                )
+            if "ranking_final_score" in aggregated.columns:
+                aggregated["final_score_numeric"] = pd.to_numeric(
+                    aggregated["ranking_final_score"], errors="coerce"
+                )
+
+        sort_cols: List[str] = []
+        ascending: List[bool] = []
+        if "final_score_numeric" in aggregated.columns:
+            sort_cols.append("final_score_numeric")
+            ascending.append(False)
+        sort_cols.append("total_value")
+        ascending.append(False)
+        aggregated = aggregated.sort_values(sort_cols, ascending=ascending, na_position="last")
+
+        findings: List[Finding] = []
+        for _, row in aggregated.head(max(limit, 1)).iterrows():
+            supplier_id = self._resolve_supplier_id(row.get("supplier_id"))
+            if not supplier_id:
+                continue
+            impact = self._to_float(row.get("total_value"), 0.0)
+            contract_ids = row.get("contract_ids")
+            sources = (
+                [str(src) for src in contract_ids if src]
+                if isinstance(contract_ids, list)
+                else []
+            )
+            details: Dict[str, Any] = {
+                "analysis_type": "contract_portfolio_fallback",
+                "contract_count": int(row.get("contract_count", 0) or 0),
+            }
+            if impact:
+                details["total_contract_value_gbp"] = impact
+            next_expiry = row.get("next_expiry")
+            if isinstance(next_expiry, date):
+                details["next_contract_end_date"] = str(next_expiry)
+            supplier_name = row.get("supplier_name")
+            if isinstance(supplier_name, str) and supplier_name:
+                details["supplier_name"] = supplier_name
+            ranking_score = row.get("ranking_final_score")
+            if pd.notna(ranking_score):
+                details["ranking_final_score"] = self._to_float(ranking_score)
+            ranking_justification = row.get("ranking_justification")
+            if isinstance(ranking_justification, str) and ranking_justification.strip():
+                details["ranking_justification"] = ranking_justification.strip()
+            ranking_spend = row.get("ranking_total_spend")
+            if pd.notna(ranking_spend):
+                details["ranking_total_spend"] = self._to_float(ranking_spend)
+            ranking_risk = row.get("ranking_risk_score")
+            if pd.notna(ranking_risk):
+                details["ranking_risk_score"] = self._to_float(ranking_risk)
+            risk_score = row.get("risk_score")
+            if pd.notna(risk_score):
+                details["risk_score"] = self._to_float(risk_score)
+            if "is_preferred_supplier" in row:
+                pref = row.get("is_preferred_supplier")
+                if pd.isna(pref):
+                    pref_value = None
+                elif isinstance(pref, bool):
+                    pref_value = pref
+                else:
+                    pref_value = str(pref).strip().lower() in {"true", "1", "y", "yes"}
+                details["is_preferred_supplier"] = pref_value
+            category_id = row.get("primary_category") if category_col else None
+            finding = self._build_finding(
+                f"{detector} - Portfolio",
+                supplier_id,
+                category_id,
+                None,
+                impact,
+                details,
+                sources,
+            )
+            if isinstance(supplier_name, str) and supplier_name:
+                finding.supplier_name = supplier_name
+            findings.append(finding)
+
+        return findings
+
     def _policy_contract_expiry(
         self,
         tables: Dict[str, pd.DataFrame],
@@ -1243,14 +1439,36 @@ class OpportunityMinerAgent(BaseAgent):
 
         if findings:
             self._default_notifications(notifications)
-        else:
+            return findings
+
+        fallback_findings = self._contract_portfolio_fallback(
+            tables,
+            detector,
+            reference_date,
+            input_data.get("ranking"),
+        )
+        if fallback_findings:
+            supplier_ids = [f.supplier_id for f in fallback_findings if f.supplier_id]
             self._log_policy_event(
                 policy_id,
                 None,
-                "no_action",
-                "No contracts expiring within negotiation window",
-                {"negotiation_window_days": window_days},
+                "fallback",
+                "No contracts expiring within negotiation window; surfaced top contract suppliers",
+                {
+                    "negotiation_window_days": window_days,
+                    "supplier_candidates": supplier_ids,
+                },
             )
+            self._default_notifications(notifications)
+            return fallback_findings
+
+        self._log_policy_event(
+            policy_id,
+            None,
+            "no_action",
+            "No contracts expiring within negotiation window",
+            {"negotiation_window_days": window_days},
+        )
         return findings
 
     def _policy_supplier_risk(
