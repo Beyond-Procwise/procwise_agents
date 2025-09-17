@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
@@ -20,14 +20,12 @@ class QuoteComparisonAgent(BaseAgent):
     """Aggregate quote data for candidate suppliers."""
 
     DEFAULT_METRIC_WEIGHTS: Dict[str, float] = {
-        "total_cost": 0.4,
-        "unit_price": 0.3,
-        "tenure": 0.2,
-        "volume": 0.1,
+        "total_cost": 0.6,
+        "tenure": 0.25,
+        "volume": 0.15,
     }
     METRIC_CONFIG: Dict[str, Dict[str, str]] = {
         "total_cost": {"key": "total_cost_gbp", "direction": "lower", "label": "total cost"},
-        "unit_price": {"key": "unit_price_gbp", "direction": "lower", "label": "unit price"},
         "tenure": {"key": "tenure", "direction": "lower", "label": "lead time"},
         "volume": {"key": "volume", "direction": "higher", "label": "volume"},
     }
@@ -122,7 +120,6 @@ class QuoteComparisonAgent(BaseAgent):
             "line_total": "line_total",
             "total_amount": "total_amount",
             "total_amount_incl_tax": "total_amount_incl_tax",
-            "unit_price": "unit_price",
             "quantity": "quantity",
         }
         for original, alias in numeric_cols.items():
@@ -140,7 +137,6 @@ class QuoteComparisonAgent(BaseAgent):
             "line_total": "sum",
             "total_amount": "sum",
             "total_amount_incl_tax": "sum",
-            "unit_price": "mean",
             "quantity": "sum",
             "tenure_days": "mean",
             "quote_id": "nunique",
@@ -171,7 +167,6 @@ class QuoteComparisonAgent(BaseAgent):
                     if pd.notna(row.get("total_amount_incl_tax"))
                     else row.get("total_amount")
                 ),
-                "unit_price": self._to_float(row.get("unit_price")),
                 "quote_file_s3_path": path_value if pd.notna(path_value) else None,
                 "tenure": self._to_float(row.get("tenure_days")) if pd.notna(row.get("tenure_days")) else None,
                 "volume": self._to_float(row.get("quantity")),
@@ -318,7 +313,7 @@ class QuoteComparisonAgent(BaseAgent):
 
     def _merge_weight_entries(self, source: Dict, fallback: Dict) -> Dict:
         merged = dict(fallback)
-        numeric_keys = ("total_spend", "total_cost", "unit_price", "volume")
+        numeric_keys = ("total_spend", "total_cost", "volume")
         for key in numeric_keys:
             value = source.get(key)
             if not self._is_null(value):
@@ -370,9 +365,6 @@ class QuoteComparisonAgent(BaseAgent):
                 else entry.get("total_amount")
             ),
             "total_cost": total_cost,
-            "unit_price": self._to_float(
-                entry.get("unit_price") if not self._is_null(entry.get("unit_price")) else entry.get("avg_unit_price")
-            ),
             "quote_file_s3_path": quote_path,
             "tenure": tenure_value,
             "volume": self._to_float(entry.get("volume") or entry.get("line_items_count")),
@@ -436,7 +428,6 @@ class QuoteComparisonAgent(BaseAgent):
             "name": "weighting",
             "total_spend": 1.0,
             "total_cost": 0.0,
-            "unit_price": 0.0,
             "quote_file_s3_path": None,
             "tenure": 0.0,
             "volume": 0.0,
@@ -444,7 +435,6 @@ class QuoteComparisonAgent(BaseAgent):
         }
         metric_weights = self._extract_metric_weights(weights)
         entry["total_cost"] = metric_weights.get("total_cost", 0.0)
-        entry["unit_price"] = metric_weights.get("unit_price", 0.0)
         entry["tenure"] = metric_weights.get("tenure", 0.0)
         entry["volume"] = metric_weights.get("volume", 0.0)
         entry["weighting_factors"] = metric_weights
@@ -542,8 +532,6 @@ class QuoteComparisonAgent(BaseAgent):
             entry["total_cost_usd"] = self._to_float(entry.get("total_cost"))
             entry["total_spend_gbp"] = self._to_float(entry.get("total_spend"))
             entry["total_spend_usd"] = self._to_float(entry.get("total_spend"))
-            entry["unit_price_gbp"] = self._to_float(entry.get("unit_price"))
-            entry["unit_price_usd"] = self._to_float(entry.get("unit_price"))
             return
 
         currency_code = (
@@ -557,20 +545,42 @@ class QuoteComparisonAgent(BaseAgent):
 
         total_cost = self._to_float(entry.get("total_cost"))
         total_spend = self._to_float(entry.get("total_spend"))
-        unit_price = self._to_float(entry.get("unit_price"))
 
         entry["total_cost_gbp"] = total_cost * rate
         entry["total_spend_gbp"] = total_spend * rate
-        entry["unit_price_gbp"] = unit_price * rate
 
         if usd_rate > 0:
             entry["total_cost_usd"] = entry["total_cost_gbp"] / usd_rate
             entry["total_spend_usd"] = entry["total_spend_gbp"] / usd_rate
-            entry["unit_price_usd"] = entry["unit_price_gbp"] / usd_rate
         else:
             entry["total_cost_usd"] = total_cost
             entry["total_spend_usd"] = total_spend
-            entry["unit_price_usd"] = unit_price
+
+    def _round_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self._round_value(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [self._round_value(item) for item in value]
+        if self._is_null(value):
+            if isinstance(value, float) and math.isnan(value):
+                return 0.0
+            return None if value is not None else value
+        if isinstance(value, Decimal):
+            value = float(value)
+        if isinstance(value, (int, float)):
+            try:
+                decimal_value = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                rounded = float(decimal_value)
+            except (ArithmeticError, ValueError, TypeError):
+                rounded = round(float(value), 2)
+            if math.isclose(rounded, round(rounded)):
+                return int(round(rounded))
+            return rounded
+        return value
+
+    def _round_entry_values(self, entry: Dict[str, Any]) -> None:
+        for key, value in list(entry.items()):
+            entry[key] = self._round_value(value)
 
     def _calculate_weighting_scores(
         self, entries: List[Dict[str, Any]], weights: Dict[str, float]
@@ -699,10 +709,6 @@ class QuoteComparisonAgent(BaseAgent):
                     reasons.append(
                         f"Lowest {cfg['label']} ({self._format_currency(numeric, 'GBP')})"
                     )
-                elif metric == "unit_price":
-                    reasons.append(
-                        f"Best {cfg['label']} ({self._format_currency(numeric, 'GBP')})"
-                    )
                 elif metric == "tenure":
                     reasons.append(f"Shortest lead time ({numeric:.0f} days)")
                 else:
@@ -724,6 +730,8 @@ class QuoteComparisonAgent(BaseAgent):
         supplier_entries = [entry for entry in rows if entry.get("name") != "weighting"]
         stats = self._calculate_weighting_scores(supplier_entries, metric_weights)
         recommended = self._apply_recommendations(supplier_entries, stats, metric_weights)
+        for entry in rows:
+            self._round_entry_values(entry)
         return rows, recommended
 
     def _build_recommended_summary(
@@ -732,7 +740,7 @@ class QuoteComparisonAgent(BaseAgent):
         if not recommended_entry:
             return None
         recommendation = recommended_entry.get("recommendation", {})
-        return {
+        summary = {
             "supplier_id": recommended_entry.get("supplier_id"),
             "name": recommended_entry.get("name"),
             "weighting_score": recommended_entry.get("weighting_score"),
@@ -741,6 +749,7 @@ class QuoteComparisonAgent(BaseAgent):
             "ticker": recommendation.get("ticker"),
             "justification": recommendation.get("justification"),
         }
+        return {key: self._round_value(value) for key, value in summary.items()}
 
     def _format_currency(self, amount: float, currency: Optional[str]) -> str:
         code = (currency or "GBP").upper()

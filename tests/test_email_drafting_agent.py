@@ -62,6 +62,8 @@ def test_email_drafting_agent(monkeypatch):
     assert "<p>Dear Acme,</p>" in draft["body"]
     assert "<p>Deadline for submission: 01/01/2025</p>" in draft["body"]
     assert "<table" in draft["body"]
+    assert draft["subject"].count("RFQ") == 1
+    assert "leading suppliers" not in draft["body"].lower()
     assert draft["sent_status"] is False
     assert draft["sender"] == "sender@example.com"
     assert draft["contact_level"] == 0

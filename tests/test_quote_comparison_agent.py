@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -59,7 +60,6 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
             "name": "weighting",
             "total_spend": 1.0,
             "total_cost": 0,
-            "unit_price": 0,
             "quote_file_s3_path": None,
             "tenure": None,
             "volume": None,
@@ -67,20 +67,18 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
         {
             "name": "Supplier A",
             "supplier_id": "S1",
-            "total_spend": 100,
-            "total_cost": 90,
-            "unit_price": 10,
-            "volume": 10,
+            "total_spend": 100.789,
+            "total_cost": 90.1234,
+            "volume": 10.456,
             "tenure": "Net 30",
             "quote_file_s3_path": "s3://bucket/s1.pdf",
         },
         {
             "name": "Supplier B",
             "supplier_id": "S2",
-            "total_spend": 200,
-            "total_cost": 180,
-            "unit_price": 9,
-            "volume": 20,
+            "total_spend": 200.333,
+            "total_cost": 180.8765,
+            "volume": 20.111,
             "tenure": "Net 45",
             "quote_file_s3_path": "s3://bucket/s2.pdf",
         },
@@ -97,12 +95,20 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     assert suppliers == {"S1", "S2"}
     assert comparison[1]["quote_file_s3_path"] == "s3://bucket/s1.pdf"
     assert comparison[1]["currency"] == "GBP"
+    assert "unit_price" not in comparison[0]
+    assert "unit_price" not in comparison[1]
+    assert "unit_price" not in comparison[2]
+    assert comparison[1]["total_cost"] == pytest.approx(90.12)
+    assert comparison[1]["total_spend"] == pytest.approx(100.79)
+    assert comparison[1]["volume"] == pytest.approx(10.46)
+    assert round(comparison[1]["weighting_score"], 2) == comparison[1]["weighting_score"]
     assert comparison[1]["weighting_score"] > comparison[2]["weighting_score"]
     recommended = result.data.get("recommended_quote")
     assert recommended is not None
     assert recommended["supplier_id"] == "S1"
     assert recommended["ticker"] == "RECOMMENDED"
     assert recommended["weighting_score"] == comparison[1]["weighting_score"]
+    assert recommended["total_cost_gbp"] == pytest.approx(90.12)
 
 
 def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
@@ -117,7 +123,6 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
             "name": "weighting",
             "total_spend": 1.0,
             "total_cost": 0,
-            "unit_price": 0,
             "quote_file_s3_path": None,
             "tenure": None,
             "volume": None,
@@ -127,7 +132,6 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
             "supplier_id": "S1",
             "total_spend": 100,
             "total_cost": 90,
-            "unit_price": 10,
             "volume": 10,
         },
         {
@@ -135,7 +139,6 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
             "supplier_id": None,
             "total_spend": 200,
             "total_cost": 180,
-            "unit_price": 9,
             "volume": 20,
         },
     ]
@@ -153,6 +156,7 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     assert comparison[0]["name"] == "weighting"
     assert comparison[1]["name"] == "Supplier B"
     assert comparison[1]["supplier_id"] is None
+    assert all("unit_price" not in row for row in comparison)
     recommended = result.data.get("recommended_quote")
     assert recommended is not None
     assert recommended["name"] == "Supplier B"
