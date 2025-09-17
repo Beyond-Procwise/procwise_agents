@@ -64,6 +64,10 @@ def test_email_drafting_agent(monkeypatch):
     assert "<table" in draft["body"]
     assert draft["sent_status"] is False
     assert draft["sender"] == "sender@example.com"
+    assert draft["contact_level"] == 0
+    assert draft["recipients"] == []
+    assert draft.get("receiver") is None
+    assert draft["thread_index"] == 1
     assert "action_id" in draft
     assert draft["action_id"] is None
     assert captured["drafts"][0] == draft
@@ -138,28 +142,12 @@ def test_email_drafting_includes_action_ids(monkeypatch):
     assert output.pass_fields["action_id"] == "email-action"
 
 
-def test_email_drafting_handles_manual_email_request(monkeypatch):
+def test_email_drafting_creates_manual_draft_without_sending(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)
 
     stored = []
     monkeypatch.setattr(agent, "_store_draft", lambda draft: stored.append(draft))
-
-    sent_payload = {}
-
-    def fake_send(subject, body, recipients, sender, attachments=None):
-        sent_payload.update(
-            {
-                "subject": subject,
-                "body": body,
-                "recipients": recipients,
-                "sender": sender,
-                "attachments": attachments,
-            }
-        )
-        return True
-
-    monkeypatch.setattr(agent.email_service, "send_email", fake_send)
 
     context = AgentContext(
         workflow_id="wf5",
@@ -176,13 +164,7 @@ def test_email_drafting_handles_manual_email_request(monkeypatch):
     output = agent.run(context)
 
     assert output.status == AgentStatus.SUCCESS
-    assert output.data["sent"] is True
-    assert sent_payload["subject"] == "Manual Subject"
-    assert sent_payload["sender"] == "sender@example.com"
-    assert sent_payload["recipients"] == ["user@example.com", "team@example.com"]
-    assert sent_payload["attachments"] is None
-    assert sent_payload["body"].startswith("<!-- RFQ-ID: RFQ-MANUAL -->")
-    assert "<p>Hello supplier</p>" in sent_payload["body"]
+    assert "sent" not in output.data
 
     drafts = output.data["drafts"]
     assert len(drafts) == 1
@@ -191,6 +173,9 @@ def test_email_drafting_handles_manual_email_request(monkeypatch):
     assert draft["sent_status"] is False
     assert draft["action_id"] == "manual-action"
     assert draft["recipients"] == ["user@example.com", "team@example.com"]
+    assert draft["receiver"] == "user@example.com"
+    assert draft["contact_level"] == 1
+    assert draft["thread_index"] == 1
     assert stored[0] == draft
     assert output.data["recipients"] == ["user@example.com", "team@example.com"]
     assert output.data["action_id"] == "manual-action"

@@ -1,0 +1,266 @@
+"""Email dispatch service for sending stored RFQ drafts."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from utils.gpu import configure_gpu
+
+from .email_service import EmailService
+
+configure_gpu()
+
+logger = logging.getLogger(__name__)
+
+_RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+
+class EmailDispatchService:
+    """Send persisted RFQ drafts via Amazon SES and update their status."""
+
+    def __init__(self, agent_nick):
+        self.agent_nick = agent_nick
+        self.email_service = EmailService(agent_nick)
+        self.settings = agent_nick.settings
+        self.logger = logging.getLogger(__name__)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def send_draft(
+        self,
+        rfq_id: str,
+        recipients: Optional[Iterable[str]] = None,
+        sender: Optional[str] = None,
+        subject_override: Optional[str] = None,
+        body_override: Optional[str] = None,
+        attachments: Optional[List[Tuple[bytes, str]]] = None,
+    ) -> Dict[str, Any]:
+        """Send the latest draft for ``rfq_id`` and mark it as sent."""
+
+        rfq_id = (rfq_id or "").strip()
+        if not rfq_id:
+            raise ValueError("rfq_id is required to send an email draft")
+
+        with self.agent_nick.get_db_connection() as conn:
+            draft_row = self._fetch_latest_draft(conn, rfq_id)
+            if draft_row is None:
+                raise ValueError(f"No stored draft found for RFQ {rfq_id}")
+
+            draft = self._hydrate_draft(draft_row)
+
+            recipient_list = self._normalise_recipients(
+                recipients if recipients is not None else draft.get("recipients")
+            )
+            if not recipient_list and draft.get("receiver"):
+                recipient_list = self._normalise_recipients([draft["receiver"]])
+
+            if not recipient_list:
+                raise ValueError("At least one recipient email is required to send the draft")
+
+            sender_candidate = (
+                sender
+                if sender is not None
+                else draft.get("sender")
+                or getattr(self.settings, "ses_default_sender", "")
+            )
+            sender_email = str(sender_candidate).strip()
+            if not sender_email:
+                raise ValueError("Sender email address is required")
+
+            if subject_override is not None:
+                subject_candidate = subject_override
+            else:
+                subject_candidate = draft.get("subject")
+            subject_str = str(subject_candidate).strip() if subject_candidate else ""
+            subject = subject_str or f"RFQ {rfq_id} – Request for Quotation"
+
+            body_source = body_override if body_override is not None else draft.get("body")
+            body_text = str(body_source).strip() if body_source else ""
+            body = self._ensure_rfq_annotation(body_text, rfq_id)
+
+            dispatch_payload = dict(draft)
+            dispatch_payload.update(
+                {
+                    "subject": subject,
+                    "body": body,
+                    "recipients": recipient_list,
+                    "receiver": recipient_list[0] if recipient_list else draft.get("receiver"),
+                    "contact_level": 1 if recipient_list else 0,
+                    "sender": sender_email,
+                }
+            )
+
+            sent = self.email_service.send_email(
+                subject,
+                body,
+                recipient_list,
+                sender_email,
+                attachments,
+            )
+
+            self._update_draft_status(
+                conn,
+                draft_row,
+                dispatch_payload,
+                recipient_list,
+                sent,
+            )
+
+            dispatch_payload["sent_status"] = bool(sent)
+            if sent:
+                dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
+
+            return {
+                "rfq_id": rfq_id,
+                "sent": bool(sent),
+                "recipients": recipient_list,
+                "sender": sender_email,
+                "subject": subject,
+                "body": body,
+                "thread_index": dispatch_payload.get("thread_index"),
+                "draft": dispatch_payload,
+            }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _fetch_latest_draft(self, conn, rfq_id: str) -> Optional[Tuple]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
+                       recipient_email, contact_level, thread_index, payload, sender, sent_on
+                FROM proc.draft_rfq_emails
+                WHERE rfq_id = %s
+                ORDER BY sent ASC, thread_index DESC, id DESC
+                LIMIT 1
+                """,
+                (rfq_id,),
+            )
+            return cur.fetchone()
+
+    def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
+        (
+            draft_id,
+            rfq_id,
+            supplier_id,
+            supplier_name,
+            subject,
+            body,
+            sent,
+            recipient_email,
+            contact_level,
+            thread_index,
+            payload,
+            sender,
+            sent_on,
+        ) = row
+
+        hydrated: Dict[str, Any]
+        if isinstance(payload, dict):
+            hydrated = dict(payload)
+        else:
+            try:
+                hydrated = json.loads(payload) if payload else {}
+            except Exception:
+                hydrated = {}
+
+        defaults = {
+            "id": draft_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "subject": subject,
+            "body": body,
+            "sent_status": bool(sent),
+            "receiver": recipient_email,
+            "contact_level": contact_level,
+            "thread_index": thread_index,
+            "sender": sender,
+            "recipients": hydrated.get("recipients") or ([recipient_email] if recipient_email else []),
+        }
+        for key, value in defaults.items():
+            hydrated.setdefault(key, value)
+        if sent_on and "sent_on" not in hydrated:
+            hydrated["sent_on"] = sent_on if isinstance(sent_on, str) else getattr(sent_on, "isoformat", lambda: sent_on)()
+        recipients_value = hydrated.get("recipients")
+        if isinstance(recipients_value, str):
+            hydrated["recipients"] = self._normalise_recipients([recipients_value])
+        elif isinstance(recipients_value, Iterable):
+            hydrated["recipients"] = self._normalise_recipients(recipients_value)
+        else:
+            hydrated["recipients"] = []
+        if not hydrated.get("sender"):
+            hydrated["sender"] = getattr(self.settings, "ses_default_sender", "")
+        return hydrated
+
+    def _update_draft_status(
+        self,
+        conn,
+        row: Tuple,
+        payload: Dict[str, Any],
+        recipients: Sequence[str],
+        sent: bool,
+    ) -> None:
+        draft_id = row[0]
+        recipient = recipients[0] if recipients else payload.get("receiver")
+        try:
+            contact_level = int(payload.get("contact_level", 1 if recipients else 0))
+        except Exception:
+            contact_level = 1 if recipients else 0
+
+        payload["sent_status"] = bool(sent)
+        payload_json = json.dumps(payload, default=str)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE proc.draft_rfq_emails
+                SET sent = %s,
+                    subject = %s,
+                    body = %s,
+                    recipient_email = %s,
+                    contact_level = %s,
+                    payload = %s,
+                    sent_on = CASE WHEN %s THEN NOW() ELSE sent_on END,
+                    updated_on = NOW()
+                WHERE id = %s
+                """,
+                (
+                    bool(sent),
+                    payload.get("subject"),
+                    payload.get("body"),
+                    recipient,
+                    contact_level,
+                    payload_json,
+                    bool(sent),
+                    draft_id,
+                ),
+            )
+        conn.commit()
+
+    def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
+        if recipients is None:
+            return []
+        values: List[str] = []
+        for value in recipients:
+            if not isinstance(value, str):
+                continue
+            candidate = value.strip()
+            if not candidate:
+                continue
+            if candidate.lower() not in {item.lower() for item in values}:
+                values.append(candidate)
+        return values
+
+    def _ensure_rfq_annotation(self, body: str, rfq_id: str) -> str:
+        if not body:
+            return f"<!-- RFQ-ID: {rfq_id} -->"
+        if _RFQ_ID_PATTERN.search(body):
+            return body
+        return f"<!-- RFQ-ID: {rfq_id} -->\n{body.strip()}"

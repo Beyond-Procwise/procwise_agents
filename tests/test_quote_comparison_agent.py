@@ -96,6 +96,13 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     suppliers = {row["supplier_id"] for row in comparison if row["name"] != "weighting"}
     assert suppliers == {"S1", "S2"}
     assert comparison[1]["quote_file_s3_path"] == "s3://bucket/s1.pdf"
+    assert comparison[1]["currency"] == "GBP"
+    assert comparison[1]["weighting_score"] > comparison[2]["weighting_score"]
+    recommended = result.data.get("recommended_quote")
+    assert recommended is not None
+    assert recommended["supplier_id"] == "S1"
+    assert recommended["ticker"] == "RECOMMENDED"
+    assert recommended["weighting_score"] == comparison[1]["weighting_score"]
 
 
 def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
@@ -146,3 +153,6 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     assert comparison[0]["name"] == "weighting"
     assert comparison[1]["name"] == "Supplier B"
     assert comparison[1]["supplier_id"] is None
+    recommended = result.data.get("recommended_quote")
+    assert recommended is not None
+    assert recommended["name"] == "Supplier B"
