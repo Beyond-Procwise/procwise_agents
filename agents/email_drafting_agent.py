@@ -138,6 +138,7 @@ class EmailDraftingAgent(BaseAgent):
         manual_subject_rendered: Optional[str] = None
         manual_body_rendered: Optional[str] = None
         manual_rfq_id: Optional[str] = None
+        manual_sent_flag: bool = data.get("sent_status", True)
 
         for supplier in ranking:
             supplier_id = supplier.get("supplier_id")
@@ -187,7 +188,7 @@ class EmailDraftingAgent(BaseAgent):
             content = self._sanitise_generated_body(message if comment else rendered)
             comment = comment if comment else f"<!-- RFQ-ID: {rfq_id} -->"
             body = comment if not content else f"{comment}\n{content}"
-            subject = f"RFQ {rfq_id} – Request for Quotation"
+            subject = f"{rfq_id} – Request for Quotation"
 
             draft_action_id = supplier.get("action_id") or default_action_id
 
@@ -241,7 +242,7 @@ class EmailDraftingAgent(BaseAgent):
                 "rfq_id": manual_rfq_id,
                 "subject": manual_subject_rendered,
                 "body": manual_body_rendered,
-                "sent_status": bool(manual_sent),
+                "sent_status": bool(manual_sent_flag),
                 "sender": manual_sender,
                 "action_id": default_action_id,
                 "supplier_profile": {},
@@ -369,8 +370,8 @@ class EmailDraftingAgent(BaseAgent):
                 "We would appreciate a refreshed proposal aligned to the updated scope below."
             )
         return (
-            "We are engaging leading suppliers for an upcoming procurement exercise and "
-            f"would like {supplier_name} to participate."
+            "We are initiating a focused sourcing exercise for the scope outlined below and "
+            f"would welcome {supplier_name}'s proposal."
         )
 
     def _opportunity_summary(self, supplier: Dict, profile: Dict) -> str:
