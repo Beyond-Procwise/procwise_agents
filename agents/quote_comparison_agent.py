@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -17,9 +19,25 @@ logger = logging.getLogger(__name__)
 class QuoteComparisonAgent(BaseAgent):
     """Aggregate quote data for candidate suppliers."""
 
+    DEFAULT_METRIC_WEIGHTS: Dict[str, float] = {
+        "total_cost": 0.4,
+        "unit_price": 0.3,
+        "tenure": 0.2,
+        "volume": 0.1,
+    }
+    METRIC_CONFIG: Dict[str, Dict[str, str]] = {
+        "total_cost": {"key": "total_cost_gbp", "direction": "lower", "label": "total cost"},
+        "unit_price": {"key": "unit_price_gbp", "direction": "lower", "label": "unit price"},
+        "tenure": {"key": "tenure", "direction": "lower", "label": "lead time"},
+        "volume": {"key": "volume", "direction": "higher", "label": "volume"},
+    }
+    EPSILON = 1e-9
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
+        self._fx_to_gbp: Dict[str, float] = {"GBP": 1.0, "USD": 0.79}
+        self._resolved_metric_weights: Dict[str, float] = {}
 
     def run(self, context: AgentContext) -> AgentOutput:
         supplier_ids = self._collect_supplier_ids(context.input_data)
@@ -28,6 +46,11 @@ class QuoteComparisonAgent(BaseAgent):
             context.input_data.get("weightings")
             or context.input_data.get("weights")
             or {}
+        )
+        metric_weights = (
+            dict(self._resolved_metric_weights)
+            if self._resolved_metric_weights
+            else dict(self.DEFAULT_METRIC_WEIGHTS)
         )
 
         passed_quotes = self._extract_passed_quotes(context.input_data)
@@ -39,10 +62,15 @@ class QuoteComparisonAgent(BaseAgent):
                 weight_entry,
             )
             if formatted is not None and has_suppliers:
+                finalised, recommended = self._finalise_results(formatted, metric_weights)
+                recommended_summary = self._build_recommended_summary(recommended)
+                payload = {"comparison": finalised}
+                if recommended_summary:
+                    payload["recommended_quote"] = recommended_summary
                 return AgentOutput(
                     status=AgentStatus.SUCCESS,
-                    data={"comparison": formatted},
-                    pass_fields={"comparison": formatted},
+                    data=payload,
+                    pass_fields=payload,
                 )
 
         quotes = self._read_table("proc.quote_agent")
@@ -55,11 +83,15 @@ class QuoteComparisonAgent(BaseAgent):
         )
 
         if quotes.empty or quote_lines.empty:
-            result = [weight_entry]
+            results, recommended = self._finalise_results([weight_entry], metric_weights)
+            recommended_summary = self._build_recommended_summary(recommended)
+            payload = {"comparison": results}
+            if recommended_summary:
+                payload["recommended_quote"] = recommended_summary
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data={"comparison": result},
-                pass_fields={"comparison": result},
+                data=payload,
+                pass_fields=payload,
             )
 
         quotes["quote_id"] = quotes["quote_id"].astype(str)
@@ -70,11 +102,15 @@ class QuoteComparisonAgent(BaseAgent):
             quote_lines = quote_lines[quote_lines["quote_id"].isin(quotes["quote_id"])]
 
         if quotes.empty:
-            result = [weight_entry]
+            results, recommended = self._finalise_results([weight_entry], metric_weights)
+            recommended_summary = self._build_recommended_summary(recommended)
+            payload = {"comparison": results}
+            if recommended_summary:
+                payload["recommended_quote"] = recommended_summary
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
-                data={"comparison": result},
-                pass_fields={"comparison": result},
+                data=payload,
+                pass_fields=payload,
             )
 
         merged = quote_lines.merge(
@@ -110,6 +146,8 @@ class QuoteComparisonAgent(BaseAgent):
             "quote_id": "nunique",
             "quote_file_s3_path": "first",
         }
+        if "currency" in merged.columns:
+            aggregations["currency"] = "first"
         available_aggs = {
             col: func for col, func in aggregations.items() if col in merged.columns
         }
@@ -127,23 +165,30 @@ class QuoteComparisonAgent(BaseAgent):
             entry = {
                 "name": supplier_name,
                 "supplier_id": supplier_id,
-                "total_spend": float(row.get("line_total", 0.0) or 0.0),
-                "total_cost": float(
+                "total_spend": self._to_float(row.get("line_total")),
+                "total_cost": self._to_float(
                     row.get("total_amount_incl_tax")
                     if pd.notna(row.get("total_amount_incl_tax"))
-                    else row.get("total_amount", 0.0) or 0.0
+                    else row.get("total_amount")
                 ),
-                "unit_price": float(row.get("unit_price", 0.0) or 0.0),
+                "unit_price": self._to_float(row.get("unit_price")),
                 "quote_file_s3_path": path_value if pd.notna(path_value) else None,
-                "tenure": float(row.get("tenure_days", 0.0) or 0.0),
-                "volume": float(row.get("quantity", 0.0) or 0.0),
+                "tenure": self._to_float(row.get("tenure_days")) if pd.notna(row.get("tenure_days")) else None,
+                "volume": self._to_float(row.get("quantity")),
+                "currency": row.get("currency") if pd.notna(row.get("currency")) else None,
             }
             results.append(entry)
 
+        finalised_results, recommended = self._finalise_results(results, metric_weights)
+        recommended_summary = self._build_recommended_summary(recommended)
+        payload = {"comparison": finalised_results}
+        if recommended_summary:
+            payload["recommended_quote"] = recommended_summary
+
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={"comparison": results},
-            pass_fields={"comparison": results},
+            data=payload,
+            pass_fields=payload,
         )
 
     def _extract_passed_quotes(self, input_data: Dict) -> List[Dict]:
@@ -288,6 +333,11 @@ class QuoteComparisonAgent(BaseAgent):
         elif source.get("quote_file_s3_path") is None:
             merged["quote_file_s3_path"] = None
 
+        if source.get("weighting_factors"):
+            merged["weighting_factors"] = dict(source["weighting_factors"])
+        elif fallback.get("weighting_factors"):
+            merged["weighting_factors"] = dict(fallback["weighting_factors"])
+
         return merged
 
     def _format_passed_quote(self, entry: Dict) -> Dict:
@@ -309,11 +359,7 @@ class QuoteComparisonAgent(BaseAgent):
         elif self._is_null(quote_path):
             quote_path = None
 
-        tenure = entry.get("tenure") or entry.get("payment_terms")
-        if isinstance(tenure, (int, float, Decimal)) and not self._is_null(tenure):
-            tenure_value: Optional[float] = self._to_float(tenure)
-        else:
-            tenure_value = tenure if tenure not in ("", None) else None
+        tenure_value = self._parse_tenure(entry.get("tenure") or entry.get("payment_terms"))
 
         return {
             "name": supplier_name,
@@ -330,6 +376,7 @@ class QuoteComparisonAgent(BaseAgent):
             "quote_file_s3_path": quote_path,
             "tenure": tenure_value,
             "volume": self._to_float(entry.get("volume") or entry.get("line_items_count")),
+            "currency": entry.get("currency") or entry.get("currency_code"),
         }
 
     def _clean_identifier(self, value: Optional[object]) -> Optional[str]:
@@ -385,43 +432,58 @@ class QuoteComparisonAgent(BaseAgent):
         return supplier_ids
 
     def _prepare_weight_entry(self, weights: Dict) -> Dict:
-        default = {
+        entry = {
             "name": "weighting",
-            "total_spend": 0.0,
+            "total_spend": 1.0,
             "total_cost": 0.0,
             "unit_price": 0.0,
             "quote_file_s3_path": None,
-            "tenure": None,
+            "tenure": 0.0,
             "volume": 0.0,
+            "currency": "GBP",
         }
+        metric_weights = self._extract_metric_weights(weights)
+        entry["total_cost"] = metric_weights.get("total_cost", 0.0)
+        entry["unit_price"] = metric_weights.get("unit_price", 0.0)
+        entry["tenure"] = metric_weights.get("tenure", 0.0)
+        entry["volume"] = metric_weights.get("volume", 0.0)
+        entry["weighting_factors"] = metric_weights
+        return entry
+
+    def _extract_metric_weights(self, weights: Any) -> Dict[str, float]:
+        raw: Dict[str, float] = {}
         if isinstance(weights, (int, float, Decimal)):
-            result = default.copy()
-            result["total_spend"] = float(weights)
-            return result
-        if isinstance(weights, str):
+            value = float(weights)
+            if value > 0:
+                raw["total_cost"] = value
+        elif isinstance(weights, str):
             try:
                 value = float(weights)
             except (TypeError, ValueError):
-                return default
-            result = default.copy()
-            result["total_spend"] = value
-            return result
-        if not isinstance(weights, dict):
-            return default
-        result = default.copy()
-        for key in ("total_spend", "total_cost", "unit_price", "volume"):
-            value = weights.get(key)
-            try:
-                result[key] = float(value)
-            except (TypeError, ValueError):
-                pass
-        if weights.get("tenure") is not None:
-            try:
-                result["tenure"] = float(weights.get("tenure"))
-            except (TypeError, ValueError):
-                result["tenure"] = weights.get("tenure")
-        result["quote_file_s3_path"] = weights.get("quote_file_s3_path")
-        return result
+                value = 0.0
+            if value > 0:
+                raw["total_cost"] = value
+        elif isinstance(weights, dict):
+            for key in self.METRIC_CONFIG.keys():
+                value = weights.get(key)
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric > 0:
+                    raw[key] = numeric
+
+        if not raw:
+            raw = dict(self.DEFAULT_METRIC_WEIGHTS)
+
+        total = sum(raw.values())
+        if total <= 0:
+            total = sum(self.DEFAULT_METRIC_WEIGHTS.values())
+            raw = dict(self.DEFAULT_METRIC_WEIGHTS)
+
+        normalised = {metric: value / total for metric, value in raw.items() if value > 0}
+        self._resolved_metric_weights = normalised
+        return normalised
 
     def _read_table(self, table: str) -> pd.DataFrame:
         sql = f"SELECT * FROM {table}"
@@ -435,3 +497,270 @@ class QuoteComparisonAgent(BaseAgent):
         except Exception:
             logger.exception("QuoteComparisonAgent failed to read %s", table)
             return pd.DataFrame()
+
+    def _load_fx_rates(self) -> None:
+        if self._fx_to_gbp:
+            return
+
+        rates: Dict[str, float] = {"GBP": 1.0, "USD": 0.79}
+        for table in ("proc.currency_rates", "proc.fx_rates", "proc.indices"):
+            df = self._read_table(table)
+            if df.empty:
+                continue
+            currency_col = next(
+                (col for col in ("currency", "from_currency", "code") if col in df.columns),
+                None,
+            )
+            value_col = next(
+                (col for col in ("rate_to_gbp", "gbp_rate", "value", "rate") if col in df.columns),
+                None,
+            )
+            if not currency_col or not value_col:
+                continue
+            for _, row in df.iterrows():
+                currency = row.get(currency_col)
+                if not currency:
+                    continue
+                try:
+                    rate = float(row.get(value_col))
+                except (TypeError, ValueError):
+                    continue
+                if rate and rate > 0:
+                    rates[str(currency).strip().upper()] = rate
+        self._fx_to_gbp = rates
+
+    def _rate_to_gbp(self, currency: Optional[str]) -> float:
+        self._load_fx_rates()
+        if not currency:
+            return 1.0
+        return self._fx_to_gbp.get(str(currency).strip().upper(), 1.0)
+
+    def _augment_currency_fields(self, entry: Dict[str, Any]) -> None:
+        if entry.get("name", "").lower() == "weighting":
+            entry.setdefault("currency", "GBP")
+            entry["total_cost_gbp"] = self._to_float(entry.get("total_cost"))
+            entry["total_cost_usd"] = self._to_float(entry.get("total_cost"))
+            entry["total_spend_gbp"] = self._to_float(entry.get("total_spend"))
+            entry["total_spend_usd"] = self._to_float(entry.get("total_spend"))
+            entry["unit_price_gbp"] = self._to_float(entry.get("unit_price"))
+            entry["unit_price_usd"] = self._to_float(entry.get("unit_price"))
+            return
+
+        currency_code = (
+            str(entry.get("currency") or entry.get("currency_code") or "GBP")
+            .strip()
+            .upper()
+        )
+        rate = self._rate_to_gbp(currency_code)
+        usd_rate = self._rate_to_gbp("USD")
+        entry["currency"] = currency_code
+
+        total_cost = self._to_float(entry.get("total_cost"))
+        total_spend = self._to_float(entry.get("total_spend"))
+        unit_price = self._to_float(entry.get("unit_price"))
+
+        entry["total_cost_gbp"] = total_cost * rate
+        entry["total_spend_gbp"] = total_spend * rate
+        entry["unit_price_gbp"] = unit_price * rate
+
+        if usd_rate > 0:
+            entry["total_cost_usd"] = entry["total_cost_gbp"] / usd_rate
+            entry["total_spend_usd"] = entry["total_spend_gbp"] / usd_rate
+            entry["unit_price_usd"] = entry["unit_price_gbp"] / usd_rate
+        else:
+            entry["total_cost_usd"] = total_cost
+            entry["total_spend_usd"] = total_spend
+            entry["unit_price_usd"] = unit_price
+
+    def _calculate_weighting_scores(
+        self, entries: List[Dict[str, Any]], weights: Dict[str, float]
+    ) -> Dict[str, Dict[str, float]]:
+        stats: Dict[str, Dict[str, float]] = {}
+        if not entries:
+            return stats
+
+        for metric, cfg in self.METRIC_CONFIG.items():
+            values: List[float] = []
+            for entry in entries:
+                value = entry.get(cfg["key"])
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                values.append(numeric)
+            if values:
+                stats[metric] = {
+                    "min": min(values),
+                    "max": max(values),
+                    "direction": cfg["direction"],
+                }
+
+        for entry in entries:
+            score_total = 0.0
+            weight_total = 0.0
+            breakdown: Dict[str, float] = {}
+            for metric, cfg in self.METRIC_CONFIG.items():
+                weight = weights.get(metric, 0.0)
+                if weight <= 0:
+                    continue
+                stat = stats.get(metric)
+                if not stat:
+                    continue
+                value = entry.get(cfg["key"])
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                min_val = stat["min"]
+                max_val = stat["max"]
+                if math.isclose(max_val, min_val, rel_tol=self.EPSILON, abs_tol=self.EPSILON):
+                    normalised = 1.0
+                else:
+                    if stat["direction"] == "lower":
+                        normalised = (max_val - numeric) / (max_val - min_val)
+                    else:
+                        normalised = (numeric - min_val) / (max_val - min_val)
+                    normalised = max(0.0, min(1.0, normalised))
+                breakdown[metric] = normalised
+                score_total += normalised * weight
+                weight_total += weight
+
+            if weight_total > 0:
+                entry["weighting_score"] = (score_total / weight_total) * 100.0
+            else:
+                entry["weighting_score"] = 0.0
+            if breakdown:
+                entry["weighting_breakdown"] = {
+                    key: round(value * 100.0, 2) for key, value in breakdown.items()
+                }
+
+        return stats
+
+    def _apply_recommendations(
+        self,
+        entries: List[Dict[str, Any]],
+        stats: Dict[str, Dict[str, float]],
+        weights: Dict[str, float],
+    ) -> Optional[Dict[str, Any]]:
+        if not entries:
+            return None
+
+        best = max(
+            entries,
+            key=lambda e: (
+                e.get("weighting_score", 0.0),
+                -self._to_float(e.get("total_cost_gbp")),
+            ),
+        )
+        best["recommendation"] = {
+            "ticker": "RECOMMENDED",
+            "justification": self._build_recommendation_reason(best, stats),
+        }
+        best_score = best.get("weighting_score", 0.0)
+        best_cost = self._to_float(best.get("total_cost_gbp"))
+
+        for entry in entries:
+            if entry is best:
+                continue
+            reasons: List[str] = []
+            score_diff = best_score - entry.get("weighting_score", 0.0)
+            if score_diff > self.EPSILON:
+                reasons.append(f"Score {score_diff:.1f} below best option")
+            cost_diff = self._to_float(entry.get("total_cost_gbp")) - best_cost
+            if cost_diff > self.EPSILON:
+                reasons.append(
+                    f"{self._format_currency(cost_diff, 'GBP')} higher total cost"
+                )
+            entry["recommendation"] = {
+                "ticker": "ALTERNATIVE",
+                "justification": ", ".join(reasons)
+                if reasons
+                else "Viable alternative with lower composite score",
+            }
+
+        return best
+
+    def _build_recommendation_reason(
+        self, entry: Dict[str, Any], stats: Dict[str, Dict[str, float]]
+    ) -> str:
+        reasons: List[str] = []
+        for metric, cfg in self.METRIC_CONFIG.items():
+            stat = stats.get(metric)
+            if not stat:
+                continue
+            value = entry.get(cfg["key"])
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            target = stat["min"] if cfg["direction"] == "lower" else stat["max"]
+            if math.isclose(numeric, target, rel_tol=self.EPSILON, abs_tol=self.EPSILON):
+                if metric == "total_cost":
+                    reasons.append(
+                        f"Lowest {cfg['label']} ({self._format_currency(numeric, 'GBP')})"
+                    )
+                elif metric == "unit_price":
+                    reasons.append(
+                        f"Best {cfg['label']} ({self._format_currency(numeric, 'GBP')})"
+                    )
+                elif metric == "tenure":
+                    reasons.append(f"Shortest lead time ({numeric:.0f} days)")
+                else:
+                    reasons.append(f"Highest {cfg['label']}")
+        if not reasons:
+            reasons.append(
+                f"Highest composite score {entry.get('weighting_score', 0.0):.1f}"
+            )
+        reasons.append("Recommendation generated from weighted quote evaluation.")
+        return "; ".join(reasons)
+
+    def _finalise_results(
+        self, rows: List[Dict[str, Any]], metric_weights: Dict[str, float]
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if not rows:
+            return rows, None
+        for entry in rows:
+            self._augment_currency_fields(entry)
+        supplier_entries = [entry for entry in rows if entry.get("name") != "weighting"]
+        stats = self._calculate_weighting_scores(supplier_entries, metric_weights)
+        recommended = self._apply_recommendations(supplier_entries, stats, metric_weights)
+        return rows, recommended
+
+    def _build_recommended_summary(
+        self, recommended_entry: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not recommended_entry:
+            return None
+        recommendation = recommended_entry.get("recommendation", {})
+        return {
+            "supplier_id": recommended_entry.get("supplier_id"),
+            "name": recommended_entry.get("name"),
+            "weighting_score": recommended_entry.get("weighting_score"),
+            "total_cost_gbp": recommended_entry.get("total_cost_gbp"),
+            "total_cost_usd": recommended_entry.get("total_cost_usd"),
+            "ticker": recommendation.get("ticker"),
+            "justification": recommendation.get("justification"),
+        }
+
+    def _format_currency(self, amount: float, currency: Optional[str]) -> str:
+        code = (currency or "GBP").upper()
+        symbol = "£" if code == "GBP" else "$" if code == "USD" else ""
+        if symbol:
+            return f"{symbol}{amount:,.2f}"
+        return f"{amount:,.2f} {code}"
+
+    def _parse_tenure(self, value: Any) -> Optional[float]:
+        if value is None or self._is_null(value):
+            return None
+        if isinstance(value, (int, float, Decimal)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+        return None
