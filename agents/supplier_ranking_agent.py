@@ -255,6 +255,11 @@ class SupplierRankingAgent(BaseAgent):
                 if str(entry.get("supplier_id", "")).strip() in candidate_set
             ]
 
+        total_rankings = len(ranking)
+        for index, entry in enumerate(ranking, start=1):
+            entry["rank_position"] = index
+            entry["rank_count"] = total_rankings
+
         logger.info(
             "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)
         )
@@ -262,11 +267,14 @@ class SupplierRankingAgent(BaseAgent):
         output_data = {
             "ranking": ranking,
             "supplier_profiles": profiles,
+            "rank_count": total_rankings,
         }
         pass_fields = {
             "ranking": ranking,
             "supplier_profiles": profiles,
         }
+        if total_rankings:
+            pass_fields["rank_count"] = total_rankings
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=output_data,

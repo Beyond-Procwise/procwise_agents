@@ -15,12 +15,11 @@ import uuid
 from datetime import datetime
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from jinja2 import Template
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
-from services.email_service import EmailService
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -107,7 +106,6 @@ class EmailDraftingAgent(BaseAgent):
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.email_service = EmailService(agent_nick)
         self._draft_table_checked = False
         self._draft_table_lock = threading.Lock()
 
@@ -137,7 +135,6 @@ class EmailDraftingAgent(BaseAgent):
         manual_body_input = data.get("body") if isinstance(data.get("body"), str) else None
         manual_subject_input = data.get("subject") if isinstance(data.get("subject"), str) else None
         manual_has_body = bool(manual_body_input and manual_body_input.strip())
-        manual_sent: Optional[bool] = None
         manual_subject_rendered: Optional[str] = None
         manual_body_rendered: Optional[str] = None
         manual_rfq_id: Optional[str] = None
@@ -194,6 +191,11 @@ class EmailDraftingAgent(BaseAgent):
 
             draft_action_id = supplier.get("action_id") or default_action_id
 
+            receiver = self._resolve_receiver(supplier, profile)
+            recipients = self._normalise_recipients([receiver]) if receiver else []
+            receiver = recipients[0] if recipients else receiver
+            contact_level = 1 if receiver else 0
+
             draft = {
                 "supplier_id": supplier_id,
                 "supplier_name": supplier_name,
@@ -204,14 +206,18 @@ class EmailDraftingAgent(BaseAgent):
                 "sender": self.agent_nick.settings.ses_default_sender,
                 "action_id": draft_action_id,
                 "supplier_profile": profile,
+                "receiver": receiver,
+                "contact_level": contact_level,
+                "recipients": recipients,
             }
             if draft_action_id:
                 draft["action_id"] = draft_action_id
+            draft.setdefault("thread_index", 1)
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
 
-        if not drafts and manual_recipients and manual_has_body:
+        if manual_recipients and manual_has_body:
             manual_comment, manual_message = self._split_existing_comment(manual_body_input)
             manual_body_content = (
                 self._sanitise_generated_body(manual_message)
@@ -229,18 +235,6 @@ class EmailDraftingAgent(BaseAgent):
                 f"{manual_rfq_id} – Request for Quotation"
             )
 
-            try:
-                manual_sent = self.email_service.send_email(
-                    manual_subject_rendered,
-                    manual_body_rendered,
-                    manual_recipients,
-                    manual_sender,
-                    data.get("attachments"),
-                )
-            except Exception:  # pragma: no cover - network/runtime
-                logger.exception("Email send failed for manual drafting request")
-                manual_sent = False
-
             manual_draft = {
                 "supplier_id": None,
                 "supplier_name": ", ".join(manual_recipients),
@@ -252,16 +246,17 @@ class EmailDraftingAgent(BaseAgent):
                 "action_id": default_action_id,
                 "supplier_profile": {},
                 "recipients": manual_recipients,
+                "receiver": manual_recipients[0] if manual_recipients else None,
+                "contact_level": 1 if manual_recipients else 0,
             }
             if default_action_id:
                 manual_draft["action_id"] = default_action_id
+            manual_draft.setdefault("thread_index", 1)
             drafts.append(manual_draft)
             self._store_draft(manual_draft)
 
         logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
         output_data: Dict[str, Any] = {"drafts": drafts, "prompt": PROMPT_TEMPLATE}
-        if manual_sent is not None:
-            output_data["sent"] = manual_sent
         if manual_subject_rendered is not None:
             output_data["subject"] = manual_subject_rendered
         if manual_body_rendered is not None:
@@ -551,20 +546,50 @@ class EmailDraftingAgent(BaseAgent):
         try:
             with self.agent_nick.get_db_connection() as conn:
                 self._ensure_table_exists(conn)
+                thread_index = draft.get("thread_index")
+                if not isinstance(thread_index, int) or thread_index < 1:
+                    thread_index = self._next_thread_index(conn, draft["rfq_id"])
+                    draft["thread_index"] = thread_index
+
+                recipients = draft.get("recipients")
+                if isinstance(recipients, list) and recipients:
+                    receiver = str(recipients[0]).strip()
+                else:
+                    receiver = draft.get("receiver")
+                    receiver = str(receiver).strip() if isinstance(receiver, str) else None
+
+                contact_level = draft.get("contact_level")
+                try:
+                    contact_level_int = int(contact_level)
+                except Exception:
+                    contact_level_int = 1 if receiver else 0
+                contact_level_int = max(0, contact_level_int)
+                draft["contact_level"] = contact_level_int
+
+                payload = json.dumps(draft, default=str)
+
                 with conn.cursor() as cur:
                     cur.execute(
                         """
                         INSERT INTO proc.draft_rfq_emails
-                        (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), %s)
+                        (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent,
+                         recipient_email, contact_level, thread_index, sender, payload)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+
                         """,
                         (
                             draft["rfq_id"],
-                            draft["supplier_id"],
+                            draft.get("supplier_id"),
                             draft.get("supplier_name"),
                             draft["subject"],
                             draft["body"],
                             bool(draft.get("sent_status")),
+                            receiver,
+                            contact_level_int,
+                            thread_index,
+                            draft.get("sender"),
+                            payload,
+
                         ),
                     )
                 conn.commit()
@@ -593,14 +618,80 @@ class EmailDraftingAgent(BaseAgent):
                         subject TEXT NOT NULL,
                         body TEXT NOT NULL,
                         created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        sent BOOLEAN NOT NULL DEFAULT FALSE
+                        sent BOOLEAN NOT NULL DEFAULT FALSE,
+                        sent_on TIMESTAMPTZ,
+                        recipient_email TEXT,
+                        contact_level INTEGER NOT NULL DEFAULT 0,
+                        thread_index INTEGER NOT NULL DEFAULT 1,
+                        sender TEXT,
+                        payload JSONB,
+                        updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS supplier_name TEXT"
                 )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS sent_on TIMESTAMPTZ"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS recipient_email TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS contact_level INTEGER NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS thread_index INTEGER NOT NULL DEFAULT 1"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS sender TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS payload JSONB"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                )
 
 
             self._draft_table_checked = True
+
+    def _next_thread_index(self, conn, rfq_id: str) -> int:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(MAX(thread_index), 0) FROM proc.draft_rfq_emails WHERE rfq_id = %s",
+                (rfq_id,),
+            )
+            row = cur.fetchone()
+        try:
+            current = int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            current = 0
+        return current + 1
+
+    def _resolve_receiver(self, supplier: Dict[str, Any], profile: Dict[str, Any]) -> Optional[str]:
+        """Determine the best receiver email for a supplier."""
+
+        candidates: List[str] = []
+
+        def _append_candidate(value: Optional[str]) -> None:
+            if not value:
+                return
+            candidate = str(value).strip()
+            if candidate and candidate.lower() not in {c.lower() for c in candidates}:
+                candidates.append(candidate)
+
+        _append_candidate(supplier.get("contact_email"))
+        _append_candidate(supplier.get("contact_email_1"))
+        _append_candidate(supplier.get("contact_email_2"))
+
+        contacts = profile.get("contacts") if isinstance(profile, dict) else None
+        if isinstance(contacts, Sequence):
+            for contact in contacts:
+                if isinstance(contact, dict):
+                    _append_candidate(contact.get("email"))
+                    _append_candidate(contact.get("contact_email"))
+
+        return candidates[0] if candidates else None
 

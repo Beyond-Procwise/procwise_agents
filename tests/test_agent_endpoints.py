@@ -65,32 +65,6 @@ class DummyOrchestrator:
         }
 
 
-class SupplierActionOrchestrator(DummyOrchestrator):
-    """Simulates drafts with supplier-specific action identifiers."""
-
-    def execute_workflow(self, workflow_name, input_data):
-        if workflow_name == "email_drafting":
-            output = {
-                **input_data,
-                "action_id": input_data.get("action_id", "wf-action"),
-                "body": input_data.get("body", "<p>generated</p>"),
-                "sent": False,
-                "drafts": [
-                    {
-                        "rfq_id": "RFQ-456",
-                        "action_id": "supplier-action-1",
-                        "sent_status": False,
-                    }
-                ],
-            }
-            return {
-                "status": "completed",
-                "workflow_id": "wf",
-                "result": {"email_drafting": output},
-            }
-        return super().execute_workflow(workflow_name, input_data)
-
-
 
 def test_agent_execute_endpoint():
     app = FastAPI()
@@ -125,16 +99,47 @@ def test_workflow_types_endpoint():
     assert "DiscrepancyDetectionAgent" not in types
 
 
-def test_email_workflow_returns_action_id():
+def test_email_workflow_returns_action_id(monkeypatch):
     app = FastAPI()
     app.include_router(workflows_router)
     orchestrator = DummyOrchestrator()
     app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
     client = TestClient(app)
+
+    calls = {}
+
+    class StubDispatch:
+        def __init__(self, agent_nick):
+            calls["agent_nick"] = agent_nick
+
+        def send_draft(
+            self,
+            rfq_id,
+            recipients=None,
+            sender=None,
+            subject_override=None,
+            body_override=None,
+            attachments=None,
+        ):
+            calls["args"] = (rfq_id, recipients, sender, subject_override, body_override)
+            return {
+                "rfq_id": rfq_id,
+                "sent": True,
+                "recipients": recipients or ["r1", "r2"],
+                "sender": sender or "sender@example.com",
+                "subject": subject_override or "s",
+                "body": body_override or "<!-- RFQ-ID: RFQ-123 --><p>generated</p>",
+                "thread_index": 1,
+                "draft": {"rfq_id": rfq_id, "sent_status": True},
+            }
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
 
     resp = client.post(
         "/workflows/email",
         data={
+            "rfq_id": "RFQ-123",
             "subject": "s",
             "recipients": "r1,r2",
             "action_id": "a1",
@@ -144,51 +149,72 @@ def test_email_workflow_returns_action_id():
     assert resp.status_code == 200
     data = resp.json()
     assert data["action_id"] == "a1"
-    assert data["result"]["email_drafting"]["sent"] is True
-    assert data["result"]["email_drafting"]["body"].endswith("<p>generated</p>")
-    assert data["result"]["email_drafting"]["recipients"] == ["r1", "r2"]
-    drafts = data["result"]["email_drafting"]["drafts"]
-    assert drafts[0]["sent_status"] is True
+    assert data["status"] == "completed"
+    assert data["result"]["sent"] is True
+    assert data["result"]["recipients"] == ["r1", "r2"]
+    assert data["result"]["draft"]["sent_status"] is True
+    assert calls["args"][0] == "RFQ-123"
 
     prs = orchestrator.agent_nick.process_routing_service
     assert len(prs.logged) == 2
     assert prs.logged[0]["status"] == "started"
     assert prs.logged[1]["status"] == "completed"
-    assert prs.logged[0]["action_desc"]["subject"] == "s"
+    assert prs.logged[0]["action_desc"]["rfq_id"] == "RFQ-123"
     assert prs.updated_details["output"]["sent"] is True
-    assert prs.updated_details["output"]["body"].endswith("<p>generated</p>")
-    assert prs.updated_details["output"]["recipients"] == ["r1", "r2"]
-    assert prs.updated_details["output"]["drafts"][0]["sent_status"] is True
     assert prs.updated_details["status"] == "completed"
 
 
-def test_email_workflow_marks_supplier_specific_action_ids():
+def test_email_workflow_marks_failed_dispatch(monkeypatch):
     app = FastAPI()
     app.include_router(workflows_router)
-    orchestrator = SupplierActionOrchestrator()
+    orchestrator = DummyOrchestrator()
     app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
     client = TestClient(app)
+
+    class StubDispatchFail:
+        def __init__(self, agent_nick):
+            self.agent_nick = agent_nick
+
+        def send_draft(
+            self,
+            rfq_id,
+            recipients=None,
+            sender=None,
+            subject_override=None,
+            body_override=None,
+            attachments=None,
+        ):
+            return {
+                "rfq_id": rfq_id,
+                "sent": False,
+                "recipients": recipients or [],
+                "sender": sender or "sender@example.com",
+                "subject": subject_override or "subject",
+                "body": body_override or "<p>body</p>",
+                "thread_index": 1,
+                "draft": {"rfq_id": rfq_id, "sent_status": False},
+            }
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatchFail)
 
     resp = client.post(
         "/workflows/email",
         data={
+            "rfq_id": "RFQ-456",
             "subject": "supplier action",
             "recipients": "buyer@example.com",
             "action_id": "workflow-action",
-            "body": "<!-- RFQ-ID: RFQ-456 --><p>generated</p>",
         },
     )
 
     assert resp.status_code == 200
     data = resp.json()
 
-    drafts = data["result"]["email_drafting"]["drafts"]
-    assert drafts[0]["action_id"] == "supplier-action-1"
-    assert drafts[0]["sent_status"] is True
-    assert data["result"]["email_drafting"]["sent"] is True
+    assert data["status"] == "failed"
+    assert data["result"]["sent"] is False
 
     prs = orchestrator.agent_nick.process_routing_service
-    assert prs.updated_details["output"]["drafts"][0]["sent_status"] is True
-    assert prs.updated_details["status"] == "completed"
+    assert prs.updated_details["status"] == "failed"
 
 

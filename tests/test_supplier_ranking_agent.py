@@ -48,6 +48,9 @@ def test_top_n_parsed_from_query(monkeypatch):
 
     output = agent.run(context)
     assert len(output.data["ranking"]) == 5
+    assert output.data["rank_count"] == 5
+    assert output.data["ranking"][0]["rank_position"] == 1
+    assert all(entry["rank_count"] == 5 for entry in output.data["ranking"])
 
 
 def test_execute_ranking_flow_extracts_criteria_from_query():

@@ -6,7 +6,7 @@ import json
 import os
 import asyncio
 import logging
-import re
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
+from services.email_dispatch_service import EmailDispatchService
 
 # Ensure GPU-related environment variables are set
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -49,55 +50,6 @@ def get_agent_nick(request: Request):
     if not agent_nick:
         raise HTTPException(status_code=503, detail="AgentNick not available")
     return agent_nick
-
-
-RFQ_ID_PATTERN = re.compile(r"<!--\s*RFQ-ID:\s*([A-Za-z0-9_-]+)\s*-->")
-
-
-def _extract_rfq_id(body: Optional[str]) -> Optional[str]:
-    if not body:
-        return None
-    match = RFQ_ID_PATTERN.search(body)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def _mark_drafts_as_sent(
-    email_output: Dict[str, Any],
-    action_id: Optional[str],
-    rfq_id: Optional[str],
-) -> bool:
-    drafts = email_output.get("drafts")
-    if not isinstance(drafts, list):
-        return False
-
-    updated = False
-    for draft in drafts:
-        if not isinstance(draft, dict):
-            continue
-
-        draft_action_id = draft.get("action_id")
-        if action_id and not draft_action_id:
-            draft["action_id"] = action_id
-
-        draft_rfq_id = draft.get("rfq_id")
-        if rfq_id:
-            if draft_rfq_id and draft_rfq_id != rfq_id:
-                continue
-            if not draft_rfq_id:
-                draft["rfq_id"] = rfq_id
-
-        if draft.get("sent_status") is True:
-            continue
-
-        draft["sent_status"] = True
-        updated = True
-
-    if updated and email_output.get("sent") is not True:
-        email_output["sent"] = True
-
-    return updated
 
 
 class AskRequest(BaseModel):
@@ -426,107 +378,103 @@ async def extract_documents(
 
 
 # ---------------------------------------------------------------------------
-# Email drafting endpoint
+# Email dispatch endpoint
 # ---------------------------------------------------------------------------
 @router.post("/email")
-async def draft_email(
-    subject: str = Form(...),
-    recipients: str = Form(...),
+async def send_email(
+    rfq_id: str = Form(...),
+    recipients: Optional[str] = Form(None),
     sender: Optional[str] = Form(None),
+    subject: Optional[str] = Form(None),
     body: Optional[str] = Form(None),
     action_id: Optional[str] = Form(None),
     orchestrator: Orchestrator = Depends(get_orchestrator),
+    agent_nick=Depends(get_agent_nick),
 ):
-    """Draft and send an email using the EmailDraftingAgent."""
-    recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
+    """Send a previously drafted RFQ email using the dispatch service."""
+
+    recipient_list = None
+    if recipients is not None:
+        recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
+
     input_data = {
-        "subject": subject,
+        "rfq_id": rfq_id,
         "recipients": recipient_list,
         "sender": sender,
+        "subject": subject,
         "body": body,
         "action_id": action_id,
     }
-    rfq_id = _extract_rfq_id(body)
+
     prs = orchestrator.agent_nick.process_routing_service
 
-    # Log the process with the expected schema so that the resulting entry in
-    # ``proc.routing`` always contains ``input``/``output`` sections.  The
-    # ``output`` fields are populated with placeholders and will be updated once
-    # the EmailDraftingAgent finishes execution.
     initial_details = {
         "input": input_data,
         "agents": [],
-        "output": {
-            "body": "",
-            "sent": False,
-            "prompt": "",
-            "recipients": None,
-            "attachments": None,
-        },
+        "output": {},
         "status": "saved",
     }
     process_id = prs.log_process(
-        process_name="email_drafting", process_details=initial_details
-
+        process_name="email_dispatch", process_details=initial_details
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
 
     action_id = prs.log_action(
         process_id=process_id,
-        agent_type="email_drafting",
+        agent_type="email_dispatch",
         action_desc=input_data,
         status="started",
         action_id=action_id,
-
     )
 
-    try:
-        result = await run_in_threadpool(
-            orchestrator.execute_workflow, "email_drafting", input_data
-        )
+    dispatch_service = EmailDispatchService(agent_nick)
 
-        email_output = result.get("result", {}).get("email_drafting", {})
-        _mark_drafts_as_sent(email_output, action_id, rfq_id)
+    try:
+        dispatch_call = partial(
+            dispatch_service.send_draft,
+            rfq_id,
+            recipient_list,
+            sender,
+            subject,
+            body,
+        )
+        result = await run_in_threadpool(dispatch_call)
 
         prs.log_action(
             process_id=process_id,
-            agent_type="email_drafting",
+            agent_type="email_dispatch",
             action_desc=input_data,
             process_output=result,
-            status="completed",
+            status="completed" if result.get("sent") else "failed",
             action_id=action_id,
         )
-
-        sent_flag = bool(email_output.get("sent"))
-        if not sent_flag:
-            drafts = email_output.get("drafts") or []
-            sent_flag = any(
-                isinstance(draft, dict) and draft.get("sent_status") is True
-                for draft in drafts
-            )
 
         final_details = {
             "input": input_data,
             "agents": [],
-            "output": email_output,
-            "status": "completed" if sent_flag else "failed",
+            "output": result,
+            "status": "completed" if result.get("sent") else "failed",
         }
         prs.update_process_details(process_id, final_details)
-        prs.update_process_status(process_id, 1 if sent_flag else -1)
+        prs.update_process_status(process_id, 1 if result.get("sent") else -1)
 
     except Exception as exc:  # pragma: no cover - network/runtime
         prs.log_action(
             process_id=process_id,
-            agent_type="email_drafting",
-            action_desc=str(exc),
+            agent_type="email_dispatch",
+            action_desc=input_data,
             status="failed",
             action_id=action_id,
         )
         prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {**result, "action_id": action_id}
+    return {
+        "status": "completed" if result.get("sent") else "failed",
+        "result": result,
+        "action_id": action_id,
+    }
 
 
 @router.post("/negotiate")
