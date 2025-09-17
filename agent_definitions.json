@@ -13,6 +13,13 @@
   },
 
   {
+    "agentId": 3,
+    "agentType": "QuoteComparisonAgent",
+    "description": "Aggregates historical quotes into a comparable structure for downstream evaluation.",
+    "dependencies": ["db_client"]
+  },
+
+  {
     "agentId": 4,
     "agentType": "OpportunityMinerAgent",
     "description": "Identifies procurement anomalies and savings opportunities.",

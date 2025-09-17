@@ -15,7 +15,7 @@ import logging
 import os
 import re
 from collections import Counter
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -81,7 +81,11 @@ class SupplierRankingAgent(BaseAgent):
                     error="Failed to fetch supplier data",
                 )
         try:
-            df = supplier_data.copy() if isinstance(supplier_data, pd.DataFrame) else pd.DataFrame(supplier_data)
+            df = (
+                supplier_data.copy()
+                if isinstance(supplier_data, pd.DataFrame)
+                else pd.DataFrame(supplier_data)
+            )
         except Exception:
             logger.exception("Invalid supplier_data format")
             return AgentOutput(
@@ -89,6 +93,9 @@ class SupplierRankingAgent(BaseAgent):
                 data={},
                 error="Failed to parse supplier_data into DataFrame",
             )
+
+        if "supplier_id" in df.columns:
+            df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
 
         if df.empty:
             return AgentOutput(
@@ -99,7 +106,7 @@ class SupplierRankingAgent(BaseAgent):
 
         if "supplier_id" not in df.columns:
             if "supplier_name" in df.columns:
-                df["supplier_id"] = df["supplier_name"].astype(str)
+                df["supplier_id"] = df["supplier_name"].astype(str).str.strip()
                 logger.warning(
                     "supplier_data missing 'supplier_id'; derived IDs from supplier_name"
                 )
@@ -111,16 +118,53 @@ class SupplierRankingAgent(BaseAgent):
                     error="supplier_data missing 'supplier_id' column",
                 )
 
+        directory_entries = context.input_data.get("supplier_directory") or []
+        directory_lookup: Dict[str, Dict[str, Any]] = {}
+        directory_map: Dict[str, Optional[str]] = {}
+        for entry in directory_entries:
+            if not isinstance(entry, dict):
+                continue
+            supplier_id = entry.get("supplier_id")
+            if supplier_id is None:
+                continue
+            sid = str(supplier_id).strip()
+            if not sid:
+                continue
+            directory_lookup[sid] = entry
+            supplier_name = entry.get("supplier_name")
+            directory_map[sid] = (
+                str(supplier_name).strip() if isinstance(supplier_name, str) and supplier_name.strip() else None
+            )
+
+        if directory_map and "supplier_id" in df.columns:
+            mapped_names = df["supplier_id"].map(directory_map)
+            if "supplier_name" in df.columns:
+                df["supplier_name"] = mapped_names.combine_first(df["supplier_name"])
+            else:
+                df["supplier_name"] = mapped_names
+
         candidate_ids = context.input_data.get("supplier_candidates")
         candidate_set = self._normalise_id_set(candidate_ids)
         if candidate_set:
-            df = df[df["supplier_id"].astype(str).isin(candidate_set)].copy()
+            df = df[df["supplier_id"].astype(str).str.strip().isin(candidate_set)].copy()
+            df = self._ensure_candidate_rows(df, candidate_set, directory_lookup)
+            if directory_map and "supplier_id" in df.columns:
+                mapped_names = df["supplier_id"].map(directory_map)
+                if "supplier_name" in df.columns:
+                    df["supplier_name"] = mapped_names.combine_first(df["supplier_name"])
+                else:
+                    df["supplier_name"] = mapped_names
             if df.empty:
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
                     error="No matching suppliers found for candidates",
                 )
+
+        if "supplier_name" in df.columns:
+            df["supplier_name"] = df["supplier_name"].apply(
+                lambda val: val.strip() if isinstance(val, str) else val
+            )
 
         tables = self._load_procurement_tables(candidate_set)
         df = self._merge_supplier_metrics(df, tables)
@@ -222,6 +266,54 @@ class SupplierRankingAgent(BaseAgent):
             return {str(val).strip() for val in ids if str(val).strip()}
         except Exception:
             return {str(ids).strip()}
+
+    def _ensure_candidate_rows(
+        self,
+        df: pd.DataFrame,
+        candidate_ids: set[str],
+        directory_lookup: Dict[str, Dict[str, Any]],
+    ) -> pd.DataFrame:
+        if not candidate_ids:
+            return df
+
+        present_ids: set[str] = set()
+        if "supplier_id" in df.columns and not df.empty:
+            present_ids = set(df["supplier_id"].astype(str).str.strip())
+
+        missing = [cid for cid in candidate_ids if cid not in present_ids]
+
+        if not missing and not df.empty:
+            return df
+
+        fallback_rows: List[Dict[str, Any]] = []
+        for cid in missing:
+            entry = directory_lookup.get(cid, {})
+            row: Dict[str, Any] = dict(entry) if isinstance(entry, dict) else {}
+            row["supplier_id"] = cid
+            supplier_name = row.get("supplier_name")
+            if isinstance(supplier_name, str):
+                row["supplier_name"] = supplier_name.strip()
+            elif supplier_name is None:
+                row["supplier_name"] = pd.NA
+            fallback_rows.append(row)
+
+        if not fallback_rows and df.empty:
+            fallback_rows = [{"supplier_id": cid, "supplier_name": pd.NA} for cid in candidate_ids]
+
+        if not fallback_rows:
+            return df
+
+        fallback_df = pd.DataFrame(fallback_rows)
+        if "supplier_id" in fallback_df.columns:
+            fallback_df["supplier_id"] = fallback_df["supplier_id"].astype(str).str.strip()
+
+        if df.empty:
+            return fallback_df
+
+        combined = pd.concat([df, fallback_df], ignore_index=True, sort=False)
+        if "supplier_id" in combined.columns:
+            combined["supplier_id"] = combined["supplier_id"].astype(str).str.strip()
+        return combined
 
     def _load_procurement_tables(self, supplier_ids: Iterable[str]) -> Dict[str, pd.DataFrame]:
         suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}

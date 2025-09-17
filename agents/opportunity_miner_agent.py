@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import Counter, defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
@@ -33,6 +34,7 @@ class Finding:
     weightage: float = 0.0
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
     context_documents: List[Dict[str, Any]] = field(default_factory=list)
+    item_reference: Optional[str] = None
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
@@ -71,12 +73,27 @@ class OpportunityMinerAgent(BaseAgent):
         return self.process(context)
 
     def _read_sql(self, query: str, params: Any = None) -> pd.DataFrame:
+        """Read a SQL query using a SQLAlchemy engine when available."""
+
+        engine = self.agent_nick.get_db_engine()
+        if engine is not None:
+            with engine.connect() as conn:
+                return pd.read_sql(query, conn, params=params)
+
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 return pd.read_sql(query, conn, params=params)
-        with self.agent_nick.get_db_connection() as conn:
-            return pd.read_sql(query, conn, params=params)
+
+        with closing(self.agent_nick.get_db_connection()) as conn:
+            with conn.cursor() as cursor:
+                if params is not None:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                return pd.DataFrame(rows, columns=columns)
 
     def _get_table_columns(self, schema: str, table: str) -> set[str]:
         """Return cached column names for ``schema.table``."""
@@ -232,8 +249,14 @@ class OpportunityMinerAgent(BaseAgent):
             ]
             self._load_supplier_risk_map()
             for f in filtered:
+                candidate_item = f.item_reference or f.item_id
+                if not candidate_item and isinstance(f.calculation_details, dict):
+                    candidate_item = (
+                        f.calculation_details.get("item_reference")
+                        or f.calculation_details.get("item_id")
+                    )
                 f.candidate_suppliers = self._find_candidate_suppliers(
-                    f.item_id, f.supplier_id, f.source_records
+                    candidate_item, f.supplier_id, f.source_records
                 )
             self._attach_vector_context(filtered)
 
@@ -261,12 +284,45 @@ class OpportunityMinerAgent(BaseAgent):
             }
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
-                s["supplier_id"]
+                str(s["supplier_id"]).strip()
                 for f in filtered
                 for s in f.candidate_suppliers
-                if s.get("supplier_id")
+                if s.get("supplier_id") and str(s["supplier_id"]).strip()
             }
             data["supplier_candidates"] = list(supplier_candidates)
+
+            directory_map: Dict[str, Dict[str, Any]] = {}
+
+            def _register_supplier(supplier_id: Optional[str], supplier_name: Optional[str]) -> None:
+                if not supplier_id:
+                    return
+                sid = str(supplier_id).strip()
+                if not sid:
+                    return
+                entry = directory_map.setdefault(sid, {"supplier_id": sid})
+                if supplier_name and not entry.get("supplier_name"):
+                    entry["supplier_name"] = str(supplier_name).strip()
+
+            for f in filtered:
+                _register_supplier(f.supplier_id, f.supplier_name)
+                for candidate in f.candidate_suppliers:
+                    _register_supplier(
+                        candidate.get("supplier_id"), candidate.get("supplier_name")
+                    )
+
+            lookup = getattr(self, "_supplier_lookup", {})
+            if lookup:
+                for sid, entry in directory_map.items():
+                    if entry.get("supplier_name"):
+                        continue
+                    supplier_name = lookup.get(sid)
+                    if supplier_name:
+                        entry["supplier_name"] = supplier_name
+
+            if directory_map:
+                data["supplier_directory"] = sorted(
+                    directory_map.values(), key=lambda entry: entry["supplier_id"]
+                )
             data["notifications"] = sorted(notifications)
             logger.info(
                 "OpportunityMinerAgent produced %d findings and %d candidate suppliers",
@@ -317,15 +373,27 @@ class OpportunityMinerAgent(BaseAgent):
         """
 
         dfs: Dict[str, pd.DataFrame] = {}
+        engine = self.agent_nick.get_db_engine()
+        if engine is not None:
+            with engine.connect() as conn:
+                for table, sql_name in self.TABLE_MAP.items():
+                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+            return dfs
+
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 for table, sql_name in self.TABLE_MAP.items():
                     dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
-        else:
-            with self.agent_nick.get_db_connection() as conn:
-                for table, sql_name in self.TABLE_MAP.items():
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
+            return dfs
+
+        with closing(self.agent_nick.get_db_connection()) as conn:
+            for table, sql_name in self.TABLE_MAP.items():
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT * FROM {sql_name}")
+                    rows = cursor.fetchall()
+                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                    dfs[table] = pd.DataFrame(rows, columns=columns)
         return dfs
 
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -866,6 +934,7 @@ class OpportunityMinerAgent(BaseAgent):
             calculation_details=details,
             source_records=sources,
             detected_on=datetime.utcnow(),
+            item_reference=item_id,
         )
 
         logger.debug(
@@ -1093,6 +1162,8 @@ class OpportunityMinerAgent(BaseAgent):
                 continue
 
             original_item = finding.item_id
+            if original_item and not finding.item_reference:
+                finding.item_reference = str(original_item)
             description = None
             if original_item:
                 description = _resolve(

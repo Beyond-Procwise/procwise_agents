@@ -124,3 +124,70 @@ def test_supplier_ranking_trains_when_possible(monkeypatch):
     agent.run(context)
 
     assert nick.trained is True
+
+
+def test_supplier_ranking_injects_missing_candidates(monkeypatch):
+    class StubPolicyEngine:
+        def __init__(self):
+            self.supplier_policies = [
+                {
+                    "policyName": "WeightAllocationPolicy",
+                    "details": {"rules": {"default_weights": {"price": 1.0}}},
+                },
+                {"policyName": "CategoricalScoringPolicy", "details": {"rules": {}}},
+                {
+                    "policyName": "NormalizationDirectionPolicy",
+                    "details": {"rules": {"price": "lower_is_better"}},
+                },
+            ]
+
+    class StubQueryEngine:
+        def fetch_purchase_order_data(self):
+            return pd.DataFrame()
+
+        def fetch_invoice_data(self):
+            return pd.DataFrame()
+
+        def fetch_procurement_flow(self, embed: bool = False):
+            return pd.DataFrame()
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(extraction_model="llama3", script_user="tester"),
+        policy_engine=StubPolicyEngine(),
+        query_engine=StubQueryEngine(),
+    )
+
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+    monkeypatch.setattr(agent, "_read_table", lambda table: pd.DataFrame())
+
+    supplier_df = pd.DataFrame(
+        {
+            "supplier_id": ["S1"],
+            "supplier_name": ["Alpha"],
+            "avg_unit_price": [10.0],
+        }
+    )
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="supplier_ranking",
+        user_id="user",
+        input_data={
+            "supplier_data": supplier_df,
+            "supplier_candidates": ["S1", "S2"],
+            "supplier_directory": [
+                {"supplier_id": "S1", "supplier_name": "Alpha"},
+                {"supplier_id": "S2", "supplier_name": "Beta"},
+            ],
+            "intent": {"parameters": {"criteria": ["price"], "top_n": 2}},
+            "query": "rank suppliers",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    ranking_ids = {entry["supplier_id"] for entry in output.data["ranking"]}
+    assert ranking_ids == {"S1", "S2"}
+    assert any(entry["supplier_name"] == "Beta" for entry in output.data["ranking"])

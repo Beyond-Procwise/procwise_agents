@@ -139,6 +139,70 @@ def test_fetch_supplier_data_defaults_on_time_pct(monkeypatch):
     assert "0.0 AS on_time_pct" in captured["sql"]
 
 
+def test_fetch_supplier_data_filters_candidates(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    monkeypatch.setattr(engine, "_price_expression", lambda *a, **k: "0")
+    monkeypatch.setattr(engine, "_quantity_expression", lambda *a, **k: "1")
+    monkeypatch.setattr(engine, "_get_columns", lambda *a, **k: [])
+
+    sample = pd.DataFrame(
+        {
+            "supplier_id": ["S1", "S2"],
+            "supplier_name": ["Alpha", "Beta"],
+            "po_spend": [10.0, 20.0],
+            "invoice_spend": [5.0, 6.0],
+            "total_spend": [15.0, 26.0],
+            "invoice_count": [1, 2],
+            "on_time_pct": [1.0, 0.5],
+        }
+    )
+
+    monkeypatch.setattr(pd, "read_sql", lambda sql, conn: sample.copy())
+
+    result = engine.fetch_supplier_data({"supplier_candidates": ["S2"]})
+
+    assert list(result["supplier_id"]) == ["S2"]
+    assert list(result["supplier_name"]) == ["Beta"]
+
+
+def test_fetch_supplier_data_uses_directory_fallback(monkeypatch):
+    engine = QueryEngine(
+        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
+    )
+    monkeypatch.setattr(engine, "_price_expression", lambda *a, **k: "0")
+    monkeypatch.setattr(engine, "_quantity_expression", lambda *a, **k: "1")
+    monkeypatch.setattr(engine, "_get_columns", lambda *a, **k: [])
+
+    sample = pd.DataFrame(
+        {
+            "supplier_id": ["S1"],
+            "supplier_name": ["Alpha"],
+            "po_spend": [10.0],
+            "invoice_spend": [5.0],
+            "total_spend": [15.0],
+            "invoice_count": [1],
+            "on_time_pct": [1.0],
+        }
+    )
+
+    monkeypatch.setattr(pd, "read_sql", lambda sql, conn: sample.copy())
+
+    payload = {
+        "supplier_candidates": ["S3"],
+        "supplier_directory": [
+            {"supplier_id": "S3", "supplier_name": "Gamma Corp"}
+        ],
+    }
+
+    result = engine.fetch_supplier_data(payload)
+
+    assert list(result["supplier_id"]) == ["S3"]
+    assert result.loc[0, "supplier_name"] == "Gamma Corp"
+    assert set(result.columns) == set(sample.columns)
+
+
 def test_fetch_procurement_flow_builds_expected_query(monkeypatch):
     engine = QueryEngine(
         agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
