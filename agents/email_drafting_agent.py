@@ -232,7 +232,7 @@ class EmailDraftingAgent(BaseAgent):
                 else f"{manual_comment}\n{manual_body_content}"
             )
             manual_subject_rendered = manual_subject_input or (
-                f"RFQ {manual_rfq_id} – Request for Quotation"
+                f"{manual_rfq_id} – Request for Quotation"
             )
 
             manual_draft = {
@@ -241,7 +241,7 @@ class EmailDraftingAgent(BaseAgent):
                 "rfq_id": manual_rfq_id,
                 "subject": manual_subject_rendered,
                 "body": manual_body_rendered,
-                "sent_status": False,
+                "sent_status": bool(manual_sent),
                 "sender": manual_sender,
                 "action_id": default_action_id,
                 "supplier_profile": {},
@@ -575,6 +575,7 @@ class EmailDraftingAgent(BaseAgent):
                         (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent,
                          recipient_email, contact_level, thread_index, sender, payload)
                         VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+
                         """,
                         (
                             draft["rfq_id"],
@@ -588,6 +589,7 @@ class EmailDraftingAgent(BaseAgent):
                             thread_index,
                             draft.get("sender"),
                             payload,
+
                         ),
                     )
                 conn.commit()
