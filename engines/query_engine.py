@@ -338,6 +338,7 @@ class QueryEngine(BaseEngine):
                             fallback_df = fallback_df[base_columns]
                         df = pd.concat([df, fallback_df], ignore_index=True, sort=False)
 
+
             return df
         except Exception as exc:
             # Surface the original exception so callers can handle it explicitly

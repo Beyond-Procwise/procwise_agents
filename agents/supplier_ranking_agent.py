@@ -97,6 +97,7 @@ class SupplierRankingAgent(BaseAgent):
         if "supplier_id" in df.columns:
             df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
 
+
         if df.empty:
             return AgentOutput(
                 status=AgentStatus.FAILED,
@@ -136,6 +137,7 @@ class SupplierRankingAgent(BaseAgent):
                 str(supplier_name).strip() if isinstance(supplier_name, str) and supplier_name.strip() else None
             )
 
+
         if directory_map and "supplier_id" in df.columns:
             mapped_names = df["supplier_id"].map(directory_map)
             if "supplier_name" in df.columns:
@@ -154,6 +156,7 @@ class SupplierRankingAgent(BaseAgent):
                     df["supplier_name"] = mapped_names.combine_first(df["supplier_name"])
                 else:
                     df["supplier_name"] = mapped_names
+
             if df.empty:
                 return AgentOutput(
                     status=AgentStatus.FAILED,
