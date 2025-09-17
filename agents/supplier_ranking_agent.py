@@ -240,6 +240,13 @@ class SupplierRankingAgent(BaseAgent):
             for _, row in top_df.iterrows()
         ]
 
+        if candidate_set:
+            ranking = [
+                entry
+                for entry in ranking
+                if str(entry.get("supplier_id", "")).strip() in candidate_set
+            ]
+
         logger.info(
             "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)
         )

@@ -59,8 +59,9 @@ def test_email_drafting_agent(monkeypatch):
     assert draft["supplier_name"] == "Acme"
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
-    assert "Dear Acme," in draft["body"]
-    assert "Deadline for submission: 01/01/2025" in draft["body"]
+    assert "<p>Dear Acme,</p>" in draft["body"]
+    assert "<p>Deadline for submission: 01/01/2025</p>" in draft["body"]
+    assert "<table" in draft["body"]
     assert draft["sent_status"] is False
     assert draft["sender"] == "sender@example.com"
     assert "action_id" in draft
@@ -86,7 +87,7 @@ def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
 
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
-    assert "Hello Bob" in output.data["drafts"][0]["body"]
+    assert "<p>Hello Bob</p>" in output.data["drafts"][0]["body"]
 
 
 def test_email_drafting_handles_missing_ranking(monkeypatch):
@@ -135,4 +136,63 @@ def test_email_drafting_includes_action_ids(monkeypatch):
     assert drafts[1]["supplier_name"] == "Beta"
 
     assert output.pass_fields["action_id"] == "email-action"
+
+
+def test_email_drafting_handles_manual_email_request(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+
+    stored = []
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: stored.append(draft))
+
+    sent_payload = {}
+
+    def fake_send(subject, body, recipients, sender, attachments=None):
+        sent_payload.update(
+            {
+                "subject": subject,
+                "body": body,
+                "recipients": recipients,
+                "sender": sender,
+                "attachments": attachments,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(agent.email_service, "send_email", fake_send)
+
+    context = AgentContext(
+        workflow_id="wf5",
+        agent_id="email_drafting",
+        user_id="u1",
+        input_data={
+            "subject": "Manual Subject",
+            "recipients": ["user@example.com", "team@example.com", "user@example.com"],
+            "body": "<!-- RFQ-ID: RFQ-MANUAL --><p>Hello supplier</p>",
+            "action_id": "manual-action",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["sent"] is True
+    assert sent_payload["subject"] == "Manual Subject"
+    assert sent_payload["sender"] == "sender@example.com"
+    assert sent_payload["recipients"] == ["user@example.com", "team@example.com"]
+    assert sent_payload["attachments"] is None
+    assert sent_payload["body"].startswith("<!-- RFQ-ID: RFQ-MANUAL -->")
+    assert "<p>Hello supplier</p>" in sent_payload["body"]
+
+    drafts = output.data["drafts"]
+    assert len(drafts) == 1
+    draft = drafts[0]
+    assert draft["rfq_id"] == "RFQ-MANUAL"
+    assert draft["sent_status"] is False
+    assert draft["action_id"] == "manual-action"
+    assert draft["recipients"] == ["user@example.com", "team@example.com"]
+    assert stored[0] == draft
+    assert output.data["recipients"] == ["user@example.com", "team@example.com"]
+    assert output.data["action_id"] == "manual-action"
+    assert output.pass_fields["body"].startswith("<!-- RFQ-ID: RFQ-MANUAL -->")
 
