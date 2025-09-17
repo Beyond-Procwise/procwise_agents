@@ -226,7 +226,7 @@ class EmailDraftingAgent(BaseAgent):
                 else f"{manual_comment}\n{manual_body_content}"
             )
             manual_subject_rendered = manual_subject_input or (
-                f"RFQ {manual_rfq_id} – Request for Quotation"
+                f"{manual_rfq_id} – Request for Quotation"
             )
 
             try:
