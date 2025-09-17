@@ -1038,6 +1038,12 @@ class Orchestrator:
                 downstream_agents.append(normalised)
                 seen_downstream.add(normalised)
 
+        if should_run_opportunity and "email_drafting" in seen_downstream:
+            downstream_agents = [
+                agent_name for agent_name in downstream_agents if agent_name != "email_drafting"
+            ]
+            seen_downstream.discard("email_drafting")
+
         if downstream_agents:
             downstream_results: Dict[str, Any] = {}
             for agent_name in downstream_agents:

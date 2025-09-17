@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -39,10 +40,25 @@ class Finding:
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
     context_documents: List[Dict[str, Any]] = field(default_factory=list)
     item_reference: Optional[str] = None
+    feedback_status: Optional[str] = None
+    feedback_reason: Optional[str] = None
+    feedback_updated_at: Optional[datetime] = None
+    feedback_user: Optional[str] = None
+    feedback_metadata: Optional[Dict[str, Any]] = None
+    is_rejected: bool = False
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
-        d["detected_on"] = self.detected_on.isoformat()
+        detected = self.detected_on
+        if isinstance(detected, datetime):
+            d["detected_on"] = detected.isoformat()
+        else:
+            d["detected_on"] = str(detected)
+        updated = self.feedback_updated_at
+        if isinstance(updated, datetime):
+            d["feedback_updated_at"] = updated.isoformat()
+        elif updated is not None:
+            d["feedback_updated_at"] = str(updated)
         return d
 
 
@@ -263,6 +279,7 @@ class OpportunityMinerAgent(BaseAgent):
                     candidate_item, f.supplier_id, f.source_records
                 )
             self._attach_vector_context(filtered)
+            self._apply_feedback_annotations(filtered)
 
             # compute weightage
             total_impact = sum(f.financial_impact_gbp for f in filtered)
@@ -2640,6 +2657,39 @@ class OpportunityMinerAgent(BaseAgent):
                 continue
             hits = self.vector_search(" ".join(map(str, query_parts)), top_k=3)
             f.context_documents = [h.payload for h in hits]
+
+    def _apply_feedback_annotations(self, findings: List[Finding]) -> None:
+        """Attach persisted feedback to each finding when available."""
+
+        if not findings:
+            return
+
+        feedback_map = load_opportunity_feedback(self.agent_nick)
+        if not feedback_map:
+            return
+
+        for finding in findings:
+            info = feedback_map.get(finding.opportunity_id)
+            if not info:
+                continue
+
+            finding.feedback_status = info.get("status")
+            finding.feedback_reason = info.get("reason")
+            finding.feedback_user = info.get("user_id")
+            finding.feedback_metadata = info.get("metadata")
+            updated = info.get("updated_on")
+            if isinstance(updated, datetime):
+                finding.feedback_updated_at = updated
+            elif updated:
+                try:
+                    finding.feedback_updated_at = datetime.fromisoformat(str(updated))
+                except Exception:  # pragma: no cover - defensive parsing
+                    logger.debug(
+                        "Unable to parse feedback timestamp for %s", finding.opportunity_id
+                    )
+            finding.is_rejected = (
+                str(info.get("status") or "").strip().lower() == "rejected"
+            )
 
     def _find_candidate_suppliers(
         self,

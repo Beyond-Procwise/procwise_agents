@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -14,12 +15,16 @@ from pydantic import BaseModel, Field, field_validator
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
+from services.opportunity_service import record_opportunity_feedback
 
 # Ensure GPU-related environment variables are set
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +42,13 @@ def get_rag_pipeline(request: Request) -> RAGPipeline:
     if not pipeline:
         raise HTTPException(status_code=503, detail="RAG Pipeline service is not available.")
     return pipeline
+
+
+def get_agent_nick(request: Request):
+    agent_nick = getattr(request.app.state, "agent_nick", None)
+    if not agent_nick:
+        raise HTTPException(status_code=503, detail="AgentNick not available")
+    return agent_nick
 
 
 RFQ_ID_PATTERN = re.compile(r"<!--\s*RFQ-ID:\s*([A-Za-z0-9_-]+)\s*-->")
@@ -197,6 +209,22 @@ class AgentType(BaseModel):
     dependencies: List[str]
 
 
+class OpportunityRejectionRequest(BaseModel):
+    reason: Optional[str] = Field(
+        default=None,
+        description="Optional feedback describing why the opportunity was rejected.",
+        max_length=2000,
+    )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Identifier for the user submitting the feedback.",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Additional metadata to persist alongside the feedback.",
+    )
+
+
 router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
 
 
@@ -294,6 +322,47 @@ def mine_opportunities(
         )
         prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/opportunities/{opportunity_id}/reject")
+def reject_opportunity(
+    opportunity_id: str,
+    req: OpportunityRejectionRequest,
+    agent_nick=Depends(get_agent_nick),
+):
+    if not opportunity_id or not opportunity_id.strip():
+        raise HTTPException(status_code=400, detail="opportunity_id must be provided")
+
+    try:
+        record = record_opportunity_feedback(
+            agent_nick,
+            opportunity_id.strip(),
+            status="rejected",
+            reason=req.reason,
+            user_id=req.user_id,
+            metadata=req.metadata,
+        )
+    except Exception as exc:  # pragma: no cover - database/network
+        logger.exception("Failed to record rejection for opportunity %s", opportunity_id)
+        raise HTTPException(status_code=500, detail="Failed to record opportunity feedback") from exc
+
+    updated_on = record.get("updated_on")
+    if isinstance(updated_on, (bytes, str)):
+        updated_iso = str(updated_on)
+    elif updated_on is not None:
+        updated_iso = updated_on.isoformat()
+    else:
+        updated_iso = None
+
+    payload = {
+        "opportunity_id": record.get("opportunity_id"),
+        "status": record.get("status"),
+        "reason": record.get("reason"),
+        "user_id": record.get("user_id"),
+        "metadata": record.get("metadata"),
+        "updated_on": updated_iso,
+    }
+    return {"status": "success", "feedback": payload}
 
 
 @router.post("/extract")

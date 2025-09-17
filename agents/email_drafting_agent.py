@@ -94,12 +94,14 @@ class EmailDraftingAgent(BaseAgent):
         "<p>Dear {supplier_contact_name_html},</p>"
         "<p>{relationship_opening_html}</p>"
         "<p>{opportunity_summary_html}</p>"
-        "<p>To support a fair evaluation please complete the table below with your latest commercial and service offer.</p>"
+        "<p>Please review the requirement below and share your best quotation."
+        " Kindly complete the table with your commercial response.</p>"
         "{rfq_table_html}"
         "<p>Evaluation focus:</p>"
         "{evaluation_focus_html}"
         "<p>Deadline for submission: {deadline_html}</p>"
         "<p>Primary contact: {contact_line_html}</p>"
+        "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>"
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
 
@@ -245,7 +247,7 @@ class EmailDraftingAgent(BaseAgent):
                 "rfq_id": manual_rfq_id,
                 "subject": manual_subject_rendered,
                 "body": manual_body_rendered,
-                "sent_status": False,
+                "sent_status": bool(manual_sent),
                 "sender": manual_sender,
                 "action_id": default_action_id,
                 "supplier_profile": {},
@@ -508,7 +510,12 @@ class EmailDraftingAgent(BaseAgent):
             paragraphs = [line.strip() for line in text.splitlines() if line.strip()]
             if not paragraphs:
                 return ""
-            return "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
+            text = "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
+
+        suggestion_pattern = re.compile(
+            r"<p[^>]*>[^<]*(suggest|recommend|consider)[^<]*</p>", re.IGNORECASE
+        )
+        text = suggestion_pattern.sub("", text)
         return text
 
     def _normalise_recipients(self, recipients: Any) -> List[str]:
@@ -549,7 +556,7 @@ class EmailDraftingAgent(BaseAgent):
                         """
                         INSERT INTO proc.draft_rfq_emails
                         (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), FALSE)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s)
                         """,
                         (
                             draft["rfq_id"],
@@ -557,6 +564,7 @@ class EmailDraftingAgent(BaseAgent):
                             draft.get("supplier_name"),
                             draft["subject"],
                             draft["body"],
+                            bool(draft.get("sent_status")),
                         ),
                     )
                 conn.commit()

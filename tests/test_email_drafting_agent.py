@@ -188,7 +188,7 @@ def test_email_drafting_handles_manual_email_request(monkeypatch):
     assert len(drafts) == 1
     draft = drafts[0]
     assert draft["rfq_id"] == "RFQ-MANUAL"
-    assert draft["sent_status"] is False
+    assert draft["sent_status"] is True
     assert draft["action_id"] == "manual-action"
     assert draft["recipients"] == ["user@example.com", "team@example.com"]
     assert stored[0] == draft
