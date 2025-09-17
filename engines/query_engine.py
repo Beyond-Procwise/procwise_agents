@@ -188,7 +188,38 @@ class QueryEngine(BaseEngine):
         return "1"
 
     def fetch_supplier_data(self, input_data: dict = None) -> pd.DataFrame:
-        """Return up-to-date supplier metrics."""
+        """Return up-to-date supplier metrics.
+
+        ``input_data`` may contain ``supplier_candidates`` and
+        ``supplier_directory`` entries originating from the
+        ``OpportunityMinerAgent``.  When provided the result set is filtered so
+        that downstream agents only receive rows linked to the opportunity flow
+        and any missing suppliers are synthesised from the directory payload.
+        """
+
+        candidate_ids: set[str] = set()
+        directory_lookup: dict[str, dict] = {}
+        if input_data:
+            raw_candidates = input_data.get("supplier_candidates") or []
+            for cand in raw_candidates:
+                if cand is None:
+                    continue
+                cand_str = str(cand).strip()
+                if cand_str:
+                    candidate_ids.add(cand_str)
+
+            directory_entries = input_data.get("supplier_directory") or []
+            for entry in directory_entries:
+                if not isinstance(entry, dict):
+                    continue
+                supplier_id = entry.get("supplier_id")
+                if supplier_id is None:
+                    continue
+                sid = str(supplier_id).strip()
+                if not sid:
+                    continue
+                directory_lookup[sid] = entry
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 # Line item tables carry the price/quantity information we need
@@ -273,10 +304,41 @@ class QueryEngine(BaseEngine):
             with self._pandas_reader() as reader:
                 df = pd.read_sql(sql, reader)
 
+            base_columns = list(df.columns)
+
             if "supplier_id" in df.columns:
                 df["supplier_id"] = df["supplier_id"].astype(str).str.strip()
             if "supplier_name" in df.columns:
                 df["supplier_name"] = df["supplier_name"].astype(str).str.strip()
+
+            if candidate_ids and "supplier_id" in df.columns:
+                df = df[df["supplier_id"].isin(candidate_ids)].copy()
+
+            if candidate_ids:
+                present = (
+                    set(df["supplier_id"].astype(str).str.strip())
+                    if "supplier_id" in df.columns
+                    else set()
+                )
+                missing = [cid for cid in candidate_ids if cid not in present]
+                if missing:
+                    fallback_rows = []
+                    for cid in missing:
+                        entry = directory_lookup.get(cid, {})
+                        row = dict(entry) if isinstance(entry, dict) else {}
+                        row["supplier_id"] = cid
+                        row.setdefault("supplier_name", entry.get("supplier_name") if isinstance(entry, dict) else None)
+                        fallback_rows.append(row)
+                    if fallback_rows:
+                        fallback_df = pd.DataFrame(fallback_rows)
+                        if base_columns:
+                            for col in base_columns:
+                                if col not in fallback_df.columns:
+                                    fallback_df[col] = pd.NA
+                            fallback_df = fallback_df[base_columns]
+                        df = pd.concat([df, fallback_df], ignore_index=True, sort=False)
+
+
             return df
         except Exception as exc:
             # Surface the original exception so callers can handle it explicitly
