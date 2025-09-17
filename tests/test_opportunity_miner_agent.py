@@ -226,11 +226,33 @@ def _sample_tables() -> Dict[str, Any]:
         ]
     )
 
+    product_mapping = pd.DataFrame(
+        [
+            {
+                "product": "Logistics Support - Catalog",
+                "category_level_1": "Logistics",
+                "category_level_2": "Support",
+                "category_level_3": None,
+                "category_level_4": None,
+                "category_level_5": None,
+            },
+            {
+                "product": "Adhoc Consulting Services",
+                "category_level_1": "Professional Services",
+                "category_level_2": "Consulting",
+                "category_level_3": None,
+                "category_level_4": None,
+                "category_level_5": None,
+            },
+        ]
+    )
+
     return {
         "purchase_orders": purchase_orders,
         "purchase_order_lines": purchase_order_lines,
         "invoices": invoices,
         "invoice_lines": invoice_lines,
+        "product_mapping": product_mapping,
         "contracts": contracts,
         "indices": indices,
         "shipments": shipments,
@@ -353,7 +375,7 @@ def test_candidate_supplier_lookup_uses_original_item(monkeypatch):
     finding = next(
         f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"
     )
-    assert finding["item_id"] == "Logistics Support"
+    assert finding["item_id"] == "Logistics Support - Catalog"
     assert finding.get("item_reference") == "ITM-001"
 
 

@@ -147,6 +147,14 @@ class SupplierRankingAgent(BaseAgent):
 
         candidate_ids = context.input_data.get("supplier_candidates")
         candidate_set = self._normalise_id_set(candidate_ids)
+        directory_ids = {sid for sid in directory_map.keys() if sid}
+        if directory_ids:
+            if candidate_set:
+                candidate_set = {sid for sid in candidate_set if sid in directory_ids}
+                if not candidate_set:
+                    candidate_set = directory_ids
+            else:
+                candidate_set = directory_ids
         if candidate_set:
             df = df[df["supplier_id"].astype(str).str.strip().isin(candidate_set)].copy()
             df = self._ensure_candidate_rows(df, candidate_set, directory_lookup)
@@ -239,6 +247,13 @@ class SupplierRankingAgent(BaseAgent):
             self._prepare_ranking_entry(row, profiles.get(str(row.get("supplier_id"))), weights)
             for _, row in top_df.iterrows()
         ]
+
+        if candidate_set:
+            ranking = [
+                entry
+                for entry in ranking
+                if str(entry.get("supplier_id", "")).strip() in candidate_set
+            ]
 
         logger.info(
             "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)

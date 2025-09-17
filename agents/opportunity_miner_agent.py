@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -15,6 +16,9 @@ from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
+
+
+_CATALOG_MATCH_THRESHOLD = 0.45
 
 
 @dataclass
@@ -357,6 +361,7 @@ class OpportunityMinerAgent(BaseAgent):
         "contracts": "proc.contracts",
         "quotes": "proc.quote_agent",
         "quote_lines": "proc.quote_line_items_agent",
+        "product_mapping": "proc.cat_product_mapping",
         # "price_benchmarks": "price_benchmarks",
         # "indices": "indices",
         # "shipments": "shipments",
@@ -1156,6 +1161,46 @@ class OpportunityMinerAgent(BaseAgent):
             most_common = counter.most_common(1)
             return most_common[0][0] if most_common else None
 
+        description_matches: Dict[str, Dict[str, Any]] = {}
+        catalog = tables.get("product_mapping", pd.DataFrame())
+        if isinstance(catalog, pd.DataFrame) and not catalog.empty:
+            if "product" in catalog.columns:
+                catalog_df = catalog.dropna(subset=["product"]).copy()
+                if not catalog_df.empty:
+                    catalog_df["product"] = catalog_df["product"].astype(str).str.strip()
+                    catalog_df = catalog_df[catalog_df["product"] != ""]
+                    catalog_rows = []
+                    for row in catalog_df.itertuples(index=False):
+                        product_name = getattr(row, "product", None)
+                        if not product_name:
+                            continue
+                        entry: Dict[str, Any] = {"product": str(product_name).strip()}
+                        for level in range(1, 6):
+                            field = f"category_level_{level}"
+                            if hasattr(row, field):
+                                entry[field] = getattr(row, field)
+                        catalog_rows.append(entry)
+                    if catalog_rows:
+                        catalog_index = [
+                            (entry["product"].lower(), entry)
+                            for entry in catalog_rows
+                        ]
+                        unique_descriptions = {desc for counter in supplier_desc.values() for desc in counter}
+                        for description in unique_descriptions:
+                            key = description.lower()
+                            best_score = 0.0
+                            best_entry: Optional[Dict[str, Any]] = None
+                            for product_key, entry in catalog_index:
+                                score = SequenceMatcher(None, key, product_key).ratio()
+                                if score > best_score:
+                                    best_score = score
+                                    best_entry = entry
+                            if best_entry and best_score >= _CATALOG_MATCH_THRESHOLD:
+                                description_matches[description] = {
+                                    **best_entry,
+                                    "match_score": best_score,
+                                }
+
         for finding in findings:
             supplier_id = finding.supplier_id
             if not supplier_id:
@@ -1193,7 +1238,29 @@ class OpportunityMinerAgent(BaseAgent):
                 finding.calculation_details.setdefault("item_reference", original_item)
             if isinstance(finding.calculation_details, dict):
                 finding.calculation_details.setdefault("item_description", description)
-            finding.item_id = description
+            catalog_entry = description_matches.get(description)
+            if catalog_entry:
+                product_name = str(catalog_entry.get("product", "")).strip()
+                if product_name:
+                    finding.item_id = product_name
+                    if isinstance(finding.calculation_details, dict):
+                        finding.calculation_details.setdefault("catalog_product", product_name)
+                        category_details = {}
+                        for level in range(1, 6):
+                            field = f"category_level_{level}"
+                            value = catalog_entry.get(field)
+                            if value:
+                                category_details[field] = str(value).strip()
+                                if not finding.category_id:
+                                    finding.category_id = str(value)
+                        if category_details:
+                            finding.calculation_details.setdefault(
+                                "catalog_categories", category_details
+                            )
+                else:
+                    finding.item_id = description
+            else:
+                finding.item_id = description
 
         return findings
 

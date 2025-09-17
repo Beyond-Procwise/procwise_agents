@@ -13,8 +13,9 @@ import re
 import threading
 import uuid
 from datetime import datetime
+from html import escape
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from jinja2 import Template
 
@@ -35,30 +36,71 @@ PROMPT_PATH = (
 with PROMPT_PATH.open("r", encoding="utf-8") as fp:
     PROMPT_TEMPLATE = json.load(fp)["prompt_template"]
 
-RFQ_TABLE_HEADER = (
-    "Item Description | UOM | Qty | Target Unit Price (Currency) | Extended Price | Delivery Lead Time (days) | Payment Terms (days) | Warranty / Support | Contract Ref | Comments\n"
-    "---------------- | --- | --- | --------------------------- | -------------- | ------------------------- | -------------------- | ----------------- | ------------ | --------"
+_RFQ_TABLE_COLUMNS: List[str] = [
+    "Item Description",
+    "UOM",
+    "Qty",
+    "Target Unit Price (Currency)",
+    "Extended Price",
+    "Delivery Lead Time (days)",
+    "Payment Terms (days)",
+    "Warranty / Support",
+    "Contract Ref",
+    "Comments",
+]
+_RFQ_TABLE_STYLE = (
+    "border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 13px;"
 )
+_RFQ_HEADER_CELL_STYLE = (
+    "border: 1px solid #d0d0d0; padding: 6px; text-align: left; background-color: #f5f5f5;"
+)
+_RFQ_BODY_CELL_STYLE = "border: 1px solid #d0d0d0; padding: 6px; text-align: left;"
+_RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", flags=re.IGNORECASE)
 
+
+def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
+    header_cells = "".join(
+        f'<th style="{_RFQ_HEADER_CELL_STYLE}">{escape(col)}</th>'
+        for col in _RFQ_TABLE_COLUMNS
+    )
+
+    rows = [desc for desc in descriptions if isinstance(desc, str) and desc.strip()]
+    if not rows:
+        rows = [""]
+
+    body_rows: List[str] = []
+    for description in rows:
+        first_cell = escape(description.strip()) if description else "&nbsp;"
+        cells = [f'<td style="{_RFQ_BODY_CELL_STYLE}">{first_cell}</td>']
+        for _ in range(len(_RFQ_TABLE_COLUMNS) - 1):
+            cells.append(f'<td style="{_RFQ_BODY_CELL_STYLE}">&nbsp;</td>')
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    return (
+        f'<table class="rfq-table" style="{_RFQ_TABLE_STYLE}">'
+        f'<thead><tr>{header_cells}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        "</table>"
+    )
+
+
+RFQ_TABLE_HEADER = _build_rfq_table_html([])
 
 
 class EmailDraftingAgent(BaseAgent):
     """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
     TEXT_TEMPLATE = (
-        "Dear {supplier_contact_name},\n\n"
-        "{relationship_opening}\n\n"
-        "{opportunity_summary}\n\n"
-        "To support a fair evaluation please complete the table below with your latest commercial and service offer.\n\n"
-        "{rfq_table}\n\n"
-        "Evaluation focus:\n"
-        "{evaluation_focus}\n\n"
-        "Deadline for submission: {deadline}\n"
-        "Primary contact: {category_manager_name} ({category_manager_email})\n\n"
-        "Kind regards,\n"
-        "{your_name}\n"
-        "{your_title}\n"
-        "{your_company}\n"
+        "<p>Dear {supplier_contact_name_html},</p>"
+        "<p>{relationship_opening_html}</p>"
+        "<p>{opportunity_summary_html}</p>"
+        "<p>To support a fair evaluation please complete the table below with your latest commercial and service offer.</p>"
+        "{rfq_table_html}"
+        "<p>Evaluation focus:</p>"
+        "{evaluation_focus_html}"
+        "<p>Deadline for submission: {deadline_html}</p>"
+        "<p>Primary contact: {contact_line_html}</p>"
+        "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
 
     def __init__(self, agent_nick):
@@ -88,10 +130,20 @@ class EmailDraftingAgent(BaseAgent):
         default_action_id = data.get("action_id")
         drafts = []
 
+        manual_recipients = self._normalise_recipients(data.get("recipients"))
+        manual_sender = data.get("sender") or self.agent_nick.settings.ses_default_sender
+        manual_body_input = data.get("body") if isinstance(data.get("body"), str) else None
+        manual_subject_input = data.get("subject") if isinstance(data.get("subject"), str) else None
+        manual_has_body = bool(manual_body_input and manual_body_input.strip())
+        manual_sent: Optional[bool] = None
+        manual_subject_rendered: Optional[str] = None
+        manual_body_rendered: Optional[str] = None
+        manual_rfq_id: Optional[str] = None
+
         for supplier in ranking:
             supplier_id = supplier.get("supplier_id")
             supplier_name = supplier.get("supplier_name", supplier_id)
-            rfq_id = f"RFQ-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+            rfq_id = self._generate_rfq_id()
 
             profile = supplier_profiles.get(str(supplier_id)) if supplier_id is not None else {}
             if profile is None:
@@ -117,19 +169,25 @@ class EmailDraftingAgent(BaseAgent):
                 "your_title": sender_title,
                 "your_company": data.get("your_company", "ProcWise"),
             }
+            for key, value in list(fmt_args.items()):
+                fmt_args[f"{key}_html"] = self._format_plain_text(value)
             body_template = data.get("body") or self.TEXT_TEMPLATE
             contextual_args = self._build_template_args(
                 supplier, profile, fmt_args, data
             )
             template_args = {**data, **fmt_args, **contextual_args}
             if "{{" in body_template or "{%" in body_template:
-                body = Template(body_template).render(**template_args)
+                rendered = Template(body_template).render(**template_args)
             else:
                 try:
-                    body = body_template.format(**template_args)
+                    rendered = body_template.format(**template_args)
                 except KeyError:
-                    body = body_template
-            body = f"<!-- RFQ-ID: {rfq_id} -->\n" + body
+                    rendered = body_template
+
+            comment, message = self._split_existing_comment(rendered)
+            content = self._sanitise_generated_body(message if comment else rendered)
+            comment = comment if comment else f"<!-- RFQ-ID: {rfq_id} -->"
+            body = comment if not content else f"{comment}\n{content}"
             subject = f"RFQ {rfq_id} – Request for Quotation"
 
             draft_action_id = supplier.get("action_id") or default_action_id
@@ -151,14 +209,85 @@ class EmailDraftingAgent(BaseAgent):
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
 
+        if not drafts and manual_recipients and manual_has_body:
+            manual_comment, manual_message = self._split_existing_comment(manual_body_input)
+            manual_body_content = (
+                self._sanitise_generated_body(manual_message)
+                if manual_comment
+                else self._sanitise_generated_body(manual_body_input)
+            )
+            manual_rfq_id = self._extract_rfq_id(manual_comment) or self._generate_rfq_id()
+            manual_comment = manual_comment or f"<!-- RFQ-ID: {manual_rfq_id} -->"
+            manual_body_rendered = (
+                manual_comment
+                if not manual_body_content
+                else f"{manual_comment}\n{manual_body_content}"
+            )
+            manual_subject_rendered = manual_subject_input or (
+                f"RFQ {manual_rfq_id} – Request for Quotation"
+            )
+
+            try:
+                manual_sent = self.email_service.send_email(
+                    manual_subject_rendered,
+                    manual_body_rendered,
+                    manual_recipients,
+                    manual_sender,
+                    data.get("attachments"),
+                )
+            except Exception:  # pragma: no cover - network/runtime
+                logger.exception("Email send failed for manual drafting request")
+                manual_sent = False
+
+            manual_draft = {
+                "supplier_id": None,
+                "supplier_name": ", ".join(manual_recipients),
+                "rfq_id": manual_rfq_id,
+                "subject": manual_subject_rendered,
+                "body": manual_body_rendered,
+                "sent_status": False,
+                "sender": manual_sender,
+                "action_id": default_action_id,
+                "supplier_profile": {},
+                "recipients": manual_recipients,
+            }
+            if default_action_id:
+                manual_draft["action_id"] = default_action_id
+            drafts.append(manual_draft)
+            self._store_draft(manual_draft)
+
         logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
-        output_data = {"drafts": drafts}
+        output_data: Dict[str, Any] = {"drafts": drafts, "prompt": PROMPT_TEMPLATE}
+        if manual_sent is not None:
+            output_data["sent"] = manual_sent
+        if manual_subject_rendered is not None:
+            output_data["subject"] = manual_subject_rendered
+        if manual_body_rendered is not None:
+            output_data["body"] = manual_body_rendered
+        if manual_recipients:
+            output_data["recipients"] = manual_recipients
+        if manual_sender:
+            output_data["sender"] = manual_sender
+        if data.get("attachments") is not None:
+            output_data["attachments"] = data.get("attachments")
+        if drafts and "body" not in output_data:
+            output_data["body"] = drafts[0].get("body")
+        if drafts and "subject" not in output_data:
+            output_data["subject"] = drafts[0].get("subject")
+        if drafts and "sender" not in output_data:
+            output_data["sender"] = drafts[0].get("sender")
         if default_action_id:
             output_data["action_id"] = default_action_id
 
-        pass_fields = {"drafts": drafts}
+        pass_fields: Dict[str, Any] = {"drafts": drafts}
         if default_action_id:
             pass_fields["action_id"] = default_action_id
+        if manual_subject_rendered is not None:
+            pass_fields["subject"] = manual_subject_rendered
+        if manual_body_rendered is not None:
+            pass_fields["body"] = manual_body_rendered
+        if manual_recipients:
+            pass_fields["recipients"] = manual_recipients
 
         return AgentOutput(
             status=AgentStatus.SUCCESS,
@@ -166,6 +295,9 @@ class EmailDraftingAgent(BaseAgent):
             pass_fields=pass_fields,
         )
 
+
+    def _generate_rfq_id(self) -> str:
+        return f"RFQ-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
     def _derive_sender_identity(
         self, sender_email: str, override_title: Optional[str] = None
@@ -183,18 +315,38 @@ class EmailDraftingAgent(BaseAgent):
         base_args: Dict,
         context: Dict,
     ) -> Dict:
+        html_augmented = {
+            f"{key}_html": self._format_plain_text(value)
+            for key, value in base_args.items()
+            if f"{key}_html" not in base_args
+        }
+        base_args.update(html_augmented)
         relationship = self._relationship_opening(supplier)
         summary = self._opportunity_summary(supplier, profile)
         evaluation_focus = self._build_evaluation_focus(supplier, profile)
         rfq_table = self._render_rfq_table(profile)
+        if not base_args.get("deadline"):
+            fallback = context.get("deadline", "TBC")
+            base_args["deadline"] = fallback
+            base_args["deadline_html"] = self._format_plain_text(fallback)
+        else:
+            base_args.setdefault(
+                "deadline_html", self._format_plain_text(base_args.get("deadline"))
+            )
+
         args = {
             "relationship_opening": relationship,
+            "relationship_opening_html": self._format_plain_text(relationship),
             "opportunity_summary": summary,
+            "opportunity_summary_html": self._format_plain_text(summary),
             "evaluation_focus": evaluation_focus,
+            "evaluation_focus_html": self._format_focus_html(evaluation_focus),
             "rfq_table": rfq_table,
+            "rfq_table_html": rfq_table,
+            "contact_line_html": self._compose_contact_line(base_args),
         }
-        if not base_args.get("deadline"):
-            args.setdefault("deadline", context.get("deadline", "TBC"))
+        args.setdefault("deadline", base_args.get("deadline"))
+        args.setdefault("deadline_html", base_args.get("deadline_html", ""))
         return args
 
     def _relationship_opening(self, supplier: Dict) -> str:
@@ -288,12 +440,104 @@ class EmailDraftingAgent(BaseAgent):
         items = profile.get("items") or []
         if not items:
             return RFQ_TABLE_HEADER
-        lines = [RFQ_TABLE_HEADER]
-        for description in items:
-            lines.append(
-                f"{description} |  |  |  |  |  |  |  |  | "
-            )
-        return "\n".join(lines)
+        descriptions = [
+            str(description).strip()
+            for description in items
+            if isinstance(description, str) and str(description).strip()
+        ]
+        return _build_rfq_table_html(descriptions)
+
+    def _format_plain_text(self, value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        return escape(text).replace("\n", "<br>")
+
+    def _format_focus_html(self, focus: str) -> str:
+        if not focus:
+            return "<p></p>"
+        items = []
+        for line in focus.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("- "):
+                cleaned = cleaned[2:].strip()
+            items.append(cleaned)
+        if not items:
+            return f"<p>{escape(focus)}</p>"
+        return "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>"
+
+    def _compose_contact_line(self, base_args: Dict[str, Any]) -> str:
+        name = base_args.get("category_manager_name_html") or ""
+        email = base_args.get("category_manager_email_html") or ""
+        if name and email:
+            return f"{name} ({email})"
+        return name or email or ""
+
+    def _split_existing_comment(self, body: str) -> tuple[Optional[str], str]:
+        if not isinstance(body, str):
+            return None, ""
+        match = re.match(r"\s*(<!--.*?-->)", body, flags=re.DOTALL)
+        if match and "RFQ-ID" in match.group(1):
+            comment = match.group(1).strip()
+            remainder = body[match.end():].lstrip("\n")
+            return comment, remainder
+        return None, body
+
+    def _extract_rfq_id(self, comment: Optional[str]) -> Optional[str]:
+        if not comment:
+            return None
+        match = _RFQ_ID_PATTERN.search(comment)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def _sanitise_generated_body(self, body: str) -> str:
+        if not body:
+            return ""
+        text = body.strip()
+        text = re.sub(r"^```(?:html|markdown)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"```$", "", text).strip()
+        greeting = re.search(r"(<p[^>]*>|Dear\s+|Hello\s+|Hi\s+)", text, flags=re.IGNORECASE)
+        if greeting and greeting.start() > 0:
+            text = text[greeting.start():].lstrip()
+        if "<" not in text:
+            paragraphs = [line.strip() for line in text.splitlines() if line.strip()]
+            if not paragraphs:
+                return ""
+            return "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
+        return text
+
+    def _normalise_recipients(self, recipients: Any) -> List[str]:
+        if recipients is None:
+            return []
+        values: List[str] = []
+        if isinstance(recipients, str):
+            values = [recipients]
+        elif isinstance(recipients, Iterable):
+            values = [
+                str(value)
+                for value in recipients
+                if isinstance(value, str) and str(value).strip()
+            ]
+        else:
+            return []
+
+        normalised: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            candidate = value.strip()
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalised.append(candidate)
+        return normalised
 
     def _store_draft(self, draft: dict) -> None:
         """Persist email draft to ``proc.draft_rfq_emails``."""

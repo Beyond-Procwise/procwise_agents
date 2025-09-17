@@ -60,6 +60,7 @@ async def lifespan(app: FastAPI):
             supplier_agent=agent_nick.agents.get('supplier_interaction'),
             negotiation_agent=agent_nick.agents.get('NegotiationAgent'),
         )
+        app.state.agent_nick = agent_nick
         app.state.orchestrator = Orchestrator(agent_nick)
         app.state.rag_pipeline = RAGPipeline(agent_nick)
         logger.info("System initialized successfully.")
@@ -67,6 +68,8 @@ async def lifespan(app: FastAPI):
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
         app.state.orchestrator = None; app.state.rag_pipeline = None
     yield
+    if hasattr(app.state, "agent_nick"):
+        app.state.agent_nick = None
     logger.info("API shutting down.")
 
 app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)
