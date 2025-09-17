@@ -1,16 +1,3 @@
-"""Utilities for monitoring inbound RFQ responses delivered via Amazon SES.
-
-The :class:`SESEmailWatcher` class polls an inbound message source (S3 by
-default) for supplier responses.  For each message it extracts the RFQ
-identifier, forwards the message to :class:`SupplierInteractionAgent` for
-normalisation and, when necessary, triggers the
-``NegotiationAgent`` to continue the workflow automatically.
-
-All helpers in this module are written with GPU-enabled environments in mind –
-``configure_gpu`` is invoked during initialisation so downstream agents inherit
-the same configuration regardless of where the watcher is instantiated.
-"""
-
 from __future__ import annotations
 
 import logging
