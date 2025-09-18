@@ -59,8 +59,9 @@ def test_email_drafting_agent(monkeypatch):
     assert draft["supplier_name"] == "Acme"
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
-    assert "<p>Dear Acme,</p>" in draft["body"]
-    assert "<p>Deadline for submission: 01/01/2025</p>" in draft["body"]
+    assert "<p>Dear Acme, we are reaching out to request your quotation for the requirement below.</p>" in draft["body"]
+    assert "<p>Please submit your response by 01/01/2025.</p>" in draft["body"]
+    assert "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>" in draft["body"]
     assert "<table" in draft["body"]
     assert draft["subject"].count("RFQ") == 1
     assert "leading suppliers" not in draft["body"].lower()

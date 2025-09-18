@@ -52,9 +52,21 @@ class InMemoryDraftStore:
             self.rows[draft_id].update(updates)
 
 
+class InMemoryActionStore:
+    def __init__(self):
+        self.rows = {}
+
+    def get(self, action_id):
+        return self.rows.get(action_id)
+
+    def update(self, action_id, payload):
+        self.rows[action_id] = payload
+
+
 class DummyCursor:
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, draft_store, action_store):
+        self.store = draft_store
+        self.action_store = action_store
         self._result = []
 
     def __enter__(self):
@@ -82,6 +94,13 @@ class DummyCursor:
             if sent_bool:
                 updates["sent_on"] = "now"
             self.store.update(draft_id, **updates)
+        elif normalized.startswith("SELECT process_output FROM proc.action"):
+            action_id = params[0]
+            payload = self.action_store.get(action_id)
+            self._result = [(payload,)] if payload is not None else []
+        elif normalized.startswith("UPDATE proc.action SET process_output"):
+            payload_json, action_id = params
+            self.action_store.update(action_id, payload_json)
         else:  # pragma: no cover - defensive
             raise AssertionError(f"Unexpected query: {query}")
 
@@ -90,8 +109,9 @@ class DummyCursor:
 
 
 class DummyConnection:
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, draft_store, action_store):
+        self.store = draft_store
+        self.action_store = action_store
 
     def __enter__(self):
         return self
@@ -100,19 +120,20 @@ class DummyConnection:
         return False
 
     def cursor(self):
-        return DummyCursor(self.store)
+        return DummyCursor(self.store, self.action_store)
 
     def commit(self):
         pass
 
 
 class DummyNick:
-    def __init__(self, store):
+    def __init__(self, draft_store, action_store):
         self.settings = SimpleNamespace(ses_default_sender="sender@example.com")
-        self._store = store
+        self._store = draft_store
+        self.action_store = action_store
 
     def get_db_connection(self):
-        return DummyConnection(self._store)
+        return DummyConnection(self._store, self.action_store)
 
 
 def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
@@ -127,6 +148,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "thread_index": 1,
         "contact_level": 1,
         "sent_status": False,
+        "action_id": "action-1",
     }
     draft_id = store.add(
         {
@@ -145,7 +167,10 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         }
     )
 
-    nick = DummyNick(store)
+    action_store = InMemoryActionStore()
+    action_store.update("action-1", json.dumps({"drafts": [draft_payload]}))
+
+    nick = DummyNick(store, action_store)
     service = EmailDispatchService(nick)
 
     sent_args = {}
@@ -174,6 +199,8 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
+    updated_action = json.loads(action_store.get("action-1"))
+    assert updated_action["drafts"][0]["sent_status"] is True
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
     assert sent_args["body"].startswith("<!-- RFQ-ID: RFQ-UNIT -->")
