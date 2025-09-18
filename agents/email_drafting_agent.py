@@ -64,8 +64,6 @@ def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
     )
 
     rows = [desc for desc in descriptions if isinstance(desc, str) and desc.strip()]
-    if not rows:
-        rows = [""]
 
     body_rows: List[str] = []
     for description in rows:
@@ -74,6 +72,11 @@ def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
         for _ in range(len(_RFQ_TABLE_COLUMNS) - 1):
             cells.append(f'<td style="{_RFQ_BODY_CELL_STYLE}">&nbsp;</td>')
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    blank_cells = [
+        f'<td style="{_RFQ_BODY_CELL_STYLE}">&nbsp;</td>' for _ in _RFQ_TABLE_COLUMNS
+    ]
+    body_rows.append(f"<tr>{''.join(blank_cells)}</tr>")
 
     return (
         f'<table class="rfq-table" style="{_RFQ_TABLE_STYLE}">'
@@ -90,17 +93,13 @@ class EmailDraftingAgent(BaseAgent):
     """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
     TEXT_TEMPLATE = (
-        "<p>Dear {supplier_contact_name_html},</p>"
-        "<p>{relationship_opening_html}</p>"
-        "<p>{opportunity_summary_html}</p>"
-        "<p>Please review the requirement below and share your best quotation."
-        " Kindly complete the table with your commercial response.</p>"
-        "{rfq_table_html}"
-        "<p>Evaluation focus:</p>"
-        "{evaluation_focus_html}"
-        "<p>Deadline for submission: {deadline_html}</p>"
-        "<p>Primary contact: {contact_line_html}</p>"
+        "<p>Dear {supplier_contact_name_html}, we are reaching out to request your quotation for the requirement below.</p>"
+        "<p>{scope_summary_html}</p>"
+        "<p>Please review these details and let us know if any clarifications are needed.</p>"
+        "<p>Kindly complete the table and return your best quote.</p>"
+        "<p>Please submit your response by {deadline_html}.</p>"
         "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>"
+        "{rfq_table_html}"
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
 
@@ -319,120 +318,127 @@ class EmailDraftingAgent(BaseAgent):
             if f"{key}_html" not in base_args
         }
         base_args.update(html_augmented)
-        relationship = self._relationship_opening(supplier)
-        summary = self._opportunity_summary(supplier, profile)
-        evaluation_focus = self._build_evaluation_focus(supplier, profile)
+
         rfq_table = self._render_rfq_table(profile)
-        if not base_args.get("deadline"):
-            fallback = context.get("deadline", "TBC")
-            base_args["deadline"] = fallback
-            base_args["deadline_html"] = self._format_plain_text(fallback)
-        else:
-            base_args.setdefault(
-                "deadline_html", self._format_plain_text(base_args.get("deadline"))
-            )
+        scope_summary = self._compose_scope_summary(supplier, profile, context)
 
-        args = {
-            "relationship_opening": relationship,
-            "relationship_opening_html": self._format_plain_text(relationship),
-            "opportunity_summary": summary,
-            "opportunity_summary_html": self._format_plain_text(summary),
-            "evaluation_focus": evaluation_focus,
-            "evaluation_focus_html": self._format_focus_html(evaluation_focus),
-            "rfq_table": rfq_table,
+        deadline_value = base_args.get("deadline")
+        if not deadline_value:
+            fallback = context.get("deadline") or context.get("submission_deadline")
+            deadline_value = fallback if fallback else "TBC"
+            base_args["deadline"] = deadline_value
+        deadline_clean = str(deadline_value).strip() or "TBC"
+        base_args["deadline_html"] = self._format_plain_text(deadline_clean)
+
+        return {
+            "scope_summary_html": self._format_plain_text(scope_summary),
             "rfq_table_html": rfq_table,
-            "contact_line_html": self._compose_contact_line(base_args),
+            "deadline": base_args.get("deadline"),
+            "deadline_html": base_args.get("deadline_html"),
         }
-        args.setdefault("deadline", base_args.get("deadline"))
-        args.setdefault("deadline_html", base_args.get("deadline_html", ""))
-        return args
 
-    def _relationship_opening(self, supplier: Dict) -> str:
-        supplier_name = supplier.get("supplier_name") or "your organisation"
-        spend = supplier.get("total_spend")
-        po_count = supplier.get("po_count")
-        try:
-            spend_value = float(spend) if spend is not None else 0.0
-        except Exception:
-            spend_value = 0.0
-        try:
-            po_count_value = float(po_count) if po_count is not None else 0.0
-        except Exception:
-            po_count_value = 0.0
-        if po_count_value > 0:
-            return (
-                f"Thank you for the continued collaboration with {supplier_name}. "
-                "We are refreshing our sourcing position and would value an updated quotation from your team."
-            )
-        if spend_value > 0:
-            return (
-                f"Our records show meaningful recent engagement with {supplier_name}. "
-                "We would appreciate a refreshed proposal aligned to the updated scope below."
-            )
-        return (
-            "We are initiating a focused sourcing exercise for the scope outlined below and "
-            f"would welcome {supplier_name}'s proposal."
+    def _compose_scope_summary(
+        self, supplier: Dict, profile: Dict, context: Dict
+    ) -> str:
+        sentences: List[str] = []
+        relationship = self._relationship_sentence(supplier)
+        scope_sentences = self._scope_sentences(supplier, profile, context)
+
+        for candidate in [relationship, *scope_sentences]:
+            formatted = self._ensure_sentence(candidate)
+            if formatted:
+                sentences.append(formatted)
+            if len(sentences) >= 2:
+                break
+
+        if not sentences:
+            sentences.append("The detailed requirement is TBC.")
+        return " ".join(sentences)
+
+    def _relationship_sentence(self, supplier: Dict) -> str:
+        supplier_name = (
+            supplier.get("supplier_name")
+            or supplier.get("supplier_id")
+            or "your team"
         )
+        spend = self._as_float(supplier.get("total_spend")) or 0.0
+        po_count = self._as_float(supplier.get("po_count")) or 0.0
+        if po_count > 0:
+            return (
+                f"We appreciate the recent collaboration with {supplier_name} and "
+                "look forward to your updated quotation"
+            )
+        if spend > 0:
+            return (
+                f"We value our ongoing work with {supplier_name} and would welcome your refreshed proposal"
+            )
+        return f"We would welcome {supplier_name}'s response for this sourcing need"
 
-    def _opportunity_summary(self, supplier: Dict, profile: Dict) -> str:
-        justification = supplier.get("justification")
+    def _scope_sentences(
+        self, supplier: Dict, profile: Dict, context: Dict
+    ) -> List[str]:
+        sentences: List[str] = []
         items = profile.get("items") or []
         categories = profile.get("categories") or {}
-        category_focus = next(
-            (
-                values[0]
-                for key, values in sorted(categories.items())
-                if isinstance(values, list) and values
-            ),
-            None,
-        )
-        if items and category_focus:
-            scope = ", ".join(items[:3])
-            return (
-                f"Our opportunity analysis highlights forthcoming demand in {category_focus}. "
-                f"Please provide your best commercial and service position for {scope}."
+        descriptions = [
+            str(description).strip()
+            for description in items
+            if isinstance(description, str) and str(description).strip()
+        ]
+        category_focus = self._first_category_value(categories)
+        if descriptions and category_focus:
+            scope = ", ".join(descriptions[:3])
+            sentences.append(
+                f"The request covers {scope} within {category_focus}"
             )
-        if items:
-            scope = ", ".join(items[:3])
-            return (
-                f"We are consolidating pricing for the following items: {scope}. "
-                "Kindly confirm your latest offer and any value-added services."
-            )
-        if justification:
-            return justification
-        return (
-            "We are conducting a market test and would appreciate a detailed quote "
-            "covering pricing, lead times and support arrangements."
-        )
+        elif descriptions:
+            scope = ", ".join(descriptions[:3])
+            sentences.append(f"The request covers {scope}")
+        elif category_focus:
+            sentences.append(f"The sourcing focus is in {category_focus}")
+        else:
+            fallback_scope = context.get("requirement_summary")
+            if isinstance(fallback_scope, str) and fallback_scope.strip():
+                sentences.append(fallback_scope.strip())
 
-    def _build_evaluation_focus(self, supplier: Dict, profile: Dict) -> str:
-        focus_lines: List[str] = []
-        weights = supplier.get("weights") or {}
-        if isinstance(weights, dict) and weights:
-            parts = []
-            for key, value in weights.items():
-                try:
-                    parts.append(f"{key.title()}: {float(value):.0%}")
-                except Exception:
-                    parts.append(f"{key.title()}: {value}")
-            focus_lines.append("Commercial weighting – " + ", ".join(parts))
-        categories = profile.get("categories") or {}
-        collected = []
-        for level in sorted(categories.keys()):
-            collected.extend(categories[level])
-        unique_categories = [c for c in sorted({c for c in collected if c}) if c]
-        if unique_categories:
-            focus_lines.append(
-                "Category scope – " + ", ".join(unique_categories[:3])
-            )
         justification = supplier.get("justification")
-        if justification and justification not in focus_lines:
-            focus_lines.append(f"Opportunity driver – {justification}")
-        if not focus_lines:
-            focus_lines.append(
-                "We will evaluate on total cost of ownership, responsiveness and compliance with policy obligations."
-            )
-        return "\n".join(f"- {line}" for line in focus_lines)
+        if isinstance(justification, str) and justification.strip():
+            sentences.append(justification.strip())
+
+        if not sentences:
+            sentences.append("The detailed requirement is TBC")
+
+        return sentences
+
+    @staticmethod
+    def _ensure_sentence(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        sentence = str(text).strip()
+        if not sentence:
+            return None
+        if sentence[-1] not in ".!?":
+            sentence += "."
+        return sentence
+
+    @staticmethod
+    def _first_category_value(categories: Dict) -> Optional[str]:
+        if not isinstance(categories, dict):
+            return None
+        for key in sorted(categories.keys()):
+            values = categories.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        return None
+
+    @staticmethod
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except Exception:
+            return None
 
     def _render_rfq_table(self, profile: Dict) -> str:
         items = profile.get("items") or []
@@ -452,28 +458,6 @@ class EmailDraftingAgent(BaseAgent):
         if not text:
             return ""
         return escape(text).replace("\n", "<br>")
-
-    def _format_focus_html(self, focus: str) -> str:
-        if not focus:
-            return "<p></p>"
-        items = []
-        for line in focus.splitlines():
-            cleaned = line.strip()
-            if not cleaned:
-                continue
-            if cleaned.startswith("- "):
-                cleaned = cleaned[2:].strip()
-            items.append(cleaned)
-        if not items:
-            return f"<p>{escape(focus)}</p>"
-        return "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>"
-
-    def _compose_contact_line(self, base_args: Dict[str, Any]) -> str:
-        name = base_args.get("category_manager_name_html") or ""
-        email = base_args.get("category_manager_email_html") or ""
-        if name and email:
-            return f"{name} ({email})"
-        return name or email or ""
 
     def _split_existing_comment(self, body: str) -> tuple[Optional[str], str]:
         if not isinstance(body, str):

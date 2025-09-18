@@ -111,6 +111,15 @@ class EmailDispatchService:
                 sent,
             )
 
+            self._update_action_sent_status(
+                conn,
+                dispatch_payload,
+                rfq_id,
+                bool(sent),
+            )
+
+            conn.commit()
+
             dispatch_payload["sent_status"] = bool(sent)
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
@@ -242,7 +251,52 @@ class EmailDispatchService:
                     draft_id,
                 ),
             )
-        conn.commit()
+
+    def _update_action_sent_status(
+        self,
+        conn,
+        payload: Dict[str, Any],
+        rfq_id: str,
+        sent: bool,
+    ) -> None:
+        action_id = payload.get("action_id")
+        if not action_id:
+            return
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT process_output FROM proc.action WHERE action_id = %s",
+                    (action_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return
+
+            process_output = self._load_json_field(row[0])
+            if process_output is None:
+                return
+
+            if not self._mark_sent_status(process_output, rfq_id, sent):
+                return
+
+            updated_payload = json.dumps(process_output, default=str)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE proc.action
+                    SET process_output = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE action_id = %s
+                    """,
+                    (updated_payload, action_id),
+                )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to update sent_status for action %s and RFQ %s",
+                action_id,
+                rfq_id,
+            )
 
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:
@@ -264,3 +318,49 @@ class EmailDispatchService:
         if _RFQ_ID_PATTERN.search(body):
             return body
         return f"<!-- RFQ-ID: {rfq_id} -->\n{body.strip()}"
+
+    @staticmethod
+    def _load_json_field(value: Any) -> Optional[Any]:
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _mark_sent_status(data: Any, rfq_id: str, sent: bool) -> bool:
+        """Update ``sent_status`` in ``data`` for drafts matching ``rfq_id``."""
+
+        updated = False
+
+        if isinstance(data, dict):
+            updated |= EmailDispatchService._update_draft_collection(
+                data.get("drafts"), rfq_id, sent
+            )
+            if data.get("rfq_id") == rfq_id and data.get("sent_status") != sent:
+                data["sent_status"] = sent
+                if sent and "sent_on" not in data:
+                    data["sent_on"] = datetime.utcnow().isoformat()
+                updated = True
+        elif isinstance(data, list):
+            for item in data:
+                updated |= EmailDispatchService._mark_sent_status(item, rfq_id, sent)
+
+        return updated
+
+    @staticmethod
+    def _update_draft_collection(value: Any, rfq_id: str, sent: bool) -> bool:
+        if not isinstance(value, list):
+            return False
+        updated = False
+        for draft in value:
+            if isinstance(draft, dict) and draft.get("rfq_id") == rfq_id:
+                if draft.get("sent_status") != sent:
+                    draft["sent_status"] = sent
+                    updated = True
+                if sent and "sent_on" not in draft:
+                    draft["sent_on"] = datetime.utcnow().isoformat()
+        return updated

@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from agents.base_agent import AgentNick
+from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
 from agents.supplier_ranking_agent import SupplierRankingAgent
 from agents.quote_evaluation_agent import QuoteEvaluationAgent
@@ -41,20 +42,38 @@ async def lifespan(app: FastAPI):
         discrepancy_agent = DiscrepancyDetectionAgent(agent_nick)
         quote_evaluation_agent = QuoteEvaluationAgent(agent_nick)
         quote_comparison_agent = QuoteComparisonAgent(agent_nick)
-        agent_nick.agents = {
-            'data_extraction': DataExtractionAgent(agent_nick),
-            'supplier_ranking': SupplierRankingAgent(agent_nick),
-            'quote_evaluation': quote_evaluation_agent,
-            'opportunity_miner': OpportunityMinerAgent(agent_nick),
-            'DiscrepancyDetectionAgent': discrepancy_agent,
-            'email_drafting': EmailDraftingAgent(agent_nick),
-            'NegotiationAgent': NegotiationAgent(agent_nick),
-            'ApprovalsAgent': ApprovalsAgent(agent_nick),
-            'supplier_interaction': SupplierInteractionAgent(agent_nick),
-            'QuoteEvaluationAgent': quote_evaluation_agent,
-            'quote_comparison': quote_comparison_agent,
-            'QuoteComparisonAgent': quote_comparison_agent,
-        }
+        negotiation_agent = NegotiationAgent(agent_nick)
+        approvals_agent = ApprovalsAgent(agent_nick)
+        supplier_interaction_agent = SupplierInteractionAgent(agent_nick)
+
+        agent_nick.agents = AgentRegistry(
+            {
+                "data_extraction": DataExtractionAgent(agent_nick),
+                "supplier_ranking": SupplierRankingAgent(agent_nick),
+                "quote_evaluation": quote_evaluation_agent,
+                "quote_comparison": quote_comparison_agent,
+                "opportunity_miner": OpportunityMinerAgent(agent_nick),
+                "discrepancy_detection": discrepancy_agent,
+                "email_drafting": EmailDraftingAgent(agent_nick),
+                "negotiation": negotiation_agent,
+                "approvals": approvals_agent,
+                "supplier_interaction": supplier_interaction_agent,
+            }
+        )
+        agent_nick.agents.add_aliases(
+            {
+                "DataExtractionAgent": "data_extraction",
+                "SupplierRankingAgent": "supplier_ranking",
+                "QuoteEvaluationAgent": "quote_evaluation",
+                "QuoteComparisonAgent": "quote_comparison",
+                "OpportunityMinerAgent": "opportunity_miner",
+                "DiscrepancyDetectionAgent": "discrepancy_detection",
+                "EmailDraftingAgent": "email_drafting",
+                "NegotiationAgent": "negotiation",
+                "ApprovalsAgent": "approvals",
+                "SupplierInteractionAgent": "supplier_interaction",
+            }
+        )
         agent_nick.email_watcher = SESEmailWatcher(
             agent_nick,
             supplier_agent=agent_nick.agents.get('supplier_interaction'),
