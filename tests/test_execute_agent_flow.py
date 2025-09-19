@@ -543,6 +543,7 @@ def test_supplier_ranking_flow_applies_agent_prompts_and_policies():
     assert any(p.get("policyId") == 9 for p in opportunity_policies)
     assert any(p.get("policyId") == 25 for p in ranking_policies)
 
+
 def test_execute_agent_flow_passes_fields_to_children():
     class ParentAgent:
         def execute(self, context):
