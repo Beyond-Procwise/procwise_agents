@@ -41,13 +41,9 @@ class Orchestrator:
     # started failing once the policy checks were tightened.  Providing a
     # canonical fallback keeps those legacy flows operational while newer
     # definitions can continue to supply their own workflow names.
-    WORKFLOW_DEFAULTS = {
-        "opportunity_miner": "contract_expiry_check",
-    }
+    WORKFLOW_DEFAULTS: Dict[str, str] = {}
 
-    WORKFLOW_ALIASES = {
-        "opportunity_mining": "contract_expiry_check",
-    }
+    WORKFLOW_ALIASES: Dict[str, str] = {}
 
     WORKFLOW_DEFAULT_CONDITIONS = {
         "contract_expiry_check": {"negotiation_window_days": 90},

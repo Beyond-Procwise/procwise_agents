@@ -401,6 +401,55 @@ def test_price_variance_detection_generates_finding(monkeypatch):
         },
     )
 
+def test_instruction_overrides_populate_price_variance_fields(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context("price_variance_check", {})
+
+    instructions = {
+        "supplier_id": "SI0001",
+        "item_id": "ITM-001",
+        "actual_price": "11.25",
+        "benchmark_price": "9.50",
+        "variance_threshold_pct": "0.10",
+        "quantity": "15",
+    }
+
+    agent._apply_instruction_overrides(context, instructions)
+
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["item_id"] == "ITM-001"
+    assert conditions["actual_price"] == 11.25
+    assert conditions["benchmark_price"] == 9.50
+    assert conditions["variance_threshold_pct"] == 0.10
+    assert conditions["quantity"] == 15
+
+
+def test_price_variance_uses_top_level_fields_when_conditions_missing(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context("price_variance_check", {})
+
+    context.input_data.update(
+        {
+            "supplier_id": "SI0001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        }
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["item_id"] == "ITM-001"
+    assert conditions["actual_price"] == 11.0
+    assert conditions["benchmark_price"] == 9.0
+
+
 def create_agent(monkeypatch, tables: Optional[Dict[str, Any]] = None):
     nick = DummyNick()
     agent = OpportunityMinerAgent(nick, min_financial_impact=0)

@@ -719,7 +719,7 @@ def test_execute_legacy_flow_injects_workflow_metadata():
     assert captured["input"]["workflow"] == "price_variance_check"
 
 
-def test_execute_legacy_flow_defaults_workflow_for_opportunity_miner():
+def test_execute_legacy_flow_leaves_workflow_unset_for_opportunity_miner():
     captured = {}
 
     class CaptureAgent:
@@ -749,8 +749,9 @@ def test_execute_legacy_flow_defaults_workflow_for_opportunity_miner():
 
     orchestrator.execute_agent_flow(flow, {"ranking": []})
 
-    assert captured["input"]["workflow"] == "contract_expiry_check"
-    assert captured["input"].get("conditions", {}).get("negotiation_window_days") == 90
+    assert "workflow" not in captured["input"]
+    conditions = captured["input"].get("conditions")
+    assert not conditions or "negotiation_window_days" not in conditions
 
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
@@ -799,8 +800,9 @@ def test_execute_workflow_promotes_falsy_workflow_value():
     result = orchestrator.execute_workflow("opportunity_mining", {"workflow": None})
 
     assert result["status"] == "completed"
-    assert captured["input"]["workflow"] == "contract_expiry_check"
-    assert captured["input"].get("conditions", {}).get("negotiation_window_days") == 90
+    assert captured["input"]["workflow"] == "opportunity_mining"
+    conditions = captured["input"].get("conditions")
+    assert not conditions or "negotiation_window_days" not in conditions
 
 
 def test_create_child_context_preserves_parent_workflow():
