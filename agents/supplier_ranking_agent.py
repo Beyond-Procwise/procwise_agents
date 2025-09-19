@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from utils.gpu import configure_gpu
+from utils.instructions import parse_instruction_sources
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 # Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
@@ -54,6 +55,75 @@ class SupplierRankingAgent(BaseAgent):
         self.policy_engine = agent_nick.policy_engine
         self.query_engine = agent_nick.query_engine
         self._device = configure_gpu()
+
+    def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(prompt, dict):
+            return sources
+        for field in ("prompt_config", "metadata", "prompts_desc", "template"):
+            value = prompt.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(policy, dict):
+            return sources
+        for field in ("policy_details", "details", "policy_desc", "description"):
+            value = policy.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _collect_instruction_bundle(self, context: AgentContext) -> Dict[str, Any]:
+        sources: List[Any] = []
+        for policy in context.input_data.get("policies") or []:
+            sources.extend(self._instruction_sources_from_policy(policy))
+        for prompt in context.input_data.get("prompts") or []:
+            sources.extend(self._instruction_sources_from_prompt(prompt))
+        return parse_instruction_sources(sources)
+
+    def _coerce_numeric_map(self, payload: Any) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric >= 0:
+                    result[str(key).strip()] = numeric
+        elif isinstance(payload, (list, tuple)):
+            for item in payload:
+                if isinstance(item, dict):
+                    result.update(self._coerce_numeric_map(item))
+        elif isinstance(payload, str):
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return self._coerce_numeric_map(parsed)
+        return result
+
+    def _ensure_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                pass
+            return [token.strip() for token in re.split(r"[,;]", text) if token.strip()]
+        return [str(value).strip()]
 
     def _coerce_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
         entry = dict(policy)
@@ -187,6 +257,8 @@ class SupplierRankingAgent(BaseAgent):
                     error="supplier_data missing 'supplier_id' column",
                 )
 
+        instructions = self._collect_instruction_bundle(context)
+
         policy_bundle = self._resolve_policy_bundle(context)
 
         directory_entries = context.input_data.get("supplier_directory") or []
@@ -253,9 +325,35 @@ class SupplierRankingAgent(BaseAgent):
 
         intent = context.input_data.get("intent", {})
         requested = intent.get("parameters", {}).get("criteria", [])
+        criteria_override = (
+            instructions.get("criteria")
+            or instructions.get("metrics")
+            or instructions.get("focus_metrics")
+        )
+        override_criteria = self._ensure_list(criteria_override)
+        if override_criteria:
+            requested = override_criteria
+            intent.setdefault("parameters", {})["criteria"] = override_criteria
+
         weight_policy = self._find_policy(policy_bundle, "WeightAllocationPolicy")
         weight_rules = self._extract_policy_rules(weight_policy)
         default_weights = weight_rules.get("default_weights", {})
+        override_weights_map: Dict[str, float] = {}
+        for key in ("metric_weights", "weights", "weightings", "default_weights"):
+            override_weights_map = self._coerce_numeric_map(instructions.get(key))
+            if override_weights_map:
+                break
+        if override_weights_map:
+            total_override = sum(override_weights_map.values())
+            if total_override > 0:
+                default_weights = {
+                    metric: value / total_override
+                    for metric, value in override_weights_map.items()
+                    if value >= 0
+                }
+            else:
+                default_weights = override_weights_map
+
         criteria = requested if requested else list(default_weights.keys())
         weights = {
             crit: default_weights.get(crit, 0.0)
@@ -289,6 +387,16 @@ class SupplierRankingAgent(BaseAgent):
             query_text = context.input_data.get("query", "")
             match = re.search(r"top[-\s]*(\d+)", query_text, re.IGNORECASE)
             top_n = int(match.group(1)) if match else 3
+        override_top_n = (
+            instructions.get("top_n")
+            or instructions.get("max_suppliers")
+            or instructions.get("supplier_limit")
+        )
+        if override_top_n is not None:
+            try:
+                top_n = int(float(override_top_n))
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
         top_n = max(1, min(int(top_n), len(ranked_df)))
 
         top_df = ranked_df.head(top_n).copy()

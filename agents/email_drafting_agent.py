@@ -21,6 +21,7 @@ from jinja2 import Template
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
+from utils.instructions import parse_instruction_sources
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,117 @@ class EmailDraftingAgent(BaseAgent):
         self._draft_table_checked = False
         self._draft_table_lock = threading.Lock()
 
+    def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(prompt, dict):
+            return sources
+        for field in ("prompt_config", "metadata", "prompts_desc", "template"):
+            value = prompt.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(policy, dict):
+            return sources
+        for field in ("policy_details", "details", "policy_desc", "description"):
+            value = policy.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _resolve_instruction_settings(self, context: AgentContext) -> Dict[str, Any]:
+        sources: List[Any] = []
+        for policy in context.input_data.get("policies") or []:
+            sources.extend(self._instruction_sources_from_policy(policy))
+        for prompt in context.input_data.get("prompts") or []:
+            sources.extend(self._instruction_sources_from_prompt(prompt))
+        instructions = parse_instruction_sources(sources)
+        settings: Dict[str, Any] = {}
+
+        def _pick(*keys: str) -> Optional[Any]:
+            for key in keys:
+                value = instructions.get(key)
+                if value:
+                    return value
+            return None
+
+        settings["body_template"] = _pick("body_template", "email_body_template", "email_body")
+        settings["subject_template"] = _pick(
+            "subject_template", "email_subject_template", "email_subject"
+        )
+        settings["include_rfq_table"] = instructions.get("include_rfq_table")
+        settings["additional_paragraph"] = _pick(
+            "additional_paragraph", "additional_note", "instructions"
+        )
+        settings["compliance_notice"] = _pick("compliance_notice", "compliance_clause")
+        settings["_instructions_present"] = bool(instructions)
+        return settings
+
+    @staticmethod
+    def _coerce_text(value: Any) -> Optional[str]:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "yes", "y", "1", "on"}:
+                return True
+            if text in {"false", "no", "n", "0", "off"}:
+                return False
+        return None
+
+    def _render_template_string(self, template: str, args: Dict[str, Any]) -> str:
+        if "{{" in template or "{%" in template:
+            return Template(template).render(**args)
+        try:
+            return template.format(**args)
+        except KeyError:
+            return template
+
+    def _render_instruction_paragraph(self, text: Optional[str]) -> str:
+        cleaned = self._coerce_text(text)
+        if not cleaned:
+            return ""
+        formatted = self._format_plain_text(cleaned)
+        if not formatted:
+            return ""
+        return f"<p>{formatted}</p>"
+
+    @staticmethod
+    def _normalise_subject_line(subject: str, rfq_id: Optional[str]) -> str:
+        """Remove duplicated RFQ tokens that often arise from templates."""
+
+        if not isinstance(subject, str):
+            return ""
+
+        trimmed = subject.strip()
+        if not trimmed:
+            return ""
+
+        if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {'"', "'"}:
+            trimmed = trimmed[1:-1].strip()
+
+        if rfq_id:
+            identifier = str(rfq_id).strip()
+            if identifier:
+                pattern = re.compile(
+                    rf"(?i)\bRFQ[\s:-]+{re.escape(identifier)}"
+                )
+                trimmed = pattern.sub(identifier, trimmed, count=1)
+
+        return trimmed
+
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
         logger.info("EmailDraftingAgent starting with input %s", context.input_data)
@@ -139,6 +251,61 @@ class EmailDraftingAgent(BaseAgent):
         manual_body_rendered: Optional[str] = None
         manual_rfq_id: Optional[str] = None
         manual_sent_flag: bool = data.get("sent_status", True)
+
+        instruction_settings = self._resolve_instruction_settings(context)
+        body_template_override = self._coerce_text(
+            instruction_settings.get("body_template")
+        )
+        subject_template_override = self._coerce_text(
+            instruction_settings.get("subject_template")
+        )
+        include_rfq_setting = instruction_settings.get("include_rfq_table")
+        include_rfq_table = self._coerce_bool(include_rfq_setting)
+        if include_rfq_table is None:
+            include_rfq_table = True
+        additional_paragraph = self._coerce_text(
+            instruction_settings.get("additional_paragraph")
+        )
+        compliance_notice = self._coerce_text(
+            instruction_settings.get("compliance_notice")
+        )
+        instructions_present = instruction_settings.get("_instructions_present", False)
+
+        additional_section_html = self._render_instruction_paragraph(additional_paragraph)
+        compliance_section_html = ""
+        if compliance_notice:
+            compliance_text = self._format_plain_text(compliance_notice)
+            if compliance_text:
+                compliance_section_html = (
+                    f"<p><strong>Compliance:</strong> {compliance_text}</p>"
+                )
+        instruction_suffix = "".join(
+            section
+            for section in (additional_section_html, compliance_section_html)
+            if section
+        )
+
+        manual_template_candidate = (
+            manual_body_input if isinstance(manual_body_input, str) else None
+        )
+        has_template_candidate = bool(
+            manual_template_candidate and manual_template_candidate.strip()
+        )
+        explicit_body_template = self._coerce_text(data.get("body_template"))
+        base_body_template = (
+            body_template_override
+            or (
+                manual_template_candidate
+                if has_template_candidate and not manual_recipients
+                else None
+            )
+            or explicit_body_template
+            or self.TEXT_TEMPLATE
+        )
+        subject_template_source = (
+            subject_template_override
+            or self._coerce_text(data.get("subject_template"))
+        )
 
         for supplier in ranking:
             supplier_id = supplier.get("supplier_id")
@@ -171,31 +338,59 @@ class EmailDraftingAgent(BaseAgent):
             }
             for key, value in list(fmt_args.items()):
                 fmt_args[f"{key}_html"] = self._format_plain_text(value)
-            body_template = data.get("body") or self.TEXT_TEMPLATE
+            body_template = base_body_template or self.TEXT_TEMPLATE
             contextual_args = self._build_template_args(
-                supplier, profile, fmt_args, data
+                supplier,
+                profile,
+                fmt_args,
+                data,
+                include_rfq_table=include_rfq_table,
             )
             template_args = {**data, **fmt_args, **contextual_args}
-            if "{{" in body_template or "{%" in body_template:
-                rendered = Template(body_template).render(**template_args)
-            else:
-                try:
-                    rendered = body_template.format(**template_args)
-                except KeyError:
-                    rendered = body_template
+            template_args.update(
+                {
+                    "rfq_id": rfq_id,
+                    "additional_paragraph_html": additional_section_html,
+                    "compliance_notice_html": compliance_section_html,
+                }
+            )
+            rendered = self._render_template_string(body_template, template_args)
 
             comment, message = self._split_existing_comment(rendered)
-            content = self._sanitise_generated_body(message if comment else rendered)
+            message_content = message if comment else rendered
+            appended_sections: List[str] = []
+            if additional_section_html and additional_section_html not in message_content:
+                appended_sections.append(additional_section_html)
+            if compliance_section_html and compliance_section_html not in message_content:
+                appended_sections.append(compliance_section_html)
+            if appended_sections:
+                message_content = f"{message_content}{''.join(appended_sections)}"
+            elif instruction_suffix and instruction_suffix not in message_content:
+                message_content = f"{message_content}{instruction_suffix}"
+
+            content = self._sanitise_generated_body(message_content)
             comment = comment if comment else f"<!-- RFQ-ID: {rfq_id} -->"
             body = comment if not content else f"{comment}\n{content}"
-            subject = f"{rfq_id} – Request for Quotation"
+            if subject_template_source:
+                subject_args = dict(template_args)
+                subject_args.setdefault("rfq_id", rfq_id)
+                subject = self._render_template_string(
+                    subject_template_source, subject_args
+                )
+                subject = self._normalise_subject_line(subject, rfq_id)
+                subject = subject or f"{rfq_id} – Request for Quotation"
+            else:
+                subject = f"{rfq_id} – Request for Quotation"
 
             draft_action_id = supplier.get("action_id") or default_action_id
 
             receiver = self._resolve_receiver(supplier, profile)
-            recipients = self._normalise_recipients([receiver]) if receiver else []
-            receiver = recipients[0] if recipients else receiver
-            contact_level = 1 if receiver else 0
+            recipients: List[str] = []
+            if receiver and not instructions_present:
+                recipients = self._normalise_recipients([receiver])
+            if recipients:
+                receiver = recipients[0]
+            contact_level = 1 if recipients else 0
 
             draft = {
                 "supplier_id": supplier_id,
@@ -312,6 +507,8 @@ class EmailDraftingAgent(BaseAgent):
         profile: Dict,
         base_args: Dict,
         context: Dict,
+        *,
+        include_rfq_table: bool = True,
     ) -> Dict:
         html_augmented = {
             f"{key}_html": self._format_plain_text(value)
@@ -320,7 +517,7 @@ class EmailDraftingAgent(BaseAgent):
         }
         base_args.update(html_augmented)
 
-        rfq_table = self._render_rfq_table(profile)
+        rfq_table = self._render_rfq_table(profile) if include_rfq_table else ""
         scope_summary = self._compose_scope_summary(supplier, profile, context)
 
         deadline_value = base_args.get("deadline")

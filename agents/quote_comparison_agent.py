@@ -12,6 +12,7 @@ import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
+from utils.instructions import parse_instruction_sources
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +38,60 @@ class QuoteComparisonAgent(BaseAgent):
         self._fx_to_gbp: Dict[str, float] = {"GBP": 1.0, "USD": 0.79}
         self._resolved_metric_weights: Dict[str, float] = {}
 
+    def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(prompt, dict):
+            return sources
+        for field in ("prompt_config", "metadata", "prompts_desc", "template"):
+            value = prompt.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(policy, dict):
+            return sources
+        for field in ("policy_details", "details", "policy_desc", "description"):
+            value = policy.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _collect_instruction_bundle(self, context: AgentContext) -> Dict[str, Any]:
+        sources: List[Any] = []
+        for policy in context.input_data.get("policies") or []:
+            sources.extend(self._instruction_sources_from_policy(policy))
+        for prompt in context.input_data.get("prompts") or []:
+            sources.extend(self._instruction_sources_from_prompt(prompt))
+        return parse_instruction_sources(sources)
+
     def run(self, context: AgentContext) -> AgentOutput:
+        instructions = self._collect_instruction_bundle(context)
         supplier_ids = self._collect_supplier_ids(context.input_data)
         supplier_names = self._collect_supplier_names(context.input_data)
-        weight_entry = self._prepare_weight_entry(
+        base_weights = (
             context.input_data.get("weightings")
             or context.input_data.get("weights")
             or {}
         )
+        override_weights = None
+        for key in ("weightings", "weights", "metric_weights", "default_weights"):
+            candidate = instructions.get(key)
+            if candidate:
+                override_weights = candidate
+                break
+        weight_entry = self._prepare_weight_entry(override_weights or base_weights)
         metric_weights = (
             dict(self._resolved_metric_weights)
             if self._resolved_metric_weights
             else dict(self.DEFAULT_METRIC_WEIGHTS)
         )
+        for key in ("metric_weights", "weights", "weightings", "default_weights"):
+            candidate = instructions.get(key)
+            if candidate:
+                metric_weights = self._extract_metric_weights(candidate)
+                break
 
         passed_quotes = self._extract_passed_quotes(context.input_data)
         if passed_quotes:
@@ -58,6 +100,7 @@ class QuoteComparisonAgent(BaseAgent):
                 supplier_ids,
                 supplier_names,
                 weight_entry,
+                override_from_instruction=bool(override_weights),
             )
             if formatted is not None and has_suppliers:
                 finalised, recommended = self._finalise_results(formatted, metric_weights)
@@ -242,6 +285,8 @@ class QuoteComparisonAgent(BaseAgent):
         supplier_ids: Set[str],
         supplier_names: Set[str],
         weight_entry: Dict,
+        *,
+        override_from_instruction: bool = False,
     ) -> Tuple[Optional[List[Dict]], bool]:
         supplier_id_tokens = {
             token
@@ -260,7 +305,11 @@ class QuoteComparisonAgent(BaseAgent):
 
             name = str(entry.get("name", "")).strip()
             if name.lower() == "weighting":
-                weight_row = self._merge_weight_entries(entry, weight_entry)
+                weight_row = self._merge_weight_entries(
+                    entry,
+                    weight_entry,
+                    override_from_instruction=override_from_instruction,
+                )
                 continue
 
             has_supplier_entries = True
@@ -276,7 +325,7 @@ class QuoteComparisonAgent(BaseAgent):
         if not supplier_rows:
             return None, True
 
-        weight_row = weight_row or weight_entry
+        weight_row = weight_row or dict(weight_entry)
         results = [weight_row]
         results.extend(supplier_rows)
         return results, True
@@ -311,13 +360,26 @@ class QuoteComparisonAgent(BaseAgent):
             return True
         return False
 
-    def _merge_weight_entries(self, source: Dict, fallback: Dict) -> Dict:
+    def _merge_weight_entries(
+        self,
+        source: Dict,
+        fallback: Dict,
+        *,
+        override_from_instruction: bool = False,
+    ) -> Dict:
         merged = dict(fallback)
         numeric_keys = ("total_spend", "total_cost", "volume")
         for key in numeric_keys:
             value = source.get(key)
-            if not self._is_null(value):
-                merged[key] = self._to_float(value)
+            if self._is_null(value):
+                continue
+            numeric = self._to_float(value)
+            fallback_numeric = self._to_float(fallback.get(key))
+            if override_from_instruction and fallback_numeric > 0:
+                continue
+            if numeric <= 0 and fallback_numeric > 0:
+                continue
+            merged[key] = numeric
 
         if not self._is_null(source.get("tenure")):
             merged["tenure"] = source.get("tenure")
@@ -418,7 +480,7 @@ class QuoteComparisonAgent(BaseAgent):
                         supplier_ids.add(str(supplier).strip())
         return supplier_ids
 
-    def _prepare_weight_entry(self, weights: Dict) -> Dict:
+    def _prepare_weight_entry(self, weights: Any) -> Dict:
         entry = {
             "name": "weighting",
             "total_spend": 1.0,

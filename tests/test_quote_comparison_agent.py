@@ -162,3 +162,54 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     recommended = result.data.get("recommended_quote")
     assert recommended is not None
     assert recommended["name"] == "Supplier B"
+
+
+def test_quote_comparison_applies_instruction_weights(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteComparisonAgent(nick)
+
+    monkeypatch.setattr(agent, "_read_table", lambda *_args, **_kwargs: pd.DataFrame())
+
+    quotes_payload = [
+        {
+            "name": "weighting",
+            "total_spend": 1.0,
+            "total_cost": 0,
+            "quote_file_s3_path": None,
+            "tenure": None,
+            "volume": None,
+        },
+        {
+            "name": "Supplier A",
+            "supplier_id": "S1",
+            "total_spend": 100,
+            "total_cost": 90,
+            "volume": 10,
+        },
+        {
+            "name": "Supplier B",
+            "supplier_id": "S2",
+            "total_spend": 200,
+            "total_cost": 180,
+            "volume": 20,
+        },
+    ]
+
+    prompts = [
+        {
+            "promptId": 1,
+            "prompts_desc": "{\"metric_weights\": {\"total_cost\": 0.2, \"tenure\": 0.3, \"volume\": 0.5}}",
+        }
+    ]
+
+    context = _build_context(
+        quotes_payload,
+        extra_input={"prompts": prompts},
+    )
+
+    result = agent.run(context)
+
+    weight_entry = result.data["comparison"][0]
+    assert weight_entry["total_cost"] == pytest.approx(0.2)
+    assert weight_entry["tenure"] == pytest.approx(0.3)
+    assert weight_entry["volume"] == pytest.approx(0.5)

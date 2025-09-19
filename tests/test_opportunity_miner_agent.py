@@ -612,3 +612,57 @@ def test_inflation_passthrough_detection(monkeypatch):
     ]
     assert inflation
     assert inflation[0]["supplier_id"] == "SI0001"
+
+
+def test_apply_instruction_settings_updates_context():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    context = AgentContext(
+        workflow_id="wf",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "prompts": [
+                {
+                    "promptId": 1,
+                    "prompts_desc": "workflow: custom_flow\nmin_financial_impact: 2500\nlookback_period_days: 45",
+                }
+            ],
+            "policies": [
+                {
+                    "policyId": 4,
+                    "policy_desc": "{\"parameters\": {\"negotiation_window_days\": 60}}",
+                }
+            ],
+        },
+    )
+
+    agent._apply_instruction_settings(context)
+
+    assert context.input_data["workflow"] == "custom_flow"
+    assert context.input_data["min_financial_impact"] == 2500
+    assert context.input_data["conditions"]["lookback_period_days"] == 45
+    assert context.input_data["conditions"]["negotiation_window_days"] == 60
+
+
+def test_assemble_policy_registry_filters_static_entries():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    input_data = {
+        "policies": [
+            {
+                "policyId": "oppfinderpolicy_004_contract_expiry_opportunity",
+                "policyName": "Contract Expiry",
+                "policy_desc": "{\"parameters\": {\"negotiation_window_days\": 75}}",
+            }
+        ]
+    }
+
+    registry, provided = agent._assemble_policy_registry(input_data)
+    assert len(provided) == 1
+    assert list(registry.keys()) == ["contract_expiry_check"]
+    entry = registry["contract_expiry_check"]
+    assert entry["policy_id"] == "oppfinderpolicy_004_contract_expiry_opportunity"
+    assert entry.get("parameters", {}).get("negotiation_window_days") == 75

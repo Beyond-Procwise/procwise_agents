@@ -307,3 +307,77 @@ def test_ranking_uses_context_policy_weights(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     assert output.data["ranking"][0]["supplier_id"] == "S1"
     assert output.data["ranking"][0]["weights"]["delivery"] == 1.0
+
+
+def test_supplier_ranking_instruction_overrides(monkeypatch):
+    class StubPolicyEngine:
+        def __init__(self):
+            self.supplier_policies = []
+
+    class StubQueryEngine:
+        def fetch_supplier_data(self, *_args, **_kwargs):
+            return pd.DataFrame()
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(extraction_model="llama3", script_user="tester"),
+        policy_engine=StubPolicyEngine(),
+        query_engine=StubQueryEngine(),
+    )
+
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_load_procurement_tables", lambda *_: {})
+    monkeypatch.setattr(agent, "_merge_supplier_metrics", lambda df, _tables: df)
+    monkeypatch.setattr(agent, "_build_supplier_profiles", lambda _tables, ids: {sid: {} for sid in ids})
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+
+    df = pd.DataFrame(
+        {
+            "supplier_id": ["S1", "S2", "S3"],
+            "supplier_name": ["Alpha", "Beta", "Gamma"],
+            "price": [50, 40, 60],
+            "delivery": [5, 10, 7],
+        }
+    )
+
+    prompts = [
+        {
+            "promptId": 1,
+            "prompts_desc": "{\"criteria\": [\"price\"], \"top_n\": 2}",
+        }
+    ]
+
+    policies = [
+        {
+            "policyId": 10,
+            "policyName": "WeightAllocationPolicy",
+            "details": {"rules": {"default_weights": {"price": 1.0}}},
+        },
+        {
+            "policyId": 11,
+            "policyName": "NormalizationDirectionPolicy",
+            "details": {"rules": {"price": "lower_is_better"}},
+        },
+    ]
+
+    context = AgentContext(
+        workflow_id="wf-instruction",
+        agent_id="supplier_ranking",
+        user_id="tester",
+        input_data={
+            "supplier_data": df,
+            "prompts": prompts,
+            "policies": policies,
+            "intent": {},
+            "query": "rank suppliers",
+        },
+    )
+
+    output = agent.run(context)
+
+    ranking = output.data["ranking"]
+    assert len(ranking) == 2
+    assert ranking[0]["supplier_id"] == "S2"
+    weights = ranking[0]["weights"]
+    assert weights["price"] == pytest.approx(1.0)
+    assert context.input_data["intent"].get("parameters", {}).get("criteria") == ["price"]
+

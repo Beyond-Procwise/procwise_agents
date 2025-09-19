@@ -86,6 +86,68 @@ def test_email_drafting_agent(monkeypatch):
     assert captured["drafts"][0] == draft
 
 
+def test_email_drafting_applies_instruction_settings(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+
+    stored = []
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: stored.append(draft))
+
+    ranking = [
+        {
+            "supplier_id": "S1",
+            "supplier_name": "Alpha Co",
+            "contact_email": "alpha@example.com",
+        }
+    ]
+
+    prompts = [
+        {
+            "promptId": 1,
+            "prompts_desc": (
+                "body_template: \"<p>Dear {supplier_contact_name_html}, we kindly request a quotation.</p>\"\n"
+                "include_rfq_table: false\n"
+                "additional_paragraph: \"Please confirm receipt of this request.\""
+            ),
+        }
+    ]
+
+    policies = [
+        {
+            "policyId": 2,
+            "policy_desc": (
+                "subject_template: \"RFQ {rfq_id} for {supplier_company}\"\n"
+                "compliance_notice: \"All quotations are confidential.\""
+            ),
+        }
+    ]
+
+    context = AgentContext(
+        workflow_id="wf-instruction",
+        agent_id="email_drafting",
+        user_id="tester",
+        input_data={
+            "ranking": ranking,
+            "prompts": prompts,
+            "policies": policies,
+            "submission_deadline": "2025-01-15",
+        },
+    )
+
+    output = agent.run(context)
+    draft = output.data["drafts"][0]
+
+    assert draft["subject"].startswith("RFQ")
+    assert "Alpha Co" in draft["subject"]
+    body = draft["body"]
+    assert "we kindly request a quotation" in body
+    assert "Please confirm receipt of this request." in body
+    assert "All quotations are confidential" in body
+    assert "Compliance" in body
+    assert "<table" not in body
+    assert draft["recipients"] == []
+
+
 def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
     nick = DummyNick()
     agent = EmailDraftingAgent(nick)

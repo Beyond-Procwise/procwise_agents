@@ -9,13 +9,14 @@ from difflib import SequenceMatcher
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
+from utils.instructions import parse_instruction_sources
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,174 @@ class OpportunityMinerAgent(BaseAgent):
         self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         logger.info("OpportunityMinerAgent using device: %s", self.device)
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
+
+    def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(prompt, dict):
+            return sources
+        for field in ("prompt_config", "metadata", "prompts_desc", "template"):
+            value = prompt.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(policy, dict):
+            return sources
+        for field in ("policy_details", "details", "policy_desc", "description"):
+            value = policy.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _apply_instruction_overrides(
+        self, context: AgentContext, instructions: Dict[str, Any]
+    ) -> None:
+        if not instructions:
+            return
+
+        workflow_hint = instructions.get("workflow") or instructions.get("workflow_name")
+        if workflow_hint:
+            candidate = str(workflow_hint).strip()
+            if candidate:
+                context.input_data["workflow"] = candidate
+
+        min_impact = (
+            instructions.get("min_financial_impact")
+            or instructions.get("minimum_financial_impact")
+            or instructions.get("financial_impact_threshold")
+        )
+        threshold = self._coerce_float(min_impact)
+        if threshold is not None and threshold >= 0:
+            context.input_data["min_financial_impact"] = threshold
+
+        conditions = context.input_data.get("conditions")
+        if not isinstance(conditions, dict):
+            conditions = {}
+            context.input_data["conditions"] = conditions
+
+        alias_map = {
+            "negotiation_window_days": {
+                "negotiation_window_days",
+                "negotiation_window",
+                "window_days",
+                "renewal_window_days",
+            },
+            "lookback_period_days": {
+                "lookback_period_days",
+                "lookback_period",
+                "lookback_days",
+            },
+            "reference_date": {"reference_date", "analysis_date", "base_date"},
+            "risk_threshold": {"risk_threshold", "risk_score_threshold"},
+            "minimum_volume_gbp": {
+                "minimum_volume_gbp",
+                "min_volume_gbp",
+                "volume_threshold",
+            },
+            "minimum_value_gbp": {
+                "minimum_value_gbp",
+                "minimum_spend_gbp",
+                "min_value_gbp",
+            },
+            "minimum_unused_value_gbp": {
+                "minimum_unused_value_gbp",
+                "unused_value_threshold",
+            },
+            "minimum_overlap_gbp": {"minimum_overlap_gbp", "overlap_threshold"},
+            "market_inflation_pct": {"market_inflation_pct", "inflation_pct"},
+            "minimum_quantity_threshold": {
+                "minimum_quantity_threshold",
+                "quantity_threshold",
+            },
+            "minimum_spend_threshold": {
+                "minimum_spend_threshold",
+                "spend_threshold",
+            },
+        }
+
+        def _assign_condition(key: str, raw: Any) -> None:
+            if raw is None:
+                return
+            if isinstance(raw, dict):
+                conditions[key] = raw
+                return
+            if isinstance(raw, (list, tuple, set)):
+                values = [v for v in raw if v is not None]
+                if values:
+                    conditions[key] = list(values)
+                return
+            if isinstance(raw, bool):
+                conditions[key] = raw
+                return
+            numeric = self._coerce_float(raw)
+            if numeric is not None:
+                if key.endswith("_days"):
+                    conditions[key] = int(numeric)
+                else:
+                    conditions[key] = numeric
+                return
+            text = str(raw).strip()
+            if text:
+                conditions[key] = text
+
+        for canonical, aliases in alias_map.items():
+            for alias in aliases:
+                if alias in instructions:
+                    _assign_condition(canonical, instructions[alias])
+                    break
+
+        def _merge_condition_dict(payload: Any) -> None:
+            if not isinstance(payload, dict):
+                return
+            for raw_key, raw_value in payload.items():
+                if raw_key is None:
+                    continue
+                norm_key = self._normalise_policy_slug(raw_key) or str(raw_key).strip()
+                if not norm_key:
+                    continue
+                _assign_condition(norm_key, raw_value)
+
+        for block_key in (
+            "conditions",
+            "parameters",
+            "policy_parameters",
+            "default_conditions",
+        ):
+            _merge_condition_dict(instructions.get(block_key))
+
+        rules_block = instructions.get("rules")
+        if isinstance(rules_block, dict):
+            _merge_condition_dict(rules_block)
+            for nested_key in ("parameters", "conditions"):
+                _merge_condition_dict(rules_block.get(nested_key))
+
+    def _apply_instruction_settings(self, context: AgentContext) -> None:
+        sources: List[Any] = []
+        prompts = context.input_data.get("prompts") or []
+        for prompt in prompts:
+            sources.extend(self._instruction_sources_from_prompt(prompt))
+        policies = context.input_data.get("policies") or []
+        for policy in policies:
+            sources.extend(self._instruction_sources_from_policy(policy))
+        instructions = parse_instruction_sources(sources)
+        self._apply_instruction_overrides(context, instructions)
 
     # ------------------------------------------------------------------
     # Public API
@@ -216,50 +385,77 @@ class OpportunityMinerAgent(BaseAgent):
             self._escalations = []
             notifications: set[str] = set()
 
+            self._apply_instruction_settings(context)
+
             min_impact_threshold = self._resolve_min_financial_impact(
                 context.input_data
             )
 
-            workflow_name = context.input_data.get("workflow")
-            dynamic_registry = self._build_dynamic_policy_registry(context.input_data)
-            use_dynamic_registry = bool(dynamic_registry)
-            policy_registry = (
-                dynamic_registry if use_dynamic_registry else self._get_policy_registry()
+            policy_registry, provided_policies = self._assemble_policy_registry(
+                context.input_data
             )
-            alias_map = {"opportunity_mining": "contract_expiry_check"}
 
-            if not workflow_name and not use_dynamic_registry:
-                message = "Mandatory orchestrator field 'workflow' is missing."
+            if not policy_registry:
+                if provided_policies:
+                    message = (
+                        "No supported opportunity policies matched the provided configuration"
+                    )
+                    details = {
+                        "policies": [
+                            policy.get("policyId")
+                            or policy.get("policyName")
+                            or policy.get("policy_desc")
+                            for policy in provided_policies
+                        ]
+                    }
+                    self._log_policy_event("unknown", None, "blocked", message, details)
+                    return self._blocked_output(message)
+                message = "No opportunity policies available"
                 self._log_policy_event("unknown", None, "blocked", message, {})
                 return self._blocked_output(message)
 
+            workflow_hint = context.input_data.get("workflow")
+            workflow_name = (
+                str(workflow_hint).strip() if isinstance(workflow_hint, str) and workflow_hint.strip() else None
+            )
+            if workflow_name:
+                context.input_data["workflow"] = workflow_name
+
             requested_keys: List[str] = []
-            if use_dynamic_registry:
-                if workflow_name:
-                    slug = self._normalise_policy_slug(workflow_name)
-                    if slug and slug in policy_registry:
-                        requested_keys.append(slug)
-                    elif workflow_name in policy_registry:
-                        requested_keys.append(workflow_name)
-                if not requested_keys:
-                    requested_keys = list(policy_registry.keys())
-            else:
-                lookup_name = workflow_name
-                mapped = (
-                    alias_map.get(workflow_name.lower())
-                    if isinstance(workflow_name, str)
-                    else None
-                )
-                if mapped:
-                    lookup_name = mapped
-                    context.input_data["workflow"] = lookup_name
-                if lookup_name not in policy_registry:
-                    message = f"Unsupported opportunity workflow '{workflow_name}'"
-                    self._log_policy_event(
-                        "unknown", None, "blocked", message, {"workflow": workflow_name}
-                    )
-                    return self._blocked_output(message)
-                requested_keys = [lookup_name]
+            if workflow_name:
+                tokens = {workflow_name.lower()}
+                slug = self._normalise_policy_slug(workflow_name)
+                if slug:
+                    tokens.add(slug)
+                for key, cfg in policy_registry.items():
+                    canonical = cfg.get("policy_slug", key)
+                    aliases = {alias.lower() for alias in cfg.get("aliases", set())}
+                    aliases.add(canonical.lower())
+                    if tokens & aliases:
+                        requested_keys = [canonical]
+                        context.input_data["workflow"] = canonical
+                        workflow_name = canonical
+                        break
+
+            if not requested_keys:
+                requested_keys = list(policy_registry.keys())
+                if requested_keys:
+                    if workflow_name:
+                        normalized = self._normalise_policy_slug(workflow_name)
+                        for key in list(requested_keys):
+                            cfg = policy_registry.get(key) or {}
+                            aliases = {alias.lower() for alias in cfg.get("aliases", set())}
+                            aliases.add(key.lower())
+                            if normalized and normalized in aliases:
+                                requested_keys = [key]
+                                context.input_data["workflow"] = key
+                                workflow_name = key
+                                break
+                    else:
+                        context.input_data["workflow"] = requested_keys[0]
+                        workflow_name = requested_keys[0]
+
+            use_dynamic_registry = len(requested_keys) > 1
 
             base_conditions = (
                 context.input_data.get("conditions").copy()
@@ -276,37 +472,47 @@ class OpportunityMinerAgent(BaseAgent):
                     continue
                 policy_input = dict(context.input_data)
                 policy_input["conditions"] = dict(base_conditions)
-                if use_dynamic_registry:
-                    policy_input["conditions"].update(
-                        policy_cfg.get("parameters", {})
+                parameters = policy_cfg.get("parameters")
+                if isinstance(parameters, dict):
+                    policy_input["conditions"].update(parameters)
+
+                missing_fields = self._missing_required_fields(
+                    policy_input,
+                    policy_cfg.get("required_fields", []),
+                    policy_cfg.get("default_conditions", {}),
+                )
+                if missing_fields:
+                    message = (
+                        "Missing mandatory orchestrator fields: "
+                        + ", ".join(sorted(missing_fields))
                     )
-                    missing_fields: List[str] = []
-                else:
-                    missing_fields = self._missing_required_fields(
-                        policy_input,
-                        policy_cfg.get("required_fields", []),
-                        policy_cfg.get("default_conditions", {}),
+                    self._log_policy_event(
+                        policy_cfg.get("policy_id", "unknown"),
+                        None,
+                        "blocked",
+                        message,
+                        {"missing_fields": sorted(missing_fields)},
                     )
-                    if missing_fields:
-                        message = (
-                            "Missing mandatory orchestrator fields: "
-                            + ", ".join(sorted(missing_fields))
-                        )
-                        self._log_policy_event(
-                            policy_cfg["policy_id"],
-                            None,
-                            "blocked",
-                            message,
-                            {"missing_fields": sorted(missing_fields)},
-                        )
-                        return self._blocked_output(
-                            message, policy_id=policy_cfg["policy_id"]
-                        )
-                    if not isinstance(context.input_data.get("conditions"), dict):
-                        context.input_data["conditions"] = {}
+                    return self._blocked_output(
+                        message, policy_id=policy_cfg.get("policy_id")
+                    )
+
+                if not isinstance(context.input_data.get("conditions"), dict):
+                    context.input_data["conditions"] = {}
+                if isinstance(context.input_data.get("conditions"), dict):
                     context.input_data["conditions"].update(policy_input["conditions"])
 
-                handler = policy_cfg["handler"]
+                handler = policy_cfg.get("handler")
+                if handler is None:
+                    self._log_policy_event(
+                        policy_cfg.get("policy_id", "unknown"),
+                        None,
+                        "skipped",
+                        "Policy handler missing; skipping execution",
+                        {},
+                    )
+                    continue
+
                 findings = handler(tables, policy_input, notifications, policy_cfg)
                 aggregated_findings.extend(findings)
                 display_name = (
@@ -847,25 +1053,25 @@ class OpportunityMinerAgent(BaseAgent):
         return slug or None
 
     def _coerce_policy_rules(self, policy: Dict[str, Any]) -> Dict[str, Any]:
-        details = policy.get("details")
-        if isinstance(details, str):
-            try:
-                details = json.loads(details)
-            except Exception:  # pragma: no cover - defensive
-                details = {}
-        elif isinstance(details, dict):
-            details = dict(details)
-        else:
-            details = {}
-        if not details:
-            extra = policy.get("policy_details")
-            if isinstance(extra, str):
+        details: Dict[str, Any] = {}
+
+        def _merge_details(target: Dict[str, Any], candidate: Any) -> Dict[str, Any]:
+            if isinstance(candidate, str):
                 try:
-                    details = json.loads(extra)
-                except Exception:  # pragma: no cover - defensive
-                    details = {}
-            elif isinstance(extra, dict):
-                details = dict(extra)
+                    candidate = json.loads(candidate)
+                except Exception:  # pragma: no cover - defensive parsing
+                    return target
+            if isinstance(candidate, dict):
+                if not target:
+                    return dict(candidate)
+                merged = dict(target)
+                merged.update(candidate)
+                return merged
+            return target
+
+        for field in ("details", "policy_details", "policy_desc", "description"):
+            details = _merge_details(details, policy.get(field))
+
         rules = details.get("rules") if isinstance(details, dict) else {}
         if isinstance(rules, str):
             try:
@@ -876,6 +1082,10 @@ class OpportunityMinerAgent(BaseAgent):
             rules = dict(rules)
         else:
             rules = {}
+
+        if not rules and isinstance(details, dict):
+            rules = dict(details)
+
         return rules
 
     def _resolve_dynamic_policy_handler(self, slug: str):
@@ -884,6 +1094,166 @@ class OpportunityMinerAgent(BaseAgent):
             "supplier_consolidation_opportunity": self._policy_supplier_consolidation,
         }
         return mapping.get(slug)
+
+    def _decorate_policy_entry(
+        self,
+        key: str,
+        config: Dict[str, Any],
+        provided_policy: Optional[Dict[str, Any]] = None,
+        slug_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        entry = dict(config)
+        policy_name = entry.get("policy_name") or entry.get("detector") or key
+        entry["policy_name"] = policy_name
+        policy_id = entry.get("policy_id") or entry.get("policyId") or key
+        entry["policy_id"] = str(policy_id)
+        key_slug = self._normalise_policy_slug(key)
+        slug = key_slug or slug_hint or self._normalise_policy_slug(policy_name)
+        if not slug:
+            slug = str(key).strip().lower() or str(entry["policy_id"]).strip().lower()
+        entry["policy_slug"] = slug
+
+        alias_set: set[str] = set()
+
+        def _add_alias(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (dict, list, tuple, set)):
+                return
+            text = str(value).strip()
+            if not text:
+                return
+            alias_set.add(text.lower())
+            slugged = self._normalise_policy_slug(text)
+            if slugged:
+                alias_set.add(slugged)
+
+        _add_alias(slug)
+        _add_alias(key)
+        _add_alias(policy_name)
+        _add_alias(entry["policy_id"])
+        _add_alias(entry.get("detector"))
+
+        if provided_policy:
+            entry["source_policy"] = provided_policy
+            for field in (
+                "policyName",
+                "policy_name",
+                "policy_desc",
+                "description",
+                "policyId",
+                "policy_id",
+            ):
+                _add_alias(provided_policy.get(field))
+
+        entry["aliases"] = alias_set
+        return entry
+
+    def _collect_policy_tokens(self, policy: Dict[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+        for field in (
+            "policyId",
+            "policy_id",
+            "id",
+            "policyName",
+            "policy_name",
+            "policy_desc",
+            "description",
+            "detector",
+        ):
+            value = policy.get(field)
+            if value is None or isinstance(value, (dict, list, tuple, set)):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            tokens.add(text.lower())
+            slug = self._normalise_policy_slug(text)
+            if slug:
+                tokens.add(slug)
+        return tokens
+
+    def _filter_registry_by_policies(
+        self,
+        registry: Dict[str, Dict[str, Any]],
+        policies: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(policies, list) or not policies:
+            return {
+                entry["policy_slug"]: entry
+                for key, cfg in registry.items()
+                for entry in [self._decorate_policy_entry(key, cfg)]
+            }
+
+        filtered: Dict[str, Dict[str, Any]] = {}
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            tokens = self._collect_policy_tokens(policy)
+            slug_hint = self._normalise_policy_slug(
+                policy.get("policyName")
+                or policy.get("policy_desc")
+                or policy.get("description")
+            )
+            matched_entry: Optional[Dict[str, Any]] = None
+            for key, cfg in registry.items():
+                probe = self._decorate_policy_entry(key, cfg, slug_hint=slug_hint)
+                aliases = probe.get("aliases", set())
+                if tokens & aliases:
+                    matched_entry = self._decorate_policy_entry(
+                        key, cfg, provided_policy=policy, slug_hint=slug_hint
+                    )
+                    break
+            if not matched_entry:
+                continue
+            rules = self._coerce_policy_rules(policy)
+            if rules:
+                matched_entry["rules"] = rules
+                parameters = rules.get("parameters")
+                if isinstance(parameters, dict) and parameters:
+                    existing_params = (
+                        matched_entry.get("parameters")
+                        if isinstance(matched_entry.get("parameters"), dict)
+                        else {}
+                    )
+                    merged_params = {**existing_params, **parameters}
+                    matched_entry["parameters"] = merged_params
+                    if not matched_entry.get("required_fields"):
+                        matched_entry["required_fields"] = list(merged_params.keys())
+                default_conditions = rules.get("default_conditions")
+                if isinstance(default_conditions, dict) and default_conditions:
+                    existing_defaults = (
+                        matched_entry.get("default_conditions")
+                        if isinstance(matched_entry.get("default_conditions"), dict)
+                        else {}
+                    )
+                    matched_entry["default_conditions"] = {
+                        **existing_defaults,
+                        **default_conditions,
+                    }
+            filtered[matched_entry["policy_slug"]] = matched_entry
+        return filtered
+
+    def _assemble_policy_registry(
+        self, input_data: Dict[str, Any]
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        provided_policies = [
+            policy
+            for policy in input_data.get("policies") or []
+            if isinstance(policy, dict)
+        ]
+        base_registry = self._filter_registry_by_policies(
+            self._get_policy_registry(), provided_policies
+        )
+        dynamic_registry = self._build_dynamic_policy_registry(input_data)
+        registry: Dict[str, Dict[str, Any]] = {}
+        registry.update(base_registry)
+        registry.update(dynamic_registry)
+        if not provided_policies and not registry:
+            registry = self._filter_registry_by_policies(
+                self._get_policy_registry(), []
+            )
+        return registry, provided_policies
 
     def _build_dynamic_policy_registry(
         self, input_data: Dict[str, Any]
@@ -917,7 +1287,8 @@ class OpportunityMinerAgent(BaseAgent):
                     parameters = {}
             if not isinstance(parameters, dict):
                 parameters = {}
-            registry[slug] = {
+            entry = {
+
                 "policy_id": str(
                     policy.get("policyId") or policy.get("policy_id") or slug
                 ),
@@ -935,6 +1306,11 @@ class OpportunityMinerAgent(BaseAgent):
                 "source_policy": policy,
                 "rules": rules,
             }
+            decorated = self._decorate_policy_entry(
+                slug, entry, provided_policy=policy, slug_hint=slug
+            )
+            registry[decorated["policy_slug"]] = decorated
+
         return registry
 
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
@@ -1032,6 +1408,7 @@ class OpportunityMinerAgent(BaseAgent):
             "price_variance_check": {
                 "policy_id": "oppfinderpolicy_001_price_benchmark_variance_detection",
                 "detector": "Price Benchmark Variance",
+                "policy_name": "Price Benchmark Variance",
                 "required_fields": [
                     "supplier_id",
                     "item_id",
@@ -1043,12 +1420,14 @@ class OpportunityMinerAgent(BaseAgent):
             "volume_consolidation_check": {
                 "policy_id": "oppfinderpolicy_003_volume_consolidation",
                 "detector": "Volume Consolidation",
+                "policy_name": "Volume Consolidation",
                 "required_fields": ["minimum_volume_gbp"],
                 "handler": self._policy_volume_consolidation,
             },
             "contract_expiry_check": {
                 "policy_id": "oppfinderpolicy_004_contract_expiry_opportunity",
                 "detector": "Contract Expiry Opportunity",
+                "policy_name": "Contract Expiry Opportunity",
                 "required_fields": ["negotiation_window_days"],
                 "handler": self._policy_contract_expiry,
                 "default_conditions": {"negotiation_window_days": 90},
@@ -1056,48 +1435,56 @@ class OpportunityMinerAgent(BaseAgent):
             "supplier_risk_check": {
                 "policy_id": "oppfinderpolicy_005_supplier_risk_alert",
                 "detector": "Supplier Risk Alert",
+                "policy_name": "Supplier Risk Alert",
                 "required_fields": ["risk_threshold"],
                 "handler": self._policy_supplier_risk,
             },
             "maverick_spend_check": {
                 "policy_id": "oppfinderpolicy_006_maverick_spend_detection",
                 "detector": "Maverick Spend Detection",
+                "policy_name": "Maverick Spend Detection",
                 "required_fields": ["minimum_value_gbp"],
                 "handler": self._policy_maverick_spend,
             },
             "duplicate_supplier_check": {
                 "policy_id": "oppfinderpolicy_007_duplicate_supplier",
                 "detector": "Duplicate Supplier",
+                "policy_name": "Duplicate Supplier",
                 "required_fields": ["minimum_overlap_gbp"],
                 "handler": self._policy_duplicate_supplier,
             },
             "category_overspend_check": {
                 "policy_id": "oppfinderpolicy_008_category_overspend",
                 "detector": "Category Overspend",
+                "policy_name": "Category Overspend",
                 "required_fields": ["category_budgets"],
                 "handler": self._policy_category_overspend,
             },
             "inflation_passthrough_check": {
                 "policy_id": "oppfinderpolicy_009_inflation_pass-through",
                 "detector": "Inflation Pass-Through",
+                "policy_name": "Inflation Pass-Through",
                 "required_fields": ["market_inflation_pct"],
                 "handler": self._policy_inflation_passthrough,
             },
             "unused_contract_value_check": {
                 "policy_id": "oppfinderpolicy_010_unused_contract_value",
                 "detector": "Unused Contract Value",
+                "policy_name": "Unused Contract Value",
                 "required_fields": ["minimum_unused_value_gbp"],
                 "handler": self._policy_unused_contract_value,
             },
             "supplier_performance_check": {
                 "policy_id": "oppfinderpolicy_011_supplier_performance_deviation",
                 "detector": "Supplier Performance Deviation",
+                "policy_name": "Supplier Performance Deviation",
                 "required_fields": ["performance_records"],
                 "handler": self._policy_supplier_performance,
             },
             "esg_opportunity_check": {
                 "policy_id": "oppfinderpolicy_012_esg_opportunity",
                 "detector": "ESG Opportunity",
+                "policy_name": "ESG Opportunity",
                 "required_fields": ["esg_scores"],
                 "handler": self._policy_esg_opportunity,
             },
