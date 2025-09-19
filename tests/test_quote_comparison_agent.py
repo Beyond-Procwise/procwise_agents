@@ -91,6 +91,7 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     comparison = result.data["comparison"]
     assert len(comparison) == 3
     assert comparison[0]["name"] == "weighting"
+    assert "weighting_factors" not in comparison[0]
     suppliers = {row["supplier_id"] for row in comparison if row["name"] != "weighting"}
     assert suppliers == {"S1", "S2"}
     assert comparison[1]["quote_file_s3_path"] == "s3://bucket/s1.pdf"
@@ -154,9 +155,61 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     comparison = result.data["comparison"]
     assert len(comparison) == 2
     assert comparison[0]["name"] == "weighting"
+    assert "weighting_factors" not in comparison[0]
     assert comparison[1]["name"] == "Supplier B"
     assert comparison[1]["supplier_id"] is None
     assert all("unit_price" not in row for row in comparison)
     recommended = result.data.get("recommended_quote")
     assert recommended is not None
     assert recommended["name"] == "Supplier B"
+
+
+def test_quote_comparison_applies_instruction_weights(monkeypatch):
+    nick = DummyNick()
+    agent = QuoteComparisonAgent(nick)
+
+    monkeypatch.setattr(agent, "_read_table", lambda *_args, **_kwargs: pd.DataFrame())
+
+    quotes_payload = [
+        {
+            "name": "weighting",
+            "total_spend": 1.0,
+            "total_cost": 0,
+            "quote_file_s3_path": None,
+            "tenure": None,
+            "volume": None,
+        },
+        {
+            "name": "Supplier A",
+            "supplier_id": "S1",
+            "total_spend": 100,
+            "total_cost": 90,
+            "volume": 10,
+        },
+        {
+            "name": "Supplier B",
+            "supplier_id": "S2",
+            "total_spend": 200,
+            "total_cost": 180,
+            "volume": 20,
+        },
+    ]
+
+    prompts = [
+        {
+            "promptId": 1,
+            "prompts_desc": "{\"metric_weights\": {\"total_cost\": 0.2, \"tenure\": 0.3, \"volume\": 0.5}}",
+        }
+    ]
+
+    context = _build_context(
+        quotes_payload,
+        extra_input={"prompts": prompts},
+    )
+
+    result = agent.run(context)
+
+    weight_entry = result.data["comparison"][0]
+    assert weight_entry["total_cost"] == pytest.approx(0.2)
+    assert weight_entry["tenure"] == pytest.approx(0.3)
+    assert weight_entry["volume"] == pytest.approx(0.5)

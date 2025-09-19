@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from utils.gpu import configure_gpu
+from utils.instructions import parse_instruction_sources
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 # Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
@@ -54,6 +55,143 @@ class SupplierRankingAgent(BaseAgent):
         self.policy_engine = agent_nick.policy_engine
         self.query_engine = agent_nick.query_engine
         self._device = configure_gpu()
+
+    def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(prompt, dict):
+            return sources
+        for field in ("prompt_config", "metadata", "prompts_desc", "template"):
+            value = prompt.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
+        sources: List[Any] = []
+        if not isinstance(policy, dict):
+            return sources
+        for field in ("policy_details", "details", "policy_desc", "description"):
+            value = policy.get(field)
+            if value:
+                sources.append(value)
+        return sources
+
+    def _collect_instruction_bundle(self, context: AgentContext) -> Dict[str, Any]:
+        sources: List[Any] = []
+        for policy in context.input_data.get("policies") or []:
+            sources.extend(self._instruction_sources_from_policy(policy))
+        for prompt in context.input_data.get("prompts") or []:
+            sources.extend(self._instruction_sources_from_prompt(prompt))
+        return parse_instruction_sources(sources)
+
+    def _coerce_numeric_map(self, payload: Any) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric >= 0:
+                    result[str(key).strip()] = numeric
+        elif isinstance(payload, (list, tuple)):
+            for item in payload:
+                if isinstance(item, dict):
+                    result.update(self._coerce_numeric_map(item))
+        elif isinstance(payload, str):
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return self._coerce_numeric_map(parsed)
+        return result
+
+    def _ensure_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                pass
+            return [token.strip() for token in re.split(r"[,;]", text) if token.strip()]
+        return [str(value).strip()]
+
+    def _coerce_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
+        entry = dict(policy)
+        details = entry.get("details")
+        if isinstance(details, str):
+            try:
+                entry["details"] = json.loads(details)
+            except Exception:  # pragma: no cover - defensive
+                entry["details"] = {}
+        elif isinstance(details, dict):
+            entry["details"] = dict(details)
+        else:
+            entry["details"] = {}
+        if not entry["details"]:
+            raw_details = entry.get("policy_details")
+            if isinstance(raw_details, str):
+                try:
+                    entry["details"] = json.loads(raw_details)
+                except Exception:  # pragma: no cover - defensive
+                    entry["details"] = {}
+            elif isinstance(raw_details, dict):
+                entry["details"] = dict(raw_details)
+        rules = entry["details"].get("rules") if isinstance(entry["details"], dict) else {}
+        if isinstance(rules, str):
+            try:
+                entry["details"]["rules"] = json.loads(rules)
+            except Exception:  # pragma: no cover - defensive
+                entry["details"]["rules"] = {}
+        elif isinstance(rules, dict):
+            entry["details"]["rules"] = dict(rules)
+        else:
+            entry["details"]["rules"] = {}
+        return entry
+
+    def _resolve_policy_bundle(self, context: AgentContext) -> List[Dict[str, Any]]:
+        raw = context.input_data.get("policies")
+        bundle: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            for policy in raw:
+                if isinstance(policy, dict):
+                    bundle.append(self._coerce_policy(policy))
+        if bundle:
+            return bundle
+        return [self._coerce_policy(policy) for policy in self.policy_engine.supplier_policies]
+
+    def _find_policy(
+        self, policies: List[Dict[str, Any]], name: str
+    ) -> Optional[Dict[str, Any]]:
+        target = str(name).strip().lower()
+        for policy in policies:
+            policy_name = (
+                policy.get("policyName")
+                or policy.get("policy_name")
+                or policy.get("name")
+                or policy.get("description")
+            )
+            if policy_name and str(policy_name).strip().lower() == target:
+                return policy
+        return None
+
+    def _extract_policy_rules(self, policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not policy:
+            return {}
+        details = policy.get("details")
+        if not isinstance(details, dict):
+            return {}
+        rules = details.get("rules")
+        return dict(rules) if isinstance(rules, dict) else {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,6 +257,9 @@ class SupplierRankingAgent(BaseAgent):
                     error="supplier_data missing 'supplier_id' column",
                 )
 
+        instructions = self._collect_instruction_bundle(context)
+        policy_bundle = self._resolve_policy_bundle(context)
+
         directory_entries = context.input_data.get("supplier_directory") or []
         directory_lookup: Dict[str, Dict[str, Any]] = {}
         directory_map: Dict[str, Optional[str]] = {}
@@ -183,19 +324,34 @@ class SupplierRankingAgent(BaseAgent):
 
         intent = context.input_data.get("intent", {})
         requested = intent.get("parameters", {}).get("criteria", [])
-        weight_policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "WeightAllocationPolicy"
-            ),
-            {},
+        criteria_override = (
+            instructions.get("criteria")
+            or instructions.get("metrics")
+            or instructions.get("focus_metrics")
         )
-        default_weights = (
-            weight_policy.get("details", {})
-            .get("rules", {})
-            .get("default_weights", {})
-        )
+        override_criteria = self._ensure_list(criteria_override)
+        if override_criteria:
+            requested = override_criteria
+            intent.setdefault("parameters", {})["criteria"] = override_criteria
+
+        weight_policy = self._find_policy(policy_bundle, "WeightAllocationPolicy")
+        weight_rules = self._extract_policy_rules(weight_policy)
+        default_weights = weight_rules.get("default_weights", {})
+        override_weights_map: Dict[str, float] = {}
+        for key in ("metric_weights", "weights", "weightings", "default_weights"):
+            override_weights_map = self._coerce_numeric_map(instructions.get(key))
+            if override_weights_map:
+                break
+        if override_weights_map:
+            total_override = sum(override_weights_map.values())
+            if total_override > 0:
+                default_weights = {
+                    metric: value / total_override
+                    for metric, value in override_weights_map.items()
+                    if value >= 0
+                }
+            else:
+                default_weights = override_weights_map
         criteria = requested if requested else list(default_weights.keys())
         weights = {
             crit: default_weights.get(crit, 0.0)
@@ -204,16 +360,9 @@ class SupplierRankingAgent(BaseAgent):
         }
 
         df = self._prepare_scoring_columns(df, weights)
-        scored_df = self._score_categorical_criteria(df, weights.keys())
-        norm_policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "NormalizationDirectionPolicy"
-            ),
-            {},
-        )
-        direction_map = norm_policy.get("details", {}).get("rules", {})
+        scored_df = self._score_categorical_criteria(df, weights.keys(), policy_bundle)
+        norm_policy = self._find_policy(policy_bundle, "NormalizationDirectionPolicy")
+        direction_map = self._extract_policy_rules(norm_policy)
         scored_df = self._normalize_numeric_scores(scored_df, direction_map)
 
         scored_df["final_score"] = 0.0
@@ -236,6 +385,16 @@ class SupplierRankingAgent(BaseAgent):
             query_text = context.input_data.get("query", "")
             match = re.search(r"top[-\s]*(\d+)", query_text, re.IGNORECASE)
             top_n = int(match.group(1)) if match else 3
+        override_top_n = (
+            instructions.get("top_n")
+            or instructions.get("max_suppliers")
+            or instructions.get("supplier_limit")
+        )
+        if override_top_n is not None:
+            try:
+                top_n = int(float(override_top_n))
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
         top_n = max(1, min(int(top_n), len(ranked_df)))
 
         top_df = ranked_df.head(top_n).copy()
@@ -644,19 +803,17 @@ class SupplierRankingAgent(BaseAgent):
             result["payment_terms"] = result.get("po_payment_terms")
         return result
 
-    def _score_categorical_criteria(self, df: pd.DataFrame, criteria: Iterable[str]) -> pd.DataFrame:
+    def _score_categorical_criteria(
+        self,
+        df: pd.DataFrame,
+        criteria: Iterable[str],
+        policies: List[Dict[str, Any]],
+    ) -> pd.DataFrame:
         out = df.copy()
-        policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "CategoricalScoringPolicy"
-            ),
-            None,
-        )
+        policy = self._find_policy(policies, "CategoricalScoringPolicy")
         if not policy:
             return out
-        rules = policy.get("details", {}).get("rules", {})
+        rules = self._extract_policy_rules(policy)
         for crit in criteria:
             raw_col = crit
             score_col = f"{crit}_score"

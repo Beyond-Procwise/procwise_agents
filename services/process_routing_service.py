@@ -4,7 +4,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import re
 from pathlib import Path
 import os
@@ -140,6 +140,90 @@ class ProcessRoutingService:
         return details
 
     @staticmethod
+    def _coerce_identifier_list(value: Any) -> List[int]:
+        """Return a deduplicated list of integer identifiers."""
+
+        if value is None:
+            return []
+
+        if isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+
+        resolved: List[int] = []
+
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, (list, tuple, set)):
+                resolved.extend(ProcessRoutingService._coerce_identifier_list(item))
+                continue
+            if isinstance(item, dict):
+                for key in ("promptId", "policyId", "id"):
+                    if key in item:
+                        resolved.extend(
+                            ProcessRoutingService._coerce_identifier_list(item[key])
+                        )
+                        break
+                continue
+            if isinstance(item, str):
+                token = item.strip()
+                if not token:
+                    continue
+                if "," in token:
+                    resolved.extend(
+                        ProcessRoutingService._coerce_identifier_list(token.split(","))
+                    )
+                    continue
+                try:
+                    number = int(token)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    number = int(item)
+                except (TypeError, ValueError):
+                    continue
+            resolved.append(number)
+
+        deduped: List[int] = []
+        seen: set[int] = set()
+        for number in resolved:
+            if number in seen:
+                continue
+            seen.add(number)
+            deduped.append(number)
+        return deduped
+
+    @classmethod
+    def _normalise_agent_properties(
+        cls, props: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Clean agent property payloads coming from persisted workflows."""
+
+        cleaned: Dict[str, Any] = {}
+        if isinstance(props, dict):
+            for key, value in props.items():
+                if key == "memory":
+                    continue
+                cleaned[key] = value
+
+        llm_value = cleaned.get("llm")
+        if isinstance(llm_value, str):
+            base = llm_value.split(":", 1)[0].strip()
+            cleaned["llm"] = base or llm_value.strip()
+        elif llm_value is None:
+            cleaned["llm"] = None
+        else:
+            cleaned["llm"] = str(llm_value)
+
+        cleaned["prompts"] = cls._coerce_identifier_list(cleaned.get("prompts"))
+        cleaned["policies"] = cls._coerce_identifier_list(cleaned.get("policies"))
+
+        return cleaned
+
+    @staticmethod
     def _canonical_key(raw: str, agent_defs: Dict[str, str]) -> Optional[str]:
         """Normalize a raw agent identifier to a known registry key.
 
@@ -163,8 +247,8 @@ class ProcessRoutingService:
                 return slug
         return None
 
-    @staticmethod
-    def convert_agents_to_flow(details: Dict[str, Any]) -> Dict[str, Any]:
+    @classmethod
+    def convert_agents_to_flow(cls, details: Dict[str, Any]) -> Dict[str, Any]:
         """Convert legacy ``agents`` list into nested agent flow."""
 
         agents = details.get("agents") or []
@@ -227,6 +311,8 @@ class ProcessRoutingService:
                 props["workflow"] = workflow_hint
             else:
                 props.pop("workflow", None)
+
+            props = cls._normalise_agent_properties(props)
 
             flow = {
                 "agent": name,
@@ -343,9 +429,18 @@ class ProcessRoutingService:
             node["agent_type"] = agent_defs.get(base_key, raw_type)
         else:
             base_key = raw_type
-        props = node.setdefault("agent_property", {"llm": None, "prompts": [], "policies": []})
-        props["prompts"] = prompt_map.get(base_key, [])
-        props["policies"] = policy_map.get(base_key, [])
+        raw_props = node.get("agent_property", {"llm": None, "prompts": [], "policies": []})
+        props = self._normalise_agent_properties(raw_props)
+
+        prompt_ids = set(props.get("prompts", []))
+        prompt_ids.update(self._coerce_identifier_list(prompt_map.get(base_key)))
+        props["prompts"] = sorted(prompt_ids)
+
+        policy_ids = set(props.get("policies", []))
+        policy_ids.update(self._coerce_identifier_list(policy_map.get(base_key)))
+        props["policies"] = sorted(policy_ids)
+
+        node["agent_property"] = props
         for branch in ["onSuccess", "onFailure", "onCompletion"]:
             if branch in node:
                 self._enrich_node(node[branch], agent_defs, prompt_map, policy_map)

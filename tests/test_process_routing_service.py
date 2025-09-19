@@ -152,6 +152,32 @@ def test_convert_agents_to_flow_handles_reverse_dependencies():
     assert flow["onSuccess"]["onFailure"]["agent"] == "A3"
 
 
+def test_convert_agents_to_flow_normalises_properties():
+    details = {
+        "status": "saved",
+        "agents": [
+            {
+                "agent": "A1",
+                "status": "saved",
+                "agent_property": {
+                    "llm": "llama3.2:latest",
+                    "memory": "3.2B",
+                    "prompts": ["1", "2", "1"],
+                    "policies": [{"policyId": "3"}, "4"],
+                },
+                "dependencies": {},
+            }
+        ],
+    }
+
+    flow = ProcessRoutingService.convert_agents_to_flow(details)
+    props = flow["agent_property"]
+    assert props["llm"] == "llama3.2"
+    assert props["prompts"] == [1, 2]
+    assert props["policies"] == [3, 4]
+    assert "memory" not in props
+
+
 class FetchCursor:
     def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details
@@ -201,22 +227,34 @@ def test_get_process_details_enriches_agent_data():
     proc_details = {
         "status": "saved",
         "agent_type": "supplier_ranking_123",
-        "agent_property": {"llm": None, "prompts": [], "policies": []},
+        "agent_property": {
+            "llm": "llama3.2:latest",
+            "memory": "3.2B",
+            "prompts": [],
+            "policies": [],
+        },
     }
-    conn = FetchConn(
-        proc_details,
-        [(1, "{supplier_ranking}")],
-        [(2, "{supplier_ranking}")],
-    )
+    prompt_rows = [(1, "hello", "{supplier_ranking}")]
+    policy_rows = [
+        (2, "Example policy", json.dumps({"rules": {}}), "{supplier_ranking}"),
+    ]
+    conn = FetchConn(proc_details, prompt_rows, policy_rows)
     agent = SimpleNamespace(
         get_db_connection=lambda: conn,
         settings=SimpleNamespace(script_user="tester"),
     )
     prs = ProcessRoutingService(agent)
+    prs._load_agent_links = lambda: (
+        {"supplier_ranking": "SupplierRankingAgent"},
+        {"supplier_ranking": [1]},
+        {"supplier_ranking": [2]},
+    )
     details = prs.get_process_details(1)
     assert details["agent_type"] == "SupplierRankingAgent"
     assert details["agent_property"]["prompts"] == [1]
     assert details["agent_property"]["policies"] == [2]
+    assert details["agent_property"]["llm"] == "llama3.2"
+    assert "memory" not in details["agent_property"]
 
 
 def test_get_process_details_handles_prefixed_agent_names():
