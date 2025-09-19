@@ -25,6 +25,7 @@ class ProcessRoutingService:
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
+        self._agent_defaults_cache: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -372,6 +373,8 @@ class ProcessRoutingService:
         agent_defs: Dict[str, str] = {}
         prompt_map: Dict[str, list[int]] = {}
         policy_map: Dict[str, list[int]] = {}
+        default_props: Dict[str, Dict[str, Any]] = {}
+        default_ts: Dict[str, datetime] = {}
 
         # Load agent definitions from the bundled JSON file instead of the DB
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
@@ -386,6 +389,44 @@ class ProcessRoutingService:
                 slug = slug[:-6]
             agent_defs[slug] = agent_class
             agent_defs[str(item.get("agentId"))] = agent_class
+
+        def _coerce_timestamp(value: Any) -> datetime:
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        def _parse_agent_property(payload: Any) -> Optional[Dict[str, Any]]:
+            if payload is None:
+                return None
+            if isinstance(payload, dict):
+                return dict(payload)
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode()
+            if isinstance(payload, str):
+                text = payload.strip()
+                if not text:
+                    return None
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    logger.debug("Failed to parse agent_property JSON: %s", text)
+                    return None
+                if isinstance(parsed, dict):
+                    return parsed
+                return None
+            return None
+
+        def _record_default(slug: Optional[str], props: Dict[str, Any], modified: Any, created: Any) -> None:
+            if not slug or not isinstance(props, dict):
+                return
+            timestamp = _coerce_timestamp(modified or created)
+            existing = default_ts.get(slug)
+            if existing is not None and existing >= timestamp:
+                return
+            default_ts[slug] = timestamp
+            default_props[slug] = props
 
         try:
             with self.agent_nick.get_db_connection() as conn:
@@ -413,9 +454,32 @@ class ProcessRoutingService:
                     for pid, linked in cursor.fetchall():
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
                             _record(policy_map, key, pid)
+
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT agent_type, agent_name, agent_property, modified_time, created_time
+                        FROM proc.agent
+                        WHERE agent_property IS NOT NULL
+                        """
+                    )
+                    for agent_type, agent_name, props_payload, modified, created in cursor.fetchall():
+                        parsed = _parse_agent_property(props_payload)
+                        if not parsed:
+                            continue
+                        normalized = self._normalise_agent_properties(parsed)
+                        slug: Optional[str] = None
+                        for candidate in (agent_type, agent_name):
+                            slug = self._canonical_key(str(candidate or ""), agent_defs)
+                            if slug:
+                                break
+                        if not slug:
+                            continue
+                        _record_default(slug, normalized, modified, created)
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load agent linkage metadata")
 
+        self._agent_defaults_cache = dict(default_props)
         return agent_defs, prompt_map, policy_map
 
     def _enrich_node(self, node, agent_defs, prompt_map, policy_map):
@@ -431,6 +495,29 @@ class ProcessRoutingService:
             base_key = raw_type
         raw_props = node.get("agent_property", {"llm": None, "prompts": [], "policies": []})
         props = self._normalise_agent_properties(raw_props)
+
+        defaults_map = getattr(self, "_agent_defaults_cache", {}) or {}
+        default_props = defaults_map.get(base_key) or {}
+        merged_props: Dict[str, Any] = dict(default_props)
+
+        for key, value in props.items():
+            if key in {"prompts", "policies"}:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, dict) and isinstance(merged_props.get(key), dict):
+                combined = dict(merged_props[key])
+                combined.update(value)
+                merged_props[key] = combined
+            else:
+                merged_props[key] = value
+
+        for field in ("prompts", "policies"):
+            combined_ids = set(self._coerce_identifier_list(default_props.get(field)))
+            combined_ids.update(self._coerce_identifier_list(props.get(field)))
+            merged_props[field] = sorted(combined_ids)
+
+        props = self._normalise_agent_properties(merged_props)
 
         prompt_ids = set(props.get("prompts", []))
         prompt_ids.update(self._coerce_identifier_list(prompt_map.get(base_key)))

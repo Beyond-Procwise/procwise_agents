@@ -278,6 +278,35 @@ def test_get_process_details_handles_prefixed_agent_names():
     assert details["agent_type"] == "QuoteEvaluationAgent"
 
 
+def test_enrich_node_applies_agent_defaults():
+    agent = SimpleNamespace(settings=SimpleNamespace(script_user="tester"))
+    prs = ProcessRoutingService(agent)
+    prs._agent_defaults_cache = {
+        "opportunity_miner": {
+            "llm": "llama3",
+            "prompts": [50],
+            "policies": [9],
+            "conditions": {"negotiation_window_days": 30},
+        }
+    }
+
+    node = {
+        "agent_type": "opportunity_miner",
+        "agent_property": {"prompts": [51], "conditions": {"negotiation_window_days": 60}},
+    }
+
+    agent_defs = {"opportunity_miner": "OpportunityMinerAgent"}
+    prompt_map = {"opportunity_miner": [52]}
+    policy_map = {"opportunity_miner": [10]}
+
+    prs._enrich_node(node, agent_defs, prompt_map, policy_map)
+
+    props = node["agent_property"]
+    assert props["llm"] == "llama3"
+    assert props["prompts"] == [50, 51, 52]
+    assert props["policies"] == [9, 10]
+    assert props["conditions"]["negotiation_window_days"] == 60
+
 def test_update_agent_status_preserves_structure():
     initial = {
         "status": "",

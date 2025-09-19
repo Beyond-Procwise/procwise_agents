@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -13,9 +14,96 @@ from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 
 
+def _opportunity_policy_rows():
+    def row(pid: int, identifier: str, name: str, parameters: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None):
+        details: Dict[str, Any] = {
+            "policy_identifier": identifier,
+            "rules": {"parameters": parameters},
+        }
+        if defaults:
+            details["rules"]["default_conditions"] = defaults
+        return {
+            "policy_id": pid,
+            "policy_name": name,
+            "policy_type": "opportunity_mining",
+            "policy_desc": identifier,
+            "policy_details": json.dumps(details),
+        }
+
+    return [
+        row(
+            1,
+            "oppfinderpolicy_001_price_benchmark_variance_detection",
+            "Price Benchmark Variance",
+            {"variance_threshold_pct": 0.05},
+        ),
+        row(
+            3,
+            "oppfinderpolicy_003_volume_consolidation",
+            "Volume Consolidation",
+            {"minimum_volume_gbp": 1000},
+        ),
+        row(
+            4,
+            "oppfinderpolicy_004_contract_expiry_opportunity",
+            "Contract Expiry Opportunity",
+            {"negotiation_window_days": 90},
+            {"negotiation_window_days": 90},
+        ),
+        row(
+            5,
+            "oppfinderpolicy_005_supplier_risk_alert",
+            "Supplier Risk Alert",
+            {"risk_threshold": 0.7},
+        ),
+        row(
+            6,
+            "oppfinderpolicy_006_maverick_spend_detection",
+            "Maverick Spend Detection",
+            {"minimum_value_gbp": 5000},
+        ),
+        row(
+            7,
+            "oppfinderpolicy_007_duplicate_supplier",
+            "Duplicate Supplier",
+            {"minimum_overlap_gbp": 10000},
+        ),
+        row(
+            8,
+            "oppfinderpolicy_008_category_overspend",
+            "Category Overspend",
+            {"category_budgets": {"CatA": 100000}},
+        ),
+        row(
+            9,
+            "oppfinderpolicy_009_inflation_pass-through",
+            "Inflation Pass-Through",
+            {"market_inflation_pct": 0.02},
+        ),
+        row(
+            10,
+            "oppfinderpolicy_010_unused_contract_value",
+            "Unused Contract Value",
+            {"minimum_unused_value_gbp": 1000},
+        ),
+        row(
+            11,
+            "oppfinderpolicy_011_supplier_performance_deviation",
+            "Supplier Performance Deviation",
+            {"performance_records": {}},
+        ),
+        row(
+            12,
+            "oppfinderpolicy_012_esg_opportunity",
+            "ESG Opportunity",
+            {"esg_scores": []},
+        ),
+    ]
+
+
 class DummyNick:
     def __init__(self):
-        self.policy_engine = PolicyEngine()
+        self.policy_engine = PolicyEngine(policy_rows=_opportunity_policy_rows())
         self.settings = SimpleNamespace(script_user="tester")
 
 
@@ -30,6 +118,41 @@ def test_price_expression_falls_back_to_unit_price(monkeypatch):
 
     expr = agent._price_expression("proc", "po_line_items_agent", "li")
     assert expr == "li.unit_price"
+
+
+def test_build_finding_includes_policy_identifier():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    finding_a = agent._build_finding(
+        "VolumeDiscountOpportunity",
+        "SI0001",
+        "CatA",
+        "Item-1",
+        100.0,
+        {},
+        ["PO1"],
+        policy_id="policy_9",
+        policy_name="Volume Discount Opportunity",
+    )
+    finding_b = agent._build_finding(
+        "VolumeDiscountOpportunity",
+        "SI0001",
+        "CatA",
+        "Item-1",
+        100.0,
+        {},
+        ["PO1"],
+        policy_id="policy_10",
+        policy_name="Volume Discount Opportunity",
+    )
+
+    assert finding_a.policy_id == "policy_9"
+    assert finding_b.policy_id == "policy_10"
+    assert finding_a.opportunity_id != finding_b.opportunity_id
+    assert "policy_9" in finding_a.opportunity_id
+    assert "policy_10" in finding_b.opportunity_id
 
 
 def _sample_tables() -> Dict[str, Any]:

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
@@ -37,7 +36,6 @@ with warnings.catch_warnings():
         category=UserWarning,
     )
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 logger = logging.getLogger(__name__)
 
 
@@ -46,12 +44,8 @@ class SupplierRankingAgent(BaseAgent):
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.prompt_library = self._load_json_file(
-            "prompts/SupplierRankingAgent_PromptLibrary.json"
-        )
-        self.justification_template = self._load_json_file(
-            "prompts/Justification_Tag_Prompt_Template.json"
-        )
+        self.prompt_library: Dict[str, Any] = {}
+        self.justification_template: Dict[str, Any] = {}
         self.policy_engine = agent_nick.policy_engine
         self.query_engine = agent_nick.query_engine
         self._device = configure_gpu()
@@ -83,6 +77,79 @@ class SupplierRankingAgent(BaseAgent):
         for prompt in context.input_data.get("prompts") or []:
             sources.extend(self._instruction_sources_from_prompt(prompt))
         return parse_instruction_sources(sources)
+
+    def _ingest_prompt_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        if payload.get("templates") and not self.prompt_library:
+            self.prompt_library = dict(payload)
+        if payload.get("prompt_template") and not self.justification_template:
+            self.justification_template = dict(payload)
+
+    def _load_prompt_from_db(self, prompt_id: int) -> None:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT prompts_desc FROM proc.prompt WHERE prompt_id = %s",
+                        (prompt_id,),
+                    )
+                    row = cursor.fetchone()
+            if not row:
+                return
+            raw = row[0]
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode(errors="ignore")
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    return
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    return
+            elif isinstance(raw, dict):
+                payload = raw
+            else:
+                return
+            self._ingest_prompt_payload(payload)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load prompt %s from database", prompt_id)
+
+    def _ensure_prompt_assets(self, context: AgentContext) -> None:
+        if self.prompt_library and self.justification_template:
+            return
+
+        seen_ids: set[int] = set()
+        for prompt in context.input_data.get("prompts") or []:
+            if not isinstance(prompt, dict):
+                continue
+            self._ingest_prompt_payload(prompt)
+            pid = prompt.get("promptId")
+            try:
+                if pid is not None:
+                    seen_ids.add(int(pid))
+            except (TypeError, ValueError):
+                continue
+
+        if (not self.prompt_library or not self.justification_template) and seen_ids:
+            for pid in seen_ids:
+                if self.prompt_library and self.justification_template:
+                    break
+                self._load_prompt_from_db(pid)
+
+        if not self.prompt_library:
+            self.prompt_library = {"templates": []}
+        if not self.justification_template:
+            self.justification_template = {
+                "prompt_template": (
+                    "Supplier {supplier_name} achieved a final score of {final_score:.2f}."
+                    "\n{score_breakdown}"
+                )
+            }
 
     def _coerce_numeric_map(self, payload: Any) -> Dict[str, float]:
         result: Dict[str, float] = {}
@@ -256,6 +323,8 @@ class SupplierRankingAgent(BaseAgent):
                     data={},
                     error="supplier_data missing 'supplier_id' column",
                 )
+
+        self._ensure_prompt_assets(context)
 
         instructions = self._collect_instruction_bundle(context)
 
@@ -926,11 +995,3 @@ class SupplierRankingAgent(BaseAgent):
         counter = Counter(cleaned)
         return [val for val, _ in counter.most_common(limit)]
 
-    def _load_json_file(self, rel_path: str) -> dict:
-        path = os.path.join(PROJECT_ROOT, rel_path)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception as exc:  # pragma: no cover - configuration error
-            logger.critical("Failed to load JSON at %s: %s", path, exc)
-            return {}

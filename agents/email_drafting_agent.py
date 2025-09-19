@@ -14,7 +14,6 @@ import threading
 import uuid
 from datetime import datetime
 from html import escape
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from jinja2 import Template
@@ -27,14 +26,30 @@ logger = logging.getLogger(__name__)
 
 configure_gpu()
 
-PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "prompts"
-    / "EmailDraftingAgent_Prompt_Template.json"
+DEFAULT_PROMPT_TEMPLATE = (
+    "[Subject]\n\n"
+    "Request for Quotation (RFQ) – Office Furniture\n\n"
+    "[Greeting Block]\n\n"
+    "Dear {supplier_contact_name},\n\n"
+    "[Introduction and Context]\n\n"
+    "We are requesting a quotation for the following items/services as part of our sourcing process.\n"
+    "Please complete the table in full to ensure your proposal can be evaluated accurately.\n\n"
+    "[Structured Pricing & Commercial Table]\n\n"
+    "Item ID Description  UOM  Qty  Unit Price (Currency)  Extended Price  Delivery Lead Time (days)  "
+    "Payment Terms (days)  Warranty / Support  Contract Ref  Comments\n\n"
+    "[Terms & Conditions Confirmation]\n\n"
+    "Please confirm one of the following options:\n\n"
+    "[ ] I accept Your Company’s Standard Terms & Conditions\n    (https://yourcompany.com/procurement-terms)\n\n"
+    "[ ] I wish to proceed under my current contract with Your Company:\n"
+    "    Contract Number [__________]\n\n"
+    "[Submission Instructions]\n\n"
+    "Deadline for submission: {submission_deadline}\n\n"
+    "Please return the completed table and confirmation via reply to this email.\n"
+    "For queries, contact {category_manager_name}, {category_manager_title}, {category_manager_email}.\n\n"
+    "[Closing Block]\n\n"
+    "Thank you for your response. We look forward to your proposal.\n\n"
+    "Kind regards,\n{your_name}\n{your_title}\n{your_company}"
 )
-
-with PROMPT_PATH.open("r", encoding="utf-8") as fp:
-    PROMPT_TEMPLATE = json.load(fp)["prompt_template"]
 
 _RFQ_TABLE_COLUMNS: List[str] = [
     "Item Description",
@@ -109,6 +124,7 @@ class EmailDraftingAgent(BaseAgent):
         super().__init__(agent_nick)
         self._draft_table_checked = False
         self._draft_table_lock = threading.Lock()
+        self.prompt_template = DEFAULT_PROMPT_TEMPLATE
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -119,6 +135,96 @@ class EmailDraftingAgent(BaseAgent):
             if value:
                 sources.append(value)
         return sources
+
+    def _extract_prompt_template(self, prompt: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(prompt, dict):
+            return None
+        payload: Any = (
+            prompt.get("prompts_desc")
+            or prompt.get("template")
+            or prompt.get("prompt_template")
+        )
+        if isinstance(payload, dict):
+            template = payload.get("prompt_template") or payload.get("template")
+            return str(template) if template else None
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode(errors="ignore")
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text
+            if isinstance(parsed, dict):
+                template = parsed.get("prompt_template") or parsed.get("template")
+                return str(template) if template else None
+            return text
+        return None
+
+    def _load_prompt_template_from_db(self, prompt_id: int) -> Optional[str]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT prompts_desc FROM proc.prompt WHERE prompt_id = %s",
+                        (prompt_id,),
+                    )
+                    row = cursor.fetchone()
+            if not row:
+                return None
+            payload = row[0]
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode(errors="ignore")
+            if isinstance(payload, str):
+                payload = payload.strip()
+                if not payload:
+                    return None
+                try:
+                    parsed = json.loads(payload)
+                except Exception:
+                    return payload
+                if isinstance(parsed, dict):
+                    template = parsed.get("prompt_template") or parsed.get("template")
+                    return str(template) if template else None
+                return None
+            if isinstance(payload, dict):
+                template = payload.get("prompt_template") or payload.get("template")
+                return str(template) if template else None
+            return None
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load prompt %s for email drafting", prompt_id)
+            return None
+
+    def _ensure_prompt_template(self, context: AgentContext) -> None:
+        if self.prompt_template and self.prompt_template != DEFAULT_PROMPT_TEMPLATE:
+            return
+
+        seen_ids: set[int] = set()
+        for prompt in context.input_data.get("prompts") or []:
+            template = self._extract_prompt_template(prompt)
+            if template:
+                self.prompt_template = template
+            pid = prompt.get("promptId") if isinstance(prompt, dict) else None
+            try:
+                if pid is not None:
+                    seen_ids.add(int(pid))
+            except (TypeError, ValueError):
+                continue
+
+        if (self.prompt_template == DEFAULT_PROMPT_TEMPLATE or not self.prompt_template) and seen_ids:
+            for pid in seen_ids:
+                template = self._load_prompt_template_from_db(pid)
+                if template:
+                    self.prompt_template = template
+                    break
+
+        if not self.prompt_template:
+            self.prompt_template = DEFAULT_PROMPT_TEMPLATE
 
     def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -224,6 +330,7 @@ class EmailDraftingAgent(BaseAgent):
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
         logger.info("EmailDraftingAgent starting with input %s", context.input_data)
+        self._ensure_prompt_template(context)
         data = dict(context.input_data)
         prev = data.get("previous_agent_output")
         if isinstance(prev, str):
@@ -452,7 +559,7 @@ class EmailDraftingAgent(BaseAgent):
             self._store_draft(manual_draft)
 
         logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
-        output_data: Dict[str, Any] = {"drafts": drafts, "prompt": PROMPT_TEMPLATE}
+        output_data: Dict[str, Any] = {"drafts": drafts, "prompt": self.prompt_template}
         if manual_subject_rendered is not None:
             output_data["subject"] = manual_subject_rendered
         if manual_body_rendered is not None:
