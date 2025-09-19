@@ -1,6 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any, Dict
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -76,6 +77,66 @@ def test_json_flow_inherits_payload_when_input_missing():
     payload = {"foo": "bar"}
     orchestrator.execute_agent_flow(flow, payload)
     assert agent.received == payload
+
+
+def test_json_flow_injects_proc_agent_prompts_and_policies():
+    captured: Dict[str, Any] = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = dict(context.input_data)
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    class DummyPRS:
+        def __init__(self):
+            self._agent_defaults_cache = {
+                "opportunity_miner": {
+                    "llm": "llama3",
+                    "prompts": [50],
+                    "policies": [9],
+                }
+            }
+
+        def _load_agent_links(self):  # pragma: no cover - cache primed
+            return {}, {}, {}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": CaptureAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        process_routing_service=DummyPRS(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {
+        50: {"promptId": 50, "template": "from-db"}
+    }
+    orchestrator._load_policies = lambda: {
+        9: {"policyId": 9, "policy_desc": "{}"}
+    }
+
+    flow = {
+        "entrypoint": "start",
+        "steps": {
+            "start": {
+                "agent": "opportunity_miner",
+            }
+        },
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    input_data = captured.get("input", {})
+    prompts = input_data.get("prompts") or []
+    policies = input_data.get("policies") or []
+    assert input_data.get("llm") == "llama3"
+    assert any(p.get("promptId") == 50 for p in prompts)
+    assert any(p.get("policyId") == 9 for p in policies)
 
 
 class DummyAgent:
@@ -397,6 +458,150 @@ def test_execute_agent_flow_handles_prefixed_agent_names():
     assert flow["status"] == 100
     assert agent.ran is True
 
+
+def test_inject_agent_instructions_uses_agent_defaults():
+    class DummyPRS:
+        def __init__(self):
+            self._agent_defaults_cache = {
+                "opportunity_miner": {
+                    "llm": "llama3",
+                    "prompts": [50],
+                    "policies": [9],
+                    "conditions": {"negotiation_window_days": 45},
+                }
+            }
+
+        def _load_agent_links(self):  # pragma: no cover - not triggered
+            return {}, {}, {}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1, parallel_processing=False),
+        agents={"opportunity_miner": DummyAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        process_routing_service=DummyPRS(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {
+        50: {"promptId": 50, "template": "workflow: dynamic"}
+    }
+    orchestrator._load_policies = lambda: {
+        9: {"policyId": 9, "policy_desc": "{}"}
+    }
+
+    payload = {"conditions": {"existing": True}}
+    orchestrator._inject_agent_instructions("opportunity_miner", payload)
+
+    assert payload["llm"] == "llama3"
+    assert payload["conditions"]["negotiation_window_days"] == 45
+    assert payload["conditions"]["existing"] is True
+    assert any(p.get("promptId") == 50 for p in payload["prompts"])
+    assert any(p.get("policyId") == 9 for p in payload["policies"])
+
+
+def test_supplier_ranking_flow_applies_agent_prompts_and_policies():
+    seen: Dict[str, Any] = {}
+
+    class CaptureOpportunityAgent:
+        def execute(self, context):
+            seen["opportunity_prompts"] = context.input_data.get("prompts")
+            seen["opportunity_policies"] = context.input_data.get("policies")
+            pass_fields = {
+                "supplier_candidates": ["S1"],
+                "supplier_directory": [
+                    {"supplier_id": "S1", "supplier_name": "Acme Corp"}
+                ],
+                "findings": [],
+            }
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=pass_fields,
+                pass_fields=pass_fields,
+            )
+
+    class CaptureRankingAgent:
+        def execute(self, context):
+            seen["ranking_prompts"] = context.input_data.get("prompts")
+            seen["ranking_policies"] = context.input_data.get("policies")
+            ranking_payload = {"ranking": [{"supplier_id": "S1"}]}
+            pass_fields = {
+                "ranking": ranking_payload,
+                "supplier_candidates": context.input_data.get("supplier_candidates", []),
+            }
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"ranking": ranking_payload},
+                pass_fields=pass_fields,
+            )
+
+    class CaptureEmailAgent:
+        def execute(self, context):
+            seen["email_prompts"] = context.input_data.get("prompts")
+            seen["email_policies"] = context.input_data.get("policies")
+            return AgentOutput(status=AgentStatus.SUCCESS, data={"drafts": []})
+
+    class DummyPRS:
+        def __init__(self):
+            self._agent_defaults_cache = {
+                "opportunity_miner": {"prompts": [50], "policies": [9]},
+                "supplier_ranking": {"prompts": [200], "policies": [25]},
+            }
+
+        def _load_agent_links(self):  # pragma: no cover - cache already primed
+            return {}, {}, {}
+
+    class AllowAllPolicy:
+        def validate_workflow(self, *_, **__):  # pragma: no cover - simple stub
+            return {"allowed": True}
+
+    class StubQueryEngine:
+        def fetch_supplier_data(self, *_):  # pragma: no cover - simple stub
+            return [{"supplier_id": "S1"}]
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1, parallel_processing=False),
+        agents={
+            "opportunity_miner": CaptureOpportunityAgent(),
+            "supplier_ranking": CaptureRankingAgent(),
+            "email_drafting": CaptureEmailAgent(),
+        },
+        policy_engine=AllowAllPolicy(),
+        query_engine=StubQueryEngine(),
+        routing_engine=SimpleNamespace(routing_model={}),
+        process_routing_service=DummyPRS(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent",
+        "supplier_ranking": "SupplierRankingAgent",
+        "email_drafting": "EmailDraftingAgent",
+    }
+    orchestrator._load_prompts = lambda: {
+        50: {"promptId": 50, "template": "workflow: contract_expiry_check"},
+        200: {"promptId": 200, "template": "criteria: risk"},
+    }
+    orchestrator._load_policies = lambda: {
+        9: {"policyId": 9, "policy_desc": "{}"},
+        25: {"policyId": 25, "policy_desc": "{\"rules\": {}}"},
+    }
+
+    result = orchestrator.execute_workflow("supplier_ranking", {"query": "top 1"})
+
+    assert result["status"] == "completed"
+    opportunity_prompts = seen.get("opportunity_prompts") or []
+    ranking_prompts = seen.get("ranking_prompts") or []
+    assert any(p.get("promptId") == 50 for p in opportunity_prompts)
+    assert any(p.get("promptId") == 200 for p in ranking_prompts)
+    opportunity_policies = seen.get("opportunity_policies") or []
+    ranking_policies = seen.get("ranking_policies") or []
+    assert any(p.get("policyId") == 9 for p in opportunity_policies)
+    assert any(p.get("policyId") == 25 for p in ranking_policies)
 
 def test_execute_agent_flow_passes_fields_to_children():
     class ParentAgent:

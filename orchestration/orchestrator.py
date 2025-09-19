@@ -310,56 +310,38 @@ class Orchestrator:
         return details
 
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
-        """Load prompt templates keyed by ``promptId``.
-
-        The ``prompts_desc`` field in ``proc.prompt`` stores free-form text
-        rather than JSON.  Each row may also reference one or more linked
-        agents via ``linked_agents`` which are resolved into agent metadata.
-        A file-system fallback is used when the database is unavailable.
-        """
+        """Load prompt templates keyed by ``promptId`` from :class:`PromptEngine`."""
 
         if self._prompt_cache is not None:
             return dict(self._prompt_cache)
 
-        prompts: Dict[int, Dict[str, Any]] = {}
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT prompt_id, prompts_desc, prompt_linked_agents"
-                        " FROM proc.prompt WHERE prompts_desc IS NOT NULL"
-                    )
-                    rows = cursor.fetchall()
-                for pid, desc, linked in rows:
-                    if not desc:
-                        continue
-                    desc_text = str(desc)
-                    value = {
-                        "promptId": int(pid),
-                        "template": desc_text,
-                        "prompts_desc": desc_text,
-                        "agents": self._get_agent_details(linked),
-                    }
-                    prompts[int(pid)] = value
-            if prompts:
-                self._prompt_cache = prompts
-                return dict(prompts)
-        except Exception:  # pragma: no cover - defensive fall back
-            logger.exception("Failed to load prompts from DB, falling back to file")
+        prompt_engine = getattr(self.agent_nick, "prompt_engine", None)
+        if prompt_engine is None:
+            from orchestration.prompt_engine import PromptEngine  # local import to avoid cycles
 
-        path = Path(__file__).resolve().parents[1] / "prompts" / "prompts.json"
-        with path.open() as f:
-            data = json.load(f)
-        templates = data.get("templates", [])
-        result: Dict[int, Dict[str, Any]] = {}
-        for template in templates:
-            if "promptId" not in template:
-                continue
-            entry = dict(template)
-            entry.setdefault("prompts_desc", entry.get("template", ""))
-            result[int(entry["promptId"])] = entry
-        self._prompt_cache = result
-        return dict(result)
+            prompt_engine = PromptEngine(self.agent_nick)
+            setattr(self.agent_nick, "prompt_engine", prompt_engine)
+
+        try:
+            catalog = prompt_engine.prompts_by_id()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load prompts from prompt engine")
+            self._prompt_cache = {}
+            return {}
+
+        prompts: Dict[int, Dict[str, Any]] = {}
+        for pid, prompt in catalog.items():
+            entry = dict(prompt)
+            linked = prompt.get("linked_agents") or prompt.get("agents")
+            if isinstance(linked, (list, tuple, set)):
+                linked_spec = "{" + ",".join(str(item) for item in linked) + "}"
+            else:
+                linked_spec = linked
+            entry["agents"] = self._get_agent_details(linked_spec)
+            prompts[int(pid)] = entry
+
+        self._prompt_cache = dict(prompts)
+        return dict(prompts)
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
@@ -410,26 +392,12 @@ class Orchestrator:
                         "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value
-            if policies:
-                self._policy_cache = policies
-                return dict(policies)
-        except Exception:  # pragma: no cover - defensive fall back
-            logger.exception("Failed to load policies from DB, falling back to files")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load policies from DB")
+            self._policy_cache = {}
+            return {}
 
-        policy_dir = Path(__file__).resolve().parents[1] / "policies"
-        idx = 1
-        for file in sorted(policy_dir.glob("*.json")):
-            with file.open() as f:
-                items = json.load(f)
-            for item in items:
-                entry = dict(item)
-                policy_id = int(entry.get("policyId", idx))
-                entry.setdefault("policyId", policy_id)
-                entry.setdefault("policy_desc", entry.get("description", ""))
-                entry.setdefault("details", entry.get("details", {}))
-                policies[policy_id] = entry
-                idx = max(idx, policy_id) + 1
-        self._policy_cache = policies
+        self._policy_cache = dict(policies)
         return dict(policies)
 
 
@@ -778,6 +746,13 @@ class Orchestrator:
                 agent_key=agent_key,
             )
 
+            # Ensure that database-backed defaults from ``proc.agent`` are
+            # applied consistently so that agents receive their configured
+            # prompts and policies even when the JSON flow omits them.  Without
+            # this injection the orchestrator would pass only the static flow
+            # payload which led to the agents operating on stale instructions.
+            self._inject_agent_instructions(agent_key, agent_input)
+
             success = False
             attempt = 0
             result = None
@@ -1007,14 +982,53 @@ class Orchestrator:
         if not isinstance(input_data, dict):
             return
 
-        prompts_present = bool(input_data.get("prompts"))
-        policies_present = bool(input_data.get("policies"))
-        if prompts_present and policies_present:
-            return
-
         agent_defs = self._load_agent_definitions()
         canonical = self._canonical_key(agent_key, agent_defs) or self._resolve_agent_name(agent_key)
         canonical = canonical or agent_key
+
+        default_config: Dict[str, Any] = {}
+        prs = getattr(self.agent_nick, "process_routing_service", None)
+        if prs is not None:
+            defaults_map = getattr(prs, "_agent_defaults_cache", None)
+            if defaults_map is None:
+                try:  # pragma: no cover - cache priming
+                    prs._load_agent_links()
+                    defaults_map = getattr(prs, "_agent_defaults_cache", {})
+                except Exception:
+                    logger.exception("Failed to load agent defaults for %s", agent_key)
+                    defaults_map = {}
+            if isinstance(defaults_map, dict):
+                default_config = dict(defaults_map.get(canonical, {}))
+
+        default_llm = default_config.get("llm")
+        if default_llm and not input_data.get("llm"):
+            input_data["llm"] = default_llm
+
+        for key, value in default_config.items():
+            if key in {"llm", "prompts", "policies"}:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                existing = input_data.get(key)
+                if isinstance(existing, dict):
+                    merged = dict(value)
+                    merged.update(existing)
+                    input_data[key] = merged
+                elif key not in input_data:
+                    input_data[key] = dict(value)
+            elif key not in input_data:
+                input_data[key] = value
+
+        prompts_catalog = self._load_prompts()
+        policies_catalog = self._load_policies()
+
+        default_prompt_ids = ProcessRoutingService._coerce_identifier_list(
+            default_config.get("prompts")
+        )
+        default_policy_ids = ProcessRoutingService._coerce_identifier_list(
+            default_config.get("policies")
+        )
 
         def _merge(target_key: str, items: List[Dict[str, Any]], identifier: str) -> None:
             if not items:
@@ -1037,25 +1051,39 @@ class Orchestrator:
                 if ident is not None:
                     seen.add(ident)
 
-        if not prompts_present:
-            prompt_objs: List[Dict[str, Any]] = []
-            for prompt in self._load_prompts().values():
+        prompt_objs: List[Dict[str, Any]] = []
+        for pid in default_prompt_ids:
+            prompt = prompts_catalog.get(pid) if isinstance(prompts_catalog, dict) else None
+            if prompt:
+                prompt_objs.append(dict(prompt))
+            else:  # pragma: no cover - defensive logging
+                logger.warning("Default prompt id %s not found for agent %s", pid, canonical)
+
+        if not prompt_objs and not input_data.get("prompts"):
+            for prompt in (prompts_catalog.values() if isinstance(prompts_catalog, dict) else []):
                 for meta in prompt.get("agents", []):
                     slug = meta.get("agent_type") or self._resolve_agent_name(meta.get("agent_name"))
                     if slug == canonical:
                         prompt_objs.append(dict(prompt))
                         break
-            _merge("prompts", prompt_objs, "promptId")
+        _merge("prompts", prompt_objs, "promptId")
 
-        if not policies_present:
-            policy_objs: List[Dict[str, Any]] = []
-            for policy in self._load_policies().values():
+        policy_objs: List[Dict[str, Any]] = []
+        for pid in default_policy_ids:
+            policy = policies_catalog.get(pid) if isinstance(policies_catalog, dict) else None
+            if policy:
+                policy_objs.append(dict(policy))
+            else:  # pragma: no cover - defensive logging
+                logger.warning("Default policy id %s not found for agent %s", pid, canonical)
+
+        if not policy_objs and not input_data.get("policies"):
+            for policy in (policies_catalog.values() if isinstance(policies_catalog, dict) else []):
                 for meta in policy.get("agents", []):
                     slug = meta.get("agent_type") or self._resolve_agent_name(meta.get("agent_name"))
                     if slug == canonical:
                         policy_objs.append(dict(policy))
                         break
-            _merge("policies", policy_objs, "policyId")
+        _merge("policies", policy_objs, "policyId")
 
     def _execute_extraction_workflow(self, context: AgentContext) -> Dict:
         """Execute document extraction workflow"""

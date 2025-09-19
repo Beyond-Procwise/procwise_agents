@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -13,9 +14,63 @@ from engines.policy_engine import PolicyEngine
 from orchestration.orchestrator import Orchestrator
 
 
+def _supplier_policy_rows():
+    weight_details = {
+        "rules": {
+            "default_weights": {
+                "price": 0.4,
+                "delivery": 0.3,
+                "risk": 0.2,
+                "payment_terms": 0.1,
+            }
+        }
+    }
+    categorical_details = {
+        "rules": {
+            "payment_terms": {
+                "Net 30": 10,
+                "Net 45": 8,
+                "Net 60": 6,
+                "default": 5,
+            }
+        }
+    }
+    normalization_details = {
+        "rules": {
+            "price": "lower_is_better",
+            "delivery": "higher_is_better",
+            "risk": "lower_is_better",
+            "payment_terms": "higher_is_better",
+        }
+    }
+    return [
+        {
+            "policy_id": 201,
+            "policy_name": "WeightAllocationPolicy",
+            "policy_type": "supplier_ranking",
+            "policy_desc": "Default supplier ranking weights",
+            "policy_details": json.dumps(weight_details),
+        },
+        {
+            "policy_id": 202,
+            "policy_name": "CategoricalScoringPolicy",
+            "policy_type": "supplier_ranking",
+            "policy_desc": "Categorical scoring rules",
+            "policy_details": json.dumps(categorical_details),
+        },
+        {
+            "policy_id": 203,
+            "policy_name": "NormalizationDirectionPolicy",
+            "policy_type": "supplier_ranking",
+            "policy_desc": "Normalization direction rules",
+            "policy_details": json.dumps(normalization_details),
+        },
+    ]
+
+
 class DummyNick:
     def __init__(self):
-        self.policy_engine = PolicyEngine()
+        self.policy_engine = PolicyEngine(policy_rows=_supplier_policy_rows())
         self.settings = SimpleNamespace(
             extraction_model="llama3", script_user="tester"
         )
