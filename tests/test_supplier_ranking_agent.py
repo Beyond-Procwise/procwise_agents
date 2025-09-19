@@ -380,3 +380,4 @@ def test_supplier_ranking_instruction_overrides(monkeypatch):
     weights = ranking[0]["weights"]
     assert weights["price"] == pytest.approx(1.0)
     assert context.input_data["intent"].get("parameters", {}).get("criteria") == ["price"]
+

@@ -512,6 +512,7 @@ class OpportunityMinerAgent(BaseAgent):
                         {},
                     )
                     continue
+
                 findings = handler(tables, policy_input, notifications, policy_cfg)
                 aggregated_findings.extend(findings)
                 display_name = (
@@ -1287,6 +1288,7 @@ class OpportunityMinerAgent(BaseAgent):
             if not isinstance(parameters, dict):
                 parameters = {}
             entry = {
+
                 "policy_id": str(
                     policy.get("policyId") or policy.get("policy_id") or slug
                 ),
@@ -1308,6 +1310,7 @@ class OpportunityMinerAgent(BaseAgent):
                 slug, entry, provided_policy=policy, slug_hint=slug
             )
             registry[decorated["policy_slug"]] = decorated
+
         return registry
 
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:

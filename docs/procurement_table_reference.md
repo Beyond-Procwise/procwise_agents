@@ -282,3 +282,84 @@ quote_line_id text COLLATE pg_catalog."default" NOT NULL,
     last_modified_date timestamp without time zone,
     CONSTRAINT quote_line_items_agent_pkey PRIMARY KEY (quote_line_id)
 ```
+### `proc.policy`
+```
+policy_id integer NOT NULL DEFAULT nextval('proc.policy_policy_id_seq'::regclass),
+    policy_name character varying(255) COLLATE pg_catalog."default" NOT NULL,
+    policy_type character varying(100) COLLATE pg_catalog."default",
+    policy_linked_agents integer[],
+    policy_desc text COLLATE pg_catalog."default",
+    policy_details text COLLATE pg_catalog."default",
+    policy_status integer DEFAULT 1,
+    created_date timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    created_by character varying(100) COLLATE pg_catalog."default",
+    last_modified_date timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    last_modified_by character varying(100) COLLATE pg_catalog."default",
+    version text COLLATE pg_catalog."default",
+    CONSTRAINT policy_pkey1 PRIMARY KEY (policy_id)
+```
+### `proc.prompt`
+```
+prompt_id integer NOT NULL DEFAULT nextval('proc.prompt_prompt_id_seq'::regclass),
+    prompt_name character varying(255) COLLATE pg_catalog."default" NOT NULL,
+    prompt_type character varying(100) COLLATE pg_catalog."default",
+    prompt_linked_agents integer[],
+    prompts_desc text COLLATE pg_catalog."default",
+    prompts_status integer DEFAULT 1,
+    created_date timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    created_by character varying(100) COLLATE pg_catalog."default",
+    last_modified_date timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    last_modified_by character varying(100) COLLATE pg_catalog."default",
+    version text COLLATE pg_catalog."default",
+    CONSTRAINT prompt_pkey PRIMARY KEY (prompt_id)
+```
+
+### `proc.agent`
+```
+agent_id character varying(255) COLLATE pg_catalog."default" NOT NULL,
+    user_id character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    user_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    agent_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    agent_property jsonb NOT NULL DEFAULT '{}'::jsonb,
+    agent_type character varying(50) COLLATE pg_catalog."default" NOT NULL,
+    created_by character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    created_time timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    modified_by character varying(100) COLLATE pg_catalog."default",
+    modified_time timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    agent_description text COLLATE pg_catalog."default",
+    CONSTRAINT agent_pkey PRIMARY KEY (agent_id)
+```
+### `proc.routing`
+```
+process_id integer NOT NULL DEFAULT nextval('proc.process_process_id_seq'::regclass),
+    process_name text COLLATE pg_catalog."default" NOT NULL,
+    process_details jsonb,
+    process_status integer DEFAULT 0,
+    created_on timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    created_by text COLLATE pg_catalog."default",
+    modified_on timestamp without time zone,
+    modified_by text COLLATE pg_catalog."default",
+    user_id text COLLATE pg_catalog."default",
+    user_name text COLLATE pg_catalog."default",
+    raw_data json,
+    CONSTRAINT process_pkey PRIMARY KEY (process_id)
+```
+### `proc.draft_rfq_emails`
+```
+id bigint NOT NULL DEFAULT nextval('proc.draft_rfq_emails_id_seq'::regclass),
+    rfq_id text COLLATE pg_catalog."default" NOT NULL,
+    supplier_id text COLLATE pg_catalog."default",
+    subject text COLLATE pg_catalog."default" NOT NULL,
+    body text COLLATE pg_catalog."default" NOT NULL,
+    created_on timestamp with time zone NOT NULL DEFAULT now(),
+    sent boolean NOT NULL DEFAULT false,
+    supplier_name text COLLATE pg_catalog."default",
+    sent_on timestamp with time zone,
+    recipient_email text COLLATE pg_catalog."default",
+    contact_level integer NOT NULL DEFAULT 0,
+    thread_index integer NOT NULL DEFAULT 1,
+    sender text COLLATE pg_catalog."default",
+    payload jsonb,
+    updated_on timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT draft_rfq_emails_pkey PRIMARY KEY (id)
+```

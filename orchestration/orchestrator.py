@@ -432,6 +432,7 @@ class Orchestrator:
         self._policy_cache = policies
         return dict(policies)
 
+
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:
         """Convert class-like agent names to registry keys."""

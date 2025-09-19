@@ -258,6 +258,7 @@ class SupplierRankingAgent(BaseAgent):
                 )
 
         instructions = self._collect_instruction_bundle(context)
+
         policy_bundle = self._resolve_policy_bundle(context)
 
         directory_entries = context.input_data.get("supplier_directory") or []
@@ -352,6 +353,7 @@ class SupplierRankingAgent(BaseAgent):
                 }
             else:
                 default_weights = override_weights_map
+
         criteria = requested if requested else list(default_weights.keys())
         weights = {
             crit: default_weights.get(crit, 0.0)
