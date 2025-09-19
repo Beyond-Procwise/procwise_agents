@@ -5,6 +5,7 @@ from qdrant_client import models
 from sentence_transformers import CrossEncoder
 
 from services.rag_service import RAGService
+from services.intelligent_retrieval import IntelligentRetrievalService
 from .base_agent import BaseAgent
 from utils.gpu import configure_gpu
 
@@ -23,6 +24,8 @@ class RAGAgent(BaseAgent):
         self._executor = ThreadPoolExecutor(max_workers=2)
         # Service providing FAISS and BM25 retrieval
         self.rag_service = RAGService(agent_nick)
+        # Intelligent retrieval service with enhanced capabilities
+        self.intelligent_retrieval = IntelligentRetrievalService(self.rag_service, agent_nick)
 
     def run(
         self,
@@ -57,13 +60,31 @@ class RAGAgent(BaseAgent):
 
         search_hits = []
         seen_ids = set()
-        query_variants = [query] + self._expand_query(query)
-        for q in query_variants:
-            hits = self.rag_service.search(q, top_k=top_k, filters=qdrant_filter)
-            for h in hits:
-                if h.id not in seen_ids:
-                    search_hits.append(h)
-                    seen_ids.add(h.id)
+        
+        # Use intelligent retrieval for better results
+        try:
+            search_hits = self.intelligent_retrieval.adaptive_search(
+                query, 
+                top_k=top_k * 2,  # Get more candidates for better filtering
+                filters=qdrant_filter
+            )
+            # Remove duplicates while preserving order
+            unique_hits = []
+            for hit in search_hits:
+                if hit.id not in seen_ids:
+                    unique_hits.append(hit)
+                    seen_ids.add(hit.id)
+            search_hits = unique_hits
+        except Exception as e:
+            # Fallback to original method if intelligent retrieval fails
+            print(f"Intelligent retrieval failed, falling back to original method: {e}")
+            query_variants = [query] + self._expand_query(query)
+            for q in query_variants:
+                hits = self.rag_service.search(q, top_k=top_k, filters=qdrant_filter)
+                for h in hits:
+                    if h.id not in seen_ids:
+                        search_hits.append(h)
+                        seen_ids.add(h.id)
 
         if not search_hits:
             answer = "I could not find any relevant documents to answer your question."
@@ -163,11 +184,18 @@ class RAGAgent(BaseAgent):
         return []
 
     def _generate_followups(self, query: str, context: str):
-        """Generate follow-up questions based on current context."""
+        """Generate follow-up questions based on current context and query intent."""
+        # Detect query intent for more targeted follow-ups
+        try:
+            query_intent = self.intelligent_retrieval.detect_query_intent(query)
+            intent_context = f" The user asked a {query_intent.value} question."
+        except Exception:
+            intent_context = ""
+        
         prompt = (
             "You are a helpful procurement assistant. Based on the user's question and the "
             "retrieved context, suggest three concise follow-up questions that would clarify "
-            "the request or gather more details. Return each question on a new line.\n\n"
+            f"the request or gather more details.{intent_context} Return each question on a new line.\n\n"
             f"QUESTION: {query}\n\nCONTEXT:\n{context}\n\nFOLLOW_UP_QUESTIONS:"
         )
         resp = self.call_ollama(prompt, model=self.settings.extraction_model)
