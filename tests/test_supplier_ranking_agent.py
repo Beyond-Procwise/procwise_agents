@@ -260,3 +260,50 @@ def test_supplier_ranking_limits_to_opportunity_directory(monkeypatch):
     ranking_ids = {entry["supplier_id"] for entry in output.data["ranking"]}
     assert ranking_ids == {"S1", "S2"}
     assert all(entry["supplier_id"] in {"S1", "S2"} for entry in output.data["ranking"])
+
+
+def test_ranking_uses_context_policy_weights(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+
+    df = pd.DataFrame(
+        {
+            "supplier_id": ["S1", "S2"],
+            "supplier_name": ["Alpha", "Beta"],
+            "delivery": [9, 6],
+            "price": [12.0, 8.0],
+            "risk": [4.0, 2.0],
+        }
+    )
+
+    policies = [
+        {
+            "policyName": "WeightAllocationPolicy",
+            "details": {
+                "rules": {"default_weights": {"delivery": 1.0, "price": 0.0, "risk": 0.0}}
+            },
+        },
+        {
+            "policyName": "NormalizationDirectionPolicy",
+            "details": {"rules": {"delivery": "higher_is_better"}},
+        },
+    ]
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="supplier_ranking",
+        user_id="tester",
+        input_data={
+            "supplier_data": df,
+            "policies": policies,
+            "intent": {"parameters": {"criteria": ["delivery"], "top_n": 2}},
+            "query": "rank suppliers",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["ranking"][0]["supplier_id"] == "S1"
+    assert output.data["ranking"][0]["weights"]["delivery"] == 1.0

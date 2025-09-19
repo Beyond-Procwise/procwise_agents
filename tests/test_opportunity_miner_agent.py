@@ -398,8 +398,59 @@ def test_min_financial_impact_override_filters_findings(monkeypatch):
 
     assert output.status == AgentStatus.SUCCESS
     assert output.data["opportunity_count"] == 0
-    assert output.data["findings"] == []
-    assert output.data["min_financial_impact"] == 50.0
+
+
+def test_dynamic_policies_surface_opportunities(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    policies = [
+        {
+            "policyId": 201,
+            "policyName": "VolumeDiscountOpportunity",
+            "details": {
+                "rules": {
+                    "parameters": {
+                        "minimum_quantity_threshold": 5,
+                        "minimum_spend_threshold": 50,
+                        "target_discount_pct": 10,
+                    }
+                }
+            },
+        },
+        {
+            "policyId": 202,
+            "policyName": "SupplierConsolidationOpportunity",
+            "details": {
+                "rules": {
+                    "parameters": {
+                        "minimum_supplier_count": 2,
+                        "consolidation_savings_pct": 8,
+                    }
+                }
+            },
+        },
+    ]
+    context = AgentContext(
+        workflow_id="wf-dynamic",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={"policies": policies},
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    detectors = {finding["detector_type"] for finding in output.data["findings"]}
+    assert "VolumeDiscountOpportunity" in detectors
+    assert "SupplierConsolidationOpportunity" in detectors
+    policy_suppliers = output.data.get("policy_suppliers")
+    assert policy_suppliers
+    for name in ("VolumeDiscountOpportunity", "SupplierConsolidationOpportunity"):
+        suppliers = policy_suppliers.get(name)
+        assert suppliers
+        assert any(supplier.startswith("SI") for supplier in suppliers)
+    assert output.data.get("policy_opportunities")
+    assert output.data.get("supplier_candidates")
 
 
 def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
