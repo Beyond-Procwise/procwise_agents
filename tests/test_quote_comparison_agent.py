@@ -91,6 +91,7 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     comparison = result.data["comparison"]
     assert len(comparison) == 3
     assert comparison[0]["name"] == "weighting"
+    assert "weighting_factors" not in comparison[0]
     suppliers = {row["supplier_id"] for row in comparison if row["name"] != "weighting"}
     assert suppliers == {"S1", "S2"}
     assert comparison[1]["quote_file_s3_path"] == "s3://bucket/s1.pdf"
@@ -154,6 +155,7 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     comparison = result.data["comparison"]
     assert len(comparison) == 2
     assert comparison[0]["name"] == "weighting"
+    assert "weighting_factors" not in comparison[0]
     assert comparison[1]["name"] == "Supplier B"
     assert comparison[1]["supplier_id"] is None
     assert all("unit_price" not in row for row in comparison)

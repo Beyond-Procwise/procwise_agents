@@ -327,9 +327,11 @@ class Orchestrator:
                 for pid, desc, linked in rows:
                     if not desc:
                         continue
+                    desc_text = str(desc)
                     value = {
                         "promptId": int(pid),
-                        "template": str(desc),
+                        "template": desc_text,
+                        "prompts_desc": desc_text,
                         "agents": self._get_agent_details(linked),
                     }
                     prompts[int(pid)] = value
@@ -342,7 +344,14 @@ class Orchestrator:
         with path.open() as f:
             data = json.load(f)
         templates = data.get("templates", [])
-        return {int(t["promptId"]): t for t in templates if "promptId" in t}
+        result: Dict[int, Dict[str, Any]] = {}
+        for template in templates:
+            if "promptId" not in template:
+                continue
+            entry = dict(template)
+            entry.setdefault("prompts_desc", entry.get("template", ""))
+            result[int(entry["promptId"])] = entry
+        return result
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
@@ -358,16 +367,35 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc, policy_linked_agents"
-                        " FROM proc.policy WHERE policy_desc IS NOT NULL"
+                        "SELECT policy_id, policy_desc, policy_details, policy_linked_agents"
+                        " FROM proc.policy"
                     )
                     rows = cursor.fetchall()
-                for pid, desc, linked in rows:
-                    if not desc:
+                for pid, desc, details, linked in rows:
+                    if not desc and not details:
                         continue
+                    detail_payload: Any = {}
+                    if isinstance(details, (bytes, bytearray)):
+                        details = details.decode()
+                    if isinstance(details, str):
+                        candidate = details.strip()
+                        if candidate:
+                            try:
+                                detail_payload = json.loads(candidate)
+                            except Exception:
+                                detail_payload = candidate
+                        else:
+                            detail_payload = {}
+                    elif isinstance(details, dict):
+                        detail_payload = details
+                    elif details is not None:
+                        detail_payload = details
+                    desc_text = str(desc) if desc is not None else ""
                     value = {
                         "policyId": int(pid),
-                        "description": str(desc),
+                        "policy_desc": desc_text,
+                        "description": desc_text,
+                        "details": detail_payload if detail_payload is not None else {},
                         "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value
@@ -382,8 +410,13 @@ class Orchestrator:
             with file.open() as f:
                 items = json.load(f)
             for item in items:
-                policies[idx] = item
-                idx += 1
+                entry = dict(item)
+                policy_id = int(entry.get("policyId", idx))
+                entry.setdefault("policyId", policy_id)
+                entry.setdefault("policy_desc", entry.get("description", ""))
+                entry.setdefault("details", entry.get("details", {}))
+                policies[policy_id] = entry
+                idx = max(idx, policy_id) + 1
         return policies
 
     @staticmethod
