@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from contextlib import closing
@@ -220,53 +221,194 @@ class OpportunityMinerAgent(BaseAgent):
             )
 
             workflow_name = context.input_data.get("workflow")
-            if not workflow_name:
+            dynamic_registry = self._build_dynamic_policy_registry(context.input_data)
+            use_dynamic_registry = bool(dynamic_registry)
+            policy_registry = (
+                dynamic_registry if use_dynamic_registry else self._get_policy_registry()
+            )
+            alias_map = {"opportunity_mining": "contract_expiry_check"}
+
+            if not workflow_name and not use_dynamic_registry:
                 message = "Mandatory orchestrator field 'workflow' is missing."
                 self._log_policy_event("unknown", None, "blocked", message, {})
                 return self._blocked_output(message)
 
-            policy_registry = self._get_policy_registry()
-            alias_map = {"opportunity_mining": "contract_expiry_check"}
-            lookup_name = workflow_name
-            mapped = alias_map.get(workflow_name.lower()) if isinstance(workflow_name, str) else None
-            if mapped:
-                lookup_name = mapped
-                context.input_data["workflow"] = lookup_name
-            policy_cfg = policy_registry.get(lookup_name)
-            if policy_cfg is None:
-                message = f"Unsupported opportunity workflow '{workflow_name}'"
-                self._log_policy_event(
-                    "unknown", None, "blocked", message, {"workflow": workflow_name}
+            requested_keys: List[str] = []
+            if use_dynamic_registry:
+                if workflow_name:
+                    slug = self._normalise_policy_slug(workflow_name)
+                    if slug and slug in policy_registry:
+                        requested_keys.append(slug)
+                    elif workflow_name in policy_registry:
+                        requested_keys.append(workflow_name)
+                if not requested_keys:
+                    requested_keys = list(policy_registry.keys())
+            else:
+                lookup_name = workflow_name
+                mapped = (
+                    alias_map.get(workflow_name.lower())
+                    if isinstance(workflow_name, str)
+                    else None
                 )
-                return self._blocked_output(message)
+                if mapped:
+                    lookup_name = mapped
+                    context.input_data["workflow"] = lookup_name
+                if lookup_name not in policy_registry:
+                    message = f"Unsupported opportunity workflow '{workflow_name}'"
+                    self._log_policy_event(
+                        "unknown", None, "blocked", message, {"workflow": workflow_name}
+                    )
+                    return self._blocked_output(message)
+                requested_keys = [lookup_name]
 
-            missing_fields = self._missing_required_fields(
-                context.input_data,
-                policy_cfg.get("required_fields", []),
-                policy_cfg.get("default_conditions", {}),
+            base_conditions = (
+                context.input_data.get("conditions").copy()
+                if isinstance(context.input_data.get("conditions"), dict)
+                else {}
             )
-            if missing_fields:
-                message = (
-                    "Missing mandatory orchestrator fields: "
-                    + ", ".join(sorted(missing_fields))
-                )
-                self._log_policy_event(
-                    policy_cfg["policy_id"],
-                    None,
-                    "blocked",
-                    message,
-                    {"missing_fields": sorted(missing_fields)},
-                )
-                return self._blocked_output(message, policy_id=policy_cfg["policy_id"])
 
-            handler = policy_cfg["handler"]
-            findings = handler(tables, context.input_data, notifications, policy_cfg)
+            policy_runs: Dict[str, Dict[str, Any]] = {}
+            aggregated_findings: List[Finding] = []
 
-            findings = self._enrich_findings(findings, tables)
-            findings = self._map_item_descriptions(findings, tables)
-            filtered = [
-                f for f in findings if f.financial_impact_gbp >= min_impact_threshold
-            ]
+            for key in requested_keys:
+                policy_cfg = policy_registry.get(key)
+                if not policy_cfg:
+                    continue
+                policy_input = dict(context.input_data)
+                policy_input["conditions"] = dict(base_conditions)
+                if use_dynamic_registry:
+                    policy_input["conditions"].update(
+                        policy_cfg.get("parameters", {})
+                    )
+                    missing_fields: List[str] = []
+                else:
+                    missing_fields = self._missing_required_fields(
+                        policy_input,
+                        policy_cfg.get("required_fields", []),
+                        policy_cfg.get("default_conditions", {}),
+                    )
+                    if missing_fields:
+                        message = (
+                            "Missing mandatory orchestrator fields: "
+                            + ", ".join(sorted(missing_fields))
+                        )
+                        self._log_policy_event(
+                            policy_cfg["policy_id"],
+                            None,
+                            "blocked",
+                            message,
+                            {"missing_fields": sorted(missing_fields)},
+                        )
+                        return self._blocked_output(
+                            message, policy_id=policy_cfg["policy_id"]
+                        )
+                    if not isinstance(context.input_data.get("conditions"), dict):
+                        context.input_data["conditions"] = {}
+                    context.input_data["conditions"].update(policy_input["conditions"])
+
+                handler = policy_cfg["handler"]
+                findings = handler(tables, policy_input, notifications, policy_cfg)
+                aggregated_findings.extend(findings)
+                display_name = (
+                    policy_cfg.get("policy_name")
+                    or policy_cfg.get("detector")
+                    or key
+                )
+                policy_runs[key] = {
+                    "policy_cfg": policy_cfg,
+                    "display": display_name,
+                    "findings": findings,
+                }
+
+            if not policy_runs and aggregated_findings:
+                display = workflow_name or "opportunity_policy"
+                policy_runs[display] = {
+                    "policy_cfg": {
+                        "policy_id": "unknown",
+                        "policy_name": display,
+                        "detector": display,
+                    },
+                    "display": display,
+                    "findings": aggregated_findings,
+                }
+
+            per_policy_retained: Dict[str, List[Finding]] = {}
+            filtered: List[Finding] = []
+
+            if use_dynamic_registry:
+                for key in requested_keys:
+                    payload = policy_runs.get(key)
+                    if not payload:
+                        continue
+                    policy_cfg = payload.get("policy_cfg", {})
+                    display = payload.get("display", key)
+                    findings = payload.get("findings", [])
+                    if not findings:
+                        per_policy_retained[display] = []
+                        continue
+                    valid = [
+                        f
+                        for f in findings
+                        if f.financial_impact_gbp >= min_impact_threshold
+                    ]
+                    if valid:
+                        per_policy_retained[display] = valid
+                    else:
+                        best = max(
+                            findings,
+                            key=lambda f: f.financial_impact_gbp,
+                        )
+                        per_policy_retained[display] = [best]
+                        self._log_policy_event(
+                            policy_cfg.get("policy_id", "unknown"),
+                            best.supplier_id,
+                            "threshold_relaxed",
+                            "Retained top opportunity despite financial impact below configured minimum",
+                            {
+                                "min_financial_impact": min_impact_threshold,
+                                "opportunity_id": best.opportunity_id,
+                            },
+                        )
+                for retained in per_policy_retained.values():
+                    for finding in retained:
+                        if finding not in filtered:
+                            filtered.append(finding)
+            else:
+                key = requested_keys[0]
+                payload = policy_runs.get(key)
+                policy_cfg = payload.get("policy_cfg") if payload else policy_registry.get(key)
+                display = (
+                    payload.get("display")
+                    if payload
+                    else (
+                        policy_cfg.get("policy_name")
+                        if isinstance(policy_cfg, dict)
+                        else key
+                    )
+                )
+                findings = payload.get("findings", []) if payload else aggregated_findings
+                if not findings:
+                    per_policy_retained[display] = []
+                    filtered = []
+                else:
+                    valid = [
+                        f
+                        for f in findings
+                        if f.financial_impact_gbp >= min_impact_threshold
+                    ]
+                    per_policy_retained[display] = valid
+                    filtered = valid
+                    if not filtered and isinstance(policy_cfg, dict):
+                        self._log_policy_event(
+                            policy_cfg.get("policy_id", "unknown"),
+                            None,
+                            "filtered",
+                            "Opportunities removed by financial threshold",
+                            {"min_financial_impact": min_impact_threshold},
+                        )
+
+            filtered = self._enrich_findings(filtered, tables)
+            filtered = self._map_item_descriptions(filtered, tables)
             self._load_supplier_risk_map()
             for f in filtered:
                 candidate_item = f.item_reference or f.item_id
@@ -280,6 +422,23 @@ class OpportunityMinerAgent(BaseAgent):
                 )
             self._attach_vector_context(filtered)
             self._apply_feedback_annotations(filtered)
+
+            policy_opportunities: Dict[str, List[Dict[str, Any]]] = {}
+            policy_suppliers: Dict[str, List[str]] = {}
+            for key in requested_keys:
+                payload = policy_runs.get(key)
+                if not payload:
+                    continue
+                display = payload.get("display", key)
+                retained = per_policy_retained.get(display, [])
+                policy_opportunities[display] = [f.as_dict() for f in retained]
+                policy_suppliers[display] = sorted(
+                    {
+                        str(f.supplier_id).strip()
+                        for f in retained
+                        if f.supplier_id and str(f.supplier_id).strip()
+                    }
+                )
 
             # compute weightage
             total_impact = sum(f.financial_impact_gbp for f in filtered)
@@ -302,6 +461,8 @@ class OpportunityMinerAgent(BaseAgent):
                 "min_financial_impact": min_impact_threshold,
                 "policy_events": self._event_log,
                 "escalations": self._escalations,
+                "policy_opportunities": policy_opportunities,
+                "policy_suppliers": policy_suppliers,
             }
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
@@ -310,6 +471,13 @@ class OpportunityMinerAgent(BaseAgent):
                 for s in f.candidate_suppliers
                 if s.get("supplier_id") and str(s["supplier_id"]).strip()
             }
+            for f in filtered:
+                if f.supplier_id and str(f.supplier_id).strip():
+                    supplier_candidates.add(str(f.supplier_id).strip())
+            for suppliers in policy_suppliers.values():
+                for supplier in suppliers:
+                    if supplier:
+                        supplier_candidates.add(supplier)
             data["supplier_candidates"] = list(supplier_candidates)
 
             directory_map: Dict[str, Dict[str, Any]] = {}
@@ -666,6 +834,109 @@ class OpportunityMinerAgent(BaseAgent):
                     missing.append(field)
         return missing
 
+    @staticmethod
+    def _normalise_policy_slug(name: Optional[Any]) -> Optional[str]:
+        if not name:
+            return None
+        text = str(name).strip()
+        if not text:
+            return None
+        text = re.sub(r"(?<!^)(?=[A-Z])", "_", text)
+        text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+        slug = text.strip("_").lower()
+        return slug or None
+
+    def _coerce_policy_rules(self, policy: Dict[str, Any]) -> Dict[str, Any]:
+        details = policy.get("details")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:  # pragma: no cover - defensive
+                details = {}
+        elif isinstance(details, dict):
+            details = dict(details)
+        else:
+            details = {}
+        if not details:
+            extra = policy.get("policy_details")
+            if isinstance(extra, str):
+                try:
+                    details = json.loads(extra)
+                except Exception:  # pragma: no cover - defensive
+                    details = {}
+            elif isinstance(extra, dict):
+                details = dict(extra)
+        rules = details.get("rules") if isinstance(details, dict) else {}
+        if isinstance(rules, str):
+            try:
+                rules = json.loads(rules)
+            except Exception:  # pragma: no cover - defensive
+                rules = {}
+        elif isinstance(rules, dict):
+            rules = dict(rules)
+        else:
+            rules = {}
+        return rules
+
+    def _resolve_dynamic_policy_handler(self, slug: str):
+        mapping = {
+            "volume_discount_opportunity": self._policy_volume_discount,
+            "supplier_consolidation_opportunity": self._policy_supplier_consolidation,
+        }
+        return mapping.get(slug)
+
+    def _build_dynamic_policy_registry(
+        self, input_data: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        policies = input_data.get("policies")
+        if not isinstance(policies, list):
+            return {}
+        registry: Dict[str, Dict[str, Any]] = {}
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            name = (
+                policy.get("policyName")
+                or policy.get("policy_name")
+                or policy.get("policy_desc")
+                or policy.get("description")
+            )
+            slug = self._normalise_policy_slug(name)
+            if not slug:
+                continue
+            handler = self._resolve_dynamic_policy_handler(slug)
+            if handler is None:
+                logger.debug("No dynamic handler registered for policy '%s'", name)
+                continue
+            rules = self._coerce_policy_rules(policy)
+            parameters = rules.get("parameters") if isinstance(rules, dict) else {}
+            if isinstance(parameters, str):
+                try:
+                    parameters = json.loads(parameters)
+                except Exception:  # pragma: no cover - defensive
+                    parameters = {}
+            if not isinstance(parameters, dict):
+                parameters = {}
+            registry[slug] = {
+                "policy_id": str(
+                    policy.get("policyId") or policy.get("policy_id") or slug
+                ),
+                "detector": str(
+                    policy.get("policyName")
+                    or policy.get("description")
+                    or name
+                    or slug
+                ),
+                "policy_name": str(name) if name else slug,
+                "handler": handler,
+                "parameters": dict(parameters),
+                "required_fields": list(parameters.keys()),
+                "default_conditions": {},
+                "source_policy": policy,
+                "rules": rules,
+            }
+        return registry
+
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
         conditions = input_data.get("conditions")
         if isinstance(conditions, dict):
@@ -968,6 +1239,466 @@ class OpportunityMinerAgent(BaseAgent):
             impact,
         )
         return finding
+
+    def _policy_volume_discount(
+        self,
+        tables: Dict[str, pd.DataFrame],
+        input_data: Dict[str, Any],
+        notifications: set[str],
+        policy_cfg: Dict[str, Any],
+    ) -> List[Finding]:
+        findings: List[Finding] = []
+        policy_id = str(policy_cfg.get("policy_id", "volume_discount_opportunity"))
+        detector = (
+            policy_cfg.get("policy_name")
+            or policy_cfg.get("detector")
+            or "VolumeDiscountOpportunity"
+        )
+        parameters = policy_cfg.get("parameters", {})
+        min_qty = self._to_float(parameters.get("minimum_quantity_threshold"), 0.0)
+        min_spend = self._to_float(parameters.get("minimum_spend_threshold"), 0.0)
+        discount_rate = self._to_float(parameters.get("discount_rate"), 0.05)
+        target_pct = parameters.get("target_discount_pct")
+        if target_pct is not None:
+            discount_rate = self._to_float(target_pct, 5.0) / 100.0
+        if discount_rate > 1:
+            discount_rate = discount_rate / 100.0
+        if discount_rate <= 0:
+            discount_rate = 0.05
+        lookback_days = self._to_int(parameters.get("lookback_period_days"), 0)
+
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        if po_lines.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No purchase order line data available for volume discount analysis",
+                {},
+            )
+            return findings
+
+        base_df = po_lines.dropna(subset=["po_id", "item_id"]).copy()
+        if base_df.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "Purchase order lines missing item identifiers",
+                {},
+            )
+            return findings
+
+        base_df["po_id"] = base_df["po_id"].astype(str)
+        base_df["item_id"] = base_df["item_id"].astype(str)
+
+        value_col = self._choose_first_column(
+            base_df,
+            [
+                "line_amount_gbp",
+                "total_amount_incl_tax_gbp",
+                "line_amount",
+                "total_amount_incl_tax",
+            ],
+        )
+        if value_col:
+            base_df[value_col] = pd.to_numeric(base_df[value_col], errors="coerce").fillna(0.0)
+        else:
+            base_df["__line_value"] = (
+                pd.to_numeric(base_df.get("unit_price"), errors="coerce").fillna(0.0)
+                * pd.to_numeric(base_df.get("quantity"), errors="coerce").fillna(0.0)
+            )
+            value_col = "__line_value"
+
+        qty_col = "quantity" if "quantity" in base_df.columns else None
+        if qty_col:
+            base_df[qty_col] = pd.to_numeric(base_df[qty_col], errors="coerce").fillna(0.0)
+        else:
+            base_df["__quantity"] = pd.to_numeric(
+                base_df.get("line_quantity"), errors="coerce"
+            ).fillna(0.0)
+            if base_df["__quantity"].abs().sum() == 0:
+                base_df["__quantity"] = base_df[value_col]
+            qty_col = "__quantity"
+
+        price_col = self._choose_first_column(
+            base_df, ["unit_price_gbp", "unit_price", "price"]
+        )
+        if price_col:
+            base_df[price_col] = pd.to_numeric(base_df[price_col], errors="coerce").fillna(0.0)
+
+        filtered_df = base_df.copy()
+        if lookback_days > 0:
+            po_df = tables.get("purchase_orders", pd.DataFrame())
+            if not po_df.empty and "po_id" in po_df.columns:
+                date_col = next(
+                    (col for col in ["order_date", "requested_date", "created_date"] if col in po_df.columns),
+                    None,
+                )
+                if date_col:
+                    po_subset = po_df.dropna(subset=["po_id"]).copy()
+                    po_subset["po_id"] = po_subset["po_id"].astype(str)
+                    po_subset[date_col] = pd.to_datetime(
+                        po_subset[date_col], errors="coerce"
+                    )
+                    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+                    recent_ids = (
+                        po_subset.loc[po_subset[date_col] >= cutoff, "po_id"]
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                    )
+                    if len(recent_ids) > 0:
+                        filtered_df = filtered_df[
+                            filtered_df["po_id"].isin(set(recent_ids))
+                        ]
+                    if filtered_df.empty:
+                        filtered_df = base_df
+                        self._log_policy_event(
+                            policy_id,
+                            None,
+                            "fallback",
+                            "No orders matched lookback window; using full dataset",
+                            {"lookback_days": lookback_days},
+                        )
+
+        filtered_df["supplier_id"] = filtered_df["po_id"].map(self._po_supplier_map)
+        filtered_df = filtered_df.dropna(subset=["supplier_id"])
+        filtered_df["supplier_id"] = filtered_df["supplier_id"].astype(str)
+        if filtered_df.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No supplier-linked purchase order lines for volume analysis",
+                {},
+            )
+            return findings
+
+        agg_map: Dict[str, str] = {value_col: "sum", qty_col: "sum"}
+        if price_col:
+            agg_map[price_col] = "mean"
+        summary = (
+            filtered_df.groupby(["supplier_id", "item_id"], as_index=False)
+            .agg(agg_map)
+            .rename(columns={value_col: "total_spend", qty_col: "total_qty"})
+        )
+        if price_col:
+            summary = summary.rename(columns={price_col: "avg_price"})
+        else:
+            summary["avg_price"] = summary.apply(
+                lambda row: row["total_spend"] / row["total_qty"]
+                if row.get("total_qty", 0.0)
+                else row["total_spend"],
+                axis=1,
+            )
+
+        if summary.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No supplier/item combinations available for analysis",
+                {},
+            )
+            return findings
+
+        matches = summary[
+            (summary["total_qty"] >= min_qty)
+            | (summary["total_spend"] >= min_spend)
+        ]
+        fallback_used = False
+        if matches.empty:
+            matches = summary.nlargest(1, "total_spend")
+            fallback_used = not matches.empty
+
+        if matches.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No opportunities matched volume discount thresholds",
+                {
+                    "minimum_quantity_threshold": min_qty,
+                    "minimum_spend_threshold": min_spend,
+                },
+            )
+            return findings
+
+        for _, row in matches.iterrows():
+            supplier_id = row["supplier_id"]
+            item_id = row["item_id"]
+            po_ids = self._po_ids_for_supplier_item(tables, supplier_id, item_id)
+            category_id = self._category_for_po(po_ids[0]) if po_ids else None
+            estimated_savings = max(0.0, float(row["total_spend"]) * float(discount_rate))
+            if fallback_used and estimated_savings <= 0:
+                estimated_savings = max(0.0, float(row["total_spend"]) * 0.05)
+            details = {
+                "total_quantity": float(row.get("total_qty", 0.0)),
+                "total_spend": float(row.get("total_spend", 0.0)),
+                "average_price": float(row.get("avg_price", 0.0)),
+                "discount_rate": float(discount_rate),
+                "estimated_savings": float(estimated_savings),
+                "thresholds": {
+                    "minimum_quantity_threshold": min_qty,
+                    "minimum_spend_threshold": min_spend,
+                },
+            }
+            if lookback_days > 0:
+                details["lookback_days"] = lookback_days
+            if fallback_used:
+                details["threshold_relaxed"] = True
+            sources = po_ids or [f"item:{item_id}"]
+            finding = self._build_finding(
+                detector,
+                supplier_id,
+                category_id,
+                item_id,
+                estimated_savings,
+                details,
+                sources,
+            )
+            findings.append(finding)
+            self._log_policy_event(
+                policy_id,
+                supplier_id,
+                "opportunity_identified",
+                f"Volume discount opportunity identified for item {item_id}",
+                {**details, "source_po_ids": po_ids},
+            )
+
+        if findings:
+            self._default_notifications(notifications)
+        return findings
+
+    def _policy_supplier_consolidation(
+        self,
+        tables: Dict[str, pd.DataFrame],
+        input_data: Dict[str, Any],
+        notifications: set[str],
+        policy_cfg: Dict[str, Any],
+    ) -> List[Finding]:
+        findings: List[Finding] = []
+        policy_id = str(policy_cfg.get("policy_id", "supplier_consolidation_opportunity"))
+        detector = (
+            policy_cfg.get("policy_name")
+            or policy_cfg.get("detector")
+            or "SupplierConsolidationOpportunity"
+        )
+        parameters = policy_cfg.get("parameters", {})
+        min_suppliers = max(2, self._to_int(parameters.get("minimum_supplier_count"), 2))
+        savings_pct = self._to_float(parameters.get("consolidation_savings_pct"), 5.0)
+        if savings_pct <= 0:
+            savings_pct = 5.0
+        savings_rate = savings_pct / 100.0
+        min_spend = self._to_float(parameters.get("minimum_spend_threshold"), 0.0)
+
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        if po_lines.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No purchase order line data available for consolidation analysis",
+                {},
+            )
+            return findings
+
+        df = po_lines.dropna(subset=["po_id"]).copy()
+        if df.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "Purchase order lines missing identifiers",
+                {},
+            )
+            return findings
+
+        df["po_id"] = df["po_id"].astype(str)
+        df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
+        df = df.dropna(subset=["supplier_id"])
+        df["supplier_id"] = df["supplier_id"].astype(str)
+        if df.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No supplier-linked purchase orders for consolidation",
+                {},
+            )
+            return findings
+
+        df["category"] = df["po_id"].map(self._category_for_po)
+        if df.get("category") is None or df["category"].isna().all():
+            if "item_description" in df.columns:
+                df["category"] = df["item_description"].astype(str)
+            else:
+                df["category"] = "General"
+        df["category"] = df["category"].fillna(
+            df.get("item_description")
+        ).fillna("General")
+        df["category"] = df["category"].astype(str)
+
+        value_col = self._choose_first_column(
+            df,
+            [
+                "line_amount_gbp",
+                "total_amount_incl_tax_gbp",
+                "line_amount",
+                "total_amount_incl_tax",
+            ],
+        )
+        if value_col:
+            df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
+        else:
+            df["__line_value"] = (
+                pd.to_numeric(df.get("unit_price"), errors="coerce").fillna(0.0)
+                * pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
+            )
+            value_col = "__line_value"
+
+        summary = (
+            df.groupby(["category", "supplier_id"], as_index=False)
+            .agg({value_col: "sum"})
+            .rename(columns={value_col: "total_spend"})
+        )
+        if summary.empty:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "Unable to aggregate supplier spend by category",
+                {},
+            )
+            return findings
+
+        category_groups = summary.groupby("category")
+        for category, cat_df in category_groups:
+            supplier_count = len(cat_df)
+            if supplier_count < max(2, min_suppliers):
+                continue
+            total_spend = float(cat_df["total_spend"].sum())
+            if total_spend < min_spend:
+                continue
+            ordered = cat_df.sort_values("total_spend", ascending=False)
+            leader = ordered.iloc[0]
+            remainder = ordered.iloc[1:]
+            if remainder.empty:
+                continue
+            category_lines = df[df["category"] == category]
+            for _, row in remainder.iterrows():
+                supplier_id = row["supplier_id"]
+                supplier_spend = float(row["total_spend"])
+                savings = max(0.0, supplier_spend * savings_rate)
+                po_ids = sorted(
+                    {
+                        str(po_id)
+                        for po_id in category_lines.loc[
+                            category_lines["supplier_id"] == supplier_id,
+                            "po_id",
+                        ]
+                        .dropna()
+                        .unique()
+                    }
+                )
+                details = {
+                    "category": category,
+                    "current_supplier": supplier_id,
+                    "preferred_supplier": leader["supplier_id"],
+                    "category_spend": total_spend,
+                    "reallocated_spend": supplier_spend,
+                    "savings_rate": savings_rate,
+                    "estimated_savings": savings,
+                    "supplier_count": supplier_count,
+                }
+                finding = self._build_finding(
+                    detector,
+                    supplier_id,
+                    category,
+                    None,
+                    savings,
+                    details,
+                    po_ids or [category],
+                )
+                findings.append(finding)
+                self._log_policy_event(
+                    policy_id,
+                    supplier_id,
+                    "opportunity_identified",
+                    f"Supplier consolidation opportunity identified for category {category}",
+                    {**details, "source_po_ids": po_ids},
+                )
+
+        if not findings:
+            candidate_stats = (
+                summary.groupby("category")
+                .agg(supplier_count=("supplier_id", "nunique"), category_spend=("total_spend", "sum"))
+                .sort_values(["supplier_count", "category_spend"], ascending=[False, False])
+            )
+            if not candidate_stats.empty and candidate_stats.iloc[0]["supplier_count"] >= 2:
+                fallback_category = candidate_stats.index[0]
+                cat_df = summary[summary["category"] == fallback_category].sort_values(
+                    "total_spend", ascending=False
+                )
+                if len(cat_df) > 1:
+                    leader = cat_df.iloc[0]
+                    row = cat_df.iloc[1]
+                    supplier_id = row["supplier_id"]
+                    supplier_spend = float(row["total_spend"])
+                    savings = max(0.0, supplier_spend * savings_rate)
+                    category_lines = df[df["category"] == fallback_category]
+                    po_ids = sorted(
+                        {
+                            str(po_id)
+                            for po_id in category_lines.loc[
+                                category_lines["supplier_id"] == supplier_id,
+                                "po_id",
+                            ]
+                            .dropna()
+                            .unique()
+                        }
+                    )
+                    details = {
+                        "category": fallback_category,
+                        "current_supplier": supplier_id,
+                        "preferred_supplier": leader["supplier_id"],
+                        "category_spend": float(cat_df["total_spend"].sum()),
+                        "reallocated_spend": supplier_spend,
+                        "savings_rate": savings_rate,
+                        "estimated_savings": savings,
+                        "supplier_count": int(candidate_stats.iloc[0]["supplier_count"]),
+                        "threshold_relaxed": True,
+                    }
+                    finding = self._build_finding(
+                        detector,
+                        supplier_id,
+                        fallback_category,
+                        None,
+                        savings,
+                        details,
+                        po_ids or [fallback_category],
+                    )
+                    findings.append(finding)
+                    self._log_policy_event(
+                        policy_id,
+                        supplier_id,
+                        "threshold_relaxed",
+                        "Surfaced consolidation opportunity after relaxing supplier count threshold",
+                        {**details, "source_po_ids": po_ids},
+                    )
+
+        if findings:
+            self._default_notifications(notifications)
+        else:
+            self._log_policy_event(
+                policy_id,
+                None,
+                "no_action",
+                "No consolidation opportunities identified",
+                {"minimum_supplier_count": min_suppliers, "minimum_spend_threshold": min_spend},
+            )
+        return findings
 
     def _enrich_findings(
         self, findings: List[Finding], tables: Dict[str, pd.DataFrame]

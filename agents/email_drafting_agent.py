@@ -93,13 +93,14 @@ class EmailDraftingAgent(BaseAgent):
     """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
     TEXT_TEMPLATE = (
-        "<p>Dear {supplier_contact_name_html}, we are reaching out to request your quotation for the requirement below.</p>"
+        "<p>Dear {supplier_contact_name_html},</p>"
+        "<p>We are writing to request a formal quotation for the requirement outlined below.</p>"
         "<p>{scope_summary_html}</p>"
-        "<p>Please review these details and let us know if any clarifications are needed.</p>"
-        "<p>Kindly complete the table and return your best quote.</p>"
-        "<p>Please submit your response by {deadline_html}.</p>"
+        "<p>Please review the enclosed details and let us know if you require any clarification.</p>"
+        "<p>Kindly complete the table and return your quotation by {deadline_html}.</p>"
         "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>"
         "{rfq_table_html}"
+        "<p>We appreciate your timely response.</p>"
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
 
@@ -401,14 +402,38 @@ class EmailDraftingAgent(BaseAgent):
             if isinstance(fallback_scope, str) and fallback_scope.strip():
                 sentences.append(fallback_scope.strip())
 
-        justification = supplier.get("justification")
-        if isinstance(justification, str) and justification.strip():
-            sentences.append(justification.strip())
+        justification_clean = self._clean_justification(
+            supplier.get("justification")
+        )
+        if justification_clean:
+            sentences.append(justification_clean)
 
         if not sentences:
             sentences.append("The detailed requirement is TBC")
 
         return sentences
+
+    @staticmethod
+    def _clean_justification(text: Optional[str]) -> Optional[str]:
+        if not isinstance(text, str):
+            return None
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        banned = (
+            "rank",
+            "ranking",
+            "analysis",
+            "score",
+            "scoring",
+            "evaluation",
+            "assess",
+            "assessment",
+        )
+        if any(keyword in lowered for keyword in banned):
+            return None
+        return cleaned
 
     @staticmethod
     def _ensure_sentence(text: Optional[str]) -> Optional[str]:
@@ -496,6 +521,11 @@ class EmailDraftingAgent(BaseAgent):
             r"<p[^>]*>[^<]*(suggest|recommend|consider)[^<]*</p>", re.IGNORECASE
         )
         text = suggestion_pattern.sub("", text)
+        restricted_pattern = re.compile(
+            r"<p[^>]*>[^<]*(rank|ranking|analysis|score|scoring|evaluation|assess|assessment)[^<]*</p>",
+            re.IGNORECASE,
+        )
+        text = restricted_pattern.sub("", text)
         return text
 
     def _normalise_recipients(self, recipients: Any) -> List[str]:

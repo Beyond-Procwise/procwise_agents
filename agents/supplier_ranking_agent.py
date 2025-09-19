@@ -55,6 +55,74 @@ class SupplierRankingAgent(BaseAgent):
         self.query_engine = agent_nick.query_engine
         self._device = configure_gpu()
 
+    def _coerce_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
+        entry = dict(policy)
+        details = entry.get("details")
+        if isinstance(details, str):
+            try:
+                entry["details"] = json.loads(details)
+            except Exception:  # pragma: no cover - defensive
+                entry["details"] = {}
+        elif isinstance(details, dict):
+            entry["details"] = dict(details)
+        else:
+            entry["details"] = {}
+        if not entry["details"]:
+            raw_details = entry.get("policy_details")
+            if isinstance(raw_details, str):
+                try:
+                    entry["details"] = json.loads(raw_details)
+                except Exception:  # pragma: no cover - defensive
+                    entry["details"] = {}
+            elif isinstance(raw_details, dict):
+                entry["details"] = dict(raw_details)
+        rules = entry["details"].get("rules") if isinstance(entry["details"], dict) else {}
+        if isinstance(rules, str):
+            try:
+                entry["details"]["rules"] = json.loads(rules)
+            except Exception:  # pragma: no cover - defensive
+                entry["details"]["rules"] = {}
+        elif isinstance(rules, dict):
+            entry["details"]["rules"] = dict(rules)
+        else:
+            entry["details"]["rules"] = {}
+        return entry
+
+    def _resolve_policy_bundle(self, context: AgentContext) -> List[Dict[str, Any]]:
+        raw = context.input_data.get("policies")
+        bundle: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            for policy in raw:
+                if isinstance(policy, dict):
+                    bundle.append(self._coerce_policy(policy))
+        if bundle:
+            return bundle
+        return [self._coerce_policy(policy) for policy in self.policy_engine.supplier_policies]
+
+    def _find_policy(
+        self, policies: List[Dict[str, Any]], name: str
+    ) -> Optional[Dict[str, Any]]:
+        target = str(name).strip().lower()
+        for policy in policies:
+            policy_name = (
+                policy.get("policyName")
+                or policy.get("policy_name")
+                or policy.get("name")
+                or policy.get("description")
+            )
+            if policy_name and str(policy_name).strip().lower() == target:
+                return policy
+        return None
+
+    def _extract_policy_rules(self, policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not policy:
+            return {}
+        details = policy.get("details")
+        if not isinstance(details, dict):
+            return {}
+        rules = details.get("rules")
+        return dict(rules) if isinstance(rules, dict) else {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -118,6 +186,8 @@ class SupplierRankingAgent(BaseAgent):
                     data={},
                     error="supplier_data missing 'supplier_id' column",
                 )
+
+        policy_bundle = self._resolve_policy_bundle(context)
 
         directory_entries = context.input_data.get("supplier_directory") or []
         directory_lookup: Dict[str, Dict[str, Any]] = {}
@@ -183,19 +253,9 @@ class SupplierRankingAgent(BaseAgent):
 
         intent = context.input_data.get("intent", {})
         requested = intent.get("parameters", {}).get("criteria", [])
-        weight_policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "WeightAllocationPolicy"
-            ),
-            {},
-        )
-        default_weights = (
-            weight_policy.get("details", {})
-            .get("rules", {})
-            .get("default_weights", {})
-        )
+        weight_policy = self._find_policy(policy_bundle, "WeightAllocationPolicy")
+        weight_rules = self._extract_policy_rules(weight_policy)
+        default_weights = weight_rules.get("default_weights", {})
         criteria = requested if requested else list(default_weights.keys())
         weights = {
             crit: default_weights.get(crit, 0.0)
@@ -204,16 +264,9 @@ class SupplierRankingAgent(BaseAgent):
         }
 
         df = self._prepare_scoring_columns(df, weights)
-        scored_df = self._score_categorical_criteria(df, weights.keys())
-        norm_policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "NormalizationDirectionPolicy"
-            ),
-            {},
-        )
-        direction_map = norm_policy.get("details", {}).get("rules", {})
+        scored_df = self._score_categorical_criteria(df, weights.keys(), policy_bundle)
+        norm_policy = self._find_policy(policy_bundle, "NormalizationDirectionPolicy")
+        direction_map = self._extract_policy_rules(norm_policy)
         scored_df = self._normalize_numeric_scores(scored_df, direction_map)
 
         scored_df["final_score"] = 0.0
@@ -644,19 +697,17 @@ class SupplierRankingAgent(BaseAgent):
             result["payment_terms"] = result.get("po_payment_terms")
         return result
 
-    def _score_categorical_criteria(self, df: pd.DataFrame, criteria: Iterable[str]) -> pd.DataFrame:
+    def _score_categorical_criteria(
+        self,
+        df: pd.DataFrame,
+        criteria: Iterable[str],
+        policies: List[Dict[str, Any]],
+    ) -> pd.DataFrame:
         out = df.copy()
-        policy = next(
-            (
-                p
-                for p in self.policy_engine.supplier_policies
-                if p["policyName"] == "CategoricalScoringPolicy"
-            ),
-            None,
-        )
+        policy = self._find_policy(policies, "CategoricalScoringPolicy")
         if not policy:
             return out
-        rules = policy.get("details", {}).get("rules", {})
+        rules = self._extract_policy_rules(policy)
         for crit in criteria:
             raw_col = crit
             score_col = f"{crit}_score"
