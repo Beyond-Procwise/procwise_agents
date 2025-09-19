@@ -476,7 +476,9 @@ class OpportunityMinerAgent(BaseAgent):
                 policy_input["conditions"] = dict(base_conditions)
                 parameters = policy_cfg.get("parameters")
                 if isinstance(parameters, dict):
-                    policy_input["conditions"].update(parameters)
+                    for param_key, param_value in parameters.items():
+                        if param_key not in policy_input["conditions"]:
+                            policy_input["conditions"][param_key] = param_value
 
                 missing_fields = self._missing_required_fields(
                     policy_input,
@@ -1136,6 +1138,11 @@ class OpportunityMinerAgent(BaseAgent):
         _add_alias(entry["policy_id"])
         _add_alias(entry.get("detector"))
 
+        existing_aliases = config.get("aliases")
+        if isinstance(existing_aliases, (set, list, tuple)):
+            for alias in existing_aliases:
+                _add_alias(alias)
+
         if provided_policy:
             entry["source_policy"] = provided_policy
             for field in (
@@ -1406,91 +1413,191 @@ class OpportunityMinerAgent(BaseAgent):
         return threshold
 
     def _get_policy_registry(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            "price_variance_check": {
-                "policy_id": "oppfinderpolicy_001_price_benchmark_variance_detection",
-                "detector": "Price Benchmark Variance",
-                "policy_name": "Price Benchmark Variance",
-                "required_fields": [
-                    "supplier_id",
-                    "item_id",
-                    "actual_price",
-                    "benchmark_price",
-                ],
-                "handler": self._policy_price_benchmark_variance,
-            },
-            "volume_consolidation_check": {
-                "policy_id": "oppfinderpolicy_003_volume_consolidation",
-                "detector": "Volume Consolidation",
-                "policy_name": "Volume Consolidation",
-                "required_fields": ["minimum_volume_gbp"],
-                "handler": self._policy_volume_consolidation,
-            },
-            "contract_expiry_check": {
-                "policy_id": "oppfinderpolicy_004_contract_expiry_opportunity",
-                "detector": "Contract Expiry Opportunity",
-                "policy_name": "Contract Expiry Opportunity",
-                "required_fields": ["negotiation_window_days"],
-                "handler": self._policy_contract_expiry,
-                "default_conditions": {"negotiation_window_days": 90},
-            },
-            "supplier_risk_check": {
-                "policy_id": "oppfinderpolicy_005_supplier_risk_alert",
-                "detector": "Supplier Risk Alert",
-                "policy_name": "Supplier Risk Alert",
-                "required_fields": ["risk_threshold"],
-                "handler": self._policy_supplier_risk,
-            },
-            "maverick_spend_check": {
-                "policy_id": "oppfinderpolicy_006_maverick_spend_detection",
-                "detector": "Maverick Spend Detection",
-                "policy_name": "Maverick Spend Detection",
-                "required_fields": ["minimum_value_gbp"],
-                "handler": self._policy_maverick_spend,
-            },
-            "duplicate_supplier_check": {
-                "policy_id": "oppfinderpolicy_007_duplicate_supplier",
-                "detector": "Duplicate Supplier",
-                "policy_name": "Duplicate Supplier",
-                "required_fields": ["minimum_overlap_gbp"],
-                "handler": self._policy_duplicate_supplier,
-            },
-            "category_overspend_check": {
-                "policy_id": "oppfinderpolicy_008_category_overspend",
-                "detector": "Category Overspend",
-                "policy_name": "Category Overspend",
-                "required_fields": ["category_budgets"],
-                "handler": self._policy_category_overspend,
-            },
-            "inflation_passthrough_check": {
-                "policy_id": "oppfinderpolicy_009_inflation_pass-through",
-                "detector": "Inflation Pass-Through",
-                "policy_name": "Inflation Pass-Through",
-                "required_fields": ["market_inflation_pct"],
-                "handler": self._policy_inflation_passthrough,
-            },
-            "unused_contract_value_check": {
-                "policy_id": "oppfinderpolicy_010_unused_contract_value",
-                "detector": "Unused Contract Value",
-                "policy_name": "Unused Contract Value",
-                "required_fields": ["minimum_unused_value_gbp"],
-                "handler": self._policy_unused_contract_value,
-            },
-            "supplier_performance_check": {
-                "policy_id": "oppfinderpolicy_011_supplier_performance_deviation",
-                "detector": "Supplier Performance Deviation",
-                "policy_name": "Supplier Performance Deviation",
-                "required_fields": ["performance_records"],
-                "handler": self._policy_supplier_performance,
-            },
-            "esg_opportunity_check": {
-                "policy_id": "oppfinderpolicy_012_esg_opportunity",
-                "detector": "ESG Opportunity",
-                "policy_name": "ESG Opportunity",
-                "required_fields": ["esg_scores"],
-                "handler": self._policy_esg_opportunity,
-            },
+        """Return policy metadata keyed by canonical workflow slug."""
+
+        def entry(
+            slug: str,
+            detector: str,
+            handler,
+            required: Iterable[str],
+            default_conditions: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            aliases = {
+                self._normalise_policy_slug(slug),
+                self._normalise_policy_slug(detector),
+            }
+            return {
+                "policy_slug": slug,
+                "policy_id": slug,
+                "detector": detector,
+                "policy_name": detector,
+                "required_fields": list(required),
+                "handler": handler,
+                "default_conditions": dict(default_conditions or {}),
+                "aliases": {alias for alias in aliases if alias},
+            }
+
+        registry: Dict[str, Dict[str, Any]] = {
+            "price_variance_check": entry(
+                "price_variance_check",
+                "Price Benchmark Variance",
+                self._policy_price_benchmark_variance,
+                ["supplier_id", "item_id", "actual_price", "benchmark_price"],
+            ),
+            "volume_consolidation_check": entry(
+                "volume_consolidation_check",
+                "Volume Consolidation",
+                self._policy_volume_consolidation,
+                ["minimum_volume_gbp"],
+            ),
+            "contract_expiry_check": entry(
+                "contract_expiry_check",
+                "Contract Expiry Opportunity",
+                self._policy_contract_expiry,
+                ["negotiation_window_days"],
+                {"negotiation_window_days": 90},
+            ),
+            "supplier_risk_check": entry(
+                "supplier_risk_check",
+                "Supplier Risk Alert",
+                self._policy_supplier_risk,
+                ["risk_threshold"],
+            ),
+            "maverick_spend_check": entry(
+                "maverick_spend_check",
+                "Maverick Spend Detection",
+                self._policy_maverick_spend,
+                ["minimum_value_gbp"],
+            ),
+            "duplicate_supplier_check": entry(
+                "duplicate_supplier_check",
+                "Duplicate Supplier",
+                self._policy_duplicate_supplier,
+                ["minimum_overlap_gbp"],
+            ),
+            "category_overspend_check": entry(
+                "category_overspend_check",
+                "Category Overspend",
+                self._policy_category_overspend,
+                ["category_budgets"],
+            ),
+            "inflation_passthrough_check": entry(
+                "inflation_passthrough_check",
+                "Inflation Pass-Through",
+                self._policy_inflation_passthrough,
+                ["market_inflation_pct"],
+            ),
+            "unused_contract_value_check": entry(
+                "unused_contract_value_check",
+                "Unused Contract Value",
+                self._policy_unused_contract_value,
+                ["minimum_unused_value_gbp"],
+            ),
+            "supplier_performance_check": entry(
+                "supplier_performance_check",
+                "Supplier Performance Deviation",
+                self._policy_supplier_performance,
+                ["performance_records"],
+            ),
+            "esg_opportunity_check": entry(
+                "esg_opportunity_check",
+                "ESG Opportunity",
+                self._policy_esg_opportunity,
+                ["esg_scores"],
+            ),
         }
+
+        engine = getattr(self.agent_nick, "policy_engine", None)
+        policies = []
+        if engine is not None:
+            if hasattr(engine, "iter_policies"):
+                policies = list(engine.iter_policies())
+            elif hasattr(engine, "list_policies"):
+                policies = list(engine.list_policies())  # pragma: no cover - legacy
+
+        def aliases_for(policy: Dict[str, Any]) -> set[str]:
+            aliases: set[str] = set()
+            for key in ("policyName", "policy_desc", "policyId", "slug"):
+                alias = self._normalise_policy_slug(policy.get(key))
+                if alias:
+                    aliases.add(alias)
+            for alias in policy.get("aliases", []):
+                norm = self._normalise_policy_slug(alias)
+                if norm:
+                    aliases.add(norm)
+            details = policy.get("details", {})
+            if isinstance(details, dict):
+                for key in (
+                    "policy_name",
+                    "identifier",
+                    "policy_identifier",
+                    "name",
+                ):
+                    alias = self._normalise_policy_slug(details.get(key))
+                    if alias:
+                        aliases.add(alias)
+                rules = details.get("rules")
+                if isinstance(rules, dict):
+                    for key in ("policy_name", "name"):
+                        alias = self._normalise_policy_slug(rules.get(key))
+                        if alias:
+                            aliases.add(alias)
+            return aliases
+
+        for policy in policies:
+            policy_aliases = aliases_for(policy)
+            if not policy_aliases:
+                continue
+            for slug, entry_data in registry.items():
+                entry_aliases = entry_data.setdefault("aliases", set())
+                base_aliases = {
+                    self._normalise_policy_slug(slug),
+                    self._normalise_policy_slug(entry_data.get("policy_id")),
+                    self._normalise_policy_slug(entry_data.get("policy_name")),
+                    self._normalise_policy_slug(entry_data.get("detector")),
+                }
+                entry_aliases.update(alias for alias in base_aliases if alias)
+                if entry_aliases & policy_aliases:
+                    entry_aliases.update(policy_aliases)
+                    policy_id = policy.get("policyId")
+                    if policy_id:
+                        entry_data["policy_id"] = str(policy_id)
+                    name = policy.get("policyName")
+                    if name:
+                        entry_data["policy_name"] = str(name)
+                    desc = policy.get("policy_desc")
+                    if desc:
+                        entry_data["policy_desc"] = desc
+                    entry_data["source_policy"] = policy
+                    details = policy.get("details", {})
+                    if isinstance(details, dict):
+                        rules = details.get("rules")
+                        if isinstance(rules, dict):
+                            params = rules.get("parameters")
+                            if isinstance(params, dict):
+                                existing = (
+                                    entry_data.get("parameters")
+                                    if isinstance(entry_data.get("parameters"), dict)
+                                    else {}
+                                )
+                                merged_params = {**existing, **params}
+                                entry_data["parameters"] = merged_params
+                                if not entry_data.get("required_fields"):
+                                    entry_data["required_fields"] = list(merged_params.keys())
+                            defaults = rules.get("default_conditions")
+                            if isinstance(defaults, dict):
+                                existing_defaults = (
+                                    entry_data.get("default_conditions")
+                                    if isinstance(entry_data.get("default_conditions"), dict)
+                                    else {}
+                                )
+                                entry_data["default_conditions"] = {
+                                    **existing_defaults,
+                                    **defaults,
+                                }
+                    break
+
+        return registry
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:

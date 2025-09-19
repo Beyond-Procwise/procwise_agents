@@ -72,6 +72,15 @@ class BaseAgent:
         logger.info(
             f"Initialized agent: {self.__class__.__name__} on device {self.device}"
         )
+        prompt_engine = getattr(agent_nick, "prompt_engine", None)
+        if prompt_engine is None:
+            try:
+                prompt_engine = PromptEngine(agent_nick)
+            except Exception:  # pragma: no cover - defensive fallback for tests
+                logger.debug("Falling back to in-memory prompt engine", exc_info=True)
+                prompt_engine = PromptEngine(agent_nick=None, prompt_rows=[])
+            setattr(agent_nick, "prompt_engine", prompt_engine)
+        self.prompt_engine = prompt_engine
 
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")
@@ -208,8 +217,8 @@ class AgentNick:
         logger.info("Clients initialized.")
 
         logger.info("Initializing core engines...")
-        self.prompt_engine = PromptEngine()
-        self.policy_engine = PolicyEngine()
+        self.prompt_engine = PromptEngine(self)
+        self.policy_engine = PolicyEngine(self)
         self.query_engine = QueryEngine(self)
         self.routing_engine = RoutingEngine(self)
         self.process_routing_service = ProcessRoutingService(self)

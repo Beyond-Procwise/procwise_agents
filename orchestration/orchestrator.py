@@ -310,56 +310,38 @@ class Orchestrator:
         return details
 
     def _load_prompts(self) -> Dict[int, Dict[str, Any]]:
-        """Load prompt templates keyed by ``promptId``.
-
-        The ``prompts_desc`` field in ``proc.prompt`` stores free-form text
-        rather than JSON.  Each row may also reference one or more linked
-        agents via ``linked_agents`` which are resolved into agent metadata.
-        A file-system fallback is used when the database is unavailable.
-        """
+        """Load prompt templates keyed by ``promptId`` from :class:`PromptEngine`."""
 
         if self._prompt_cache is not None:
             return dict(self._prompt_cache)
 
-        prompts: Dict[int, Dict[str, Any]] = {}
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT prompt_id, prompts_desc, prompt_linked_agents"
-                        " FROM proc.prompt WHERE prompts_desc IS NOT NULL"
-                    )
-                    rows = cursor.fetchall()
-                for pid, desc, linked in rows:
-                    if not desc:
-                        continue
-                    desc_text = str(desc)
-                    value = {
-                        "promptId": int(pid),
-                        "template": desc_text,
-                        "prompts_desc": desc_text,
-                        "agents": self._get_agent_details(linked),
-                    }
-                    prompts[int(pid)] = value
-            if prompts:
-                self._prompt_cache = prompts
-                return dict(prompts)
-        except Exception:  # pragma: no cover - defensive fall back
-            logger.exception("Failed to load prompts from DB, falling back to file")
+        prompt_engine = getattr(self.agent_nick, "prompt_engine", None)
+        if prompt_engine is None:
+            from orchestration.prompt_engine import PromptEngine  # local import to avoid cycles
 
-        path = Path(__file__).resolve().parents[1] / "prompts" / "prompts.json"
-        with path.open() as f:
-            data = json.load(f)
-        templates = data.get("templates", [])
-        result: Dict[int, Dict[str, Any]] = {}
-        for template in templates:
-            if "promptId" not in template:
-                continue
-            entry = dict(template)
-            entry.setdefault("prompts_desc", entry.get("template", ""))
-            result[int(entry["promptId"])] = entry
-        self._prompt_cache = result
-        return dict(result)
+            prompt_engine = PromptEngine(self.agent_nick)
+            setattr(self.agent_nick, "prompt_engine", prompt_engine)
+
+        try:
+            catalog = prompt_engine.prompts_by_id()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load prompts from prompt engine")
+            self._prompt_cache = {}
+            return {}
+
+        prompts: Dict[int, Dict[str, Any]] = {}
+        for pid, prompt in catalog.items():
+            entry = dict(prompt)
+            linked = prompt.get("linked_agents") or prompt.get("agents")
+            if isinstance(linked, (list, tuple, set)):
+                linked_spec = "{" + ",".join(str(item) for item in linked) + "}"
+            else:
+                linked_spec = linked
+            entry["agents"] = self._get_agent_details(linked_spec)
+            prompts[int(pid)] = entry
+
+        self._prompt_cache = dict(prompts)
+        return dict(prompts)
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
@@ -410,26 +392,12 @@ class Orchestrator:
                         "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value
-            if policies:
-                self._policy_cache = policies
-                return dict(policies)
-        except Exception:  # pragma: no cover - defensive fall back
-            logger.exception("Failed to load policies from DB, falling back to files")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load policies from DB")
+            self._policy_cache = {}
+            return {}
 
-        policy_dir = Path(__file__).resolve().parents[1] / "policies"
-        idx = 1
-        for file in sorted(policy_dir.glob("*.json")):
-            with file.open() as f:
-                items = json.load(f)
-            for item in items:
-                entry = dict(item)
-                policy_id = int(entry.get("policyId", idx))
-                entry.setdefault("policyId", policy_id)
-                entry.setdefault("policy_desc", entry.get("description", ""))
-                entry.setdefault("details", entry.get("details", {}))
-                policies[policy_id] = entry
-                idx = max(idx, policy_id) + 1
-        self._policy_cache = policies
+        self._policy_cache = dict(policies)
         return dict(policies)
 
 
