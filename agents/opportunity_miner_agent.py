@@ -188,6 +188,46 @@ class OpportunityMinerAgent(BaseAgent):
                 "minimum_spend_threshold",
                 "spend_threshold",
             },
+            "supplier_id": {
+                "supplier_id",
+                "supplier",
+                "supplier_code",
+                "vendor_id",
+            },
+            "item_id": {
+                "item_id",
+                "item",
+                "item_code",
+                "material_id",
+                "sku",
+            },
+            "actual_price": {
+                "actual_price",
+                "current_price",
+                "price_paid",
+                "unit_price",
+                "current_unit_price",
+            },
+            "benchmark_price": {
+                "benchmark_price",
+                "benchmark_unit_price",
+                "target_price",
+                "reference_price",
+            },
+            "quantity": {
+                "quantity",
+                "volume",
+                "units",
+                "unit_count",
+                "order_quantity",
+            },
+            "variance_threshold_pct": {
+                "variance_threshold_pct",
+                "variance_threshold",
+                "threshold_pct",
+                "price_variance_threshold",
+                "variance_pct_threshold",
+            },
         }
 
         def _assign_condition(key: str, raw: Any) -> None:
@@ -1033,10 +1073,34 @@ class OpportunityMinerAgent(BaseAgent):
         if not isinstance(conditions, dict):
             conditions = {}
             input_data["conditions"] = conditions
+
+        def _resolve_from(container: Any, field: str) -> Any:
+            if not isinstance(container, dict):
+                return None
+            value = container.get(field)
+            if value is None:
+                return None
+            if isinstance(value, str) and not value.strip():
+                return None
+            return value
         missing = []
         for field in required_fields:
             value = conditions.get(field)
             if value is None or (isinstance(value, str) and not value.strip()):
+                fallback = None
+                for source in (
+                    input_data,
+                    input_data.get("parameters"),
+                    input_data.get("defaults"),
+                ):
+                    fallback = _resolve_from(source, field)
+                    if fallback is not None:
+                        conditions[field] = fallback
+                        break
+
+                if fallback is not None:
+                    continue
+
                 default_map = defaults or {}
                 if field in default_map and default_map[field] is not None:
                     conditions[field] = default_map[field]
@@ -1323,9 +1387,33 @@ class OpportunityMinerAgent(BaseAgent):
         return registry
 
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
+        def _resolve_from(container: Any) -> Any:
+            if not isinstance(container, dict):
+                return None
+            value = container.get(key)
+            if value is None:
+                return None
+            if isinstance(value, str) and not value.strip():
+                return None
+            return value
+
         conditions = input_data.get("conditions")
         if isinstance(conditions, dict):
-            return conditions.get(key, default)
+            value = _resolve_from(conditions)
+            if value is not None:
+                return value
+
+        for source in (
+            input_data,
+            input_data.get("parameters"),
+            input_data.get("defaults"),
+        ):
+            value = _resolve_from(source)
+            if value is not None:
+                if isinstance(conditions, dict):
+                    conditions.setdefault(key, value)
+                return value
+
         return default
 
     def _resolve_supplier_id(self, supplier_id: Optional[Any]) -> Optional[str]:
