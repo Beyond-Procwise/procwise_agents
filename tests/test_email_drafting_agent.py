@@ -34,7 +34,13 @@ def test_email_drafting_agent(monkeypatch):
     captured = {}
     monkeypatch.setattr(agent, "_store_draft", lambda draft: captured.setdefault("drafts", []).append(draft))
 
-    ranking = [{"supplier_id": "S1", "supplier_name": "Acme"}]
+    ranking = [
+        {
+            "supplier_id": "S1",
+            "supplier_name": "Acme",
+            "justification": "Ranked 1 following spend analysis.",
+        }
+    ]
     context = AgentContext(
         workflow_id="wf1",
         agent_id="email_drafting",
@@ -59,12 +65,16 @@ def test_email_drafting_agent(monkeypatch):
     assert draft["supplier_name"] == "Acme"
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
-    assert "<p>Dear Acme, we are reaching out to request your quotation for the requirement below.</p>" in draft["body"]
-    assert "<p>Please submit your response by 01/01/2025.</p>" in draft["body"]
+    assert "<p>Dear Acme,</p>" in draft["body"]
+    assert "formal quotation for the requirement outlined below" in draft["body"]
+    assert "<p>Kindly complete the table and return your quotation by 01/01/2025.</p>" in draft["body"]
     assert "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>" in draft["body"]
+    assert "<p>We appreciate your timely response.</p>" in draft["body"]
     assert "<table" in draft["body"]
     assert draft["subject"].count("RFQ") == 1
-    assert "leading suppliers" not in draft["body"].lower()
+    body_lower = draft["body"].lower()
+    assert "rank" not in body_lower
+    assert "analysis" not in body_lower
     assert draft["sent_status"] is False
     assert draft["sender"] == "sender@example.com"
     assert draft["contact_level"] == 0

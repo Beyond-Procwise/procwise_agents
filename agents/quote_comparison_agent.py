@@ -328,11 +328,6 @@ class QuoteComparisonAgent(BaseAgent):
         elif source.get("quote_file_s3_path") is None:
             merged["quote_file_s3_path"] = None
 
-        if source.get("weighting_factors"):
-            merged["weighting_factors"] = dict(source["weighting_factors"])
-        elif fallback.get("weighting_factors"):
-            merged["weighting_factors"] = dict(fallback["weighting_factors"])
-
         return merged
 
     def _format_passed_quote(self, entry: Dict) -> Dict:
@@ -437,7 +432,6 @@ class QuoteComparisonAgent(BaseAgent):
         entry["total_cost"] = metric_weights.get("total_cost", 0.0)
         entry["tenure"] = metric_weights.get("tenure", 0.0)
         entry["volume"] = metric_weights.get("volume", 0.0)
-        entry["weighting_factors"] = metric_weights
         return entry
 
     def _extract_metric_weights(self, weights: Any) -> Dict[str, float]:
