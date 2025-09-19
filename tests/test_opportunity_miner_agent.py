@@ -32,6 +32,41 @@ def test_price_expression_falls_back_to_unit_price(monkeypatch):
     assert expr == "li.unit_price"
 
 
+def test_build_finding_includes_policy_identifier():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    finding_a = agent._build_finding(
+        "VolumeDiscountOpportunity",
+        "SI0001",
+        "CatA",
+        "Item-1",
+        100.0,
+        {},
+        ["PO1"],
+        policy_id="policy_9",
+        policy_name="Volume Discount Opportunity",
+    )
+    finding_b = agent._build_finding(
+        "VolumeDiscountOpportunity",
+        "SI0001",
+        "CatA",
+        "Item-1",
+        100.0,
+        {},
+        ["PO1"],
+        policy_id="policy_10",
+        policy_name="Volume Discount Opportunity",
+    )
+
+    assert finding_a.policy_id == "policy_9"
+    assert finding_b.policy_id == "policy_10"
+    assert finding_a.opportunity_id != finding_b.opportunity_id
+    assert "policy_9" in finding_a.opportunity_id
+    assert "policy_10" in finding_b.opportunity_id
+
+
 def _sample_tables() -> Dict[str, Any]:
     purchase_orders = pd.DataFrame(
         [

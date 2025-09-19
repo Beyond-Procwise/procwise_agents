@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ class Finding:
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
     context_documents: List[Dict[str, Any]] = field(default_factory=list)
     item_reference: Optional[str] = None
+    policy_id: Optional[str] = None
     feedback_status: Optional[str] = None
     feedback_reason: Optional[str] = None
     feedback_updated_at: Optional[datetime] = None
@@ -1585,6 +1587,9 @@ class OpportunityMinerAgent(BaseAgent):
         impact: float,
         details: Dict,
         sources: List[str],
+        *,
+        policy_id: Optional[str] = None,
+        policy_name: Optional[str] = None,
     ) -> Finding:
         """Create a :class:`Finding` ensuring NaNs are normalised."""
 
@@ -1604,8 +1609,43 @@ class OpportunityMinerAgent(BaseAgent):
         if impact is None or (isinstance(impact, float) and pd.isna(impact)):
             impact = 0.0
 
+        detector_slug = self._normalise_policy_slug(detector) or "detector"
+        policy_slug = (
+            self._normalise_policy_slug(policy_id)
+            or self._normalise_policy_slug(policy_name)
+            or detector_slug
+        )
+
+        def _slug_or_default(value: Optional[str], default: str) -> str:
+            slug = self._normalise_policy_slug(value)
+            return slug or default
+
+        supplier_slug = _slug_or_default(supplier_id, "na")
+        item_slug = _slug_or_default(item_id, "na")
+
+        source_token = "none"
+        if sources:
+            normalised_sources = [
+                str(src).strip()
+                for src in sources
+                if src is not None and str(src).strip()
+            ]
+            if normalised_sources:
+                joined = "|".join(sorted(normalised_sources))
+                source_token = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:8]
+
+        opportunity_id = "_".join(
+            token
+            for token in [policy_slug, detector_slug, source_token, supplier_slug, item_slug]
+            if token
+        )
+
+        policy_identifier = None
+        if policy_id is not None:
+            policy_identifier = str(policy_id).strip() or None
+
         finding = Finding(
-            opportunity_id=f"{detector}_{len(sources)}_{supplier_id or 'NA'}_{item_id or 'NA'}",
+            opportunity_id=opportunity_id,
             detector_type=detector,
             supplier_id=supplier_id,
             category_id=category_id,
@@ -1615,6 +1655,7 @@ class OpportunityMinerAgent(BaseAgent):
             source_records=sources,
             detected_on=datetime.utcnow(),
             item_reference=item_id,
+            policy_id=policy_identifier,
         )
 
         logger.debug(
@@ -1844,6 +1885,8 @@ class OpportunityMinerAgent(BaseAgent):
                 estimated_savings,
                 details,
                 sources,
+                policy_id=policy_id,
+                policy_name=policy_cfg.get("policy_name"),
             )
             findings.append(finding)
             self._log_policy_event(
@@ -2007,6 +2050,8 @@ class OpportunityMinerAgent(BaseAgent):
                     savings,
                     details,
                     po_ids or [category],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
                 findings.append(finding)
                 self._log_policy_event(
@@ -2065,6 +2110,8 @@ class OpportunityMinerAgent(BaseAgent):
                         savings,
                         details,
                         po_ids or [fallback_category],
+                        policy_id=policy_id,
+                        policy_name=policy_cfg.get("policy_name"),
                     )
                     findings.append(finding)
                     self._log_policy_event(
@@ -2469,6 +2516,8 @@ class OpportunityMinerAgent(BaseAgent):
                 impact,
                 details,
                 sources,
+                policy_id=policy_id,
+                policy_name=policy_cfg.get("policy_name"),
             )
         )
         self._record_escalation(
@@ -2620,6 +2669,8 @@ class OpportunityMinerAgent(BaseAgent):
                         potential_savings,
                         details,
                         po_ids or [item_id],
+                        policy_id=policy_id,
+                        policy_name=policy_cfg.get("policy_name"),
                     )
                 )
                 self._log_policy_event(
@@ -2649,6 +2700,8 @@ class OpportunityMinerAgent(BaseAgent):
         reference_date: date,
         ranking: Optional[Iterable[Dict[str, Any]]],
         limit: int = 3,
+        policy_id: Optional[str] = None,
+        policy_name: Optional[str] = None,
     ) -> List[Finding]:
         contracts = tables.get("contracts", pd.DataFrame())
         if contracts.empty or "supplier_id" not in contracts.columns or "contract_id" not in contracts.columns:
@@ -2831,6 +2884,8 @@ class OpportunityMinerAgent(BaseAgent):
                 impact,
                 details,
                 sources,
+                policy_id=policy_id,
+                policy_name=policy_name,
             )
             if isinstance(supplier_name, str) and supplier_name:
                 finding.supplier_name = supplier_name
@@ -2904,6 +2959,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     [s for s in sources if s],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -2922,6 +2979,8 @@ class OpportunityMinerAgent(BaseAgent):
             detector,
             reference_date,
             input_data.get("ranking"),
+            policy_id=policy_id,
+            policy_name=policy_cfg.get("policy_name"),
         )
         if fallback_findings:
             supplier_ids = [f.supplier_id for f in fallback_findings if f.supplier_id]
@@ -3003,6 +3062,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     [supplier_id],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -3078,6 +3139,8 @@ class OpportunityMinerAgent(BaseAgent):
                     value,
                     details,
                     [str(po_id)],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -3193,6 +3256,8 @@ class OpportunityMinerAgent(BaseAgent):
                     total_spend,
                     details,
                     po_ids or [item_id],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._log_policy_event(
@@ -3330,6 +3395,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     sources or [category_id],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -3471,6 +3538,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     po_ids + invoice_ids,
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -3580,6 +3649,8 @@ class OpportunityMinerAgent(BaseAgent):
                     unused,
                     details,
                     invoice_ids or [contract_id],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._log_policy_event(
@@ -3659,6 +3730,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     sources if isinstance(sources, list) else [str(sources)],
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
@@ -3732,6 +3805,8 @@ class OpportunityMinerAgent(BaseAgent):
                     impact,
                     details,
                     sources,
+                    policy_id=policy_id,
+                    policy_name=policy_cfg.get("policy_name"),
                 )
             )
             self._record_escalation(
