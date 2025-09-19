@@ -746,6 +746,13 @@ class Orchestrator:
                 agent_key=agent_key,
             )
 
+            # Ensure that database-backed defaults from ``proc.agent`` are
+            # applied consistently so that agents receive their configured
+            # prompts and policies even when the JSON flow omits them.  Without
+            # this injection the orchestrator would pass only the static flow
+            # payload which led to the agents operating on stale instructions.
+            self._inject_agent_instructions(agent_key, agent_input)
+
             success = False
             attempt = 0
             result = None

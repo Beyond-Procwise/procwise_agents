@@ -79,6 +79,66 @@ def test_json_flow_inherits_payload_when_input_missing():
     assert agent.received == payload
 
 
+def test_json_flow_injects_proc_agent_prompts_and_policies():
+    captured: Dict[str, Any] = {}
+
+    class CaptureAgent:
+        def execute(self, context):
+            captured["input"] = dict(context.input_data)
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    class DummyPRS:
+        def __init__(self):
+            self._agent_defaults_cache = {
+                "opportunity_miner": {
+                    "llm": "llama3",
+                    "prompts": [50],
+                    "policies": [9],
+                }
+            }
+
+        def _load_agent_links(self):  # pragma: no cover - cache primed
+            return {}, {}, {}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={"opportunity_miner": CaptureAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        process_routing_service=DummyPRS(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {
+        50: {"promptId": 50, "template": "from-db"}
+    }
+    orchestrator._load_policies = lambda: {
+        9: {"policyId": 9, "policy_desc": "{}"}
+    }
+
+    flow = {
+        "entrypoint": "start",
+        "steps": {
+            "start": {
+                "agent": "opportunity_miner",
+            }
+        },
+    }
+
+    orchestrator.execute_agent_flow(flow)
+
+    input_data = captured.get("input", {})
+    prompts = input_data.get("prompts") or []
+    policies = input_data.get("policies") or []
+    assert input_data.get("llm") == "llama3"
+    assert any(p.get("promptId") == 50 for p in prompts)
+    assert any(p.get("policyId") == 9 for p in policies)
+
+
 class DummyAgent:
     def __init__(self):
         self.ran = False
