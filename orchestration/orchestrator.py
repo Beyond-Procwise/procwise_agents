@@ -1007,14 +1007,53 @@ class Orchestrator:
         if not isinstance(input_data, dict):
             return
 
-        prompts_present = bool(input_data.get("prompts"))
-        policies_present = bool(input_data.get("policies"))
-        if prompts_present and policies_present:
-            return
-
         agent_defs = self._load_agent_definitions()
         canonical = self._canonical_key(agent_key, agent_defs) or self._resolve_agent_name(agent_key)
         canonical = canonical or agent_key
+
+        default_config: Dict[str, Any] = {}
+        prs = getattr(self.agent_nick, "process_routing_service", None)
+        if prs is not None:
+            defaults_map = getattr(prs, "_agent_defaults_cache", None)
+            if defaults_map is None:
+                try:  # pragma: no cover - cache priming
+                    prs._load_agent_links()
+                    defaults_map = getattr(prs, "_agent_defaults_cache", {})
+                except Exception:
+                    logger.exception("Failed to load agent defaults for %s", agent_key)
+                    defaults_map = {}
+            if isinstance(defaults_map, dict):
+                default_config = dict(defaults_map.get(canonical, {}))
+
+        default_llm = default_config.get("llm")
+        if default_llm and not input_data.get("llm"):
+            input_data["llm"] = default_llm
+
+        for key, value in default_config.items():
+            if key in {"llm", "prompts", "policies"}:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                existing = input_data.get(key)
+                if isinstance(existing, dict):
+                    merged = dict(value)
+                    merged.update(existing)
+                    input_data[key] = merged
+                elif key not in input_data:
+                    input_data[key] = dict(value)
+            elif key not in input_data:
+                input_data[key] = value
+
+        prompts_catalog = self._load_prompts()
+        policies_catalog = self._load_policies()
+
+        default_prompt_ids = ProcessRoutingService._coerce_identifier_list(
+            default_config.get("prompts")
+        )
+        default_policy_ids = ProcessRoutingService._coerce_identifier_list(
+            default_config.get("policies")
+        )
 
         def _merge(target_key: str, items: List[Dict[str, Any]], identifier: str) -> None:
             if not items:
@@ -1037,25 +1076,39 @@ class Orchestrator:
                 if ident is not None:
                     seen.add(ident)
 
-        if not prompts_present:
-            prompt_objs: List[Dict[str, Any]] = []
-            for prompt in self._load_prompts().values():
+        prompt_objs: List[Dict[str, Any]] = []
+        for pid in default_prompt_ids:
+            prompt = prompts_catalog.get(pid) if isinstance(prompts_catalog, dict) else None
+            if prompt:
+                prompt_objs.append(dict(prompt))
+            else:  # pragma: no cover - defensive logging
+                logger.warning("Default prompt id %s not found for agent %s", pid, canonical)
+
+        if not prompt_objs and not input_data.get("prompts"):
+            for prompt in (prompts_catalog.values() if isinstance(prompts_catalog, dict) else []):
                 for meta in prompt.get("agents", []):
                     slug = meta.get("agent_type") or self._resolve_agent_name(meta.get("agent_name"))
                     if slug == canonical:
                         prompt_objs.append(dict(prompt))
                         break
-            _merge("prompts", prompt_objs, "promptId")
+        _merge("prompts", prompt_objs, "promptId")
 
-        if not policies_present:
-            policy_objs: List[Dict[str, Any]] = []
-            for policy in self._load_policies().values():
+        policy_objs: List[Dict[str, Any]] = []
+        for pid in default_policy_ids:
+            policy = policies_catalog.get(pid) if isinstance(policies_catalog, dict) else None
+            if policy:
+                policy_objs.append(dict(policy))
+            else:  # pragma: no cover - defensive logging
+                logger.warning("Default policy id %s not found for agent %s", pid, canonical)
+
+        if not policy_objs and not input_data.get("policies"):
+            for policy in (policies_catalog.values() if isinstance(policies_catalog, dict) else []):
                 for meta in policy.get("agents", []):
                     slug = meta.get("agent_type") or self._resolve_agent_name(meta.get("agent_name"))
                     if slug == canonical:
                         policy_objs.append(dict(policy))
                         break
-            _merge("policies", policy_objs, "policyId")
+        _merge("policies", policy_objs, "policyId")
 
     def _execute_extraction_workflow(self, context: AgentContext) -> Dict:
         """Execute document extraction workflow"""

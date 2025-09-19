@@ -398,6 +398,51 @@ def test_execute_agent_flow_handles_prefixed_agent_names():
     assert agent.ran is True
 
 
+def test_inject_agent_instructions_uses_agent_defaults():
+    class DummyPRS:
+        def __init__(self):
+            self._agent_defaults_cache = {
+                "opportunity_miner": {
+                    "llm": "llama3",
+                    "prompts": [50],
+                    "policies": [9],
+                    "conditions": {"negotiation_window_days": 45},
+                }
+            }
+
+        def _load_agent_links(self):  # pragma: no cover - not triggered
+            return {}, {}, {}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1, parallel_processing=False),
+        agents={"opportunity_miner": DummyAgent()},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        process_routing_service=DummyPRS(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {
+        "opportunity_miner": "OpportunityMinerAgent"
+    }
+    orchestrator._load_prompts = lambda: {
+        50: {"promptId": 50, "template": "workflow: dynamic"}
+    }
+    orchestrator._load_policies = lambda: {
+        9: {"policyId": 9, "policy_desc": "{}"}
+    }
+
+    payload = {"conditions": {"existing": True}}
+    orchestrator._inject_agent_instructions("opportunity_miner", payload)
+
+    assert payload["llm"] == "llama3"
+    assert payload["conditions"]["negotiation_window_days"] == 45
+    assert payload["conditions"]["existing"] is True
+    assert any(p.get("promptId") == 50 for p in payload["prompts"])
+    assert any(p.get("policyId") == 9 for p in payload["policies"])
+
+
 def test_execute_agent_flow_passes_fields_to_children():
     class ParentAgent:
         def execute(self, context):
