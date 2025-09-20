@@ -308,6 +308,7 @@ class OpportunityMinerAgent(BaseAgent):
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
     ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
+
         """Limit retained findings to at most two per category for each policy."""
 
         aggregated: List[Finding] = []
@@ -318,6 +319,7 @@ class OpportunityMinerAgent(BaseAgent):
             if not isinstance(items, list):
                 per_policy[display] = []
                 category_map[display] = {}
+
                 continue
 
             valid_items: List[Finding] = [
@@ -326,6 +328,7 @@ class OpportunityMinerAgent(BaseAgent):
             if not valid_items:
                 per_policy[display] = []
                 category_map[display] = {}
+
                 continue
 
             sorted_items = sorted(
@@ -357,6 +360,7 @@ class OpportunityMinerAgent(BaseAgent):
             category_map[display] = limited_by_category
 
             for finding in flattened:
+
                 key = finding.opportunity_id or f"{display}:{id(finding)}"
                 if key in seen_ids:
                     continue
@@ -364,6 +368,7 @@ class OpportunityMinerAgent(BaseAgent):
                 aggregated.append(finding)
 
         return aggregated, category_map
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -749,6 +754,7 @@ class OpportunityMinerAgent(BaseAgent):
             filtered, per_policy_categories = self._apply_policy_category_limits(
                 per_policy_retained
             )
+
 
             filtered = self._enrich_findings(filtered, tables)
             filtered = self._map_item_descriptions(filtered, tables)
