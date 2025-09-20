@@ -520,26 +520,6 @@ class OpportunityMinerAgent(BaseAgent):
                         if param_key not in policy_input["conditions"]:
                             policy_input["conditions"][param_key] = param_value
 
-                missing_fields = self._missing_required_fields(
-                    policy_input,
-                    policy_cfg.get("required_fields", []),
-                    policy_cfg.get("default_conditions", {}),
-                )
-                if missing_fields:
-                    message = (
-                        "Missing mandatory orchestrator fields: "
-                        + ", ".join(sorted(missing_fields))
-                    )
-                    self._log_policy_event(
-                        policy_cfg.get("policy_id", "unknown"),
-                        None,
-                        "blocked",
-                        message,
-                        {"missing_fields": sorted(missing_fields)},
-                    )
-                    return self._blocked_output(
-                        message, policy_id=policy_cfg.get("policy_id")
-                    )
 
                 if not isinstance(context.input_data.get("conditions"), dict):
                     context.input_data["conditions"] = {}
