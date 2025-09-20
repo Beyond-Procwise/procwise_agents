@@ -307,15 +307,19 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
-    ) -> List[Finding]:
+    ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
+
         """Limit retained findings to at most two per category for each policy."""
 
         aggregated: List[Finding] = []
         seen_ids: set[str] = set()
+        category_map: Dict[str, Dict[str, List[Finding]]] = {}
 
         for display, items in per_policy.items():
             if not isinstance(items, list):
                 per_policy[display] = []
+                category_map[display] = {}
+
                 continue
 
             valid_items: List[Finding] = [
@@ -323,6 +327,8 @@ class OpportunityMinerAgent(BaseAgent):
             ]
             if not valid_items:
                 per_policy[display] = []
+                category_map[display] = {}
+
                 continue
 
             sorted_items = sorted(
@@ -337,23 +343,32 @@ class OpportunityMinerAgent(BaseAgent):
                 category = str(cat_raw).strip() if cat_raw else "uncategorized"
                 categories.setdefault(category, []).append(finding)
 
-            limited: List[Finding] = []
-            for cat_findings in categories.values():
-                limited.extend(cat_findings[:2])
+            limited_by_category: Dict[str, List[Finding]] = {}
+            for category, cat_findings in categories.items():
+                top = cat_findings[:2]
+                if top:
+                    limited_by_category[category] = top
 
-            if not limited:
-                limited.append(sorted_items[0])
+            if not limited_by_category:
+                limited_by_category["uncategorized"] = [sorted_items[0]]
 
-            per_policy[display] = limited
+            flattened: List[Finding] = []
+            for bucket in limited_by_category.values():
+                flattened.extend(bucket)
 
-            for finding in limited:
+            per_policy[display] = flattened
+            category_map[display] = limited_by_category
+
+            for finding in flattened:
+
                 key = finding.opportunity_id or f"{display}:{id(finding)}"
                 if key in seen_ids:
                     continue
                 seen_ids.add(key)
                 aggregated.append(finding)
 
-        return aggregated
+        return aggregated, category_map
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -736,7 +751,10 @@ class OpportunityMinerAgent(BaseAgent):
                     else:
                         per_policy_retained[display] = []
 
-            filtered = self._apply_policy_category_limits(per_policy_retained)
+            filtered, per_policy_categories = self._apply_policy_category_limits(
+                per_policy_retained
+            )
+
 
             filtered = self._enrich_findings(filtered, tables)
             filtered = self._map_item_descriptions(filtered, tables)
@@ -756,6 +774,9 @@ class OpportunityMinerAgent(BaseAgent):
 
             policy_opportunities: Dict[str, List[Dict[str, Any]]] = {}
             policy_suppliers: Dict[str, List[str]] = {}
+            policy_category_opportunities: Dict[
+                str, Dict[str, List[Dict[str, Any]]]
+            ] = {}
             for key in requested_keys:
                 payload = policy_runs.get(key)
                 if not payload:
@@ -769,6 +790,34 @@ class OpportunityMinerAgent(BaseAgent):
                         for f in retained
                         if f.supplier_id and str(f.supplier_id).strip()
                     }
+                )
+                categories = per_policy_categories.get(display, {})
+                policy_category_opportunities[display] = {
+                    category: [f.as_dict() for f in findings]
+                    for category, findings in categories.items()
+                }
+
+            for display, retained in per_policy_retained.items():
+                policy_opportunities.setdefault(
+                    display, [f.as_dict() for f in retained]
+                )
+                policy_suppliers.setdefault(
+                    display,
+                    sorted(
+                        {
+                            str(f.supplier_id).strip()
+                            for f in retained
+                            if f.supplier_id and str(f.supplier_id).strip()
+                        }
+                    ),
+                )
+                categories = per_policy_categories.get(display, {})
+                policy_category_opportunities.setdefault(
+                    display,
+                    {
+                        category: [f.as_dict() for f in findings]
+                        for category, findings in categories.items()
+                    },
                 )
 
             # compute weightage
@@ -793,6 +842,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "policy_events": self._event_log,
                 "escalations": self._escalations,
                 "policy_opportunities": policy_opportunities,
+                "policy_category_opportunities": policy_category_opportunities,
                 "policy_suppliers": policy_suppliers,
             }
             # pass candidate supplier IDs to downstream agents

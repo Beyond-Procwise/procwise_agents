@@ -178,6 +178,31 @@ def test_convert_agents_to_flow_normalises_properties():
     assert "memory" not in props
 
 
+def test_convert_agents_to_flow_preserves_agent_ref_id():
+    details = {
+        "status": "saved",
+        "agents": [
+            {
+                "agent": "A1",
+                "agent_ref_id": "123",
+                "agent_id": "123",
+                "status": "saved",
+                "agent_property": {},
+                "dependencies": {},
+            }
+        ],
+    }
+
+    flow = ProcessRoutingService.convert_agents_to_flow(details)
+    assert flow["agent_ref_id"] == "123"
+    assert flow["agent_id"] == "123"
+
+
+def test_normalise_agent_properties_defaults_llm():
+    props = ProcessRoutingService._normalise_agent_properties({"prompts": [1]})
+    assert props["llm"] == ProcessRoutingService.DEFAULT_LLM_MODEL
+
+
 class FetchCursor:
     def __init__(self, proc_details, prompt_rows, policy_rows):
         self.proc_details = proc_details
@@ -306,6 +331,42 @@ def test_enrich_node_applies_agent_defaults():
     assert props["prompts"] == [50, 51, 52]
     assert props["policies"] == [9, 10]
     assert props["conditions"]["negotiation_window_days"] == 60
+
+
+def test_enrich_node_uses_base_agent_ref_id():
+    agent = SimpleNamespace(settings=SimpleNamespace(script_user="tester"))
+    prs = ProcessRoutingService(agent)
+    prs._agent_property_cache_by_id = {
+        "admin_opportunity_000065": {
+            "llm": "llama-db",
+            "prompts": [9],
+            "policies": [12],
+        }
+    }
+    prs._agent_type_cache_by_id = {
+        "admin_opportunity_000065": "OpportunityMinerAgent"
+    }
+    prs._prompt_id_catalog = {9}
+    prs._policy_id_catalog = {12}
+
+    node = {
+        "agent_ref_id": "admin_opportunity_000065_1758278380887",
+        "agent_property": {},
+        "agent_type": "opportunity_miner",
+    }
+
+    prs._enrich_node(
+        node,
+        {"opportunity_miner": "OpportunityMinerAgent"},
+        {},
+        {},
+    )
+
+    props = node["agent_property"]
+    assert props["llm"] == "llama-db"
+    assert props["prompts"] == [9]
+    assert props["policies"] == [12]
+    assert node["agent_id"] == "admin_opportunity_000065"
 
 def test_update_agent_status_preserves_structure():
     initial = {

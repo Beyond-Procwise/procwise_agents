@@ -782,7 +782,7 @@ class Orchestrator:
                     combined_props[key] = step.get(key)
 
             normalised_props = ProcessRoutingService._normalise_agent_properties(
-                combined_props
+                combined_props, apply_default=False
             )
 
             agent_input = dict(rendered_input)
@@ -861,6 +861,9 @@ class Orchestrator:
             # this injection the orchestrator would pass only the static flow
             # payload which led to the agents operating on stale instructions.
             self._inject_agent_instructions(agent_key, agent_input)
+
+            if not ProcessRoutingService._extract_llm_name(agent_input.get("llm")):
+                agent_input["llm"] = ProcessRoutingService.DEFAULT_LLM_MODEL
 
             success = False
             attempt = 0

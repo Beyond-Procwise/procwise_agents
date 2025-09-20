@@ -76,7 +76,9 @@ def test_json_flow_inherits_payload_when_input_missing():
 
     payload = {"foo": "bar"}
     orchestrator.execute_agent_flow(flow, payload)
-    assert agent.received == payload
+    assert agent.received.get("foo") == "bar"
+    assert agent.received.get("llm") == ProcessRoutingService.DEFAULT_LLM_MODEL
+    assert set(agent.received.keys()) == {"foo", "llm"}
 
 
 def test_json_flow_injects_proc_agent_prompts_and_policies():
