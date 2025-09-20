@@ -127,7 +127,7 @@ class OpportunityMinerAgent(BaseAgent):
     def _apply_instruction_overrides(
         self, context: AgentContext, instructions: Dict[str, Any]
     ) -> None:
-        if not instructions:
+        if not isinstance(instructions, dict):
             return
 
         workflow_hint = instructions.get("workflow") or instructions.get("workflow_name")
@@ -286,6 +286,14 @@ class OpportunityMinerAgent(BaseAgent):
             for nested_key in ("parameters", "conditions"):
                 _merge_condition_dict(rules_block.get(nested_key))
 
+        for canonical, aliases in alias_map.items():
+            if canonical in conditions:
+                continue
+            for alias in aliases:
+                if alias in context.input_data:
+                    _assign_condition(canonical, context.input_data[alias])
+                    break
+
     def _apply_instruction_settings(self, context: AgentContext) -> None:
         sources: List[Any] = []
         prompts = context.input_data.get("prompts") or []
@@ -297,6 +305,56 @@ class OpportunityMinerAgent(BaseAgent):
         instructions = parse_instruction_sources(sources)
         self._apply_instruction_overrides(context, instructions)
 
+    def _apply_policy_category_limits(
+        self, per_policy: Dict[str, List[Finding]]
+    ) -> List[Finding]:
+        """Limit retained findings to at most two per category for each policy."""
+
+        aggregated: List[Finding] = []
+        seen_ids: set[str] = set()
+
+        for display, items in per_policy.items():
+            if not isinstance(items, list):
+                per_policy[display] = []
+                continue
+
+            valid_items: List[Finding] = [
+                item for item in items if isinstance(item, Finding)
+            ]
+            if not valid_items:
+                per_policy[display] = []
+                continue
+
+            sorted_items = sorted(
+                valid_items,
+                key=lambda f: f.financial_impact_gbp,
+                reverse=True,
+            )
+
+            categories: Dict[str, List[Finding]] = {}
+            for finding in sorted_items:
+                cat_raw = finding.category_id
+                category = str(cat_raw).strip() if cat_raw else "uncategorized"
+                categories.setdefault(category, []).append(finding)
+
+            limited: List[Finding] = []
+            for cat_findings in categories.values():
+                limited.extend(cat_findings[:2])
+
+            if not limited:
+                limited.append(sorted_items[0])
+
+            per_policy[display] = limited
+
+            for finding in limited:
+                key = finding.opportunity_id or f"{display}:{id(finding)}"
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                aggregated.append(finding)
+
+        return aggregated
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -307,18 +365,8 @@ class OpportunityMinerAgent(BaseAgent):
     def _read_sql(self, query: str, params: Any = None) -> pd.DataFrame:
         """Read a SQL query using a SQLAlchemy engine when available."""
 
-        engine = self.agent_nick.get_db_engine()
-        if engine is not None:
-            with engine.connect() as conn:
-                return pd.read_sql(query, conn, params=params)
-
-        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
-        if callable(pandas_conn):
-            with pandas_conn() as conn:
-                return pd.read_sql(query, conn, params=params)
-
-        with closing(self.agent_nick.get_db_connection()) as conn:
-            with conn.cursor() as cursor:
+        def _fetch_with_cursor(connection) -> pd.DataFrame:
+            with connection.cursor() as cursor:
                 if params is not None:
                     cursor.execute(query, params)
                 else:
@@ -326,6 +374,27 @@ class OpportunityMinerAgent(BaseAgent):
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
                 return pd.DataFrame(rows, columns=columns)
+
+        engine_getter = getattr(self.agent_nick, "get_db_engine", None)
+        engine = engine_getter() if callable(engine_getter) else None
+        if engine is not None:
+            with engine.connect() as conn:
+                return pd.read_sql(query, conn, params=params)
+
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
+        if callable(pandas_conn):
+            with pandas_conn() as conn:
+                if hasattr(conn, "cursor"):
+                    return _fetch_with_cursor(conn)
+                return pd.read_sql(query, conn, params=params)
+
+        conn_getter = getattr(self.agent_nick, "get_db_connection", None)
+        if callable(conn_getter):
+            with closing(conn_getter()) as conn:
+                return _fetch_with_cursor(conn)
+
+        logger.debug("No database connection available for query; returning empty DataFrame")
+        return pd.DataFrame()
 
     def _get_table_columns(self, schema: str, table: str) -> set[str]:
         """Return cached column names for ``schema.table``."""
@@ -432,6 +501,24 @@ class OpportunityMinerAgent(BaseAgent):
             min_impact_threshold = self._resolve_min_financial_impact(
                 context.input_data
             )
+            explicit_min_override = any(
+                key in context.input_data
+                for key in (
+                    "min_financial_impact",
+                    "minimum_financial_impact",
+                    "financial_impact_threshold",
+                )
+            )
+            conditions_payload = context.input_data.get("conditions")
+            if isinstance(conditions_payload, dict):
+                explicit_min_override = explicit_min_override or any(
+                    key in conditions_payload
+                    for key in (
+                        "min_financial_impact",
+                        "minimum_financial_impact",
+                        "financial_impact_threshold",
+                    )
+                )
 
             policy_registry, provided_policies = self._assemble_policy_registry(
                 context.input_data
@@ -462,6 +549,11 @@ class OpportunityMinerAgent(BaseAgent):
             )
             if workflow_name:
                 context.input_data["workflow"] = workflow_name
+
+            if not workflow_name and not provided_policies:
+                message = "Workflow name is required to execute opportunity mining"
+                self._log_policy_event("unknown", None, "blocked", message, {})
+                return self._blocked_output(message)
 
             requested_keys: List[str] = []
             if workflow_name:
@@ -563,7 +655,6 @@ class OpportunityMinerAgent(BaseAgent):
                 }
 
             per_policy_retained: Dict[str, List[Finding]] = {}
-            filtered: List[Finding] = []
 
             if use_dynamic_registry:
                 for key in requested_keys:
@@ -583,7 +674,7 @@ class OpportunityMinerAgent(BaseAgent):
                     ]
                     if valid:
                         per_policy_retained[display] = valid
-                    else:
+                    elif not explicit_min_override:
                         best = max(
                             findings,
                             key=lambda f: f.financial_impact_gbp,
@@ -599,10 +690,8 @@ class OpportunityMinerAgent(BaseAgent):
                                 "opportunity_id": best.opportunity_id,
                             },
                         )
-                for retained in per_policy_retained.values():
-                    for finding in retained:
-                        if finding not in filtered:
-                            filtered.append(finding)
+                    else:
+                        per_policy_retained[display] = []
             else:
                 key = requested_keys[0]
                 payload = policy_runs.get(key)
@@ -619,23 +708,35 @@ class OpportunityMinerAgent(BaseAgent):
                 findings = payload.get("findings", []) if payload else aggregated_findings
                 if not findings:
                     per_policy_retained[display] = []
-                    filtered = []
                 else:
                     valid = [
                         f
                         for f in findings
                         if f.financial_impact_gbp >= min_impact_threshold
                     ]
-                    per_policy_retained[display] = valid
-                    filtered = valid
-                    if not filtered and isinstance(policy_cfg, dict):
-                        self._log_policy_event(
-                            policy_cfg.get("policy_id", "unknown"),
-                            None,
-                            "filtered",
-                            "Opportunities removed by financial threshold",
-                            {"min_financial_impact": min_impact_threshold},
+                    if valid:
+                        per_policy_retained[display] = valid
+                    elif not explicit_min_override:
+                        best = max(
+                            findings,
+                            key=lambda f: f.financial_impact_gbp,
                         )
+                        per_policy_retained[display] = [best]
+                        if isinstance(policy_cfg, dict):
+                            self._log_policy_event(
+                                policy_cfg.get("policy_id", "unknown"),
+                                best.supplier_id,
+                                "threshold_relaxed",
+                                "Retained top opportunity despite financial impact below configured minimum",
+                                {
+                                    "min_financial_impact": min_impact_threshold,
+                                    "opportunity_id": best.opportunity_id,
+                                },
+                            )
+                    else:
+                        per_policy_retained[display] = []
+
+            filtered = self._apply_policy_category_limits(per_policy_retained)
 
             filtered = self._enrich_findings(filtered, tables)
             filtered = self._map_item_descriptions(filtered, tables)

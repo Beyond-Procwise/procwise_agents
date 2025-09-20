@@ -26,6 +26,10 @@ class ProcessRoutingService:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self._agent_defaults_cache: Optional[Dict[str, Any]] = None
+        self._agent_property_cache_by_id: Dict[str, Dict[str, Any]] = {}
+        self._agent_type_cache_by_id: Dict[str, str] = {}
+        self._prompt_id_catalog: set[int] = set()
+        self._policy_id_catalog: set[int] = set()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -375,6 +379,10 @@ class ProcessRoutingService:
         policy_map: Dict[str, list[int]] = {}
         default_props: Dict[str, Dict[str, Any]] = {}
         default_ts: Dict[str, datetime] = {}
+        property_by_id: Dict[str, Dict[str, Any]] = {}
+        type_by_id: Dict[str, str] = {}
+        prompt_ids_catalog: set[int] = set()
+        policy_ids_catalog: set[int] = set()
 
         # Load agent definitions from the bundled JSON file instead of the DB
         path = Path(__file__).resolve().parents[1] / "agent_definitions.json"
@@ -444,6 +452,10 @@ class ProcessRoutingService:
                         "SELECT prompt_id, prompt_linked_agents FROM proc.prompt"
                     )
                     for pid, linked in cursor.fetchall():
+                        try:
+                            prompt_ids_catalog.add(int(pid))
+                        except Exception:
+                            continue
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
                             _record(prompt_map, key, pid)
 
@@ -452,22 +464,30 @@ class ProcessRoutingService:
                         "SELECT policy_id, policy_linked_agents FROM proc.policy"
                     )
                     for pid, linked in cursor.fetchall():
+                        try:
+                            policy_ids_catalog.add(int(pid))
+                        except Exception:
+                            continue
                         for key in re.findall(r"[A-Za-z0-9_]+", str(linked or "")):
                             _record(policy_map, key, pid)
 
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT agent_type, agent_name, agent_property, modified_time, created_time
+                        SELECT agent_id, agent_type, agent_name, agent_property, modified_time, created_time
                         FROM proc.agent
                         WHERE agent_property IS NOT NULL
                         """
                     )
-                    for agent_type, agent_name, props_payload, modified, created in cursor.fetchall():
+                    for agent_id, agent_type, agent_name, props_payload, modified, created in cursor.fetchall():
                         parsed = _parse_agent_property(props_payload)
                         if not parsed:
                             continue
                         normalized = self._normalise_agent_properties(parsed)
+                        if agent_id:
+                            property_by_id[str(agent_id)] = dict(normalized)
+                            if agent_type:
+                                type_by_id[str(agent_id)] = str(agent_type)
                         slug: Optional[str] = None
                         for candidate in (agent_type, agent_name):
                             slug = self._canonical_key(str(candidate or ""), agent_defs)
@@ -480,6 +500,10 @@ class ProcessRoutingService:
             logger.exception("Failed to load agent linkage metadata")
 
         self._agent_defaults_cache = dict(default_props)
+        self._agent_property_cache_by_id = property_by_id
+        self._agent_type_cache_by_id = type_by_id
+        self._prompt_id_catalog = prompt_ids_catalog
+        self._policy_id_catalog = policy_ids_catalog
         return agent_defs, prompt_map, policy_map
 
     def _enrich_node(self, node, agent_defs, prompt_map, policy_map):
@@ -487,6 +511,18 @@ class ProcessRoutingService:
 
         if not isinstance(node, dict):
             return
+        agent_ref_id = node.get("agent_ref_id") or node.get("agent_id")
+        db_props_payload: Dict[str, Any] = {}
+        if agent_ref_id is not None:
+            ref_key = str(agent_ref_id).strip()
+            if ref_key:
+                db_props_payload = dict(
+                    getattr(self, "_agent_property_cache_by_id", {}).get(ref_key) or {}
+                )
+                db_agent_type = getattr(self, "_agent_type_cache_by_id", {}).get(ref_key)
+                if db_agent_type:
+                    node["agent_type"] = db_agent_type
+
         raw_type = str(node.get("agent_type", ""))
         base_key = self._canonical_key(raw_type, agent_defs)
         if base_key:
@@ -494,26 +530,34 @@ class ProcessRoutingService:
         else:
             base_key = raw_type
         raw_props = node.get("agent_property", {"llm": None, "prompts": [], "policies": []})
+        db_props = self._normalise_agent_properties(db_props_payload)
         props = self._normalise_agent_properties(raw_props)
 
         defaults_map = getattr(self, "_agent_defaults_cache", {}) or {}
         default_props = defaults_map.get(base_key) or {}
         merged_props: Dict[str, Any] = dict(default_props)
 
-        for key, value in props.items():
-            if key in {"prompts", "policies"}:
-                continue
-            if value is None:
-                continue
-            if isinstance(value, dict) and isinstance(merged_props.get(key), dict):
-                combined = dict(merged_props[key])
-                combined.update(value)
-                merged_props[key] = combined
-            else:
-                merged_props[key] = value
+        def _merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+            for key, value in source.items():
+                if key in {"prompts", "policies"}:
+                    continue
+                if value is None:
+                    continue
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    combined = dict(target[key])
+                    combined.update(value)
+                    target[key] = combined
+                elif isinstance(value, dict):
+                    target[key] = dict(value)
+                else:
+                    target[key] = value
+
+        _merge_into(merged_props, db_props)
+        _merge_into(merged_props, props)
 
         for field in ("prompts", "policies"):
             combined_ids = set(self._coerce_identifier_list(default_props.get(field)))
+            combined_ids.update(self._coerce_identifier_list(db_props.get(field)))
             combined_ids.update(self._coerce_identifier_list(props.get(field)))
             merged_props[field] = sorted(combined_ids)
 
@@ -526,6 +570,24 @@ class ProcessRoutingService:
         policy_ids = set(props.get("policies", []))
         policy_ids.update(self._coerce_identifier_list(policy_map.get(base_key)))
         props["policies"] = sorted(policy_ids)
+
+        prompt_catalog = getattr(self, "_prompt_id_catalog", set()) or set()
+        if prompt_catalog:
+            invalid_prompts = [pid for pid in props.get("prompts", []) if pid not in prompt_catalog]
+            if invalid_prompts:
+                logger.warning(
+                    "Discarding unknown prompt ids %s for agent %s", invalid_prompts, base_key or agent_ref_id
+                )
+            props["prompts"] = [pid for pid in props.get("prompts", []) if pid in prompt_catalog]
+
+        policy_catalog = getattr(self, "_policy_id_catalog", set()) or set()
+        if policy_catalog:
+            invalid_policies = [pid for pid in props.get("policies", []) if pid not in policy_catalog]
+            if invalid_policies:
+                logger.warning(
+                    "Discarding unknown policy ids %s for agent %s", invalid_policies, base_key or agent_ref_id
+                )
+            props["policies"] = [pid for pid in props.get("policies", []) if pid in policy_catalog]
 
         node["agent_property"] = props
         for branch in ["onSuccess", "onFailure", "onCompletion"]:
