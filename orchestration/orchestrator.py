@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -356,11 +356,13 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc, policy_details, policy_linked_agents"
-                        " FROM proc.policy"
+                        """
+                        SELECT policy_id, policy_name, policy_desc, policy_details, policy_linked_agents
+                        FROM proc.policy
+                        """
                     )
                     rows = cursor.fetchall()
-                for pid, desc, details, linked in rows:
+                for pid, name, desc, details, linked in rows:
                     if not desc and not details:
                         continue
                     detail_payload: Any = {}
@@ -380,11 +382,15 @@ class Orchestrator:
                     elif details is not None:
                         detail_payload = details
                     desc_text = str(desc) if desc is not None else ""
+                    name_text = str(name).strip() if name is not None else ""
+                    detail_obj = detail_payload if detail_payload is not None else {}
                     value = {
                         "policyId": int(pid),
+                        "policyName": name_text or None,
+                        "policy_name": name_text or None,
                         "policy_desc": desc_text,
                         "description": desc_text,
-                        "details": detail_payload if detail_payload is not None else {},
+                        "details": detail_obj,
                         "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value
@@ -547,6 +553,119 @@ class Orchestrator:
     # New JSON flow executor
     # ------------------------------------------------------------------
 
+    def _merge_pass_fields(self, target: Dict[str, Any], new_fields: Dict[str, Any]) -> None:
+        """Merge ``new_fields`` into ``target`` without losing supplier data."""
+
+        if not isinstance(target, dict) or not isinstance(new_fields, dict):
+            return
+
+        for key, value in new_fields.items():
+            if self._merge_supplier_field(target, key, value):
+                continue
+            target[key] = value
+
+    def _merge_supplier_field(self, target: Dict[str, Any], key: str, value: Any) -> bool:
+        """Specialised merge for supplier-related payloads."""
+
+        if key == "supplier_candidates" and isinstance(value, list):
+            existing = target.get(key)
+            combined: List[str] = []
+            seen: set[str] = set()
+
+            def _normalise(item: Any) -> Optional[str]:
+                if item is None:
+                    return None
+                if isinstance(item, str):
+                    candidate = item.strip()
+                else:
+                    candidate = str(item).strip()
+                return candidate or None
+
+            for sequence in (
+                existing if isinstance(existing, list) else [],
+                value,
+            ):
+                for item in sequence:
+                    candidate = _normalise(item)
+                    if not candidate or candidate in seen:
+                        continue
+                    combined.append(candidate)
+                    seen.add(candidate)
+
+            target[key] = combined
+            return True
+
+        if key == "supplier_directory" and isinstance(value, list):
+            existing = target.get(key)
+            merged: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+
+            def _entry_key(entry: Any) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+                if isinstance(entry, dict):
+                    candidate = {k: v for k, v in entry.items() if v is not None}
+                    sid = candidate.get("supplier_id")
+                    if sid is not None:
+                        token = str(sid).strip()
+                        if token:
+                            return token, candidate
+                    try:
+                        token = json.dumps(candidate, sort_keys=True, default=str)
+                    except Exception:
+                        token = repr(sorted(candidate.items()))
+                    return token, candidate
+                if entry is None:
+                    return None, None
+                token = str(entry).strip()
+                if not token:
+                    return None, None
+                return token, {"value": entry}
+
+            def _accumulate(source: Any) -> None:
+                if not isinstance(source, list):
+                    return
+                for entry in source:
+                    token, payload = _entry_key(entry)
+                    if not token or not isinstance(payload, dict):
+                        continue
+                    current = merged.get(token, {})
+                    updated = dict(current)
+                    updated.update(payload)
+                    merged[token] = updated
+                    if token not in order:
+                        order.append(token)
+
+            _accumulate(existing if isinstance(existing, list) else [])
+            _accumulate(value)
+            target[key] = [merged[token] for token in order]
+            return True
+
+        if key == "policy_suppliers" and isinstance(value, dict):
+            existing = target.get(key) if isinstance(target.get(key), dict) else {}
+            combined: Dict[str, List[str]] = {}
+
+            def _collect(source: Dict[str, Any]) -> None:
+                for policy_key, suppliers in source.items():
+                    policy_token = str(policy_key)
+                    bucket = combined.setdefault(policy_token, [])
+                    if isinstance(suppliers, (list, tuple, set)):
+                        sequence = suppliers
+                    else:
+                        sequence = [suppliers]
+                    for supplier in sequence:
+                        if supplier is None:
+                            continue
+                        candidate = str(supplier).strip()
+                        if candidate and candidate not in bucket:
+                            bucket.append(candidate)
+
+            if isinstance(existing, dict):
+                _collect(existing)
+            _collect(value)
+            target[key] = combined
+            return True
+
+        return False
+
     def _execute_json_flow(
         self,
         flow: Dict[str, Any],
@@ -669,7 +788,7 @@ class Orchestrator:
                     combined_props[key] = step.get(key)
 
             normalised_props = ProcessRoutingService._normalise_agent_properties(
-                combined_props
+                combined_props, apply_default=False
             )
 
             agent_input = dict(rendered_input)
@@ -749,6 +868,9 @@ class Orchestrator:
             # payload which led to the agents operating on stale instructions.
             self._inject_agent_instructions(agent_key, agent_input)
 
+            if not ProcessRoutingService._extract_llm_name(agent_input.get("llm")):
+                agent_input["llm"] = ProcessRoutingService.DEFAULT_LLM_MODEL
+
             success = False
             attempt = 0
             result = None
@@ -809,8 +931,7 @@ class Orchestrator:
                 value = _extract(data, expr)
                 _assign(run_ctx, key, value)
             if result and result.pass_fields:
-                for k, v in result.pass_fields.items():
-                    run_ctx[k] = v
+                self._merge_pass_fields(run_ctx, result.pass_fields)
             if result and result.error:
                 run_ctx["errors"][step_name] = result.error
 
@@ -926,9 +1047,9 @@ class Orchestrator:
                 )
 
             # Prepare fields for downstream nodes
-            next_fields = {**(inherited or {})}
+            next_fields = dict(inherited or {})
             if result and result.pass_fields:
-                next_fields.update(result.pass_fields)
+                self._merge_pass_fields(next_fields, result.pass_fields)
 
             if result and result.status == AgentStatus.SUCCESS and node.get("onSuccess"):
                 _run(node["onSuccess"], next_fields)
@@ -1263,7 +1384,7 @@ class Orchestrator:
                     agent_result.data if agent_result else {}
                 )
                 if agent_result and agent_result.pass_fields:
-                    pass_fields.update(agent_result.pass_fields)
+                    self._merge_pass_fields(pass_fields, agent_result.pass_fields)
             results["downstream_results"] = downstream_results
 
         if should_run_opportunity or downstream_agents:
@@ -1359,7 +1480,7 @@ class Orchestrator:
                 if quote_res:
                     results["quote_evaluation"] = quote_res.data or {}
                     if quote_res.pass_fields:
-                        pass_fields.update(quote_res.pass_fields)
+                        self._merge_pass_fields(pass_fields, quote_res.pass_fields)
 
                     if quote_res.next_agents:
                         downstream: Dict[str, Any] = {}
@@ -1375,7 +1496,7 @@ class Orchestrator:
                             agent_res = self._execute_agent(normalised, child_ctx)
                             downstream[normalised] = agent_res.data if agent_res else {}
                             if agent_res and agent_res.pass_fields:
-                                pass_fields.update(agent_res.pass_fields)
+                                self._merge_pass_fields(pass_fields, agent_res.pass_fields)
                         if downstream:
                             results.setdefault("downstream_results", {}).update(downstream)
 
@@ -1426,7 +1547,7 @@ class Orchestrator:
 
                 # Merge fields to be passed to subsequent agents.
                 if result.pass_fields:
-                    pass_fields.update(result.pass_fields)
+                    self._merge_pass_fields(pass_fields, result.pass_fields)
 
             current_agents = next_agents
             depth += 1
@@ -1487,7 +1608,7 @@ class Orchestrator:
 
                 # Update pass fields for next agent
                 if result and result.pass_fields:
-                    pass_fields.update(result.pass_fields)
+                    self._merge_pass_fields(pass_fields, result.pass_fields)
 
         return results
 

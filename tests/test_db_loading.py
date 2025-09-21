@@ -41,6 +41,7 @@ class DummyCursor:
             self._rows = self._data_map.get("policy", [])
             self.description = [
                 ("policy_id", None, None, None, None, None, None),
+                ("policy_name", None, None, None, None, None, None),
                 ("policy_desc", None, None, None, None, None, None),
                 ("policy_details", None, None, None, None, None, None),
                 ("policy_linked_agents", None, None, None, None, None, None),
@@ -112,12 +113,19 @@ def test_load_prompts_from_db():
 
 def test_load_policies_from_db():
     policy_rows = [
-        (2, "Example policy", json.dumps({"rules": {}}), "{supplier_ranking}"),
+        (
+            2,
+            "ExamplePolicy",
+            "Example policy",
+            json.dumps({"rules": {}}),
+            "{supplier_ranking}",
+        ),
     ]
     orchestrator = make_orchestrator(policy_rows=policy_rows)
     policies = orchestrator._load_policies()
     assert policies[2]["description"] == "Example policy"
     assert policies[2]["details"] == {"rules": {}}
+    assert policies[2]["policyName"] == "ExamplePolicy"
     assert policies[2]["agents"][0]["agent_name"] == "SupplierRankingAgent"
 
 

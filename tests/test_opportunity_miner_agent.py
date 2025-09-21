@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+from datetime import datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -9,7 +11,7 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.opportunity_miner_agent import OpportunityMinerAgent
+from agents.opportunity_miner_agent import OpportunityMinerAgent, Finding
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 
@@ -153,6 +155,33 @@ def test_build_finding_includes_policy_identifier():
     assert finding_a.opportunity_id != finding_b.opportunity_id
     assert "policy_9" in finding_a.opportunity_id
     assert "policy_10" in finding_b.opportunity_id
+
+
+def test_normalise_currency_handles_decimal_sources():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    tables = {
+        "purchase_orders": pd.DataFrame(
+            [
+                {
+                    "po_id": "PO-1",
+                    "currency": "USD",
+                    "total_amount": Decimal("100.00"),
+                }
+            ]
+        ),
+        "indices": pd.DataFrame([
+            {"currency": "USD", "value": Decimal("0.80")}
+        ]),
+    }
+
+    normalised = agent._normalise_currency(tables)
+    purchase_orders = normalised["purchase_orders"]
+
+    assert "total_amount_gbp" in purchase_orders.columns
+    assert pytest.approx(80.0) == purchase_orders.loc[0, "total_amount_gbp"]
 
 
 def _sample_tables() -> Dict[str, Any]:
@@ -622,7 +651,79 @@ def test_dynamic_policies_surface_opportunities(monkeypatch):
         assert suppliers
         assert any(supplier.startswith("SI") for supplier in suppliers)
     assert output.data.get("policy_opportunities")
+    category_map = output.data.get("policy_category_opportunities")
+    assert category_map
+    for categories in category_map.values():
+        for entries in categories.values():
+            if entries:
+                assert 1 <= len(entries) <= 2
     assert output.data.get("supplier_candidates")
+
+
+def test_policy_category_limits_caps_results():
+    agent = OpportunityMinerAgent(DummyNick())
+    now = datetime.utcnow()
+
+    per_policy = {
+        "PolicyA": [
+            Finding(
+                opportunity_id="a1",
+                detector_type="Test",
+                supplier_id="SI001",
+                category_id="CatA",
+                item_id="Item1",
+                financial_impact_gbp=120.0,
+                calculation_details={},
+                source_records=["PO1"],
+                detected_on=now,
+            ),
+            Finding(
+                opportunity_id="a2",
+                detector_type="Test",
+                supplier_id="SI002",
+                category_id="CatA",
+                item_id="Item2",
+                financial_impact_gbp=110.0,
+                calculation_details={},
+                source_records=["PO2"],
+                detected_on=now,
+            ),
+            Finding(
+                opportunity_id="a3",
+                detector_type="Test",
+                supplier_id="SI003",
+                category_id="CatA",
+                item_id="Item3",
+                financial_impact_gbp=90.0,
+                calculation_details={},
+                source_records=["PO3"],
+                detected_on=now,
+            ),
+            Finding(
+                opportunity_id="b1",
+                detector_type="Test",
+                supplier_id="SI004",
+                category_id="CatB",
+                item_id="Item4",
+                financial_impact_gbp=150.0,
+                calculation_details={},
+                source_records=["PO4"],
+                detected_on=now,
+            ),
+        ]
+    }
+
+    aggregated, category_map = agent._apply_policy_category_limits(per_policy)
+
+    assert "PolicyA" in category_map
+    categories = category_map["PolicyA"]
+    assert set(categories.keys()) == {"CatA", "CatB"}
+    assert len(categories["CatA"]) == 2
+    assert len(categories["CatB"]) == 1
+    aggregated_ids = {finding.opportunity_id for finding in aggregated}
+    assert aggregated_ids == {"a1", "a2", "b1"}
+    retained_ids = {finding.opportunity_id for finding in per_policy["PolicyA"]}
+    assert retained_ids == aggregated_ids
 
 
 def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):

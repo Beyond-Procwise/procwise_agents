@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from utils.db import read_sql_compat
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 
@@ -537,9 +538,9 @@ class QuoteComparisonAgent(BaseAgent):
         try:
             if callable(pandas_conn):
                 with pandas_conn() as conn:
-                    return pd.read_sql(sql, conn)
+                    return read_sql_compat(sql, conn)
             with self.agent_nick.get_db_connection() as conn:
-                return pd.read_sql(sql, conn)
+                return read_sql_compat(sql, conn)
         except Exception:
             logger.exception("QuoteComparisonAgent failed to read %s", table)
             return pd.DataFrame()
