@@ -83,6 +83,7 @@ class OpportunityMinerAgent(BaseAgent):
         self._event_log: List[Dict[str, Any]] = []
         self._escalations: List[Dict[str, Any]] = []
         self._column_cache: Dict[str, set[str]] = {}
+        self._policy_engine_catalog: Optional[Dict[str, Dict[str, Any]]] = None
 
         # GPU configuration
         self.device = configure_gpu()
@@ -506,6 +507,7 @@ class OpportunityMinerAgent(BaseAgent):
             self._event_log = []
             self._escalations = []
             notifications: set[str] = set()
+            self._policy_engine_catalog = None
 
             self._apply_instruction_settings(context)
 
@@ -1359,6 +1361,180 @@ class OpportunityMinerAgent(BaseAgent):
                 tokens.add(slug)
         return tokens
 
+    def _get_policy_engine_catalog(self) -> Dict[str, Dict[str, Any]]:
+        if self._policy_engine_catalog is not None:
+            return self._policy_engine_catalog
+
+        catalog: Dict[str, Dict[str, Any]] = {}
+        engine = getattr(self.agent_nick, "policy_engine", None)
+        if engine is None:
+            self._policy_engine_catalog = catalog
+            return catalog
+
+        try:
+            if hasattr(engine, "iter_policies"):
+                policies = list(engine.iter_policies())
+            elif hasattr(engine, "list_policies"):
+                policies = list(engine.list_policies())  # pragma: no cover - legacy
+            else:
+                policies = []
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load policies from policy engine")
+            policies = []
+
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            tokens = self._collect_policy_tokens(policy)
+            slug = self._normalise_policy_slug(policy.get("slug"))
+            if slug:
+                tokens.add(slug)
+            aliases = policy.get("aliases")
+            if isinstance(aliases, (list, tuple, set)):
+                for alias in aliases:
+                    alias_slug = self._normalise_policy_slug(alias)
+                    if alias_slug:
+                        tokens.add(alias_slug)
+            for token in tokens:
+                if not token:
+                    continue
+                catalog.setdefault(str(token).lower(), policy)
+
+        self._policy_engine_catalog = catalog
+        return catalog
+
+    def _enrich_provided_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(policy, dict):
+            return policy
+
+        enriched = dict(policy)
+        try:
+            existing_rules = self._coerce_policy_rules(policy)
+        except Exception:  # pragma: no cover - defensive
+            existing_rules = {}
+        catalog = self._get_policy_engine_catalog()
+
+        tokens = self._collect_policy_tokens(enriched)
+        slug_hint = self._normalise_policy_slug(
+            enriched.get("slug")
+            or enriched.get("policyName")
+            or enriched.get("policy_name")
+            or enriched.get("policy_desc")
+            or enriched.get("description")
+        )
+        if slug_hint:
+            tokens.add(slug_hint)
+
+        candidate = None
+        for token in tokens:
+            if token is None:
+                continue
+            probe = catalog.get(str(token).lower())
+            if probe:
+                candidate = probe
+                break
+
+        if candidate is None:
+            return enriched
+
+        def _assign(field: str, value: Any) -> None:
+            if field not in enriched or enriched[field] in (None, "", [], {}):
+                enriched[field] = value
+
+        candidate_id = candidate.get("policyId") or candidate.get("policy_id")
+        if candidate_id is not None:
+            candidate_id = str(candidate_id)
+            _assign("policyId", candidate_id)
+            _assign("policy_id", candidate_id)
+
+        for name in (
+            candidate.get("policyName"),
+            candidate.get("policy_name"),
+            candidate.get("detector"),
+        ):
+            if name:
+                _assign("policyName", name)
+                _assign("policy_name", name)
+                break
+
+        description = candidate.get("policy_desc") or candidate.get("description")
+        if description:
+            _assign("policy_desc", description)
+            _assign("description", description)
+
+        details = candidate.get("details")
+        if isinstance(details, dict):
+            if not isinstance(enriched.get("details"), dict):
+                enriched["details"] = dict(details)
+            if not enriched.get("policy_details"):
+                enriched["policy_details"] = dict(details)
+            rules = details.get("rules")
+            if isinstance(rules, dict) and not isinstance(enriched.get("rules"), dict):
+                enriched["rules"] = dict(rules)
+
+        slug = candidate.get("slug") or self._normalise_policy_slug(
+            candidate.get("policy_name") or candidate.get("policyName")
+        )
+        if slug:
+            _assign("slug", slug)
+
+        alias_tokens: set[str] = set()
+        existing_aliases = enriched.get("aliases")
+        if isinstance(existing_aliases, (list, tuple, set)):
+            for alias in existing_aliases:
+                normalised = self._normalise_policy_slug(alias)
+                if normalised:
+                    alias_tokens.add(normalised)
+        candidate_aliases = candidate.get("aliases")
+        if isinstance(candidate_aliases, (list, tuple, set)):
+            for alias in candidate_aliases:
+                normalised = self._normalise_policy_slug(alias)
+                if normalised:
+                    alias_tokens.add(normalised)
+        if slug:
+            normalised_slug = self._normalise_policy_slug(slug)
+            if normalised_slug:
+                alias_tokens.add(normalised_slug)
+        if alias_tokens:
+            enriched["aliases"] = sorted(alias_tokens)
+
+        def _merge_rules(target: Any, overrides: Dict[str, Any]) -> Dict[str, Any]:
+            base: Dict[str, Any] = {}
+            if isinstance(target, dict):
+                base = dict(target)
+            for key, value in overrides.items():
+                if key == "parameters" and isinstance(value, dict):
+                    existing = base.get("parameters")
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(value)
+                        base["parameters"] = merged
+                    else:
+                        base["parameters"] = dict(value)
+                elif key == "default_conditions" and isinstance(value, dict):
+                    existing = base.get("default_conditions")
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(value)
+                        base["default_conditions"] = merged
+                    else:
+                        base["default_conditions"] = dict(value)
+                else:
+                    base[key] = value
+            return base
+
+        if isinstance(existing_rules, dict) and existing_rules:
+            overrides = existing_rules
+            for container_key in ("policy_details", "details"):
+                container = enriched.get(container_key)
+                if isinstance(container, dict):
+                    container["rules"] = _merge_rules(
+                        container.get("rules"), overrides
+                    )
+            enriched["rules"] = _merge_rules(enriched.get("rules"), overrides)
+
+        return enriched
+
     def _filter_registry_by_policies(
         self,
         registry: Dict[str, Dict[str, Any]],
@@ -1423,11 +1599,14 @@ class OpportunityMinerAgent(BaseAgent):
     def _assemble_policy_registry(
         self, input_data: Dict[str, Any]
     ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
-        provided_policies = [
-            policy
-            for policy in input_data.get("policies") or []
-            if isinstance(policy, dict)
-        ]
+        provided_policies: List[Dict[str, Any]] = []
+        policies_payload = input_data.get("policies")
+        if isinstance(policies_payload, list):
+            for policy in policies_payload:
+                if isinstance(policy, dict):
+                    provided_policies.append(self._enrich_provided_policy(policy))
+        if provided_policies:
+            input_data["policies"] = provided_policies
         base_registry = self._filter_registry_by_policies(
             self._get_policy_registry(), provided_policies
         )
