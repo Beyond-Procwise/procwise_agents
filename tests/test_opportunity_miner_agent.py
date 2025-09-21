@@ -11,7 +11,11 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.opportunity_miner_agent import OpportunityMinerAgent, Finding
+from agents.opportunity_miner_agent import (
+    OpportunityMinerAgent,
+    Finding,
+    _PURCHASE_LINE_VALUE_COLUMNS,
+)
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 
@@ -411,9 +415,47 @@ def _sample_tables() -> Dict[str, Any]:
         "supplier_master": supplier_master,
     }
 
-    assert output.status == AgentStatus.FAILED
-    assert output.data["blocked_reason"]
-    assert output.data["policy_events"]
+
+def test_resolve_supplier_id_matches_supplier_aliases():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    tables = {
+        "supplier_master": pd.DataFrame(
+            [
+                {
+                    "supplier_id": "SI0001",
+                    "supplier_name": "Acme Industrial Ltd",
+                    "trading_name": "ACME LTD",
+                },
+                {
+                    "supplier_id": "SI0002",
+                    "supplier_name": "Beta Manufacturing",
+                },
+            ]
+        ),
+        "contracts": pd.DataFrame(),
+        "purchase_orders": pd.DataFrame(),
+        "invoices": pd.DataFrame(),
+    }
+
+    agent._build_supplier_lookup(tables)
+
+    assert agent._resolve_supplier_id("SI0001") == "SI0001"
+    assert agent._resolve_supplier_id("acme industrial ltd") == "SI0001"
+    assert agent._resolve_supplier_id("ACME LTD") == "SI0001"
+    assert agent._resolve_supplier_id("Beta Manufacturing") == "SI0002"
+    assert agent._resolve_supplier_id("Unknown Supplier") is None
+
+
+def test_choose_first_column_handles_line_total_column():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    df = pd.DataFrame({"po_id": ["PO1"], "item_id": ["Item"], "line_total": [100.0]})
+
+    selected = agent._choose_first_column(df, _PURCHASE_LINE_VALUE_COLUMNS)
+    assert selected == "line_total"
 
 
 def test_price_variance_detection_generates_finding(monkeypatch):

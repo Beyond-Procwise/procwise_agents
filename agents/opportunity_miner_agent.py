@@ -24,6 +24,28 @@ logger = logging.getLogger(__name__)
 
 _CATALOG_MATCH_THRESHOLD = 0.45
 
+_PURCHASE_LINE_VALUE_COLUMNS = [
+    "line_amount_gbp",
+    "total_amount_incl_tax_gbp",
+    "line_total_gbp",
+    "total_amount_gbp",
+    "line_amount",
+    "total_amount_incl_tax",
+    "line_total",
+    "total_amount",
+]
+
+_INVOICE_LINE_VALUE_COLUMNS = [
+    "line_amount_gbp",
+    "total_amount_incl_tax_gbp",
+    "line_total_gbp",
+    "total_amount_gbp",
+    "line_amount",
+    "total_amount_incl_tax",
+    "line_total",
+    "total_amount",
+]
+
 
 @dataclass
 class Finding:
@@ -73,6 +95,7 @@ class OpportunityMinerAgent(BaseAgent):
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
         self._supplier_lookup: Dict[str, Optional[str]] = {}
+        self._supplier_alias_lookup: Dict[str, List[str]] = {}
         self._contract_supplier_map: Dict[str, str] = {}
         self._contract_metadata: Dict[str, Dict[str, Any]] = {}
         self._po_supplier_map: Dict[str, str] = {}
@@ -194,6 +217,8 @@ class OpportunityMinerAgent(BaseAgent):
                 "supplier",
                 "supplier_code",
                 "vendor_id",
+                "supplier_name",
+                "vendor_name",
             },
             "item_id": {
                 "item_id",
@@ -960,11 +985,25 @@ class OpportunityMinerAgent(BaseAgent):
             logger.debug("Table %s columns: %s", name, list(tables[name].columns))
         return tables
 
+    def _normalise_supplier_key(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):  # type: ignore[arg-type]
+                return None
+        except Exception:
+            pass
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        return re.sub(r"[^a-z0-9]", "", text)
+
     def _build_supplier_lookup(self, tables: Dict[str, pd.DataFrame]) -> None:
         """Build helper maps to resolve supplier metadata from ``proc.supplier``."""
 
         supplier_master = tables.get("supplier_master", pd.DataFrame())
         lookup: Dict[str, Optional[str]] = {}
+        alias_map: Dict[str, set[str]] = {}
 
         def _normalise(value: Any) -> Optional[str]:
             if value is None:
@@ -987,9 +1026,27 @@ class OpportunityMinerAgent(BaseAgent):
                 for _, row in df.iterrows():
                     supplier_id = row["supplier_id"]
                     lookup[supplier_id] = row.get("supplier_name") or None
+                    aliases = {
+                        supplier_id,
+                        row.get("supplier_name"),
+                        row.get("trading_name"),
+                    }
+                    for alias in list(aliases):
+                        normalised_alias = self._normalise_supplier_key(alias)
+                        if normalised_alias:
+                            alias_map.setdefault(normalised_alias, set()).add(supplier_id)
 
         self._supplier_lookup = lookup
-        logger.debug("Loaded %d suppliers from master data", len(self._supplier_lookup))
+        self._supplier_alias_lookup = {
+            key: sorted(values)
+            for key, values in alias_map.items()
+            if values
+        }
+        logger.debug(
+            "Loaded %d suppliers from master data with %d alias keys",
+            len(self._supplier_lookup),
+            len(self._supplier_alias_lookup),
+        )
 
         contracts = tables.get("contracts", pd.DataFrame())
         contract_map: Dict[str, str] = {}
@@ -1767,10 +1824,62 @@ class OpportunityMinerAgent(BaseAgent):
         supplier = str(supplier_id).strip()
         if not supplier:
             return None
-        if self._supplier_lookup and supplier not in self._supplier_lookup:
-            logger.debug("Supplier %s not found in master data; skipping", supplier)
-            return None
-        return supplier
+        lookup = self._supplier_lookup
+        if not lookup:
+            return supplier
+        if supplier in lookup:
+            return supplier
+
+        alias_key = self._normalise_supplier_key(supplier)
+        alias_lookup = self._supplier_alias_lookup
+
+        def _choose_candidate(candidates: Iterable[str]) -> Optional[str]:
+            chosen: Optional[str] = None
+            best_score = 0.0
+            raw_normalised = supplier.lower()
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                candidate_texts = [candidate.lower()]
+                display = lookup.get(candidate)
+                if display:
+                    candidate_texts.append(str(display).strip().lower())
+                for text in candidate_texts:
+                    if not text:
+                        continue
+                    score = SequenceMatcher(None, raw_normalised, text).ratio()
+                    if score > best_score:
+                        best_score = score
+                        chosen = candidate
+            if chosen is not None:
+                return chosen
+            candidate_list = [c for c in candidates if c is not None]
+            return sorted(candidate_list)[0] if candidate_list else None
+
+        candidates: Optional[Iterable[str]] = None
+        if alias_key and alias_lookup:
+            candidates = alias_lookup.get(alias_key)
+
+        if not candidates and alias_key and alias_lookup:
+            best_key = None
+            best_ratio = 0.0
+            for key, ids in alias_lookup.items():
+                if not key or not ids:
+                    continue
+                ratio = SequenceMatcher(None, alias_key, key).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_key = key
+            if best_key and best_ratio >= 0.85:
+                candidates = alias_lookup.get(best_key)
+
+        if candidates:
+            resolved = _choose_candidate(candidates)
+            if resolved:
+                return resolved
+
+        logger.debug("Supplier %s not found in master data; skipping", supplier)
+        return None
 
     def _log_policy_event(
         self,
@@ -2262,12 +2371,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             base_df,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col:
             base_df[value_col] = pd.to_numeric(base_df[value_col], errors="coerce").fillna(0.0)
@@ -2512,12 +2616,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             df,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col:
             df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
@@ -2997,10 +3096,29 @@ class OpportunityMinerAgent(BaseAgent):
         policy_id = policy_cfg["policy_id"]
         detector = policy_cfg["detector"]
 
-        supplier_id = self._resolve_supplier_id(self._get_condition(input_data, "supplier_id"))
+        raw_supplier = self._get_condition(input_data, "supplier_id")
+        if raw_supplier is None:
+            raw_supplier = self._get_condition(input_data, "supplier_name")
+        supplier_id = self._resolve_supplier_id(raw_supplier)
         if not supplier_id:
+            provided = None
+            if raw_supplier is not None:
+                provided = str(raw_supplier).strip()
+            if not provided:
+                message = "Supplier identifier missing from policy conditions"
+                details: Dict[str, Any] = {}
+            else:
+                message = "Supplier not recognised in master data"
+                normalised = self._normalise_supplier_key(provided)
+                details = {"provided_identifier": provided}
+                if normalised:
+                    details["normalised_identifier"] = normalised
             self._log_policy_event(
-                policy_id, None, "blocked", "Supplier not recognised in master data", {}
+                policy_id,
+                None,
+                "blocked",
+                message,
+                details,
             )
             return findings
 
@@ -3090,12 +3208,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             po_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         price_col = self._choose_first_column(po_lines, ["unit_price_gbp", "unit_price"])
         qty_col = "quantity" if "quantity" in po_lines.columns else None
@@ -3729,12 +3842,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             po_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col is None:
             self._log_policy_event(
@@ -3854,12 +3962,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         amount_col = self._choose_first_column(
             invoice_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _INVOICE_LINE_VALUE_COLUMNS,
         )
         if amount_col is None:
             self._log_policy_event(
@@ -4129,12 +4232,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         amount_col = self._choose_first_column(
             invoice_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _INVOICE_LINE_VALUE_COLUMNS,
         )
         contract_value_col = self._choose_first_column(
             contracts, ["total_contract_value_gbp", "total_contract_value"]
