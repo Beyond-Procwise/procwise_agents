@@ -466,6 +466,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         self._merge_conditions_from_source(conditions, instructions)
 
+
     def _apply_instruction_settings(self, context: AgentContext) -> None:
         sources: List[Any] = []
         prompts = context.input_data.get("prompts") or []
