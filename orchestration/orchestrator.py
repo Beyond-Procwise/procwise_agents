@@ -356,11 +356,13 @@ class Orchestrator:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT policy_id, policy_desc, policy_details, policy_linked_agents"
-                        " FROM proc.policy"
+                        """
+                        SELECT policy_id, policy_name, policy_desc, policy_details, policy_linked_agents
+                        FROM proc.policy
+                        """
                     )
                     rows = cursor.fetchall()
-                for pid, desc, details, linked in rows:
+                for pid, name, desc, details, linked in rows:
                     if not desc and not details:
                         continue
                     detail_payload: Any = {}
@@ -380,11 +382,15 @@ class Orchestrator:
                     elif details is not None:
                         detail_payload = details
                     desc_text = str(desc) if desc is not None else ""
+                    name_text = str(name).strip() if name is not None else ""
+                    detail_obj = detail_payload if detail_payload is not None else {}
                     value = {
                         "policyId": int(pid),
+                        "policyName": name_text or None,
+                        "policy_name": name_text or None,
                         "policy_desc": desc_text,
                         "description": desc_text,
-                        "details": detail_payload if detail_payload is not None else {},
+                        "details": detail_obj,
                         "agents": self._get_agent_details(linked),
                     }
                     policies[int(pid)] = value

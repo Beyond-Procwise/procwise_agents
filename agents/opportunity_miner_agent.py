@@ -944,27 +944,12 @@ class OpportunityMinerAgent(BaseAgent):
         """
 
         dfs: Dict[str, pd.DataFrame] = {}
-        engine = self.agent_nick.get_db_engine()
-        if engine is not None:
-            with engine.connect() as conn:
-                for table, sql_name in self.TABLE_MAP.items():
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
-            return dfs
-
-        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
-        if callable(pandas_conn):
-            with pandas_conn() as conn:
-                for table, sql_name in self.TABLE_MAP.items():
-                    dfs[table] = pd.read_sql(f"SELECT * FROM {sql_name}", conn)
-            return dfs
-
-        with closing(self.agent_nick.get_db_connection()) as conn:
-            for table, sql_name in self.TABLE_MAP.items():
-                with conn.cursor() as cursor:
-                    cursor.execute(f"SELECT * FROM {sql_name}")
-                    rows = cursor.fetchall()
-                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                    dfs[table] = pd.DataFrame(rows, columns=columns)
+        for table, sql_name in self.TABLE_MAP.items():
+            try:
+                dfs[table] = self._read_sql(f"SELECT * FROM {sql_name}")
+            except Exception:
+                logger.exception("Failed to ingest table %s (%s)", table, sql_name)
+                dfs[table] = pd.DataFrame()
         return dfs
 
     def _validate_data(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -4223,30 +4208,28 @@ class OpportunityMinerAgent(BaseAgent):
         )
 
         if not item_id and sources:
-            try:
-                with self.agent_nick.pandas_connection() as conn:
-                    for src in sources:
-                        df = pd.read_sql(
-                            "SELECT item_id FROM proc.po_line_items_agent WHERE po_id = %s",
-                            conn,
+            for src in sources:
+                try:
+                    df = self._read_sql(
+                        "SELECT item_id FROM proc.po_line_items_agent WHERE po_id = %s",
+                        params=(src,),
+                    )
+                    if df.empty:
+                        df = self._read_sql(
+                            "SELECT item_id FROM proc.invoice_line_items_agent WHERE invoice_id = %s",
                             params=(src,),
                         )
-                        if df.empty:
-                            df = pd.read_sql(
-                                "SELECT item_id FROM proc.invoice_line_items_agent WHERE invoice_id = %s",
-                                conn,
-                                params=(src,),
-                            )
-                        if not df.empty:
-                            item_id = str(df["item_id"].dropna().iloc[0])
-                            logger.debug(
-                                "_find_candidate_suppliers inferred item_id %s from source %s",
-                                item_id,
-                                src,
-                            )
-                            break
-            except Exception:
-                logger.exception("Failed to infer item_id from sources %s", sources)
+                    if df.empty:
+                        continue
+                    item_id = str(df["item_id"].dropna().iloc[0])
+                    logger.debug(
+                        "_find_candidate_suppliers inferred item_id %s from source %s",
+                        item_id,
+                        src,
+                    )
+                    break
+                except Exception:
+                    logger.exception("Failed to infer item_id from source %s", src)
 
         if not item_id:
             logger.debug("_find_candidate_suppliers: no item_id available; skipping")

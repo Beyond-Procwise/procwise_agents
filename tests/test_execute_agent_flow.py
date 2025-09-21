@@ -119,7 +119,7 @@ def test_json_flow_injects_proc_agent_prompts_and_policies():
         50: {"promptId": 50, "template": "from-db"}
     }
     orchestrator._load_policies = lambda: {
-        9: {"policyId": 9, "policy_desc": "{}"}
+        9: {"policyId": 9, "policyName": "VolumeDiscount", "policy_desc": "{}"}
     }
 
     flow = {
@@ -164,7 +164,7 @@ def test_execute_agent_flow_runs_and_updates_status():
         "data_extraction": "DataExtractionAgent"
     }
     orchestrator._load_prompts = lambda: {1: {}}
-    orchestrator._load_policies = lambda: {1: {}}
+    orchestrator._load_policies = lambda: {1: {"policyId": 1, "policyName": "ExamplePolicy"}}
     flow = {
         "status": "saved",
         "agent_type": "data_extraction",
@@ -493,7 +493,7 @@ def test_inject_agent_instructions_uses_agent_defaults():
         50: {"promptId": 50, "template": "workflow: dynamic"}
     }
     orchestrator._load_policies = lambda: {
-        9: {"policyId": 9, "policy_desc": "{}"}
+        9: {"policyId": 9, "policyName": "VolumeDiscount", "policy_desc": "{}"}
     }
 
     payload = {"conditions": {"existing": True}}
@@ -589,8 +589,12 @@ def test_supplier_ranking_flow_applies_agent_prompts_and_policies():
         200: {"promptId": 200, "template": "criteria: risk"},
     }
     orchestrator._load_policies = lambda: {
-        9: {"policyId": 9, "policy_desc": "{}"},
-        25: {"policyId": 25, "policy_desc": "{\"rules\": {}}"},
+        9: {"policyId": 9, "policyName": "VolumeDiscount", "policy_desc": "{}"},
+        25: {
+            "policyId": 25,
+            "policyName": "SupplierRanking",
+            "policy_desc": "{\"rules\": {}}",
+        },
     }
 
     result = orchestrator.execute_workflow("supplier_ranking", {"query": "top 1"})

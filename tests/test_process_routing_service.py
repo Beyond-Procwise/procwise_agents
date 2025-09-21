@@ -261,7 +261,13 @@ def test_get_process_details_enriches_agent_data():
     }
     prompt_rows = [(1, "hello", "{supplier_ranking}")]
     policy_rows = [
-        (2, "Example policy", json.dumps({"rules": {}}), "{supplier_ranking}"),
+        (
+            2,
+            "ExamplePolicy",
+            "Example policy",
+            json.dumps({"rules": {}}),
+            "{supplier_ranking}",
+        ),
     ]
     conn = FetchConn(proc_details, prompt_rows, policy_rows)
     agent = SimpleNamespace(
