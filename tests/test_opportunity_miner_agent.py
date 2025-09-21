@@ -11,7 +11,11 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.opportunity_miner_agent import OpportunityMinerAgent, Finding
+from agents.opportunity_miner_agent import (
+    OpportunityMinerAgent,
+    Finding,
+    _PURCHASE_LINE_VALUE_COLUMNS,
+)
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 
@@ -411,9 +415,47 @@ def _sample_tables() -> Dict[str, Any]:
         "supplier_master": supplier_master,
     }
 
-    assert output.status == AgentStatus.FAILED
-    assert output.data["blocked_reason"]
-    assert output.data["policy_events"]
+
+def test_resolve_supplier_id_matches_supplier_aliases():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    tables = {
+        "supplier_master": pd.DataFrame(
+            [
+                {
+                    "supplier_id": "SI0001",
+                    "supplier_name": "Acme Industrial Ltd",
+                    "trading_name": "ACME LTD",
+                },
+                {
+                    "supplier_id": "SI0002",
+                    "supplier_name": "Beta Manufacturing",
+                },
+            ]
+        ),
+        "contracts": pd.DataFrame(),
+        "purchase_orders": pd.DataFrame(),
+        "invoices": pd.DataFrame(),
+    }
+
+    agent._build_supplier_lookup(tables)
+
+    assert agent._resolve_supplier_id("SI0001") == "SI0001"
+    assert agent._resolve_supplier_id("acme industrial ltd") == "SI0001"
+    assert agent._resolve_supplier_id("ACME LTD") == "SI0001"
+    assert agent._resolve_supplier_id("Beta Manufacturing") == "SI0002"
+    assert agent._resolve_supplier_id("Unknown Supplier") is None
+
+
+def test_choose_first_column_handles_line_total_column():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    df = pd.DataFrame({"po_id": ["PO1"], "item_id": ["Item"], "line_total": [100.0]})
+
+    selected = agent._choose_first_column(df, _PURCHASE_LINE_VALUE_COLUMNS)
+    assert selected == "line_total"
 
 
 def test_price_variance_detection_generates_finding(monkeypatch):
@@ -476,6 +518,75 @@ def test_price_variance_uses_top_level_fields_when_conditions_missing(monkeypatc
     assert conditions["supplier_id"] == "SI0001"
     assert conditions["item_id"] == "ITM-001"
     assert conditions["actual_price"] == 11.0
+
+
+def test_price_variance_accepts_camel_case_conditions(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = AgentContext(
+        workflow_id="wf-camel",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "price_variance_check",
+            "conditions": {},
+            "supplierId": "SI0001",
+            "itemId": "ITM-001",
+            "actualPrice": "11.50",
+            "benchmarkPrice": "9.25",
+            "quantity": "12",
+            "varianceThresholdPct": "0.05",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["item_id"] == "ITM-001"
+    assert conditions["actual_price"] == 11.5
+    assert conditions["benchmark_price"] == 9.25
+    assert conditions["quantity"] == 12.0
+    assert conditions["variance_threshold_pct"] == 0.05
+
+
+def test_policy_conditions_merge_into_context(monkeypatch):
+    agent = create_agent(monkeypatch)
+    policy_payload = {
+        "policyId": 9,
+        "policyName": "Price Benchmark Variance",
+        "policy_desc": "oppfinderpolicy_001_price_benchmark_variance_detection",
+        "conditions": {
+            "supplierId": "SI0001",
+            "itemId": "ITM-001",
+            "actualPrice": 11.0,
+            "benchmarkPrice": 9.0,
+            "quantity": 10,
+            "varianceThresholdPct": 0.05,
+        },
+    }
+
+    context = AgentContext(
+        workflow_id="wf-policy",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "price_variance_check",
+            "conditions": {},
+            "policies": [policy_payload],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["benchmark_price"] == 9.0
+    assert any(
+        f["detector_type"] == "Price Benchmark Variance"
+        for f in output.data["findings"]
+    )
     assert conditions["benchmark_price"] == 9.0
 
 
@@ -740,6 +851,32 @@ def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     assert all(f["supplier_id"] for f in vc)
 
 
+def test_volume_consolidation_uses_line_level_supplier_ids(monkeypatch):
+    tables = _sample_tables()
+    purchase_orders = tables["purchase_orders"].drop(columns=["supplier_id"])
+    purchase_orders = purchase_orders.assign(contract_id=None)
+    tables["purchase_orders"] = purchase_orders
+    po_lines = tables["purchase_order_lines"].copy()
+    po_lines["supplier_id"] = ["SI0001", "SI0002", "SI0002"]
+    tables["purchase_order_lines"] = po_lines
+
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "volume_consolidation_check", {"minimum_volume_gbp": 50}
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    vc = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Volume Consolidation"
+    ]
+    assert vc
+    assert all(f["supplier_id"] for f in vc)
+
+
 def test_contract_expiry_injects_default_window(monkeypatch):
     agent = create_agent(monkeypatch)
     context = build_context(
@@ -939,3 +1076,45 @@ def test_assemble_policy_registry_filters_static_entries():
     entry = registry["contract_expiry_check"]
     assert entry["policy_id"] == "oppfinderpolicy_004_contract_expiry_opportunity"
     assert entry.get("parameters", {}).get("negotiation_window_days") == 75
+
+
+def test_registry_matches_numeric_policy_identifiers_without_catalog():
+    class CataloglessNick:
+        def __init__(self):
+            self.settings = SimpleNamespace(script_user="tester")
+            self.prompt_engine = SimpleNamespace()
+            self.policy_engine = None
+            self.process_routing_service = SimpleNamespace(
+                log_process=lambda **kwargs: None,
+                log_run_detail=lambda **kwargs: None,
+                log_action=lambda **kwargs: None,
+                update_process_status=lambda **kwargs: None,
+            )
+
+    agent = OpportunityMinerAgent(CataloglessNick())
+
+    input_data = {
+        "policies": [
+            {
+                "policyId": 9,
+                "policyName": "oppfinderpolicy_001_price_benchmark_variance_detection",
+                "policy_desc": "Identify suppliers charging above benchmark.",
+            },
+            {
+                "policyId": 10,
+                "policyName": "oppfinderpolicy_003_volume_consolidation",
+                "policy_desc": "Identify consolidation opportunities across multiple suppliers.",
+            },
+        ]
+    }
+
+    registry, provided = agent._assemble_policy_registry(dict(input_data))
+
+    assert {"price_variance_check", "volume_consolidation_check"} == set(registry.keys())
+    first_entry = registry["price_variance_check"]
+    assert first_entry["policy_id"] == "oppfinderpolicy_001_price_benchmark_variance_detection"
+    assert first_entry["policy_slug"] == "price_variance_check"
+    second_entry = registry["volume_consolidation_check"]
+    assert second_entry["policy_id"] == "oppfinderpolicy_003_volume_consolidation"
+    assert second_entry["policy_slug"] == "volume_consolidation_check"
+    assert len(provided) == 2
