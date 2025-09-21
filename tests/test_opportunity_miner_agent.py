@@ -518,6 +518,75 @@ def test_price_variance_uses_top_level_fields_when_conditions_missing(monkeypatc
     assert conditions["supplier_id"] == "SI0001"
     assert conditions["item_id"] == "ITM-001"
     assert conditions["actual_price"] == 11.0
+
+
+def test_price_variance_accepts_camel_case_conditions(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = AgentContext(
+        workflow_id="wf-camel",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "price_variance_check",
+            "conditions": {},
+            "supplierId": "SI0001",
+            "itemId": "ITM-001",
+            "actualPrice": "11.50",
+            "benchmarkPrice": "9.25",
+            "quantity": "12",
+            "varianceThresholdPct": "0.05",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["item_id"] == "ITM-001"
+    assert conditions["actual_price"] == 11.5
+    assert conditions["benchmark_price"] == 9.25
+    assert conditions["quantity"] == 12.0
+    assert conditions["variance_threshold_pct"] == 0.05
+
+
+def test_policy_conditions_merge_into_context(monkeypatch):
+    agent = create_agent(monkeypatch)
+    policy_payload = {
+        "policyId": 9,
+        "policyName": "Price Benchmark Variance",
+        "policy_desc": "oppfinderpolicy_001_price_benchmark_variance_detection",
+        "conditions": {
+            "supplierId": "SI0001",
+            "itemId": "ITM-001",
+            "actualPrice": 11.0,
+            "benchmarkPrice": 9.0,
+            "quantity": 10,
+            "varianceThresholdPct": 0.05,
+        },
+    }
+
+    context = AgentContext(
+        workflow_id="wf-policy",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "price_variance_check",
+            "conditions": {},
+            "policies": [policy_payload],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    conditions = context.input_data["conditions"]
+    assert conditions["supplier_id"] == "SI0001"
+    assert conditions["benchmark_price"] == 9.0
+    assert any(
+        f["detector_type"] == "Price Benchmark Variance"
+        for f in output.data["findings"]
+    )
     assert conditions["benchmark_price"] == 9.0
 
 
@@ -778,6 +847,32 @@ def test_volume_consolidation_identifies_costlier_supplier(monkeypatch):
     output = agent.run(context)
 
     vc = [f for f in output.data["findings"] if f["detector_type"] == "Volume Consolidation"]
+    assert vc
+    assert all(f["supplier_id"] for f in vc)
+
+
+def test_volume_consolidation_uses_line_level_supplier_ids(monkeypatch):
+    tables = _sample_tables()
+    purchase_orders = tables["purchase_orders"].drop(columns=["supplier_id"])
+    purchase_orders = purchase_orders.assign(contract_id=None)
+    tables["purchase_orders"] = purchase_orders
+    po_lines = tables["purchase_order_lines"].copy()
+    po_lines["supplier_id"] = ["SI0001", "SI0002", "SI0002"]
+    tables["purchase_order_lines"] = po_lines
+
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "volume_consolidation_check", {"minimum_volume_gbp": 50}
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    vc = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Volume Consolidation"
+    ]
     assert vc
     assert all(f["supplier_id"] for f in vc)
 

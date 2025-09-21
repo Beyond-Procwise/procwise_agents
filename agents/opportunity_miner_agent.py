@@ -17,7 +17,7 @@ import pandas as pd
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
-from utils.instructions import parse_instruction_sources
+from utils.instructions import parse_instruction_sources, normalize_instruction_key
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,156 @@ _INVOICE_LINE_VALUE_COLUMNS = [
     "line_total",
     "total_amount",
 ]
+
+
+_CONDITION_KEY_ALIASES: Dict[str, set[str]] = {
+    "supplier_id": {
+        "supplier",
+        "supplierid",
+        "supplier_identifier",
+        "supplier_code",
+        "supplier_reference",
+        "vendor",
+        "vendor_id",
+        "vendorid",
+    },
+    "supplier_name": {
+        "suppliername",
+        "vendor_name",
+        "vendorname",
+        "trading_name",
+    },
+    "item_id": {
+        "item",
+        "itemid",
+        "item_code",
+        "itemcode",
+        "sku",
+        "product_id",
+        "productid",
+        "material_id",
+        "materialid",
+        "item_reference",
+    },
+    "actual_price": {
+        "actualprice",
+        "current_price",
+        "currentprice",
+        "unit_price",
+        "unitprice",
+        "price_paid",
+        "paid_price",
+        "current_unit_price",
+    },
+    "benchmark_price": {
+        "benchmarkprice",
+        "target_price",
+        "targetprice",
+        "reference_price",
+        "referenceprice",
+        "benchmark_unit_price",
+    },
+    "quantity": {
+        "qty",
+        "quantity_ordered",
+        "ordered_quantity",
+        "order_quantity",
+        "volume",
+    },
+    "variance_threshold_pct": {
+        "variance_threshold",
+        "variance_thresholdpct",
+        "variancepct",
+        "threshold_pct",
+        "thresholdpct",
+    },
+    "minimum_volume_gbp": {
+        "min_volume_gbp",
+        "minimum_volume",
+        "minimum_spend_threshold",
+        "minimum_spend_gbp",
+        "volume_threshold",
+    },
+    "minimum_value_gbp": {
+        "min_value_gbp",
+        "minimum_value",
+        "minimum_spend_gbp",
+        "minimum_spend_threshold",
+    },
+    "minimum_overlap_gbp": {
+        "min_overlap_gbp",
+        "overlap_threshold_gbp",
+    },
+    "risk_threshold": {
+        "risk_score_threshold",
+        "minimum_risk_score",
+    },
+    "lookback_period_days": {
+        "lookback_days",
+        "lookback_period",
+    },
+    "negotiation_window_days": {
+        "negotiation_window",
+        "window_days",
+        "renewal_window_days",
+    },
+    "reference_date": {
+        "analysis_date",
+        "base_date",
+    },
+    "market_inflation_pct": {
+        "inflation_rate_pct",
+        "inflation_pct",
+        "market_inflation",
+    },
+    "minimum_unused_value_gbp": {
+        "unused_value_threshold_gbp",
+        "min_unused_value_gbp",
+    },
+}
+
+
+_NUMERIC_CONDITION_KEYS: set[str] = {
+    "actual_price",
+    "benchmark_price",
+    "quantity",
+    "variance_threshold_pct",
+    "minimum_volume_gbp",
+    "minimum_value_gbp",
+    "minimum_overlap_gbp",
+    "risk_threshold",
+    "market_inflation_pct",
+    "minimum_unused_value_gbp",
+}
+
+
+_INTEGER_CONDITION_KEYS: set[str] = {
+    "lookback_period_days",
+    "negotiation_window_days",
+}
+
+
+def _build_condition_alias_maps() -> Tuple[Dict[str, set[str]], Dict[str, str]]:
+    normalised: Dict[str, set[str]] = {}
+    reverse: Dict[str, str] = {}
+
+    for canonical, aliases in _CONDITION_KEY_ALIASES.items():
+        values = {canonical, *aliases}
+        normals: set[str] = set()
+        for alias in values:
+            key = normalize_instruction_key(alias)
+            if key:
+                normals.add(key)
+        if not normals:
+            continue
+        normalised[canonical] = normals
+        for key in normals:
+            reverse.setdefault(key, canonical)
+
+    return normalised, reverse
+
+
+_NORMALISED_CONDITION_ALIASES, _CONDITION_ALIAS_LOOKUP = _build_condition_alias_maps()
 
 
 @dataclass
@@ -148,6 +298,146 @@ class OpportunityMinerAgent(BaseAgent):
                 sources.append(value)
         return sources
 
+    def _resolve_canonical_condition_key(self, key: Any) -> Optional[str]:
+        normalised = normalize_instruction_key(key)
+        if not normalised:
+            return None
+        canonical = _CONDITION_ALIAS_LOOKUP.get(normalised)
+        if canonical:
+            return canonical
+        for candidate, aliases in _NORMALISED_CONDITION_ALIASES.items():
+            if normalised in aliases:
+                return candidate
+        return None
+
+    def _is_condition_value(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        try:
+            if pd.isna(value):  # type: ignore[arg-type]
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _has_condition_value(self, conditions: Dict[str, Any], key: str) -> bool:
+        if key not in conditions:
+            return False
+        existing = conditions.get(key)
+        if existing is None:
+            return False
+        if isinstance(existing, str) and not existing.strip():
+            return False
+        try:
+            if pd.isna(existing):  # type: ignore[arg-type]
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _coerce_condition_value(self, key: str, value: Any) -> Any:
+        if key in _INTEGER_CONDITION_KEYS:
+            try:
+                numeric = int(float(value))
+                return numeric
+            except Exception:
+                return value
+        if key in _NUMERIC_CONDITION_KEYS:
+            coerced = self._coerce_float(value)
+            if coerced is not None:
+                return coerced
+        return value
+
+    def _assign_condition(
+        self,
+        conditions: Dict[str, Any],
+        key: str,
+        value: Any,
+        *,
+        override: bool = False,
+    ) -> None:
+        if not self._is_condition_value(value):
+            return
+        if not override and self._has_condition_value(conditions, key):
+            return
+        conditions[key] = self._coerce_condition_value(key, value)
+
+    def _merge_conditions_from_source(
+        self,
+        conditions: Dict[str, Any],
+        source: Any,
+        *,
+        override: bool = False,
+    ) -> None:
+        if not isinstance(conditions, dict):
+            return
+
+        visited: set[int] = set()
+
+        def _walk(payload: Any) -> None:
+            if payload is None:
+                return
+            if isinstance(payload, dict):
+                payload_id = id(payload)
+                if payload_id in visited:
+                    return
+                visited.add(payload_id)
+                if payload is conditions:
+                    return
+                for raw_key, raw_value in payload.items():
+                    canonical = self._resolve_canonical_condition_key(raw_key)
+                    if canonical and not isinstance(raw_value, (dict, list, tuple, set)):
+                        self._assign_condition(
+                            conditions, canonical, raw_value, override=override
+                        )
+                    else:
+                        _walk(raw_value)
+                return
+            if isinstance(payload, (list, tuple, set)):
+                for item in payload:
+                    _walk(item)
+                return
+            if isinstance(payload, str):
+                text = payload.strip()
+                if not text:
+                    return
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return
+                _walk(parsed)
+
+        _walk(source)
+
+    def _find_column_for_key(self, df: pd.DataFrame, canonical_key: str) -> Optional[str]:
+        if df.empty:
+            return None
+        aliases = _NORMALISED_CONDITION_ALIASES.get(canonical_key, set())
+        if not aliases:
+            aliases = {normalize_instruction_key(canonical_key)}
+        for column in df.columns:
+            if normalize_instruction_key(column) in aliases:
+                return column
+        return None
+
+    def _resolve_condition_value(self, container: Any, key: str) -> Any:
+        if not isinstance(container, dict):
+            return None
+        value = container.get(key)
+        if self._is_condition_value(value):
+            return value
+        aliases = _NORMALISED_CONDITION_ALIASES.get(key, set())
+        if not aliases:
+            aliases = {normalize_instruction_key(key)}
+        for candidate_key, candidate_value in container.items():
+            if not self._is_condition_value(candidate_value):
+                continue
+            if normalize_instruction_key(candidate_key) in aliases:
+                return candidate_value
+        return None
+
     def _apply_instruction_overrides(
         self, context: AgentContext, instructions: Dict[str, Any]
     ) -> None:
@@ -174,151 +464,8 @@ class OpportunityMinerAgent(BaseAgent):
             conditions = {}
             context.input_data["conditions"] = conditions
 
-        alias_map = {
-            "negotiation_window_days": {
-                "negotiation_window_days",
-                "negotiation_window",
-                "window_days",
-                "renewal_window_days",
-            },
-            "lookback_period_days": {
-                "lookback_period_days",
-                "lookback_period",
-                "lookback_days",
-            },
-            "reference_date": {"reference_date", "analysis_date", "base_date"},
-            "risk_threshold": {"risk_threshold", "risk_score_threshold"},
-            "minimum_volume_gbp": {
-                "minimum_volume_gbp",
-                "min_volume_gbp",
-                "volume_threshold",
-            },
-            "minimum_value_gbp": {
-                "minimum_value_gbp",
-                "minimum_spend_gbp",
-                "min_value_gbp",
-            },
-            "minimum_unused_value_gbp": {
-                "minimum_unused_value_gbp",
-                "unused_value_threshold",
-            },
-            "minimum_overlap_gbp": {"minimum_overlap_gbp", "overlap_threshold"},
-            "market_inflation_pct": {"market_inflation_pct", "inflation_pct"},
-            "minimum_quantity_threshold": {
-                "minimum_quantity_threshold",
-                "quantity_threshold",
-            },
-            "minimum_spend_threshold": {
-                "minimum_spend_threshold",
-                "spend_threshold",
-            },
-            "supplier_id": {
-                "supplier_id",
-                "supplier",
-                "supplier_code",
-                "vendor_id",
-                "supplier_name",
-                "vendor_name",
-            },
-            "item_id": {
-                "item_id",
-                "item",
-                "item_code",
-                "material_id",
-                "sku",
-            },
-            "actual_price": {
-                "actual_price",
-                "current_price",
-                "price_paid",
-                "unit_price",
-                "current_unit_price",
-            },
-            "benchmark_price": {
-                "benchmark_price",
-                "benchmark_unit_price",
-                "target_price",
-                "reference_price",
-            },
-            "quantity": {
-                "quantity",
-                "volume",
-                "units",
-                "unit_count",
-                "order_quantity",
-            },
-            "variance_threshold_pct": {
-                "variance_threshold_pct",
-                "variance_threshold",
-                "threshold_pct",
-                "price_variance_threshold",
-                "variance_pct_threshold",
-            },
-        }
+        self._merge_conditions_from_source(conditions, instructions)
 
-        def _assign_condition(key: str, raw: Any) -> None:
-            if raw is None:
-                return
-            if isinstance(raw, dict):
-                conditions[key] = raw
-                return
-            if isinstance(raw, (list, tuple, set)):
-                values = [v for v in raw if v is not None]
-                if values:
-                    conditions[key] = list(values)
-                return
-            if isinstance(raw, bool):
-                conditions[key] = raw
-                return
-            numeric = self._coerce_float(raw)
-            if numeric is not None:
-                if key.endswith("_days"):
-                    conditions[key] = int(numeric)
-                else:
-                    conditions[key] = numeric
-                return
-            text = str(raw).strip()
-            if text:
-                conditions[key] = text
-
-        for canonical, aliases in alias_map.items():
-            for alias in aliases:
-                if alias in instructions:
-                    _assign_condition(canonical, instructions[alias])
-                    break
-
-        def _merge_condition_dict(payload: Any) -> None:
-            if not isinstance(payload, dict):
-                return
-            for raw_key, raw_value in payload.items():
-                if raw_key is None:
-                    continue
-                norm_key = self._normalise_policy_slug(raw_key) or str(raw_key).strip()
-                if not norm_key:
-                    continue
-                _assign_condition(norm_key, raw_value)
-
-        for block_key in (
-            "conditions",
-            "parameters",
-            "policy_parameters",
-            "default_conditions",
-        ):
-            _merge_condition_dict(instructions.get(block_key))
-
-        rules_block = instructions.get("rules")
-        if isinstance(rules_block, dict):
-            _merge_condition_dict(rules_block)
-            for nested_key in ("parameters", "conditions"):
-                _merge_condition_dict(rules_block.get(nested_key))
-
-        for canonical, aliases in alias_map.items():
-            if canonical in conditions:
-                continue
-            for alias in aliases:
-                if alias in context.input_data:
-                    _assign_condition(canonical, context.input_data[alias])
-                    break
 
     def _apply_instruction_settings(self, context: AgentContext) -> None:
         sources: List[Any] = []
@@ -330,6 +477,10 @@ class OpportunityMinerAgent(BaseAgent):
             sources.extend(self._instruction_sources_from_policy(policy))
         instructions = parse_instruction_sources(sources)
         self._apply_instruction_overrides(context, instructions)
+
+        conditions = context.input_data.get("conditions")
+        if isinstance(conditions, dict):
+            self._merge_conditions_from_source(conditions, context.input_data)
 
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
@@ -644,11 +795,18 @@ class OpportunityMinerAgent(BaseAgent):
                     continue
                 policy_input = dict(context.input_data)
                 policy_input["conditions"] = dict(base_conditions)
-                parameters = policy_cfg.get("parameters")
-                if isinstance(parameters, dict):
-                    for param_key, param_value in parameters.items():
-                        if param_key not in policy_input["conditions"]:
-                            policy_input["conditions"][param_key] = param_value
+                self._merge_conditions_from_source(
+                    policy_input["conditions"], policy_cfg.get("default_conditions")
+                )
+                self._merge_conditions_from_source(
+                    policy_input["conditions"], policy_cfg.get("parameters")
+                )
+                self._merge_conditions_from_source(
+                    policy_input["conditions"], policy_cfg.get("rules")
+                )
+                self._merge_conditions_from_source(
+                    policy_input["conditions"], policy_cfg.get("source_policy")
+                )
 
 
                 if not isinstance(context.input_data.get("conditions"), dict):
@@ -1013,24 +1171,31 @@ class OpportunityMinerAgent(BaseAgent):
                     return None
             except Exception:
                 pass
-            value = str(value).strip()
-            return value or None
+            text = str(value).strip()
+            return text or None
 
-        if not supplier_master.empty and "supplier_id" in supplier_master.columns:
-            df = supplier_master.dropna(subset=["supplier_id"]).copy()
+        supplier_id_col = self._find_column_for_key(supplier_master, "supplier_id")
+        if not supplier_master.empty and supplier_id_col:
+            df = supplier_master.dropna(subset=[supplier_id_col]).copy()
             if not df.empty:
-                df["supplier_id"] = df["supplier_id"].map(_normalise)
-                if "supplier_name" in df.columns:
-                    df["supplier_name"] = df["supplier_name"].map(_normalise)
-                df = df.dropna(subset=["supplier_id"])
+                df[supplier_id_col] = df[supplier_id_col].map(_normalise)
+                name_col = self._find_column_for_key(df, "supplier_name")
+                trading_col = "trading_name" if "trading_name" in df.columns else None
+                if name_col and name_col in df.columns:
+                    df[name_col] = df[name_col].map(_normalise)
+                if trading_col and trading_col in df.columns:
+                    df[trading_col] = df[trading_col].map(_normalise)
+                df = df.dropna(subset=[supplier_id_col])
                 for _, row in df.iterrows():
-                    supplier_id = row["supplier_id"]
-                    lookup[supplier_id] = row.get("supplier_name") or None
-                    aliases = {
-                        supplier_id,
-                        row.get("supplier_name"),
-                        row.get("trading_name"),
-                    }
+                    supplier_id = row.get(supplier_id_col)
+                    if not supplier_id:
+                        continue
+                    lookup[supplier_id] = row.get(name_col) or row.get(trading_col) or None
+                    aliases = {supplier_id}
+                    if name_col and row.get(name_col):
+                        aliases.add(row.get(name_col))
+                    if trading_col and row.get(trading_col):
+                        aliases.add(row.get(trading_col))
                     for alias in list(aliases):
                         normalised_alias = self._normalise_supplier_key(alias)
                         if normalised_alias:
@@ -1051,22 +1216,30 @@ class OpportunityMinerAgent(BaseAgent):
         contracts = tables.get("contracts", pd.DataFrame())
         contract_map: Dict[str, str] = {}
         contract_meta: Dict[str, Dict[str, Any]] = {}
-        if not contracts.empty and "contract_id" in contracts.columns:
-            df = contracts.dropna(subset=["contract_id"]).copy()
-            df["contract_id"] = df["contract_id"].map(_normalise)
-            if "supplier_id" in df.columns:
-                df["supplier_id"] = df["supplier_id"].map(_normalise)
-            if "spend_category" in df.columns:
-                df["spend_category"] = df["spend_category"].map(_normalise)
-            if "category_id" in df.columns:
-                df["category_id"] = df["category_id"].map(_normalise)
-            df = df.dropna(subset=["contract_id"])
+        contract_id_col = "contract_id" if "contract_id" in contracts.columns else None
+        if not contracts.empty and contract_id_col:
+            df = contracts.dropna(subset=[contract_id_col]).copy()
+            df[contract_id_col] = df[contract_id_col].map(_normalise)
+            supplier_col = self._find_column_for_key(df, "supplier_id")
+            if supplier_col and supplier_col in df.columns:
+                df[supplier_col] = df[supplier_col].map(_normalise)
+            spend_col = "spend_category" if "spend_category" in df.columns else None
+            if spend_col and spend_col in df.columns:
+                df[spend_col] = df[spend_col].map(_normalise)
+            category_col = "category_id" if "category_id" in df.columns else None
+            if category_col and category_col in df.columns:
+                df[category_col] = df[category_col].map(_normalise)
+            df = df.dropna(subset=[contract_id_col])
             for _, row in df.iterrows():
-                contract_id = row.get("contract_id")
+                contract_id = row.get(contract_id_col)
                 if not contract_id:
                     continue
-                supplier_id = row.get("supplier_id")
-                spend_category = row.get("spend_category") or row.get("category_id")
+                supplier_id = row.get(supplier_col) if supplier_col else None
+                spend_category = None
+                if spend_col:
+                    spend_category = row.get(spend_col)
+                if not spend_category and category_col:
+                    spend_category = row.get(category_col)
                 contract_meta[contract_id] = {
                     "supplier_id": supplier_id,
                     "spend_category": spend_category,
@@ -1092,8 +1265,9 @@ class OpportunityMinerAgent(BaseAgent):
         if not purchase_orders.empty and "po_id" in purchase_orders.columns:
             df = purchase_orders.dropna(subset=["po_id"]).copy()
             df["po_id"] = df["po_id"].map(_normalise)
-            if "supplier_id" in df.columns:
-                df["supplier_id"] = df["supplier_id"].map(_normalise)
+            supplier_col = self._find_column_for_key(df, "supplier_id")
+            if supplier_col and supplier_col in df.columns:
+                df[supplier_col] = df[supplier_col].map(_normalise)
             if "contract_id" in df.columns:
                 df["contract_id"] = df["contract_id"].map(_normalise)
             df = df.dropna(subset=["po_id"])
@@ -1101,7 +1275,7 @@ class OpportunityMinerAgent(BaseAgent):
                 po_id = row.get("po_id")
                 if not po_id:
                     continue
-                supplier_id = row.get("supplier_id")
+                supplier_id = row.get(supplier_col) if supplier_col else None
                 contract_id = row.get("contract_id")
                 if contract_id:
                     po_contract_map[po_id] = contract_id
@@ -1119,8 +1293,9 @@ class OpportunityMinerAgent(BaseAgent):
         if not invoices.empty and "invoice_id" in invoices.columns:
             df = invoices.dropna(subset=["invoice_id"]).copy()
             df["invoice_id"] = df["invoice_id"].map(_normalise)
-            if "supplier_id" in df.columns:
-                df["supplier_id"] = df["supplier_id"].map(_normalise)
+            supplier_col = self._find_column_for_key(df, "supplier_id")
+            if supplier_col and supplier_col in df.columns:
+                df[supplier_col] = df[supplier_col].map(_normalise)
             if "po_id" in df.columns:
                 df["po_id"] = df["po_id"].map(_normalise)
             df = df.dropna(subset=["invoice_id"])
@@ -1129,7 +1304,7 @@ class OpportunityMinerAgent(BaseAgent):
                 if not invoice_id:
                     continue
                 po_id = row.get("po_id")
-                supplier_id = row.get("supplier_id")
+                supplier_id = row.get(supplier_col) if supplier_col else None
                 if po_id:
                     invoice_po_map[invoice_id] = po_id
                 candidate = supplier_id
@@ -1789,32 +1964,24 @@ class OpportunityMinerAgent(BaseAgent):
         return registry
 
     def _get_condition(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
-        def _resolve_from(container: Any) -> Any:
-            if not isinstance(container, dict):
-                return None
-            value = container.get(key)
-            if value is None:
-                return None
-            if isinstance(value, str) and not value.strip():
-                return None
-            return value
-
         conditions = input_data.get("conditions")
-        if isinstance(conditions, dict):
-            value = _resolve_from(conditions)
-            if value is not None:
-                return value
+        if not isinstance(conditions, dict):
+            conditions = {}
+            input_data["conditions"] = conditions
+
+        value = self._resolve_condition_value(conditions, key)
+        if self._is_condition_value(value):
+            return value
 
         for source in (
             input_data,
             input_data.get("parameters"),
             input_data.get("defaults"),
         ):
-            value = _resolve_from(source)
-            if value is not None:
-                if isinstance(conditions, dict):
-                    conditions.setdefault(key, value)
-                return value
+            candidate = self._resolve_condition_value(source, key)
+            if self._is_condition_value(candidate):
+                self._assign_condition(conditions, key, candidate)
+                return candidate
 
         return default
 
@@ -3239,9 +3406,19 @@ class OpportunityMinerAgent(BaseAgent):
             df[price_col] = df[price_col].fillna(0.0)
         if qty_col:
             df[qty_col] = df[qty_col].fillna(0.0)
-        df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
+        supplier_col = self._find_column_for_key(df, "supplier_id")
+        mapped_suppliers = df["po_id"].map(self._po_supplier_map)
+        if supplier_col and supplier_col in df.columns:
+            existing = df[supplier_col].apply(
+                lambda v: str(v).strip() if self._is_condition_value(v) else None
+            )
+            df["supplier_id"] = mapped_suppliers.where(~mapped_suppliers.isna(), existing)
+        else:
+            df["supplier_id"] = mapped_suppliers
+        df["supplier_id"] = df["supplier_id"].apply(
+            lambda v: str(v).strip() if self._is_condition_value(v) else None
+        )
         df = df.dropna(subset=["supplier_id"])
-        df["supplier_id"] = df["supplier_id"].astype(str)
 
         if df.empty:
             self._log_policy_event(
