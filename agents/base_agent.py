@@ -271,7 +271,8 @@ class AgentNick:
 
         engine = self.get_db_engine()
         if engine is not None:
-            yield engine
+            with engine.connect() as connection:
+                yield connection
             return
 
         conn = self.get_db_connection()

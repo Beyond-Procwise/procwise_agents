@@ -35,8 +35,11 @@ def configure_gpu() -> str:
 
     # Ensure GPU visibility and enablement for libraries that honour these
     # environment variables. Defaults are chosen to utilise the first GPU.
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     os.environ.setdefault("OLLAMA_USE_GPU", "1")
+    os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
+    os.environ.setdefault("OMP_NUM_THREADS", "8")
 
     if torch is not None and torch.cuda.is_available():  # pragma: no cover - hardware dependent
         torch.set_default_device("cuda")
@@ -46,6 +49,7 @@ def configure_gpu() -> str:
 
     # Many libraries such as ``sentence_transformers`` respect this variable.
     os.environ.setdefault("SENTENCE_TRANSFORMERS_DEFAULT_DEVICE", _DEVICE)
+    os.environ.setdefault("PROCWISE_DEVICE", _DEVICE)
 
     _CONFIGURED = True
     return _DEVICE
