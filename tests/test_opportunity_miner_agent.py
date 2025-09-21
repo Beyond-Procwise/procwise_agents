@@ -658,6 +658,86 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
+def test_price_variance_infers_supplier_from_contract(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "contract_id": "CO000001",
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0001"
+    assert context.input_data["conditions"]["supplier_id"] == "SI0001"
+
+
+def test_price_variance_infers_supplier_from_item(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0001"
+    assert context.input_data["conditions"]["supplier_id"] == "SI0001"
+
+
+def test_price_variance_infers_supplier_from_description(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "item_description": "Logistics Support",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0001"
+    assert context.input_data["conditions"]["supplier_id"] == "SI0001"
+
+
 def test_candidate_supplier_lookup_uses_original_item(monkeypatch):
     agent = create_agent(monkeypatch)
     calls: list[Any] = []
@@ -858,6 +938,29 @@ def test_volume_consolidation_uses_line_level_supplier_ids(monkeypatch):
     tables["purchase_orders"] = purchase_orders
     po_lines = tables["purchase_order_lines"].copy()
     po_lines["supplier_id"] = ["SI0001", "SI0002", "SI0002"]
+    tables["purchase_order_lines"] = po_lines
+
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "volume_consolidation_check", {"minimum_volume_gbp": 50}
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    vc = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Volume Consolidation"
+    ]
+    assert vc
+    assert all(f["supplier_id"] for f in vc)
+
+
+def test_volume_consolidation_handles_misaligned_po_ids(monkeypatch):
+    tables = _sample_tables()
+    po_lines = tables["purchase_order_lines"].copy()
+    po_lines["po_id"] = po_lines["po_id"].str.lower() + "  "
     tables["purchase_order_lines"] = po_lines
 
     agent = create_agent(monkeypatch, tables)
