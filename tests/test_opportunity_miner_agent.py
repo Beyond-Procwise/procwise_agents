@@ -939,3 +939,45 @@ def test_assemble_policy_registry_filters_static_entries():
     entry = registry["contract_expiry_check"]
     assert entry["policy_id"] == "oppfinderpolicy_004_contract_expiry_opportunity"
     assert entry.get("parameters", {}).get("negotiation_window_days") == 75
+
+
+def test_registry_matches_numeric_policy_identifiers_without_catalog():
+    class CataloglessNick:
+        def __init__(self):
+            self.settings = SimpleNamespace(script_user="tester")
+            self.prompt_engine = SimpleNamespace()
+            self.policy_engine = None
+            self.process_routing_service = SimpleNamespace(
+                log_process=lambda **kwargs: None,
+                log_run_detail=lambda **kwargs: None,
+                log_action=lambda **kwargs: None,
+                update_process_status=lambda **kwargs: None,
+            )
+
+    agent = OpportunityMinerAgent(CataloglessNick())
+
+    input_data = {
+        "policies": [
+            {
+                "policyId": 9,
+                "policyName": "oppfinderpolicy_001_price_benchmark_variance_detection",
+                "policy_desc": "Identify suppliers charging above benchmark.",
+            },
+            {
+                "policyId": 10,
+                "policyName": "oppfinderpolicy_003_volume_consolidation",
+                "policy_desc": "Identify consolidation opportunities across multiple suppliers.",
+            },
+        ]
+    }
+
+    registry, provided = agent._assemble_policy_registry(dict(input_data))
+
+    assert {"price_variance_check", "volume_consolidation_check"} == set(registry.keys())
+    first_entry = registry["price_variance_check"]
+    assert first_entry["policy_id"] == "oppfinderpolicy_001_price_benchmark_variance_detection"
+    assert first_entry["policy_slug"] == "price_variance_check"
+    second_entry = registry["volume_consolidation_check"]
+    assert second_entry["policy_id"] == "oppfinderpolicy_003_volume_consolidation"
+    assert second_entry["policy_slug"] == "volume_consolidation_check"
+    assert len(provided) == 2

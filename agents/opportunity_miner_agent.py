@@ -1334,6 +1334,34 @@ class OpportunityMinerAgent(BaseAgent):
             ):
                 _add_alias(provided_policy.get(field))
 
+            provided_identifier: Optional[str] = None
+            raw_identifier = provided_policy.get("policyId") or provided_policy.get("policy_id")
+            if raw_identifier not in (None, "", [], {}):
+                provided_identifier = str(raw_identifier)
+            if (not provided_identifier or provided_identifier.isdigit()) and provided_policy.get(
+                "policyName"
+            ):
+                provided_identifier = str(provided_policy["policyName"])
+            if (not provided_identifier or provided_identifier.isdigit()) and provided_policy.get(
+                "policy_name"
+            ):
+                provided_identifier = str(provided_policy["policy_name"])
+            if provided_identifier:
+                entry["policy_id"] = provided_identifier
+
+            provided_name = (
+                provided_policy.get("policyName")
+                or provided_policy.get("policy_name")
+                or provided_policy.get("policy_desc")
+                or provided_policy.get("description")
+            )
+            if provided_name:
+                entry["policy_name"] = str(provided_name)
+                _add_alias(provided_name)
+
+            if provided_identifier:
+                _add_alias(provided_identifier)
+
         entry["aliases"] = alias_set
         return entry
 
@@ -1359,6 +1387,15 @@ class OpportunityMinerAgent(BaseAgent):
             slug = self._normalise_policy_slug(text)
             if slug:
                 tokens.add(slug)
+                # capture suffix portions to allow matching enriched policy slugs
+                parts = slug.split("_")
+                if parts and parts[0].startswith("oppfinderpolicy"):
+                    parts = parts[2:]
+                while len(parts) > 1:
+                    candidate = "_".join(parts)
+                    if len(candidate) >= 4:
+                        tokens.add(candidate)
+                    parts = parts[:-1]
         return tokens
 
     def _get_policy_engine_catalog(self) -> Dict[str, Dict[str, Any]]:
@@ -1561,7 +1598,23 @@ class OpportunityMinerAgent(BaseAgent):
             for key, cfg in registry.items():
                 probe = self._decorate_policy_entry(key, cfg, slug_hint=slug_hint)
                 aliases = probe.get("aliases", set())
-                if tokens & aliases:
+                alias_tokens = {alias for alias in aliases if alias}
+                if tokens & alias_tokens:
+                    matched = True
+                else:
+                    matched = False
+                    for token in tokens:
+                        if not token:
+                            continue
+                        for alias in alias_tokens:
+                            if not alias:
+                                continue
+                            if alias in token or token in alias:
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
                     matched_entry = self._decorate_policy_entry(
                         key, cfg, provided_policy=policy, slug_hint=slug_hint
                     )
