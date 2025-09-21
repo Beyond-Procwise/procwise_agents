@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 import pandas as pd
 
 from .base_engine import BaseEngine
+from utils.db import read_sql_compat
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -302,7 +303,7 @@ class QueryEngine(BaseEngine):
                 LEFT JOIN inv ON s.supplier_id = inv.supplier_id
                 """
             with self._pandas_reader() as reader:
-                df = pd.read_sql(sql, reader)
+                df = read_sql_compat(sql, reader)
 
             base_columns = list(df.columns)
 
@@ -349,13 +350,13 @@ class QueryEngine(BaseEngine):
         """Return invoice headers from ``proc.invoice_agent``."""
         sql = "SELECT * FROM proc.invoice_agent;"
         with self._pandas_reader() as conn:
-            return pd.read_sql(sql, conn)
+            return read_sql_compat(sql, conn)
 
     def fetch_purchase_order_data(self, intent: dict | None = None) -> pd.DataFrame:
         """Return purchase order headers from ``proc.purchase_order_agent``."""
         sql = "SELECT * FROM proc.purchase_order_agent;"
         with self._pandas_reader() as conn:
-            return pd.read_sql(sql, conn)
+            return read_sql_compat(sql, conn)
 
     def fetch_procurement_flow(self, embed: bool = False) -> pd.DataFrame:
         """Return enriched procurement data across multiple tables.
@@ -430,8 +431,8 @@ class QueryEngine(BaseEngine):
         """
 
         with self._pandas_reader() as conn:
-            df = pd.read_sql(sql, conn)
-            category_df = pd.read_sql(category_sql, conn)
+            df = read_sql_compat(sql, conn)
+            category_df = read_sql_compat(category_sql, conn)
 
         df = self._assign_procurement_categories(df, category_df)
 

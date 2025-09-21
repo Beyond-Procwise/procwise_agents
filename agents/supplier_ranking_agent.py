@@ -20,6 +20,7 @@ import pandas as pd
 
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
+from utils.db import read_sql_compat
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 # Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
@@ -603,9 +604,9 @@ class SupplierRankingAgent(BaseAgent):
         try:
             if callable(pandas_conn):
                 with pandas_conn() as conn:
-                    return pd.read_sql(sql, conn)
+                    return read_sql_compat(sql, conn)
             with self.agent_nick.get_db_connection() as conn:
-                return pd.read_sql(sql, conn)
+                return read_sql_compat(sql, conn)
         except Exception:
             logger.exception("Failed to read table %s", table)
             return pd.DataFrame()

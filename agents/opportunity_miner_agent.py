@@ -319,7 +319,6 @@ class OpportunityMinerAgent(BaseAgent):
             if not isinstance(items, list):
                 per_policy[display] = []
                 category_map[display] = {}
-
                 continue
 
             valid_items: List[Finding] = [
@@ -328,7 +327,6 @@ class OpportunityMinerAgent(BaseAgent):
             if not valid_items:
                 per_policy[display] = []
                 category_map[display] = {}
-
                 continue
 
             sorted_items = sorted(
@@ -360,7 +358,6 @@ class OpportunityMinerAgent(BaseAgent):
             category_map[display] = limited_by_category
 
             for finding in flattened:
-
                 key = finding.opportunity_id or f"{display}:{id(finding)}"
                 if key in seen_ids:
                     continue
@@ -368,7 +365,6 @@ class OpportunityMinerAgent(BaseAgent):
                 aggregated.append(finding)
 
         return aggregated, category_map
-
 
     # ------------------------------------------------------------------
     # Public API
@@ -755,7 +751,6 @@ class OpportunityMinerAgent(BaseAgent):
                 per_policy_retained
             )
 
-
             filtered = self._enrich_findings(filtered, tables)
             filtered = self._map_item_descriptions(filtered, tables)
             self._load_supplier_risk_map()
@@ -1114,9 +1109,11 @@ class OpportunityMinerAgent(BaseAgent):
             if currency_col is None:
                 return df
             rate_col = df[currency_col].map(lambda c: fx_rates.get(c, 1.0))
+            rate_series = pd.to_numeric(rate_col, errors="coerce").fillna(1.0)
             for col in cols:
                 if col in df.columns:
-                    df[f"{col}_gbp"] = df[col] * rate_col
+                    numeric_col = pd.to_numeric(df[col], errors="coerce")
+                    df[f"{col}_gbp"] = numeric_col.fillna(0.0) * rate_series
             return df
 
         tables["purchase_orders"] = convert(
@@ -4148,6 +4145,8 @@ class OpportunityMinerAgent(BaseAgent):
                 "SELECT supplier_id, COALESCE(risk_score, 0.0) AS risk_score FROM proc.supplier"
             )
             if not df.empty:
+                if "risk_score" in df.columns:
+                    df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce").fillna(0.0)
                 self._supplier_risk_map = dict(zip(df["supplier_id"], df["risk_score"]))
         except Exception:
             self._supplier_risk_map = {}

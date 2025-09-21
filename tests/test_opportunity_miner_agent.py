@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -154,6 +155,33 @@ def test_build_finding_includes_policy_identifier():
     assert finding_a.opportunity_id != finding_b.opportunity_id
     assert "policy_9" in finding_a.opportunity_id
     assert "policy_10" in finding_b.opportunity_id
+
+
+def test_normalise_currency_handles_decimal_sources():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    tables = {
+        "purchase_orders": pd.DataFrame(
+            [
+                {
+                    "po_id": "PO-1",
+                    "currency": "USD",
+                    "total_amount": Decimal("100.00"),
+                }
+            ]
+        ),
+        "indices": pd.DataFrame([
+            {"currency": "USD", "value": Decimal("0.80")}
+        ]),
+    }
+
+    normalised = agent._normalise_currency(tables)
+    purchase_orders = normalised["purchase_orders"]
+
+    assert "total_amount_gbp" in purchase_orders.columns
+    assert pytest.approx(80.0) == purchase_orders.loc[0, "total_amount_gbp"]
 
 
 def _sample_tables() -> Dict[str, Any]:

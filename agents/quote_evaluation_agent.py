@@ -8,6 +8,7 @@ import numpy as np
 from qdrant_client import models
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from utils.db import read_sql_compat
 from utils.gpu import configure_gpu
 
 # Ensure GPU configuration is applied
@@ -709,12 +710,15 @@ class QuoteEvaluationAgent(BaseAgent):
         sql = (
             "SELECT supplier_id, price, lead_time, response_text FROM proc.supplier_responses WHERE rfq_id = %s"
         )
+        pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         try:
-            with self.agent_nick.get_db_connection() as conn:
-                df = None
-                import pandas as pd
-
-                df = pd.read_sql(sql, conn, params=(rfq_id,))
+            df = None
+            if callable(pandas_conn):
+                with pandas_conn() as conn:
+                    df = read_sql_compat(sql, conn, params=(rfq_id,))
+            else:
+                with self.agent_nick.get_db_connection() as conn:
+                    df = read_sql_compat(sql, conn, params=(rfq_id,))
             return df.to_dict(orient="records") if df is not None else []
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to fetch supplier responses")

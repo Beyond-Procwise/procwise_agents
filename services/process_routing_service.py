@@ -657,7 +657,6 @@ class ProcessRoutingService:
         _merge_into(merged_props, db_props)
         _merge_into(merged_props, props, skip_llm_override=llm_from_default)
 
-
         for field in ("prompts", "policies"):
             combined_ids = set(self._coerce_identifier_list(default_props.get(field)))
             combined_ids.update(self._coerce_identifier_list(db_props.get(field)))
@@ -681,7 +680,6 @@ class ProcessRoutingService:
             if invalid_prompts:
                 logger.warning(
                     "Discarding unknown prompt ids %s for agent %s", invalid_prompts, base_key or ref_for_log
-
                 )
             props["prompts"] = [pid for pid in props.get("prompts", []) if pid in prompt_catalog]
 
