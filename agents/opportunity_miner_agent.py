@@ -308,6 +308,7 @@ class OpportunityMinerAgent(BaseAgent):
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
     ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
+
         """Limit retained findings to at most two per category for each policy."""
 
         aggregated: List[Finding] = []
