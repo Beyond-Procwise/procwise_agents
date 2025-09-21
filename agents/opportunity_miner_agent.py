@@ -24,6 +24,28 @@ logger = logging.getLogger(__name__)
 
 _CATALOG_MATCH_THRESHOLD = 0.45
 
+_PURCHASE_LINE_VALUE_COLUMNS = [
+    "line_amount_gbp",
+    "total_amount_incl_tax_gbp",
+    "line_total_gbp",
+    "total_amount_gbp",
+    "line_amount",
+    "total_amount_incl_tax",
+    "line_total",
+    "total_amount",
+]
+
+_INVOICE_LINE_VALUE_COLUMNS = [
+    "line_amount_gbp",
+    "total_amount_incl_tax_gbp",
+    "line_total_gbp",
+    "total_amount_gbp",
+    "line_amount",
+    "total_amount_incl_tax",
+    "line_total",
+    "total_amount",
+]
+
 
 @dataclass
 class Finding:
@@ -73,6 +95,7 @@ class OpportunityMinerAgent(BaseAgent):
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
         self._supplier_lookup: Dict[str, Optional[str]] = {}
+        self._supplier_alias_lookup: Dict[str, List[str]] = {}
         self._contract_supplier_map: Dict[str, str] = {}
         self._contract_metadata: Dict[str, Dict[str, Any]] = {}
         self._po_supplier_map: Dict[str, str] = {}
@@ -83,6 +106,7 @@ class OpportunityMinerAgent(BaseAgent):
         self._event_log: List[Dict[str, Any]] = []
         self._escalations: List[Dict[str, Any]] = []
         self._column_cache: Dict[str, set[str]] = {}
+        self._policy_engine_catalog: Optional[Dict[str, Dict[str, Any]]] = None
 
         # GPU configuration
         self.device = configure_gpu()
@@ -193,6 +217,8 @@ class OpportunityMinerAgent(BaseAgent):
                 "supplier",
                 "supplier_code",
                 "vendor_id",
+                "supplier_name",
+                "vendor_name",
             },
             "item_id": {
                 "item_id",
@@ -506,6 +532,7 @@ class OpportunityMinerAgent(BaseAgent):
             self._event_log = []
             self._escalations = []
             notifications: set[str] = set()
+            self._policy_engine_catalog = None
 
             self._apply_instruction_settings(context)
 
@@ -958,11 +985,25 @@ class OpportunityMinerAgent(BaseAgent):
             logger.debug("Table %s columns: %s", name, list(tables[name].columns))
         return tables
 
+    def _normalise_supplier_key(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):  # type: ignore[arg-type]
+                return None
+        except Exception:
+            pass
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        return re.sub(r"[^a-z0-9]", "", text)
+
     def _build_supplier_lookup(self, tables: Dict[str, pd.DataFrame]) -> None:
         """Build helper maps to resolve supplier metadata from ``proc.supplier``."""
 
         supplier_master = tables.get("supplier_master", pd.DataFrame())
         lookup: Dict[str, Optional[str]] = {}
+        alias_map: Dict[str, set[str]] = {}
 
         def _normalise(value: Any) -> Optional[str]:
             if value is None:
@@ -985,9 +1026,27 @@ class OpportunityMinerAgent(BaseAgent):
                 for _, row in df.iterrows():
                     supplier_id = row["supplier_id"]
                     lookup[supplier_id] = row.get("supplier_name") or None
+                    aliases = {
+                        supplier_id,
+                        row.get("supplier_name"),
+                        row.get("trading_name"),
+                    }
+                    for alias in list(aliases):
+                        normalised_alias = self._normalise_supplier_key(alias)
+                        if normalised_alias:
+                            alias_map.setdefault(normalised_alias, set()).add(supplier_id)
 
         self._supplier_lookup = lookup
-        logger.debug("Loaded %d suppliers from master data", len(self._supplier_lookup))
+        self._supplier_alias_lookup = {
+            key: sorted(values)
+            for key, values in alias_map.items()
+            if values
+        }
+        logger.debug(
+            "Loaded %d suppliers from master data with %d alias keys",
+            len(self._supplier_lookup),
+            len(self._supplier_alias_lookup),
+        )
 
         contracts = tables.get("contracts", pd.DataFrame())
         contract_map: Dict[str, str] = {}
@@ -1332,6 +1391,34 @@ class OpportunityMinerAgent(BaseAgent):
             ):
                 _add_alias(provided_policy.get(field))
 
+            provided_identifier: Optional[str] = None
+            raw_identifier = provided_policy.get("policyId") or provided_policy.get("policy_id")
+            if raw_identifier not in (None, "", [], {}):
+                provided_identifier = str(raw_identifier)
+            if (not provided_identifier or provided_identifier.isdigit()) and provided_policy.get(
+                "policyName"
+            ):
+                provided_identifier = str(provided_policy["policyName"])
+            if (not provided_identifier or provided_identifier.isdigit()) and provided_policy.get(
+                "policy_name"
+            ):
+                provided_identifier = str(provided_policy["policy_name"])
+            if provided_identifier:
+                entry["policy_id"] = provided_identifier
+
+            provided_name = (
+                provided_policy.get("policyName")
+                or provided_policy.get("policy_name")
+                or provided_policy.get("policy_desc")
+                or provided_policy.get("description")
+            )
+            if provided_name:
+                entry["policy_name"] = str(provided_name)
+                _add_alias(provided_name)
+
+            if provided_identifier:
+                _add_alias(provided_identifier)
+
         entry["aliases"] = alias_set
         return entry
 
@@ -1357,7 +1444,190 @@ class OpportunityMinerAgent(BaseAgent):
             slug = self._normalise_policy_slug(text)
             if slug:
                 tokens.add(slug)
+                # capture suffix portions to allow matching enriched policy slugs
+                parts = slug.split("_")
+                if parts and parts[0].startswith("oppfinderpolicy"):
+                    parts = parts[2:]
+                while len(parts) > 1:
+                    candidate = "_".join(parts)
+                    if len(candidate) >= 4:
+                        tokens.add(candidate)
+                    parts = parts[:-1]
         return tokens
+
+    def _get_policy_engine_catalog(self) -> Dict[str, Dict[str, Any]]:
+        if self._policy_engine_catalog is not None:
+            return self._policy_engine_catalog
+
+        catalog: Dict[str, Dict[str, Any]] = {}
+        engine = getattr(self.agent_nick, "policy_engine", None)
+        if engine is None:
+            self._policy_engine_catalog = catalog
+            return catalog
+
+        try:
+            if hasattr(engine, "iter_policies"):
+                policies = list(engine.iter_policies())
+            elif hasattr(engine, "list_policies"):
+                policies = list(engine.list_policies())  # pragma: no cover - legacy
+            else:
+                policies = []
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to load policies from policy engine")
+            policies = []
+
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            tokens = self._collect_policy_tokens(policy)
+            slug = self._normalise_policy_slug(policy.get("slug"))
+            if slug:
+                tokens.add(slug)
+            aliases = policy.get("aliases")
+            if isinstance(aliases, (list, tuple, set)):
+                for alias in aliases:
+                    alias_slug = self._normalise_policy_slug(alias)
+                    if alias_slug:
+                        tokens.add(alias_slug)
+            for token in tokens:
+                if not token:
+                    continue
+                catalog.setdefault(str(token).lower(), policy)
+
+        self._policy_engine_catalog = catalog
+        return catalog
+
+    def _enrich_provided_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(policy, dict):
+            return policy
+
+        enriched = dict(policy)
+        try:
+            existing_rules = self._coerce_policy_rules(policy)
+        except Exception:  # pragma: no cover - defensive
+            existing_rules = {}
+        catalog = self._get_policy_engine_catalog()
+
+        tokens = self._collect_policy_tokens(enriched)
+        slug_hint = self._normalise_policy_slug(
+            enriched.get("slug")
+            or enriched.get("policyName")
+            or enriched.get("policy_name")
+            or enriched.get("policy_desc")
+            or enriched.get("description")
+        )
+        if slug_hint:
+            tokens.add(slug_hint)
+
+        candidate = None
+        for token in tokens:
+            if token is None:
+                continue
+            probe = catalog.get(str(token).lower())
+            if probe:
+                candidate = probe
+                break
+
+        if candidate is None:
+            return enriched
+
+        def _assign(field: str, value: Any) -> None:
+            if field not in enriched or enriched[field] in (None, "", [], {}):
+                enriched[field] = value
+
+        candidate_id = candidate.get("policyId") or candidate.get("policy_id")
+        if candidate_id is not None:
+            candidate_id = str(candidate_id)
+            _assign("policyId", candidate_id)
+            _assign("policy_id", candidate_id)
+
+        for name in (
+            candidate.get("policyName"),
+            candidate.get("policy_name"),
+            candidate.get("detector"),
+        ):
+            if name:
+                _assign("policyName", name)
+                _assign("policy_name", name)
+                break
+
+        description = candidate.get("policy_desc") or candidate.get("description")
+        if description:
+            _assign("policy_desc", description)
+            _assign("description", description)
+
+        details = candidate.get("details")
+        if isinstance(details, dict):
+            if not isinstance(enriched.get("details"), dict):
+                enriched["details"] = dict(details)
+            if not enriched.get("policy_details"):
+                enriched["policy_details"] = dict(details)
+            rules = details.get("rules")
+            if isinstance(rules, dict) and not isinstance(enriched.get("rules"), dict):
+                enriched["rules"] = dict(rules)
+
+        slug = candidate.get("slug") or self._normalise_policy_slug(
+            candidate.get("policy_name") or candidate.get("policyName")
+        )
+        if slug:
+            _assign("slug", slug)
+
+        alias_tokens: set[str] = set()
+        existing_aliases = enriched.get("aliases")
+        if isinstance(existing_aliases, (list, tuple, set)):
+            for alias in existing_aliases:
+                normalised = self._normalise_policy_slug(alias)
+                if normalised:
+                    alias_tokens.add(normalised)
+        candidate_aliases = candidate.get("aliases")
+        if isinstance(candidate_aliases, (list, tuple, set)):
+            for alias in candidate_aliases:
+                normalised = self._normalise_policy_slug(alias)
+                if normalised:
+                    alias_tokens.add(normalised)
+        if slug:
+            normalised_slug = self._normalise_policy_slug(slug)
+            if normalised_slug:
+                alias_tokens.add(normalised_slug)
+        if alias_tokens:
+            enriched["aliases"] = sorted(alias_tokens)
+
+        def _merge_rules(target: Any, overrides: Dict[str, Any]) -> Dict[str, Any]:
+            base: Dict[str, Any] = {}
+            if isinstance(target, dict):
+                base = dict(target)
+            for key, value in overrides.items():
+                if key == "parameters" and isinstance(value, dict):
+                    existing = base.get("parameters")
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(value)
+                        base["parameters"] = merged
+                    else:
+                        base["parameters"] = dict(value)
+                elif key == "default_conditions" and isinstance(value, dict):
+                    existing = base.get("default_conditions")
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(value)
+                        base["default_conditions"] = merged
+                    else:
+                        base["default_conditions"] = dict(value)
+                else:
+                    base[key] = value
+            return base
+
+        if isinstance(existing_rules, dict) and existing_rules:
+            overrides = existing_rules
+            for container_key in ("policy_details", "details"):
+                container = enriched.get(container_key)
+                if isinstance(container, dict):
+                    container["rules"] = _merge_rules(
+                        container.get("rules"), overrides
+                    )
+            enriched["rules"] = _merge_rules(enriched.get("rules"), overrides)
+
+        return enriched
 
     def _filter_registry_by_policies(
         self,
@@ -1385,7 +1655,23 @@ class OpportunityMinerAgent(BaseAgent):
             for key, cfg in registry.items():
                 probe = self._decorate_policy_entry(key, cfg, slug_hint=slug_hint)
                 aliases = probe.get("aliases", set())
-                if tokens & aliases:
+                alias_tokens = {alias for alias in aliases if alias}
+                if tokens & alias_tokens:
+                    matched = True
+                else:
+                    matched = False
+                    for token in tokens:
+                        if not token:
+                            continue
+                        for alias in alias_tokens:
+                            if not alias:
+                                continue
+                            if alias in token or token in alias:
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
                     matched_entry = self._decorate_policy_entry(
                         key, cfg, provided_policy=policy, slug_hint=slug_hint
                     )
@@ -1423,11 +1709,14 @@ class OpportunityMinerAgent(BaseAgent):
     def _assemble_policy_registry(
         self, input_data: Dict[str, Any]
     ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
-        provided_policies = [
-            policy
-            for policy in input_data.get("policies") or []
-            if isinstance(policy, dict)
-        ]
+        provided_policies: List[Dict[str, Any]] = []
+        policies_payload = input_data.get("policies")
+        if isinstance(policies_payload, list):
+            for policy in policies_payload:
+                if isinstance(policy, dict):
+                    provided_policies.append(self._enrich_provided_policy(policy))
+        if provided_policies:
+            input_data["policies"] = provided_policies
         base_registry = self._filter_registry_by_policies(
             self._get_policy_registry(), provided_policies
         )
@@ -1535,10 +1824,62 @@ class OpportunityMinerAgent(BaseAgent):
         supplier = str(supplier_id).strip()
         if not supplier:
             return None
-        if self._supplier_lookup and supplier not in self._supplier_lookup:
-            logger.debug("Supplier %s not found in master data; skipping", supplier)
-            return None
-        return supplier
+        lookup = self._supplier_lookup
+        if not lookup:
+            return supplier
+        if supplier in lookup:
+            return supplier
+
+        alias_key = self._normalise_supplier_key(supplier)
+        alias_lookup = self._supplier_alias_lookup
+
+        def _choose_candidate(candidates: Iterable[str]) -> Optional[str]:
+            chosen: Optional[str] = None
+            best_score = 0.0
+            raw_normalised = supplier.lower()
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                candidate_texts = [candidate.lower()]
+                display = lookup.get(candidate)
+                if display:
+                    candidate_texts.append(str(display).strip().lower())
+                for text in candidate_texts:
+                    if not text:
+                        continue
+                    score = SequenceMatcher(None, raw_normalised, text).ratio()
+                    if score > best_score:
+                        best_score = score
+                        chosen = candidate
+            if chosen is not None:
+                return chosen
+            candidate_list = [c for c in candidates if c is not None]
+            return sorted(candidate_list)[0] if candidate_list else None
+
+        candidates: Optional[Iterable[str]] = None
+        if alias_key and alias_lookup:
+            candidates = alias_lookup.get(alias_key)
+
+        if not candidates and alias_key and alias_lookup:
+            best_key = None
+            best_ratio = 0.0
+            for key, ids in alias_lookup.items():
+                if not key or not ids:
+                    continue
+                ratio = SequenceMatcher(None, alias_key, key).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_key = key
+            if best_key and best_ratio >= 0.85:
+                candidates = alias_lookup.get(best_key)
+
+        if candidates:
+            resolved = _choose_candidate(candidates)
+            if resolved:
+                return resolved
+
+        logger.debug("Supplier %s not found in master data; skipping", supplier)
+        return None
 
     def _log_policy_event(
         self,
@@ -2030,12 +2371,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             base_df,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col:
             base_df[value_col] = pd.to_numeric(base_df[value_col], errors="coerce").fillna(0.0)
@@ -2280,12 +2616,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             df,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col:
             df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
@@ -2765,10 +3096,29 @@ class OpportunityMinerAgent(BaseAgent):
         policy_id = policy_cfg["policy_id"]
         detector = policy_cfg["detector"]
 
-        supplier_id = self._resolve_supplier_id(self._get_condition(input_data, "supplier_id"))
+        raw_supplier = self._get_condition(input_data, "supplier_id")
+        if raw_supplier is None:
+            raw_supplier = self._get_condition(input_data, "supplier_name")
+        supplier_id = self._resolve_supplier_id(raw_supplier)
         if not supplier_id:
+            provided = None
+            if raw_supplier is not None:
+                provided = str(raw_supplier).strip()
+            if not provided:
+                message = "Supplier identifier missing from policy conditions"
+                details: Dict[str, Any] = {}
+            else:
+                message = "Supplier not recognised in master data"
+                normalised = self._normalise_supplier_key(provided)
+                details = {"provided_identifier": provided}
+                if normalised:
+                    details["normalised_identifier"] = normalised
             self._log_policy_event(
-                policy_id, None, "blocked", "Supplier not recognised in master data", {}
+                policy_id,
+                None,
+                "blocked",
+                message,
+                details,
             )
             return findings
 
@@ -2858,12 +3208,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             po_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         price_col = self._choose_first_column(po_lines, ["unit_price_gbp", "unit_price"])
         qty_col = "quantity" if "quantity" in po_lines.columns else None
@@ -3497,12 +3842,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         value_col = self._choose_first_column(
             po_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _PURCHASE_LINE_VALUE_COLUMNS,
         )
         if value_col is None:
             self._log_policy_event(
@@ -3622,12 +3962,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         amount_col = self._choose_first_column(
             invoice_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _INVOICE_LINE_VALUE_COLUMNS,
         )
         if amount_col is None:
             self._log_policy_event(
@@ -3897,12 +4232,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         amount_col = self._choose_first_column(
             invoice_lines,
-            [
-                "line_amount_gbp",
-                "total_amount_incl_tax_gbp",
-                "line_amount",
-                "total_amount_incl_tax",
-            ],
+            _INVOICE_LINE_VALUE_COLUMNS,
         )
         contract_value_col = self._choose_first_column(
             contracts, ["total_contract_value_gbp", "total_contract_value"]

@@ -11,7 +11,11 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.opportunity_miner_agent import OpportunityMinerAgent, Finding
+from agents.opportunity_miner_agent import (
+    OpportunityMinerAgent,
+    Finding,
+    _PURCHASE_LINE_VALUE_COLUMNS,
+)
 from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 
@@ -411,9 +415,47 @@ def _sample_tables() -> Dict[str, Any]:
         "supplier_master": supplier_master,
     }
 
-    assert output.status == AgentStatus.FAILED
-    assert output.data["blocked_reason"]
-    assert output.data["policy_events"]
+
+def test_resolve_supplier_id_matches_supplier_aliases():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    tables = {
+        "supplier_master": pd.DataFrame(
+            [
+                {
+                    "supplier_id": "SI0001",
+                    "supplier_name": "Acme Industrial Ltd",
+                    "trading_name": "ACME LTD",
+                },
+                {
+                    "supplier_id": "SI0002",
+                    "supplier_name": "Beta Manufacturing",
+                },
+            ]
+        ),
+        "contracts": pd.DataFrame(),
+        "purchase_orders": pd.DataFrame(),
+        "invoices": pd.DataFrame(),
+    }
+
+    agent._build_supplier_lookup(tables)
+
+    assert agent._resolve_supplier_id("SI0001") == "SI0001"
+    assert agent._resolve_supplier_id("acme industrial ltd") == "SI0001"
+    assert agent._resolve_supplier_id("ACME LTD") == "SI0001"
+    assert agent._resolve_supplier_id("Beta Manufacturing") == "SI0002"
+    assert agent._resolve_supplier_id("Unknown Supplier") is None
+
+
+def test_choose_first_column_handles_line_total_column():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    df = pd.DataFrame({"po_id": ["PO1"], "item_id": ["Item"], "line_total": [100.0]})
+
+    selected = agent._choose_first_column(df, _PURCHASE_LINE_VALUE_COLUMNS)
+    assert selected == "line_total"
 
 
 def test_price_variance_detection_generates_finding(monkeypatch):
@@ -939,3 +981,45 @@ def test_assemble_policy_registry_filters_static_entries():
     entry = registry["contract_expiry_check"]
     assert entry["policy_id"] == "oppfinderpolicy_004_contract_expiry_opportunity"
     assert entry.get("parameters", {}).get("negotiation_window_days") == 75
+
+
+def test_registry_matches_numeric_policy_identifiers_without_catalog():
+    class CataloglessNick:
+        def __init__(self):
+            self.settings = SimpleNamespace(script_user="tester")
+            self.prompt_engine = SimpleNamespace()
+            self.policy_engine = None
+            self.process_routing_service = SimpleNamespace(
+                log_process=lambda **kwargs: None,
+                log_run_detail=lambda **kwargs: None,
+                log_action=lambda **kwargs: None,
+                update_process_status=lambda **kwargs: None,
+            )
+
+    agent = OpportunityMinerAgent(CataloglessNick())
+
+    input_data = {
+        "policies": [
+            {
+                "policyId": 9,
+                "policyName": "oppfinderpolicy_001_price_benchmark_variance_detection",
+                "policy_desc": "Identify suppliers charging above benchmark.",
+            },
+            {
+                "policyId": 10,
+                "policyName": "oppfinderpolicy_003_volume_consolidation",
+                "policy_desc": "Identify consolidation opportunities across multiple suppliers.",
+            },
+        ]
+    }
+
+    registry, provided = agent._assemble_policy_registry(dict(input_data))
+
+    assert {"price_variance_check", "volume_consolidation_check"} == set(registry.keys())
+    first_entry = registry["price_variance_check"]
+    assert first_entry["policy_id"] == "oppfinderpolicy_001_price_benchmark_variance_detection"
+    assert first_entry["policy_slug"] == "price_variance_check"
+    second_entry = registry["volume_consolidation_check"]
+    assert second_entry["policy_id"] == "oppfinderpolicy_003_volume_consolidation"
+    assert second_entry["policy_slug"] == "volume_consolidation_check"
+    assert len(provided) == 2
