@@ -64,6 +64,26 @@ _CONDITION_KEY_ALIASES: Dict[str, set[str]] = {
         "vendorname",
         "trading_name",
     },
+    "contract_id": {
+        "contract",
+        "contractid",
+        "contract_identifier",
+        "contract_reference",
+        "contract_number",
+    },
+    "po_id": {
+        "po",
+        "purchase_order_id",
+        "purchaseorderid",
+        "po_number",
+        "purchase_order_number",
+    },
+    "invoice_id": {
+        "invoice",
+        "invoiceid",
+        "invoice_number",
+        "invoice_reference",
+    },
     "item_id": {
         "item",
         "itemid",
@@ -826,6 +846,8 @@ class OpportunityMinerAgent(BaseAgent):
                     continue
 
                 findings = handler(tables, policy_input, notifications, policy_cfg)
+                if isinstance(context.input_data.get("conditions"), dict):
+                    context.input_data["conditions"].update(policy_input["conditions"])
                 aggregated_findings.extend(findings)
                 display_name = (
                     policy_cfg.get("policy_name")
@@ -1156,6 +1178,19 @@ class OpportunityMinerAgent(BaseAgent):
             return None
         return re.sub(r"[^a-z0-9]", "", text)
 
+    def _normalise_identifier(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):  # type: ignore[arg-type]
+                return None
+        except Exception:
+            pass
+        text = str(value).strip()
+        if not text:
+            return None
+        return text.upper()
+
     def _build_supplier_lookup(self, tables: Dict[str, pd.DataFrame]) -> None:
         """Build helper maps to resolve supplier metadata from ``proc.supplier``."""
 
@@ -1163,7 +1198,7 @@ class OpportunityMinerAgent(BaseAgent):
         lookup: Dict[str, Optional[str]] = {}
         alias_map: Dict[str, set[str]] = {}
 
-        def _normalise(value: Any) -> Optional[str]:
+        def _normalise_text(value: Any) -> Optional[str]:
             if value is None:
                 return None
             try:
@@ -1174,17 +1209,20 @@ class OpportunityMinerAgent(BaseAgent):
             text = str(value).strip()
             return text or None
 
+        def _normalise_id(value: Any) -> Optional[str]:
+            return self._normalise_identifier(value)
+
         supplier_id_col = self._find_column_for_key(supplier_master, "supplier_id")
         if not supplier_master.empty and supplier_id_col:
             df = supplier_master.dropna(subset=[supplier_id_col]).copy()
             if not df.empty:
-                df[supplier_id_col] = df[supplier_id_col].map(_normalise)
+                df[supplier_id_col] = df[supplier_id_col].map(_normalise_id)
                 name_col = self._find_column_for_key(df, "supplier_name")
                 trading_col = "trading_name" if "trading_name" in df.columns else None
                 if name_col and name_col in df.columns:
-                    df[name_col] = df[name_col].map(_normalise)
+                    df[name_col] = df[name_col].map(_normalise_text)
                 if trading_col and trading_col in df.columns:
-                    df[trading_col] = df[trading_col].map(_normalise)
+                    df[trading_col] = df[trading_col].map(_normalise_text)
                 df = df.dropna(subset=[supplier_id_col])
                 for _, row in df.iterrows():
                     supplier_id = row.get(supplier_id_col)
@@ -1219,22 +1257,23 @@ class OpportunityMinerAgent(BaseAgent):
         contract_id_col = "contract_id" if "contract_id" in contracts.columns else None
         if not contracts.empty and contract_id_col:
             df = contracts.dropna(subset=[contract_id_col]).copy()
-            df[contract_id_col] = df[contract_id_col].map(_normalise)
+            df[contract_id_col] = df[contract_id_col].map(_normalise_id)
             supplier_col = self._find_column_for_key(df, "supplier_id")
             if supplier_col and supplier_col in df.columns:
-                df[supplier_col] = df[supplier_col].map(_normalise)
+                df[supplier_col] = df[supplier_col].map(_normalise_id)
             spend_col = "spend_category" if "spend_category" in df.columns else None
             if spend_col and spend_col in df.columns:
-                df[spend_col] = df[spend_col].map(_normalise)
+                df[spend_col] = df[spend_col].map(_normalise_text)
             category_col = "category_id" if "category_id" in df.columns else None
             if category_col and category_col in df.columns:
-                df[category_col] = df[category_col].map(_normalise)
+                df[category_col] = df[category_col].map(_normalise_text)
             df = df.dropna(subset=[contract_id_col])
             for _, row in df.iterrows():
                 contract_id = row.get(contract_id_col)
                 if not contract_id:
                     continue
                 supplier_id = row.get(supplier_col) if supplier_col else None
+                supplier_id = _normalise_id(supplier_id)
                 spend_category = None
                 if spend_col:
                     spend_category = row.get(spend_col)
@@ -1264,18 +1303,19 @@ class OpportunityMinerAgent(BaseAgent):
         po_contract_map: Dict[str, str] = {}
         if not purchase_orders.empty and "po_id" in purchase_orders.columns:
             df = purchase_orders.dropna(subset=["po_id"]).copy()
-            df["po_id"] = df["po_id"].map(_normalise)
+            df["po_id"] = df["po_id"].map(_normalise_id)
             supplier_col = self._find_column_for_key(df, "supplier_id")
             if supplier_col and supplier_col in df.columns:
-                df[supplier_col] = df[supplier_col].map(_normalise)
+                df[supplier_col] = df[supplier_col].map(_normalise_id)
             if "contract_id" in df.columns:
-                df["contract_id"] = df["contract_id"].map(_normalise)
+                df["contract_id"] = df["contract_id"].map(_normalise_id)
             df = df.dropna(subset=["po_id"])
             for _, row in df.iterrows():
                 po_id = row.get("po_id")
                 if not po_id:
                     continue
                 supplier_id = row.get(supplier_col) if supplier_col else None
+                supplier_id = _normalise_id(supplier_id)
                 contract_id = row.get("contract_id")
                 if contract_id:
                     po_contract_map[po_id] = contract_id
@@ -1292,12 +1332,12 @@ class OpportunityMinerAgent(BaseAgent):
         invoice_po_map: Dict[str, str] = {}
         if not invoices.empty and "invoice_id" in invoices.columns:
             df = invoices.dropna(subset=["invoice_id"]).copy()
-            df["invoice_id"] = df["invoice_id"].map(_normalise)
+            df["invoice_id"] = df["invoice_id"].map(_normalise_id)
             supplier_col = self._find_column_for_key(df, "supplier_id")
             if supplier_col and supplier_col in df.columns:
-                df[supplier_col] = df[supplier_col].map(_normalise)
+                df[supplier_col] = df[supplier_col].map(_normalise_id)
             if "po_id" in df.columns:
-                df["po_id"] = df["po_id"].map(_normalise)
+                df["po_id"] = df["po_id"].map(_normalise_id)
             df = df.dropna(subset=["invoice_id"])
             for _, row in df.iterrows():
                 invoice_id = row.get("invoice_id")
@@ -1305,6 +1345,7 @@ class OpportunityMinerAgent(BaseAgent):
                     continue
                 po_id = row.get("po_id")
                 supplier_id = row.get(supplier_col) if supplier_col else None
+                supplier_id = _normalise_id(supplier_id)
                 if po_id:
                     invoice_po_map[invoice_id] = po_id
                 candidate = supplier_id
@@ -1988,22 +2029,23 @@ class OpportunityMinerAgent(BaseAgent):
     def _resolve_supplier_id(self, supplier_id: Optional[Any]) -> Optional[str]:
         if supplier_id is None:
             return None
-        supplier = str(supplier_id).strip()
-        if not supplier:
+        raw_text = str(supplier_id).strip()
+        if not raw_text:
             return None
+        supplier = self._normalise_identifier(raw_text) or raw_text
         lookup = self._supplier_lookup
         if not lookup:
             return supplier
         if supplier in lookup:
             return supplier
 
-        alias_key = self._normalise_supplier_key(supplier)
+        alias_key = self._normalise_supplier_key(raw_text)
         alias_lookup = self._supplier_alias_lookup
 
         def _choose_candidate(candidates: Iterable[str]) -> Optional[str]:
             chosen: Optional[str] = None
             best_score = 0.0
-            raw_normalised = supplier.lower()
+            raw_normalised = raw_text.lower()
             for candidate in candidates:
                 if candidate is None:
                     continue
@@ -2047,6 +2089,133 @@ class OpportunityMinerAgent(BaseAgent):
 
         logger.debug("Supplier %s not found in master data; skipping", supplier)
         return None
+
+    def _resolve_policy_supplier(
+        self, input_data: Dict[str, Any]
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        metadata: Dict[str, Any] = {"attempted_sources": {}}
+        conditions = input_data.get("conditions")
+        if not isinstance(conditions, dict):
+            conditions = {}
+            input_data["conditions"] = conditions
+
+        message: Optional[str] = None
+        error: Optional[str] = None
+
+        raw_supplier = self._get_condition(input_data, "supplier_id")
+        if self._is_condition_value(raw_supplier):
+            metadata["provided_identifier"] = str(raw_supplier).strip()
+            resolved = self._resolve_supplier_id(raw_supplier)
+            if resolved:
+                metadata["resolved_source"] = "supplier_id"
+                metadata["supplier_id"] = resolved
+                self._assign_condition(conditions, "supplier_id", resolved, override=True)
+                return resolved, metadata
+            message = "Supplier not recognised in master data"
+            error = "unmatched_supplier_identifier"
+
+        raw_name = self._get_condition(input_data, "supplier_name")
+        if self._is_condition_value(raw_name):
+            metadata["provided_supplier_name"] = str(raw_name).strip()
+            resolved = self._resolve_supplier_id(raw_name)
+            if resolved:
+                metadata["resolved_source"] = "supplier_name"
+                metadata["supplier_id"] = resolved
+                self._assign_condition(conditions, "supplier_id", resolved, override=True)
+                return resolved, metadata
+            if message is None:
+                message = "Supplier not recognised in master data"
+                error = "unmatched_supplier_identifier"
+
+        contract_raw = self._get_condition(input_data, "contract_id")
+        contract_id = self._normalise_identifier(contract_raw)
+        if contract_id:
+            metadata["attempted_sources"]["contract_id"] = contract_id
+            contract_supplier_map = getattr(self, "_contract_supplier_map", {})
+            supplier_candidate = contract_supplier_map.get(contract_id)
+            if not supplier_candidate:
+                contract_meta = getattr(self, "_contract_metadata", {})
+                supplier_candidate = contract_meta.get(contract_id, {}).get("supplier_id")
+            supplier_candidate = self._resolve_supplier_id(supplier_candidate)
+            if supplier_candidate:
+                metadata["resolved_source"] = "contract_id"
+                metadata["contract_id"] = contract_id
+                metadata["supplier_id"] = supplier_candidate
+                self._assign_condition(conditions, "supplier_id", supplier_candidate, override=True)
+                self._assign_condition(conditions, "contract_id", contract_id, override=True)
+                return supplier_candidate, metadata
+
+        po_raw = self._get_condition(input_data, "po_id")
+        po_id = self._normalise_identifier(po_raw)
+        if po_id:
+            metadata["attempted_sources"]["po_id"] = po_id
+            po_supplier_map = getattr(self, "_po_supplier_map", {})
+            po_contract_map = getattr(self, "_po_contract_map", {})
+            contract_supplier_map = getattr(self, "_contract_supplier_map", {})
+            supplier_candidate = po_supplier_map.get(po_id)
+            if not supplier_candidate:
+                contract_id = po_contract_map.get(po_id)
+                if contract_id:
+                    metadata["attempted_sources"]["contract_id_from_po"] = contract_id
+                    supplier_candidate = contract_supplier_map.get(contract_id)
+                    if not supplier_candidate:
+                        contract_meta = getattr(self, "_contract_metadata", {})
+                        supplier_candidate = contract_meta.get(contract_id, {}).get("supplier_id")
+            supplier_candidate = self._resolve_supplier_id(supplier_candidate)
+            if supplier_candidate:
+                metadata["resolved_source"] = "po_id"
+                metadata["po_id"] = po_id
+                metadata["supplier_id"] = supplier_candidate
+                self._assign_condition(conditions, "supplier_id", supplier_candidate, override=True)
+                self._assign_condition(conditions, "po_id", po_id, override=True)
+                return supplier_candidate, metadata
+
+        invoice_raw = self._get_condition(input_data, "invoice_id")
+        invoice_id = self._normalise_identifier(invoice_raw)
+        if invoice_id:
+            metadata["attempted_sources"]["invoice_id"] = invoice_id
+            invoice_supplier_map = getattr(self, "_invoice_supplier_map", {})
+            invoice_po_map = getattr(self, "_invoice_po_map", {})
+            po_supplier_map = getattr(self, "_po_supplier_map", {})
+            po_contract_map = getattr(self, "_po_contract_map", {})
+            contract_supplier_map = getattr(self, "_contract_supplier_map", {})
+            supplier_candidate = invoice_supplier_map.get(invoice_id)
+            if not supplier_candidate:
+                po_id = invoice_po_map.get(invoice_id)
+                if po_id:
+                    metadata["attempted_sources"]["po_id_from_invoice"] = po_id
+                    supplier_candidate = po_supplier_map.get(po_id)
+                    if not supplier_candidate:
+                        contract_id = po_contract_map.get(po_id)
+                        if contract_id:
+                            metadata["attempted_sources"]["contract_id_from_invoice"] = contract_id
+                            supplier_candidate = contract_supplier_map.get(contract_id)
+                            if not supplier_candidate:
+                                contract_meta = getattr(self, "_contract_metadata", {})
+                                supplier_candidate = contract_meta.get(contract_id, {}).get("supplier_id")
+            supplier_candidate = self._resolve_supplier_id(supplier_candidate)
+            if supplier_candidate:
+                metadata["resolved_source"] = "invoice_id"
+                metadata["invoice_id"] = invoice_id
+                metadata["supplier_id"] = supplier_candidate
+                self._assign_condition(conditions, "supplier_id", supplier_candidate, override=True)
+                self._assign_condition(conditions, "invoice_id", invoice_id, override=True)
+                return supplier_candidate, metadata
+
+        attempts = metadata.get("attempted_sources") or {}
+        if not attempts:
+            metadata.pop("attempted_sources", None)
+        if message is None:
+            if attempts:
+                message = "Unable to resolve supplier from transactional context"
+                error = "supplier_lookup_failed"
+            else:
+                message = "Supplier identifier missing from policy conditions"
+                error = "missing_supplier_identifier"
+        metadata["message"] = message
+        if error:
+            metadata["error"] = error
+        return None, metadata
 
     def _log_policy_event(
         self,
@@ -2345,11 +2514,19 @@ class OpportunityMinerAgent(BaseAgent):
         if po_lines.empty or "po_id" not in po_lines.columns:
             return []
         df = po_lines.dropna(subset=["po_id"]).copy()
+        df["po_id"] = df["po_id"].map(self._normalise_identifier)
+        df = df.dropna(subset=["po_id"])
         if item_id is not None and "item_id" in df.columns:
-            df = df[df["item_id"].astype(str) == str(item_id)]
+            target_item = str(item_id).strip()
+            df = df[df["item_id"].astype(str).str.strip() == target_item]
         po_ids = df["po_id"].astype(str).unique().tolist()
         if supplier_id:
-            po_ids = [po_id for po_id in po_ids if self._po_supplier_map.get(po_id) == supplier_id]
+            resolved_supplier = self._resolve_supplier_id(supplier_id)
+            po_ids = [
+                po_id
+                for po_id in po_ids
+                if self._po_supplier_map.get(po_id) == resolved_supplier
+            ]
         return po_ids
 
     def _invoice_ids_for_po(
@@ -3263,29 +3440,17 @@ class OpportunityMinerAgent(BaseAgent):
         policy_id = policy_cfg["policy_id"]
         detector = policy_cfg["detector"]
 
-        raw_supplier = self._get_condition(input_data, "supplier_id")
-        if raw_supplier is None:
-            raw_supplier = self._get_condition(input_data, "supplier_name")
-        supplier_id = self._resolve_supplier_id(raw_supplier)
+        supplier_id, supplier_meta = self._resolve_policy_supplier(input_data)
         if not supplier_id:
-            provided = None
-            if raw_supplier is not None:
-                provided = str(raw_supplier).strip()
-            if not provided:
+            message = supplier_meta.get("message") if supplier_meta else None
+            if not message:
                 message = "Supplier identifier missing from policy conditions"
-                details: Dict[str, Any] = {}
-            else:
-                message = "Supplier not recognised in master data"
-                normalised = self._normalise_supplier_key(provided)
-                details = {"provided_identifier": provided}
-                if normalised:
-                    details["normalised_identifier"] = normalised
             self._log_policy_event(
                 policy_id,
                 None,
                 "blocked",
                 message,
-                details,
+                supplier_meta if supplier_meta else {},
             )
             return findings
 
@@ -3399,8 +3564,9 @@ class OpportunityMinerAgent(BaseAgent):
                 {},
             )
             return findings
-        df["po_id"] = df["po_id"].astype(str)
-        df["item_id"] = df["item_id"].astype(str)
+        df["po_id"] = df["po_id"].map(self._normalise_identifier)
+        df = df.dropna(subset=["po_id"])
+        df["item_id"] = df["item_id"].astype(str).str.strip()
         df[value_col] = df[value_col].fillna(0.0)
         if price_col:
             df[price_col] = df[price_col].fillna(0.0)
@@ -3409,15 +3575,11 @@ class OpportunityMinerAgent(BaseAgent):
         supplier_col = self._find_column_for_key(df, "supplier_id")
         mapped_suppliers = df["po_id"].map(self._po_supplier_map)
         if supplier_col and supplier_col in df.columns:
-            existing = df[supplier_col].apply(
-                lambda v: str(v).strip() if self._is_condition_value(v) else None
-            )
+            existing = df[supplier_col].apply(self._resolve_supplier_id)
             df["supplier_id"] = mapped_suppliers.where(~mapped_suppliers.isna(), existing)
         else:
             df["supplier_id"] = mapped_suppliers
-        df["supplier_id"] = df["supplier_id"].apply(
-            lambda v: str(v).strip() if self._is_condition_value(v) else None
-        )
+        df["supplier_id"] = df["supplier_id"].map(self._resolve_supplier_id)
         df = df.dropna(subset=["supplier_id"])
 
         if df.empty:
@@ -3949,17 +4111,26 @@ class OpportunityMinerAgent(BaseAgent):
             return findings
 
         for _, row in purchase_orders.iterrows():
-            po_id = row.get("po_id")
-            contract_id = row.get("contract_id")
+            po_raw = row.get("po_id")
+            po_id = self._normalise_identifier(po_raw)
+            contract_raw = row.get("contract_id")
+            contract_id = self._normalise_identifier(contract_raw)
             if contract_id and contract_id in self._contract_supplier_map:
                 continue
-            supplier_id = self._resolve_supplier_id(row.get("supplier_id") or self._po_supplier_map.get(str(po_id)))
+            supplier_candidate = self._resolve_supplier_id(row.get("supplier_id"))
+            if not supplier_candidate and po_id:
+                supplier_candidate = self._po_supplier_map.get(po_id)
+            if not supplier_candidate and contract_id:
+                supplier_candidate = self._contract_supplier_map.get(contract_id)
+            supplier_id = self._resolve_supplier_id(supplier_candidate)
             if not supplier_id:
                 continue
             value = self._to_float(row.get(value_col, 0.0))
             if value < minimum_value:
                 continue
-            details = {"po_total": value, "contract_id": contract_id}
+            details = {"po_total": value}
+            if contract_id or contract_raw:
+                details["contract_id"] = contract_id or contract_raw
             findings.append(
                 self._build_finding(
                     detector,
@@ -3968,7 +4139,7 @@ class OpportunityMinerAgent(BaseAgent):
                     None,
                     value,
                     details,
-                    [str(po_id)],
+                    [po_id or str(po_raw)],
                     policy_id=policy_id,
                     policy_name=policy_cfg.get("policy_name"),
                 )
