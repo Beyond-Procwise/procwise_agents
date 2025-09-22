@@ -644,28 +644,32 @@ class SupplierRankingAgent(BaseAgent):
             "avg_unit_price",
             "total_volume",
             "avg_lead_time_days",
+            "total_spend",
         ]:
             if column in result.columns:
                 result[column] = pd.to_numeric(result[column], errors="coerce")
 
+        spend_components = [
+            result.get("po_total_value"),
+            result.get("invoice_total_value"),
+            result.get("po_line_spend"),
+        ]
+        numeric_components: List[pd.Series] = []
+        for comp in spend_components:
+            if isinstance(comp, pd.Series):
+                numeric_components.append(pd.to_numeric(comp, errors="coerce").fillna(0.0))
+
         if "total_spend" in result.columns:
-            spend_components = [
-                result.get("po_total_value"),
-                result.get("invoice_total_value"),
-                result.get("po_line_spend"),
-            ]
-            for comp in spend_components:
-                if comp is not None:
-                    result["total_spend"] = result["total_spend"].fillna(0) + comp.fillna(0)
+            total_spend_series = pd.to_numeric(
+                result["total_spend"], errors="coerce"
+            ).fillna(0.0)
         else:
-            result["total_spend"] = 0.0
-            for comp in [
-                result.get("po_total_value"),
-                result.get("invoice_total_value"),
-                result.get("po_line_spend"),
-            ]:
-                if comp is not None:
-                    result["total_spend"] += comp.fillna(0)
+            total_spend_series = pd.Series(0.0, index=result.index, dtype="float64")
+
+        for comp_series in numeric_components:
+            total_spend_series = total_spend_series.add(comp_series, fill_value=0.0)
+
+        result["total_spend"] = total_spend_series
 
         if "avg_unit_price" not in result.columns:
             result["avg_unit_price"] = pd.NA
