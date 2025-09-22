@@ -3703,9 +3703,22 @@ class OpportunityMinerAgent(BaseAgent):
         if purchase_orders.empty or "po_id" not in purchase_orders.columns:
             return findings
 
+        supplier_id_col = self._find_column_for_key(purchase_orders, "supplier_id")
+        supplier_name_col = self._find_column_for_key(purchase_orders, "supplier_name")
+        supplier_col = None
+        if supplier_id_col and supplier_id_col in purchase_orders.columns:
+            supplier_col = supplier_id_col
+        elif supplier_name_col and supplier_name_col in purchase_orders.columns:
+            supplier_col = supplier_name_col
+        if not supplier_col:
+            return findings
+
+        join_df = purchase_orders[["po_id", supplier_col]].copy()
+        join_df = join_df.rename(columns={supplier_col: "supplier_reference"})
+
         try:
             merged = po_lines.merge(
-                purchase_orders[["po_id", "supplier_id"]],
+                join_df,
                 on="po_id",
                 how="left",
             )
@@ -3727,12 +3740,22 @@ class OpportunityMinerAgent(BaseAgent):
             text = str(value).strip()
             return text or None
 
+        if "supplier_reference" not in merged.columns:
+            return findings
+        merged["supplier_reference"] = merged["supplier_reference"].map(_clean)
+        merged["supplier_id"] = merged["supplier_reference"].map(self._resolve_supplier_id)
+        unresolved_mask = merged["supplier_id"].isna() & merged["supplier_reference"].notna()
+        if unresolved_mask.any():
+            merged.loc[unresolved_mask, "supplier_id"] = merged.loc[
+                unresolved_mask, "supplier_reference"
+            ]
         merged["supplier_id"] = merged["supplier_id"].map(_clean)
         merged["po_id"] = merged["po_id"].map(_clean)
         if "item_id" in merged.columns:
             merged["item_id"] = merged["item_id"].map(_clean)
         merged["item_description"] = merged["item_description"].map(_clean)
         merged = merged.dropna(subset=["supplier_id", "item_description"])
+        merged = merged.drop(columns=["supplier_reference"], errors="ignore")
         if merged.empty:
             return findings
 
@@ -5354,21 +5377,23 @@ class OpportunityMinerAgent(BaseAgent):
 
         sql = f"""
             WITH po_suppliers AS (
-                SELECT p.supplier_id,
+                SELECT p.supplier_name AS supplier_reference,
                        {po_price_expr} AS unit_price
                 FROM proc.po_line_items_agent li
                 JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
-                WHERE li.item_id = %s AND p.supplier_id IS NOT NULL
+                WHERE li.item_id = %s
+                  AND NULLIF(BTRIM(p.supplier_name), '') IS NOT NULL
             ), invoice_suppliers AS (
-                SELECT ia.supplier_id,
+                SELECT ia.supplier_name AS supplier_reference,
                        {inv_price_expr} AS unit_price
                 FROM proc.invoice_line_items_agent ili
                 JOIN proc.invoice_agent ia ON ia.invoice_id = ili.invoice_id
-                WHERE ili.item_id = %s AND ia.supplier_id IS NOT NULL
+                WHERE ili.item_id = %s
+                  AND NULLIF(BTRIM(ia.supplier_name), '') IS NOT NULL
             )
-            SELECT supplier_id, unit_price FROM po_suppliers
+            SELECT supplier_reference, unit_price FROM po_suppliers
             UNION ALL
-            SELECT supplier_id, unit_price FROM invoice_suppliers
+            SELECT supplier_reference, unit_price FROM invoice_suppliers
         """
         try:
             df = self._read_sql(sql, params=(item_id, item_id))
@@ -5376,6 +5401,24 @@ class OpportunityMinerAgent(BaseAgent):
             logger.exception("_find_candidate_suppliers query failed for item %s", item_id)
             return []
 
+        if df.empty:
+            return []
+
+        df = df.dropna(subset=["supplier_reference", "unit_price"])
+        if df.empty:
+            return []
+
+        df = df.copy()
+        df["supplier_reference"] = df["supplier_reference"].astype(str).str.strip()
+        df = df[df["supplier_reference"] != ""]
+        if df.empty:
+            return []
+
+        df["supplier_id"] = df["supplier_reference"].map(self._resolve_supplier_id)
+        unresolved_mask = df["supplier_id"].isna()
+        if unresolved_mask.any():
+            df.loc[unresolved_mask, "supplier_id"] = df.loc[unresolved_mask, "supplier_reference"]
+        df = df.drop(columns=["supplier_reference"])
         if df.empty:
             return []
 
