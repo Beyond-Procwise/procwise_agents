@@ -1423,9 +1423,11 @@ class OpportunityMinerAgent(BaseAgent):
             df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
             if supplier_col and supplier_col in df.columns:
                 fallback_suppliers = df[supplier_col].map(self._resolve_supplier_id)
-                df.loc[df["supplier_id"].isna(), "supplier_id"] = fallback_suppliers[
-                    df["supplier_id"].isna()
-                ]
+                mask = df["supplier_id"].isna()
+                if mask.any():
+                    if df["supplier_id"].dtype != object:
+                        df["supplier_id"] = df["supplier_id"].astype("object")
+                    df.loc[mask, "supplier_id"] = fallback_suppliers[mask]
             df["supplier_id"] = df["supplier_id"].map(self._resolve_supplier_id)
             df = df.dropna(subset=["supplier_id"])
             if not df.empty:
@@ -1468,9 +1470,11 @@ class OpportunityMinerAgent(BaseAgent):
             supplier_col = self._find_column_for_key(df, "supplier_id")
             if supplier_col and supplier_col in df.columns:
                 fallback_suppliers = df[supplier_col].map(self._resolve_supplier_id)
-                df.loc[df["supplier_id"].isna(), "supplier_id"] = fallback_suppliers[
-                    df["supplier_id"].isna()
-                ]
+                mask = df["supplier_id"].isna()
+                if mask.any():
+                    if df["supplier_id"].dtype != object:
+                        df["supplier_id"] = df["supplier_id"].astype("object")
+                    df.loc[mask, "supplier_id"] = fallback_suppliers[mask]
             df["supplier_id"] = df["supplier_id"].map(self._resolve_supplier_id)
             df = df.dropna(subset=["supplier_id"])
             if not df.empty:
