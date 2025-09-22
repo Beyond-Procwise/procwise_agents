@@ -42,8 +42,8 @@ class DummyNick:
             script_user="AgentNick",
             ses_default_sender="nicholasgeelen@procwise.co.uk",
             ses_smtp_endpoint="email-smtp.eu-west-1.amazonaws.com",
-            ses_smtp_user="AKIA",
-            ses_smtp_password="secret",
+            ses_smtp_secret_name="ses/smtp/credentials",
+            ses_region="eu-west-1",
             ses_inbound_prefix="ses/inbound/",
             s3_bucket_name="bucket",
         )
