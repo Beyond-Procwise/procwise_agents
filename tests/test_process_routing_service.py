@@ -198,6 +198,12 @@ def test_convert_agents_to_flow_preserves_agent_ref_id():
     assert flow["agent_id"] == "123"
 
 
+def test_canonical_key_matches_class_name():
+    defs = {"opportunity_miner": "OpportunityMinerAgent"}
+    slug = ProcessRoutingService._canonical_key("OpportunityMinerAgent", defs)
+    assert slug == "opportunity_miner"
+
+
 def test_normalise_agent_properties_defaults_llm():
     props = ProcessRoutingService._normalise_agent_properties({"prompts": [1]})
     assert props["llm"] == ProcessRoutingService.DEFAULT_LLM_MODEL
@@ -309,6 +315,70 @@ def test_get_process_details_handles_prefixed_agent_names():
     assert details["agent_type"] == "QuoteEvaluationAgent"
 
 
+def test_load_agent_links_normalises_proc_agent_type():
+    agent_id = "admin_testopp_000092_1758530338949"
+    raw_agent_type = agent_id
+    agent_name = "OpportunityMinerAgent"
+    props_payload = json.dumps({"llm": "llama-2", "prompts": [7]})
+    timestamp = datetime.utcnow()
+
+    class AgentCursor:
+        def __init__(self):
+            self.query = ""
+
+        def execute(self, sql, params=None):
+            self.query = sql
+
+        def fetchall(self):
+            if "FROM proc.prompt" in self.query:
+                return []
+            if "FROM proc.policy" in self.query:
+                return []
+            if "FROM proc.agent" in self.query:
+                return [
+                    (
+                        agent_id,
+                        raw_agent_type,
+                        agent_name,
+                        props_payload,
+                        timestamp,
+                        timestamp,
+                    )
+                ]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class AgentConn:
+        def cursor(self):
+            return AgentCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    agent = SimpleNamespace(
+        get_db_connection=lambda: AgentConn(),
+        settings=SimpleNamespace(script_user="tester"),
+    )
+
+    prs = ProcessRoutingService(agent)
+    agent_defs, prompt_map, policy_map = prs._load_agent_links()
+
+    assert agent_defs.get("opportunity_miner") == "OpportunityMinerAgent"
+    assert prs._agent_type_cache_by_id[agent_id] == "OpportunityMinerAgent"
+    assert "opportunity_miner" in prs._agent_defaults_cache
+    assert prs._agent_defaults_cache["opportunity_miner"]["llm"] == "llama-2"
+    assert prompt_map == {}
+    assert policy_map == {}
+
+
 def test_enrich_node_applies_agent_defaults():
     agent = SimpleNamespace(settings=SimpleNamespace(script_user="tester"))
     prs = ProcessRoutingService(agent)
@@ -373,6 +443,35 @@ def test_enrich_node_uses_base_agent_ref_id():
     assert props["prompts"] == [9]
     assert props["policies"] == [12]
     assert node["agent_id"] == "admin_opportunity_000065"
+
+
+def test_enrich_node_replaces_dynamic_agent_type_with_db_value():
+    agent = SimpleNamespace(settings=SimpleNamespace(script_user="tester"))
+    prs = ProcessRoutingService(agent)
+    dynamic_id = "admin_testopp_000092_1758530338949"
+    prs._agent_property_cache_by_id = {
+        dynamic_id: {"llm": "legacy-llm", "prompts": [], "policies": []}
+    }
+    prs._agent_type_cache_by_id = {dynamic_id: "OpportunityMinerAgent"}
+    prs._prompt_id_catalog = set()
+    prs._policy_id_catalog = set()
+
+    node = {
+        "agent_id": dynamic_id,
+        "agent_type": dynamic_id,
+        "agent_property": {},
+    }
+
+    prs._enrich_node(
+        node,
+        {"opportunity_miner": "OpportunityMinerAgent"},
+        {},
+        {},
+    )
+
+    assert node["agent_type"] == "OpportunityMinerAgent"
+    assert node["agent_property"]["llm"] == "legacy-llm"
+
 
 def test_update_agent_status_preserves_structure():
     initial = {

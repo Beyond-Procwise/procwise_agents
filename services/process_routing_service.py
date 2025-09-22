@@ -316,16 +316,32 @@ class ProcessRoutingService:
 
         if not raw:
             return None
+
         key = re.sub(r"_[0-9]+(?:_[0-9]+)*$", "", raw)
         key = re.sub(r"^(?:admin|user|service)_", "", key)
         key = re.sub(r"_agent$", "", key)
-        if key in agent_defs:
-            return key
-        if raw in agent_defs:
-            return raw
-        for slug in agent_defs:
-            if slug in key or key in slug:
+
+        key_lower = key.lower()
+        raw_lower = str(raw).lower()
+
+        if key_lower in agent_defs:
+            return key_lower
+        if raw_lower in agent_defs:
+            return raw_lower
+
+        for slug, class_name in agent_defs.items():
+            slug_lower = slug.lower()
+            if slug_lower in {key_lower, raw_lower}:
                 return slug
+            if key_lower in slug_lower or slug_lower in key_lower:
+                return slug
+            class_lower = str(class_name or "").lower()
+            if class_lower:
+                if key_lower == class_lower or raw_lower == class_lower:
+                    return slug
+                if class_lower in key_lower or key_lower in class_lower:
+                    return slug
+
         return None
 
     @classmethod
@@ -570,19 +586,27 @@ class ProcessRoutingService:
                         parsed = _parse_agent_property(props_payload)
                         if not parsed:
                             continue
+
                         normalized = self._normalise_agent_properties(parsed)
+                        slug: Optional[str] = None
+                        canonical_type: Optional[str] = None
+                        for candidate in (agent_type, agent_name):
+                            if not candidate:
+                                continue
+                            slug = self._canonical_key(str(candidate), agent_defs)
+                            if slug:
+                                canonical_type = agent_defs.get(slug) or str(candidate)
+                                break
+
                         if agent_id:
                             property_by_id[str(agent_id)] = dict(normalized)
-                            if agent_type:
+                            if canonical_type:
+                                type_by_id[str(agent_id)] = canonical_type
+                            elif agent_type:
                                 type_by_id[str(agent_id)] = str(agent_type)
-                        slug: Optional[str] = None
-                        for candidate in (agent_type, agent_name):
-                            slug = self._canonical_key(str(candidate or ""), agent_defs)
-                            if slug:
-                                break
-                        if not slug:
-                            continue
-                        _record_default(slug, normalized, modified, created)
+
+                        if slug:
+                            _record_default(slug, normalized, modified, created)
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load agent linkage metadata")
 
@@ -601,6 +625,7 @@ class ProcessRoutingService:
         agent_ref_id = node.get("agent_ref_id") or node.get("agent_id")
         db_props_payload: Dict[str, Any] = {}
         resolved_ref_key: Optional[str] = None
+        db_agent_type: Optional[str] = None
         if agent_ref_id is not None:
             ref_key = str(agent_ref_id).strip()
             if ref_key:
@@ -616,12 +641,34 @@ class ProcessRoutingService:
                     node["agent_id"] = resolved_ref_key
         ref_for_log = resolved_ref_key or agent_ref_id
 
-        raw_type = str(node.get("agent_type", ""))
+        raw_type = str(node.get("agent_type", "")).strip()
         base_key = self._canonical_key(raw_type, agent_defs)
+        canonical_type: Optional[str] = None
+
         if base_key:
-            node["agent_type"] = agent_defs.get(base_key, raw_type)
+            canonical_type = agent_defs.get(base_key, raw_type)
         else:
-            base_key = raw_type
+            fallback_type: Optional[str] = db_agent_type
+            if not fallback_type:
+                lookup_key = self._resolve_agent_lookup_key(raw_type)
+                if lookup_key:
+                    fallback_type = getattr(self, "_agent_type_cache_by_id", {}).get(lookup_key)
+
+            if fallback_type:
+                fallback_slug = self._canonical_key(str(fallback_type), agent_defs)
+                if fallback_slug:
+                    base_key = fallback_slug
+                    canonical_type = agent_defs.get(fallback_slug, str(fallback_type))
+                else:
+                    base_key = base_key or raw_type
+                    canonical_type = str(fallback_type)
+            else:
+                base_key = raw_type
+
+        if canonical_type:
+            node["agent_type"] = canonical_type
+        elif base_key:
+            node["agent_type"] = agent_defs.get(base_key, raw_type)
         raw_props = node.get("agent_property", {"llm": None, "prompts": [], "policies": []})
         db_props = self._normalise_agent_properties(db_props_payload, apply_default=False)
         props = self._normalise_agent_properties(raw_props, apply_default=False)
