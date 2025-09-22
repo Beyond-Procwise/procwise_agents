@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -651,20 +652,23 @@ class OpportunityMinerAgent(BaseAgent):
                     cursor.execute(query)
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                return pd.DataFrame(rows, columns=columns)
+                df = pd.DataFrame(rows, columns=columns)
+                return self._normalise_numeric_dataframe(df)
 
         engine_getter = getattr(self.agent_nick, "get_db_engine", None)
         engine = engine_getter() if callable(engine_getter) else None
         if engine is not None:
             with engine.connect() as conn:
-                return pd.read_sql(query, conn, params=params)
+                df = pd.read_sql(query, conn, params=params)
+                return self._normalise_numeric_dataframe(df)
 
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 if hasattr(conn, "cursor"):
                     return _fetch_with_cursor(conn)
-                return pd.read_sql(query, conn, params=params)
+                df = pd.read_sql(query, conn, params=params)
+                return self._normalise_numeric_dataframe(df)
 
         conn_getter = getattr(self.agent_nick, "get_db_connection", None)
         if callable(conn_getter):
@@ -1249,10 +1253,53 @@ class OpportunityMinerAgent(BaseAgent):
         for name, df in list(tables.items()):
             if df.empty:
                 continue
-            # Drop rows that are entirely null
-            tables[name] = df.dropna(how="all")
-            logger.debug("Table %s columns: %s", name, list(tables[name].columns))
+            # Drop rows that are entirely null and normalise numeric types.
+            cleaned = df.dropna(how="all")
+            cleaned = self._normalise_numeric_dataframe(cleaned)
+            tables[name] = cleaned
+            logger.debug("Table %s columns: %s", name, list(cleaned.columns))
         return tables
+
+    def _normalise_numeric_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy of ``df`` with Decimal values coerced to native floats."""
+
+        if df.empty:
+            return df
+
+        def _convert_decimal(value: Any) -> Any:
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
+
+        for column in df.columns:
+            series = df[column]
+            if not pd.api.types.is_object_dtype(series):
+                continue
+            if series.map(lambda value: isinstance(value, Decimal)).any():
+                df[column] = series.apply(_convert_decimal)
+                series = df[column]
+            non_null = series.dropna()
+            if non_null.empty:
+                continue
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in non_null
+            ):
+                df[column] = pd.to_numeric(series, errors="coerce")
+        return df
+
+    def _normalise_numeric_value(self, value: Any) -> Any:
+        """Coerce Decimal values inside nested structures to native floats."""
+
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, dict):
+            return {k: self._normalise_numeric_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._normalise_numeric_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._normalise_numeric_value(v) for v in value)
+        return value
 
     def _normalise_supplier_key(self, value: Any) -> Optional[str]:
         if value is None:
@@ -3032,8 +3079,9 @@ class OpportunityMinerAgent(BaseAgent):
         supplier_id = _clean(supplier_id)
         category_id = _clean(category_id)
         item_id = _clean(item_id)
-        if impact is None or (isinstance(impact, float) and pd.isna(impact)):
-            impact = 0.0
+        impact_value = self._to_float(impact)
+        if pd.isna(impact_value):
+            impact_value = 0.0
 
         detector_slug = self._normalise_policy_slug(detector) or "detector"
         policy_slug = (
@@ -3050,6 +3098,7 @@ class OpportunityMinerAgent(BaseAgent):
         item_slug = _slug_or_default(item_id, "na")
 
         source_token = "none"
+        normalised_sources: List[str] = []
         if sources:
             normalised_sources = [
                 str(src).strip()
@@ -3070,15 +3119,19 @@ class OpportunityMinerAgent(BaseAgent):
         if policy_id is not None:
             policy_identifier = str(policy_id).strip() or None
 
+        details = (
+            self._normalise_numeric_value(details) if isinstance(details, dict) else {}
+        )
+
         finding = Finding(
             opportunity_id=opportunity_id,
             detector_type=detector,
             supplier_id=supplier_id,
             category_id=category_id,
             item_id=item_id,
-            financial_impact_gbp=float(impact),
+            financial_impact_gbp=impact_value,
             calculation_details=details,
-            source_records=sources,
+            source_records=normalised_sources,
             detected_on=datetime.utcnow(),
             item_reference=item_id,
             policy_id=policy_identifier,
@@ -3090,7 +3143,7 @@ class OpportunityMinerAgent(BaseAgent):
             supplier_id,
             category_id,
             item_id,
-            impact,
+            impact_value,
         )
         return finding
 
@@ -3703,9 +3756,22 @@ class OpportunityMinerAgent(BaseAgent):
         if purchase_orders.empty or "po_id" not in purchase_orders.columns:
             return findings
 
+        supplier_id_col = self._find_column_for_key(purchase_orders, "supplier_id")
+        supplier_name_col = self._find_column_for_key(purchase_orders, "supplier_name")
+        supplier_col = None
+        if supplier_id_col and supplier_id_col in purchase_orders.columns:
+            supplier_col = supplier_id_col
+        elif supplier_name_col and supplier_name_col in purchase_orders.columns:
+            supplier_col = supplier_name_col
+        if not supplier_col:
+            return findings
+
+        join_df = purchase_orders[["po_id", supplier_col]].copy()
+        join_df = join_df.rename(columns={supplier_col: "supplier_reference"})
+
         try:
             merged = po_lines.merge(
-                purchase_orders[["po_id", "supplier_id"]],
+                join_df,
                 on="po_id",
                 how="left",
             )
@@ -3727,12 +3793,22 @@ class OpportunityMinerAgent(BaseAgent):
             text = str(value).strip()
             return text or None
 
+        if "supplier_reference" not in merged.columns:
+            return findings
+        merged["supplier_reference"] = merged["supplier_reference"].map(_clean)
+        merged["supplier_id"] = merged["supplier_reference"].map(self._resolve_supplier_id)
+        unresolved_mask = merged["supplier_id"].isna() & merged["supplier_reference"].notna()
+        if unresolved_mask.any():
+            merged.loc[unresolved_mask, "supplier_id"] = merged.loc[
+                unresolved_mask, "supplier_reference"
+            ]
         merged["supplier_id"] = merged["supplier_id"].map(_clean)
         merged["po_id"] = merged["po_id"].map(_clean)
         if "item_id" in merged.columns:
             merged["item_id"] = merged["item_id"].map(_clean)
         merged["item_description"] = merged["item_description"].map(_clean)
         merged = merged.dropna(subset=["supplier_id", "item_description"])
+        merged = merged.drop(columns=["supplier_reference"], errors="ignore")
         if merged.empty:
             return findings
 
@@ -5354,21 +5430,23 @@ class OpportunityMinerAgent(BaseAgent):
 
         sql = f"""
             WITH po_suppliers AS (
-                SELECT p.supplier_id,
+                SELECT p.supplier_name AS supplier_reference,
                        {po_price_expr} AS unit_price
                 FROM proc.po_line_items_agent li
                 JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
-                WHERE li.item_id = %s AND p.supplier_id IS NOT NULL
+                WHERE li.item_id = %s
+                  AND NULLIF(BTRIM(p.supplier_name), '') IS NOT NULL
             ), invoice_suppliers AS (
-                SELECT ia.supplier_id,
+                SELECT ia.supplier_name AS supplier_reference,
                        {inv_price_expr} AS unit_price
                 FROM proc.invoice_line_items_agent ili
                 JOIN proc.invoice_agent ia ON ia.invoice_id = ili.invoice_id
-                WHERE ili.item_id = %s AND ia.supplier_id IS NOT NULL
+                WHERE ili.item_id = %s
+                  AND NULLIF(BTRIM(ia.supplier_name), '') IS NOT NULL
             )
-            SELECT supplier_id, unit_price FROM po_suppliers
+            SELECT supplier_reference, unit_price FROM po_suppliers
             UNION ALL
-            SELECT supplier_id, unit_price FROM invoice_suppliers
+            SELECT supplier_reference, unit_price FROM invoice_suppliers
         """
         try:
             df = self._read_sql(sql, params=(item_id, item_id))
@@ -5376,6 +5454,24 @@ class OpportunityMinerAgent(BaseAgent):
             logger.exception("_find_candidate_suppliers query failed for item %s", item_id)
             return []
 
+        if df.empty:
+            return []
+
+        df = df.dropna(subset=["supplier_reference", "unit_price"])
+        if df.empty:
+            return []
+
+        df = df.copy()
+        df["supplier_reference"] = df["supplier_reference"].astype(str).str.strip()
+        df = df[df["supplier_reference"] != ""]
+        if df.empty:
+            return []
+
+        df["supplier_id"] = df["supplier_reference"].map(self._resolve_supplier_id)
+        unresolved_mask = df["supplier_id"].isna()
+        if unresolved_mask.any():
+            df.loc[unresolved_mask, "supplier_id"] = df.loc[unresolved_mask, "supplier_reference"]
+        df = df.drop(columns=["supplier_reference"])
         if df.empty:
             return []
 
