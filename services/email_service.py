@@ -1,3 +1,4 @@
+import json
 import logging
 import smtplib
 from typing import Iterable, List, Optional, Tuple, Union
@@ -5,6 +6,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+
+import boto3
+
 from utils.gpu import configure_gpu
 
 configure_gpu()
@@ -54,15 +58,46 @@ class EmailService:
                 msg.attach(part)
 
         try:
+            smtp_username, smtp_password = self._fetch_smtp_credentials()
+        except Exception as exc:
+            self.logger.error("Unable to retrieve SMTP credentials: %s", exc)
+            return False
+
+        try:
             with smtplib.SMTP(
                 self.settings.ses_smtp_endpoint, self.settings.ses_smtp_port
             ) as server:
                 server.starttls()
-                server.login(
-                    self.settings.ses_smtp_user, self.settings.ses_smtp_password
-                )
+                server.login(smtp_username, smtp_password)
                 server.sendmail(sender, recipient_list, msg.as_string())
             return True
         except Exception as exc:  # pragma: no cover - network/runtime
             self.logger.error("Email send failed: %s", exc)
             return False
+
+    def _fetch_smtp_credentials(self) -> Tuple[str, str]:
+        """Retrieve freshly rotated SMTP credentials from AWS Secrets Manager."""
+
+        secret_name = getattr(self.settings, "ses_smtp_secret_name", None)
+        if not secret_name:
+            raise ValueError("SES SMTP secret name is not configured")
+
+        region = getattr(self.settings, "ses_region", None) or "eu-west-1"
+
+        client = boto3.client("secretsmanager", region_name=region)
+        secret_value = client.get_secret_value(SecretId=secret_name)
+        secret_string = secret_value.get("SecretString")
+        if not secret_string:
+            raise ValueError("Secret does not contain a SecretString payload")
+
+        try:
+            payload = json.loads(secret_string)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Secret payload is not valid JSON") from exc
+
+        username = payload.get("SMTP_USERNAME")
+        password = payload.get("SMTP_PASSWORD")
+        if not username or not password:
+            raise ValueError("Secret payload missing SMTP credentials")
+
+        return username, password

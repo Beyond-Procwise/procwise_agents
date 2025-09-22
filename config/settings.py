@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     )
 
     # Email settings
-    ses_smtp_user: str = Field(..., env="SES_SMTP_USER")
-    ses_smtp_password: str = Field(..., env="SES_SMTP_PASSWORD")
+    ses_smtp_secret_name: str = Field(
+        default="ses/smtp/credentials", env="SES_SMTP_SECRET_NAME"
+    )
     ses_smtp_endpoint: str = Field(
         default="email-smtp.eu-west-1.amazonaws.com", env="SES_SMTP_ENDPOINT"
     )
@@ -34,7 +35,7 @@ class Settings(BaseSettings):
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
     ses_inbound_bucket: Optional[str] = Field(default=None, env="SES_INBOUND_BUCKET")
     ses_inbound_prefix: str = Field(default="ses/inbound/", env="SES_INBOUND_PREFIX")
-    ses_region: Optional[str] = Field(default=None, env="SES_REGION")
+    ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
@@ -65,6 +66,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ENV_FILE_PATH
         env_file_encoding = 'utf-8'
+        extra = "ignore"
 
 try:
     settings = Settings()
