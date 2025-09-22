@@ -398,12 +398,10 @@ class SESEmailWatcher:
 
     def _get_s3_client(self):
         if self._s3_client is None:
-            self._s3_client = boto3.client(
-                "s3",
-                region_name=self.region,
-                aws_access_key_id=getattr(self.settings, "ses_smtp_user", None),
-                aws_secret_access_key=getattr(self.settings, "ses_smtp_password", None),
-            )
+            client_kwargs = {}
+            if self.region:
+                client_kwargs["region_name"] = self.region
+            self._s3_client = boto3.client("s3", **client_kwargs)
         return self._s3_client
 
     @staticmethod
