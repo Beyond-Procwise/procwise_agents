@@ -9,7 +9,7 @@ sources.
 1. **Contracts ➜ Suppliers**: `proc.contracts.supplier_id` joins to
    `proc.supplier.supplier_id` to fetch each `supplier_name`.
 2. **Suppliers ➜ Purchase Orders**: The retrieved `supplier_name` is
-   matched against `proc.purchase_order_agent.supplier_id` to gather
+   matched against `proc.purchase_order_agent.supplier_name` to gather
    purchase orders for that supplier.
 3. **Purchase Orders ➜ Line Items & Invoices**:
    - `proc.po_line_items_agent.po_id` and `proc.invoice_agent.po_id`
@@ -113,7 +113,7 @@ PRIMARY KEY (supplier_id)
 ### `proc.purchase_order_agent`
 ```
 po_id text NOT NULL DEFAULT ('PO'::text || lpad((nextval('proc.po_sequence_new'::regclass))::text, 6, '0')),
-supplier_id text,
+supplier_name text,
 buyer_id text,
 requisition_id text,
 requested_by text,
@@ -170,7 +170,7 @@ PRIMARY KEY (po_id)
 ```
 invoice_id text NOT NULL DEFAULT ('IN'::text || lpad((nextval('proc.inv_sequence_new'::regclass))::text, 6, '0')),
 po_id text,
-supplier_id text,
+supplier_name text,
 buyer_id text,
 requisition_id text,
 requested_by text,

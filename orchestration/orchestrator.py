@@ -148,6 +148,10 @@ class Orchestrator:
                 input_data=enriched_input,
             )
 
+            training_service = self._get_model_training_service()
+            if training_service is not None:
+                training_service.dispatch_due_jobs()
+
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
                 return {
@@ -167,6 +171,14 @@ class Orchestrator:
                 result = self._execute_opportunity_workflow(context)
             else:
                 result = self._execute_generic_workflow(workflow_name, context)
+
+            if training_service is not None:
+                try:
+                    training_service.record_workflow_outcome(
+                        workflow_name, workflow_id, result
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("Failed to record workflow outcome for training")
 
             return {
                 "status": "completed",
@@ -401,6 +413,19 @@ class Orchestrator:
 
         self._policy_cache = dict(policies)
         return dict(policies)
+
+    def _get_model_training_service(self):
+        service = getattr(self.agent_nick, "model_training_service", None)
+        if service is None:
+            try:
+                from services.model_training_service import ModelTrainingService
+
+                service = ModelTrainingService(self.agent_nick)
+                setattr(self.agent_nick, "model_training_service", service)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Failed to initialise model training service")
+                return None
+        return service
 
 
     @staticmethod
