@@ -50,6 +50,8 @@ class SupplierRankingAgent(BaseAgent):
         self.policy_engine = agent_nick.policy_engine
         self.query_engine = agent_nick.query_engine
         self._device = configure_gpu()
+        self._supplier_alias_map: Dict[str, str] = {}
+        self._supplier_lookup: Dict[str, Optional[str]] = {}
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -389,6 +391,12 @@ class SupplierRankingAgent(BaseAgent):
                 lambda val: val.strip() if isinstance(val, str) else val
             )
 
+        self._prime_supplier_aliases(df, directory_entries)
+
+        if self._supplier_lookup and "supplier_name" in df.columns:
+            canonical_names = df["supplier_id"].map(self._supplier_lookup.get)
+            df["supplier_name"] = canonical_names.combine_first(df["supplier_name"])
+
         tables = self._load_procurement_tables(candidate_set)
         df = self._merge_supplier_metrics(df, tables)
         profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
@@ -524,6 +532,122 @@ class SupplierRankingAgent(BaseAgent):
         except Exception:
             return {str(ids).strip()}
 
+    def _normalise_supplier_token(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            text = str(value).strip()
+        if not text:
+            return None
+        return re.sub(r"\s+", " ", text.lower())
+
+    def _coerce_supplier_id(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            text = str(value).strip()
+        return text or None
+
+    def _prime_supplier_aliases(
+        self, supplier_df: pd.DataFrame, directory_entries: Iterable[Dict[str, Any]]
+    ) -> None:
+        alias_map: Dict[str, str] = {}
+        lookup: Dict[str, Optional[str]] = {}
+
+        if isinstance(supplier_df, pd.DataFrame) and not supplier_df.empty:
+            alias_fields = [
+                col for col in ("supplier_name", "trading_name") if col in supplier_df.columns
+            ]
+            for row in supplier_df.itertuples(index=False):
+                sid = self._coerce_supplier_id(getattr(row, "supplier_id", None))
+                if not sid:
+                    continue
+                canonical_name = getattr(row, "supplier_name", None)
+                if not isinstance(canonical_name, str) or not canonical_name.strip():
+                    for field in alias_fields:
+                        value = getattr(row, field, None)
+                        if isinstance(value, str) and value.strip():
+                            canonical_name = value
+                            break
+                if isinstance(canonical_name, str):
+                    lookup.setdefault(sid, canonical_name.strip())
+                else:
+                    lookup.setdefault(sid, None)
+                norm_id = self._normalise_supplier_token(sid)
+                if norm_id:
+                    alias_map.setdefault(norm_id, sid)
+                for field in alias_fields:
+                    value = getattr(row, field, None)
+                    norm = self._normalise_supplier_token(value)
+                    if norm and norm not in alias_map:
+                        alias_map[norm] = sid
+
+        for entry in directory_entries or []:
+            if not isinstance(entry, dict):
+                continue
+            sid = self._coerce_supplier_id(entry.get("supplier_id"))
+            if not sid:
+                continue
+            name = entry.get("supplier_name")
+            if isinstance(name, str) and name.strip():
+                lookup.setdefault(sid, name.strip())
+            norm_id = self._normalise_supplier_token(sid)
+            if norm_id:
+                alias_map.setdefault(norm_id, sid)
+            for candidate in (entry.get("supplier_name"), entry.get("trading_name")):
+                norm = self._normalise_supplier_token(candidate)
+                if norm and norm not in alias_map:
+                    alias_map[norm] = sid
+
+        self._supplier_alias_map = {key: val for key, val in alias_map.items() if key and val}
+        self._supplier_lookup = {sid: lookup.get(sid) for sid in {val for val in alias_map.values()}}
+
+    def _resolve_supplier_identifier(self, value: Any) -> Optional[str]:
+        sid = self._coerce_supplier_id(value)
+        norm = self._normalise_supplier_token(value)
+        if norm and norm in self._supplier_alias_map:
+            return self._supplier_alias_map[norm]
+        if sid and (sid in self._supplier_lookup or sid in self._supplier_alias_map.values()):
+            return sid
+        return sid
+
+    def _map_supplier_ids(self, df: pd.DataFrame, name_fields: Iterable[str]) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
+        if df.empty:
+            return df
+
+        out = df.copy()
+
+        if "supplier_id" in out.columns:
+            out["supplier_id"] = out["supplier_id"].apply(self._coerce_supplier_id)
+        else:
+            out["supplier_id"] = pd.Series([None] * len(out), index=out.index, dtype="object")
+
+        missing_mask = out["supplier_id"].isna()
+        for field in name_fields:
+            if field not in out.columns:
+                continue
+            resolved = out.loc[missing_mask, field].apply(self._resolve_supplier_identifier)
+            out.loc[missing_mask, "supplier_id"] = resolved
+            missing_mask = out["supplier_id"].isna()
+            if not missing_mask.any():
+                break
+
+        if "supplier_name" in out.columns:
+            out["supplier_name"] = out["supplier_name"].apply(
+                lambda val: val.strip() if isinstance(val, str) else val
+            )
+            if self._supplier_lookup:
+                canonical = out["supplier_id"].map(self._supplier_lookup.get)
+                out["supplier_name"] = canonical.combine_first(out["supplier_name"])
+
+        return out
+
     def _ensure_candidate_rows(
         self,
         df: pd.DataFrame,
@@ -576,15 +700,17 @@ class SupplierRankingAgent(BaseAgent):
         suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}
         tables: Dict[str, pd.DataFrame] = {}
         try:
-            tables["purchase_orders"] = self.query_engine.fetch_purchase_order_data()
+            po_df = self.query_engine.fetch_purchase_order_data()
         except Exception:
             logger.exception("Failed to load purchase orders")
-            tables["purchase_orders"] = pd.DataFrame()
+            po_df = pd.DataFrame()
+        tables["purchase_orders"] = self._map_supplier_ids(po_df, ("supplier_name",))
         try:
-            tables["invoices"] = self.query_engine.fetch_invoice_data()
+            invoice_df = self.query_engine.fetch_invoice_data()
         except Exception:
             logger.exception("Failed to load invoices")
-            tables["invoices"] = pd.DataFrame()
+            invoice_df = pd.DataFrame()
+        tables["invoices"] = self._map_supplier_ids(invoice_df, ("supplier_name",))
 
         tables["po_lines"] = self._read_table("proc.po_line_items_agent")
         tables["invoice_lines"] = self._read_table("proc.invoice_line_items_agent")
@@ -593,8 +719,12 @@ class SupplierRankingAgent(BaseAgent):
         except Exception:
             logger.exception("Failed to load procurement flow")
             flow = pd.DataFrame()
-        if not flow.empty and suppliers:
-            flow = flow[flow.get("supplier_id").astype(str).isin(suppliers)]
+        flow = self._map_supplier_ids(flow, ("supplier_name",))
+        if not flow.empty and suppliers and "supplier_id" in flow.columns:
+            supplier_series = flow["supplier_id"].apply(self._coerce_supplier_id)
+            mask = supplier_series.isin(suppliers)
+            flow = flow[mask].copy()
+            flow["supplier_id"] = supplier_series.loc[flow.index]
         tables["procurement_flow"] = flow
         return tables
 
@@ -686,9 +816,12 @@ class SupplierRankingAgent(BaseAgent):
         return result
 
     def _summarise_purchase_orders(self, po_df: pd.DataFrame) -> pd.DataFrame:
-        if po_df.empty or "supplier_id" not in po_df.columns:
+        if po_df.empty:
             return pd.DataFrame()
-        df = po_df.dropna(subset=["supplier_id"]).copy()
+        df = self._map_supplier_ids(po_df, ("supplier_name",))
+        if "supplier_id" not in df.columns:
+            return pd.DataFrame()
+        df = df.dropna(subset=["supplier_id"]).copy()
         df["supplier_id"] = df["supplier_id"].astype(str)
         value_col = "total_amount_gbp" if "total_amount_gbp" in df.columns else "total_amount"
         if value_col in df.columns:
@@ -720,12 +853,19 @@ class SupplierRankingAgent(BaseAgent):
     ) -> pd.DataFrame:
         if po_lines.empty or "po_id" not in po_lines.columns:
             return pd.DataFrame()
-        df = po_lines.copy()
         if po_df.empty or "po_id" not in po_df.columns:
             return pd.DataFrame()
-        merge_cols = ["po_id", "supplier_id"]
-        df = df.merge(po_df[merge_cols], on="po_id", how="left")
-        df = df.dropna(subset=["supplier_id"])
+        po_lookup = self._map_supplier_ids(po_df, ("supplier_name",))
+        join_cols = ["po_id"]
+        extra_cols = [col for col in ("supplier_id", "supplier_name") if col in po_lookup.columns]
+        if not extra_cols:
+            return pd.DataFrame()
+        join_df = po_lookup[join_cols + extra_cols].drop_duplicates("po_id")
+        df = po_lines.merge(join_df, on="po_id", how="left")
+        df = self._map_supplier_ids(df, ("supplier_name",))
+        if "supplier_id" not in df.columns:
+            return pd.DataFrame()
+        df = df.dropna(subset=["supplier_id"]).copy()
         df["supplier_id"] = df["supplier_id"].astype(str)
 
         for col in ["unit_price", "line_total", "quantity"]:
@@ -743,9 +883,12 @@ class SupplierRankingAgent(BaseAgent):
         return agg.reset_index()
 
     def _summarise_invoices(self, invoice_df: pd.DataFrame) -> pd.DataFrame:
-        if invoice_df.empty or "supplier_id" not in invoice_df.columns:
+        if invoice_df.empty:
             return pd.DataFrame()
-        df = invoice_df.dropna(subset=["supplier_id"]).copy()
+        df = self._map_supplier_ids(invoice_df, ("supplier_name",))
+        if "supplier_id" not in df.columns:
+            return pd.DataFrame()
+        df = df.dropna(subset=["supplier_id"]).copy()
         df["supplier_id"] = df["supplier_id"].astype(str)
         total_col = "invoice_total_incl_tax" if "invoice_total_incl_tax" in df.columns else "invoice_amount"
         if total_col in df.columns:
@@ -768,10 +911,19 @@ class SupplierRankingAgent(BaseAgent):
             return pd.DataFrame()
         if invoice_df.empty or "invoice_id" not in invoice_df.columns:
             return pd.DataFrame()
-        df = invoice_lines.merge(
-            invoice_df[["invoice_id", "supplier_id"]], on="invoice_id", how="left"
-        )
-        df = df.dropna(subset=["supplier_id"])
+        invoice_lookup = self._map_supplier_ids(invoice_df, ("supplier_name",))
+        join_cols = ["invoice_id"]
+        extra_cols = [
+            col for col in ("supplier_id", "supplier_name") if col in invoice_lookup.columns
+        ]
+        if not extra_cols:
+            return pd.DataFrame()
+        join_df = invoice_lookup[join_cols + extra_cols].drop_duplicates("invoice_id")
+        df = invoice_lines.merge(join_df, on="invoice_id", how="left")
+        df = self._map_supplier_ids(df, ("supplier_name",))
+        if "supplier_id" not in df.columns:
+            return pd.DataFrame()
+        df = df.dropna(subset=["supplier_id"]).copy()
         df["supplier_id"] = df["supplier_id"].astype(str)
         if "total_amount_incl_tax" in df.columns:
             df["total_amount_incl_tax"] = pd.to_numeric(
@@ -789,7 +941,8 @@ class SupplierRankingAgent(BaseAgent):
         self, tables: Dict[str, pd.DataFrame], supplier_ids: Iterable[str]
     ) -> Dict[str, Dict]:
         flow = tables.get("procurement_flow", pd.DataFrame())
-        if flow.empty:
+        flow = self._map_supplier_ids(flow, ("supplier_name",))
+        if flow.empty or "supplier_id" not in flow.columns:
             return {}
         flow = flow.dropna(subset=["supplier_id"]).copy()
         flow["supplier_id"] = flow["supplier_id"].astype(str)

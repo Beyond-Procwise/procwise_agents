@@ -378,16 +378,74 @@ class QueryEngine(BaseEngine):
             raise RuntimeError("fetch_supplier_data failed") from exc
 
     def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
-        """Return invoice headers from ``proc.invoice_agent``."""
-        sql = "SELECT * FROM proc.invoice_agent;"
+        """Return invoice headers from ``proc.invoice_agent`` with supplier IDs."""
+
+        sql = """
+            WITH supplier_lookup AS (
+                SELECT supplier_id,
+                       LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm,
+                       supplier_name AS supplier_name_master
+                FROM proc.supplier
+            )
+            SELECT i.*,
+                   sl.supplier_id AS supplier_id_lookup,
+                   sl.supplier_name_master
+            FROM proc.invoice_agent i
+            LEFT JOIN supplier_lookup sl
+              ON LOWER(NULLIF(BTRIM(i.supplier_name), '')) = sl.supplier_name_norm;
+        """
+
         with self._pandas_reader() as conn:
-            return read_sql_compat(sql, conn)
+            df = read_sql_compat(sql, conn)
+
+        if "supplier_id_lookup" in df.columns and "supplier_id" not in df.columns:
+            df = df.rename(columns={"supplier_id_lookup": "supplier_id"})
+        elif "supplier_id_lookup" in df.columns:
+            df["supplier_id"] = df["supplier_id"].combine_first(df["supplier_id_lookup"])
+            df = df.drop(columns=["supplier_id_lookup"])
+
+        if "supplier_name_master" in df.columns:
+            df["supplier_name"] = df["supplier_name_master"].combine_first(
+                df.get("supplier_name")
+            )
+            df = df.drop(columns=["supplier_name_master"])
+
+        return df
 
     def fetch_purchase_order_data(self, intent: dict | None = None) -> pd.DataFrame:
-        """Return purchase order headers from ``proc.purchase_order_agent``."""
-        sql = "SELECT * FROM proc.purchase_order_agent;"
+        """Return purchase order headers from ``proc.purchase_order_agent`` with supplier IDs."""
+
+        sql = """
+            WITH supplier_lookup AS (
+                SELECT supplier_id,
+                       LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm,
+                       supplier_name AS supplier_name_master
+                FROM proc.supplier
+            )
+            SELECT p.*,
+                   sl.supplier_id AS supplier_id_lookup,
+                   sl.supplier_name_master
+            FROM proc.purchase_order_agent p
+            LEFT JOIN supplier_lookup sl
+              ON LOWER(NULLIF(BTRIM(p.supplier_name), '')) = sl.supplier_name_norm;
+        """
+
         with self._pandas_reader() as conn:
-            return read_sql_compat(sql, conn)
+            df = read_sql_compat(sql, conn)
+
+        if "supplier_id_lookup" in df.columns and "supplier_id" not in df.columns:
+            df = df.rename(columns={"supplier_id_lookup": "supplier_id"})
+        elif "supplier_id_lookup" in df.columns:
+            df["supplier_id"] = df["supplier_id"].combine_first(df["supplier_id_lookup"])
+            df = df.drop(columns=["supplier_id_lookup"])
+
+        if "supplier_name_master" in df.columns:
+            df["supplier_name"] = df["supplier_name_master"].combine_first(
+                df.get("supplier_name")
+            )
+            df = df.drop(columns=["supplier_name_master"])
+
+        return df
 
     def fetch_procurement_flow(self, embed: bool = False) -> pd.DataFrame:
         """Return enriched procurement data across multiple tables.
