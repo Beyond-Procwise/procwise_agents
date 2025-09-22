@@ -273,22 +273,26 @@ class QueryEngine(BaseEngine):
                 )
 
                 sql = f"""
-                WITH po AS (
-                    SELECT p.supplier_id,
+                WITH supplier_lookup AS (
+                    SELECT supplier_id,
+                           supplier_name,
+                           LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm
+                    FROM proc.supplier
+                ), po AS (
+                    SELECT LOWER(NULLIF(BTRIM(p.supplier_name), '')) AS supplier_name_norm,
                            SUM({po_price} * {po_qty}) AS po_spend
                     FROM proc.po_line_items_agent li
                     JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
-                    WHERE p.supplier_id IS NOT NULL
-                    GROUP BY p.supplier_id
+                    WHERE NULLIF(BTRIM(p.supplier_name), '') IS NOT NULL
+                    GROUP BY LOWER(NULLIF(BTRIM(p.supplier_name), ''))
                 ), inv AS (
-                    SELECT i.supplier_id,
+                    SELECT LOWER(NULLIF(BTRIM(i.supplier_name), '')) AS supplier_name_norm,
                            SUM({inv_price} * {inv_qty}) AS invoice_spend,
                            COUNT(DISTINCT i.invoice_id) AS invoice_count
                     FROM proc.invoice_agent i
                     LEFT JOIN proc.invoice_line_items_agent ili ON i.invoice_id = ili.invoice_id
-
-                    WHERE i.supplier_id IS NOT NULL
-                    GROUP BY i.supplier_id
+                    WHERE NULLIF(BTRIM(i.supplier_name), '') IS NOT NULL
+                    GROUP BY LOWER(NULLIF(BTRIM(i.supplier_name), ''))
                 )
                 SELECT
                     s.supplier_id,
@@ -298,9 +302,9 @@ class QueryEngine(BaseEngine):
                     COALESCE(po.po_spend, 0.0) + COALESCE(inv.invoice_spend, 0.0) AS total_spend,
                     COALESCE(inv.invoice_count, 0) AS invoice_count,
                     {on_time_expr}{additional_fields}
-                FROM proc.supplier s
-                LEFT JOIN po ON s.supplier_id = po.supplier_id
-                LEFT JOIN inv ON s.supplier_id = inv.supplier_id
+                FROM supplier_lookup s
+                LEFT JOIN po ON po.supplier_name_norm = s.supplier_name_norm
+                LEFT JOIN inv ON inv.supplier_name_norm = s.supplier_name_norm
                 """
             with self._pandas_reader() as reader:
                 df = read_sql_compat(sql, reader)
@@ -363,10 +367,11 @@ class QueryEngine(BaseEngine):
 
         The query implements the following flow:
 
-        1. Retrieve ``supplier_id`` values from ``proc.contracts`` and join
-           them with ``proc.supplier`` to obtain ``supplier_name``.
-        2. Match the resulting ``supplier_name`` values against the
-           ``supplier_id`` column on ``proc.purchase_order_agent``.
+        1. Retrieve supplier master data from ``proc.supplier`` and normalise
+           ``supplier_name`` values for resilient joins.
+        2. Map contracts and purchase orders to suppliers using the
+           normalised ``supplier_name`` rather than legacy numeric
+           identifiers.
         3. For the matching purchase orders, collect line items and invoices
            via ``po_id`` joins (``proc.po_line_items_agent`` and
            ``proc.invoice_agent``).
@@ -388,33 +393,63 @@ class QueryEngine(BaseEngine):
         """
 
         sql = """
-            WITH contract_supplier AS (
-                SELECT c.supplier_id, s.supplier_name
-                FROM proc.contracts c
-                JOIN proc.supplier s ON c.supplier_id = s.supplier_id
+            WITH supplier_lookup AS (
+                SELECT supplier_id,
+                       supplier_name,
+                       LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm
+                FROM proc.supplier
             ),
-            po AS (
+            contract_supplier AS (
+                SELECT c.contract_id,
+                       c.supplier_id,
+                       sl.supplier_name,
+                       sl.supplier_name_norm
+                FROM proc.contracts c
+                LEFT JOIN supplier_lookup sl ON c.supplier_id = sl.supplier_id
+            ),
+            contract_supplier_name AS (
+                SELECT DISTINCT ON (supplier_name_norm)
+                       supplier_name_norm,
+                       supplier_id,
+                       supplier_name
+                FROM contract_supplier
+                WHERE supplier_name_norm IS NOT NULL
+                ORDER BY supplier_name_norm, contract_id DESC
+            ),
+            po_raw AS (
                 SELECT p.po_id,
-                       cs.supplier_id,
-                       cs.supplier_name
+                       p.contract_id,
+                       p.supplier_name,
+                       LOWER(NULLIF(BTRIM(p.supplier_name), '')) AS supplier_name_norm
                 FROM proc.purchase_order_agent p
-                JOIN contract_supplier cs ON p.supplier_id = cs.supplier_id
+            ),
+            po_enriched AS (
+                SELECT
+                    pr.po_id,
+                    COALESCE(cs.contract_id, pr.contract_id) AS contract_id,
+                    COALESCE(sl.supplier_id, cs.supplier_id, csn.supplier_id) AS supplier_id,
+                    COALESCE(sl.supplier_name, cs.supplier_name, csn.supplier_name, pr.supplier_name) AS supplier_name,
+                    pr.supplier_name_norm
+                FROM po_raw pr
+                LEFT JOIN supplier_lookup sl ON pr.supplier_name_norm = sl.supplier_name_norm
+                LEFT JOIN contract_supplier cs ON pr.contract_id = cs.contract_id
+                LEFT JOIN contract_supplier_name csn ON pr.supplier_name_norm = csn.supplier_name_norm
             ),
             inv AS (
                 SELECT ia.invoice_id, ia.po_id
                 FROM proc.invoice_agent ia
             )
             SELECT
-                po.supplier_id,
-                po.supplier_name,
-                po.po_id,
+                pe.supplier_id,
+                pe.supplier_name,
+                pe.po_id,
                 li.po_line_id,
                 li.item_description,
                 inv.invoice_id,
                 ili.invoice_line_id
-            FROM po
-            LEFT JOIN proc.po_line_items_agent li ON po.po_id = li.po_id
-            LEFT JOIN inv ON po.po_id = inv.po_id
+            FROM po_enriched pe
+            LEFT JOIN proc.po_line_items_agent li ON pe.po_id = li.po_id
+            LEFT JOIN inv ON pe.po_id = inv.po_id
             LEFT JOIN proc.invoice_line_items_agent ili
                 ON inv.invoice_id = ili.invoice_id
         """

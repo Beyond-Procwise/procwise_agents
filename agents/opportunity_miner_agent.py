@@ -275,6 +275,7 @@ class OpportunityMinerAgent(BaseAgent):
         self.min_financial_impact = min_financial_impact
         self._supplier_lookup: Dict[str, Optional[str]] = {}
         self._supplier_alias_lookup: Dict[str, List[str]] = {}
+        self._supplier_reference_lookup: Dict[str, Dict[str, Any]] = {}
         self._contract_supplier_map: Dict[str, str] = {}
         self._contract_metadata: Dict[str, Dict[str, Any]] = {}
         self._po_supplier_map: Dict[str, str] = {}
@@ -290,6 +291,7 @@ class OpportunityMinerAgent(BaseAgent):
         self._escalations: List[Dict[str, Any]] = []
         self._column_cache: Dict[str, set[str]] = {}
         self._policy_engine_catalog: Optional[Dict[str, Dict[str, Any]]] = None
+        self._data_profile: Dict[str, Any] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -515,6 +517,61 @@ class OpportunityMinerAgent(BaseAgent):
         if isinstance(conditions, dict):
             self._merge_conditions_from_source(conditions, context.input_data)
 
+    def _ensure_instruction_payloads(self, context: AgentContext) -> None:
+        if not isinstance(context.input_data, dict):
+            return
+
+        prompts_missing = not context.input_data.get("prompts")
+        policies_missing = not context.input_data.get("policies")
+        if not prompts_missing and not policies_missing:
+            return
+
+        agent_slug = "opportunity_miner"
+
+        if prompts_missing:
+            prompt_engine = getattr(self.agent_nick, "prompt_engine", None)
+            if prompt_engine is None:
+                try:
+                    from orchestration.prompt_engine import PromptEngine
+
+                    prompt_engine = PromptEngine(self.agent_nick)
+                    setattr(self.agent_nick, "prompt_engine", prompt_engine)
+                except Exception:  # pragma: no cover - defensive loading
+                    logger.exception("Failed to initialise prompt engine for opportunity miner")
+                    prompt_engine = None
+            if prompt_engine is not None:
+                try:
+                    prompts = prompt_engine.prompts_for_agent(agent_slug)
+                except Exception:  # pragma: no cover - defensive fetch
+                    logger.exception("Failed to load prompts for opportunity miner")
+                    prompts = []
+                if prompts:
+                    context.input_data["prompts"] = prompts
+
+        if policies_missing:
+            policy_engine = getattr(self.agent_nick, "policy_engine", None)
+            if policy_engine is None:
+                try:
+                    from engines.policy_engine import PolicyEngine
+
+                    policy_engine = PolicyEngine(self.agent_nick)
+                    setattr(self.agent_nick, "policy_engine", policy_engine)
+                except Exception:  # pragma: no cover - defensive loading
+                    logger.exception("Failed to initialise policy engine for opportunity miner")
+                    policy_engine = None
+            if policy_engine is not None:
+                try:
+                    policies = [
+                        dict(policy)
+                        for policy in policy_engine.iter_policies()
+                        if agent_slug in policy.get("policy_linked_agents", [])
+                    ]
+                except Exception:  # pragma: no cover - defensive fetch
+                    logger.exception("Failed to load policies for opportunity miner")
+                    policies = []
+                if policies:
+                    context.input_data["policies"] = policies
+
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
     ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
@@ -707,17 +764,20 @@ class OpportunityMinerAgent(BaseAgent):
                     qe.train_procurement_context()
                 except Exception:  # pragma: no cover - best effort
                     logger.exception("Failed to train procurement context")
+            self._data_profile = {}
             tables = self._ingest_data()
             tables = self._validate_data(tables)
             self._build_supplier_lookup(tables)
             tables = self._normalise_currency(tables)
             tables = self._apply_index_adjustment(tables)
+            self._data_profile = self._build_data_profile(tables)
 
             self._event_log = []
             self._escalations = []
             notifications: set[str] = set()
             self._policy_engine_catalog = None
 
+            self._ensure_instruction_payloads(context)
             self._apply_instruction_settings(context)
 
             min_impact_threshold = self._resolve_min_financial_impact(
@@ -992,6 +1052,7 @@ class OpportunityMinerAgent(BaseAgent):
             policy_category_opportunities: Dict[
                 str, Dict[str, List[Dict[str, Any]]]
             ] = {}
+            policy_metadata: Dict[str, Dict[str, Any]] = {}
             for key in requested_keys:
                 payload = policy_runs.get(key)
                 if not payload:
@@ -1011,6 +1072,17 @@ class OpportunityMinerAgent(BaseAgent):
                     category: [f.as_dict() for f in findings]
                     for category, findings in categories.items()
                 }
+                policy_cfg = payload.get("policy_cfg", {})
+                if isinstance(policy_cfg, dict):
+                    entry = {
+                        "policy_id": policy_cfg.get("policy_id")
+                        or policy_cfg.get("policyId"),
+                        "policy_slug": policy_cfg.get("policy_slug"),
+                        "detector": policy_cfg.get("detector"),
+                    }
+                    policy_metadata[display] = {
+                        key: value for key, value in entry.items() if value is not None
+                    }
 
             for display, retained in per_policy_retained.items():
                 policy_opportunities.setdefault(
@@ -1034,6 +1106,7 @@ class OpportunityMinerAgent(BaseAgent):
                         for category, findings in categories.items()
                     },
                 )
+                policy_metadata.setdefault(display, {})
 
             # compute weightage
             total_impact = sum(f.financial_impact_gbp for f in filtered)
@@ -1059,7 +1132,10 @@ class OpportunityMinerAgent(BaseAgent):
                 "policy_opportunities": policy_opportunities,
                 "policy_category_opportunities": policy_category_opportunities,
                 "policy_suppliers": policy_suppliers,
+                "policy_metadata": policy_metadata,
             }
+            if self._data_profile:
+                data["data_profile"] = self._data_profile
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
                 str(s["supplier_id"]).strip()
@@ -1224,6 +1300,7 @@ class OpportunityMinerAgent(BaseAgent):
         supplier_master = tables.get("supplier_master", pd.DataFrame())
         lookup: Dict[str, Optional[str]] = {}
         alias_map: Dict[str, set[str]] = {}
+        reference_lookup: Dict[str, Dict[str, Any]] = {}
 
         def _normalise_text(value: Any) -> Optional[str]:
             if value is None:
@@ -1261,6 +1338,17 @@ class OpportunityMinerAgent(BaseAgent):
                         aliases.add(row.get(name_col))
                     if trading_col and row.get(trading_col):
                         aliases.add(row.get(trading_col))
+                    reference_lookup[str(supplier_id)] = {
+                        "supplier_id": str(supplier_id),
+                        "supplier_name": row.get(name_col) or row.get(trading_col) or None,
+                        "aliases": sorted(
+                            {
+                                str(alias)
+                                for alias in aliases
+                                if alias is not None and str(alias).strip()
+                            }
+                        ),
+                    }
                     for alias in list(aliases):
                         normalised_alias = self._normalise_supplier_key(alias)
                         if normalised_alias:
@@ -1272,6 +1360,7 @@ class OpportunityMinerAgent(BaseAgent):
             for key, values in alias_map.items()
             if values
         }
+        self._supplier_reference_lookup = reference_lookup
         logger.debug(
             "Loaded %d suppliers from master data with %d alias keys",
             len(self._supplier_lookup),
@@ -1331,9 +1420,10 @@ class OpportunityMinerAgent(BaseAgent):
         if not purchase_orders.empty and "po_id" in purchase_orders.columns:
             df = purchase_orders.dropna(subset=["po_id"]).copy()
             df["po_id"] = df["po_id"].map(_normalise_id)
-            supplier_col = self._find_column_for_key(df, "supplier_id")
-            if supplier_col and supplier_col in df.columns:
-                df[supplier_col] = df[supplier_col].map(_normalise_id)
+            supplier_id_col = self._find_column_for_key(df, "supplier_id")
+            supplier_name_col = self._find_column_for_key(df, "supplier_name")
+            if supplier_id_col and supplier_id_col in df.columns:
+                df[supplier_id_col] = df[supplier_id_col].map(_normalise_id)
             if "contract_id" in df.columns:
                 df["contract_id"] = df["contract_id"].map(_normalise_id)
             df = df.dropna(subset=["po_id"])
@@ -1341,8 +1431,13 @@ class OpportunityMinerAgent(BaseAgent):
                 po_id = row.get("po_id")
                 if not po_id:
                     continue
-                supplier_id = row.get(supplier_col) if supplier_col else None
-                supplier_id = _normalise_id(supplier_id)
+                supplier_candidate = None
+                if supplier_id_col and supplier_id_col in df.columns:
+                    supplier_candidate = row.get(supplier_id_col)
+                    supplier_candidate = _normalise_id(supplier_candidate)
+                if not supplier_candidate and supplier_name_col and supplier_name_col in df.columns:
+                    supplier_candidate = row.get(supplier_name_col)
+                supplier_id = self._resolve_supplier_id(supplier_candidate)
                 contract_id = row.get("contract_id")
                 if contract_id:
                     po_contract_map[po_id] = contract_id
@@ -1360,9 +1455,10 @@ class OpportunityMinerAgent(BaseAgent):
         if not invoices.empty and "invoice_id" in invoices.columns:
             df = invoices.dropna(subset=["invoice_id"]).copy()
             df["invoice_id"] = df["invoice_id"].map(_normalise_id)
-            supplier_col = self._find_column_for_key(df, "supplier_id")
-            if supplier_col and supplier_col in df.columns:
-                df[supplier_col] = df[supplier_col].map(_normalise_id)
+            supplier_id_col = self._find_column_for_key(df, "supplier_id")
+            supplier_name_col = self._find_column_for_key(df, "supplier_name")
+            if supplier_id_col and supplier_id_col in df.columns:
+                df[supplier_id_col] = df[supplier_id_col].map(_normalise_id)
             if "po_id" in df.columns:
                 df["po_id"] = df["po_id"].map(_normalise_id)
             df = df.dropna(subset=["invoice_id"])
@@ -1371,8 +1467,13 @@ class OpportunityMinerAgent(BaseAgent):
                 if not invoice_id:
                     continue
                 po_id = row.get("po_id")
-                supplier_id = row.get(supplier_col) if supplier_col else None
-                supplier_id = _normalise_id(supplier_id)
+                supplier_candidate = None
+                if supplier_id_col and supplier_id_col in df.columns:
+                    supplier_candidate = row.get(supplier_id_col)
+                    supplier_candidate = _normalise_id(supplier_candidate)
+                if not supplier_candidate and supplier_name_col and supplier_name_col in df.columns:
+                    supplier_candidate = row.get(supplier_name_col)
+                supplier_id = self._resolve_supplier_id(supplier_candidate)
                 if po_id:
                     invoice_po_map[invoice_id] = po_id
                 candidate = supplier_id
@@ -1419,10 +1520,22 @@ class OpportunityMinerAgent(BaseAgent):
             df = po_lines.dropna(subset=["po_id"]).copy()
             df["po_id"] = df["po_id"].map(self._normalise_identifier)
             df = df.dropna(subset=["po_id"])
-            supplier_col = self._find_column_for_key(df, "supplier_id")
             df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
-            if supplier_col and supplier_col in df.columns:
-                fallback_suppliers = df[supplier_col].map(self._resolve_supplier_id)
+            supplier_columns: List[str] = []
+            for candidate in (
+                self._find_column_for_key(df, "supplier_id"),
+                self._find_column_for_key(df, "supplier_name"),
+            ):
+                if candidate and candidate in df.columns and candidate not in supplier_columns:
+                    supplier_columns.append(candidate)
+            fallback_suppliers = None
+            for column in supplier_columns:
+                resolved = df[column].map(self._resolve_supplier_id)
+                if fallback_suppliers is None:
+                    fallback_suppliers = resolved
+                else:
+                    fallback_suppliers = fallback_suppliers.combine_first(resolved)
+            if fallback_suppliers is not None:
                 mask = df["supplier_id"].isna()
                 if mask.any():
                     if df["supplier_id"].dtype != object:
@@ -1467,9 +1580,21 @@ class OpportunityMinerAgent(BaseAgent):
                 df.loc[df["supplier_id"].isna(), "supplier_id"] = df.loc[
                     df["supplier_id"].isna(), "po_id_norm"
                 ].map(self._po_supplier_map)
-            supplier_col = self._find_column_for_key(df, "supplier_id")
-            if supplier_col and supplier_col in df.columns:
-                fallback_suppliers = df[supplier_col].map(self._resolve_supplier_id)
+            supplier_columns: List[str] = []
+            for candidate in (
+                self._find_column_for_key(df, "supplier_id"),
+                self._find_column_for_key(df, "supplier_name"),
+            ):
+                if candidate and candidate in df.columns and candidate not in supplier_columns:
+                    supplier_columns.append(candidate)
+            fallback_suppliers = None
+            for column in supplier_columns:
+                resolved = df[column].map(self._resolve_supplier_id)
+                if fallback_suppliers is None:
+                    fallback_suppliers = resolved
+                else:
+                    fallback_suppliers = fallback_suppliers.combine_first(resolved)
+            if fallback_suppliers is not None:
                 mask = df["supplier_id"].isna()
                 if mask.any():
                     if df["supplier_id"].dtype != object:
@@ -1585,6 +1710,21 @@ class OpportunityMinerAgent(BaseAgent):
             contracts["adjusted_price_gbp"] = contracts.get("agreed_price_gbp", contracts.get("agreed_price", 0.0))
             tables["contracts"] = contracts
         return tables
+
+    def _build_data_profile(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "tables": {},
+        }
+        for name, df in tables.items():
+            if not isinstance(df, pd.DataFrame):
+                continue
+            profile["tables"][name] = {
+                "row_count": int(df.shape[0]) if df is not None else 0,
+                "column_count": int(df.shape[1]) if df is not None else 0,
+                "columns": list(df.columns) if not df.empty else [],
+            }
+        return profile
 
     # ------------------------------------------------------------------
     # Policy helpers
