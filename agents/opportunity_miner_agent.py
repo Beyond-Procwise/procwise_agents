@@ -1217,6 +1217,7 @@ class OpportunityMinerAgent(BaseAgent):
             return None
         return text.lower()
 
+
     def _build_supplier_lookup(self, tables: Dict[str, pd.DataFrame]) -> None:
         """Build helper maps to resolve supplier metadata from ``proc.supplier``."""
 
@@ -2488,6 +2489,7 @@ class OpportunityMinerAgent(BaseAgent):
                         conditions, "supplier_id", supplier_candidate, override=True
                     )
                     return supplier_candidate, metadata
+
 
         attempts = metadata.get("attempted_sources") or {}
         if not attempts:
