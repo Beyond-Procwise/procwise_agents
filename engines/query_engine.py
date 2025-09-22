@@ -238,6 +238,34 @@ class QueryEngine(BaseEngine):
                 )
 
                 supplier_cols = self._get_columns(conn, "proc", "supplier")
+                supplier_cols_set = set(supplier_cols)
+
+                # Determine which supplier columns can safely be projected from
+                # ``proc.supplier``. ``supplier_id`` and ``supplier_name`` are
+                # required for downstream joins. Additional fields are only
+                # included when they exist in the current database so we avoid
+                # referencing stale or renamed columns.
+                supplier_projection: list[str] = []
+                for mandatory in ("supplier_id", "supplier_name"):
+                    if mandatory not in supplier_projection:
+                        supplier_projection.append(mandatory)
+                for field in SUPPLIER_FIELDS:
+                    if (
+                        field in supplier_cols_set
+                        and field not in {"supplier_id", "supplier_name"}
+                        and field not in supplier_projection
+                    ):
+                        supplier_projection.append(field)
+
+                supplier_lookup_select_parts = [
+                    f"src.{field}" for field in supplier_projection
+                ]
+                supplier_lookup_select_parts.append(
+                    "LOWER(NULLIF(BTRIM(src.supplier_name), '')) AS supplier_name_norm"
+                )
+                supplier_lookup_select = ",\n                           ".join(
+                    supplier_lookup_select_parts
+                )
 
                 # Build expression for on-time performance using the delivery
                 # lead-time column if present. The column is stored as
@@ -245,7 +273,7 @@ class QueryEngine(BaseEngine):
                 # when the value looks numeric to avoid ``DatatypeMismatch``
                 # errors.  Non-existent columns result in a constant ``0.0`` to
                 # keep the query resilient across database variants.
-                if "delivery_lead_time_days" in supplier_cols:
+                if "delivery_lead_time_days" in supplier_cols_set:
                     on_time_expr = (
                         "CASE "
                         "WHEN s.delivery_lead_time_days ~ '^-?\\d+(\\.\\d+)?$' "
@@ -262,22 +290,21 @@ class QueryEngine(BaseEngine):
                 # database. ``supplier_id`` and ``supplier_name`` are already
                 # projected earlier in the query, so they are skipped here to
                 # avoid duplicate columns in the result set.
-                additional = [
-                    f"s.{c}" for c in SUPPLIER_FIELDS
-                    if c in supplier_cols and c not in {"supplier_id", "supplier_name"}
+                extra_output_fields = [
+                    f"s.{field}"
+                    for field in supplier_projection
+                    if field not in {"supplier_id", "supplier_name"}
                 ]
                 additional_fields = (
-                    ",\n                    " + ",\n                    ".join(additional)
-                    if additional
+                    ",\n                    " + ",\n                    ".join(extra_output_fields)
+                    if extra_output_fields
                     else ""
                 )
 
                 sql = f"""
                 WITH supplier_lookup AS (
-                    SELECT supplier_id,
-                           supplier_name,
-                           LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm
-                    FROM proc.supplier
+                    SELECT {supplier_lookup_select}
+                    FROM proc.supplier src
                 ), po AS (
                     SELECT LOWER(NULLIF(BTRIM(p.supplier_name), '')) AS supplier_name_norm,
                            SUM({po_price} * {po_qty}) AS po_spend
