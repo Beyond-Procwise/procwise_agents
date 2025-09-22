@@ -161,6 +161,54 @@ def test_build_finding_includes_policy_identifier():
     assert "policy_10" in finding_b.opportunity_id
 
 
+def test_build_finding_normalises_decimal_inputs():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    details = {"savings": Decimal("12.34"), "nested": {"delta": Decimal("1.23")}}
+    sources = ["PO-1", Decimal("2")]
+
+    finding = agent._build_finding(
+        "SupplierConsolidationOpportunity",
+        "SI0001",
+        "Category-1",
+        "Item-1",
+        Decimal("99.50"),
+        details,
+        sources,
+        policy_id="policy_12",
+        policy_name="Supplier Consolidation",
+    )
+
+    assert isinstance(finding.financial_impact_gbp, float)
+    assert finding.financial_impact_gbp == pytest.approx(99.5)
+    assert isinstance(finding.calculation_details["savings"], float)
+    assert finding.calculation_details["nested"]["delta"] == pytest.approx(1.23)
+    assert all(isinstance(src, str) for src in finding.source_records)
+
+
+def test_normalise_numeric_dataframe_converts_decimals():
+    nick = DummyNick()
+    nick.query_engine = None
+    agent = OpportunityMinerAgent(nick)
+
+    df = pd.DataFrame(
+        {
+            "line_total": [Decimal("10.50"), Decimal("5.25"), None],
+            "po_id": ["PO-1", "PO-2", "PO-3"],
+            "line_number": [1, 2, None],
+        }
+    )
+
+    normalised = agent._normalise_numeric_dataframe(df.copy())
+
+    assert normalised["line_total"].dtype == float
+    assert normalised["line_total"].iloc[0] == pytest.approx(10.5)
+    assert normalised["line_number"].dtype == float
+    assert normalised["line_number"].iloc[1] == pytest.approx(2.0)
+
+
 def test_normalise_currency_handles_decimal_sources():
     nick = DummyNick()
     nick.query_engine = None

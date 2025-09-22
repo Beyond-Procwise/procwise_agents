@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -651,20 +652,23 @@ class OpportunityMinerAgent(BaseAgent):
                     cursor.execute(query)
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                return pd.DataFrame(rows, columns=columns)
+                df = pd.DataFrame(rows, columns=columns)
+                return self._normalise_numeric_dataframe(df)
 
         engine_getter = getattr(self.agent_nick, "get_db_engine", None)
         engine = engine_getter() if callable(engine_getter) else None
         if engine is not None:
             with engine.connect() as conn:
-                return pd.read_sql(query, conn, params=params)
+                df = pd.read_sql(query, conn, params=params)
+                return self._normalise_numeric_dataframe(df)
 
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         if callable(pandas_conn):
             with pandas_conn() as conn:
                 if hasattr(conn, "cursor"):
                     return _fetch_with_cursor(conn)
-                return pd.read_sql(query, conn, params=params)
+                df = pd.read_sql(query, conn, params=params)
+                return self._normalise_numeric_dataframe(df)
 
         conn_getter = getattr(self.agent_nick, "get_db_connection", None)
         if callable(conn_getter):
@@ -1249,10 +1253,53 @@ class OpportunityMinerAgent(BaseAgent):
         for name, df in list(tables.items()):
             if df.empty:
                 continue
-            # Drop rows that are entirely null
-            tables[name] = df.dropna(how="all")
-            logger.debug("Table %s columns: %s", name, list(tables[name].columns))
+            # Drop rows that are entirely null and normalise numeric types.
+            cleaned = df.dropna(how="all")
+            cleaned = self._normalise_numeric_dataframe(cleaned)
+            tables[name] = cleaned
+            logger.debug("Table %s columns: %s", name, list(cleaned.columns))
         return tables
+
+    def _normalise_numeric_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy of ``df`` with Decimal values coerced to native floats."""
+
+        if df.empty:
+            return df
+
+        def _convert_decimal(value: Any) -> Any:
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
+
+        for column in df.columns:
+            series = df[column]
+            if not pd.api.types.is_object_dtype(series):
+                continue
+            if series.map(lambda value: isinstance(value, Decimal)).any():
+                df[column] = series.apply(_convert_decimal)
+                series = df[column]
+            non_null = series.dropna()
+            if non_null.empty:
+                continue
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in non_null
+            ):
+                df[column] = pd.to_numeric(series, errors="coerce")
+        return df
+
+    def _normalise_numeric_value(self, value: Any) -> Any:
+        """Coerce Decimal values inside nested structures to native floats."""
+
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, dict):
+            return {k: self._normalise_numeric_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._normalise_numeric_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._normalise_numeric_value(v) for v in value)
+        return value
 
     def _normalise_supplier_key(self, value: Any) -> Optional[str]:
         if value is None:
@@ -3032,8 +3079,9 @@ class OpportunityMinerAgent(BaseAgent):
         supplier_id = _clean(supplier_id)
         category_id = _clean(category_id)
         item_id = _clean(item_id)
-        if impact is None or (isinstance(impact, float) and pd.isna(impact)):
-            impact = 0.0
+        impact_value = self._to_float(impact)
+        if pd.isna(impact_value):
+            impact_value = 0.0
 
         detector_slug = self._normalise_policy_slug(detector) or "detector"
         policy_slug = (
@@ -3050,6 +3098,7 @@ class OpportunityMinerAgent(BaseAgent):
         item_slug = _slug_or_default(item_id, "na")
 
         source_token = "none"
+        normalised_sources: List[str] = []
         if sources:
             normalised_sources = [
                 str(src).strip()
@@ -3070,15 +3119,19 @@ class OpportunityMinerAgent(BaseAgent):
         if policy_id is not None:
             policy_identifier = str(policy_id).strip() or None
 
+        details = (
+            self._normalise_numeric_value(details) if isinstance(details, dict) else {}
+        )
+
         finding = Finding(
             opportunity_id=opportunity_id,
             detector_type=detector,
             supplier_id=supplier_id,
             category_id=category_id,
             item_id=item_id,
-            financial_impact_gbp=float(impact),
+            financial_impact_gbp=impact_value,
             calculation_details=details,
-            source_records=sources,
+            source_records=normalised_sources,
             detected_on=datetime.utcnow(),
             item_reference=item_id,
             policy_id=policy_identifier,
@@ -3090,7 +3143,7 @@ class OpportunityMinerAgent(BaseAgent):
             supplier_id,
             category_id,
             item_id,
-            impact,
+            impact_value,
         )
         return finding
 
