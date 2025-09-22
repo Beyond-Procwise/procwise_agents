@@ -10,6 +10,7 @@ from email import encoders
 import boto3
 from botocore.exceptions import ClientError
 
+
 from utils.gpu import configure_gpu
 
 configure_gpu()
@@ -92,6 +93,7 @@ class EmailService:
             raise RuntimeError(
                 f"Failed to retrieve SES SMTP secret '{secret_name}'"
             ) from exc
+
         secret_string = secret_value.get("SecretString")
         if not secret_string:
             raise ValueError("Secret does not contain a SecretString payload")
@@ -147,3 +149,4 @@ class EmailService:
             aws_secret_access_key=secret_key,
             aws_session_token=session_token,
         )
+
