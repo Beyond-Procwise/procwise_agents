@@ -684,6 +684,60 @@ def test_price_variance_infers_supplier_from_contract(monkeypatch):
     assert context.input_data["conditions"]["supplier_id"] == "SI0001"
 
 
+def test_price_variance_infers_supplier_from_item(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "item_id": "ITM-001",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0001"
+    assert context.input_data["conditions"]["supplier_id"] == "SI0001"
+
+
+def test_price_variance_infers_supplier_from_description(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "item_description": "Logistics Support",
+            "actual_price": 11.0,
+            "benchmark_price": 9.0,
+            "quantity": 10,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings
+    assert findings[0]["supplier_id"] == "SI0001"
+    assert context.input_data["conditions"]["supplier_id"] == "SI0001"
+
+
 def test_candidate_supplier_lookup_uses_original_item(monkeypatch):
     agent = create_agent(monkeypatch)
     calls: list[Any] = []
