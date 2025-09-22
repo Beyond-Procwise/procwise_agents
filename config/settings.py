@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     ses_inbound_bucket: Optional[str] = Field(default=None, env="SES_INBOUND_BUCKET")
     ses_inbound_prefix: str = Field(default="ses/inbound/", env="SES_INBOUND_PREFIX")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
+    ses_secret_role_arn: Optional[str] = Field(
+        default=None, env="SES_SECRET_ROLE_ARN"
+    )
+
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
