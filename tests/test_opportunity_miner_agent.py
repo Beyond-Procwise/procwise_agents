@@ -897,6 +897,17 @@ def test_dynamic_policies_surface_opportunities(monkeypatch):
             if entries:
                 assert 1 <= len(entries) <= 2
     assert output.data.get("supplier_candidates")
+    top_summary = output.data.get("policy_top_opportunities")
+    assert top_summary
+    for policy_name, summary in top_summary.items():
+        assert "top_opportunities" in summary
+        assert summary["total_opportunities"] >= len(summary["top_opportunities"])
+        if summary["top_opportunities"]:
+            impacts = [entry["financial_impact_gbp"] for entry in summary["top_opportunities"]]
+            assert impacts == sorted(impacts, reverse=True)
+    snapshot = output.data.get("data_flow_snapshot")
+    assert snapshot
+    assert snapshot.get("relationships") is not None
 
 
 def test_policy_category_limits_caps_results():
