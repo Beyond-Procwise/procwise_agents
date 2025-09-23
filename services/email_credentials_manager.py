@@ -1,0 +1,182 @@
+"""Utilities for rotating SES SMTP credentials and updating Secrets Manager."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+from dataclasses import dataclass
+
+import boto3
+from botocore.exceptions import ClientError
+
+from utils.gpu import configure_gpu
+
+configure_gpu()
+
+
+class CredentialsRotationError(RuntimeError):
+    """Raised when SES SMTP credential rotation fails."""
+
+
+@dataclass
+class RotatedCredentials:
+    """Value object holding newly rotated SMTP credentials."""
+
+    smtp_username: str
+    smtp_password: str
+    access_key_id: str
+
+
+class SESSMTPAccessManager:
+    """Manage SES SMTP access keys stored in AWS Secrets Manager."""
+
+    def __init__(self, agent_nick):
+        self.agent_nick = agent_nick
+        self.settings = agent_nick.settings
+        self.logger = logging.getLogger(__name__)
+
+    def rotate_smtp_credentials(self) -> RotatedCredentials:
+        """Rotate the SES SMTP IAM user's credentials and persist them."""
+
+        iam_user = getattr(self.settings, "ses_smtp_iam_user", None)
+        if not iam_user:
+            raise CredentialsRotationError("SES SMTP IAM user is not configured")
+
+        secret_name = getattr(self.settings, "ses_smtp_secret_name", None)
+        if not secret_name:
+            raise CredentialsRotationError("SES SMTP secret name is not configured")
+
+        region = getattr(self.settings, "ses_region", None) or "eu-west-1"
+
+        iam_client = boto3.client("iam")
+        secrets_client = self._secrets_manager_client(region)
+
+        try:
+            response = iam_client.list_access_keys(UserName=iam_user)
+            keys = response.get("AccessKeyMetadata", [])
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            raise CredentialsRotationError(
+                "Failed to list SES SMTP IAM access keys"
+            ) from exc
+
+        if len(keys) >= 2:
+            oldest_key = sorted(keys, key=lambda item: item.get("CreateDate"))[0]
+            oldest_key_id = oldest_key.get("AccessKeyId")
+            if oldest_key_id:
+                try:
+                    iam_client.delete_access_key(
+                        UserName=iam_user,
+                        AccessKeyId=oldest_key_id,
+                    )
+                    self.logger.info(
+                        "Deleted oldest SES SMTP access key %s for user %s",
+                        oldest_key_id,
+                        iam_user,
+                    )
+                except ClientError as exc:  # pragma: no cover - boto3 error handling
+                    raise CredentialsRotationError(
+                        f"Failed to delete SES SMTP access key {oldest_key_id}"
+                    ) from exc
+
+        try:
+            new_key = iam_client.create_access_key(UserName=iam_user)["AccessKey"]
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            raise CredentialsRotationError(
+                "Failed to create a new SES SMTP access key"
+            ) from exc
+
+        access_key_id = new_key.get("AccessKeyId")
+        secret_access_key = new_key.get("SecretAccessKey")
+        if not access_key_id or not secret_access_key:
+            raise CredentialsRotationError(
+                "IAM did not return a complete set of credentials"
+            )
+
+        smtp_password = self._create_smtp_password(secret_access_key, region)
+
+        secret_value = json.dumps(
+            {
+                "SMTP_USERNAME": access_key_id,
+                "SMTP_PASSWORD": smtp_password,
+            }
+        )
+
+        try:
+            secrets_client.put_secret_value(
+                SecretId=secret_name,
+                SecretString=secret_value,
+            )
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            raise CredentialsRotationError(
+                f"Failed to update secret {secret_name} with rotated credentials"
+            ) from exc
+
+        self.logger.info(
+            "Rotated SES SMTP credentials for user %s and updated secret %s",
+            iam_user,
+            secret_name,
+        )
+
+        return RotatedCredentials(
+            smtp_username=access_key_id,
+            smtp_password=smtp_password,
+            access_key_id=access_key_id,
+        )
+
+    def _create_smtp_password(self, secret_access_key: str, region: str) -> str:
+        """Convert an IAM secret access key into an SES SMTP password."""
+
+        message = "SendRawEmail"
+        version = 0x02
+        sig = hmac.new(
+            region.encode("utf-8"),
+            secret_access_key.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        sig2 = hmac.new(message.encode("utf-8"), sig, hashlib.sha256).digest()
+        return base64.b64encode(bytes([version]) + sig2).decode()
+
+    def _secrets_manager_client(self, region: str):
+        """Create a Secrets Manager client, assuming a role when configured."""
+
+        role_arn = getattr(self.settings, "ses_secret_role_arn", None)
+        if not role_arn:
+            return boto3.client("secretsmanager", region_name=region)
+
+        self.logger.debug(
+            "Assuming role %s to update SES SMTP credentials", role_arn
+        )
+
+        sts_kwargs = {"region_name": region} if region else {}
+        sts_client = boto3.client("sts", **sts_kwargs)
+
+        try:
+            response = sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName="ProcWiseEmailSecrets",
+            )
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            raise CredentialsRotationError(
+                f"Unable to assume role {role_arn} for SES secret access"
+            ) from exc
+
+        credentials = response.get("Credentials")
+        if not credentials:
+            raise CredentialsRotationError("STS did not return temporary credentials")
+
+        access_key = credentials.get("AccessKeyId")
+        secret_key = credentials.get("SecretAccessKey")
+        session_token = credentials.get("SessionToken")
+        if not all([access_key, secret_key, session_token]):
+            raise CredentialsRotationError("Incomplete credentials received from STS")
+
+        return boto3.client(
+            "secretsmanager",
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token,
+        )
