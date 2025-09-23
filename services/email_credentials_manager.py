@@ -56,6 +56,7 @@ class SESSMTPAccessManager:
             if not iam_user:
                 raise CredentialsRotationError("SES SMTP IAM user is not configured")
 
+
         try:
             response = iam_client.list_access_keys(UserName=iam_user)
             keys = response.get("AccessKeyMetadata", [])
