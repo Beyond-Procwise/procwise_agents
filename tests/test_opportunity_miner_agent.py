@@ -889,6 +889,11 @@ def test_dynamic_policies_surface_opportunities(monkeypatch):
         suppliers = policy_suppliers.get(name)
         assert suppliers
         assert any(supplier.startswith("SI") for supplier in suppliers)
+    supplier_gaps = output.data.get("policy_supplier_gaps")
+    assert supplier_gaps is not None
+    for name, suppliers in policy_suppliers.items():
+        if suppliers:
+            assert name not in supplier_gaps
     assert output.data.get("policy_opportunities")
     category_map = output.data.get("policy_category_opportunities")
     assert category_map
@@ -908,6 +913,37 @@ def test_dynamic_policies_surface_opportunities(monkeypatch):
     snapshot = output.data.get("data_flow_snapshot")
     assert snapshot
     assert snapshot.get("relationships") is not None
+
+
+def test_policy_supplier_gap_reason_when_no_suppliers(monkeypatch):
+    tables = _sample_tables()
+    agent = create_agent(monkeypatch, tables)
+    context = build_context(
+        "price_variance_check",
+        {
+            "supplier_id": "SI9999",
+            "item_id": "ITM-999",
+            "actual_price": 10.0,
+            "benchmark_price": 9.0,
+            "quantity": 5,
+            "variance_threshold_pct": 0.05,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    suppliers_by_policy = output.data.get("policy_suppliers")
+    assert suppliers_by_policy
+    for suppliers in suppliers_by_policy.values():
+        assert isinstance(suppliers, list)
+        assert len(suppliers) == 0
+    supplier_gaps = output.data.get("policy_supplier_gaps")
+    assert supplier_gaps
+    reason = next(iter(supplier_gaps.values()))
+    assert isinstance(reason, str)
+    assert reason
+
 
 
 def test_policy_category_limits_caps_results():

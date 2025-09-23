@@ -5,8 +5,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 from qdrant_client import models
 
@@ -15,121 +14,39 @@ from utils.gpu import configure_gpu
 logger = logging.getLogger(__name__)
 
 
-# Canonical procurement relationships derived from ``docs/procurement_table_reference.md``.
-# ``source``/``target`` reference the table identifiers used by ``OpportunityMinerAgent.TABLE_MAP``
-# (and other services) so that the relationships can be evaluated directly against the
-# pandas DataFrames loaded at runtime.
-PROCUREMENT_RELATIONSHIPS: Tuple[Dict[str, Any], ...] = (
-    {
-        "source": "contracts",
-        "source_column": "supplier_id",
-        "target": "supplier_master",
-        "target_column": "supplier_id",
-        "relationship": "references",
-        "description": "Contracts are linked to supplier master records via supplier_id.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "purchase_orders",
-        "source_column": "contract_id",
-        "target": "contracts",
-        "target_column": "contract_id",
-        "relationship": "references",
-        "description": "Purchase orders reference the contract they were raised against.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "purchase_orders",
-        "source_column": "supplier_id",
-        "target": "supplier_master",
-        "target_column": "supplier_id",
-        "relationship": "references",
-        "description": "Purchase orders inherit supplier attributes from the supplier master.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "purchase_order_lines",
-        "source_column": "po_id",
-        "target": "purchase_orders",
-        "target_column": "po_id",
-        "relationship": "belongs_to",
-        "description": "Line items roll up to their parent purchase order via po_id.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "invoice_lines",
-        "source_column": "invoice_id",
-        "target": "invoices",
-        "target_column": "invoice_id",
-        "relationship": "belongs_to",
-        "description": "Invoice line items aggregate into invoices via invoice_id.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "invoice_lines",
-        "source_column": "po_id",
-        "target": "purchase_orders",
-        "target_column": "po_id",
-        "relationship": "reconciles",
-        "description": "Invoice lines reconcile back to the originating purchase order.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "invoices",
-        "source_column": "po_id",
-        "target": "purchase_orders",
-        "target_column": "po_id",
-        "relationship": "reconciles",
-        "description": "Invoices reconcile to the purchase order that triggered them.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "product_mapping",
-        "source_column": "product",
-        "target": "purchase_order_lines",
-        "target_column": "item_description",
-        "relationship": "categorises",
-        "description": "Product taxonomy enriches PO line descriptions for category analytics.",
-        "source_normalizer": "text",
-        "target_normalizer": "text",
-    },
-    {
-        "source": "quote_lines",
-        "source_column": "quote_id",
-        "target": "quotes",
-        "target_column": "quote_id",
-        "relationship": "belongs_to",
-        "description": "Quote line items attach to their header quote records.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-    {
-        "source": "quotes",
-        "source_column": "po_id",
-        "target": "purchase_orders",
-        "target_column": "po_id",
-        "relationship": "compares",
-        "description": "Quotes can be compared against the purchase order ultimately issued.",
-        "source_normalizer": "id",
-        "target_normalizer": "id",
-    },
-)
+@dataclass(frozen=True)
+class RelationshipConfig:
+    """Configuration describing how two procurement tables relate."""
 
-# High level flow paths for reporting and vector persistence.
-PROCUREMENT_FLOW_PATHS: Tuple[Tuple[str, ...], ...] = (
-    ("contracts", "supplier_master", "purchase_orders", "purchase_order_lines"),
-    ("contracts", "purchase_orders", "invoices", "invoice_lines"),
-    ("purchase_orders", "purchase_order_lines", "product_mapping"),
-    ("purchase_orders", "quotes", "quote_lines"),
-    ("purchase_orders", "invoices", "invoice_lines"),
-)
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+    relationship: str
+    description: str
+    source_normalizer: str = "id"
+    target_normalizer: str = "id"
+    source_aliases: Tuple[str, ...] = ()
+    target_aliases: Tuple[str, ...] = ()
+    source_column_aliases: Tuple[str, ...] = ()
+    target_column_aliases: Tuple[str, ...] = ()
+
+
+@dataclass
+class TableAliasIndex:
+    """Index translating canonical procurement tables to runtime aliases."""
+
+    canonical_to_aliases: Dict[str, Tuple[str, ...]]
+    alias_to_canonical: Dict[str, str]
+
+    def resolve_alias(self, canonical: str, tables: Mapping[str, pd.DataFrame]) -> Optional[str]:
+        for alias in self.canonical_to_aliases.get(canonical, ()):  # pragma: no branch - deterministic order
+            if alias in tables:
+                return alias
+        return None
+
+    def canonical_name(self, alias: str) -> str:
+        return self.alias_to_canonical.get(alias, alias)
 
 
 @dataclass
@@ -144,6 +61,8 @@ class RelationAnalysis:
     description: Optional[str]
     status: str
     confidence: float
+    source_table_alias: Optional[str] = None
+    target_table_alias: Optional[str] = None
     source_column_resolved: Optional[str] = None
     target_column_resolved: Optional[str] = None
     source_unique_values: int = 0
@@ -156,9 +75,11 @@ class RelationAnalysis:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "source_table": self.source_table,
+            "source_table_alias": self.source_table_alias,
             "source_column": self.source_column,
             "source_column_resolved": self.source_column_resolved,
             "target_table": self.target_table,
+            "target_table_alias": self.target_table_alias,
             "target_column": self.target_column,
             "target_column_resolved": self.target_column_resolved,
             "relationship_type": self.relationship_type,
@@ -172,6 +93,134 @@ class RelationAnalysis:
             "target_coverage": self.target_coverage,
             "sample_values": list(self.sample_values),
         }
+
+
+# Canonical procurement relationships derived from ``docs/procurement_table_reference.md``.
+PROCUREMENT_TABLE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "proc.contracts": ("contracts",),
+    "proc.supplier": ("supplier_master", "suppliers"),
+    "proc.purchase_order_agent": ("purchase_orders", "purchase_order_agent"),
+    "proc.po_line_items_agent": ("purchase_order_lines", "po_line_items"),
+    "proc.invoice_agent": ("invoices", "invoice_agent"),
+    "proc.invoice_line_items_agent": ("invoice_lines", "invoice_line_items"),
+    "proc.cat_product_mapping": ("product_mapping", "cat_product_mapping"),
+    "proc.quote_agent": ("quotes", "quote_agent"),
+    "proc.quote_line_items_agent": ("quote_lines", "quote_line_items"),
+}
+
+PROCUREMENT_RELATIONSHIPS: Tuple[RelationshipConfig, ...] = (
+    RelationshipConfig(
+        source_table="proc.contracts",
+        source_column="supplier_id",
+        target_table="proc.supplier",
+        target_column="supplier_id",
+        relationship="references",
+        description="Contracts are linked to supplier master records via supplier_id.",
+        source_aliases=("contracts",),
+        target_aliases=("supplier_master", "suppliers"),
+    ),
+    RelationshipConfig(
+        source_table="proc.purchase_order_agent",
+        source_column="contract_id",
+        target_table="proc.contracts",
+        target_column="contract_id",
+        relationship="references",
+        description="Purchase orders reference the contract they were raised against.",
+        source_aliases=("purchase_orders",),
+        target_aliases=("contracts",),
+    ),
+    RelationshipConfig(
+        source_table="proc.purchase_order_agent",
+        source_column="supplier_id",
+        target_table="proc.supplier",
+        target_column="supplier_id",
+        relationship="references",
+        description="Purchase orders inherit supplier attributes from the supplier master.",
+        source_aliases=("purchase_orders",),
+        target_aliases=("supplier_master", "suppliers"),
+    ),
+    RelationshipConfig(
+        source_table="proc.po_line_items_agent",
+        source_column="po_id",
+        target_table="proc.purchase_order_agent",
+        target_column="po_id",
+        relationship="belongs_to",
+        description="Line items roll up to their parent purchase order via po_id.",
+        source_aliases=("purchase_order_lines",),
+        target_aliases=("purchase_orders",),
+    ),
+    RelationshipConfig(
+        source_table="proc.invoice_line_items_agent",
+        source_column="invoice_id",
+        target_table="proc.invoice_agent",
+        target_column="invoice_id",
+        relationship="belongs_to",
+        description="Invoice line items aggregate into invoices via invoice_id.",
+        source_aliases=("invoice_lines",),
+        target_aliases=("invoices",),
+    ),
+    RelationshipConfig(
+        source_table="proc.invoice_line_items_agent",
+        source_column="po_id",
+        target_table="proc.purchase_order_agent",
+        target_column="po_id",
+        relationship="reconciles",
+        description="Invoice lines reconcile back to the originating purchase order.",
+        source_aliases=("invoice_lines",),
+        target_aliases=("purchase_orders",),
+    ),
+    RelationshipConfig(
+        source_table="proc.invoice_agent",
+        source_column="po_id",
+        target_table="proc.purchase_order_agent",
+        target_column="po_id",
+        relationship="reconciles",
+        description="Invoices reconcile to the purchase order that triggered them.",
+        source_aliases=("invoices",),
+        target_aliases=("purchase_orders",),
+    ),
+    RelationshipConfig(
+        source_table="proc.cat_product_mapping",
+        source_column="product",
+        target_table="proc.po_line_items_agent",
+        target_column="item_description",
+        relationship="categorises",
+        description="Product taxonomy enriches PO line descriptions for category analytics.",
+        source_aliases=("product_mapping",),
+        target_aliases=("purchase_order_lines",),
+        source_normalizer="text",
+        target_normalizer="text",
+    ),
+    RelationshipConfig(
+        source_table="proc.quote_line_items_agent",
+        source_column="quote_id",
+        target_table="proc.quote_agent",
+        target_column="quote_id",
+        relationship="belongs_to",
+        description="Quote line items attach to their header quote records.",
+        source_aliases=("quote_lines",),
+        target_aliases=("quotes",),
+    ),
+    RelationshipConfig(
+        source_table="proc.quote_agent",
+        source_column="po_id",
+        target_table="proc.purchase_order_agent",
+        target_column="po_id",
+        relationship="compares",
+        description="Quotes can be compared against the purchase order ultimately issued.",
+        source_aliases=("quotes",),
+        target_aliases=("purchase_orders",),
+    ),
+)
+
+# High level flow paths for reporting and vector persistence (canonical table names).
+PROCUREMENT_FLOW_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("proc.contracts", "proc.supplier", "proc.purchase_order_agent", "proc.po_line_items_agent"),
+    ("proc.contracts", "proc.purchase_order_agent", "proc.invoice_agent", "proc.invoice_line_items_agent"),
+    ("proc.purchase_order_agent", "proc.po_line_items_agent", "proc.cat_product_mapping"),
+    ("proc.purchase_order_agent", "proc.quote_agent", "proc.quote_line_items_agent"),
+    ("proc.purchase_order_agent", "proc.invoice_agent", "proc.invoice_line_items_agent"),
+)
 
 
 class DataFlowManager:
@@ -192,29 +241,32 @@ class DataFlowManager:
     # Public API
     # ------------------------------------------------------------------
     def build_data_flow_map(
-        self, tables: Dict[str, pd.DataFrame]
+        self,
+        tables: Dict[str, pd.DataFrame],
+        table_name_map: Optional[Mapping[str, str]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Analyse relationships across ``tables`` and build a knowledge graph."""
 
+        alias_index = self._build_alias_index(tables, table_name_map)
         relations: List[RelationAnalysis] = []
         for config in PROCUREMENT_RELATIONSHIPS:
             try:
-                relation = self._analyse_relationship(config, tables)
+                relation = self._analyse_relationship(config, tables, alias_index)
             except Exception:  # pragma: no cover - defensive guardrail
                 logger.exception("Failed to analyse relationship %s", config)
                 relation = RelationAnalysis(
-                    source_table=config["source"],
-                    source_column=config["source_column"],
-                    target_table=config["target"],
-                    target_column=config["target_column"],
-                    relationship_type=config.get("relationship", "related_to"),
-                    description=config.get("description"),
+                    source_table=config.source_table,
+                    source_column=config.source_column,
+                    target_table=config.target_table,
+                    target_column=config.target_column,
+                    relationship_type=config.relationship,
+                    description=config.description,
                     status="error",
                     confidence=0.0,
                 )
             relations.append(relation)
 
-        graph = self._build_graph(relations, tables)
+        graph = self._build_graph(relations, tables, alias_index)
         relations_dicts = [relation.as_dict() for relation in relations]
         return relations_dicts, graph
 
@@ -255,23 +307,36 @@ class DataFlowManager:
             }
             if relation.get("description"):
                 payload["description"] = relation.get("description")
+            if relation.get("source_table_alias"):
+                payload["source_table_alias"] = relation.get("source_table_alias")
+            if relation.get("target_table_alias"):
+                payload["target_table_alias"] = relation.get("target_table_alias")
             point_id = self._deterministic_id(text)
             points.append(
                 models.PointStruct(id=point_id, vector=vector, payload=payload)
             )
 
         if graph:
-            for path in graph.get("paths", []):
-                if not path:
+            for path_entry in graph.get("paths", []):
+                if isinstance(path_entry, dict):
+                    canonical_path = tuple(path_entry.get("canonical", ()))
+                    resolved_aliases = tuple(path_entry.get("resolved", ()))
+                else:  # pragma: no cover - legacy format compatibility
+                    canonical_path = tuple(path_entry)
+                    resolved_aliases = ()
+                if not canonical_path:
                     continue
-                path_text = self._path_to_text(path)
+                path_text = self._path_to_text(canonical_path, resolved_aliases or None)
                 vector = self._embed_text(path_text)
                 if vector is None:
                     continue
                 payload = {
                     "document_type": "knowledge_graph_path",
-                    "path": list(path),
+                    "path": list(canonical_path),
                 }
+                if resolved_aliases and resolved_aliases != canonical_path:
+                    payload["resolved_aliases"] = list(resolved_aliases)
+
                 point_id = self._deterministic_id(path_text)
                 points.append(
                     models.PointStruct(id=point_id, vector=vector, payload=payload)
@@ -294,67 +359,78 @@ class DataFlowManager:
     # Relationship analysis helpers
     # ------------------------------------------------------------------
     def _analyse_relationship(
-        self, config: Dict[str, Any], tables: Dict[str, pd.DataFrame]
+        self,
+        config: RelationshipConfig,
+        tables: Dict[str, pd.DataFrame],
+        alias_index: TableAliasIndex,
     ) -> RelationAnalysis:
-        source_table = config["source"]
-        target_table = config["target"]
-        relation_type = config.get("relationship", "related_to")
-        description = config.get("description")
-
-        source_df = tables.get(source_table, pd.DataFrame())
-        target_df = tables.get(target_table, pd.DataFrame())
+        source_alias = alias_index.resolve_alias(config.source_table, tables)
+        target_alias = alias_index.resolve_alias(config.target_table, tables)
+        source_df = tables.get(source_alias, pd.DataFrame()) if source_alias else pd.DataFrame()
+        target_df = tables.get(target_alias, pd.DataFrame()) if target_alias else pd.DataFrame()
 
         if source_df.empty or target_df.empty:
             status = "missing_data"
-            if source_df.empty and target_df.empty:
+            if (source_df.empty and source_alias is None) or (target_df.empty and target_alias is None):
                 status = "missing_tables"
             return RelationAnalysis(
-                source_table=source_table,
-                source_column=config["source_column"],
-                target_table=target_table,
-                target_column=config["target_column"],
-                relationship_type=relation_type,
-                description=description,
+                source_table=config.source_table,
+                source_table_alias=source_alias,
+                source_column=config.source_column,
+                target_table=config.target_table,
+                target_table_alias=target_alias,
+                target_column=config.target_column,
+                relationship_type=config.relationship,
+                description=config.description,
                 status=status,
                 confidence=0.0,
             )
 
-        source_column = self._resolve_column(source_df, config["source_column"], config.get("source_aliases"))
-        target_column = self._resolve_column(target_df, config["target_column"], config.get("target_aliases"))
+        source_column = self._resolve_column(
+            source_df, config.source_column, config.source_column_aliases
+        )
+        target_column = self._resolve_column(
+            target_df, config.target_column, config.target_column_aliases
+        )
+
 
         if source_column is None or target_column is None:
             missing = source_column is None
             status = "missing_column_source" if missing else "missing_column_target"
             return RelationAnalysis(
-                source_table=source_table,
-                source_column=config["source_column"],
+                source_table=config.source_table,
+                source_table_alias=source_alias,
+                source_column=config.source_column,
                 source_column_resolved=source_column,
-                target_table=target_table,
-                target_column=config["target_column"],
+                target_table=config.target_table,
+                target_table_alias=target_alias,
+                target_column=config.target_column,
                 target_column_resolved=target_column,
-                relationship_type=relation_type,
-                description=description,
+                relationship_type=config.relationship,
+                description=config.description,
                 status=status,
                 confidence=0.0,
             )
 
         source_series = self._normalise_series(
-            source_df[source_column], config.get("source_normalizer", "id")
+            source_df[source_column], config.source_normalizer
         )
         target_series = self._normalise_series(
-            target_df[target_column], config.get("target_normalizer", "id")
+            target_df[target_column], config.target_normalizer
         )
 
         if source_series.empty or target_series.empty:
             return RelationAnalysis(
-                source_table=source_table,
-                source_column=config["source_column"],
+                source_table=config.source_table,
+                source_table_alias=source_alias,
+                source_column=config.source_column,
                 source_column_resolved=source_column,
-                target_table=target_table,
-                target_column=config["target_column"],
+                target_table=config.target_table,
+                target_table_alias=target_alias,
+                target_column=config.target_column,
                 target_column_resolved=target_column,
-                relationship_type=relation_type,
-                description=description,
+                relationship_type=config.relationship,
+                description=config.description,
                 status="insufficient_values",
                 confidence=0.0,
             )
@@ -363,14 +439,16 @@ class DataFlowManager:
         target_unique = set(target_series.unique().tolist())
         if not source_unique or not target_unique:
             return RelationAnalysis(
-                source_table=source_table,
-                source_column=config["source_column"],
+                source_table=config.source_table,
+                source_table_alias=source_alias,
+                source_column=config.source_column,
                 source_column_resolved=source_column,
-                target_table=target_table,
-                target_column=config["target_column"],
+                target_table=config.target_table,
+                target_table_alias=target_alias,
+                target_column=config.target_column,
                 target_column_resolved=target_column,
-                relationship_type=relation_type,
-                description=description,
+                relationship_type=config.relationship,
+                description=config.description,
                 status="insufficient_values",
                 confidence=0.0,
             )
@@ -384,14 +462,16 @@ class DataFlowManager:
         samples = tuple(sorted(list(intersection))[:5])
 
         return RelationAnalysis(
-            source_table=source_table,
-            source_column=config["source_column"],
+            source_table=config.source_table,
+            source_table_alias=source_alias,
+            source_column=config.source_column,
             source_column_resolved=source_column,
-            target_table=target_table,
-            target_column=config["target_column"],
+            target_table=config.target_table,
+            target_table_alias=target_alias,
+            target_column=config.target_column,
             target_column_resolved=target_column,
-            relationship_type=relation_type,
-            description=description,
+            relationship_type=config.relationship,
+            description=config.description,
             status=status,
             confidence=confidence,
             source_unique_values=len(source_unique),
@@ -450,24 +530,104 @@ class DataFlowManager:
         self,
         relations: Iterable[RelationAnalysis],
         tables: Dict[str, pd.DataFrame],
+        alias_index: TableAliasIndex,
     ) -> Dict[str, Any]:
         nodes: Dict[str, Dict[str, Any]] = {}
-        for name, df in tables.items():
+        for canonical, aliases in alias_index.canonical_to_aliases.items():
+            alias_key = alias_index.resolve_alias(canonical, tables)
+            df = tables.get(alias_key, pd.DataFrame()) if alias_key else pd.DataFrame()
             metadata = {
                 "type": "table",
-                "row_count": int(df.shape[0]),
-                "columns": [str(col) for col in df.columns],
+                "row_count": int(df.shape[0]) if not df.empty else 0,
+                "columns": [str(col) for col in df.columns] if not df.empty else [],
             }
-            nodes[name] = metadata
+            if alias_key and alias_key != canonical:
+                metadata["alias"] = alias_key
+            nodes[canonical] = metadata
+
+        for alias, df in tables.items():
+            canonical = alias_index.canonical_name(alias)
+            if canonical in nodes and nodes[canonical].get("alias") == alias:
+                continue
+            if canonical in nodes and canonical != alias:
+                continue
+            nodes.setdefault(
+                canonical,
+                {
+                    "type": "table",
+                    "row_count": int(df.shape[0]),
+                    "columns": [str(col) for col in df.columns],
+                },
+            )
 
         edges = [relation.as_dict() for relation in relations]
 
-        paths: List[Tuple[str, ...]] = []
+        paths: List[Dict[str, Tuple[str, ...]]] = []
         for path in PROCUREMENT_FLOW_PATHS:
-            if all(table in tables and not tables[table].empty for table in path):
-                paths.append(path)
+            resolved: List[str] = []
+            include = True
+            for canonical in path:
+                alias_key = alias_index.resolve_alias(canonical, tables)
+                df = tables.get(alias_key, pd.DataFrame()) if alias_key else pd.DataFrame()
+                if alias_key is None or df.empty:
+                    include = False
+                    break
+                resolved.append(alias_key)
+            if include:
+                paths.append({"canonical": path, "resolved": tuple(resolved)})
 
         return {"nodes": nodes, "edges": edges, "paths": paths}
+
+    def _build_alias_index(
+        self,
+        tables: Mapping[str, pd.DataFrame],
+        table_name_map: Optional[Mapping[str, str]] = None,
+    ) -> TableAliasIndex:
+        canonical_to_aliases: Dict[str, set[str]] = {
+            canonical: set(aliases) | {canonical}
+            for canonical, aliases in PROCUREMENT_TABLE_ALIASES.items()
+        }
+        alias_to_canonical: Dict[str, str] = {}
+        for canonical, aliases in canonical_to_aliases.items():
+            for alias in aliases:
+                alias_to_canonical[alias] = canonical
+
+        for config in PROCUREMENT_RELATIONSHIPS:
+            canonical_to_aliases.setdefault(config.source_table, set()).add(config.source_table)
+            canonical_to_aliases.setdefault(config.target_table, set()).add(config.target_table)
+            for alias in config.source_aliases:
+                canonical_to_aliases[config.source_table].add(alias)
+                alias_to_canonical[alias] = config.source_table
+            for alias in config.target_aliases:
+                canonical_to_aliases[config.target_table].add(alias)
+                alias_to_canonical[alias] = config.target_table
+
+        if table_name_map:
+            for alias, canonical in table_name_map.items():
+                canonical_to_aliases.setdefault(canonical, set()).add(alias)
+                alias_to_canonical[alias] = canonical
+
+        for canonical in list(canonical_to_aliases.keys()):
+            canonical_to_aliases[canonical].add(canonical)
+            alias_to_canonical.setdefault(canonical, canonical)
+
+        for alias in tables.keys():
+            canonical = alias_to_canonical.get(alias)
+            if canonical:
+                canonical_to_aliases.setdefault(canonical, set()).add(alias)
+            else:
+                alias_to_canonical[alias] = alias
+                canonical_to_aliases.setdefault(alias, set()).add(alias)
+
+        canonical_to_aliases_sorted = {
+            canonical: tuple(sorted(aliases))
+            for canonical, aliases in canonical_to_aliases.items()
+        }
+        return TableAliasIndex(
+            canonical_to_aliases=canonical_to_aliases_sorted,
+            alias_to_canonical=alias_to_canonical,
+        )
+
 
     # ------------------------------------------------------------------
     # Qdrant helpers
@@ -498,7 +658,13 @@ class DataFlowManager:
                     distance=models.Distance.COSINE,
                 ),
             )
-            for field in ("document_type", "source_table", "target_table", "relationship_type"):
+            for field in (
+                "document_type",
+                "source_table",
+                "target_table",
+                "relationship_type",
+            ):
+
                 try:
                     self.qdrant_client.create_payload_index(
                         collection_name=self.collection_name,
@@ -565,6 +731,9 @@ class DataFlowManager:
     def _relation_to_text(self, relation: Dict[str, Any]) -> str:
         source = relation.get("source_table")
         target = relation.get("target_table")
+        source_alias = relation.get("source_table_alias")
+        target_alias = relation.get("target_table_alias")
+
         source_column = relation.get("source_column_resolved") or relation.get("source_column")
         target_column = relation.get("target_column_resolved") or relation.get("target_column")
         relation_type = relation.get("relationship_type", "related_to")
@@ -572,8 +741,16 @@ class DataFlowManager:
         status = relation.get("status")
         confidence = relation.get("confidence")
         samples = relation.get("sample_values") or []
+
+        def _table_label(canonical: Optional[str], alias: Optional[str]) -> str:
+            if canonical and alias and canonical != alias:
+                return f"{canonical} [{alias}]"
+            return canonical or alias or "unknown"
+
+        source_label = _table_label(source, source_alias)
+        target_label = _table_label(target, target_alias)
         parts = [
-            f"{source}.{source_column} {relation_type} {target}.{target_column}",
+            f"{source_label}.{source_column} {relation_type} {target_label}.{target_column}",
         ]
         if description:
             parts.append(description)
@@ -586,6 +763,18 @@ class DataFlowManager:
             parts.append(f"status: {status}")
         return ". ".join(parts)
 
-    def _path_to_text(self, path: Sequence[str]) -> str:
-        sequence = " -> ".join(path)
-        return f"Procurement data flows through {sequence}."
+    def _path_to_text(
+        self,
+        canonical_path: Sequence[str],
+        resolved_path: Optional[Sequence[str]] = None,
+    ) -> str:
+        canonical_sequence = " -> ".join(canonical_path)
+        if resolved_path:
+            resolved_sequence = " -> ".join(resolved_path)
+            if tuple(canonical_path) != tuple(resolved_path):
+                return (
+                    f"Procurement data flows through {canonical_sequence} "
+                    f"(resolved via {resolved_sequence})."
+                )
+        return f"Procurement data flows through {canonical_sequence}."
+
