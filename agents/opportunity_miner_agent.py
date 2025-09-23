@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from services.data_flow_manager import DataFlowManager
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources, normalize_instruction_key
@@ -293,6 +294,8 @@ class OpportunityMinerAgent(BaseAgent):
         self._column_cache: Dict[str, set[str]] = {}
         self._policy_engine_catalog: Optional[Dict[str, Dict[str, Any]]] = None
         self._data_profile: Dict[str, Any] = {}
+        self._data_flow_manager: Optional[DataFlowManager] = None
+        self._data_flow_snapshot: Dict[str, Any] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -634,6 +637,196 @@ class OpportunityMinerAgent(BaseAgent):
 
         return aggregated, category_map
 
+    def _get_data_flow_manager(self) -> Optional[DataFlowManager]:
+        if self._data_flow_manager is None:
+            try:
+                self._data_flow_manager = DataFlowManager(self.agent_nick)
+            except Exception:  # pragma: no cover - defensive lazy init
+                logger.exception("Failed to initialise DataFlowManager")
+                self._data_flow_manager = None
+        return self._data_flow_manager
+
+    def _capture_data_flow(self, tables: Dict[str, pd.DataFrame]) -> None:
+        self._data_flow_snapshot = {}
+        if not isinstance(tables, dict) or not tables:
+            return
+        manager = self._get_data_flow_manager()
+        if manager is None:
+            return
+        try:
+            relations, graph = manager.build_data_flow_map(
+                tables, table_name_map=self.TABLE_MAP
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to build data flow map")
+            return
+        self._data_flow_snapshot = {
+            "relationships": relations,
+            "graph": graph,
+        }
+        try:
+            manager.persist_knowledge_graph(relations, graph)
+        except Exception:  # pragma: no cover - persistence best effort
+            logger.exception("Failed to persist knowledge graph")
+
+    def _summarise_top_opportunities(
+        self,
+        per_policy: Dict[str, List[Finding]],
+        per_policy_categories: Optional[Dict[str, Dict[str, List[Finding]]]] = None,
+        *,
+        limit: int = 3,
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {}
+        categories = per_policy_categories or {}
+
+        for display, findings in per_policy.items():
+            valid = [finding for finding in findings if isinstance(finding, Finding)]
+            category_details = categories.get(display, {})
+            category_breakdown: Dict[str, float] = {}
+            for category, bucket in category_details.items():
+                total = sum(
+                    f.financial_impact_gbp
+                    for f in bucket
+                    if isinstance(f, Finding)
+                )
+                category_breakdown[str(category)] = float(total)
+
+            if not valid:
+                summary[display] = {
+                    "total_opportunities": 0,
+                    "total_financial_impact_gbp": 0.0,
+                    "top_opportunities": [],
+                    "categories": category_breakdown,
+                }
+                continue
+
+            ordered = sorted(
+                valid,
+                key=lambda finding: finding.financial_impact_gbp,
+                reverse=True,
+            )
+            total_impact = float(sum(f.financial_impact_gbp for f in valid))
+            top_entries: List[Dict[str, Any]] = []
+            for index, finding in enumerate(ordered[: max(limit, 1)]):
+                top_entries.append(
+                    {
+                        "rank": index + 1,
+                        "opportunity_id": finding.opportunity_id,
+                        "detector_type": finding.detector_type,
+                        "supplier_id": finding.supplier_id,
+                        "supplier_name": finding.supplier_name,
+                        "category_id": finding.category_id,
+                        "item_id": finding.item_id,
+                        "financial_impact_gbp": float(finding.financial_impact_gbp),
+                        "weightage": float(finding.weightage),
+                        "policy_id": finding.policy_id,
+                    }
+                )
+
+            summary[display] = {
+                "total_opportunities": len(valid),
+                "total_financial_impact_gbp": total_impact,
+                "top_opportunities": top_entries,
+                "categories": category_breakdown,
+            }
+
+        return summary
+
+    def _summarise_supplier_link_issue(self) -> Optional[str]:
+        snapshot = self._data_flow_snapshot or {}
+        relationships = snapshot.get("relationships") or []
+        for relation in relationships:
+            source = relation.get("source_table")
+            target = relation.get("target_table")
+            if "proc.supplier" not in (source, target):
+                continue
+            status = relation.get("status")
+            if status in {"linked", None}:
+                continue
+            source_label = relation.get("source_table_alias") or source
+            target_label = relation.get("target_table_alias") or target
+            status_label = {
+                "missing_tables": "required tables are missing",
+                "missing_data": "required tables are empty",
+                "missing_column_source": "source column is unavailable",
+                "missing_column_target": "target column is unavailable",
+                "insufficient_values": "insufficient values to determine linkage",
+                "no_overlap": "no shared identifiers between tables",
+                "error": "relationship analysis failed",
+            }.get(status, status.replace("_", " "))
+            return f"{source_label} ↔ {target_label}: {status_label}"
+        return None
+
+    def _determine_supplier_gap_reason(
+        self,
+        display: str,
+        retained: List[Finding],
+        policy_payload: Optional[Dict[str, Any]],
+        tables: Dict[str, pd.DataFrame],
+        *,
+        min_impact_threshold: float,
+        explicit_min_override: bool,
+    ) -> Optional[str]:
+        if retained:
+            if not any(f.supplier_id for f in retained):
+                return (
+                    "Policy findings do not include supplier identifiers after evaluating the "
+                    "procurement data flow."
+                )
+            return None
+
+        supplier_table = None
+        for key in ("supplier_master", "proc.supplier"):
+            df = tables.get(key)
+            if df is not None:
+                supplier_table = df
+                break
+        if supplier_table is not None and supplier_table.empty:
+            return (
+                "Supplier master dataset is empty; unable to highlight suppliers for this policy."
+            )
+
+        linkage_issue = self._summarise_supplier_link_issue()
+        if linkage_issue:
+            return f"Supplier linkage incomplete: {linkage_issue}"
+
+        findings: List[Any] = []
+        if isinstance(policy_payload, dict):
+            payload_findings = policy_payload.get("findings", [])
+            if isinstance(payload_findings, list):
+                findings = payload_findings
+
+        def _supplier_from(record: Any) -> Optional[str]:
+            if isinstance(record, Finding):
+                return record.supplier_id
+            if isinstance(record, dict):
+                value = record.get("supplier_id")
+                if value:
+                    text = str(value).strip()
+                    return text or None
+            return None
+
+        suppliers_in_findings = [
+            _supplier_from(item)
+            for item in findings
+            if _supplier_from(item) is not None
+        ]
+
+        if findings and not suppliers_in_findings:
+            return (
+                "Policy calculations produced opportunities without supplier identifiers."
+            )
+
+        if suppliers_in_findings and not retained:
+            if not explicit_min_override and min_impact_threshold > 0:
+                return (
+                    "Available opportunities did not meet the configured minimum financial impact "
+                    "threshold, so no suppliers were highlighted."
+                )
+            return "Policy findings were filtered out by the provided configuration."
+
+        return "No qualifying transactions matched the policy criteria for the available data."
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -775,6 +968,7 @@ class OpportunityMinerAgent(BaseAgent):
             tables = self._normalise_currency(tables)
             tables = self._apply_index_adjustment(tables)
             self._data_profile = self._build_data_profile(tables)
+            self._capture_data_flow(tables)
 
             self._event_log = []
             self._escalations = []
@@ -949,6 +1143,12 @@ class OpportunityMinerAgent(BaseAgent):
                     "findings": aggregated_findings,
                 }
 
+            policy_runs_by_display: Dict[str, Dict[str, Any]] = {
+                payload.get("display", key): payload
+                for key, payload in policy_runs.items()
+                if payload
+            }
+
             per_policy_retained: Dict[str, List[Finding]] = {}
 
             if use_dynamic_registry:
@@ -1112,6 +1312,23 @@ class OpportunityMinerAgent(BaseAgent):
                 )
                 policy_metadata.setdefault(display, {})
 
+            policy_supplier_gaps: Dict[str, str] = {}
+            for display, suppliers in policy_suppliers.items():
+                if suppliers:
+                    continue
+                payload = policy_runs_by_display.get(display)
+                retained = per_policy_retained.get(display, [])
+                reason = self._determine_supplier_gap_reason(
+                    display,
+                    retained,
+                    payload,
+                    tables,
+                    min_impact_threshold=min_impact_threshold,
+                    explicit_min_override=explicit_min_override,
+                )
+                if reason:
+                    policy_supplier_gaps[display] = reason
+
             # compute weightage
             total_impact = sum(f.financial_impact_gbp for f in filtered)
             if total_impact > 0:
@@ -1121,6 +1338,10 @@ class OpportunityMinerAgent(BaseAgent):
             else:
                 for f in filtered:
                     f.weightage = 0.0
+
+            policy_top_summary = self._summarise_top_opportunities(
+                per_policy_retained, per_policy_categories
+            )
 
             self._output_excel(filtered)
             self._output_feed(filtered)
@@ -1136,10 +1357,13 @@ class OpportunityMinerAgent(BaseAgent):
                 "policy_opportunities": policy_opportunities,
                 "policy_category_opportunities": policy_category_opportunities,
                 "policy_suppliers": policy_suppliers,
+                "policy_supplier_gaps": policy_supplier_gaps,
                 "policy_metadata": policy_metadata,
+                "policy_top_opportunities": policy_top_summary,
             }
             if self._data_profile:
                 data["data_profile"] = self._data_profile
+            data["data_flow_snapshot"] = self._data_flow_snapshot
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
                 str(s["supplier_id"]).strip()
