@@ -827,6 +827,7 @@ class OpportunityMinerAgent(BaseAgent):
 
         return "No qualifying transactions matched the policy criteria for the available data."
 
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

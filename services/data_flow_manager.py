@@ -6,7 +6,6 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-
 import pandas as pd
 from qdrant_client import models
 
@@ -337,6 +336,7 @@ class DataFlowManager:
                 }
                 if resolved_aliases and resolved_aliases != canonical_path:
                     payload["resolved_aliases"] = list(resolved_aliases)
+
                 point_id = self._deterministic_id(path_text)
                 points.append(
                     models.PointStruct(id=point_id, vector=vector, payload=payload)
@@ -392,6 +392,7 @@ class DataFlowManager:
         target_column = self._resolve_column(
             target_df, config.target_column, config.target_column_aliases
         )
+
 
         if source_column is None or target_column is None:
             missing = source_column is None
@@ -627,6 +628,7 @@ class DataFlowManager:
             alias_to_canonical=alias_to_canonical,
         )
 
+
     # ------------------------------------------------------------------
     # Qdrant helpers
     # ------------------------------------------------------------------
@@ -662,6 +664,7 @@ class DataFlowManager:
                 "target_table",
                 "relationship_type",
             ):
+
                 try:
                     self.qdrant_client.create_payload_index(
                         collection_name=self.collection_name,
@@ -730,6 +733,7 @@ class DataFlowManager:
         target = relation.get("target_table")
         source_alias = relation.get("source_table_alias")
         target_alias = relation.get("target_table_alias")
+
         source_column = relation.get("source_column_resolved") or relation.get("source_column")
         target_column = relation.get("target_column_resolved") or relation.get("target_column")
         relation_type = relation.get("relationship_type", "related_to")
@@ -773,3 +777,4 @@ class DataFlowManager:
                     f"(resolved via {resolved_sequence})."
                 )
         return f"Procurement data flows through {canonical_sequence}."
+

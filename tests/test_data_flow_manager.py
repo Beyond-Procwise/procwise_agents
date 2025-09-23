@@ -139,6 +139,7 @@ def test_data_flow_manager_builds_graph_and_persists():
     for path in graph["paths"]:
         assert path["canonical"]
 
+
     manager.persist_knowledge_graph(relations, graph)
 
     assert nick.qdrant_client.collections

@@ -945,6 +945,7 @@ def test_policy_supplier_gap_reason_when_no_suppliers(monkeypatch):
     assert reason
 
 
+
 def test_policy_category_limits_caps_results():
     agent = OpportunityMinerAgent(DummyNick())
     now = datetime.utcnow()

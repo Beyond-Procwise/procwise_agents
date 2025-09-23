@@ -104,6 +104,8 @@ class SESSMTPAccessManager:
             {
                 "SMTP_USERNAME": access_key_id,
                 "SMTP_PASSWORD": smtp_password,
+                "IAM_USER": iam_user,
+
             }
         )
 
@@ -176,6 +178,27 @@ class SESSMTPAccessManager:
             )
             return None
 
+        metadata_keys = (
+            "IAM_USER",
+            "iam_user",
+            "IAMUser",
+            "user",
+            "USER",
+        )
+
+        for key in metadata_keys:
+            candidate = payload.get(key)
+            if candidate:
+                candidate_str = str(candidate).strip()
+                if candidate_str:
+                    self.logger.info(
+                        "Inferred SES SMTP IAM user %s from secret %s field %s",
+                        candidate_str,
+                        secret_name,
+                        key,
+                    )
+                    return candidate_str
+
         username = (
             payload.get("SMTP_USERNAME")
             or payload.get("smtp_username")
@@ -199,9 +222,20 @@ class SESSMTPAccessManager:
         try:
             response = iam_client.get_access_key_last_used(AccessKeyId=access_key)
         except ClientError as exc:  # pragma: no cover - boto3 error handling
-            self.logger.warning(
-                "Unable to look up IAM user for access key %s: %s", access_key, exc
-            )
+            error = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+            error_code = error.get("Code")
+            if error_code == "AccessDenied":
+                self.logger.warning(
+                    "Access denied when attempting to infer IAM user for access key %s via GetAccessKeyLastUsed; configure SES_SMTP_IAM_USER or store IAM_USER in the secret",
+                    access_key,
+                )
+            else:
+                self.logger.warning(
+                    "Unable to look up IAM user for access key %s via GetAccessKeyLastUsed: %s",
+                    access_key,
+                    error_code or exc,
+                )
+
             return None
 
         inferred_user = response.get("UserName")
@@ -212,7 +246,9 @@ class SESSMTPAccessManager:
             return None
 
         self.logger.info(
-            "Inferred SES SMTP IAM user %s from secret %s", inferred_user, secret_name
+            "Inferred SES SMTP IAM user %s from secret %s via GetAccessKeyLastUsed",
+            inferred_user,
+            secret_name,
         )
         return inferred_user
 
