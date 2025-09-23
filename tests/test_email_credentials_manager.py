@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 from services.email_credentials_manager import (
     CredentialsRotationError,
@@ -64,6 +65,8 @@ def test_rotate_smtp_credentials_deletes_oldest_and_updates_secret():
     payload = json.loads(kwargs["SecretString"])
     assert payload["SMTP_USERNAME"] == "AKIANEW"
     assert payload["SMTP_PASSWORD"] == rotated.smtp_password
+    assert payload["IAM_USER"] == "ses-smtp-user.20250922-152128"
+
 
 
 def test_rotate_smtp_credentials_uses_sts_when_role_configured():
@@ -111,14 +114,12 @@ def test_rotate_smtp_credentials_uses_sts_when_role_configured():
     secrets_client.put_secret_value.assert_called_once()
 
 
-def test_rotate_smtp_credentials_infers_iam_user_when_not_configured():
+def test_rotate_smtp_credentials_infers_iam_user_from_secret_metadata():
+
     nick = DummyAgentNick(ses_smtp_iam_user=None)
     manager = SESSMTPAccessManager(nick)
 
     iam_client = MagicMock()
-    iam_client.get_access_key_last_used.return_value = {
-        "UserName": "ses-smtp-user.20250922-152128"
-    }
     iam_client.list_access_keys.return_value = {
         "AccessKeyMetadata": [
             {"AccessKeyId": "AKIAOLD", "CreateDate": datetime(2024, 1, 1)}
@@ -130,7 +131,13 @@ def test_rotate_smtp_credentials_infers_iam_user_when_not_configured():
 
     secrets_client = MagicMock()
     secrets_client.get_secret_value.return_value = {
-        "SecretString": json.dumps({"SMTP_USERNAME": "AKIAOLD"})
+        "SecretString": json.dumps(
+            {
+                "IAM_USER": "ses-smtp-user.20250922-152128",
+                "SMTP_USERNAME": "AKIAOLD",
+            }
+        )
+
     }
 
     def client_side_effect(service_name, **kwargs):
@@ -143,7 +150,8 @@ def test_rotate_smtp_credentials_infers_iam_user_when_not_configured():
     with patch("services.email_credentials_manager.boto3.client", side_effect=client_side_effect):
         rotated = manager.rotate_smtp_credentials()
 
-    iam_client.get_access_key_last_used.assert_called_once_with(AccessKeyId="AKIAOLD")
+    iam_client.get_access_key_last_used.assert_not_called()
+
     iam_client.list_access_keys.assert_called_once_with(
         UserName="ses-smtp-user.20250922-152128"
     )
@@ -168,6 +176,68 @@ def test_rotate_smtp_credentials_errors_when_inference_fails():
     with patch("services.email_credentials_manager.boto3.client", side_effect=client_side_effect):
         with pytest.raises(CredentialsRotationError):
             manager.rotate_smtp_credentials()
+
+
+def test_rotate_smtp_credentials_falls_back_to_get_access_key_last_used_when_metadata_missing():
+    nick = DummyAgentNick(ses_smtp_iam_user=None)
+    manager = SESSMTPAccessManager(nick)
+
+    iam_client = MagicMock()
+    iam_client.get_access_key_last_used.return_value = {
+        "UserName": "ses-smtp-user.20250922-152128"
+    }
+    iam_client.list_access_keys.return_value = {
+        "AccessKeyMetadata": []
+    }
+    iam_client.create_access_key.return_value = {
+        "AccessKey": {"AccessKeyId": "AKIANEW", "SecretAccessKey": "supersecret"}
+    }
+
+    secrets_client = MagicMock()
+    secrets_client.get_secret_value.return_value = {
+        "SecretString": json.dumps({"SMTP_USERNAME": "AKIAOLD"})
+    }
+
+    def client_side_effect(service_name, **kwargs):
+        if service_name == "iam":
+            return iam_client
+        if service_name == "secretsmanager":
+            return secrets_client
+        raise AssertionError(f"Unexpected service requested: {service_name}")
+
+    with patch("services.email_credentials_manager.boto3.client", side_effect=client_side_effect):
+        manager.rotate_smtp_credentials()
+
+    iam_client.get_access_key_last_used.assert_called_once_with(AccessKeyId="AKIAOLD")
+
+
+def test_infer_iam_user_logs_access_denied_without_leaking_identity(caplog):
+    nick = DummyAgentNick()
+    manager = SESSMTPAccessManager(nick)
+
+    iam_client = MagicMock()
+    error = ClientError(
+        error_response={
+            "Error": {
+                "Code": "AccessDenied",
+                "Message": "User is not authorized",
+            }
+        },
+        operation_name="GetAccessKeyLastUsed",
+    )
+    iam_client.get_access_key_last_used.side_effect = error
+
+    secrets_client = MagicMock()
+    secrets_client.get_secret_value.return_value = {
+        "SecretString": json.dumps({"SMTP_USERNAME": "AKIAOLD"})
+    }
+
+    with caplog.at_level("WARNING"):
+        inferred = manager._infer_iam_user(secrets_client, "ses/smtp/credentials", iam_client)
+
+    assert inferred is None
+    assert "Access denied" in caplog.text
+    assert "procwises3userhistory" not in caplog.text
 
 
 def test_create_smtp_password_matches_sigv4_reference():
