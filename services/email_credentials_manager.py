@@ -41,10 +41,6 @@ class SESSMTPAccessManager:
     def rotate_smtp_credentials(self) -> RotatedCredentials:
         """Rotate the SES SMTP IAM user's credentials and persist them."""
 
-        iam_user = getattr(self.settings, "ses_smtp_iam_user", None)
-        if not iam_user:
-            raise CredentialsRotationError("SES SMTP IAM user is not configured")
-
         secret_name = getattr(self.settings, "ses_smtp_secret_name", None)
         if not secret_name:
             raise CredentialsRotationError("SES SMTP secret name is not configured")
@@ -53,6 +49,13 @@ class SESSMTPAccessManager:
 
         iam_client = boto3.client("iam")
         secrets_client = self._secrets_manager_client(region)
+
+        iam_user = getattr(self.settings, "ses_smtp_iam_user", None)
+        if not iam_user:
+            iam_user = self._infer_iam_user(secrets_client, secret_name, iam_client)
+            if not iam_user:
+                raise CredentialsRotationError("SES SMTP IAM user is not configured")
+
 
         try:
             response = iam_client.list_access_keys(UserName=iam_user)
@@ -129,15 +132,89 @@ class SESSMTPAccessManager:
     def _create_smtp_password(self, secret_access_key: str, region: str) -> str:
         """Convert an IAM secret access key into an SES SMTP password."""
 
-        message = "SendRawEmail"
-        version = 0x02
-        sig = hmac.new(
-            region.encode("utf-8"),
-            secret_access_key.encode("utf-8"),
-            hashlib.sha256,
-        ).digest()
-        sig2 = hmac.new(message.encode("utf-8"), sig, hashlib.sha256).digest()
-        return base64.b64encode(bytes([version]) + sig2).decode()
+        def _sign(key: bytes, msg: str) -> bytes:
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+        signing_key = ("AWS4" + secret_access_key).encode("utf-8")
+        date_key = _sign(signing_key, "11111111")
+        region_key = _sign(date_key, region)
+        service_key = _sign(region_key, "ses")
+        terminal_key = _sign(service_key, "aws4_request")
+        signature = _sign(terminal_key, "SendRawEmail")
+
+        return base64.b64encode(b"\x04" + signature).decode()
+
+    def _infer_iam_user(self, secrets_client, secret_name: str, iam_client) -> str | None:
+        """Infer the SES SMTP IAM user from the stored credentials when absent."""
+
+        try:
+            secret_value = secrets_client.get_secret_value(
+                SecretId=secret_name,
+                VersionStage="AWSCURRENT",
+            )
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            self.logger.warning(
+                "Unable to retrieve SES SMTP secret %s to infer IAM user: %s",
+                secret_name,
+                exc,
+            )
+            return None
+
+        secret_string = secret_value.get("SecretString")
+        if not secret_string:
+            self.logger.warning(
+                "SES SMTP secret %s does not contain a SecretString payload", secret_name
+            )
+            return None
+
+        try:
+            payload = json.loads(secret_string)
+        except json.JSONDecodeError:
+            self.logger.warning(
+                "SES SMTP secret %s payload is not valid JSON; cannot infer IAM user",
+                secret_name,
+            )
+            return None
+
+        username = (
+            payload.get("SMTP_USERNAME")
+            or payload.get("smtp_username")
+            or payload.get("username")
+        )
+        if not username:
+            self.logger.warning(
+                "SES SMTP secret %s does not include an SMTP username; cannot infer IAM user",
+                secret_name,
+            )
+            return None
+
+        access_key = str(username).strip()
+        if not access_key:
+            self.logger.warning(
+                "SES SMTP secret %s includes an empty SMTP username; cannot infer IAM user",
+                secret_name,
+            )
+            return None
+
+        try:
+            response = iam_client.get_access_key_last_used(AccessKeyId=access_key)
+        except ClientError as exc:  # pragma: no cover - boto3 error handling
+            self.logger.warning(
+                "Unable to look up IAM user for access key %s: %s", access_key, exc
+            )
+            return None
+
+        inferred_user = response.get("UserName")
+        if not inferred_user:
+            self.logger.warning(
+                "IAM did not return a user name when looking up access key %s", access_key
+            )
+            return None
+
+        self.logger.info(
+            "Inferred SES SMTP IAM user %s from secret %s", inferred_user, secret_name
+        )
+        return inferred_user
 
     def _secrets_manager_client(self, region: str):
         """Create a Secrets Manager client, assuming a role when configured."""
