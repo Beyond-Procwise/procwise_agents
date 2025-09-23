@@ -71,6 +71,7 @@ class EmailService:
             self._deliver_via_smtp(
                 message_payload, sender, recipient_list, smtp_username, smtp_password
             )
+
             return True
         except smtplib.SMTPAuthenticationError as auth_exc:
             self.logger.warning(
@@ -117,6 +118,7 @@ class EmailService:
             for retry scenarios during credential rotation.
         """
 
+
         secret_name = getattr(self.settings, "ses_smtp_secret_name", None)
         if not secret_name:
             raise ValueError("SES SMTP secret name is not configured")
@@ -129,6 +131,7 @@ class EmailService:
             if version_stage:
                 get_kwargs["VersionStage"] = version_stage
             secret_value = client.get_secret_value(**get_kwargs)
+
         except ClientError as exc:
             raise RuntimeError(
                 f"Failed to retrieve SES SMTP secret '{secret_name}'"
@@ -184,6 +187,7 @@ class EmailService:
             server.ehlo()
             server.login(smtp_username, smtp_password)
             server.sendmail(sender, recipient_list, message_payload)
+
 
     def _secrets_manager_client(self, region: str):
         """Create a Secrets Manager client, assuming a role when configured."""

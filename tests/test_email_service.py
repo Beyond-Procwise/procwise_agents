@@ -3,6 +3,7 @@ import smtplib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
+
 from services.email_service import EmailService
 
 
@@ -152,3 +153,4 @@ def test_send_email_returns_false_when_retry_also_fails_authentication():
     assert result is False
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+
