@@ -4,6 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 
+from services.email_credentials_manager import (
+    CredentialsRotationError,
+    RotatedCredentials,
+)
 from services.email_service import EmailService
 
 
@@ -92,7 +96,9 @@ def test_send_email_retries_with_previous_secret_on_auth_failure():
         service,
         "_fetch_smtp_credentials",
         side_effect=[("user", "pass"), ("legacy", "secret")],
-    ) as fetch_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
+    ) as fetch_mock, patch.object(
+        service.credential_manager, "rotate_smtp_credentials"
+    ) as rotate_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
         first_smtp = MagicMock()
         first_smtp.__enter__.return_value = first_smtp
         first_smtp.__exit__.return_value = False
@@ -116,6 +122,7 @@ def test_send_email_retries_with_previous_secret_on_auth_failure():
     assert result is True
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    rotate_mock.assert_not_called()
     first_smtp.sendmail.assert_not_called()
     second_smtp.sendmail.assert_called_once()
 
@@ -130,7 +137,11 @@ def test_send_email_returns_false_when_retry_also_fails_authentication():
         service,
         "_fetch_smtp_credentials",
         side_effect=[("user", "pass"), ("legacy", "secret")],
-    ) as fetch_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
+    ) as fetch_mock, patch.object(
+        service.credential_manager,
+        "rotate_smtp_credentials",
+        side_effect=CredentialsRotationError("rotation failed"),
+    ) as rotate_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
         first_smtp = MagicMock()
         first_smtp.__enter__.return_value = first_smtp
         first_smtp.__exit__.return_value = False
@@ -153,4 +164,59 @@ def test_send_email_returns_false_when_retry_also_fails_authentication():
     assert result is False
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    rotate_mock.assert_called_once()
+
+
+def test_send_email_rotates_credentials_after_auth_failures():
+    nick = DummyAgentNick()
+    service = EmailService(nick)
+
+    rotated = RotatedCredentials(
+        smtp_username="AKIANEW",
+        smtp_password="smtp-secret",
+        access_key_id="AKIANEW",
+    )
+
+    with patch.object(
+        service,
+        "_fetch_smtp_credentials",
+        side_effect=[("user", "pass"), ("legacy", "secret")],
+    ) as fetch_mock, patch.object(
+        service.credential_manager,
+        "rotate_smtp_credentials",
+        return_value=rotated,
+    ) as rotate_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
+        first_smtp = MagicMock()
+        first_smtp.__enter__.return_value = first_smtp
+        first_smtp.__exit__.return_value = False
+        first_smtp.login.side_effect = smtplib.SMTPAuthenticationError(
+            535, b"Invalid"
+        )
+
+        second_smtp = MagicMock()
+        second_smtp.__enter__.return_value = second_smtp
+        second_smtp.__exit__.return_value = False
+        second_smtp.login.side_effect = smtplib.SMTPAuthenticationError(
+            535, b"Invalid"
+        )
+
+        third_smtp = MagicMock()
+        third_smtp.__enter__.return_value = third_smtp
+        third_smtp.__exit__.return_value = False
+
+        smtp_mock.side_effect = [first_smtp, second_smtp, third_smtp]
+
+        result = service.send_email(
+            subject="Test",
+            body="<p>Hello</p>",
+            recipients=["to@example.com"],
+            sender="from@example.com",
+        )
+
+    assert result is True
+    assert fetch_mock.call_args_list[0] == call()
+    assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    rotate_mock.assert_called_once_with()
+    third_smtp.login.assert_called_once_with("AKIANEW", "smtp-secret")
+    third_smtp.sendmail.assert_called_once()
 

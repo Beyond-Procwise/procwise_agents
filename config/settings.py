@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     ses_secret_role_arn: Optional[str] = Field(
         default=None, env="SES_SECRET_ROLE_ARN"
     )
+    ses_smtp_iam_user: Optional[str] = Field(
+        default=None, env="SES_SMTP_IAM_USER"
+    )
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
