@@ -13,6 +13,11 @@ from botocore.exceptions import ClientError
 
 from utils.gpu import configure_gpu
 
+from .email_credentials_manager import (
+    CredentialsRotationError,
+    SESSMTPAccessManager,
+)
+
 configure_gpu()
 
 
@@ -23,6 +28,7 @@ class EmailService:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.logger = logging.getLogger(__name__)
+        self.credential_manager = SESSMTPAccessManager(agent_nick)
 
     def send_email(
         self,
@@ -86,7 +92,11 @@ class EmailService:
                 self.logger.error(
                     "Unable to retrieve fallback SMTP credentials: %s", fallback_exc
                 )
-                return False
+                return self._attempt_rotation_and_resend(
+                    message_payload,
+                    sender,
+                    recipient_list,
+                )
 
             try:
                 self._deliver_via_smtp(
@@ -98,13 +108,64 @@ class EmailService:
                 )
                 return True
             except smtplib.SMTPAuthenticationError as fallback_auth_exc:
-                self.logger.error("Email send failed: %s", fallback_auth_exc)
-                return False
+                self.logger.error(
+                    "Fallback SES SMTP credentials failed authentication: %s",
+                    fallback_auth_exc,
+                )
+                return self._attempt_rotation_and_resend(
+                    message_payload,
+                    sender,
+                    recipient_list,
+                )
             except Exception as fallback_exc:  # pragma: no cover - defensive
                 self.logger.error("Email send failed: %s", fallback_exc)
                 return False
         except Exception as exc:  # pragma: no cover - network/runtime
             self.logger.error("Email send failed: %s", exc)
+            return False
+
+    def _attempt_rotation_and_resend(
+        self,
+        message_payload: str,
+        sender: str,
+        recipient_list: List[str],
+    ) -> bool:
+        """Rotate SMTP credentials and retry delivery once."""
+
+        self.logger.info(
+            "Attempting to rotate SES SMTP credentials after repeated authentication failures"
+        )
+
+        try:
+            rotated = self.credential_manager.rotate_smtp_credentials()
+        except CredentialsRotationError as exc:
+            self.logger.error("SES SMTP credential rotation failed: %s", exc)
+            return False
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.error(
+                "Unexpected error while rotating SES SMTP credentials: %s", exc
+            )
+            return False
+
+        try:
+            self._deliver_via_smtp(
+                message_payload,
+                sender,
+                recipient_list,
+                rotated.smtp_username,
+                rotated.smtp_password,
+            )
+            return True
+        except smtplib.SMTPAuthenticationError as auth_exc:
+            self.logger.error(
+                "Email send failed even after rotating SES SMTP credentials: %s",
+                auth_exc,
+            )
+            return False
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.error(
+                "Email send failed after rotating SES SMTP credentials: %s", exc
+            )
             return False
 
     def _fetch_smtp_credentials(self, *, version_stage: str = "AWSCURRENT") -> Tuple[str, str]:
