@@ -68,6 +68,7 @@ def test_rotate_smtp_credentials_deletes_oldest_and_updates_secret():
     assert payload["IAM_USER"] == "ses-smtp-user.20250922-152128"
 
 
+
 def test_rotate_smtp_credentials_uses_sts_when_role_configured():
     nick = DummyAgentNick(ses_secret_role_arn="arn:aws:iam::123456789012:role/test")
     manager = SESSMTPAccessManager(nick)
@@ -114,6 +115,7 @@ def test_rotate_smtp_credentials_uses_sts_when_role_configured():
 
 
 def test_rotate_smtp_credentials_infers_iam_user_from_secret_metadata():
+
     nick = DummyAgentNick(ses_smtp_iam_user=None)
     manager = SESSMTPAccessManager(nick)
 
@@ -135,6 +137,7 @@ def test_rotate_smtp_credentials_infers_iam_user_from_secret_metadata():
                 "SMTP_USERNAME": "AKIAOLD",
             }
         )
+
     }
 
     def client_side_effect(service_name, **kwargs):
@@ -148,6 +151,7 @@ def test_rotate_smtp_credentials_infers_iam_user_from_secret_metadata():
         rotated = manager.rotate_smtp_credentials()
 
     iam_client.get_access_key_last_used.assert_not_called()
+
     iam_client.list_access_keys.assert_called_once_with(
         UserName="ses-smtp-user.20250922-152128"
     )
