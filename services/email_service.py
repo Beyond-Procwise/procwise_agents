@@ -1,6 +1,7 @@
 import json
 import logging
 import smtplib
+import ssl
 from typing import Iterable, List, Optional, Tuple, Union
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -9,7 +10,6 @@ from email import encoders
 
 import boto3
 from botocore.exceptions import ClientError
-
 
 from utils.gpu import configure_gpu
 
@@ -65,20 +65,59 @@ class EmailService:
             self.logger.error("Unable to retrieve SMTP credentials: %s", exc)
             return False
 
+        message_payload = msg.as_string()
+
         try:
-            with smtplib.SMTP(
-                self.settings.ses_smtp_endpoint, self.settings.ses_smtp_port
-            ) as server:
-                server.starttls()
-                server.login(smtp_username, smtp_password)
-                server.sendmail(sender, recipient_list, msg.as_string())
+            self._deliver_via_smtp(
+                message_payload, sender, recipient_list, smtp_username, smtp_password
+            )
+
             return True
+        except smtplib.SMTPAuthenticationError as auth_exc:
+            self.logger.warning(
+                "SMTP authentication failed with current credentials; attempting fallback",
+                exc_info=auth_exc,
+            )
+            try:
+                fallback_username, fallback_password = self._fetch_smtp_credentials(
+                    version_stage="AWSPREVIOUS"
+                )
+            except Exception as fallback_exc:
+                self.logger.error(
+                    "Unable to retrieve fallback SMTP credentials: %s", fallback_exc
+                )
+                return False
+
+            try:
+                self._deliver_via_smtp(
+                    message_payload,
+                    sender,
+                    recipient_list,
+                    fallback_username,
+                    fallback_password,
+                )
+                return True
+            except smtplib.SMTPAuthenticationError as fallback_auth_exc:
+                self.logger.error("Email send failed: %s", fallback_auth_exc)
+                return False
+            except Exception as fallback_exc:  # pragma: no cover - defensive
+                self.logger.error("Email send failed: %s", fallback_exc)
+                return False
         except Exception as exc:  # pragma: no cover - network/runtime
             self.logger.error("Email send failed: %s", exc)
             return False
 
-    def _fetch_smtp_credentials(self) -> Tuple[str, str]:
-        """Retrieve freshly rotated SMTP credentials from AWS Secrets Manager."""
+    def _fetch_smtp_credentials(self, *, version_stage: str = "AWSCURRENT") -> Tuple[str, str]:
+        """Retrieve SMTP credentials from AWS Secrets Manager.
+
+        Parameters
+        ----------
+        version_stage:
+            The Secrets Manager version stage to request. Defaults to
+            ``"AWSCURRENT"`` but can be overridden (e.g. ``"AWSPREVIOUS"``)
+            for retry scenarios during credential rotation.
+        """
+
 
         secret_name = getattr(self.settings, "ses_smtp_secret_name", None)
         if not secret_name:
@@ -88,12 +127,15 @@ class EmailService:
 
         client = self._secrets_manager_client(region)
         try:
-            secret_value = client.get_secret_value(SecretId=secret_name)
+            get_kwargs = {"SecretId": secret_name}
+            if version_stage:
+                get_kwargs["VersionStage"] = version_stage
+            secret_value = client.get_secret_value(**get_kwargs)
+
         except ClientError as exc:
             raise RuntimeError(
                 f"Failed to retrieve SES SMTP secret '{secret_name}'"
             ) from exc
-
         secret_string = secret_value.get("SecretString")
         if not secret_string:
             raise ValueError("Secret does not contain a SecretString payload")
@@ -103,12 +145,49 @@ class EmailService:
         except json.JSONDecodeError as exc:
             raise ValueError("Secret payload is not valid JSON") from exc
 
-        username = payload.get("SMTP_USERNAME")
-        password = payload.get("SMTP_PASSWORD")
+        username = (
+            payload.get("SMTP_USERNAME")
+            or payload.get("smtp_username")
+            or payload.get("username")
+        )
+        password = (
+            payload.get("SMTP_PASSWORD")
+            or payload.get("smtp_password")
+            or payload.get("password")
+        )
         if not username or not password:
-            raise ValueError("Secret payload missing SMTP credentials")
+            raise ValueError(
+                f"Secret payload missing SMTP credentials for stage {version_stage}"
+            )
 
-        return username, password
+        username_str = str(username).strip()
+        password_str = str(password).strip()
+        if not username_str or not password_str:
+            raise ValueError(
+                f"Secret payload missing SMTP credentials for stage {version_stage}"
+            )
+
+        return username_str, password_str
+
+    def _deliver_via_smtp(
+        self,
+        message_payload: str,
+        sender: str,
+        recipient_list: List[str],
+        smtp_username: str,
+        smtp_password: str,
+    ) -> None:
+        """Send the prepared email payload using the provided credentials."""
+
+        with smtplib.SMTP(
+            self.settings.ses_smtp_endpoint, self.settings.ses_smtp_port
+        ) as server:
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+            server.login(smtp_username, smtp_password)
+            server.sendmail(sender, recipient_list, message_payload)
+
 
     def _secrets_manager_client(self, region: str):
         """Create a Secrets Manager client, assuming a role when configured."""
@@ -149,4 +228,3 @@ class EmailService:
             aws_secret_access_key=secret_key,
             aws_session_token=session_token,
         )
-

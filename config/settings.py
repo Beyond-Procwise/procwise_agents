@@ -40,7 +40,6 @@ class Settings(BaseSettings):
         default=None, env="SES_SECRET_ROLE_ARN"
     )
 
-
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
     # embeddings tailored for question/answer style retrieval.  Its

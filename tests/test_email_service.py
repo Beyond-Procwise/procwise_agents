@@ -1,6 +1,8 @@
 import json
+import smtplib
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
+
 
 from services.email_service import EmailService
 
@@ -36,7 +38,7 @@ def test_fetch_smtp_credentials_without_role_uses_direct_client():
     assert password == "pass"
     client_mock.assert_called_once_with("secretsmanager", region_name="eu-west-1")
     secrets_client.get_secret_value.assert_called_once_with(
-        SecretId="ses/smtp/credentials"
+        SecretId="ses/smtp/credentials", VersionStage="AWSCURRENT"
     )
 
 
@@ -78,5 +80,77 @@ def test_fetch_smtp_credentials_with_role_assumes_and_uses_temporary_creds():
         RoleSessionName="ProcWiseEmailSecrets",
     )
     secrets_client.get_secret_value.assert_called_once_with(
-        SecretId="ses/smtp/credentials"
+        SecretId="ses/smtp/credentials", VersionStage="AWSCURRENT"
     )
+
+
+def test_send_email_retries_with_previous_secret_on_auth_failure():
+    nick = DummyAgentNick()
+    service = EmailService(nick)
+
+    with patch.object(
+        service,
+        "_fetch_smtp_credentials",
+        side_effect=[("user", "pass"), ("legacy", "secret")],
+    ) as fetch_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
+        first_smtp = MagicMock()
+        first_smtp.__enter__.return_value = first_smtp
+        first_smtp.__exit__.return_value = False
+        first_smtp.login.side_effect = smtplib.SMTPAuthenticationError(
+            535, b"Invalid"
+        )
+
+        second_smtp = MagicMock()
+        second_smtp.__enter__.return_value = second_smtp
+        second_smtp.__exit__.return_value = False
+
+        smtp_mock.side_effect = [first_smtp, second_smtp]
+
+        result = service.send_email(
+            subject="Test",
+            body="<p>Hello</p>",
+            recipients=["to@example.com"],
+            sender="from@example.com",
+        )
+
+    assert result is True
+    assert fetch_mock.call_args_list[0] == call()
+    assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    first_smtp.sendmail.assert_not_called()
+    second_smtp.sendmail.assert_called_once()
+
+
+def test_send_email_returns_false_when_retry_also_fails_authentication():
+    nick = DummyAgentNick()
+    service = EmailService(nick)
+
+    auth_error = smtplib.SMTPAuthenticationError(535, b"Invalid")
+
+    with patch.object(
+        service,
+        "_fetch_smtp_credentials",
+        side_effect=[("user", "pass"), ("legacy", "secret")],
+    ) as fetch_mock, patch("services.email_service.smtplib.SMTP") as smtp_mock:
+        first_smtp = MagicMock()
+        first_smtp.__enter__.return_value = first_smtp
+        first_smtp.__exit__.return_value = False
+        first_smtp.login.side_effect = auth_error
+
+        second_smtp = MagicMock()
+        second_smtp.__enter__.return_value = second_smtp
+        second_smtp.__exit__.return_value = False
+        second_smtp.login.side_effect = auth_error
+
+        smtp_mock.side_effect = [first_smtp, second_smtp]
+
+        result = service.send_email(
+            subject="Test",
+            body="<p>Hello</p>",
+            recipients=["to@example.com"],
+            sender="from@example.com",
+        )
+
+    assert result is False
+    assert fetch_mock.call_args_list[0] == call()
+    assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+
