@@ -99,9 +99,13 @@ class SupplierInteractionAgent(BaseAgent):
                 )
 
             timeout = self._coerce_int(input_data.get("response_timeout"), default=900)
-            poll_interval = self._coerce_int(
-                input_data.get("response_poll_interval"), default=30
+            default_poll = getattr(
+                self.agent_nick.settings, "email_response_poll_seconds", 60
             )
+            poll_interval = self._coerce_int(
+                input_data.get("response_poll_interval"), default=default_poll
+            )
+            poll_interval = max(1, poll_interval)
             batch_limit = self._coerce_int(input_data.get("response_batch_limit"), default=5)
             expected_sender = None
             if draft_match:
@@ -310,7 +314,7 @@ class SupplierInteractionAgent(BaseAgent):
         *,
         watcher=None,
         timeout: int = 300,
-        poll_interval: int = 15,
+        poll_interval: Optional[int] = None,
         limit: int = 1,
         rfq_id: Optional[str] = None,
         supplier_id: Optional[str] = None,
@@ -345,6 +349,9 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_agent=self,
                     negotiation_agent=negotiation_agent,
                     enable_negotiation=False,
+                    response_poll_seconds=getattr(
+                        self.agent_nick.settings, "email_response_poll_seconds", 60
+                    ),
                 )
             active_watcher = self._email_watcher
 
@@ -386,9 +393,14 @@ class SupplierInteractionAgent(BaseAgent):
                     result = batch[-1]
                 if result is not None:
                     break
-            if poll_interval <= 0:
+            interval_value = poll_interval or getattr(
+                self.agent_nick.settings, "email_response_poll_seconds", 60
+            )
+            if interval_value <= 0:
                 break
-            time.sleep(min(poll_interval, max(0, deadline - time.time())))
+            time.sleep(
+                min(max(1, interval_value), max(0, deadline - time.time()))
+            )
 
         return result
 

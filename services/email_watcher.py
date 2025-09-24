@@ -87,6 +87,7 @@ class SESEmailWatcher:
         message_loader: Optional[EmailLoader] = None,
         state_store: Optional[EmailWatcherState] = None,
         enable_negotiation: bool = True,
+        response_poll_seconds: Optional[int] = None,
     ) -> None:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
@@ -105,6 +106,16 @@ class SESEmailWatcher:
         self.metadata_provider = metadata_provider
         self.state_store = state_store or InMemoryEmailWatcherState()
         self._custom_loader = message_loader
+        poll_interval = response_poll_seconds
+        if poll_interval is None:
+            poll_interval = getattr(
+                self.settings, "email_response_poll_seconds", 60
+            )
+        try:
+            poll_interval = int(poll_interval)
+        except Exception:
+            poll_interval = 60
+        self.poll_interval_seconds = max(1, poll_interval)
 
         endpoint = getattr(self.settings, "ses_smtp_endpoint", "")
         self.region = getattr(self.settings, "ses_region", None) or self._parse_region(endpoint)
@@ -176,18 +187,25 @@ class SESEmailWatcher:
 
         return results
 
-    def watch(self, *, interval: int = 60, limit: Optional[int] = None, stop_after: Optional[int] = None) -> int:
+    def watch(
+        self,
+        *,
+        interval: Optional[int] = None,
+        limit: Optional[int] = None,
+        stop_after: Optional[int] = None,
+    ) -> int:
         """Continuously poll for messages until ``stop_after`` iterations."""
 
         iterations = 0
         processed_total = 0
+        poll_delay = self.poll_interval_seconds if interval is None else max(interval, 1)
         while True:
             batch = self.poll_once(limit=limit)
             processed_total += len(batch)
             iterations += 1
             if stop_after is not None and iterations >= stop_after:
                 break
-            time.sleep(max(interval, 1))
+            time.sleep(poll_delay)
         return processed_total
 
     # ------------------------------------------------------------------

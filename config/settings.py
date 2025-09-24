@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     ses_smtp_propagation_wait_seconds: int = Field(
         default=30, env="SES_SMTP_PROPAGATION_WAIT_SECONDS"
     )
+    email_response_poll_seconds: int = Field(
+        default=60, env="EMAIL_RESPONSE_POLL_SECONDS"
+    )
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic

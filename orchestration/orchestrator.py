@@ -905,10 +905,9 @@ class Orchestrator:
                 # agent completes.
                 prs.update_agent_status(process_id, step_name, "validated")
             logger.info(
-                "Executing step %s with agent %s and input %s",
+                "Executing step %s with agent %s",
                 step_name,
                 agent_key,
-                agent_input,
             )
             while attempt <= retries and not success:
                 attempt += 1
@@ -930,11 +929,10 @@ class Orchestrator:
                     run_ctx["errors"][step_name] = str(exc)
                 finally:
                     logger.info(
-                        "Step %s attempt %s completed with status %s and output %s",
+                        "Step %s attempt %s completed with status %s",
                         step_name,
                         attempt,
                         getattr(result, "status", None),
-                        getattr(result, "data", None),
                     )
             if not success:
                 flow_status = 0
@@ -1420,7 +1418,7 @@ class Orchestrator:
     def _execute_quote_workflow(self, context: AgentContext) -> Dict:
         """Execute quote evaluation workflow"""
         # Execute quote evaluation
-        logger.info("Quote workflow starting with input %s", context.input_data)
+        logger.info("Quote workflow starting")
         quote_result = self._execute_agent("quote_evaluation", context)
 
         results: Dict[str, Any] = dict(quote_result.data)

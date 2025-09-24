@@ -46,6 +46,7 @@ class DummyNick:
             ses_region="eu-west-1",
             ses_inbound_prefix="ses/inbound/",
             s3_bucket_name="bucket",
+            email_response_poll_seconds=60,
         )
         self.agents = {}
 

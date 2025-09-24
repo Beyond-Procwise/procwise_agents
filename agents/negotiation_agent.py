@@ -23,7 +23,7 @@ class NegotiationAgent(BaseAgent):
         self._negotiation_counts: Dict[Tuple[str, Optional[str]], int] = {}
 
     def run(self, context: AgentContext) -> AgentOutput:
-        logger.info("NegotiationAgent starting with input %s", context.input_data)
+        logger.info("NegotiationAgent starting")
         supplier = context.input_data.get("supplier")
         current_offer = context.input_data.get("current_offer")
         target_price = context.input_data.get("target_price")
@@ -55,6 +55,7 @@ class NegotiationAgent(BaseAgent):
                     "message": "",
                     "transcript": [],
                     "references": [],
+                    "interaction_type": "negotiation",
                 },
                 pass_fields={
                     "supplier": supplier,
@@ -65,6 +66,7 @@ class NegotiationAgent(BaseAgent):
                     "message": "",
                     "transcript": [],
                     "references": [],
+                    "interaction_type": "negotiation",
                 },
                 next_agents=[],
             )
@@ -89,6 +91,7 @@ class NegotiationAgent(BaseAgent):
                 "transcript": [],
                 "references": [],
                 "negotiation_allowed": False,
+                "interaction_type": "negotiation",
             }
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
@@ -125,7 +128,7 @@ class NegotiationAgent(BaseAgent):
             supplier_context,
         )
 
-        logger.debug("NegotiationAgent prompt: %s", prompt)
+        logger.debug("NegotiationAgent prompt prepared")
         response = self.call_ollama(prompt=prompt)
         message = response.get("response", "").strip()
         if not message:
@@ -138,7 +141,7 @@ class NegotiationAgent(BaseAgent):
                 item_reference,
                 context.input_data,
             )
-        logger.info("NegotiationAgent generated message: %s", message)
+        logger.info("NegotiationAgent generated negotiation guidance")
 
         # Retrieve relevant references from Qdrant
         references: list[str] = []
@@ -184,8 +187,12 @@ class NegotiationAgent(BaseAgent):
             "references": references,
             "item_reference": item_reference,
             "negotiation_allowed": True,
+            "interaction_type": "negotiation",
         }
-        logger.debug("NegotiationAgent output: %s", data)
+        logger.debug(
+            "NegotiationAgent output compiled with keys: %s",
+            sorted(data.keys()),
+        )
         logger.info(
             "NegotiationAgent produced %d counter proposals", len(counter_options)
         )

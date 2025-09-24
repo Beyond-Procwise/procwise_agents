@@ -92,7 +92,7 @@ class BaseAgent:
         every agent invocation is captured in the database regardless of how it
         is triggered.
         """
-        logger.info("%s: starting with input %s", self.__class__.__name__, context.input_data)
+        logger.info("%s: starting", self.__class__.__name__)
         start_ts = datetime.utcnow()
         try:
             result = self.run(context)
