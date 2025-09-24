@@ -259,8 +259,12 @@ class EmailDispatchService:
         rfq_id: str,
         sent: bool,
     ) -> None:
-        action_id = payload.get("action_id")
+        action_id = self._extract_action_id(payload)
         if not action_id:
+            logger.debug(
+                "No action identifier found in dispatch payload for RFQ %s; skipping sent_status update",
+                rfq_id,
+            )
             return
 
         try:
@@ -297,6 +301,16 @@ class EmailDispatchService:
                 action_id,
                 rfq_id,
             )
+
+    @staticmethod
+    def _extract_action_id(payload: Dict[str, Any]) -> Optional[str]:
+        """Return the best effort action identifier from ``payload``."""
+
+        for key in ("action_id", "draft_action_id", "email_action_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:
