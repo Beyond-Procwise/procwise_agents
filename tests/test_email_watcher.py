@@ -9,7 +9,7 @@ from services.email_watcher import (
 
 
 class StubSupplierInteractionAgent:
-    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}")
+    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}", re.IGNORECASE)
 
     def __init__(self):
         self.contexts = []
@@ -147,3 +147,34 @@ def test_email_watcher_records_skipped_messages_without_rfq():
 
     assert results == []
     assert watcher.state_store.get("msg-3")["status"] == "skipped"
+
+
+def test_email_watcher_matches_uppercase_rfq_identifier():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+    messages = [
+        {
+            "id": "msg-4",
+            "subject": "Re: RFQ-20240101-ABCD1234",
+            "body": "Quoted price 1200 USD",
+            "from": "supplier@example.com",
+        }
+    ]
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {"supplier_id": "SUP-4", "target_price": 1500},
+        message_loader=lambda limit=None: messages,
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    assert results[0]["rfq_id"] == "RFQ-20240101-ABCD1234"
+    assert results[0]["supplier_id"] == "SUP-4"
+    # Supplier agent should have been invoked once with the parsed RFQ ID
+    assert supplier_agent.contexts[0].input_data["rfq_id"] == "RFQ-20240101-ABCD1234"
