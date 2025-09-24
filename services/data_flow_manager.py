@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -393,12 +394,17 @@ class DataFlowManager:
             logger.exception("Failed to ensure Qdrant collection for knowledge graph")
             return
 
-        points: List[models.PointStruct] = []
+        points_by_id: Dict[int, models.PointStruct] = {}
+        seen_point_ids: set[int] = set()
         for relation in relations:
             text = self._relation_to_text(relation)
+            point_id = self._deterministic_id(text)
+            if point_id in seen_point_ids:
+                continue
             vector = self._embed_text(text)
             if vector is None:
                 continue
+            seen_point_ids.add(point_id)
             payload = {
                 "document_type": "knowledge_graph_relation",
                 "source_table": relation.get("source_table"),
@@ -414,9 +420,8 @@ class DataFlowManager:
                 payload["source_table_alias"] = relation.get("source_table_alias")
             if relation.get("target_table_alias"):
                 payload["target_table_alias"] = relation.get("target_table_alias")
-            point_id = self._deterministic_id(text)
-            points.append(
-                models.PointStruct(id=point_id, vector=vector, payload=payload)
+            points_by_id[point_id] = models.PointStruct(
+                id=point_id, vector=vector, payload=payload
             )
 
         if graph:
@@ -430,9 +435,13 @@ class DataFlowManager:
                 if not canonical_path:
                     continue
                 path_text = self._path_to_text(canonical_path, resolved_aliases or None)
+                point_id = self._deterministic_id(path_text)
+                if point_id in seen_point_ids:
+                    continue
                 vector = self._embed_text(path_text)
                 if vector is None:
                     continue
+                seen_point_ids.add(point_id)
                 payload = {
                     "document_type": "knowledge_graph_path",
                     "path": list(canonical_path),
@@ -440,43 +449,50 @@ class DataFlowManager:
                 if resolved_aliases and resolved_aliases != canonical_path:
                     payload["resolved_aliases"] = list(resolved_aliases)
 
-                point_id = self._deterministic_id(path_text)
-                points.append(
-                    models.PointStruct(id=point_id, vector=vector, payload=payload)
+                points_by_id[point_id] = models.PointStruct(
+                    id=point_id, vector=vector, payload=payload
                 )
 
             for flow in graph.get("supplier_flows", []):
                 if not isinstance(flow, Mapping):
                     continue
-                text = self._supplier_flow_to_text(flow)
+                text, mapping_summary = self._supplier_flow_text_bundle(flow)
+                point_id = self._deterministic_id(text)
+                if point_id in seen_point_ids:
+                    continue
                 vector = self._embed_text(text)
                 if vector is None:
                     continue
+                seen_point_ids.add(point_id)
                 payload: Dict[str, Any] = {
                     "document_type": "supplier_flow",
                     "supplier_id": flow.get("supplier_id"),
                     "supplier_name": flow.get("supplier_name"),
                     "coverage_ratio": flow.get("coverage_ratio"),
                 }
+                payload["summary"] = text
+                if mapping_summary:
+                    payload["mapping_summary"] = mapping_summary
                 for key in ("contracts", "purchase_orders", "invoices", "quotes", "products"):
                     value = flow.get(key)
                     if isinstance(value, dict):
                         payload[key] = value
-                point_id = self._deterministic_id(text)
-                points.append(
-                    models.PointStruct(id=point_id, vector=vector, payload=payload)
+                points_by_id[point_id] = models.PointStruct(
+                    id=point_id, vector=vector, payload=payload
                 )
 
+        points = list(points_by_id.values())
         if not points:
             logger.debug("No knowledge graph points generated for persistence")
             return
 
         try:
-            self.qdrant_client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
-            )
+            for batch in self._batch_points(points):
+                self.qdrant_client.upsert(
+                    collection_name=self.collection_name,
+                    points=batch,
+                    wait=True,
+                )
         except Exception:  # pragma: no cover - network/runtime issues
             logger.exception("Failed to upsert knowledge graph points into Qdrant")
 
@@ -1037,6 +1053,12 @@ class DataFlowManager:
         return flows_list
 
     def _supplier_flow_to_text(self, flow: Mapping[str, Any]) -> str:
+        text, _ = self._supplier_flow_text_bundle(flow)
+        return text
+
+    def _supplier_flow_text_bundle(
+        self, flow: Mapping[str, Any]
+    ) -> Tuple[str, List[str]]:
         supplier_id = flow.get("supplier_id")
         supplier_name = flow.get("supplier_name")
         label = str(supplier_name).strip() if supplier_name else None
@@ -1119,7 +1141,115 @@ class DataFlowManager:
             if isinstance(unique, (int, float)) and unique:
                 parts.append(f"Product catalogue covers {int(unique)} unique items.")
 
-        return " ".join(parts)
+        mapping_summary = self._supplier_flow_mapping_statements(
+            flow, label, supplier_id
+        )
+        if mapping_summary:
+            parts.extend(mapping_summary)
+
+        return " ".join(parts), mapping_summary
+
+    def _supplier_flow_mapping_statements(
+        self, flow: Mapping[str, Any], label: str, supplier_id: Any
+    ) -> List[str]:
+        statements: List[str] = []
+        supplier_display = label or (f"Supplier {supplier_id}" if supplier_id else "Supplier")
+
+        def _ids_clause(ids: Optional[Sequence[Any]]) -> str:
+            if not ids:
+                return ""
+            cleaned: List[str] = []
+            for raw in ids:
+                text = str(raw).strip()
+                if text and text not in cleaned:
+                    cleaned.append(text)
+            if not cleaned:
+                return ""
+            limited = cleaned[: _SUPPLIER_FLOW_ID_LIMIT]
+            joined = ", ".join(limited)
+            if len(cleaned) > _SUPPLIER_FLOW_ID_LIMIT:
+                joined = f"{joined}, ..."
+            return f" including {joined}"
+
+        contracts = flow.get("contracts") if isinstance(flow.get("contracts"), Mapping) else {}
+        if contracts:
+            contract_count = contracts.get("count", 0)
+            if contract_count:
+                ids_clause = _ids_clause(contracts.get("contract_ids"))
+                latest = contracts.get("latest_end_date")
+                timeline = f" ending by {latest}" if latest else ""
+                statements.append(
+                    f"{supplier_display} links to `proc.contracts` via `supplier_id`, covering {int(contract_count)} contract"
+                    f"{'s' if contract_count != 1 else ''}{ids_clause}{timeline}."
+                )
+
+        purchase_orders = flow.get("purchase_orders") if isinstance(flow.get("purchase_orders"), Mapping) else {}
+        if purchase_orders:
+            po_count = purchase_orders.get("count", 0)
+            if po_count:
+                ids_clause = _ids_clause(purchase_orders.get("po_ids"))
+                total_value = self._safe_float(purchase_orders.get("total_value_gbp"))
+                value_clause = f" totalling {total_value:,.2f} GBP" if total_value else ""
+                latest = purchase_orders.get("latest_order_date")
+                timeline = f" with the latest order on {latest}" if latest else ""
+                statements.append(
+                    f"Purchase orders in `proc.purchase_order_agent` reference {supplier_display} via `supplier_id`, covering {int(po_count)} order"
+                    f"{'s' if po_count != 1 else ''}{ids_clause}{value_clause}{timeline}."
+                )
+
+        invoices = flow.get("invoices") if isinstance(flow.get("invoices"), Mapping) else {}
+        if invoices:
+            invoice_count = invoices.get("count", 0)
+            if invoice_count:
+                ids_clause = _ids_clause(invoices.get("invoice_ids"))
+                total_value = self._safe_float(invoices.get("total_value_gbp"))
+                value_clause = f" worth {total_value:,.2f} GBP" if total_value else ""
+                latest = invoices.get("latest_invoice_date")
+                timeline = f" with the latest invoice on {latest}" if latest else ""
+                statements.append(
+                    f"Invoices in `proc.invoice_agent` connect to {supplier_display}'s purchase orders via `po_id`, covering {int(invoice_count)} invoice"
+                    f"{'s' if invoice_count != 1 else ''}{ids_clause}{value_clause}{timeline}."
+                )
+
+        quotes = flow.get("quotes") if isinstance(flow.get("quotes"), Mapping) else {}
+        if quotes:
+            quote_count = quotes.get("count", 0)
+            if quote_count:
+                ids_clause = _ids_clause(quotes.get("quote_ids"))
+                total_value = self._safe_float(quotes.get("total_value_gbp"))
+                value_clause = f" valued at {total_value:,.2f} GBP" if total_value else ""
+                statements.append(
+                    f"Quotes in `proc.quote_agent` align with {supplier_display} through shared supplier details, covering {int(quote_count)} quote"
+                    f"{'s' if quote_count != 1 else ''}{ids_clause}{value_clause}."
+                )
+
+        products = flow.get("products") if isinstance(flow.get("products"), Mapping) else {}
+        if products:
+            top_items = products.get("top_items")
+            if isinstance(top_items, list) and top_items:
+                highlighted: List[str] = []
+                for item in top_items[:_SUPPLIER_FLOW_ITEM_LIMIT]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    desc = str(item.get("description") or "").strip()
+                    if not desc:
+                        continue
+                    spend = self._safe_float(item.get("spend_gbp"))
+                    if spend:
+                        highlighted.append(f"{desc} ({spend:,.2f} GBP)")
+                    else:
+                        highlighted.append(desc)
+                if highlighted:
+                    statements.append(
+                        f"Line items in `proc.po_line_items_agent` join on `po_id` to {supplier_display}'s purchase orders, highlighting {', '.join(highlighted)}."
+                    )
+            unique = products.get("unique_items")
+            if isinstance(unique, (int, float)) and unique:
+                statements.append(
+                    f"The supplier's product catalogue spans {int(unique)} unique item descriptions."
+                )
+
+        return statements
 
     def _build_alias_index(
         self,
@@ -1270,6 +1400,50 @@ class DataFlowManager:
     def _deterministic_id(self, text: str) -> int:
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         return int(digest[:16], 16)
+
+    def _batch_points(
+        self,
+        points: Sequence[models.PointStruct],
+        max_batch_bytes: int = 28 * 1024 * 1024,
+    ) -> Iterable[List[models.PointStruct]]:
+        """Yield point batches that respect Qdrant payload size limits.
+
+        ``max_batch_bytes`` is slightly below the 32MiB Qdrant limit to provide a
+        safety margin for protocol overhead.
+        """
+
+        batch: List[models.PointStruct] = []
+        batch_bytes = 0
+        for point in points:
+            point_bytes = self._estimate_point_size(point)
+            if point_bytes >= max_batch_bytes:
+                if batch:
+                    yield batch
+                    batch = []
+                    batch_bytes = 0
+                yield [point]
+                continue
+            if batch and batch_bytes + point_bytes > max_batch_bytes:
+                yield batch
+                batch = []
+                batch_bytes = 0
+            batch.append(point)
+            batch_bytes += point_bytes
+        if batch:
+            yield batch
+
+    def _estimate_point_size(self, point: models.PointStruct) -> int:
+        """Estimate the serialized size of a Qdrant point."""
+
+        vector = getattr(point, "vector", None) or []
+        vector_len = len(vector)
+        vector_bytes = vector_len * 4  # float32 approximation
+        payload = getattr(point, "payload", {})
+        try:
+            payload_bytes = len(json.dumps(payload, ensure_ascii=False))
+        except (TypeError, ValueError):  # pragma: no cover - fallback
+            payload_bytes = 0
+        return vector_bytes + payload_bytes + 512  # transport overhead buffer
 
     def _relation_to_text(self, relation: Dict[str, Any]) -> str:
         source = relation.get("source_table")
