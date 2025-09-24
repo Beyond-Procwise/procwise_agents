@@ -117,6 +117,12 @@ class SESEmailWatcher:
             poll_interval = 60
         self.poll_interval_seconds = max(1, poll_interval)
 
+        self.mailbox_address = (
+            getattr(self.settings, "supplier_mailbox", None)
+            or getattr(self.settings, "imap_user", None)
+            or "supplierconnect@procwise.co.uk"
+        )
+
         endpoint = getattr(self.settings, "ses_smtp_endpoint", "")
         self.region = getattr(self.settings, "ses_region", None) or self._parse_region(endpoint)
         self.bucket = getattr(self.settings, "ses_inbound_bucket", None) or getattr(
@@ -126,6 +132,14 @@ class SESEmailWatcher:
 
         # Lazily created S3 client to avoid mandatory AWS credentials during unit tests.
         self._s3_client = None
+
+        logger.info(
+            "Initialised email watcher for mailbox %s (bucket=%s, prefix=%s, poll_interval=%ss)",
+            self.mailbox_address,
+            self.bucket,
+            self.prefix,
+            self.poll_interval_seconds,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -148,6 +162,12 @@ class SESEmailWatcher:
         messages: List[Dict[str, object]] = []
         results: List[Dict[str, object]] = []
 
+        logger.info(
+            "Polling inbound mailbox %s with limit=%s",
+            self.mailbox_address,
+            limit if limit is not None else "unbounded",
+        )
+
         try:
             loader = self._custom_loader or self._load_from_s3
             messages = loader(limit)
@@ -155,9 +175,20 @@ class SESEmailWatcher:
             logger.exception("Failed to load inbound SES messages")
             return results
 
+        logger.info(
+            "Retrieved %d new message(s) for mailbox %s",
+            len(messages),
+            self.mailbox_address,
+        )
+
         for message in messages:
             message_id = str(message.get("id") or uuid.uuid4())
             if self.state_store and message_id in self.state_store:
+                logger.debug(
+                    "Skipping message %s for mailbox %s as it was already processed",
+                    message_id,
+                    self.mailbox_address,
+                )
                 continue
 
             try:
@@ -168,6 +199,12 @@ class SESEmailWatcher:
 
             metadata: Dict[str, object]
             if processed:
+                logger.info(
+                    "Processed message %s for RFQ %s from %s",
+                    message_id,
+                    processed.get("rfq_id"),
+                    processed.get("from_address"),
+                )
                 results.append(processed)
                 metadata = {
                     "rfq_id": processed.get("rfq_id"),
@@ -176,6 +213,12 @@ class SESEmailWatcher:
                     "status": "processed",
                 }
             else:
+                logger.warning(
+                    "Skipped message %s for mailbox %s: %s",
+                    message_id,
+                    self.mailbox_address,
+                    reason or "unknown",
+                )
                 metadata = {
                     "processed_at": datetime.now(timezone.utc).isoformat(),
                     "status": "skipped",
@@ -203,6 +246,12 @@ class SESEmailWatcher:
             batch = self.poll_once(limit=limit)
             processed_total += len(batch)
             iterations += 1
+            logger.info(
+                "Email watcher iteration %d processed %d message(s); total processed=%d",
+                iterations,
+                len(batch),
+                processed_total,
+            )
             if stop_after is not None and iterations >= stop_after:
                 break
             time.sleep(poll_delay)
@@ -249,6 +298,31 @@ class SESEmailWatcher:
         )
 
         interaction_output = self.supplier_agent.execute(context)
+        if interaction_output.status != AgentStatus.SUCCESS:
+            error_detail = interaction_output.error
+            if not error_detail and isinstance(interaction_output.data, dict):
+                error_detail = interaction_output.data.get("error")
+            logger.error(
+                "Supplier interaction failed for RFQ %s via mailbox %s: %s",
+                rfq_id,
+                self.mailbox_address,
+                error_detail or "unknown_error",
+            )
+            result = {
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "message_id": message.get("id"),
+                "subject": subject,
+                "from_address": from_address,
+                "target_price": target_price,
+                "negotiation_triggered": False,
+                "supplier_status": interaction_output.status.value,
+                "negotiation_status": None,
+                "supplier_output": interaction_output.data,
+                "negotiation_output": None,
+                "error": error_detail,
+            }
+            return result, "supplier_interaction_failed"
         negotiation_output: Optional[AgentOutput] = None
         triggered = False
 
@@ -276,6 +350,13 @@ class SESEmailWatcher:
             )
             negotiation_output = self.negotiation_agent.execute(negotiation_context)
             triggered = negotiation_output.status == AgentStatus.SUCCESS
+            logger.info(
+                "Negotiation triggered for RFQ %s (round %s) via mailbox %s; status=%s",
+                rfq_id,
+                negotiation_round,
+                self.mailbox_address,
+                negotiation_output.status.value,
+            )
 
         result = {
             "rfq_id": rfq_id,
@@ -346,6 +427,12 @@ class SESEmailWatcher:
             return []
 
         client = self._get_s3_client()
+        logger.debug(
+            "Listing inbound emails from bucket=%s, prefix=%s for mailbox %s",
+            self.bucket,
+            self.prefix,
+            self.mailbox_address,
+        )
         paginator = client.get_paginator("list_objects_v2")
         iterator = paginator.paginate(Bucket=self.bucket, Prefix=self.prefix)
 
@@ -365,6 +452,11 @@ class SESEmailWatcher:
                 parsed = self._parse_email(raw)
                 parsed["id"] = key
                 messages.append(parsed)
+                logger.debug(
+                    "Queued message %s for processing from mailbox %s",
+                    key,
+                    self.mailbox_address,
+                )
                 if limit is not None and len(messages) >= limit:
                     return messages
         return messages
@@ -381,6 +473,7 @@ class SESEmailWatcher:
         message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
         subject = message.get("subject", "")
         from_address = message.get("from", "")
+        recipients = message.get_all("to", [])
         body = self._extract_body(message)
         rfq_id = self._extract_rfq_id(f"{subject} {body}")
         return {
@@ -389,6 +482,7 @@ class SESEmailWatcher:
             "body": body,
             "rfq_id": rfq_id,
             "received_at": message.get("date"),
+            "recipients": recipients,
         }
 
     def _extract_body(self, message) -> str:

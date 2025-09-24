@@ -1440,7 +1440,6 @@ class EmailDraftingAgent(BaseAgent):
                 persisted_draft = dict(draft)
                 persisted_draft.pop("draft_record_id", None)
                 persisted_draft.pop("id", None)
-                persisted_draft.pop("action_id", None)
                 payload = json.dumps(persisted_draft, default=str)
 
                 with conn.cursor() as cur:
