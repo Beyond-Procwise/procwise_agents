@@ -2,6 +2,7 @@ import json
 import logging
 import smtplib
 import ssl
+import time
 from typing import Iterable, List, Optional, Tuple, Union
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -29,6 +30,16 @@ class EmailService:
         self.settings = agent_nick.settings
         self.logger = logging.getLogger(__name__)
         self.credential_manager = SESSMTPAccessManager(agent_nick)
+        self.smtp_propagation_attempts = self._coerce_int_setting(
+            getattr(self.settings, "ses_smtp_propagation_attempts", 6),
+            default=6,
+            minimum=1,
+        )
+        self.smtp_propagation_wait_seconds = self._coerce_int_setting(
+            getattr(self.settings, "ses_smtp_propagation_wait_seconds", 30),
+            default=30,
+            minimum=0,
+        )
 
     def send_email(
         self,
@@ -148,25 +159,77 @@ class EmailService:
             return False
 
         try:
-            self._deliver_via_smtp(
-                message_payload,
-                sender,
-                recipient_list,
-                rotated.smtp_username,
-                rotated.smtp_password,
+            confirmed_username, confirmed_password = self._fetch_smtp_credentials()
+        except Exception as exc:  # pragma: no cover - network/runtime
+            self.logger.warning(
+                "Unable to confirm rotated SES SMTP credentials from Secrets Manager: %s",
+                exc,
             )
-            return True
-        except smtplib.SMTPAuthenticationError as auth_exc:
-            self.logger.error(
-                "Email send failed even after rotating SES SMTP credentials: %s",
-                auth_exc,
-            )
+            confirmed_username = rotated.smtp_username
+            confirmed_password = rotated.smtp_password
+
+        username = confirmed_username or rotated.smtp_username
+        password = confirmed_password or rotated.smtp_password
+
+        if not username or not password:
+            self.logger.error("Rotated SES SMTP credentials are incomplete")
             return False
-        except Exception as exc:  # pragma: no cover - defensive
-            self.logger.error(
-                "Email send failed after rotating SES SMTP credentials: %s", exc
-            )
-            return False
+
+        return self._deliver_with_propagation_retry(
+            message_payload,
+            sender,
+            recipient_list,
+            username,
+            password,
+        )
+
+    def _deliver_with_propagation_retry(
+        self,
+        message_payload: str,
+        sender: str,
+        recipient_list: List[str],
+        smtp_username: str,
+        smtp_password: str,
+    ) -> bool:
+        """Attempt delivery with rotated credentials, retrying for propagation."""
+
+        attempts = max(1, int(self.smtp_propagation_attempts))
+        wait_seconds = max(0, int(self.smtp_propagation_wait_seconds))
+
+        for attempt in range(1, attempts + 1):
+            try:
+                self._deliver_via_smtp(
+                    message_payload,
+                    sender,
+                    recipient_list,
+                    smtp_username,
+                    smtp_password,
+                )
+                return True
+            except smtplib.SMTPAuthenticationError as auth_exc:
+                if attempt >= attempts:
+                    self.logger.error(
+                        "Email send failed even after rotating SES SMTP credentials: %s",
+                        auth_exc,
+                    )
+                    return False
+
+                self.logger.warning(
+                    "SMTP authentication failed using rotated SES credentials (attempt %s/%s); retrying after %ss",
+                    attempt,
+                    attempts,
+                    wait_seconds,
+                )
+                if wait_seconds:
+                    time.sleep(wait_seconds)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.error(
+                    "Email send failed after rotating SES SMTP credentials: %s",
+                    exc,
+                )
+                return False
+
+        return False
 
     def _fetch_smtp_credentials(self, *, version_stage: str = "AWSCURRENT") -> Tuple[str, str]:
         """Retrieve SMTP credentials from AWS Secrets Manager.
@@ -249,6 +312,17 @@ class EmailService:
             server.login(smtp_username, smtp_password)
             server.sendmail(sender, recipient_list, message_payload)
 
+
+    @staticmethod
+    def _coerce_int_setting(value, *, default: int, minimum: int) -> int:
+        """Coerce integer-like configuration values while enforcing bounds."""
+
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            return default
+
+        return coerced if coerced >= minimum else minimum
 
     def _secrets_manager_client(self, region: str):
         """Create a Secrets Manager client, assuming a role when configured."""
