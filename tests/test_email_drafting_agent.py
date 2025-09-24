@@ -20,6 +20,7 @@ class DummyNick:
             qdrant_collection_name="dummy",
             extraction_model="llama3",
             script_user="tester",
+            email_response_poll_seconds=60,
         )
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: None,
@@ -185,6 +186,30 @@ def test_email_drafting_follow_up_interaction(monkeypatch):
     assert "following up on our earlier quotation request" in body
     assert "update on your quotation" in body
     assert "Kindly retain the RFQ ID in the email subject" in body
+
+
+def test_email_drafting_includes_negotiation_message(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+
+    ranking = [{"supplier_id": "S1", "supplier_name": "Acme"}]
+    context = AgentContext(
+        workflow_id="wf-neg",
+        agent_id="email_drafting",
+        user_id="tester",
+        input_data={
+            "ranking": ranking,
+            "message": "Please consider revising your quotation to align with our target.",
+            "target_price": 750,
+        },
+    )
+
+    output = agent.run(context)
+    draft = output.data["drafts"][0]
+
+    assert "Please consider revising your quotation" in draft["body"]
+    assert draft["sent_status"] is False
 
 
 def test_email_drafting_uses_template_from_previous_agent(monkeypatch):

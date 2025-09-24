@@ -27,7 +27,7 @@ class QuoteEvaluationAgent(BaseAgent):
         """Fetch quotes and return only required commercial fields or compare RFQ responses."""
         try:
             input_data = context.input_data
-            logger.info("QuoteEvaluationAgent: starting with input %s", input_data)
+            logger.info("QuoteEvaluationAgent: starting")
             rfq_id = input_data.get("rfq_id")
             if rfq_id:
                 quotes = self._get_responses_from_db(rfq_id)

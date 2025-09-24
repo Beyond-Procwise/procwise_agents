@@ -758,7 +758,7 @@ class EmailDraftingAgent(BaseAgent):
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
-        logger.info("EmailDraftingAgent starting with input %s", context.input_data)
+        logger.info("EmailDraftingAgent starting")
         self._ensure_prompt_template(context)
         data = dict(context.input_data)
         prev = data.get("previous_agent_output")
@@ -789,6 +789,28 @@ class EmailDraftingAgent(BaseAgent):
         manual_sent_flag: bool = data.get("sent_status", True)
 
         instruction_settings = self._resolve_instruction_settings(context)
+        negotiation_context = data.get("negotiation")
+        negotiation_message = None
+        if isinstance(negotiation_context, dict):
+            negotiation_message = self._coerce_text(
+                negotiation_context.get("negotiation_message")
+                or negotiation_context.get("message")
+            )
+            if not negotiation_message:
+                transcript = negotiation_context.get("transcript")
+                if isinstance(transcript, list) and transcript:
+                    negotiation_message = self._coerce_text(transcript[-1])
+        if negotiation_message is None:
+            negotiation_message = self._coerce_text(
+                data.get("negotiation_message") or data.get("message")
+            )
+        negotiation_section_html = ""
+        if negotiation_message:
+            negotiation_section_html = self._render_instruction_paragraph(
+                negotiation_message
+            )
+            instruction_settings.setdefault("interaction_type", "negotiation")
+
         body_template_override = self._coerce_text(
             instruction_settings.get("body_template")
         )
@@ -888,8 +910,11 @@ class EmailDraftingAgent(BaseAgent):
                     "rfq_id": rfq_id,
                     "additional_paragraph_html": additional_section_html,
                     "compliance_notice_html": compliance_section_html,
+                    "negotiation_message_html": negotiation_section_html,
                 }
             )
+            if negotiation_message:
+                template_args["negotiation_message"] = negotiation_message
             interaction_type = self._determine_interaction_type(data, instruction_settings)
             template_args["interaction_type"] = interaction_type
             dynamic_meta = {
@@ -899,6 +924,8 @@ class EmailDraftingAgent(BaseAgent):
                 "call_to_action": instruction_settings.get("call_to_action"),
                 "context_note": instruction_settings.get("context_note"),
             }
+            if negotiation_message:
+                dynamic_meta["negotiation_message"] = negotiation_message
 
             if self._should_auto_compose(
                 body_template, instruction_settings, data
@@ -927,6 +954,8 @@ class EmailDraftingAgent(BaseAgent):
                 message_content = f"{message_content}{instruction_suffix}"
 
             content = self._sanitise_generated_body(message_content)
+            if negotiation_section_html and negotiation_section_html not in content:
+                content = f"{content}{negotiation_section_html}"
             comment = comment if comment else f"<!-- RFQ-ID: {rfq_id} -->"
             body = comment if not content else f"{comment}\n{content}"
             if subject_template_source:
@@ -1311,6 +1340,14 @@ class EmailDraftingAgent(BaseAgent):
             normalised.append(candidate)
         return normalised
 
+    def execute(self, context: AgentContext) -> AgentOutput:
+        result = super().execute(context)
+        try:
+            self._synchronise_draft_records(result)
+        except Exception:  # pragma: no cover - defensive sync
+            logger.exception("failed to synchronise draft action metadata")
+        return result
+
     def _store_draft(self, draft: dict) -> None:
         """Persist email draft to ``proc.draft_rfq_emails``."""
         try:
@@ -1336,7 +1373,11 @@ class EmailDraftingAgent(BaseAgent):
                 contact_level_int = max(0, contact_level_int)
                 draft["contact_level"] = contact_level_int
 
-                payload = json.dumps(draft, default=str)
+                persisted_draft = dict(draft)
+                persisted_draft.pop("draft_record_id", None)
+                persisted_draft.pop("id", None)
+                persisted_draft.pop("action_id", None)
+                payload = json.dumps(persisted_draft, default=str)
 
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1345,7 +1386,7 @@ class EmailDraftingAgent(BaseAgent):
                         (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent,
                          recipient_email, contact_level, thread_index, sender, payload)
                         VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
-
+                        RETURNING id
                         """,
                         (
                             draft["rfq_id"],
@@ -1359,12 +1400,49 @@ class EmailDraftingAgent(BaseAgent):
                             thread_index,
                             draft.get("sender"),
                             payload,
-
                         ),
                     )
+                    row = cur.fetchone()
+                    record_id = row[0] if row else None
                 conn.commit()
+                if record_id is not None:
+                    draft["id"] = record_id
+                    draft["draft_record_id"] = record_id
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store RFQ draft")
+
+    def _synchronise_draft_records(self, result: AgentOutput) -> None:
+        drafts = (result.data or {}).get("drafts") if isinstance(result, AgentOutput) else None
+        if not drafts:
+            return
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                for draft in drafts:
+                    if not isinstance(draft, dict):
+                        continue
+                    record_id = draft.get("draft_record_id") or draft.get("id")
+                    if not record_id:
+                        continue
+                    payload_doc = dict(draft)
+                    payload_doc.pop("draft_record_id", None)
+                    payload_doc.pop("id", None)
+                    payload = json.dumps(payload_doc, default=str)
+                    sent_flag = bool(draft.get("sent_status"))
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE proc.draft_rfq_emails
+                            SET payload = %s,
+                                sent = %s,
+                                updated_on = NOW()
+                            WHERE id = %s
+                            """,
+                            (payload, sent_flag, record_id),
+                        )
+                conn.commit()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("failed to update stored draft metadata")
 
     def _ensure_table_exists(self, conn) -> None:
         """Create the backing draft table on demand."""
