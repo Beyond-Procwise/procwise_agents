@@ -324,8 +324,11 @@ _SUPPLIER_SAMPLE_LIMIT = 200
 class DataFlowManager:
     """Constructs data flow mappings and persists them as a knowledge graph."""
 
-    def __init__(self, agent_nick: Any, collection_name: str = "Knowledge Graph") -> None:
+    def __init__(self, agent_nick: Any, collection_name: Optional[str] = None) -> None:
         self.agent_nick = agent_nick
+        settings = getattr(agent_nick, "settings", None)
+        if collection_name is None:
+            collection_name = getattr(settings, "qdrant_collection_name", None) or "Knowledge Graph"
         self.collection_name = collection_name
         self.qdrant_client = getattr(agent_nick, "qdrant_client", None)
         self.embedding_model = getattr(agent_nick, "embedding_model", None)

@@ -94,6 +94,21 @@ PROCUREMENT_CATEGORY_FIELDS = [
 
 _PRODUCT_SIMILARITY_THRESHOLD = 0.35
 
+# Canonical procurement tables that should be embedded for supplier-aware RAG
+_PROCUREMENT_TABLE_SOURCES: dict[str, tuple[str, str]] = {
+    "contracts": ("proc", "contracts"),
+    "supplier_master": ("proc", "supplier"),
+    "purchase_orders": ("proc", "purchase_order_agent"),
+    "purchase_order_lines": ("proc", "po_line_items_agent"),
+    "invoices": ("proc", "invoice_agent"),
+    "invoice_lines": ("proc", "invoice_line_items_agent"),
+    "product_mapping": ("proc", "cat_product_mapping"),
+    "quotes": ("proc", "quote_agent"),
+    "quote_lines": ("proc", "quote_line_items_agent"),
+}
+
+_TABLE_SAMPLE_LIMIT = 10000
+
 
 class QueryEngine(BaseEngine):
     def __init__(self, agent_nick):
@@ -656,31 +671,65 @@ class QueryEngine(BaseEngine):
     # Agent training helpers
     # ------------------------------------------------------------------
     def train_procurement_context(self) -> pd.DataFrame:
-        """Embed contract/supplier schemas and procurement flow for agent training.
+        """Embed procurement tables, flows and knowledge graph for agent training."""
 
-        The returned DataFrame mirrors :meth:`fetch_procurement_flow` so
-        callers can optionally reuse the joined data in their own logic.
-        """
-
+        from services.data_flow_manager import DataFlowManager
         from services.rag_service import RAGService
 
-        with self.agent_nick.get_db_connection() as conn:
-            contract_cols = self._get_columns(conn, "proc", "contracts")
-            supplier_cols = self._get_columns(conn, "proc", "supplier")
+        rag = RAGService(self.agent_nick)
+        schema_descriptions: list[str] = []
+        tables: dict[str, pd.DataFrame] = {}
+        table_name_map: dict[str, str] = {}
 
-        texts = []
-        if contract_cols:
-            texts.append(
-                "Contracts table columns: " + ", ".join(contract_cols)
+        with self._pandas_reader() as conn:
+            if conn is None:  # pragma: no cover - defensive safety net
+                logger.warning("Database connection unavailable during training")
+            for alias, (schema, table) in _PROCUREMENT_TABLE_SOURCES.items():
+                canonical = f"{schema}.{table}"
+                table_name_map[alias] = canonical
+
+                try:
+                    columns = self._get_columns(conn, schema, table) if conn else []
+                except Exception:  # pragma: no cover - errors logged upstream
+                    columns = []
+                if columns:
+                    unique_cols = sorted({str(col) for col in columns})
+                    schema_descriptions.append(
+                        f"Table {canonical} columns: {', '.join(unique_cols)}"
+                    )
+
+                sql = f"SELECT * FROM {schema}.{table} LIMIT {_TABLE_SAMPLE_LIMIT}"
+                try:
+                    df = read_sql_compat(sql, conn) if conn else pd.DataFrame()
+                except Exception:
+                    logger.exception("Failed to sample data from %s", canonical)
+                    continue
+
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    tables[alias] = df
+
+        if schema_descriptions:
+            rag.upsert_texts(
+                schema_descriptions,
+                metadata={
+                    "record_id": "procurement_schema",
+                    "document_type": "procurement_schema",
+                },
             )
-        if supplier_cols:
-            texts.append(
-                "Supplier table columns: " + ", ".join(supplier_cols)
-            )
 
-        if texts:
-            rag = RAGService(self.agent_nick)
-            rag.upsert_texts(texts, metadata={"record_id": "procurement_schema"})
+        relations: list[dict[str, object]] = []
+        graph: dict[str, object] | None = None
+        if tables:
+            try:
+                manager = DataFlowManager(self.agent_nick)
+                relations, graph = manager.build_data_flow_map(
+                    tables, table_name_map=table_name_map
+                )
+                manager.persist_knowledge_graph(relations, graph)
+            except Exception:
+                logger.exception("Failed to build or persist procurement knowledge graph")
 
-        # Reuse procurement flow embedding for richer training data
-        return self.fetch_procurement_flow(embed=True)
+        procurement_df = self.fetch_procurement_flow(embed=True)
+
+        # Return flow data for downstream agents while ensuring training side-effects ran
+        return procurement_df
