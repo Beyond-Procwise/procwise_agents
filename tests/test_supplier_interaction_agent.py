@@ -74,3 +74,30 @@ def test_supplier_interaction_agent():
     assert output.next_agents == ['NegotiationAgent']
     assert output.data['price'] == 1500.0
     assert output.data['lead_time'] == '10'
+
+
+def test_supplier_interaction_wait_for_response():
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    calls = {"count": 0}
+
+    def poll_once(limit=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return [
+                {
+                    "rfq_id": "RFQ-20240101-abcd1234",
+                    "supplier_id": "S1",
+                    "negotiation_output": {"message": "counter"},
+                }
+            ]
+        return []
+
+    watcher = SimpleNamespace(poll_once=poll_once)
+
+    result = agent.wait_for_response(watcher=watcher, timeout=1, poll_interval=0)
+
+    assert result is not None
+    assert result["rfq_id"] == "RFQ-20240101-abcd1234"
+    assert calls["count"] == 1

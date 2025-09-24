@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
 import pandas as pd
 from qdrant_client import models
 
@@ -222,6 +224,102 @@ PROCUREMENT_FLOW_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("proc.purchase_order_agent", "proc.invoice_agent", "proc.invoice_line_items_agent"),
 )
 
+_SUPPLIER_ID_ALIASES: Tuple[str, ...] = (
+    "supplier",
+    "supplier_identifier",
+    "supplier_code",
+    "supplier_reference",
+    "vendor",
+    "vendor_id",
+    "vendor_identifier",
+)
+
+_SUPPLIER_NAME_ALIASES: Tuple[str, ...] = (
+    "suppliername",
+    "vendor_name",
+    "vendorname",
+    "trading_name",
+)
+
+_PO_ID_ALIASES: Tuple[str, ...] = (
+    "purchase_order_id",
+    "purchaseorderid",
+    "po_number",
+    "purchase_order_number",
+)
+
+_INVOICE_ID_ALIASES: Tuple[str, ...] = (
+    "invoice_number",
+    "invoice_reference",
+    "invoiceid",
+)
+
+_QUOTE_ID_ALIASES: Tuple[str, ...] = (
+    "quote_number",
+    "quote_reference",
+    "quoteid",
+)
+
+_CONTRACT_ID_ALIASES: Tuple[str, ...] = (
+    "contract_number",
+    "contract_reference",
+    "contractid",
+)
+
+_ITEM_ID_ALIASES: Tuple[str, ...] = (
+    "item",
+    "itemcode",
+    "product_id",
+    "productid",
+    "sku",
+)
+
+_ITEM_DESC_ALIASES: Tuple[str, ...] = (
+    "item_name",
+    "itemdesc",
+    "product_name",
+    "product_description",
+    "service_description",
+)
+
+_PURCHASE_VALUE_COLUMNS: Tuple[str, ...] = (
+    "line_amount_gbp",
+    "line_total_gbp",
+    "total_amount_gbp",
+    "line_total",
+    "total_amount",
+)
+
+_INVOICE_VALUE_COLUMNS: Tuple[str, ...] = (
+    "total_amount_incl_tax_gbp",
+    "invoice_total_incl_tax",
+    "invoice_amount_gbp",
+    "invoice_amount",
+    "total_amount_incl_tax",
+)
+
+_PO_TOTAL_COLUMNS: Tuple[str, ...] = (
+    "total_amount_gbp",
+    "total_amount",
+    "converted_amount_usd",
+)
+
+_QUOTE_TOTAL_COLUMNS: Tuple[str, ...] = (
+    "total_amount_gbp",
+    "total_amount",
+    "quote_total",
+)
+
+_INVOICE_TOTAL_COLUMNS: Tuple[str, ...] = (
+    "invoice_total_incl_tax",
+    "invoice_amount",
+    "total_amount_incl_tax",
+)
+
+_SUPPLIER_FLOW_ID_LIMIT = 5
+_SUPPLIER_FLOW_ITEM_LIMIT = 5
+_SUPPLIER_SAMPLE_LIMIT = 200
+
 
 class DataFlowManager:
     """Constructs data flow mappings and persists them as a knowledge graph."""
@@ -267,6 +365,8 @@ class DataFlowManager:
             relations.append(relation)
 
         graph = self._build_graph(relations, tables, alias_index)
+        supplier_flows = self._extract_supplier_flows(tables, alias_index)
+        graph["supplier_flows"] = supplier_flows
         relations_dicts = [relation.as_dict() for relation in relations]
         return relations_dicts, graph
 
@@ -338,6 +438,28 @@ class DataFlowManager:
                     payload["resolved_aliases"] = list(resolved_aliases)
 
                 point_id = self._deterministic_id(path_text)
+                points.append(
+                    models.PointStruct(id=point_id, vector=vector, payload=payload)
+                )
+
+            for flow in graph.get("supplier_flows", []):
+                if not isinstance(flow, Mapping):
+                    continue
+                text = self._supplier_flow_to_text(flow)
+                vector = self._embed_text(text)
+                if vector is None:
+                    continue
+                payload: Dict[str, Any] = {
+                    "document_type": "supplier_flow",
+                    "supplier_id": flow.get("supplier_id"),
+                    "supplier_name": flow.get("supplier_name"),
+                    "coverage_ratio": flow.get("coverage_ratio"),
+                }
+                for key in ("contracts", "purchase_orders", "invoices", "quotes", "products"):
+                    value = flow.get(key)
+                    if isinstance(value, dict):
+                        payload[key] = value
+                point_id = self._deterministic_id(text)
                 points.append(
                     models.PointStruct(id=point_id, vector=vector, payload=payload)
                 )
@@ -577,6 +699,424 @@ class DataFlowManager:
                 paths.append({"canonical": path, "resolved": tuple(resolved)})
 
         return {"nodes": nodes, "edges": edges, "paths": paths}
+
+    # ------------------------------------------------------------------
+    # Supplier flow helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalise_key(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+        else:
+            text = str(value).strip().lower()
+        return text or None
+
+    @staticmethod
+    def _clean_text_series(series: Optional[pd.Series]) -> pd.Series:
+        if series is None:
+            return pd.Series(dtype="string")
+        cleaned = series.astype("string").str.strip()
+        cleaned = cleaned.replace({"": pd.NA, "None": pd.NA, "null": pd.NA})
+        cleaned = cleaned.replace({"nan": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+        return cleaned
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if math.isnan(numeric) or math.isinf(numeric):
+            return 0.0
+        return numeric
+
+    def _sum_numeric(self, series: Optional[pd.Series]) -> float:
+        if series is None or series.empty:
+            return 0.0
+        numeric = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        total = float(numeric.sum())
+        if math.isnan(total) or math.isinf(total):
+            return 0.0
+        return total
+
+    def _collect_ids(self, series: Optional[pd.Series], limit: int = _SUPPLIER_FLOW_ID_LIMIT) -> List[str]:
+        if series is None or series.empty:
+            return []
+        cleaned = self._clean_text_series(series).dropna()
+        results: List[str] = []
+        for value in cleaned:
+            text = str(value).strip()
+            if not text or text in results:
+                continue
+            results.append(text)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _format_timestamp(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return None
+            return value.to_pydatetime().isoformat()
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            parsed = None
+        if isinstance(parsed, pd.Timestamp) and not pd.isna(parsed):
+            return parsed.to_pydatetime().isoformat()
+        text = str(value).strip()
+        return text or None
+
+    def _select_first_existing(self, df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+        for column in candidates:
+            if column in df.columns:
+                return column
+        return None
+
+    def _derive_supplier_series(
+        self, df: pd.DataFrame, name_map: Mapping[str, str]
+    ) -> pd.Series:
+        if df.empty:
+            return pd.Series(dtype="string")
+        id_col = self._resolve_column(df, "supplier_id", _SUPPLIER_ID_ALIASES)
+        if id_col:
+            series = self._clean_text_series(df[id_col])
+            return series
+        name_col = self._resolve_column(df, "supplier_name", _SUPPLIER_NAME_ALIASES)
+        if not name_col:
+            return pd.Series([pd.NA] * len(df), index=df.index, dtype="string")
+        names = self._clean_text_series(df[name_col])
+        keys = names.map(self._normalise_key)
+        mapped = keys.map(lambda key: name_map.get(key) if key else None)
+        resolved = pd.Series(mapped, index=df.index, dtype="object")
+        fallback = names
+        resolved = resolved.where(resolved.notna(), fallback)
+        resolved = pd.Series(resolved, index=df.index, dtype="string").str.strip()
+        resolved = resolved.replace({"": pd.NA, "None": pd.NA, "nan": pd.NA})
+        return resolved
+
+    def _extract_supplier_flows(
+        self, tables: Dict[str, pd.DataFrame], alias_index: TableAliasIndex
+    ) -> List[Dict[str, Any]]:
+        supplier_alias = alias_index.resolve_alias("proc.supplier", tables)
+        supplier_df = tables.get(supplier_alias, pd.DataFrame()) if supplier_alias else pd.DataFrame()
+        if supplier_df.empty:
+            return []
+
+        id_col = self._resolve_column(supplier_df, "supplier_id", _SUPPLIER_ID_ALIASES)
+        if id_col is None:
+            return []
+
+        base_df = supplier_df.copy()
+        id_series = self._clean_text_series(base_df[id_col])
+        base_df = base_df.assign(__supplier_id=id_series)
+        base_df = base_df[base_df["__supplier_id"].notna()].copy()
+        if base_df.empty:
+            return []
+
+        if base_df.shape[0] > _SUPPLIER_SAMPLE_LIMIT:
+            base_df = base_df.head(_SUPPLIER_SAMPLE_LIMIT).copy()
+
+        name_col = self._resolve_column(base_df, "supplier_name", _SUPPLIER_NAME_ALIASES)
+        name_series = self._clean_text_series(base_df[name_col]) if name_col else pd.Series(dtype="string")
+
+        flows: Dict[str, Dict[str, Any]] = {}
+        name_map: Dict[str, str] = {}
+        for idx, supplier_id in base_df["__supplier_id"].items():
+            if supplier_id is None:
+                continue
+            sid = str(supplier_id).strip()
+            if not sid:
+                continue
+            entry = flows.setdefault(sid, {"supplier_id": sid})
+            supplier_name = None
+            if name_col and idx in name_series.index:
+                raw_name = name_series.loc[idx]
+                if pd.notna(raw_name):
+                    supplier_name = str(raw_name).strip()
+            if supplier_name:
+                entry.setdefault("supplier_name", supplier_name)
+                key = self._normalise_key(supplier_name)
+                if key:
+                    name_map.setdefault(key, sid)
+
+        supplier_lookup = {
+            sid: data.get("supplier_name") for sid, data in flows.items() if isinstance(data, dict)
+        }
+
+        def _ensure_entry(supplier_id: Any) -> Dict[str, Any]:
+            sid = str(supplier_id).strip()
+            if not sid:
+                sid = str(supplier_id)
+            entry = flows.setdefault(sid, {"supplier_id": sid})
+            if not entry.get("supplier_name") and sid in supplier_lookup and supplier_lookup[sid]:
+                entry["supplier_name"] = supplier_lookup[sid]
+            return entry
+
+        # Contracts
+        contract_alias = alias_index.resolve_alias("proc.contracts", tables)
+        contracts = tables.get(contract_alias, pd.DataFrame()) if contract_alias else pd.DataFrame()
+        if not contracts.empty:
+            supplier_series = self._derive_supplier_series(contracts, name_map)
+            contract_df = contracts.assign(__supplier_id=supplier_series)
+            contract_df = contract_df.dropna(subset=["__supplier_id"])
+            if not contract_df.empty:
+                contract_id_col = self._resolve_column(contract_df, "contract_id", _CONTRACT_ID_ALIASES) or "contract_id"
+                end_date_col = self._resolve_column(
+                    contract_df, "contract_end_date", ("contract_end_date", "end_date", "expiry_date")
+                )
+                for supplier_id, group in contract_df.groupby("__supplier_id"):
+                    entry = _ensure_entry(supplier_id)
+                    contract_ids = (
+                        self._collect_ids(group[contract_id_col]) if contract_id_col in group.columns else []
+                    )
+                    latest_end: Optional[str] = None
+                    if end_date_col and end_date_col in group.columns:
+                        dates = pd.to_datetime(group[end_date_col], errors="coerce")
+                        dates = dates.dropna()
+                        if not dates.empty:
+                            latest_end = self._format_timestamp(dates.max())
+                    entry["contracts"] = {
+                        "count": int(group.shape[0]),
+                        "contract_ids": contract_ids,
+                    }
+                    if latest_end:
+                        entry["contracts"]["latest_end_date"] = latest_end
+
+        # Purchase orders
+        po_alias = alias_index.resolve_alias("proc.purchase_order_agent", tables)
+        purchase_orders = tables.get(po_alias, pd.DataFrame()) if po_alias else pd.DataFrame()
+        po_supplier_series = None
+        if not purchase_orders.empty:
+            po_supplier_series = self._derive_supplier_series(purchase_orders, name_map)
+            po_df = purchase_orders.assign(__supplier_id=po_supplier_series)
+            po_df = po_df.dropna(subset=["__supplier_id"])
+            if not po_df.empty:
+                po_id_col = self._resolve_column(po_df, "po_id", _PO_ID_ALIASES) or "po_id"
+                value_col = self._select_first_existing(po_df, _PO_TOTAL_COLUMNS)
+                order_date_col = self._resolve_column(
+                    po_df, "order_date", ("order_date", "requested_date", "created_date")
+                )
+                po_summary: Dict[str, Dict[str, Any]] = {}
+                for supplier_id, group in po_df.groupby("__supplier_id"):
+                    entry = _ensure_entry(supplier_id)
+                    total_value = self._sum_numeric(group[value_col]) if value_col and value_col in group.columns else 0.0
+                    po_ids = self._collect_ids(group[po_id_col]) if po_id_col in group.columns else []
+                    latest_order = None
+                    if order_date_col and order_date_col in group.columns:
+                        dates = pd.to_datetime(group[order_date_col], errors="coerce").dropna()
+                        if not dates.empty:
+                            latest_order = self._format_timestamp(dates.max())
+                    po_summary[supplier_id] = {
+                        "count": int(group.shape[0]),
+                        "po_ids": po_ids,
+                        "total_value_gbp": round(total_value, 2),
+                    }
+                    if latest_order:
+                        po_summary[supplier_id]["latest_order_date"] = latest_order
+                    entry["purchase_orders"] = po_summary[supplier_id]
+
+        # Purchase order line items (product coverage)
+        po_lines_alias = alias_index.resolve_alias("proc.po_line_items_agent", tables)
+        po_lines = tables.get(po_lines_alias, pd.DataFrame()) if po_lines_alias else pd.DataFrame()
+        if po_supplier_series is not None and not po_lines.empty and not purchase_orders.empty:
+            po_id_col = self._resolve_column(purchase_orders, "po_id", _PO_ID_ALIASES) or "po_id"
+            line_po_id_col = self._resolve_column(po_lines, "po_id", _PO_ID_ALIASES) or "po_id"
+            po_lookup = purchase_orders[[po_id_col]].copy()
+            po_lookup["__supplier_id"] = po_supplier_series
+            join_df = po_lines.merge(po_lookup, left_on=line_po_id_col, right_on=po_id_col, how="left")
+            join_df = join_df.dropna(subset=["__supplier_id"])
+            if not join_df.empty:
+                value_col = self._select_first_existing(join_df, _PURCHASE_VALUE_COLUMNS)
+                if value_col:
+                    join_df[value_col] = pd.to_numeric(join_df[value_col], errors="coerce").fillna(0.0)
+                item_desc_col = self._resolve_column(join_df, "item_description", _ITEM_DESC_ALIASES)
+                item_id_col = self._resolve_column(join_df, "item_id", _ITEM_ID_ALIASES)
+                for supplier_id, group in join_df.groupby("__supplier_id"):
+                    entry = _ensure_entry(supplier_id)
+                    descriptions: Dict[str, float] = {}
+                    if item_desc_col and item_desc_col in group.columns:
+                        desc_series = self._clean_text_series(group[item_desc_col]).dropna()
+                        values = pd.to_numeric(group[value_col], errors="coerce").fillna(0.0) if value_col in group.columns else pd.Series(0.0, index=group.index)
+                        for idx, desc in desc_series.items():
+                            spend = self._safe_float(values.loc[idx]) if idx in values.index else 0.0
+                            descriptions[desc] = descriptions.get(desc, 0.0) + spend
+                    elif item_id_col and item_id_col in group.columns:
+                        id_series = self._clean_text_series(group[item_id_col]).dropna()
+                        values = pd.to_numeric(group[value_col], errors="coerce").fillna(0.0) if value_col in group.columns else pd.Series(0.0, index=group.index)
+                        for idx, desc in id_series.items():
+                            spend = self._safe_float(values.loc[idx]) if idx in values.index else 0.0
+                            descriptions[desc] = descriptions.get(desc, 0.0) + spend
+                    if descriptions:
+                        top_items = sorted(descriptions.items(), key=lambda item: item[1], reverse=True)
+                        entry["products"] = {
+                            "top_items": [
+                                {"description": desc, "spend_gbp": round(self._safe_float(value), 2)}
+                                for desc, value in top_items[: _SUPPLIER_FLOW_ITEM_LIMIT]
+                            ],
+                            "unique_items": len(descriptions),
+                        }
+
+        # Invoices
+        invoice_alias = alias_index.resolve_alias("proc.invoice_agent", tables)
+        invoices = tables.get(invoice_alias, pd.DataFrame()) if invoice_alias else pd.DataFrame()
+        invoice_supplier_series = None
+        if not invoices.empty:
+            invoice_supplier_series = self._derive_supplier_series(invoices, name_map)
+            inv_df = invoices.assign(__supplier_id=invoice_supplier_series)
+            inv_df = inv_df.dropna(subset=["__supplier_id"])
+            if not inv_df.empty:
+                invoice_id_col = self._resolve_column(inv_df, "invoice_id", _INVOICE_ID_ALIASES) or "invoice_id"
+                total_col = self._select_first_existing(inv_df, _INVOICE_TOTAL_COLUMNS)
+                invoice_date_col = self._resolve_column(inv_df, "invoice_date", ("invoice_date", "created_date"))
+                for supplier_id, group in inv_df.groupby("__supplier_id"):
+                    entry = _ensure_entry(supplier_id)
+                    total_value = self._sum_numeric(group[total_col]) if total_col and total_col in group.columns else 0.0
+                    invoice_ids = self._collect_ids(group[invoice_id_col]) if invoice_id_col in group.columns else []
+                    latest_invoice = None
+                    if invoice_date_col and invoice_date_col in group.columns:
+                        dates = pd.to_datetime(group[invoice_date_col], errors="coerce").dropna()
+                        if not dates.empty:
+                            latest_invoice = self._format_timestamp(dates.max())
+                    entry["invoices"] = {
+                        "count": int(group.shape[0]),
+                        "invoice_ids": invoice_ids,
+                        "total_value_gbp": round(total_value, 2),
+                    }
+                    if latest_invoice:
+                        entry["invoices"]["latest_invoice_date"] = latest_invoice
+
+        # Quotes
+        quote_alias = alias_index.resolve_alias("proc.quote_agent", tables)
+        quotes = tables.get(quote_alias, pd.DataFrame()) if quote_alias else pd.DataFrame()
+        if not quotes.empty:
+            quote_supplier_series = self._derive_supplier_series(quotes, name_map)
+            quote_df = quotes.assign(__supplier_id=quote_supplier_series)
+            quote_df = quote_df.dropna(subset=["__supplier_id"])
+            if not quote_df.empty:
+                quote_id_col = self._resolve_column(quote_df, "quote_id", _QUOTE_ID_ALIASES) or "quote_id"
+                total_col = self._select_first_existing(quote_df, _QUOTE_TOTAL_COLUMNS)
+                for supplier_id, group in quote_df.groupby("__supplier_id"):
+                    entry = _ensure_entry(supplier_id)
+                    total_value = self._sum_numeric(group[total_col]) if total_col and total_col in group.columns else 0.0
+                    quote_ids = self._collect_ids(group[quote_id_col]) if quote_id_col in group.columns else []
+                    entry["quotes"] = {
+                        "count": int(group.shape[0]),
+                        "quote_ids": quote_ids,
+                        "total_value_gbp": round(total_value, 2),
+                    }
+
+        flows_list: List[Dict[str, Any]] = []
+        for supplier_id, payload in flows.items():
+            entry = dict(payload)
+            coverage_components = 0
+            coverage_hits = 0
+            for key in ("contracts", "purchase_orders", "invoices", "quotes"):
+                details = entry.get(key)
+                if isinstance(details, dict):
+                    coverage_components += 1
+                    if details.get("count"):
+                        coverage_hits += 1
+            coverage_ratio = (coverage_hits / coverage_components) if coverage_components else 0.0
+            entry["coverage_ratio"] = round(coverage_ratio, 3)
+            flows_list.append(entry)
+
+        flows_list.sort(key=lambda item: (item.get("supplier_name") or "", item["supplier_id"]))
+        return flows_list
+
+    def _supplier_flow_to_text(self, flow: Mapping[str, Any]) -> str:
+        supplier_id = flow.get("supplier_id")
+        supplier_name = flow.get("supplier_name")
+        label = str(supplier_name).strip() if supplier_name else None
+        if label:
+            label = f"{label} ({supplier_id})"
+        else:
+            label = f"Supplier {supplier_id}"
+
+        parts = [f"{label} data flow summary."]
+
+        coverage = flow.get("coverage_ratio")
+        if isinstance(coverage, (int, float)):
+            parts.append(f"Coverage ratio across contracts, purchase orders, quotes and invoices is {coverage:.2f}.")
+
+        contracts = flow.get("contracts") if isinstance(flow.get("contracts"), dict) else {}
+        if contracts:
+            contract_count = contracts.get("count", 0)
+            if contract_count:
+                detail = f"{int(contract_count)} contract{'s' if contract_count != 1 else ''}"
+                contract_ids = contracts.get("contract_ids")
+                if isinstance(contract_ids, list) and contract_ids:
+                    detail += f" ({', '.join(contract_ids[:_SUPPLIER_FLOW_ID_LIMIT])})"
+                if contracts.get("latest_end_date"):
+                    detail += f" ending by {contracts['latest_end_date']}"
+                parts.append(detail + ".")
+
+        purchase_orders = flow.get("purchase_orders") if isinstance(flow.get("purchase_orders"), dict) else {}
+        if purchase_orders:
+            po_count = purchase_orders.get("count", 0)
+            if po_count:
+                detail = f"{int(po_count)} purchase order{'s' if po_count != 1 else ''}"
+                total_value = purchase_orders.get("total_value_gbp")
+                if isinstance(total_value, (int, float)) and total_value:
+                    detail += f" totalling {total_value:,.2f} GBP"
+                if purchase_orders.get("latest_order_date"):
+                    detail += f" (latest order {purchase_orders['latest_order_date']})"
+                parts.append(detail + ".")
+
+        invoices = flow.get("invoices") if isinstance(flow.get("invoices"), dict) else {}
+        if invoices:
+            invoice_count = invoices.get("count", 0)
+            if invoice_count:
+                detail = f"{int(invoice_count)} invoice{'s' if invoice_count != 1 else ''}"
+                total_value = invoices.get("total_value_gbp")
+                if isinstance(total_value, (int, float)) and total_value:
+                    detail += f" worth {total_value:,.2f} GBP"
+                if invoices.get("latest_invoice_date"):
+                    detail += f" (latest invoice {invoices['latest_invoice_date']})"
+                parts.append(detail + ".")
+
+        quotes = flow.get("quotes") if isinstance(flow.get("quotes"), dict) else {}
+        if quotes:
+            quote_count = quotes.get("count", 0)
+            if quote_count:
+                detail = f"{int(quote_count)} quote{'s' if quote_count != 1 else ''}"
+                total_value = quotes.get("total_value_gbp")
+                if isinstance(total_value, (int, float)) and total_value:
+                    detail += f" evaluated at {total_value:,.2f} GBP"
+                parts.append(detail + ".")
+
+        products = flow.get("products") if isinstance(flow.get("products"), dict) else {}
+        if products:
+            top_items = products.get("top_items")
+            if isinstance(top_items, list) and top_items:
+                descriptions = []
+                for item in top_items[:_SUPPLIER_FLOW_ITEM_LIMIT]:
+                    if not isinstance(item, dict):
+                        continue
+                    desc = str(item.get("description") or "").strip()
+                    spend = item.get("spend_gbp")
+                    if desc and isinstance(spend, (int, float)):
+                        descriptions.append(f"{desc} ({spend:,.2f} GBP)")
+                    elif desc:
+                        descriptions.append(desc)
+                if descriptions:
+                    parts.append(
+                        "Key products include " + ", ".join(descriptions) + "."
+                    )
+            unique = products.get("unique_items")
+            if isinstance(unique, (int, float)) and unique:
+                parts.append(f"Product catalogue covers {int(unique)} unique items.")
+
+        return " ".join(parts)
 
     def _build_alias_index(
         self,

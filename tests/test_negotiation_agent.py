@@ -56,3 +56,94 @@ def test_negotiation_agent_handles_missing_fields():
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     assert output.data["counter_proposals"] == []
+
+
+def test_negotiation_agent_builds_contextual_prompt(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    captured = {}
+
+    supplier_context = {
+        "profile": {
+            "supplier_name": "Acme Parts",
+            "default_currency": "GBP",
+            "risk_score": "Low",
+            "delivery_lead_time_days": "5",
+            "is_preferred_supplier": True,
+        },
+        "spend": {"total_amount": 120000.0, "po_count": 12},
+        "contracts": [
+            {
+                "contract_id": "CO0001",
+                "contract_end_date": None,
+                "total_contract_value": 250000.0,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(agent, "_load_supplier_context", lambda *args, **kwargs: supplier_context)
+
+    def fake_call(**kwargs):
+        captured["prompt"] = kwargs.get("prompt")
+        return {"response": "Revised counter proposal."}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    context = AgentContext(
+        workflow_id="wf2",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S1",
+            "current_offer": 1500.0,
+            "target_price": 1200.0,
+            "rfq_id": "RFQ-123",
+            "round": 1,
+            "item_id": "ITEM-1",
+            "benchmark_price": 1150.0,
+        },
+    )
+
+    output = agent.run(context)
+    prompt = captured.get("prompt", "")
+
+    assert "Acme Parts" in prompt
+    assert "Historic purchase orders total" in prompt
+    assert "risk rating" in prompt.lower()
+    assert output.data["message"] == "Revised counter proposal."
+
+
+def test_negotiation_agent_generates_fallback_message(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    supplier_context = {
+        "profile": {"supplier_name": "Omega", "default_currency": "USD"},
+        "spend": {"total_amount": 54000.0},
+        "contracts": [],
+    }
+
+    monkeypatch.setattr(agent, "_load_supplier_context", lambda *args, **kwargs: supplier_context)
+    monkeypatch.setattr(agent, "call_ollama", lambda **_: {"response": ""})
+
+    context = AgentContext(
+        workflow_id="wf3",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S2",
+            "current_offer": 1800.0,
+            "target_price": 1500.0,
+            "rfq_id": "RFQ-789",
+            "round": 2,
+            "item_id": "COMP-5",
+        },
+    )
+
+    output = agent.run(context)
+    message = output.data["message"]
+
+    assert "pricing closer" in message
+    assert "Historic collaboration" in message
+    assert output.data["decision_log"].startswith("Targeting 1500.0 against current offer")

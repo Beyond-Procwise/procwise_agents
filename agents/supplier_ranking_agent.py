@@ -439,11 +439,31 @@ class SupplierRankingAgent(BaseAgent):
             if default_weights.get(crit, 0.0) > 0
         }
 
+        if not weights:
+            fallback_metrics = [
+                metric
+                for metric in ("price", "delivery", "risk", "payment_terms")
+                if metric in df.columns or f"{metric}_score" in df.columns
+            ]
+            if fallback_metrics:
+                equal_weight = 1.0 / len(fallback_metrics)
+                weights = {metric: equal_weight for metric in fallback_metrics}
+
         df = self._prepare_scoring_columns(df, weights)
         scored_df = self._score_categorical_criteria(df, weights.keys(), policy_bundle)
         norm_policy = self._find_policy(policy_bundle, "NormalizationDirectionPolicy")
         direction_map = self._extract_policy_rules(norm_policy)
         scored_df = self._normalize_numeric_scores(scored_df, direction_map)
+
+        flow_payload = context.input_data.get("data_flow_snapshot")
+        if not isinstance(flow_payload, dict):
+            flow_payload = context.input_data
+        flow_index, flow_name_index = self._build_flow_index(flow_payload)
+        alias_tokens_map = self._alias_tokens_by_supplier()
+
+        normalised_weights = self._normalise_weight_map(scored_df, weights)
+        if normalised_weights:
+            weights = normalised_weights
 
         scored_df["final_score"] = 0.0
         for crit, weight in weights.items():
@@ -455,6 +475,10 @@ class SupplierRankingAgent(BaseAgent):
                 pd.to_numeric(scored_df[score_col].fillna(0), errors="coerce")
                 * float(weight)
             )
+
+        scored_df = self._apply_flow_bonus(
+            scored_df, flow_index, flow_name_index, alias_tokens_map
+        )
 
         ranked_df = scored_df.sort_values(
             by="final_score", ascending=False
@@ -1073,6 +1097,156 @@ class SupplierRankingAgent(BaseAgent):
                     out[score_col] = 10 * (vals - min_v) / range_diff
         return out
 
+    def _normalise_weight_map(
+        self, df: pd.DataFrame, weights: Dict[str, float]
+    ) -> Dict[str, float]:
+        available: Dict[str, float] = {}
+        for crit, weight in weights.items():
+            if weight <= 0:
+                continue
+            score_col = f"{crit}_score"
+            raw_col = crit
+            series = None
+            if score_col in df.columns:
+                series = pd.to_numeric(df[score_col], errors="coerce")
+            elif raw_col in df.columns:
+                series = pd.to_numeric(df[raw_col], errors="coerce")
+            if series is None or series.isna().all():
+                continue
+            available[crit] = float(weight)
+        if not available:
+            return {}
+        total = sum(available.values())
+        if total <= 0:
+            return {}
+        return {crit: value / total for crit, value in available.items()}
+
+    def _build_flow_index(
+        self, payload: Any
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        flow_index: Dict[str, Dict[str, Any]] = {}
+        name_index: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(payload, dict):
+            return flow_index, name_index
+
+        candidates: List[Any] = []
+        graph = payload.get("graph")
+        if isinstance(graph, dict):
+            graph_flows = graph.get("supplier_flows") or []
+            if isinstance(graph_flows, list):
+                candidates.extend(graph_flows)
+        direct_flows = payload.get("supplier_flows")
+        if isinstance(direct_flows, list):
+            candidates.extend(direct_flows)
+
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            supplier_id = entry.get("supplier_id")
+            if supplier_id is None:
+                continue
+            sid = str(supplier_id).strip()
+            if not sid:
+                continue
+            flow_index[sid] = entry
+            supplier_name = entry.get("supplier_name")
+            token = self._normalise_supplier_token(supplier_name)
+            if token:
+                name_index.setdefault(token, entry)
+        return flow_index, name_index
+
+    def _alias_tokens_by_supplier(self) -> Dict[str, List[str]]:
+        mapping: Dict[str, List[str]] = {}
+        for token, supplier_id in self._supplier_alias_map.items():
+            if not supplier_id:
+                continue
+            mapping.setdefault(supplier_id, []).append(token)
+        return mapping
+
+    def _lookup_flow_entry(
+        self,
+        supplier_id: Optional[Any],
+        supplier_name: Optional[Any],
+        flow_index: Dict[str, Dict[str, Any]],
+        flow_name_index: Dict[str, Dict[str, Any]],
+        alias_tokens: Dict[str, List[str]],
+    ) -> Optional[Dict[str, Any]]:
+        sid_token = str(supplier_id).strip() if supplier_id is not None else ""
+        if sid_token and sid_token in flow_index:
+            return flow_index.get(sid_token)
+
+        tokens: List[str] = []
+        if supplier_name:
+            token = self._normalise_supplier_token(supplier_name)
+            if token:
+                tokens.append(token)
+        if sid_token and sid_token in self._supplier_lookup:
+            lookup_name = self._supplier_lookup.get(sid_token)
+            token = self._normalise_supplier_token(lookup_name)
+            if token:
+                tokens.append(token)
+        for token in alias_tokens.get(sid_token, []):
+            if token:
+                tokens.append(token)
+
+        for token in dict.fromkeys(tokens):
+            flow = flow_name_index.get(token)
+            if flow:
+                return flow
+        return None
+
+    @staticmethod
+    def _coverage_from_flow_entry(entry: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(entry, dict):
+            return 0.0
+        coverage = entry.get("coverage_ratio")
+        if isinstance(coverage, (int, float)):
+            value = float(coverage)
+            if value < 0:
+                return 0.0
+            if value > 1.0:
+                return 1.0
+            return value
+        total = 0
+        hits = 0
+        for key in ("contracts", "purchase_orders", "invoices", "quotes"):
+            details = entry.get(key)
+            if isinstance(details, dict):
+                total += 1
+                if details.get("count"):
+                    hits += 1
+        return hits / total if total else 0.0
+
+    def _apply_flow_bonus(
+        self,
+        df: pd.DataFrame,
+        flow_index: Dict[str, Dict[str, Any]],
+        flow_name_index: Dict[str, Dict[str, Any]],
+        alias_tokens: Dict[str, List[str]],
+    ) -> pd.DataFrame:
+        if df.empty or "supplier_id" not in df.columns:
+            if "flow_coverage" not in df.columns:
+                df["flow_coverage"] = 0.0
+            return df
+        augmented = df.copy()
+        coverage_values: List[float] = []
+        for _, row in augmented.iterrows():
+            entry = self._lookup_flow_entry(
+                row.get("supplier_id"),
+                row.get("supplier_name"),
+                flow_index,
+                flow_name_index,
+                alias_tokens,
+            )
+            coverage = self._coverage_from_flow_entry(entry)
+            coverage_values.append(coverage)
+        augmented["flow_coverage"] = coverage_values
+        if "final_score" in augmented.columns:
+            augmented["final_score"] = augmented["final_score"] * (
+                1.0 + augmented["flow_coverage"].fillna(0.0) * 0.1
+            )
+        return augmented
+
     def _generate_justification(self, row: pd.Series, criteria: Iterable[str]) -> str:
         if not self.justification_template:
             return "No justification template available."
@@ -1117,8 +1291,11 @@ class SupplierRankingAgent(BaseAgent):
             "justification": row.get("justification"),
             "contact_name": row.get("contact_name_1"),
             "contact_email": row.get("contact_email_1"),
-            "weights": weights,
+            "weights": dict(weights),
         }
+        coverage = row.get("flow_coverage")
+        if isinstance(coverage, (int, float)):
+            entry["flow_coverage"] = float(coverage)
         if profile:
             entry.update(
                 {

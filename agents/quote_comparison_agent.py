@@ -613,6 +613,36 @@ class QuoteComparisonAgent(BaseAgent):
             entry["total_cost_usd"] = total_cost
             entry["total_spend_usd"] = total_spend
 
+    def _prune_redundant_spend_fields(self, entry: Dict[str, Any]) -> None:
+        spend = self._to_float(entry.get("total_spend"))
+        spend_gbp = entry.get("total_spend_gbp")
+        spend_usd = entry.get("total_spend_usd")
+
+        def _to_number(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        spend_gbp_val = _to_number(spend_gbp)
+        spend_usd_val = _to_number(spend_usd)
+
+        if spend_gbp_val is not None and math.isclose(
+            spend, spend_gbp_val, rel_tol=1e-6, abs_tol=1e-4
+        ):
+            entry.pop("total_spend_gbp", None)
+
+        if spend_usd_val is not None and math.isclose(
+            spend, spend_usd_val, rel_tol=1e-6, abs_tol=1e-4
+        ):
+            entry.pop("total_spend_usd", None)
+
+        currency = str(entry.get("currency") or "").upper()
+        if currency == "GBP" and spend_gbp_val is None:
+            entry.pop("total_spend_gbp", None)
+        if currency == "USD" and spend_usd_val is None:
+            entry.pop("total_spend_usd", None)
+
     def _round_value(self, value: Any) -> Any:
         if isinstance(value, dict):
             return {key: self._round_value(val) for key, val in value.items()}
@@ -662,12 +692,26 @@ class QuoteComparisonAgent(BaseAgent):
                     "direction": cfg["direction"],
                 }
 
+        active_weights = {metric: weight for metric, weight in weights.items() if weight > 0}
+        if not active_weights:
+            active_weights = dict(self.DEFAULT_METRIC_WEIGHTS)
+
+        valid_weights = {metric: active_weights.get(metric, 0.0) for metric in stats.keys() if active_weights.get(metric, 0.0) > 0}
+        if not valid_weights:
+            valid_weights = active_weights
+        total_weight = sum(valid_weights.values())
+        if total_weight > 0:
+            weight_map = {metric: value / total_weight for metric, value in valid_weights.items()}
+        else:
+            weight_map = valid_weights
+        self._resolved_metric_weights = dict(weight_map)
+
         for entry in entries:
             score_total = 0.0
             weight_total = 0.0
             breakdown: Dict[str, float] = {}
             for metric, cfg in self.METRIC_CONFIG.items():
-                weight = weights.get(metric, 0.0)
+                weight = weight_map.get(metric, 0.0)
                 if weight <= 0:
                     continue
                 stat = stats.get(metric)
@@ -784,9 +828,11 @@ class QuoteComparisonAgent(BaseAgent):
             return rows, None
         for entry in rows:
             self._augment_currency_fields(entry)
+            self._prune_redundant_spend_fields(entry)
         supplier_entries = [entry for entry in rows if entry.get("name") != "weighting"]
         stats = self._calculate_weighting_scores(supplier_entries, metric_weights)
-        recommended = self._apply_recommendations(supplier_entries, stats, metric_weights)
+        resolved_weights = self._resolved_metric_weights or metric_weights
+        recommended = self._apply_recommendations(supplier_entries, stats, resolved_weights)
         for entry in rows:
             self._round_entry_values(entry)
         return rows, recommended

@@ -1,5 +1,8 @@
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Sequence, Tuple
+
 from botocore.exceptions import ClientError
 from qdrant_client import models
 from sentence_transformers import CrossEncoder
@@ -11,12 +14,24 @@ from utils.gpu import configure_gpu
 configure_gpu()
 
 
+logger = logging.getLogger(__name__)
+
+
 class RAGAgent(BaseAgent):
     """Retrieval augmented generation agent with GPU optimisations."""
 
+    _KNOWLEDGE_DOCUMENT_TYPES: Tuple[str, ...] = (
+        "knowledge_graph_relation",
+        "knowledge_graph_path",
+        "supplier_flow",
+        "procurement_flow",
+    )
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        model_name = getattr(
+            self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        )
         # Cross encoder ensures accurate ranking while utilising the GPU
         self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
         # Thread pool enables parallel answer and follow-up generation
@@ -65,32 +80,61 @@ class RAGAgent(BaseAgent):
                     search_hits.append(h)
                     seen_ids.add(h.id)
 
-        if not search_hits:
-            answer = "I could not find any relevant documents to answer your question."
-            history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
-            history.append({"query": query, "answer": answer})
-            if session_id:
-                self._save_chat_history(user_id, history, session_id)
-            else:
-                self._save_chat_history(user_id, history)
-            return {"answer": answer, "follow_up_questions": [], "retrieved_documents": []}
-
-        reranked = self._rerank(query, search_hits, top_k)
-        if not reranked:
-            answer = "I could not find any relevant documents to answer your question."
-            history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
-            history.append({"query": query, "answer": answer})
-            if session_id:
-                self._save_chat_history(user_id, history, session_id)
-            else:
-                self._save_chat_history(user_id, history)
-            return {"answer": answer, "follow_up_questions": [], "retrieved_documents": []}
-
-        context = "".join(
-            f"Document ID: {hit.payload.get('record_id', hit.id)}, Score: {hit.score:.2f}\n"
-            f"Content: {hit.payload.get('content', hit.payload.get('summary', ''))}\n---\n"
-            for hit in reranked
+        documents, knowledge_hits = self._categorize_hits(search_hits)
+        reranked_docs = self._rerank(query, documents, top_k) if documents else []
+        knowledge_hits_sorted = (
+            sorted(knowledge_hits, key=lambda h: getattr(h, "score", 0.0), reverse=True)[
+                :top_k
+            ]
+            if knowledge_hits
+            else []
         )
+
+        if not reranked_docs and not knowledge_hits_sorted:
+            answer = "I could not find any relevant documents to answer your question."
+            history = self._load_chat_history(user_id, session_id)
+            history.append({"query": query, "answer": answer})
+            self._save_chat_history(user_id, history, session_id)
+            return {
+                "answer": answer,
+                "follow_up_questions": [],
+                "retrieved_documents": [],
+            }
+
+        document_context = self._build_document_context(reranked_docs)
+        knowledge_summary, knowledge_payloads = self._build_knowledge_summary(
+            knowledge_hits_sorted
+        )
+        outline = self._build_context_outline(reranked_docs, knowledge_summary)
+        plan = self._generate_agentic_plan(query, outline, knowledge_summary)
+
+        plan_text = plan.strip() if plan else (
+            "1. Review knowledge graph coverage to identify relevant suppliers.\n"
+            "2. Inspect retrieved documents for concrete figures and policy references.\n"
+            "3. Draft the answer with citations and note outstanding follow-up items."
+        )
+        outline_text = outline.strip() if outline else (
+            "- Prioritise suppliers and procurement records that align with the question."
+        )
+
+        retrieved_sections: List[str] = []
+        if knowledge_summary:
+            retrieved_sections.append(
+                f"KNOWLEDGE GRAPH INSIGHTS:\n{knowledge_summary.strip()}"
+            )
+        if document_context:
+            retrieved_sections.append(f"DOCUMENT EXCERPTS:\n{document_context.strip()}")
+
+        context_block = "\n\n".join(retrieved_sections).strip()
+        if not context_block:
+            payload_snapshot = [
+                getattr(hit, "payload", {})
+                for hit in reranked_docs + knowledge_hits_sorted
+            ]
+            context_block = self._truncate_text(
+                json.dumps(payload_snapshot, ensure_ascii=False)
+            )
+
         rag_prompt = (
             "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
             "the USER QUESTION. if required use external knowledge beyond the context only related to procurement process.\n\n"
@@ -104,30 +148,58 @@ class RAGAgent(BaseAgent):
             "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
             "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
             "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
-            f"RETRIEVED CONTENT:\n{context}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
+            f"AGENTIC PLAN:\n{plan_text}\n\n"
+            f"CONTEXT OUTLINE:\n{outline_text}\n\n"
+            f"RETRIEVED CONTENT:\n{context_block}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
         )
 
         # Generate answer and follow-up suggestions in parallel
         answer_future = self._executor.submit(
             self.call_ollama, rag_prompt, model=self.settings.extraction_model
         )
-        follow_future = self._executor.submit(self._generate_followups, query, context)
+        combined_context = "\n\n".join(
+            part for part in (outline, knowledge_summary, document_context) if part
+        )
+        follow_future = self._executor.submit(
+            self._generate_followups, query, combined_context
+        )
 
         answer_resp = answer_future.result()
         followups = follow_future.result()
         answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
 
-        history = self._load_chat_history(user_id, session_id) if session_id else self._load_chat_history(user_id)
+        history = self._load_chat_history(user_id, session_id)
         history.append({"query": query, "answer": answer})
-        if session_id:
-            self._save_chat_history(user_id, history, session_id)
-        else:
-            self._save_chat_history(user_id, history)
+        self._save_chat_history(user_id, history, session_id)
+
+        retrieved_payloads: List[Dict[str, Any]] = []
+        for hit in reranked_docs:
+            payload = getattr(hit, "payload", {}) or {}
+            retrieved_payloads.append(dict(payload))
+        retrieved_payloads.extend(knowledge_payloads)
+        if outline:
+            retrieved_payloads.append(
+                {"document_type": "context_outline", "outline": outline}
+            )
+        if knowledge_summary:
+            retrieved_payloads.append(
+                {
+                    "document_type": "knowledge_summary",
+                    "summary": knowledge_summary,
+                }
+            )
+        if plan_text:
+            retrieved_payloads.append(
+                {
+                    "document_type": "agentic_plan",
+                    "plan": plan_text,
+                }
+            )
 
         return {
             "answer": answer,
             "follow_up_questions": followups,
-            "retrieved_documents": [hit.payload for hit in search_hits] if search_hits else [],
+            "retrieved_documents": retrieved_payloads,
         }
 
     # ------------------------------------------------------------------
@@ -135,15 +207,24 @@ class RAGAgent(BaseAgent):
     # ------------------------------------------------------------------
     def _rerank(self, query: str, hits, top_k: int):
         """Re-rank search hits using a cross-encoder for improved accuracy."""
+        if not hits:
+            return []
         pairs = [
-            (query, hit.payload.get("content", hit.payload.get("summary", "")))
+            (
+                query,
+                hit.payload.get(
+                    "content",
+                    hit.payload.get("summary", json.dumps(hit.payload, ensure_ascii=False)),
+                ),
+            )
             for hit in hits
         ]
         scores = self._reranker.predict(pairs)
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
-        # Filter out obviously irrelevant documents using a neutral score
         filtered = [hit for hit, score in ranked if score > 0][:top_k]
-        return filtered
+        if filtered:
+            return filtered
+        return [hit for hit, _ in ranked[:top_k]]
 
     def _expand_query(self, query: str) -> list:
         """Generate alternative phrasings to boost retrieval recall."""
@@ -153,7 +234,9 @@ class RAGAgent(BaseAgent):
             f"QUESTION: {query}"
         )
         try:  # pragma: no cover - network call
-            resp = self.call_ollama(prompt, model=self.settings.extraction_model, format="json")
+            resp = self.call_ollama(
+                prompt, model=self.settings.extraction_model, format="json"
+            )
             data = json.loads(resp.get("response", "{}"))
             expansions = data.get("expansions", [])
             if isinstance(expansions, list):
@@ -163,11 +246,12 @@ class RAGAgent(BaseAgent):
         return []
 
     def _generate_followups(self, query: str, context: str):
-        """Generate follow-up questions based on current context."""
+        """Generate follow-up questions based on document and knowledge context."""
         prompt = (
             "You are a helpful procurement assistant. Based on the user's question and the "
-            "retrieved context, suggest three concise follow-up questions that would clarify "
-            "the request or gather more details. Return each question on a new line.\n\n"
+            "retrieved context (which can include knowledge graph insights, supplier flows "
+            "and document excerpts), suggest three concise follow-up questions that would "
+            "clarify the request or gather more details. Return each question on a new line.\n\n"
             f"QUESTION: {query}\n\nCONTEXT:\n{context}\n\nFOLLOW_UP_QUESTIONS:"
         )
         resp = self.call_ollama(prompt, model=self.settings.extraction_model)
@@ -237,3 +321,215 @@ class RAGAgent(BaseAgent):
                 f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}"
             )
 
+    def _categorize_hits(self, hits: Sequence[Any]) -> Tuple[List[Any], List[Any]]:
+        """Separate regular document hits from knowledge-graph centric hits."""
+
+        documents: List[Any] = []
+        knowledge: List[Any] = []
+        for hit in hits:
+            payload = getattr(hit, "payload", {}) or {}
+            doc_type = str(payload.get("document_type") or "").lower()
+            if (
+                doc_type in self._KNOWLEDGE_DOCUMENT_TYPES
+                or doc_type.startswith("knowledge_graph")
+                or doc_type.endswith("_flow")
+                or (
+                    not payload.get("content")
+                    and not payload.get("summary")
+                    and any(
+                        key in payload
+                        for key in (
+                            "relationship_type",
+                            "path",
+                            "coverage_ratio",
+                        )
+                    )
+                )
+            ):
+                knowledge.append(hit)
+            else:
+                documents.append(hit)
+        return documents, knowledge
+
+    def _build_document_context(self, hits: Sequence[Any]) -> str:
+        """Render a structured textual context from reranked document hits."""
+
+        sections: List[str] = []
+        for idx, hit in enumerate(hits, start=1):
+            payload: Dict[str, Any] = getattr(hit, "payload", {}) or {}
+            doc_id = (
+                payload.get("record_id")
+                or payload.get("document_id")
+                or payload.get("id")
+                or hit.id
+            )
+            doc_type = str(payload.get("document_type") or "document")
+            supplier = payload.get("supplier_name") or payload.get("supplier_id")
+            header_parts = [f"Document {idx}", f"ID: {doc_id}", f"Type: {doc_type}"]
+            if supplier:
+                header_parts.append(f"Supplier: {supplier}")
+            header = " | ".join(header_parts)
+            content = (
+                payload.get("content")
+                or payload.get("summary")
+                or payload.get("text")
+            )
+            if isinstance(content, (list, dict)):
+                content = json.dumps(content, ensure_ascii=False)
+            if not content:
+                metadata = {
+                    key: value
+                    for key, value in payload.items()
+                    if key
+                    not in {
+                        "vector",
+                        "embedding",
+                        "content",
+                        "summary",
+                        "text",
+                    }
+                    and value not in (None, "")
+                }
+                content = json.dumps(metadata, ensure_ascii=False) if metadata else ""
+            snippet = self._truncate_text(str(content).strip()) if content else ""
+            sections.append(f"{header}\n{snippet}")
+        return "\n\n".join(sections).strip()
+
+    def _build_context_outline(
+        self, document_hits: Sequence[Any], knowledge_summary: str
+    ) -> str:
+        """Generate a concise outline of the retrieved evidence."""
+
+        lines: List[str] = []
+        for hit in document_hits:
+            payload: Dict[str, Any] = getattr(hit, "payload", {}) or {}
+            doc_type = str(payload.get("document_type") or "document").replace("_", " ")
+            doc_id = payload.get("record_id") or payload.get("document_id") or hit.id
+            supplier = payload.get("supplier_name") or payload.get("supplier_id")
+            summary = payload.get("summary") or payload.get("content")
+            summary_text = ""
+            if isinstance(summary, str):
+                summary_text = summary.strip().splitlines()[0]
+            elif isinstance(summary, (list, dict)):
+                summary_text = json.dumps(summary, ensure_ascii=False)
+            outline_line = f"- {doc_type.title()} {doc_id}"
+            if supplier:
+                outline_line += f" (supplier {supplier})"
+            if summary_text:
+                outline_line += f": {self._truncate_text(summary_text, 140)}"
+            lines.append(outline_line)
+
+        if knowledge_summary:
+            first_sentence = knowledge_summary.strip().split(".")[0].strip()
+            if first_sentence:
+                lines.append(f"- Knowledge graph insight: {first_sentence}.")
+
+        return "\n".join(lines).strip()
+
+    def _build_knowledge_summary(
+        self, hits: Sequence[Any]
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Summarise knowledge graph hits into natural language text."""
+
+        if not hits:
+            return "", []
+
+        summaries: List[str] = []
+        payloads: List[Dict[str, Any]] = []
+        for hit in hits:
+            payload: Dict[str, Any] = dict(getattr(hit, "payload", {}) or {})
+            if not payload:
+                continue
+            payloads.append(payload)
+            doc_type = str(payload.get("document_type") or "").lower()
+            if doc_type == "supplier_flow":
+                supplier = payload.get("supplier_name") or payload.get("supplier_id")
+                coverage = payload.get("coverage_ratio")
+                parts: List[str] = []
+                if supplier:
+                    parts.append(str(supplier))
+                if isinstance(coverage, (int, float)):
+                    parts.append(f"coverage {coverage * 100:.1f}%")
+                for key, label in (
+                    ("contracts", "contracts"),
+                    ("purchase_orders", "purchase orders"),
+                    ("invoices", "invoices"),
+                    ("quotes", "quotes"),
+                ):
+                    details = payload.get(key)
+                    if isinstance(details, dict):
+                        count = details.get("count")
+                        if isinstance(count, (int, float)) and count:
+                            parts.append(f"{int(count)} {label}")
+                products = payload.get("products")
+                if isinstance(products, dict):
+                    top_items = products.get("top_items")
+                    if isinstance(top_items, list) and top_items:
+                        first = top_items[0]
+                        if isinstance(first, dict) and first.get("description"):
+                            parts.append(f"focus on {first['description']}")
+                if parts:
+                    summaries.append(
+                        "Supplier flow: " + ", ".join(parts).rstrip(", ") + "."
+                    )
+            elif doc_type.startswith("knowledge_graph"):
+                source = payload.get("source_table") or payload.get("path")
+                relationship = payload.get("relationship_type") or "relationship"
+                target = payload.get("target_table") or "target"
+                confidence = payload.get("confidence")
+                sentence = f"{source} {relationship} {target}" if source else relationship
+                if isinstance(confidence, (int, float)):
+                    sentence += f" (confidence {confidence:.2f})"
+                description = payload.get("description")
+                if description:
+                    sentence += f" – {description}"
+                summaries.append(sentence.strip() + ".")
+            else:
+                description = payload.get("description") or payload.get("summary")
+                if description:
+                    summaries.append(str(description).strip())
+
+        summary_text = " ".join(summaries).strip()
+        if summary_text:
+            summary_text = self._truncate_text(summary_text)
+        return summary_text, payloads
+
+    def _generate_agentic_plan(
+        self, query: str, outline: str, knowledge_summary: str
+    ) -> str:
+        """Create a lightweight reasoning plan for the answering model."""
+
+        planning_prompt = (
+            "You are coordinating an agentic RAG workflow for procurement analytics. "
+            "Given the user's question, the context outline and knowledge graph insights, "
+            "produce a short step-by-step plan (3-4 numbered steps) describing how to answer "
+            "the question using the available evidence. Keep the plan succinct.\n\n"
+            f"USER QUESTION: {query}\n\nCONTEXT OUTLINE:\n{outline or 'No outline provided.'}\n\n"
+            f"KNOWLEDGE SUMMARY:\n{knowledge_summary or 'No knowledge summary available.'}"
+        )
+        model_name = getattr(self.settings, "planning_model", self.settings.extraction_model)
+        try:  # pragma: no cover - network/LLM call
+            response = self.call_ollama(planning_prompt, model=model_name)
+            plan_text = response.get("response", "").strip()
+            if plan_text:
+                return plan_text
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Agentic planning generation failed: %s", exc)
+        return (
+            "1. Review knowledge graph coverage to identify relevant suppliers.\n"
+            "2. Inspect retrieved documents for concrete figures and policy references.\n"
+            "3. Draft the answer with citations and note outstanding follow-up items."
+        )
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int = 1200) -> str:
+        """Trim long text segments while keeping them readable."""
+
+        if len(text) <= limit:
+            return text
+        truncated = text[:limit].rstrip()
+        if " " in truncated:
+            truncated = truncated.rsplit(" ", 1)[0]
+        if not truncated:
+            truncated = text[:limit]
+        return truncated.rstrip("., ") + "..."

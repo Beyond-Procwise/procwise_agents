@@ -139,9 +139,20 @@ def test_data_flow_manager_builds_graph_and_persists():
     for path in graph["paths"]:
         assert path["canonical"]
 
+    flows = graph.get("supplier_flows")
+    assert isinstance(flows, list) and flows
+    first_flow = flows[0]
+    assert first_flow.get("supplier_id")
+    assert "coverage_ratio" in first_flow
 
     manager.persist_knowledge_graph(relations, graph)
 
     assert nick.qdrant_client.collections
     assert nick.qdrant_client.upserts
     assert all(entry["collection"] == "Knowledge Graph" for entry in nick.qdrant_client.upserts)
+    payload_types = {
+        point.payload.get("document_type")
+        for entry in nick.qdrant_client.upserts
+        for point in entry["points"]
+    }
+    assert "supplier_flow" in payload_types
