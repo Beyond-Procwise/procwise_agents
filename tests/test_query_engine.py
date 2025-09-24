@@ -1,6 +1,8 @@
 import os
 import sys
 import types
+from typing import Any
+
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -344,18 +346,45 @@ def test_fetch_procurement_flow_handles_missing_category_mapping(monkeypatch):
 
 
 def test_train_procurement_context_embeds_schema(monkeypatch):
-    engine = QueryEngine(
-        agent_nick=types.SimpleNamespace(get_db_connection=lambda: DummyContext())
-    )
+    class DummyConnection:
+        def __enter__(self):
+            return self
 
-    # stub column discovery
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    agent = types.SimpleNamespace(
+        get_db_connection=lambda: DummyConnection(),
+        settings=types.SimpleNamespace(qdrant_collection_name="ProcWise_document_embeddings"),
+    )
+    engine = QueryEngine(agent_nick=agent)
+
+    # stub column discovery across all procurement tables
     monkeypatch.setattr(
         engine,
         "_get_columns",
         lambda conn, schema, table: [f"{table}_c1", f"{table}_c2"],
     )
 
-    captured = {}
+    sample_frames = {
+        "proc.contracts": pd.DataFrame({"contract_id": ["CO1"], "supplier_id": ["SI1"]}),
+        "proc.supplier": pd.DataFrame({"supplier_id": ["SI1"], "supplier_name": ["Acme"]}),
+        "proc.purchase_order_agent": pd.DataFrame({"po_id": ["PO1"], "supplier_id": ["SI1"]}),
+        "proc.po_line_items_agent": pd.DataFrame({"po_id": ["PO1"], "item_description": ["Widget"]}),
+        "proc.invoice_agent": pd.DataFrame({"invoice_id": ["IN1"], "po_id": ["PO1"]}),
+        "proc.invoice_line_items_agent": pd.DataFrame({"invoice_id": ["IN1"], "po_id": ["PO1"]}),
+        "proc.cat_product_mapping": pd.DataFrame({"product": ["Widget"], "category_level_2": ["Hardware"]}),
+        "proc.quote_agent": pd.DataFrame({"quote_id": ["Q1"], "po_id": ["PO1"]}),
+        "proc.quote_line_items_agent": pd.DataFrame({"quote_id": ["Q1"], "line_total": [100.0]}),
+    }
+
+    def fake_read_sql(sql, conn):
+        for canonical, df in sample_frames.items():
+            if canonical in sql:
+                return df.copy()
+        return pd.DataFrame()
+
+    captured: dict[str, Any] = {}
 
     class DummyRAG:
         def __init__(self, *args, **kwargs):
@@ -365,6 +394,18 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
             captured["texts"] = texts
             captured["metadata"] = metadata
 
+    class DummyManager:
+        def __init__(self, *args, **kwargs):
+            captured["collection"] = kwargs.get("collection_name")
+
+        def build_data_flow_map(self, tables, table_name_map=None):
+            captured["tables"] = tables
+            captured["table_name_map"] = table_name_map
+            return ([{"status": "linked", "relationship_type": "references"}], {"paths": [], "supplier_flows": []})
+
+        def persist_knowledge_graph(self, relations, graph):
+            captured["persist"] = (relations, graph)
+
     def fake_flow(self, embed=False):
         captured["embed"] = embed
         return pd.DataFrame()
@@ -372,13 +413,21 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
     monkeypatch.setattr(QueryEngine, "fetch_procurement_flow", fake_flow)
 
     import services.rag_service as rag_module
+    import services.data_flow_manager as df_module
+    import engines.query_engine as qe_module
 
     monkeypatch.setattr(rag_module, "RAGService", DummyRAG)
+    monkeypatch.setattr(df_module, "DataFlowManager", DummyManager)
+    monkeypatch.setattr(qe_module, "read_sql_compat", fake_read_sql)
 
     engine.train_procurement_context()
 
-    assert "contracts_c1" in captured["texts"][0]
     assert captured["metadata"]["record_id"] == "procurement_schema"
+    assert captured["metadata"]["document_type"] == "procurement_schema"
+    assert any("contracts_c1" in text for text in captured["texts"])
+    assert isinstance(captured["tables"], dict) and "contracts" in captured["tables"]
+    assert captured["table_name_map"]["contracts"] == "proc.contracts"
+    assert captured["persist"][0][0]["status"] == "linked"
     assert captured["embed"] is True
 
 
