@@ -19,6 +19,8 @@ class DummyAgentNick:
             "ses_smtp_endpoint": "email-smtp.eu-west-1.amazonaws.com",
             "ses_smtp_port": 587,
             "ses_secret_role_arn": None,
+            "ses_smtp_propagation_attempts": 6,
+            "ses_smtp_propagation_wait_seconds": 30,
         }
         defaults.update(overrides)
         self.settings = SimpleNamespace(**defaults)
@@ -219,4 +221,142 @@ def test_send_email_rotates_credentials_after_auth_failures():
     rotate_mock.assert_called_once_with()
     third_smtp.login.assert_called_once_with("AKIANEW", "smtp-secret")
     third_smtp.sendmail.assert_called_once()
+
+
+def test_rotated_credentials_retry_until_propagation_succeeds():
+    nick = DummyAgentNick(
+        ses_smtp_propagation_attempts=2,
+        ses_smtp_propagation_wait_seconds=1,
+    )
+    service = EmailService(nick)
+
+    rotated = RotatedCredentials(
+        smtp_username="AKIANEW",
+        smtp_password="smtp-secret",
+        access_key_id="AKIANEW",
+    )
+
+    auth_error = smtplib.SMTPAuthenticationError(535, b"Invalid")
+
+    with patch.object(
+        service,
+        "_fetch_smtp_credentials",
+        side_effect=[
+            ("user", "pass"),
+            ("legacy", "secret"),
+            ("AKIANEW", "smtp-secret"),
+        ],
+    ) as fetch_mock, patch.object(
+        service.credential_manager,
+        "rotate_smtp_credentials",
+        return_value=rotated,
+    ) as rotate_mock, patch(
+        "services.email_service.smtplib.SMTP"
+    ) as smtp_mock, patch(
+        "services.email_service.time.sleep"
+    ) as sleep_mock:
+        first_smtp = MagicMock()
+        first_smtp.__enter__.return_value = first_smtp
+        first_smtp.__exit__.return_value = False
+        first_smtp.login.side_effect = auth_error
+
+        second_smtp = MagicMock()
+        second_smtp.__enter__.return_value = second_smtp
+        second_smtp.__exit__.return_value = False
+        second_smtp.login.side_effect = auth_error
+
+        third_smtp = MagicMock()
+        third_smtp.__enter__.return_value = third_smtp
+        third_smtp.__exit__.return_value = False
+        third_smtp.login.side_effect = auth_error
+
+        fourth_smtp = MagicMock()
+        fourth_smtp.__enter__.return_value = fourth_smtp
+        fourth_smtp.__exit__.return_value = False
+
+        smtp_mock.side_effect = [first_smtp, second_smtp, third_smtp, fourth_smtp]
+
+        result = service.send_email(
+            subject="Test",
+            body="<p>Hello</p>",
+            recipients=["to@example.com"],
+            sender="from@example.com",
+        )
+
+    assert result is True
+    assert fetch_mock.call_args_list[0] == call()
+    assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    assert fetch_mock.call_args_list[2] == call()
+    rotate_mock.assert_called_once_with()
+    sleep_mock.assert_called_once_with(1)
+    fourth_smtp.sendmail.assert_called_once()
+
+
+def test_rotated_credentials_retry_exhausts_attempts():
+    nick = DummyAgentNick(
+        ses_smtp_propagation_attempts=2,
+        ses_smtp_propagation_wait_seconds=2,
+    )
+    service = EmailService(nick)
+
+    rotated = RotatedCredentials(
+        smtp_username="AKIANEW",
+        smtp_password="smtp-secret",
+        access_key_id="AKIANEW",
+    )
+
+    auth_error = smtplib.SMTPAuthenticationError(535, b"Invalid")
+
+    with patch.object(
+        service,
+        "_fetch_smtp_credentials",
+        side_effect=[
+            ("user", "pass"),
+            ("legacy", "secret"),
+            ("AKIANEW", "smtp-secret"),
+        ],
+    ) as fetch_mock, patch.object(
+        service.credential_manager,
+        "rotate_smtp_credentials",
+        return_value=rotated,
+    ) as rotate_mock, patch(
+        "services.email_service.smtplib.SMTP"
+    ) as smtp_mock, patch(
+        "services.email_service.time.sleep"
+    ) as sleep_mock:
+        first_smtp = MagicMock()
+        first_smtp.__enter__.return_value = first_smtp
+        first_smtp.__exit__.return_value = False
+        first_smtp.login.side_effect = auth_error
+
+        second_smtp = MagicMock()
+        second_smtp.__enter__.return_value = second_smtp
+        second_smtp.__exit__.return_value = False
+        second_smtp.login.side_effect = auth_error
+
+        third_smtp = MagicMock()
+        third_smtp.__enter__.return_value = third_smtp
+        third_smtp.__exit__.return_value = False
+        third_smtp.login.side_effect = auth_error
+
+        fourth_smtp = MagicMock()
+        fourth_smtp.__enter__.return_value = fourth_smtp
+        fourth_smtp.__exit__.return_value = False
+        fourth_smtp.login.side_effect = auth_error
+
+        smtp_mock.side_effect = [first_smtp, second_smtp, third_smtp, fourth_smtp]
+
+        result = service.send_email(
+            subject="Test",
+            body="<p>Hello</p>",
+            recipients=["to@example.com"],
+            sender="from@example.com",
+        )
+
+    assert result is False
+    assert fetch_mock.call_args_list[0] == call()
+    assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
+    assert fetch_mock.call_args_list[2] == call()
+    rotate_mock.assert_called_once_with()
+    sleep_mock.assert_called_once_with(2)
 

@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     ses_smtp_iam_user: Optional[str] = Field(
         default=None, env="SES_SMTP_IAM_USER"
     )
+    ses_smtp_propagation_attempts: int = Field(
+        default=6, env="SES_SMTP_PROPAGATION_ATTEMPTS"
+    )
+    ses_smtp_propagation_wait_seconds: int = Field(
+        default=30, env="SES_SMTP_PROPAGATION_WAIT_SECONDS"
+    )
 
     extraction_model: str = "llama3.2"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
