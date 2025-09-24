@@ -261,6 +261,27 @@ class EmailDraftingAgent(BaseAgent):
             "additional_paragraph", "additional_note", "instructions"
         )
         settings["compliance_notice"] = _pick("compliance_notice", "compliance_clause")
+        settings["interaction_type"] = _pick(
+            "interaction_type",
+            "email_type",
+            "communication_type",
+            "message_type",
+            "intent",
+            "purpose",
+        )
+        settings["tone"] = _pick("tone", "style", "voice", "message_tone")
+        settings["call_to_action"] = _pick("call_to_action", "cta", "request")
+        settings["context_note"] = _pick(
+            "context_note",
+            "background",
+            "contextual_note",
+            "sourcing_context",
+        )
+        settings["negotiation_target"] = _pick(
+            "negotiation_target",
+            "target_price",
+            "counter_price",
+        )
         settings["_instructions_present"] = bool(instructions)
         return settings
 
@@ -302,6 +323,414 @@ class EmailDraftingAgent(BaseAgent):
         if not formatted:
             return ""
         return f"<p>{formatted}</p>"
+
+    def _should_auto_compose(
+        self,
+        template: Optional[str],
+        instruction_settings: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> bool:
+        """Return ``True`` when the agent should craft the body dynamically."""
+
+        if instruction_settings.get("body_template"):
+            return False
+
+        template_text = (template or "").strip()
+        if not template_text:
+            return True
+
+        normalised_template = re.sub(r"\s+", " ", template_text)
+        normalised_default = re.sub(r"\s+", " ", self.TEXT_TEMPLATE.strip())
+        if normalised_template == normalised_default:
+            return True
+
+        if instruction_settings.get("interaction_type") or context.get("interaction_type"):
+            return True
+
+        return False
+
+    def _determine_interaction_type(
+        self, context: Dict[str, Any], instruction_settings: Dict[str, Any]
+    ) -> str:
+        """Infer the interaction type from prompts, policies or input data."""
+
+        candidates: List[str] = []
+        context_keys = (
+            "interaction_type",
+            "email_type",
+            "communication_type",
+            "message_type",
+            "intent",
+            "purpose",
+        )
+        for key in context_keys:
+            value = context.get(key)
+            if value:
+                candidates.append(str(value))
+
+        instruction_keys = (
+            "interaction_type",
+            "email_type",
+            "communication_type",
+            "message_type",
+            "intent",
+            "purpose",
+        )
+        for key in instruction_keys:
+            value = instruction_settings.get(key)
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            normalised = self._normalise_interaction_type(candidate)
+            if normalised:
+                return normalised
+
+        subject = context.get("subject") or ""
+        if isinstance(subject, str) and "reminder" in subject.lower():
+            return "reminder"
+
+        return "rfq"
+
+    def _normalise_interaction_type(self, candidate: str) -> Optional[str]:
+        text = str(candidate or "").strip().lower()
+        if not text:
+            return None
+        cleaned = re.sub(r"[^a-z]+", "_", text)
+        cleaned = cleaned.strip("_")
+        synonyms = {
+            "followup": "follow_up",
+            "follow_up": "follow_up",
+            "follow_up_request": "follow_up",
+            "reminder": "reminder",
+            "rfq": "rfq",
+            "request": "rfq",
+            "quote_request": "rfq",
+            "negotiation": "negotiation",
+            "counter": "negotiation",
+            "counter_offer": "negotiation",
+            "clarification": "clarification",
+            "information_request": "clarification",
+            "update": "update",
+            "status_update": "update",
+            "award": "award",
+            "award_notice": "award",
+            "thankyou": "thank_you",
+            "thank_you": "thank_you",
+            "appreciation": "thank_you",
+        }
+        resolved = synonyms.get(cleaned)
+        if resolved:
+            return resolved
+        if cleaned:
+            return cleaned
+        return None
+
+    def _render_dynamic_body(
+        self,
+        supplier: Dict[str, Any],
+        profile: Dict[str, Any],
+        template_args: Dict[str, Any],
+        context: Dict[str, Any],
+        meta: Dict[str, Any],
+        *,
+        include_rfq_table: bool,
+    ) -> str:
+        interaction_type = meta.get("interaction_type") or "rfq"
+        instructions = meta.get("instructions") or {}
+        tone = meta.get("tone") or instructions.get("tone") or context.get("tone")
+        call_to_action_override = meta.get("call_to_action") or instructions.get("call_to_action")
+        context_note = meta.get("context_note") or instructions.get("context_note")
+
+        sections: List[str] = []
+        greeting_name = template_args.get("supplier_contact_name_html") or "Supplier"
+        sections.append(f"<p>Dear {greeting_name},</p>")
+
+        tone_prefix = self._interaction_tone_prefix(tone)
+        opening = self._build_dynamic_opening(
+            interaction_type, tone_prefix, template_args, context, instructions
+        )
+        if opening:
+            sections.append(opening)
+
+        scope_html = template_args.get("scope_summary_html")
+        if scope_html:
+            sections.append(f"<p>{scope_html}</p>")
+
+        if context_note:
+            context_paragraph = self._wrap_paragraph(str(context_note))
+            if context_paragraph:
+                sections.append(context_paragraph)
+
+        highlights_html = self._build_dynamic_highlights(
+            supplier, profile, context, instructions
+        )
+        if highlights_html:
+            sections.append(highlights_html)
+
+        cta = self._build_dynamic_call_to_action(
+            interaction_type,
+            template_args,
+            context,
+            instructions,
+            call_to_action_override,
+        )
+        if cta:
+            sections.append(cta)
+
+        if include_rfq_table and template_args.get("rfq_table_html"):
+            sections.append(template_args["rfq_table_html"])
+
+        closing = self._build_dynamic_closing(
+            interaction_type,
+            template_args,
+            tone,
+            instructions,
+        )
+        if closing:
+            sections.append(closing)
+
+        signature = self._build_signature_block(template_args)
+        if signature:
+            sections.append(signature)
+
+        return "\n".join(section for section in sections if section)
+
+    def _interaction_tone_prefix(self, tone: Optional[str]) -> Optional[str]:
+        if not tone:
+            return None
+        lowered = str(tone).strip().lower()
+        if "friendly" in lowered:
+            return "I hope you are well."
+        if "urgent" in lowered:
+            return "This is an urgent request requiring your prompt attention."
+        if "appreciative" in lowered or "positive" in lowered:
+            return "Thank you for your continued partnership."
+        if "formal" in lowered:
+            return "Please note the formal notice below."
+        return None
+
+    def _build_dynamic_opening(
+        self,
+        interaction_type: str,
+        tone_prefix: Optional[str],
+        template_args: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+    ) -> str:
+        phrases: List[str] = []
+        if tone_prefix:
+            phrases.append(tone_prefix)
+
+        scope_hint = self._clean_html_snippet(template_args.get("scope_summary_html"))
+        if interaction_type == "follow_up":
+            phrases.append("I am following up on our earlier quotation request.")
+        elif interaction_type == "reminder":
+            phrases.append("This is a reminder regarding the outstanding quotation.")
+        elif interaction_type == "negotiation":
+            phrases.append("Thank you for sharing your quotation details.")
+        elif interaction_type == "clarification":
+            phrases.append("We require a few clarifications on the proposal below.")
+        elif interaction_type == "award":
+            phrases.append("We are pleased to confirm the outcome of the sourcing event.")
+        elif interaction_type == "thank_you":
+            phrases.append("Thank you for your continued collaboration.")
+        else:
+            phrases.append("We are initiating a sourcing request for your review.")
+
+        if scope_hint and interaction_type in {"rfq", "follow_up", "reminder", "clarification"}:
+            phrases.append(f"The requirement focuses on {scope_hint}.")
+
+        return self._wrap_paragraph(" ".join(phrases))
+
+    def _build_dynamic_highlights(
+        self,
+        supplier: Dict[str, Any],
+        profile: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+    ) -> Optional[str]:
+        highlights = self._collect_highlights(supplier, profile, context, instructions)
+        if not highlights:
+            return None
+        items = "".join(f"<li>{escape(point)}</li>" for point in highlights[:5])
+        return f"<ul>{items}</ul>"
+
+    def _collect_highlights(
+        self,
+        supplier: Dict[str, Any],
+        profile: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+    ) -> List[str]:
+        highlights: List[str] = []
+
+        for key in ("key_points", "highlights", "notes"):
+            values = context.get(key)
+            if isinstance(values, (list, tuple, set)):
+                for value in values:
+                    if isinstance(value, str) and value.strip():
+                        highlights.append(value.strip())
+            elif isinstance(values, str) and values.strip():
+                highlights.append(values.strip())
+
+        instruction_points = instructions.get("key_points") or instructions.get("highlights")
+        if isinstance(instruction_points, (list, tuple, set)):
+            for value in instruction_points:
+                if isinstance(value, str) and value.strip():
+                    highlights.append(value.strip())
+        elif isinstance(instruction_points, str) and instruction_points.strip():
+            highlights.append(instruction_points.strip())
+
+        supplier_strengths = supplier.get("strengths") or supplier.get("differentiators")
+        if isinstance(supplier_strengths, (list, tuple, set)):
+            for value in supplier_strengths:
+                if isinstance(value, str) and value.strip():
+                    highlights.append(value.strip())
+        elif isinstance(supplier_strengths, str) and supplier_strengths.strip():
+            highlights.append(supplier_strengths.strip())
+
+        profile_highlights = profile.get("capabilities") if isinstance(profile, dict) else None
+        if isinstance(profile_highlights, (list, tuple, set)):
+            for value in profile_highlights:
+                if isinstance(value, str) and value.strip():
+                    highlights.append(value.strip())
+
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for value in highlights:
+            token = value.strip()
+            key = token.lower()
+            if token and key not in seen:
+                seen.add(key)
+                cleaned.append(token)
+        return cleaned
+
+    def _build_dynamic_call_to_action(
+        self,
+        interaction_type: str,
+        template_args: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+        override: Optional[str],
+    ) -> str:
+        if override:
+            return self._wrap_paragraph(str(override))
+
+        deadline = template_args.get("deadline_html") or template_args.get("deadline")
+        deadline_text = self._clean_html_snippet(deadline) if deadline else None
+        base: Optional[str] = None
+
+        if interaction_type == "negotiation":
+            target = instructions.get("negotiation_target")
+            if target is None:
+                target = context.get("target_price")
+            target_text = self._format_currency_value(target, context.get("currency"))
+            current_offer = self._format_currency_value(
+                context.get("current_offer"), context.get("currency")
+            )
+            base = (
+                "Could you review the pricing and confirm if a revised proposal "
+                f"closer to {target_text} is achievable?"
+            )
+            if current_offer:
+                base += f" Your current offer of {current_offer} is appreciated and forms the basis of this discussion."
+        elif interaction_type == "follow_up":
+            base = "We would appreciate an update on your quotation at your earliest convenience."
+        elif interaction_type == "reminder":
+            if deadline_text:
+                base = (
+                    f"This is a friendly reminder that the quotation is due by {deadline_text}."
+                )
+            else:
+                base = "This is a friendly reminder to share your quotation."
+        elif interaction_type == "clarification":
+            base = "Please provide clarification on the highlighted points so that we can complete the evaluation."
+        elif interaction_type == "award":
+            base = "Please confirm acceptance of the award and advise on next steps for mobilisation."
+        elif interaction_type == "thank_you":
+            base = "Please keep us informed about any support you require for the next phase."
+        else:
+            if deadline_text:
+                base = (
+                    "Please review the requirement and return your quotation using the table below "
+                    f"by {deadline_text}."
+                )
+            else:
+                base = "Please review the requirement and return your quotation using the table below."
+
+        note = " Kindly retain the RFQ ID in the email subject when replying."
+        return self._wrap_paragraph(f"{base}{note}")
+
+    def _build_dynamic_closing(
+        self,
+        interaction_type: str,
+        template_args: Dict[str, Any],
+        tone: Optional[str],
+        instructions: Dict[str, Any],
+    ) -> str:
+        closing_override = instructions.get("closing_note") or instructions.get("closing")
+        if closing_override:
+            return self._wrap_paragraph(str(closing_override))
+
+        if interaction_type == "negotiation":
+            text = "We appreciate your consideration and look forward to identifying a mutually beneficial outcome."
+        elif interaction_type == "award":
+            text = "Congratulations once again, and thank you for supporting this programme."
+        elif interaction_type == "thank_you":
+            text = "Thank you for your continued collaboration."
+        else:
+            text = "We appreciate your timely response and support." 
+
+        if tone and "urgent" in str(tone).lower():
+            text = "Your prompt attention to this matter is greatly appreciated."
+
+        return self._wrap_paragraph(text)
+
+    def _build_signature_block(self, template_args: Dict[str, Any]) -> str:
+        name = template_args.get("your_name_html") or template_args.get("your_name")
+        title = template_args.get("your_title_html") or template_args.get("your_title")
+        company = template_args.get("your_company_html") or template_args.get("your_company")
+        lines = ["Kind regards,"]
+        if name:
+            lines.append(str(name))
+        if title:
+            lines.append(str(title))
+        if company:
+            lines.append(str(company))
+        body = "<br>".join(lines)
+        return f"<p>{body}</p>"
+
+    def _wrap_paragraph(self, text: Optional[str]) -> str:
+        if not text:
+            return ""
+        stripped = str(text).strip()
+        if not stripped:
+            return ""
+        if "<" in stripped and ">" in stripped:
+            return stripped
+        return f"<p>{escape(stripped)}</p>"
+
+    def _clean_html_snippet(self, snippet: Optional[str]) -> Optional[str]:
+        if snippet is None:
+            return None
+        text = re.sub(r"<[^>]+>", "", str(snippet))
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        return cleaned or None
+
+    def _format_currency_value(self, value: Any, currency: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        code = (currency or "GBP").upper()
+        symbol = "£" if code == "GBP" else "$" if code == "USD" else ""
+        formatted = f"{amount:,.2f}"
+        if symbol:
+            return f"{symbol}{formatted}"
+        return f"{formatted} {code}"
 
     @staticmethod
     def _normalise_subject_line(subject: str, rfq_id: Optional[str]) -> str:
@@ -461,7 +890,29 @@ class EmailDraftingAgent(BaseAgent):
                     "compliance_notice_html": compliance_section_html,
                 }
             )
-            rendered = self._render_template_string(body_template, template_args)
+            interaction_type = self._determine_interaction_type(data, instruction_settings)
+            template_args["interaction_type"] = interaction_type
+            dynamic_meta = {
+                "interaction_type": interaction_type,
+                "instructions": instruction_settings,
+                "tone": instruction_settings.get("tone") or data.get("tone"),
+                "call_to_action": instruction_settings.get("call_to_action"),
+                "context_note": instruction_settings.get("context_note"),
+            }
+
+            if self._should_auto_compose(
+                body_template, instruction_settings, data
+            ):
+                rendered = self._render_dynamic_body(
+                    supplier,
+                    profile,
+                    template_args,
+                    data,
+                    dynamic_meta,
+                    include_rfq_table=include_rfq_table,
+                )
+            else:
+                rendered = self._render_template_string(body_template, template_args)
 
             comment, message = self._split_existing_comment(rendered)
             message_content = message if comment else rendered

@@ -66,10 +66,10 @@ def test_email_drafting_agent(monkeypatch):
     assert draft["rfq_id"].startswith("RFQ-")
     assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
     assert "<p>Dear Acme,</p>" in draft["body"]
-    assert "formal quotation for the requirement outlined below" in draft["body"]
-    assert "<p>Kindly complete the table and return your quotation by 01/01/2025.</p>" in draft["body"]
-    assert "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>" in draft["body"]
-    assert "<p>We appreciate your timely response.</p>" in draft["body"]
+    assert "initiating a sourcing request" in draft["body"]
+    assert "return your quotation using the table below by 01/01/2025" in draft["body"]
+    assert "Kindly retain the RFQ ID in the email subject" in draft["body"]
+    assert "We appreciate your timely response and support" in draft["body"]
     assert "<table" in draft["body"]
     assert draft["subject"].count("RFQ") == 1
     body_lower = draft["body"].lower()
@@ -146,6 +146,45 @@ def test_email_drafting_applies_instruction_settings(monkeypatch):
     assert "Compliance" in body
     assert "<table" not in body
     assert draft["recipients"] == []
+
+
+def test_email_drafting_follow_up_interaction(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+
+    ranking = [
+        {
+            "supplier_id": "S9",
+            "supplier_name": "Delta Supplies",
+        }
+    ]
+
+    prompts = [
+        {
+            "prompts_desc": "interaction_type: follow_up\n",
+        }
+    ]
+
+    context = AgentContext(
+        workflow_id="wf-follow",
+        agent_id="email_drafting",
+        user_id="tester",
+        input_data={
+            "ranking": ranking,
+            "prompts": prompts,
+            "submission_deadline": "2025-03-01",
+            "previous_sent_on": "2025-02-20",
+        },
+    )
+
+    output = agent.run(context)
+    body = output.data["drafts"][0]["body"]
+
+    assert "following up on our earlier quotation request" in body
+    assert "update on your quotation" in body
+    assert "Kindly retain the RFQ ID in the email subject" in body
 
 
 def test_email_drafting_uses_template_from_previous_agent(monkeypatch):

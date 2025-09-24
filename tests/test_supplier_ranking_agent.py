@@ -251,6 +251,98 @@ def test_supplier_ranking_injects_missing_candidates(monkeypatch):
     assert any(entry["supplier_name"] == "Beta" for entry in output.data["ranking"])
 
 
+def test_supplier_ranking_normalises_weights_to_available_metrics(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_load_procurement_tables", lambda *_: {})
+    monkeypatch.setattr(agent, "_merge_supplier_metrics", lambda df, _tables: df)
+    monkeypatch.setattr(
+        agent,
+        "_build_supplier_profiles",
+        lambda _tables, ids: {str(s): {} for s in ids},
+    )
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+
+    df = pd.DataFrame(
+        {
+            "supplier_id": ["S1", "S2"],
+            "supplier_name": ["Alpha", "Beta"],
+            "price": [50.0, 40.0],
+            "risk": [5.0, 3.0],
+        }
+    )
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="supplier_ranking",
+        user_id="user",
+        input_data={
+            "supplier_data": df,
+            "intent": {"parameters": {"criteria": ["price", "delivery", "risk"], "top_n": 2}},
+            "query": "rank suppliers",
+        },
+    )
+
+    output = agent.run(context)
+
+    weights = output.data["ranking"][0]["weights"]
+    assert "price" in weights and "risk" in weights
+    assert weights["price"] > 0
+    assert weights["risk"] > 0
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert output.data["ranking"][0]["final_score"] > 0
+
+
+def test_supplier_ranking_includes_flow_coverage_from_snapshot(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierRankingAgent(nick)
+    monkeypatch.setattr(agent, "_load_procurement_tables", lambda *_: {})
+    monkeypatch.setattr(agent, "_merge_supplier_metrics", lambda df, _tables: df)
+    monkeypatch.setattr(
+        agent,
+        "_build_supplier_profiles",
+        lambda _tables, ids: {str(s): {} for s in ids},
+    )
+    monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
+
+    df = pd.DataFrame(
+        {
+            "supplier_id": ["S1"],
+            "supplier_name": ["Alpha"],
+            "price": [50.0],
+        }
+    )
+
+    snapshot = {
+        "supplier_flows": [
+            {
+                "supplier_id": "S1",
+                "supplier_name": "Alpha",
+                "coverage_ratio": 0.6,
+                "purchase_orders": {"count": 2},
+            }
+        ]
+    }
+
+    context = AgentContext(
+        workflow_id="wf2",
+        agent_id="supplier_ranking",
+        user_id="user",
+        input_data={
+            "supplier_data": df,
+            "data_flow_snapshot": snapshot,
+            "intent": {"parameters": {"criteria": ["price"], "top_n": 1}},
+            "query": "rank suppliers",
+        },
+    )
+
+    output = agent.run(context)
+
+    ranking_entry = output.data["ranking"][0]
+    assert ranking_entry["flow_coverage"] == pytest.approx(0.6)
+    assert ranking_entry["final_score"] > 0
+
+
 def test_supplier_ranking_limits_to_opportunity_directory(monkeypatch):
     class StubPolicyEngine:
         def __init__(self):

@@ -1471,7 +1471,8 @@ class Orchestrator:
             candidates.append(candidate_str)
 
         if candidates:
-            pass_payload: Dict[str, Any] = {"supplier_candidates": candidates}
+            pass_payload: Dict[str, Any] = dict(opp_result.pass_fields or {})
+            pass_payload["supplier_candidates"] = candidates
             rank_ctx = self._create_child_context(
                 context, "supplier_ranking", pass_payload
             )

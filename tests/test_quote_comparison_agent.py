@@ -92,6 +92,7 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     assert len(comparison) == 3
     assert comparison[0]["name"] == "weighting"
     assert "weighting_factors" not in comparison[0]
+    assert "total_spend_gbp" not in comparison[0]
     suppliers = {row["supplier_id"] for row in comparison if row["name"] != "weighting"}
     assert suppliers == {"S1", "S2"}
     assert comparison[1]["quote_file_s3_path"] == "s3://bucket/s1.pdf"
@@ -101,6 +102,7 @@ def test_quote_comparison_prefers_passed_quotes(monkeypatch):
     assert "unit_price" not in comparison[2]
     assert comparison[1]["total_cost"] == pytest.approx(90.12)
     assert comparison[1]["total_spend"] == pytest.approx(100.79)
+    assert "total_spend_gbp" not in comparison[1]
     assert comparison[1]["volume"] == pytest.approx(10.46)
     assert round(comparison[1]["weighting_score"], 2) == comparison[1]["weighting_score"]
     assert comparison[1]["weighting_score"] > comparison[2]["weighting_score"]
@@ -156,8 +158,10 @@ def test_quote_comparison_filters_by_supplier_tokens(monkeypatch):
     assert len(comparison) == 2
     assert comparison[0]["name"] == "weighting"
     assert "weighting_factors" not in comparison[0]
+    assert "total_spend_gbp" not in comparison[0]
     assert comparison[1]["name"] == "Supplier B"
     assert comparison[1]["supplier_id"] is None
+    assert "total_spend_gbp" not in comparison[1]
     assert all("unit_price" not in row for row in comparison)
     recommended = result.data.get("recommended_quote")
     assert recommended is not None
@@ -213,3 +217,29 @@ def test_quote_comparison_applies_instruction_weights(monkeypatch):
     assert weight_entry["total_cost"] == pytest.approx(0.2)
     assert weight_entry["tenure"] == pytest.approx(0.3)
     assert weight_entry["volume"] == pytest.approx(0.5)
+    assert "total_spend_gbp" not in weight_entry
+
+
+def test_quote_comparison_normalises_metric_weights():
+    nick = DummyNick()
+    agent = QuoteComparisonAgent(nick)
+
+    entries = [
+        {
+            "total_cost_gbp": 120.0,
+            "tenure": 5,
+            "volume": None,
+        },
+        {
+            "total_cost_gbp": 90.0,
+            "tenure": 7,
+            "volume": None,
+        },
+    ]
+
+    agent._calculate_weighting_scores(entries, agent.DEFAULT_METRIC_WEIGHTS)
+
+    resolved = agent._resolved_metric_weights
+    assert set(resolved.keys()) == {"total_cost", "tenure"}
+    assert sum(resolved.values()) == pytest.approx(1.0)
+    assert all(entry.get("weighting_score", 0.0) > 0 for entry in entries)

@@ -178,6 +178,60 @@ class SupplierInteractionAgent(BaseAgent):
 
         return processed
 
+    def wait_for_response(
+        self,
+        *,
+        watcher=None,
+        timeout: int = 300,
+        poll_interval: int = 15,
+        limit: int = 1,
+    ) -> Optional[Dict]:
+        """Wait for an inbound supplier email and return the processed result."""
+
+        deadline = time.time() + max(timeout, 0)
+        active_watcher = watcher
+        if active_watcher is None:
+            try:
+                from services.email_watcher import SESEmailWatcher
+                from agents.negotiation_agent import NegotiationAgent
+            except Exception:  # pragma: no cover - optional import
+                SESEmailWatcher = None
+                NegotiationAgent = None  # type: ignore
+
+            if SESEmailWatcher is None:
+                return None
+
+            registry = getattr(self.agent_nick, "agents", {})
+            negotiation_agent = None
+            if isinstance(registry, dict):
+                negotiation_agent = registry.get("negotiation") or registry.get(
+                    "NegotiationAgent"
+                )
+            if negotiation_agent is None and NegotiationAgent is not None:
+                negotiation_agent = NegotiationAgent(self.agent_nick)
+
+            active_watcher = SESEmailWatcher(
+                self.agent_nick,
+                supplier_agent=self,
+                negotiation_agent=negotiation_agent,
+            )
+
+        result: Optional[Dict] = None
+        while time.time() <= deadline:
+            try:
+                batch = active_watcher.poll_once(limit=limit)
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("wait_for_response poll failed")
+                batch = []
+            if batch:
+                result = batch[-1]
+                break
+            if poll_interval <= 0:
+                break
+            time.sleep(min(poll_interval, max(0, deadline - time.time())))
+
+        return result
+
     def _extract_rfq_id(self, text: str) -> Optional[str]:
         match = self.RFQ_PATTERN.search(text)
         return match.group(0) if match else None

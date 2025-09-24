@@ -296,6 +296,8 @@ class OpportunityMinerAgent(BaseAgent):
         self._data_profile: Dict[str, Any] = {}
         self._data_flow_manager: Optional[DataFlowManager] = None
         self._data_flow_snapshot: Dict[str, Any] = {}
+        self._supplier_flow_index: Dict[str, Dict[str, Any]] = {}
+        self._supplier_flow_name_index: Dict[str, Dict[str, Any]] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -316,6 +318,17 @@ class OpportunityMinerAgent(BaseAgent):
             except ValueError:
                 return None
         return None
+
+    @staticmethod
+    def _normalise_supplier_token(value: Optional[Any]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value)
+        except Exception:
+            return None
+        text = text.strip().lower()
+        return text or None
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -648,6 +661,8 @@ class OpportunityMinerAgent(BaseAgent):
 
     def _capture_data_flow(self, tables: Dict[str, pd.DataFrame]) -> None:
         self._data_flow_snapshot = {}
+        self._supplier_flow_index = {}
+        self._supplier_flow_name_index = {}
         if not isinstance(tables, dict) or not tables:
             return
         manager = self._get_data_flow_manager()
@@ -664,6 +679,25 @@ class OpportunityMinerAgent(BaseAgent):
             "relationships": relations,
             "graph": graph,
         }
+        flows_raw = []
+        if isinstance(graph, dict):
+            flows_raw = graph.get("supplier_flows") or []
+        flow_index: Dict[str, Dict[str, Any]] = {}
+        flow_name_index: Dict[str, Dict[str, Any]] = {}
+        for flow in flows_raw:
+            if not isinstance(flow, dict):
+                continue
+            supplier_id = flow.get("supplier_id")
+            if supplier_id is not None:
+                key = str(supplier_id).strip()
+                if key:
+                    flow_index[key] = flow
+            supplier_name = flow.get("supplier_name")
+            token = self._normalise_supplier_token(supplier_name)
+            if token:
+                flow_name_index.setdefault(token, flow)
+        self._supplier_flow_index = flow_index
+        self._supplier_flow_name_index = flow_name_index
         try:
             manager.persist_knowledge_graph(relations, graph)
         except Exception:  # pragma: no cover - persistence best effort
@@ -756,6 +790,72 @@ class OpportunityMinerAgent(BaseAgent):
             }.get(status, status.replace("_", " "))
             return f"{source_label} ↔ {target_label}: {status_label}"
         return None
+
+    def _lookup_supplier_flow(
+        self, supplier_id: Optional[Any], supplier_name: Optional[Any] = None
+    ) -> Optional[Dict[str, Any]]:
+        candidate_id = str(supplier_id).strip() if supplier_id is not None else ""
+        if candidate_id and candidate_id in self._supplier_flow_index:
+            return self._supplier_flow_index.get(candidate_id)
+
+        tokens: List[str] = []
+        if supplier_name:
+            token = self._normalise_supplier_token(supplier_name)
+            if token:
+                tokens.append(token)
+
+        if candidate_id and candidate_id in self._supplier_lookup:
+            lookup_name = self._supplier_lookup.get(candidate_id)
+            token = self._normalise_supplier_token(lookup_name)
+            if token:
+                tokens.append(token)
+        if candidate_id and candidate_id in self._supplier_alias_lookup:
+            aliases = self._supplier_alias_lookup.get(candidate_id) or []
+            for alias in aliases:
+                token = self._normalise_supplier_token(alias)
+                if token:
+                    tokens.append(token)
+
+        for token in tokens:
+            flow = self._supplier_flow_name_index.get(token)
+            if flow:
+                return flow
+        return None
+
+    def _supplier_flow_coverage(
+        self, supplier_id: Optional[Any], supplier_name: Optional[Any] = None
+    ) -> float:
+        entry = self._lookup_supplier_flow(supplier_id, supplier_name)
+        if not isinstance(entry, dict):
+            return 0.0
+        coverage = entry.get("coverage_ratio")
+        if isinstance(coverage, (int, float)):
+            value = float(coverage)
+            if value < 0:
+                return 0.0
+            if value > 1.0:
+                return min(value, 1.0)
+            return value
+        total = 0
+        hits = 0
+        for key in ("contracts", "purchase_orders", "invoices", "quotes"):
+            details = entry.get(key)
+            if isinstance(details, dict):
+                total += 1
+                if details.get("count"):
+                    hits += 1
+        return hits / total if total else 0.0
+
+    def _normalise_risk_score(self, value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if numeric < 0:
+            return 0.0
+        if numeric > 1.0:
+            numeric = min(numeric / 100.0, 1.0)
+        return min(numeric, 1.0)
 
     def _determine_supplier_gap_reason(
         self,
@@ -1330,15 +1430,30 @@ class OpportunityMinerAgent(BaseAgent):
                 if reason:
                     policy_supplier_gaps[display] = reason
 
-            # compute weightage
-            total_impact = sum(f.financial_impact_gbp for f in filtered)
-            if total_impact > 0:
-                for f in filtered:
-                    risk = float(self._supplier_risk_map.get(f.supplier_id, 0.0))
-                    f.weightage = (f.financial_impact_gbp / total_impact) * (1.0 + risk)
-            else:
-                for f in filtered:
-                    f.weightage = 0.0
+            # compute weightage with risk and data coverage awareness
+            weight_factors: List[float] = []
+            for f in filtered:
+                supplier_id = f.supplier_id
+                supplier_name = f.supplier_name or None
+                sid_token = str(supplier_id).strip() if supplier_id is not None else ""
+                if not supplier_name and sid_token and sid_token in self._supplier_lookup:
+                    supplier_name = self._supplier_lookup.get(sid_token)
+                risk_raw = self._supplier_risk_map.get(sid_token)
+                risk_score = self._normalise_risk_score(risk_raw)
+                coverage = self._supplier_flow_coverage(supplier_id, supplier_name)
+                base_impact = max(f.financial_impact_gbp, 0.0)
+                factor = base_impact * (1.0 + risk_score) * (1.0 + coverage)
+                if factor <= 0.0 and base_impact > 0.0:
+                    factor = base_impact
+                weight_factors.append(factor)
+                details = f.calculation_details if isinstance(f.calculation_details, dict) else {}
+                details.setdefault("risk_score_normalised", risk_score)
+                details.setdefault("flow_coverage", coverage)
+                f.calculation_details = details
+
+            total_factor = sum(weight_factors)
+            for f, factor in zip(filtered, weight_factors):
+                f.weightage = (factor / total_factor) if total_factor > 0 else 0.0
 
             policy_top_summary = self._summarise_top_opportunities(
                 per_policy_retained, per_policy_categories
