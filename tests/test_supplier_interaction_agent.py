@@ -101,3 +101,55 @@ def test_supplier_interaction_wait_for_response():
     assert result is not None
     assert result["rfq_id"] == "RFQ-20240101-abcd1234"
     assert calls["count"] == 1
+
+
+def test_supplier_interaction_waits_using_drafts():
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    drafts = [
+        {
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "receiver": "supplier@example.com",
+        }
+    ]
+
+    def fake_wait_for_response(**kwargs):
+        assert kwargs["rfq_id"] == "RFQ-20240101-abcd1234"
+        assert kwargs["supplier_id"] == "S1"
+        return {
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "supplier_status": "success",
+            "target_price": 1000.0,
+            "supplier_output": {
+                "price": 900.0,
+                "lead_time": "5",
+                "response_text": "Quoted price 900 in 5 days",
+                "related_documents": [{"doc": 1}],
+            },
+        }
+
+    agent.wait_for_response = fake_wait_for_response  # type: ignore[assignment]
+
+    context = AgentContext(
+        workflow_id="wf2",
+        agent_id="supplier_interaction",
+        user_id="u1",
+        input_data={
+            "subject": "RFQ-20240101-abcd1234 – Request for Quotation",
+            "drafts": drafts,
+            "supplier_id": "S1",
+            "target_price": "1000",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["rfq_id"] == "RFQ-20240101-abcd1234"
+    assert output.data["price"] == 900.0
+    assert output.data["target_price"] == 1000.0
+    assert output.next_agents == ["QuoteEvaluationAgent"]

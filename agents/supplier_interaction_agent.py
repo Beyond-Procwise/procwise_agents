@@ -5,7 +5,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
@@ -20,6 +20,7 @@ class SupplierInteractionAgent(BaseAgent):
         super().__init__(agent_nick)
         self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
+        self._email_watcher = None
 
     RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}")
 
@@ -54,31 +55,157 @@ class SupplierInteractionAgent(BaseAgent):
             payload = {"business_polls": count}
             return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
 
-        subject = context.input_data.get("subject", "")
-        body = context.input_data.get("message") or context.input_data.get("body", "")
-        supplier_id = context.input_data.get("supplier_id")
+        input_data = dict(context.input_data)
+        subject = str(input_data.get("subject") or "")
+        message_text = input_data.get("message")
+        body = message_text if isinstance(message_text, str) else ""
+        drafts: List[Dict[str, Any]] = [
+            draft for draft in input_data.get("drafts", []) if isinstance(draft, dict)
+        ]
+
+        if not body:
+            fallback_body = input_data.get("body")
+            treat_body_as_message = bool(input_data.get("treat_body_as_message"))
+            if isinstance(fallback_body, str) and (treat_body_as_message or not drafts):
+                body = fallback_body
+
+        supplier_id = input_data.get("supplier_id")
+        rfq_id = input_data.get("rfq_id")
+        draft_match = self._select_draft(drafts, supplier_id=supplier_id, rfq_id=rfq_id)
+        if not supplier_id and draft_match:
+            supplier_id = draft_match.get("supplier_id")
+        if not rfq_id and draft_match:
+            rfq_id = draft_match.get("rfq_id")
+
         if not supplier_id:
-            candidates = context.input_data.get("supplier_candidates", [])
+            candidates = input_data.get("supplier_candidates", [])
             supplier_id = candidates[0] if candidates else None
+
+        await_flag = input_data.get("await_response")
+        should_wait = not body and (await_flag is True or (await_flag is None and bool(drafts)))
+
+        precomputed: Optional[Dict[str, Any]] = None
+        related_override: Optional[List[Any]] = None
+        target_override: Optional[float] = None
+
+        if should_wait:
+            if not rfq_id:
+                rfq_id = self._extract_rfq_id(subject)
+            if not rfq_id:
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="rfq_id required to await supplier response",
+                )
+
+            timeout = self._coerce_int(input_data.get("response_timeout"), default=900)
+            poll_interval = self._coerce_int(
+                input_data.get("response_poll_interval"), default=30
+            )
+            batch_limit = self._coerce_int(input_data.get("response_batch_limit"), default=5)
+            expected_sender = None
+            if draft_match:
+                expected_sender = (
+                    draft_match.get("receiver")
+                    or draft_match.get("recipient_email")
+                    or draft_match.get("contact_email")
+                )
+
+            wait_result = self.wait_for_response(
+                timeout=timeout,
+                poll_interval=poll_interval,
+                limit=batch_limit,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+                subject_hint=subject,
+                from_address=expected_sender,
+            )
+
+            if not wait_result:
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="supplier response not received",
+                )
+
+            supplier_status = str(wait_result.get("supplier_status") or "").lower()
+            if supplier_status and supplier_status != AgentStatus.SUCCESS.value:
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error=wait_result.get("error") or "supplier response processing failed",
+                )
+
+            subject = str(wait_result.get("subject") or subject)
+            supplier_id = wait_result.get("supplier_id") or supplier_id
+            rfq_id = wait_result.get("rfq_id") or rfq_id
+
+            supplier_payload = wait_result.get("supplier_output")
+            if isinstance(supplier_payload, dict):
+                precomputed = {
+                    "price": supplier_payload.get("price"),
+                    "lead_time": supplier_payload.get("lead_time"),
+                    "response_text": supplier_payload.get("response_text") or "",
+                }
+                related_override = supplier_payload.get("related_documents")
+                body = precomputed.get("response_text") or ""
+            else:
+                body = str(
+                    wait_result.get("message")
+                    or wait_result.get("body")
+                    or wait_result.get("supplier_message")
+                    or ""
+                )
+
+            target_override = self._coerce_float(wait_result.get("target_price"))
+
         if not body:
             return AgentOutput(status=AgentStatus.FAILED, data={}, error="message not provided")
 
-        # Retrieve related documents from the vector database for additional context
-        context_hits = self.vector_search(body, top_k=3)
-        related_docs = [h.payload for h in context_hits]
+        if not rfq_id:
+            rfq_id = self._extract_rfq_id(subject + " " + body)
+        if not draft_match:
+            draft_match = self._select_draft(drafts, supplier_id=supplier_id, rfq_id=rfq_id)
+            if draft_match and not supplier_id:
+                supplier_id = draft_match.get("supplier_id")
 
-        rfq_id = self._extract_rfq_id(subject + " " + body)
-        parsed = self._parse_response(body)
-        self._store_response(rfq_id, supplier_id, body, parsed)
+        parsed = (
+            {
+                "price": precomputed.get("price"),
+                "lead_time": precomputed.get("lead_time"),
+                "response_text": precomputed.get("response_text") or body,
+            }
+            if isinstance(precomputed, dict)
+            else self._parse_response(body)
+        )
 
-        target = context.input_data.get("target_price")
-        next_agent = []
-        if parsed.get("price") and target and parsed["price"] > float(target):
+        target = self._coerce_float(input_data.get("target_price"))
+        if target_override is not None:
+            target = target_override
+
+        if related_override is not None:
+            related_docs = related_override
+        else:
+            context_hits = self.vector_search(parsed.get("response_text") or body, top_k=3)
+            related_docs = [h.payload for h in context_hits]
+
+        self._store_response(rfq_id, supplier_id, parsed.get("response_text") or body, parsed)
+
+        price = parsed.get("price")
+        if price is not None and target is not None and price > target:
             next_agent = ["NegotiationAgent"]
         else:
             next_agent = ["QuoteEvaluationAgent"]
 
-        payload = {"rfq_id": rfq_id, "supplier_id": supplier_id, **parsed, "related_documents": related_docs}
+        payload = {
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            **parsed,
+            "related_documents": related_docs,
+        }
+        if target is not None:
+            payload["target_price"] = target
+
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=payload,
@@ -185,6 +312,10 @@ class SupplierInteractionAgent(BaseAgent):
         timeout: int = 300,
         poll_interval: int = 15,
         limit: int = 1,
+        rfq_id: Optional[str] = None,
+        supplier_id: Optional[str] = None,
+        subject_hint: Optional[str] = None,
+        from_address: Optional[str] = None,
     ) -> Optional[Dict]:
         """Wait for an inbound supplier email and return the processed result."""
 
@@ -201,22 +332,28 @@ class SupplierInteractionAgent(BaseAgent):
             if SESEmailWatcher is None:
                 return None
 
-            registry = getattr(self.agent_nick, "agents", {})
-            negotiation_agent = None
-            if isinstance(registry, dict):
-                negotiation_agent = registry.get("negotiation") or registry.get(
-                    "NegotiationAgent"
-                )
-            if negotiation_agent is None and NegotiationAgent is not None:
-                negotiation_agent = NegotiationAgent(self.agent_nick)
+            if self._email_watcher is None:
+                registry = getattr(self.agent_nick, "agents", {})
+                negotiation_agent = None
+                if isinstance(registry, dict):
+                    negotiation_agent = registry.get("negotiation") or registry.get(
+                        "NegotiationAgent"
+                    )
 
-            active_watcher = SESEmailWatcher(
-                self.agent_nick,
-                supplier_agent=self,
-                negotiation_agent=negotiation_agent,
-            )
+                self._email_watcher = SESEmailWatcher(
+                    self.agent_nick,
+                    supplier_agent=self,
+                    negotiation_agent=negotiation_agent,
+                    enable_negotiation=False,
+                )
+            active_watcher = self._email_watcher
 
         result: Optional[Dict] = None
+        rfq_normalised = self._normalise_identifier(rfq_id)
+        supplier_normalised = self._normalise_identifier(supplier_id)
+        subject_norm = str(subject_hint or "").strip().lower()
+        sender_normalised = self._normalise_identifier(from_address)
+
         while time.time() <= deadline:
             try:
                 batch = active_watcher.poll_once(limit=limit)
@@ -224,13 +361,109 @@ class SupplierInteractionAgent(BaseAgent):
                 logger.exception("wait_for_response poll failed")
                 batch = []
             if batch:
-                result = batch[-1]
-                break
+                for candidate in batch:
+                    if rfq_normalised and self._normalise_identifier(
+                        candidate.get("rfq_id")
+                    ) != rfq_normalised:
+                        continue
+                    if supplier_normalised and self._normalise_identifier(
+                        candidate.get("supplier_id")
+                    ) != supplier_normalised:
+                        continue
+                    if subject_norm:
+                        subj = str(candidate.get("subject") or "").lower()
+                        if subject_norm not in subj:
+                            continue
+                    if sender_normalised:
+                        sender = self._normalise_identifier(candidate.get("from_address"))
+                        if sender and sender != sender_normalised:
+                            continue
+                    result = candidate
+                    break
+                if result is None and not any(
+                    [rfq_normalised, supplier_normalised, subject_norm, sender_normalised]
+                ):
+                    result = batch[-1]
+                if result is not None:
+                    break
             if poll_interval <= 0:
                 break
             time.sleep(min(poll_interval, max(0, deadline - time.time())))
 
         return result
+
+    @staticmethod
+    def _coerce_int(value: Any, *, default: int) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalise_identifier(value: Optional[Any]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        lowered = text.lower()
+        return lowered or None
+
+    def _select_draft(
+        self,
+        drafts: List[Dict[str, Any]],
+        *,
+        supplier_id: Optional[Any] = None,
+        rfq_id: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not drafts:
+            return None
+
+        target_supplier = self._normalise_identifier(supplier_id)
+        target_rfq = self._normalise_identifier(rfq_id)
+
+        def _matches(draft: Dict[str, Any]) -> bool:
+            draft_supplier = self._normalise_identifier(draft.get("supplier_id"))
+            draft_rfq = self._normalise_identifier(draft.get("rfq_id"))
+            supplier_ok = not target_supplier or draft_supplier == target_supplier
+            rfq_ok = not target_rfq or draft_rfq == target_rfq
+            return supplier_ok and rfq_ok
+
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            if _matches(draft):
+                return draft
+
+        if target_supplier:
+            for draft in drafts:
+                if not isinstance(draft, dict):
+                    continue
+                if self._normalise_identifier(draft.get("supplier_id")) == target_supplier:
+                    return draft
+
+        if target_rfq:
+            for draft in drafts:
+                if not isinstance(draft, dict):
+                    continue
+                if self._normalise_identifier(draft.get("rfq_id")) == target_rfq:
+                    return draft
+
+        for draft in drafts:
+            if isinstance(draft, dict):
+                return draft
+        return None
 
     def _extract_rfq_id(self, text: str) -> Optional[str]:
         match = self.RFQ_PATTERN.search(text)
