@@ -86,15 +86,22 @@ class SESEmailWatcher:
         metadata_provider: Optional[Callable[[str], Dict[str, object]]] = None,
         message_loader: Optional[EmailLoader] = None,
         state_store: Optional[EmailWatcherState] = None,
+        enable_negotiation: bool = True,
     ) -> None:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.supplier_agent = supplier_agent or agent_nick.agents.get("supplier_interaction")
         if self.supplier_agent is None:
             self.supplier_agent = SupplierInteractionAgent(agent_nick)
-        self.negotiation_agent = negotiation_agent or agent_nick.agents.get("NegotiationAgent")
-        if self.negotiation_agent is None:
-            self.negotiation_agent = NegotiationAgent(agent_nick)
+        self.enable_negotiation = enable_negotiation
+        if enable_negotiation:
+            self.negotiation_agent = negotiation_agent or agent_nick.agents.get(
+                "NegotiationAgent"
+            )
+            if self.negotiation_agent is None:
+                self.negotiation_agent = NegotiationAgent(agent_nick)
+        else:
+            self.negotiation_agent = None
         self.metadata_provider = metadata_provider
         self.state_store = state_store or InMemoryEmailWatcherState()
         self._custom_loader = message_loader
@@ -228,7 +235,8 @@ class SESEmailWatcher:
         triggered = False
 
         if (
-            target_price is not None
+            self.enable_negotiation
+            and target_price is not None
             and interaction_output.status == AgentStatus.SUCCESS
             and "NegotiationAgent" in (interaction_output.next_agents or [])
             and self.negotiation_agent is not None
