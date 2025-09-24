@@ -756,6 +756,46 @@ class EmailDraftingAgent(BaseAgent):
 
         return trimmed
 
+    @staticmethod
+    def _coerce_action_id(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            candidate = value.strip()
+            return candidate or None
+        try:
+            candidate = str(value).strip()
+        except Exception:
+            return None
+        return candidate or None
+
+    def _action_belongs_to_email_agent(self, action_id: str) -> bool:
+        if not action_id:
+            return False
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return False
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT agent_type FROM proc.action WHERE action_id = %s",
+                        (action_id,),
+                    )
+                    row = cursor.fetchone()
+            if not row:
+                return False
+            agent_type = row[0]
+            if isinstance(agent_type, (bytes, bytearray)):
+                agent_type = agent_type.decode(errors="ignore")
+            agent_label = str(agent_type).strip().lower()
+            return agent_label == "emaildraftingagent".lower()
+        except Exception:  # pragma: no cover - defensive lookup
+            logger.debug(
+                "Failed to validate ownership for action %s", action_id, exc_info=True
+            )
+            return False
+
     def run(self, context: AgentContext) -> AgentOutput:
         """Draft RFQ emails for each ranked supplier without sending."""
         logger.info("EmailDraftingAgent starting")
@@ -775,7 +815,31 @@ class EmailDraftingAgent(BaseAgent):
         supplier_profiles = (
             data.get("supplier_profiles") if isinstance(data.get("supplier_profiles"), dict) else {}
         )
-        default_action_id = data.get("action_id")
+
+        validated_actions: Dict[str, bool] = {}
+
+        def _is_email_action(action_id: str) -> bool:
+            if action_id in validated_actions:
+                return validated_actions[action_id]
+            belongs = self._action_belongs_to_email_agent(action_id)
+            validated_actions[action_id] = belongs
+            return belongs
+
+        def _resolve_action_id(source: Optional[Dict[str, Any]]) -> Optional[str]:
+            if not isinstance(source, dict):
+                return None
+            for key in ("email_action_id", "draft_action_id", "action_id"):
+                candidate = self._coerce_action_id(source.get(key))
+                if not candidate:
+                    continue
+                if key == "action_id":
+                    if _is_email_action(candidate):
+                        return candidate
+                    continue
+                return candidate
+            return None
+
+        default_action_id = _resolve_action_id(data)
         drafts = []
 
         manual_recipients = self._normalise_recipients(data.get("recipients"))
@@ -969,7 +1033,7 @@ class EmailDraftingAgent(BaseAgent):
             else:
                 subject = f"{rfq_id} – Request for Quotation"
 
-            draft_action_id = supplier.get("action_id") or default_action_id
+            draft_action_id = _resolve_action_id(supplier) or default_action_id
 
             receiver = self._resolve_receiver(supplier, profile)
             recipients: List[str] = []

@@ -272,12 +272,41 @@ def test_email_drafting_includes_action_ids(monkeypatch):
     output = agent.run(context)
     assert output.status == AgentStatus.SUCCESS
     drafts = output.data["drafts"]
-    assert output.data["action_id"] == "email-action"
-    assert drafts[0]["action_id"] == "rank-1"
+    assert output.data.get("action_id") is None
+    assert drafts[0].get("action_id") is None
     assert drafts[0]["supplier_name"] == "Acme"
-    assert drafts[1]["action_id"] == "email-action"
+    assert drafts[1].get("action_id") is None
     assert drafts[1]["supplier_name"] == "Beta"
 
+    assert "action_id" not in output.pass_fields
+
+
+def test_email_drafting_reuses_valid_email_action_id(monkeypatch):
+    nick = DummyNick()
+    agent = EmailDraftingAgent(nick)
+    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+    monkeypatch.setattr(agent, "_action_belongs_to_email_agent", lambda _: True)
+
+    ranking = [
+        {"supplier_id": "S1", "supplier_name": "Acme"},
+        {"supplier_id": "S2", "supplier_name": "Beta"},
+    ]
+
+    context = AgentContext(
+        workflow_id="wf4",
+        agent_id="email_drafting",
+        user_id="u1",
+        input_data={
+            "ranking": ranking,
+            "action_id": "email-action",
+        },
+    )
+
+    output = agent.run(context)
+    drafts = output.data["drafts"]
+    assert output.data["action_id"] == "email-action"
+    assert drafts[0]["action_id"] == "email-action"
+    assert drafts[1]["action_id"] == "email-action"
     assert output.pass_fields["action_id"] == "email-action"
 
 
@@ -310,13 +339,13 @@ def test_email_drafting_creates_manual_draft_without_sending(monkeypatch):
     draft = drafts[0]
     assert draft["rfq_id"] == "RFQ-MANUAL"
     assert draft["sent_status"] is True
-    assert draft["action_id"] == "manual-action"
+    assert draft.get("action_id") is None
     assert draft["recipients"] == ["user@example.com", "team@example.com"]
     assert draft["receiver"] == "user@example.com"
     assert draft["contact_level"] == 1
     assert draft["thread_index"] == 1
     assert stored[0] == draft
     assert output.data["recipients"] == ["user@example.com", "team@example.com"]
-    assert output.data["action_id"] == "manual-action"
+    assert output.data.get("action_id") is None
     assert output.pass_fields["body"].startswith("<!-- RFQ-ID: RFQ-MANUAL -->")
 
