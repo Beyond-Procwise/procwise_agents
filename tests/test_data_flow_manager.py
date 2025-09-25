@@ -156,3 +156,17 @@ def test_data_flow_manager_builds_graph_and_persists():
         for point in entry["points"]
     }
     assert "supplier_flow" in payload_types
+
+    supplier_points = [
+        point
+        for entry in nick.qdrant_client.upserts
+        for point in entry["points"]
+        if point.payload.get("document_type") == "supplier_flow"
+    ]
+    assert supplier_points
+    for point in supplier_points:
+        summary = point.payload.get("summary")
+        assert isinstance(summary, str) and summary.strip()
+        mapping_summary = point.payload.get("mapping_summary")
+        assert isinstance(mapping_summary, list) and mapping_summary
+        assert any("proc." in statement for statement in mapping_summary)
