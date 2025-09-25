@@ -330,6 +330,16 @@ class SupplierInteractionAgent(BaseAgent):
         """Wait for an inbound supplier email and return the processed result."""
 
         deadline = time.time() + max(timeout, 0)
+
+        if (
+            watcher is None
+            and not getattr(self.agent_nick, "dispatch_service_started", False)
+        ):
+            logger.debug(
+                "Email watcher initialisation deferred until dispatch service starts."
+            )
+            return None
+
         active_watcher = watcher
         if active_watcher is None:
             try:
