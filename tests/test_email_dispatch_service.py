@@ -168,7 +168,10 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     )
 
     action_store = InMemoryActionStore()
-    action_store.update("action-1", json.dumps({"drafts": [draft_payload]}))
+    action_store.update(
+        "action-1",
+        json.dumps({"drafts": [draft_payload], "rfq_id": "RFQ-UNIT", "sent_status": False}),
+    )
 
     nick = DummyNick(store, action_store)
     service = EmailDispatchService(nick)
@@ -200,7 +203,8 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
     updated_action = json.loads(action_store.get("action-1"))
-    assert updated_action["drafts"][0]["sent_status"] is True
+    assert updated_action["drafts"][0]["sent_status"] == "True"
+    assert updated_action["sent_status"] == "True"
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
     assert sent_args["body"].startswith("<!-- RFQ-ID: RFQ-UNIT -->")

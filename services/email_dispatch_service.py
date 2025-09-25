@@ -349,16 +349,21 @@ class EmailDispatchService:
         """Update ``sent_status`` in ``data`` for drafts matching ``rfq_id``."""
 
         updated = False
+        desired_status = "True" if sent else "False"
 
         if isinstance(data, dict):
             updated |= EmailDispatchService._update_draft_collection(
                 data.get("drafts"), rfq_id, sent
             )
-            if data.get("rfq_id") == rfq_id and data.get("sent_status") != sent:
-                data["sent_status"] = sent
+            if data.get("rfq_id") == rfq_id:
+                current = EmailDispatchService._normalise_sent_status(
+                    data.get("sent_status")
+                )
+                if current != desired_status:
+                    data["sent_status"] = desired_status
+                    updated = True
                 if sent and "sent_on" not in data:
                     data["sent_on"] = datetime.utcnow().isoformat()
-                updated = True
         elif isinstance(data, list):
             for item in data:
                 updated |= EmailDispatchService._mark_sent_status(item, rfq_id, sent)
@@ -370,11 +375,30 @@ class EmailDispatchService:
         if not isinstance(value, list):
             return False
         updated = False
+        desired_status = "True" if sent else "False"
         for draft in value:
             if isinstance(draft, dict) and draft.get("rfq_id") == rfq_id:
-                if draft.get("sent_status") != sent:
-                    draft["sent_status"] = sent
+                current = EmailDispatchService._normalise_sent_status(
+                    draft.get("sent_status")
+                )
+                if current != desired_status:
+                    draft["sent_status"] = desired_status
                     updated = True
                 if sent and "sent_on" not in draft:
                     draft["sent_on"] = datetime.utcnow().isoformat()
         return updated
+
+    @staticmethod
+    def _normalise_sent_status(value: Any) -> Optional[str]:
+        """Coerce ``value`` to a canonical string representation."""
+
+        if isinstance(value, bool):
+            return "True" if value else "False"
+        if isinstance(value, str):
+            stripped = value.strip()
+            lower = stripped.lower()
+            if lower == "true":
+                return "True"
+            if lower == "false":
+                return "False"
+        return None

@@ -25,7 +25,6 @@ from agents.email_drafting_agent import EmailDraftingAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
-from services.email_watcher import SESEmailWatcher
 from api.routers import workflows, system, run
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -73,11 +72,6 @@ async def lifespan(app: FastAPI):
                 "ApprovalsAgent": "approvals",
                 "SupplierInteractionAgent": "supplier_interaction",
             }
-        )
-        agent_nick.email_watcher = SESEmailWatcher(
-            agent_nick,
-            supplier_agent=agent_nick.agents.get('supplier_interaction'),
-            negotiation_agent=agent_nick.agents.get('NegotiationAgent'),
         )
         app.state.agent_nick = agent_nick
         app.state.orchestrator = Orchestrator(agent_nick)
