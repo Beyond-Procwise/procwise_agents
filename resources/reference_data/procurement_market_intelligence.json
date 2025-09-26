@@ -1,0 +1,23 @@
+[
+  {
+    "id": "market_trends_2024",
+    "title": "2024 Global Procurement Trends",
+    "summary": "Global procurement teams are prioritising dual sourcing strategies for semiconductors, industrial electronics, and renewable energy components to mitigate geopolitical risk.",
+    "source": "Procurement Strategy Council",
+    "region": "global"
+  },
+  {
+    "id": "supply_chain_resilience",
+    "title": "Supplier Risk Signals",
+    "summary": "Specialty chemical suppliers are extending average lead times by 12-15% because of feedstock shortages. Buyers are negotiating safety stock clauses and quarterly price indexation to protect margins.",
+    "source": "Supply Chain Insights Quarterly",
+    "region": "emea"
+  },
+  {
+    "id": "sustainable_procurement",
+    "title": "Sustainable Procurement Benchmarks",
+    "summary": "Top quartile procurement organisations now require Science Based Targets initiative disclosures in RFQs for logistics, packaging, and facilities partners to validate carbon reduction commitments.",
+    "source": "Sustainable Purchasing Index",
+    "region": "global"
+  }
+]

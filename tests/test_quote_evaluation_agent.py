@@ -24,7 +24,7 @@ from api.routers.workflows import router
 class DummyNick:
     def __init__(self):
         self.settings = SimpleNamespace(
-            extraction_model="llama3",
+            extraction_model="gpt-oss",
             script_user="tester",
             qdrant_collection_name="dummy",
         )

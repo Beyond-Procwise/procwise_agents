@@ -93,7 +93,7 @@ def test_json_flow_injects_proc_agent_prompts_and_policies():
         def __init__(self):
             self._agent_defaults_cache = {
                 "opportunity_miner": {
-                    "llm": "llama3",
+                    "llm": "gpt-oss",
                     "prompts": [50],
                     "policies": [9],
                 }
@@ -136,7 +136,7 @@ def test_json_flow_injects_proc_agent_prompts_and_policies():
     input_data = captured.get("input", {})
     prompts = input_data.get("prompts") or []
     policies = input_data.get("policies") or []
-    assert input_data.get("llm") == "llama3"
+    assert input_data.get("llm") == "gpt-oss"
     assert any(p.get("promptId") == 50 for p in prompts)
     assert any(p.get("policyId") == 9 for p in policies)
 
@@ -466,7 +466,7 @@ def test_inject_agent_instructions_uses_agent_defaults():
         def __init__(self):
             self._agent_defaults_cache = {
                 "opportunity_miner": {
-                    "llm": "llama3",
+                    "llm": "gpt-oss",
                     "prompts": [50],
                     "policies": [9],
                     "conditions": {"negotiation_window_days": 45},
@@ -499,7 +499,7 @@ def test_inject_agent_instructions_uses_agent_defaults():
     payload = {"conditions": {"existing": True}}
     orchestrator._inject_agent_instructions("opportunity_miner", payload)
 
-    assert payload["llm"] == "llama3"
+    assert payload["llm"] == "gpt-oss"
     assert payload["conditions"]["negotiation_window_days"] == 45
     assert payload["conditions"]["existing"] is True
     assert any(p.get("promptId") == 50 for p in payload["prompts"])

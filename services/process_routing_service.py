@@ -22,7 +22,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 class ProcessRoutingService:
     """Service to log agent processing state into proc.routing table."""
 
-    DEFAULT_LLM_MODEL = "llama3.2"
+    DEFAULT_LLM_MODEL = "gpt-oss"
 
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick

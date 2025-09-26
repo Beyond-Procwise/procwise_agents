@@ -18,7 +18,7 @@ class DummyNick:
         self.settings = SimpleNamespace(
             ses_default_sender="sender@example.com",
             qdrant_collection_name="dummy",
-            extraction_model="llama3",
+            extraction_model="gpt-oss",
             script_user="tester",
             email_response_poll_seconds=60,
         )

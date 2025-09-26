@@ -20,6 +20,7 @@ from utils.db import read_sql_compat
 from utils.gpu import configure_gpu
 import services.data_flow_manager as data_flow_module
 import services.rag_service as rag_module
+import services.procurement_knowledge_service as procurement_knowledge_module
 import services.supplier_relationship_service as supplier_rel_module
 
 logger = logging.getLogger(__name__)
@@ -677,6 +678,12 @@ class QueryEngine(BaseEngine):
         """Embed procurement tables, flows and knowledge graph for agent training."""
 
         rag = rag_module.RAGService(self.agent_nick)
+        knowledge_service = procurement_knowledge_module.ProcurementKnowledgeService(
+            self.agent_nick
+        )
+        external_briefs = knowledge_service.load_briefs()
+        if external_briefs:
+            knowledge_service.embed_briefs(external_briefs)
         schema_descriptions: list[str] = []
         tables: dict[str, pd.DataFrame] = {}
         table_name_map: dict[str, str] = {}

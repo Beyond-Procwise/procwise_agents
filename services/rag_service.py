@@ -33,7 +33,11 @@ class RAGService:
         if cross_encoder_cls is None:
             from sentence_transformers import CrossEncoder
             cross_encoder_cls = CrossEncoder
-        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        model_name = getattr(
+            self.settings,
+            "reranker_model",
+            "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        )
         self._reranker = cross_encoder_cls(model_name, device=self.agent_nick.device)
 
     # ------------------------------------------------------------------
@@ -44,6 +48,10 @@ class RAGService:
         cleaned = " ".join(text.split())
         if not cleaned:
             return []
+        configured_max = getattr(self.settings, "rag_chunk_chars", max_chars)
+        configured_overlap = getattr(self.settings, "rag_chunk_overlap", overlap)
+        max_chars = max(configured_max, 200)
+        overlap = max(0, min(configured_overlap, max_chars - 1))
         step = max_chars - overlap if max_chars > overlap else max_chars
         return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
 
