@@ -178,3 +178,40 @@ def test_email_watcher_matches_uppercase_rfq_identifier():
     assert results[0]["supplier_id"] == "SUP-4"
     # Supplier agent should have been invoked once with the parsed RFQ ID
     assert supplier_agent.contexts[0].input_data["rfq_id"] == "RFQ-20240101-ABCD1234"
+
+
+def test_email_watcher_extracts_rfq_from_html_comment():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+    html_body = """
+        <html>
+            <body>
+                <!-- RFQ-ID: RFQ-20240202-a1b2c3d4 -->
+                <p>Supplier quotation attached.</p>
+            </body>
+        </html>
+    """
+    messages = [
+        {
+            "id": "msg-5",
+            "subject": "Re: Request for Quotation",
+            "body": html_body,
+            "from": "supplier@example.com",
+        }
+    ]
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {"supplier_id": "SUP-5", "target_price": 1500},
+        message_loader=lambda limit=None: messages,
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    assert results[0]["rfq_id"] == "RFQ-20240202-a1b2c3d4"
+    assert supplier_agent.contexts[0].input_data["rfq_id"] == "RFQ-20240202-a1b2c3d4"
