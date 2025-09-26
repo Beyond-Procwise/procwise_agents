@@ -44,6 +44,7 @@ from utils.nlp import extract_entities
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
+from utils.procurement_schema import extract_structured_content
 
 logger = logging.getLogger(__name__)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -443,7 +444,24 @@ class DataExtractionAgent(BaseAgent):
             s3_object_key = context.input_data.get("s3_object_key")
             data = self._process_documents(s3_prefix, s3_object_key)
             docs = data.get("details", [])
-            discrepancy_result = self._run_discrepancy_detection(docs, context)
+            processing_issues = [
+                {
+                    "doc_type": doc.get("doc_type", "Unknown"),
+                    "record_id": doc.get("invoice_id")
+                    or doc.get("po_id")
+                    or doc.get("id")
+                    or doc.get("object_key"),
+                    "reason": "; ".join(doc.get("issues", [])) or "document not converted",
+                }
+                for doc in docs
+                if doc.get("status") in {"error", "failed"}
+            ]
+            if processing_issues:
+                discrepancy_result = self._run_discrepancy_detection(
+                    docs, context, processing_issues
+                )
+            else:
+                discrepancy_result = self._run_discrepancy_detection(docs, context)
 
             if discrepancy_result.status != AgentStatus.SUCCESS:
                 err = discrepancy_result.error or "discrepancy detection failed"
@@ -458,7 +476,8 @@ class DataExtractionAgent(BaseAgent):
             data["summary"] = {
                 "documents_provided": len(docs),
                 "documents_valid": len(docs) - len(mismatches),
-                "documents_with_discrepancies": len(mismatches),
+                "documents_with_discrepancies": len(mismatches)
+                + len(processing_issues),
             }
             if mismatches:
                 data["mismatches"] = mismatches
@@ -468,7 +487,12 @@ class DataExtractionAgent(BaseAgent):
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
 
-    def _run_discrepancy_detection(self, docs: List[Dict[str, Any]], context: AgentContext) -> AgentOutput:
+    def _run_discrepancy_detection(
+        self,
+        docs: List[Dict[str, Any]],
+        context: AgentContext,
+        processing_issues: List[Dict[str, str]] | None = None,
+    ) -> AgentOutput:
         if not docs:
             return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": []})
         disc_agent = DiscrepancyDetectionAgent(self.agent_nick)
@@ -476,7 +500,10 @@ class DataExtractionAgent(BaseAgent):
             workflow_id=context.workflow_id,
             agent_id="discrepancy_detection",
             user_id=context.user_id,
-            input_data={"extracted_docs": docs},
+            input_data={
+                "extracted_docs": docs,
+                "processing_issues": processing_issues or [],
+            },
             parent_agent=context.agent_id,
             routing_history=context.routing_history.copy(),
         )
@@ -1147,16 +1174,21 @@ class DataExtractionAgent(BaseAgent):
         return header
 
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        # seed via lightweight JSONifier
+        # Step 1: schema-aware extraction seeded from procurement reference
+        structured = extract_structured_content(text, doc_type)
+        header_seed = self._normalize_header_fields(structured.get("header", {}), doc_type)
+        line_items_seed = self._normalize_line_item_fields(structured.get("line_items", []), doc_type)
+
+        # Step 2: lightweight JSONifier to catch explicit key:value pairs
         data = convert_document_to_json(text, doc_type)
-        header_seed = self._normalize_header_fields(data.get("header_data", {}), doc_type)
-        # NEW: layout-first header (conf map inside)
+        header_seed.update(self._normalize_header_fields(data.get("header_data", {}), doc_type))
+
+        # Step 3: layout-driven extraction for headers and line items
         header_layout = self._parse_header(text, file_bytes)
         header = {**header_layout, **header_seed}
-        # Lines: layout-based
-        line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+        line_items = line_items_seed or self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
 
-        # LLM strict fill for missing
+        # Step 4: LLM strict fill for any remaining gaps
         header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
         header = self._sanitize_party_names(header)
         if doc_type == "Contract":
