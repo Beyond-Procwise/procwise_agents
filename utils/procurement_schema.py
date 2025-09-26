@@ -122,6 +122,7 @@ PROCUREMENT_SCHEMAS: Dict[str, TableSchema] = {
             "delivery_date": ["delivery", "ship date"],
             "country": ["country"],
             "region": ["region"],
+
         },
     ),
     "proc.purchase_order_agent": TableSchema(
@@ -187,6 +188,7 @@ PROCUREMENT_SCHEMAS: Dict[str, TableSchema] = {
             "exchange_rate_to_usd": ["exchange rate", "fx rate"],
             "converted_amount_usd": ["amount usd", "usd total"],
             "contract_id": ["contract", "contract number"],
+
         },
     ),
     "proc.po_line_items_agent": TableSchema(
@@ -358,6 +360,7 @@ PROCUREMENT_SCHEMAS: Dict[str, TableSchema] = {
             "contract_signatory_role": ["signatory role", "title"],
             "payment_terms": ["payment terms", "terms"],
             "risk_assessment_completed": ["risk assessment", "risk completed"],
+
         },
     ),
 }
@@ -379,6 +382,7 @@ DOC_TYPE_TO_TABLE = {
         "proc.contracts",
         None,
     ),
+
 }
 
 _KEY_VALUE_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 \-/]{2,40})\s*[:\-]\s*(.+)$")
@@ -465,6 +469,7 @@ def _extract_key_value_pairs(text: str) -> Dict[str, str]:
         else:
             key = match.group(1).strip()
             value = match.group(2).strip()
+
         if key and value:
             pairs.setdefault(_normalise(key), value)
     return pairs
