@@ -204,6 +204,7 @@ class SESEmailWatcher:
         self._sqs_client = None
         self._assumed_credentials: Optional[Dict[str, str]] = None
         self._assumed_credentials_expiry: Optional[datetime] = None
+        self._last_s3_poll: Dict[str, Optional[datetime]] = {}
 
         logger.info(
             "Initialised email watcher for mailbox %s (bucket=%s, prefixes=%s, queue=%s, poll_interval=%ss)",
@@ -838,6 +839,8 @@ class SESEmailWatcher:
 
         for prefix in self._prefixes:
             iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            last_seen = self._last_s3_poll.get(prefix)
+            newest_seen: Optional[datetime] = last_seen
             for page in iterator:
                 contents = page.get("Contents", [])
                 contents.sort(key=lambda item: item.get("LastModified"))
@@ -847,24 +850,36 @@ class SESEmailWatcher:
                         continue
                     if self.state_store and key in self.state_store:
                         continue
+                    last_modified = obj.get("LastModified")
+                    if last_seen and last_modified and last_modified <= last_seen:
+                        continue
                     raw = self._download_object(client, key, bucket=self.bucket)
                     if raw is None:
                         continue
                     parsed = self._parse_email(raw)
                     parsed["id"] = key
-                    collected.append((obj.get("LastModified"), parsed))
+                    collected.append((last_modified, parsed))
                     seen_keys.add(key)
                     logger.debug(
                         "Queued message %s for processing from mailbox %s",
                         key,
                         self.mailbox_address,
                     )
+                    if last_modified and (
+                        newest_seen is None or last_modified > newest_seen
+                    ):
+                        newest_seen = last_modified
                     if limit is not None and len(collected) >= limit:
                         break
                 if limit is not None and len(collected) >= limit:
                     break
             if limit is not None and len(collected) >= limit:
                 break
+
+            if newest_seen:
+                previous = self._last_s3_poll.get(prefix)
+                if not previous or newest_seen > previous:
+                    self._last_s3_poll[prefix] = newest_seen
 
         collected.sort(key=lambda item: item[0] or datetime.min)
         messages = [payload for _, payload in collected]
@@ -932,6 +947,16 @@ class SESEmailWatcher:
                 return []
 
             raw_ids = data[0].split() if data else []
+            if not raw_ids and search_criteria.upper() != "ALL":
+                logger.debug(
+                    "IMAP search for %s returned no results with criteria %s; retrying with ALL",
+                    self.mailbox_address,
+                    search_criteria,
+                )
+                status, data = client.search(None, "ALL")
+                if status == "OK":
+                    raw_ids = data[0].split() if data else []
+
             if not raw_ids:
                 return []
 
@@ -1075,6 +1100,7 @@ class SESEmailWatcher:
         recipients = message.get_all("to", [])
         body = self._extract_body(message)
         rfq_id = self._extract_rfq_id(f"{subject} {body}")
+        attachments = self._extract_attachments(message)
         return {
             "subject": subject,
             "from": from_address,
@@ -1083,6 +1109,7 @@ class SESEmailWatcher:
             "received_at": message.get("date"),
             "message_id": message.get("message-id"),
             "recipients": recipients,
+            "attachments": attachments,
         }
 
     def _extract_body(self, message) -> str:
@@ -1108,6 +1135,30 @@ class SESEmailWatcher:
         except Exception:
             payload = message.get_payload(decode=True) or b""
             return payload.decode(errors="ignore")
+
+    def _extract_attachments(self, message) -> List[Dict[str, object]]:
+        attachments: List[Dict[str, object]] = []
+        for part in message.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            disposition = part.get_content_disposition()
+            if disposition not in ("attachment", "inline"):
+                continue
+            filename = part.get_filename()
+            try:
+                payload = part.get_payload(decode=True) or b""
+            except Exception:
+                payload = b""
+            attachments.append(
+                {
+                    "filename": filename,
+                    "content_type": part.get_content_type(),
+                    "content": payload,
+                    "size": len(payload),
+                    "disposition": disposition,
+                }
+            )
+        return attachments
 
     def _extract_rfq_id(self, text: str) -> Optional[str]:
         pattern = getattr(self.supplier_agent, "RFQ_PATTERN", SupplierInteractionAgent.RFQ_PATTERN)

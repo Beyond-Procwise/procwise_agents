@@ -1,6 +1,7 @@
 """Data flow management and knowledge graph persistence for ProcWise agents."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import pandas as pd
 from qdrant_client import models
 
 from utils.gpu import configure_gpu
+from services.event_bus import get_event_bus, get_current_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +349,7 @@ class DataFlowManager:
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         self._collection_ready: bool = False
         self._cached_vector_size: Optional[int] = None
+        self._event_bus = get_event_bus()
 
     # ------------------------------------------------------------------
     # Public API
@@ -384,6 +387,45 @@ class DataFlowManager:
         return relations_dicts, graph
 
     def persist_knowledge_graph(
+        self,
+        relations: Iterable[Dict[str, Any]],
+        graph: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist relations either immediately or after workflow completion."""
+
+        relations_list = list(relations)
+        if not relations_list:
+            logger.debug("Skipping knowledge graph persistence; no relations provided")
+            return
+
+        workflow_ctx = get_current_workflow()
+        workflow_id = (workflow_ctx or {}).get("workflow_id")
+        if workflow_id:
+            relations_payload = [dict(relation) for relation in relations_list]
+            graph_payload = copy.deepcopy(graph) if graph is not None else None
+
+            def _deferred(event: Dict[str, Any]) -> None:
+                if event.get("workflow_id") != workflow_id:
+                    return
+                self._event_bus.unsubscribe("workflow.complete", _deferred)
+                logger.info(
+                    "Persisting knowledge graph for workflow %s after completion (%d relations)",
+                    workflow_id,
+                    len(relations_payload),
+                )
+                self._persist_knowledge_graph_now(relations_payload, graph_payload)
+
+            self._event_bus.subscribe("workflow.complete", _deferred)
+            logger.debug(
+                "Deferred knowledge graph persistence for workflow %s with %d relation(s)",
+                workflow_id,
+                len(relations_payload),
+            )
+            return
+
+        self._persist_knowledge_graph_now(relations_list, graph)
+
+    def _persist_knowledge_graph_now(
         self,
         relations: Iterable[Dict[str, Any]],
         graph: Optional[Dict[str, Any]] = None,

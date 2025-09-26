@@ -21,6 +21,7 @@ from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from services.process_routing_service import ProcessRoutingService
 from services.backend_scheduler import BackendScheduler
+from services.event_bus import get_event_bus, workflow_scope
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class Orchestrator:
         self.routing_model = self.routing_engine.routing_model
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
         self.backend_scheduler = BackendScheduler.ensure(agent_nick)
+        self.event_bus = get_event_bus()
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
 
@@ -149,7 +151,10 @@ class Orchestrator:
                 input_data=enriched_input,
             )
 
-            training_service = self._get_model_training_service()
+            # Ensure the model training service is initialised so it can
+            # subscribe to workflow events even if no immediate action is
+            # required during execution.
+            _ = self._get_model_training_service()
 
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
@@ -171,13 +176,13 @@ class Orchestrator:
             else:
                 result = self._execute_generic_workflow(workflow_name, context)
 
-            if training_service is not None:
-                try:
-                    training_service.record_workflow_outcome(
-                        workflow_name, workflow_id, result
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception("Failed to record workflow outcome for training")
+            self._publish_workflow_complete(
+                workflow_name=workflow_name,
+                workflow_id=workflow_id,
+                context=context,
+                result=result,
+                status="completed",
+            )
 
             return {
                 "status": "completed",
@@ -188,6 +193,13 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Workflow {workflow_id} failed: {e}")
+            self._publish_workflow_complete(
+                workflow_name=workflow_name,
+                workflow_id=workflow_id,
+                context=context,
+                result={"error": str(e)},
+                status="failed",
+            )
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
     @staticmethod
@@ -1584,7 +1596,39 @@ class Orchestrator:
             return None
 
         self._inject_agent_instructions(agent_name, context.input_data)
-        return agent.execute(context)
+        workflow_name = context.input_data.get("workflow")
+        with workflow_scope(
+            workflow_id=context.workflow_id,
+            workflow_name=workflow_name,
+            agent_name=agent_name,
+            metadata={"agent_context": context.input_data},
+        ):
+            return agent.execute(context)
+
+    def _publish_workflow_complete(
+        self,
+        *,
+        workflow_name: str,
+        workflow_id: str,
+        context: AgentContext,
+        result: Any,
+        status: str,
+    ) -> None:
+        """Publish a workflow completion event to downstream services."""
+
+        try:
+            payload = {
+                "workflow_name": workflow_name,
+                "workflow_id": workflow_id,
+                "status": status,
+                "result": result,
+                "input_data": context.input_data,
+                "routing_history": list(context.routing_history),
+                "user_id": context.user_id,
+            }
+            self.event_bus.publish("workflow.complete", payload)
+        except Exception:  # pragma: no cover - defensive publication
+            logger.exception("Failed to publish workflow.complete event for %s", workflow_id)
 
     def _execute_parallel_agents(
         self, agents: List[str], context: AgentContext, pass_fields: Dict

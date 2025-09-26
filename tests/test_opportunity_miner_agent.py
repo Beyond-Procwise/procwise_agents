@@ -1003,11 +1003,12 @@ def test_policy_category_limits_caps_results():
 
     assert "PolicyA" in category_map
     categories = category_map["PolicyA"]
-    assert set(categories.keys()) == {"CatA", "CatB"}
-    assert len(categories["CatA"]) == 2
+    assert set(categories.keys()) == {"all", "CatA", "CatB"}
+    assert [f.opportunity_id for f in categories["all"]] == ["b1", "a1"]
+    assert len(categories["CatA"]) == 3
     assert len(categories["CatB"]) == 1
     aggregated_ids = {finding.opportunity_id for finding in aggregated}
-    assert aggregated_ids == {"a1", "a2", "b1"}
+    assert aggregated_ids == {"a1", "b1"}
     retained_ids = {finding.opportunity_id for finding in per_policy["PolicyA"]}
     assert retained_ids == aggregated_ids
 

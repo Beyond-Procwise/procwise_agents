@@ -5,6 +5,9 @@ import logging
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from services.event_bus import get_event_bus
+from models.supplier_ranking_trainer import SupplierRankingTrainer
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +29,10 @@ class ModelTrainingService:
             except Exception:
                 logger.exception("Failed to initialise PolicyEngine for model training")
                 self.policy_engine = None
+        self._event_bus = get_event_bus()
+        self._subscription_registered = False
+        self._supplier_trainer = SupplierRankingTrainer()
+        self._subscribe_to_events()
 
     # ------------------------------------------------------------------
     # Database utilities
@@ -54,6 +61,57 @@ class ModelTrainingService:
                 conn.commit()
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to ensure agent training queue table")
+
+    def _ensure_supplier_model_table(self) -> None:
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE SCHEMA IF NOT EXISTS proc")
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.supplier_ranking_model (
+                            model_id BIGSERIAL PRIMARY KEY,
+                            workflow_id TEXT,
+                            metrics TEXT[],
+                            label_column TEXT,
+                            policy_weights JSONB,
+                            learned_weights JSONB,
+                            trained_on TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to ensure supplier ranking model table")
+
+    # ------------------------------------------------------------------
+    # Event handling
+    # ------------------------------------------------------------------
+    def _subscribe_to_events(self) -> None:
+        if self._subscription_registered:
+            return
+        try:
+            self._event_bus.subscribe("workflow.complete", self._handle_workflow_complete)
+            self._subscription_registered = True
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to subscribe to workflow completion events")
+
+    def _handle_workflow_complete(self, event: Dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        if event.get("status") != "completed":
+            return
+        workflow_id = event.get("workflow_id")
+        if not workflow_id:
+            return
+        result = event.get("result")
+        if not isinstance(result, dict):
+            return
+        workflow_name = event.get("workflow_name") or ""
+        try:
+            self.record_workflow_outcome(workflow_name, workflow_id, result)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to handle workflow completion for training queue")
 
     # ------------------------------------------------------------------
     # Scheduling helpers
@@ -163,6 +221,22 @@ class ModelTrainingService:
     ) -> None:
         if not isinstance(result, dict):
             return
+
+        if workflow_name == "supplier_ranking":
+            snapshot = result.get("training_snapshot")
+            if isinstance(snapshot, dict) and snapshot.get("rows"):
+                payload = {
+                    "workflow_id": workflow_id,
+                    "workflow_name": workflow_name,
+                    "training_snapshot": snapshot,
+                }
+                self.enqueue_training_job(
+                    workflow_id=workflow_id,
+                    agent_slug="supplier_ranking",
+                    policy_id=None,
+                    payload=payload,
+                )
+
         opportunities = result.get("opportunities")
         if not isinstance(opportunities, dict):
             return
@@ -207,6 +281,42 @@ class ModelTrainingService:
             logger.debug("Unable to decode training payload: %s", payload)
             return {"raw": str(payload)}
 
+    def _persist_supplier_model(
+        self,
+        workflow_id: Optional[str],
+        metrics: List[Any],
+        label_column: str,
+        policy_weights: Dict[str, Any],
+        learned_weights: Dict[str, float],
+    ) -> None:
+        self._ensure_supplier_model_table()
+        try:
+            serialised_policy = json.dumps(policy_weights or {}, default=str)
+            serialised_learned = json.dumps(learned_weights or {}, default=float)
+        except TypeError:
+            serialised_policy = json.dumps({"policy_weights": str(policy_weights)})
+            serialised_learned = json.dumps({"learned_weights": str(learned_weights)})
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proc.supplier_ranking_model
+                            (workflow_id, metrics, label_column, policy_weights, learned_weights)
+                        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
+                        """,
+                        (
+                            workflow_id,
+                            list(metrics),
+                            label_column,
+                            serialised_policy,
+                            serialised_learned,
+                        ),
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to persist supplier ranking model weights")
+
     def _run_training_job(self, job: Dict[str, Any]) -> None:
         agent_slug = job.get("agent_slug")
         payload = job.get("payload") or {}
@@ -223,6 +333,25 @@ class ModelTrainingService:
                 query_engine.train_procurement_context()
             else:
                 logger.info("No query engine available for opportunity miner training")
+        elif agent_slug == "supplier_ranking":
+            snapshot = payload.get("training_snapshot") or {}
+            metrics = snapshot.get("metrics") or []
+            rows = snapshot.get("rows") or []
+            label_column = snapshot.get("label_column") or self._supplier_trainer.config.label_column
+            learned = self._supplier_trainer.train_from_records(rows, metrics, label_column)
+            if learned:
+                policy_weights = snapshot.get("policy_weights") or {}
+                self._persist_supplier_model(
+                    job.get("workflow_id"), metrics, label_column, policy_weights, learned
+                )
+                logger.info(
+                    "Supplier ranking model trained with metrics: %s",
+                    ", ".join(sorted(learned.keys())),
+                )
+            else:
+                logger.info(
+                    "Supplier ranking training skipped due to insufficient labelled samples"
+                )
         else:
             logger.info("No training routine configured for agent '%s'", agent_slug)
         logger.debug("Training payload: %s", payload)

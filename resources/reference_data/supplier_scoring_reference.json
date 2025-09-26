@@ -1,0 +1,29 @@
+{
+  "payment_terms_days": {
+    "immediate": 0.0,
+    "dueonreceipt": 0.0,
+    "uponreceipt": 0.0,
+    "cod": 0.0,
+    "cashondelivery": 0.0,
+    "net15": 15.0,
+    "net30": 30.0,
+    "net45": 45.0,
+    "net60": 60.0,
+    "net90": 90.0,
+    "net120": 120.0
+  },
+  "risk_levels": {
+    "low": 0.2,
+    "medium": 0.5,
+    "high": 0.8,
+    "critical": 1.0
+  },
+  "training": {
+    "label_column": "is_preferred_supplier",
+    "learning_rate": 0.05,
+    "epochs": 400,
+    "tolerance": 1e-05,
+    "min_samples": 6,
+    "blend_ratio": 0.5
+  }
+}

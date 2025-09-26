@@ -21,6 +21,8 @@ import pandas as pd
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 from utils.db import read_sql_compat
+from utils.reference_loader import load_reference_dataset
+from models.supplier_ranking_trainer import SupplierRankingTrainer
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 # Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
@@ -52,6 +54,8 @@ class SupplierRankingAgent(BaseAgent):
         self._device = configure_gpu()
         self._supplier_alias_map: Dict[str, str] = {}
         self._supplier_lookup: Dict[str, Optional[str]] = {}
+        self._scoring_reference = load_reference_dataset("supplier_scoring_reference")
+        self._trainer = SupplierRankingTrainer()
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -194,6 +198,46 @@ class SupplierRankingAgent(BaseAgent):
                 pass
             return [token.strip() for token in re.split(r"[,;]", text) if token.strip()]
         return [str(value).strip()]
+
+    def _payment_terms_to_days(self, series: Any) -> pd.Series:
+        if series is None:
+            return pd.Series(dtype="float64")
+        if isinstance(series, pd.Series):
+            values = series
+        else:
+            try:
+                values = pd.Series(series)
+            except Exception:
+                return pd.Series(dtype="float64")
+        reference_mapping = {}
+        if isinstance(self._scoring_reference, dict):
+            reference_mapping = self._scoring_reference.get("payment_terms_days", {}) or {}
+        mapping = {
+            str(key).lower(): float(value)
+            for key, value in reference_mapping.items()
+            if value is not None
+        }
+        days: List[Optional[float]] = []
+        for value in values:
+            if pd.isna(value):
+                days.append(None)
+                continue
+            if isinstance(value, (int, float)):
+                days.append(float(value))
+                continue
+            text = str(value).strip()
+            if not text:
+                days.append(None)
+                continue
+            lower = text.lower()
+            normalized = re.sub(r"[^a-z0-9]", "", lower)
+            mapped = mapping.get(normalized)
+            if mapped is None:
+                match = re.search(r"(\d+)", lower)
+                if match:
+                    mapped = float(match.group(1))
+            days.append(mapped)
+        return pd.Series(days, index=values.index, dtype="float64")
 
     def _coerce_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
         entry = dict(policy)
@@ -401,6 +445,13 @@ class SupplierRankingAgent(BaseAgent):
         df = self._merge_supplier_metrics(df, tables)
         profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
 
+        flow_payload = context.input_data.get("data_flow_snapshot")
+        if not isinstance(flow_payload, dict):
+            flow_payload = context.input_data
+        flow_index, flow_name_index = self._build_flow_index(flow_payload)
+        alias_tokens_map = self._alias_tokens_by_supplier()
+        df = self._annotate_flow_coverage(df, flow_index, flow_name_index, alias_tokens_map)
+
         intent = context.input_data.get("intent", {})
         requested = intent.get("parameters", {}).get("criteria", [])
         criteria_override = (
@@ -455,15 +506,13 @@ class SupplierRankingAgent(BaseAgent):
         direction_map = self._extract_policy_rules(norm_policy)
         scored_df = self._normalize_numeric_scores(scored_df, direction_map)
 
-        flow_payload = context.input_data.get("data_flow_snapshot")
-        if not isinstance(flow_payload, dict):
-            flow_payload = context.input_data
-        flow_index, flow_name_index = self._build_flow_index(flow_payload)
-        alias_tokens_map = self._alias_tokens_by_supplier()
-
         normalised_weights = self._normalise_weight_map(scored_df, weights)
         if normalised_weights:
             weights = normalised_weights
+
+        learned_weights = self._trainer.train(scored_df, weights.keys())
+        if learned_weights:
+            weights = self._trainer.blend_with_policy(weights, learned_weights)
 
         scored_df["final_score"] = 0.0
         for crit, weight in weights.items():
@@ -527,17 +576,25 @@ class SupplierRankingAgent(BaseAgent):
             "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)
         )
 
+        training_snapshot = self._trainer.build_training_snapshot(
+            scored_df, list(weights.keys()), weights
+        )
+
         output_data = {
             "ranking": ranking,
             "supplier_profiles": profiles,
             "rank_count": total_rankings,
         }
+        if training_snapshot:
+            output_data["training_snapshot"] = training_snapshot
         pass_fields = {
             "ranking": ranking,
             "supplier_profiles": profiles,
         }
         if total_rankings:
             pass_fields["rank_count"] = total_rankings
+        if training_snapshot:
+            pass_fields["training_snapshot"] = training_snapshot
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=output_data,
@@ -799,6 +856,8 @@ class SupplierRankingAgent(BaseAgent):
             "total_volume",
             "avg_lead_time_days",
             "total_spend",
+            "avg_payment_term_days",
+            "avg_paid_days",
         ]:
             if column in result.columns:
                 result[column] = pd.to_numeric(result[column], errors="coerce")
@@ -921,10 +980,20 @@ class SupplierRankingAgent(BaseAgent):
             df[total_col] = 0.0
         if "invoice_date" in df.columns:
             df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
+        if "due_date" in df.columns:
+            df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
+            df["term_days"] = (df["due_date"] - df.get("invoice_date")).dt.days
+        if "invoice_paid_date" in df.columns:
+            df["invoice_paid_date"] = pd.to_datetime(
+                df["invoice_paid_date"], errors="coerce"
+            )
+            df["paid_days"] = (df["invoice_paid_date"] - df.get("invoice_date")).dt.days
         agg = df.groupby("supplier_id").agg(
             invoice_total_value=(total_col, "sum"),
             invoice_count=("invoice_id", "nunique"),
             last_invoice_date=("invoice_date", "max"),
+            avg_payment_term_days=("term_days", "mean"),
+            avg_paid_days=("paid_days", "mean"),
         )
         return agg.reset_index()
 
@@ -1025,35 +1094,93 @@ class SupplierRankingAgent(BaseAgent):
     def _prepare_scoring_columns(self, df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame:
         result = df.copy()
         if "price" in weights:
-            if "price" not in result.columns:
-                price_series = result.get("avg_unit_price")
-                result["price"] = (
-                    pd.to_numeric(price_series, errors="coerce") if price_series is not None else 0.0
-                )
-            else:
-                result["price"] = pd.to_numeric(result["price"], errors="coerce")
+            price_series = None
+            if "price" in result.columns:
+                price_series = pd.to_numeric(result["price"], errors="coerce")
+            for column in (
+                "avg_unit_price",
+                "unit_price",
+                "po_line_spend",
+                "invoice_total_value",
+                "total_spend",
+            ):
+                if price_series is not None and not price_series.isna().all():
+                    break
+                if column in result.columns:
+                    candidate = pd.to_numeric(result[column], errors="coerce")
+                    if not candidate.isna().all():
+                        price_series = candidate
+                        break
+            if price_series is None:
+                price_series = pd.Series(0.0, index=result.index, dtype="float64")
+            result["price"] = price_series.fillna(0.0)
+
         if "delivery" in weights:
-            if "delivery" not in result.columns:
-                delivery_source = result.get("avg_lead_time_days")
-                delivery_numeric = (
-                    pd.to_numeric(delivery_source, errors="coerce")
-                    if delivery_source is not None
-                    else pd.Series(0, index=result.index)
-                )
+            delivery_series = None
+            if "delivery" in result.columns:
+                delivery_series = pd.to_numeric(result["delivery"], errors="coerce")
+            if delivery_series is None or delivery_series.isna().all():
+                candidates: List[pd.Series] = []
+                for column in ("avg_lead_time_days", "delivery_lead_time_days", "lead_time_days"):
+                    if column in result.columns:
+                        candidates.append(pd.to_numeric(result[column], errors="coerce"))
+                if candidates:
+                    lead_time = pd.concat(candidates, axis=1).mean(axis=1)
+                else:
+                    lead_time = pd.Series(0.0, index=result.index, dtype="float64")
                 with pd.option_context("mode.use_inf_as_na", True):
-                    result["delivery"] = 1 / (delivery_numeric.abs() + 1)
-            else:
-                result["delivery"] = pd.to_numeric(result["delivery"], errors="coerce")
+                    delivery_series = 1 / (lead_time.abs() + 1)
+            result["delivery"] = delivery_series.fillna(0.0)
+
         if "risk" in weights:
-            if "risk" not in result.columns:
-                risk = result.get("risk_score")
-                result["risk"] = (
-                    pd.to_numeric(risk, errors="coerce") if risk is not None else 0.0
-                )
-            else:
-                result["risk"] = pd.to_numeric(result["risk"], errors="coerce")
-        if "payment_terms" in weights and "payment_terms" not in result.columns:
-            result["payment_terms"] = result.get("po_payment_terms")
+            risk_series = None
+            if "risk" in result.columns:
+                risk_series = pd.to_numeric(result["risk"], errors="coerce")
+            if risk_series is None or risk_series.isna().all():
+                if "risk_score" in result.columns:
+                    risk_series = pd.to_numeric(result["risk_score"], errors="coerce")
+                    if risk_series.isna().all():
+                        reference_mapping = {}
+                        if isinstance(self._scoring_reference, dict):
+                            reference_mapping = self._scoring_reference.get("risk_levels", {}) or {}
+                        lookup = {
+                            str(key).lower(): float(value)
+                            for key, value in reference_mapping.items()
+                        }
+                        mapped = result["risk_score"].astype(str).str.lower().map(lookup)
+                        risk_series = mapped
+            if risk_series is None or risk_series.isna().all():
+                coverage = pd.to_numeric(result.get("flow_coverage"), errors="coerce")
+                if coverage is None or coverage.isna().all():
+                    coverage_components: List[pd.Series] = []
+                    for column in ("po_count", "invoice_count", "contract_count", "quote_count"):
+                        if column in result.columns:
+                            indicator = (
+                                pd.to_numeric(result[column], errors="coerce").fillna(0.0) > 0
+                            ).astype(float)
+                            coverage_components.append(indicator)
+                    if coverage_components:
+                        coverage = pd.concat(coverage_components, axis=1).mean(axis=1)
+                    else:
+                        coverage = pd.Series(0.0, index=result.index, dtype="float64")
+                coverage = coverage.clip(0.0, 1.0).fillna(0.0)
+                risk_series = 1.0 - coverage
+            result["risk"] = risk_series.fillna(0.0)
+
+        if "payment_terms" in weights:
+            payment_series = result.get("payment_terms")
+            if payment_series is None or payment_series.isna().all():
+                payment_series = result.get("po_payment_terms")
+            numeric_terms = None
+            if payment_series is not None:
+                numeric_terms = self._payment_terms_to_days(payment_series)
+            if (numeric_terms is None or numeric_terms.isna().all()) and "avg_payment_term_days" in result.columns:
+                numeric_terms = pd.to_numeric(result["avg_payment_term_days"], errors="coerce")
+            if (numeric_terms is None or numeric_terms.isna().all()) and "avg_paid_days" in result.columns:
+                numeric_terms = pd.to_numeric(result["avg_paid_days"], errors="coerce")
+            if numeric_terms is None:
+                numeric_terms = pd.Series(0.0, index=result.index, dtype="float64")
+            result["payment_terms"] = numeric_terms.fillna(0.0)
         return result
 
     def _score_categorical_criteria(
@@ -1216,6 +1343,31 @@ class SupplierRankingAgent(BaseAgent):
                 if details.get("count"):
                     hits += 1
         return hits / total if total else 0.0
+
+    def _annotate_flow_coverage(
+        self,
+        df: pd.DataFrame,
+        flow_index: Dict[str, Dict[str, Any]],
+        flow_name_index: Dict[str, Dict[str, Any]],
+        alias_tokens: Dict[str, List[str]],
+    ) -> pd.DataFrame:
+        if df.empty or "supplier_id" not in df.columns:
+            if "flow_coverage" not in df.columns:
+                df["flow_coverage"] = 0.0
+            return df
+        annotated = df.copy()
+        coverage_values: List[float] = []
+        for _, row in annotated.iterrows():
+            entry = self._lookup_flow_entry(
+                row.get("supplier_id"),
+                row.get("supplier_name"),
+                flow_index,
+                flow_name_index,
+                alias_tokens,
+            )
+            coverage_values.append(self._coverage_from_flow_entry(entry))
+        annotated["flow_coverage"] = coverage_values
+        return annotated
 
     def _apply_flow_bonus(
         self,

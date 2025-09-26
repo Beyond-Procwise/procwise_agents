@@ -155,10 +155,27 @@ class BaseAgent:
         on GPU-enabled systems.  When ``messages`` is provided the ``prompt`` is
         ignored.
         """
-        model_to_use = model or getattr(self.settings, "extraction_model", "llama3")
+        base_model = getattr(self.settings, "extraction_model", "llama3")
+        quantized = getattr(self.settings, "ollama_quantized_model", None)
+        model_to_use = model or base_model
+        if quantized and (model is None or model == base_model):
+            model_to_use = quantized
         try:
             options = kwargs.pop("options", {})
             options = {**self.agent_nick.ollama_options(), **options}
+            optimized_defaults = {}
+            gpu_layers = getattr(self.settings, "ollama_gpu_layers", None)
+            if gpu_layers is not None:
+                optimized_defaults["gpu_layers"] = int(gpu_layers)
+            num_batch = getattr(self.settings, "ollama_num_batch", None)
+            if num_batch is not None:
+                optimized_defaults["num_batch"] = int(num_batch)
+            optimized_defaults.setdefault("num_thread", max(1, os.cpu_count() or 1))
+            optimized_defaults.setdefault(
+                "num_gpu", max(1, int(os.getenv("OLLAMA_NUM_GPU", "1")))
+            )
+            for key, value in optimized_defaults.items():
+                options.setdefault(key, value)
             if messages is not None:
                 return ollama.chat(
                     model=model_to_use,
