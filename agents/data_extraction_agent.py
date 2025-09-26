@@ -44,7 +44,13 @@ from utils.nlp import extract_entities
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
-from utils.procurement_schema import extract_structured_content
+from utils.procurement_schema import (
+    DOC_TYPE_TO_TABLE,
+    PROCUREMENT_SCHEMAS,
+    TableSchema,
+    extract_structured_content,
+)
+
 
 logger = logging.getLogger(__name__)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -1402,6 +1408,209 @@ class DataExtractionAgent(BaseAgent):
                 header[key] = m.group(group_idx).strip()
         return header
 
+    def _get_table_schema(self, doc_type: str, kind: str) -> TableSchema | None:
+        header_table, line_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))
+        table = header_table if kind == "header" else line_table
+        if not table:
+            return None
+        return PROCUREMENT_SCHEMAS.get(table)
+
+    def _build_dataframe_from_records(
+        self,
+        data: Dict[str, Any] | List[Dict[str, Any]],
+        doc_type: str,
+        kind: str,
+    ) -> Tuple[pd.DataFrame, List[str], List[str]]:
+        schema = self._get_table_schema(doc_type, kind)
+        schema_cols = list(schema.columns) if schema else []
+        if isinstance(data, dict):
+            records = [data]
+        elif isinstance(data, list):
+            records = [row for row in data if isinstance(row, dict)]
+        else:
+            records = []
+
+        df = pd.DataFrame(records)
+        if df.empty and schema_cols:
+            df = pd.DataFrame(columns=schema_cols)
+        elif not df.empty:
+            df.columns = [str(col).strip() for col in df.columns]
+            df = df.loc[:, ~df.columns.duplicated()]
+
+        extra_cols: List[str] = []
+        missing_cols: List[str] = []
+        if schema_cols:
+            extra_cols = [col for col in df.columns if col not in schema_cols]
+            missing_cols = [col for col in schema_cols if col not in df.columns]
+            if extra_cols:
+                df = df.drop(columns=[col for col in extra_cols if col in df.columns])
+            for col in missing_cols:
+                df[col] = pd.NA
+            df = df[schema_cols]
+        return df, missing_cols, extra_cols
+
+    def _dataframe_to_header(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if df.empty:
+            return {}
+        normalized = df.replace({pd.NA: None})
+        record = normalized.iloc[0].to_dict()
+        return {k: v for k, v in record.items() if v not in ({}, [])}
+
+    def _dataframe_to_records(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        if df.empty:
+            return []
+        normalized = df.replace({pd.NA: None})
+        return normalized.to_dict("records")
+
+    def _is_substantial_value(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, set, dict)):
+            return bool(value)
+        if isinstance(value, (int, float)):
+            return True
+        return value is not None
+
+    def _merge_record_fields(
+        self, base: Dict[str, Any] | None, override: Dict[str, Any] | None
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = dict(base or {})
+        if not override:
+            return {k: v for k, v in result.items() if self._is_substantial_value(v)}
+        for key, value in override.items():
+            if not self._is_substantial_value(value):
+                continue
+            if not self._is_substantial_value(result.get(key)):
+                result[key] = value
+        return {k: v for k, v in result.items() if self._is_substantial_value(v)}
+
+    def _merge_line_items(
+        self, base: List[Dict[str, Any]] | None, override: List[Dict[str, Any]] | None
+    ) -> List[Dict[str, Any]]:
+        if not base and override:
+            return [row for row in override if any(self._is_substantial_value(v) for v in row.values())]
+        if base and not override:
+            return [row for row in base if any(self._is_substantial_value(v) for v in row.values())]
+        base = base or []
+        override = override or []
+        merged: List[Dict[str, Any]] = []
+        max_len = max(len(base), len(override))
+        for idx in range(max_len):
+            base_row = base[idx] if idx < len(base) else {}
+            override_row = override[idx] if idx < len(override) else {}
+            merged_row = self._merge_record_fields(base_row, override_row)
+            if merged_row:
+                merged.append(merged_row)
+        return merged
+
+    def _schema_verification_notes(
+        self,
+        doc_type: str,
+        header_missing: List[str],
+        header_extra: List[str],
+        line_missing: List[str],
+        line_extra: List[str],
+    ) -> List[str]:
+        header_table, line_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))
+        notes: List[str] = []
+        if header_missing:
+            notes.append(
+                f"Missing mapped columns for {header_table or 'header'}: {', '.join(sorted(header_missing))}"
+            )
+        if header_extra:
+            notes.append(
+                f"Unmapped values ignored for {header_table or 'header'}: {', '.join(sorted(header_extra))}"
+            )
+        if line_table and line_missing:
+            notes.append(
+                f"Missing mapped columns for {line_table}: {', '.join(sorted(line_missing))}"
+            )
+        if line_table and line_extra:
+            notes.append(
+                f"Unmapped values ignored for {line_table}: {', '.join(sorted(line_extra))}"
+            )
+        return notes
+
+    def _llm_structured_dataframes(
+        self,
+        text: str,
+        doc_type: str,
+        header_seed: Dict[str, Any],
+        line_items_seed: List[Dict[str, Any]],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+        schema = self._get_table_schema(doc_type, "header")
+        line_schema = self._get_table_schema(doc_type, "line_items")
+        header_columns = schema.columns if schema else []
+        header_required = schema.required if schema else []
+        line_columns = line_schema.columns if line_schema else []
+        line_required = line_schema.required if line_schema else []
+
+        if not header_columns and not line_columns:
+            return pd.DataFrame(), pd.DataFrame(), []
+
+        instructions = {
+            "document_type": doc_type,
+            "header_columns": header_columns,
+            "header_required": header_required,
+            "line_item_columns": line_columns,
+            "line_item_required": line_required,
+            "existing_header": header_seed,
+            "existing_line_items": line_items_seed,
+        }
+
+        prompt = (
+            "You are a procurement data expert. Convert the provided document text into structured tabular data. "
+            "Output strict JSON with keys 'header_rows', 'line_item_rows', and 'discrepancies'. "
+            "Use the column lists exactly as provided. Fill missing values with null instead of guessing. "
+            "Include at most one header row. Preserve numeric precision (no currency symbols)."
+        )
+
+        payload: Dict[str, Any] = {}
+        for _ in range(3):
+            try:
+                response = self.call_ollama(
+                    prompt=prompt + "\n\nInstructions:\n" + json.dumps(instructions) + "\n\nDocument:\n" + text,
+                    model=self.extraction_model,
+                    format="json",
+                )
+                candidate = response.get("response", "{}")
+                payload = json.loads(candidate)
+                if isinstance(payload, dict):
+                    break
+            except Exception:
+                continue
+
+        header_rows = payload.get("header_rows", [])
+        if isinstance(header_rows, dict):
+            header_rows = [header_rows]
+        header_df = pd.DataFrame(header_rows)
+        if header_columns:
+            for column in header_columns:
+                if column not in header_df.columns:
+                    header_df[column] = pd.NA
+            header_df = header_df[header_columns]
+
+        line_rows = payload.get("line_item_rows", [])
+        if isinstance(line_rows, dict):
+            line_rows = [line_rows]
+        line_df = pd.DataFrame(line_rows)
+        if line_columns:
+            for column in line_columns:
+                if column not in line_df.columns:
+                    line_df[column] = pd.NA
+            line_df = line_df[line_columns]
+
+        notes = payload.get("discrepancies") or payload.get("notes") or []
+        if isinstance(notes, str):
+            notes = [notes]
+        if not isinstance(notes, list):
+            notes = []
+        cleaned_notes = [str(n) for n in notes if str(n).strip()]
+
+        return header_df, line_df, cleaned_notes
+
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         # Step 1: schema-aware extraction seeded from procurement reference
         structured = extract_structured_content(text, doc_type)
@@ -1411,6 +1620,17 @@ class DataExtractionAgent(BaseAgent):
         # Step 2: lightweight JSONifier to catch explicit key:value pairs
         data = convert_document_to_json(text, doc_type)
         header_seed.update(self._normalize_header_fields(data.get("header_data", {}), doc_type))
+
+        llm_header_df, llm_line_df, llm_notes = self._llm_structured_dataframes(
+            text, doc_type, header_seed, line_items_seed
+        )
+        if not llm_header_df.empty:
+            llm_header = self._dataframe_to_header(llm_header_df)
+            header_seed = self._merge_record_fields(header_seed, llm_header)
+        if not llm_line_df.empty:
+            llm_line_items = self._dataframe_to_records(llm_line_df)
+            line_items_seed = self._merge_line_items(line_items_seed, llm_line_items)
+
 
         # Step 3: layout-driven extraction for headers and line items
         header_layout = self._parse_header(text, file_bytes)
@@ -1424,13 +1644,56 @@ class DataExtractionAgent(BaseAgent):
         header = self._sanitize_party_names(header)
         if doc_type == "Contract":
             header = self._enrich_contract_fields(text, header)
+
+        field_confidence = header.pop("_field_confidence", {})
+        prior_validation = header.pop("_validation", None)
+
+        header_df, header_missing, header_extra = self._build_dataframe_from_records(header, doc_type, "header")
+        header = self._dataframe_to_header(header_df)
+        if field_confidence:
+            header["_field_confidence"] = field_confidence
+
+        line_df, line_missing, line_extra = self._build_dataframe_from_records(line_items, doc_type, "line_items")
+        line_items = self._dataframe_to_records(line_df)
+
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
-        ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
-        field_conf = header.pop("_field_confidence", {})
+        # Ensure field confidence is retained for validation reporting
+        if field_confidence and "_field_confidence" not in header:
+            header["_field_confidence"] = field_confidence
+
+        ok, conf_boost, business_notes = self._validate_business_rules(doc_type, header, line_items)
+        field_conf = header.pop("_field_confidence", field_confidence if isinstance(field_confidence, dict) else {})
         base = np.mean(list(field_conf.values())) if field_conf else 0.75
-        overall_conf = float(min(1.0, base + conf_boost))
-        header["_validation"] = {"ok": ok, "notes": notes, "confidence": overall_conf, "field_confidence": field_conf}
+
+        schema_notes = self._schema_verification_notes(
+            doc_type, header_missing, header_extra, line_missing, line_extra
+        )
+        missing_penalty = 0.05 * (len(header_missing) + len(line_missing))
+        combined_notes: List[str] = []
+        if prior_validation and isinstance(prior_validation.get("notes"), list):
+            combined_notes.extend(prior_validation["notes"])
+        combined_notes.extend(business_notes)
+        combined_notes.extend(llm_notes)
+        combined_notes.extend(schema_notes)
+
+        ok = ok and (prior_validation.get("ok", True) if isinstance(prior_validation, dict) else True)
+        if header_missing or line_missing:
+            ok = False
+
+        overall_conf = float(min(1.0, max(0.0, base + conf_boost - missing_penalty)))
+        if isinstance(prior_validation, dict) and prior_validation.get("confidence") is not None:
+            try:
+                overall_conf = min(overall_conf, float(prior_validation["confidence"]))
+            except (TypeError, ValueError):
+                pass
+
+        header["_validation"] = {
+            "ok": ok,
+            "notes": combined_notes,
+            "confidence": overall_conf,
+            "field_confidence": field_conf,
+        }
         return header, line_items
 
     def _fill_missing_fields_with_llm(self, text: str, doc_type: str, header: Dict[str, Any], line_items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
