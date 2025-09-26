@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     ses_inbound_queue_max_messages: int = Field(
         default=10, env="SES_INBOUND_QUEUE_MAX_MESSAGES"
     )
+
     ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
     ses_secret_role_arn: Optional[str] = Field(

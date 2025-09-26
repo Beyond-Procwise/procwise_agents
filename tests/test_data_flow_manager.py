@@ -1,6 +1,11 @@
+import json
+import pytest
 from types import SimpleNamespace
 
 import pandas as pd
+from qdrant_client import models
+
+import services.data_flow_manager as data_flow_module
 
 from services.data_flow_manager import DataFlowManager
 
@@ -170,3 +175,96 @@ def test_data_flow_manager_builds_graph_and_persists():
         mapping_summary = point.payload.get("mapping_summary")
         assert isinstance(mapping_summary, list) and mapping_summary
         assert any("proc." in statement for statement in mapping_summary)
+
+
+def test_supplier_flow_payload_is_trimmed_below_limit(monkeypatch):
+    nick = DummyNick()
+    manager = DataFlowManager(nick)
+
+    oversized_payload = {
+        "document_type": "supplier_flow",
+        "supplier_id": "S-123",
+        "supplier_name": "Mega Supplier Incorporated",
+        "coverage_ratio": 0.92,
+        "summary": "A" * 12000,
+        "mapping_summary": [
+            f"Mapping statement {idx} " + ("B" * 600) for idx in range(40)
+        ],
+        "products": {
+            "unique_items": 4096,
+            "top_items": [
+                {
+                    "description": "Item description " + ("C" * 500),
+                    "spend_gbp": 125000.45,
+                }
+                for _ in range(10)
+            ],
+        },
+        "quotes": {
+            "count": 200,
+            "total_value_gbp": 987654.32,
+            "quote_ids": [f"Q{idx}" for idx in range(120)],
+        },
+        "purchase_orders": {
+            "count": 150,
+            "total_value_gbp": 543210.98,
+            "po_ids": [f"PO{idx}" for idx in range(160)],
+            "latest_order_date": "2025-01-31",
+        },
+        "invoices": {
+            "count": 80,
+            "total_value_gbp": 321098.76,
+            "invoice_ids": [f"INV{idx}" for idx in range(130)],
+            "latest_invoice_date": "2025-02-15",
+        },
+    }
+
+    sanitized = manager._sanitize_payload(oversized_payload)
+
+    monkeypatch.setattr(data_flow_module, "_POINT_PAYLOAD_SOFT_LIMIT", 2000)
+    monkeypatch.setattr(data_flow_module, "_POINT_PAYLOAD_HARD_LIMIT", 3000)
+    trimmed = manager._enforce_payload_limits(dict(sanitized))
+
+    assert manager._payload_json_size(trimmed) <= data_flow_module._POINT_PAYLOAD_HARD_LIMIT
+    assert len(trimmed.get("mapping_summary", [])) <= 12
+    products = trimmed.get("products")
+    if isinstance(products, dict):
+        assert len(products.get("top_items", [])) <= 3
+
+
+def test_batch_points_respects_serialized_size_threshold():
+    nick = DummyNick()
+    manager = DataFlowManager(nick)
+
+    points = [
+        models.PointStruct(
+            id=idx,
+            vector=[float(idx + 1)] * 128,
+            payload={
+                "document_type": "supplier_flow",
+                "supplier_id": f"S-{idx}",
+                "summary": "X" * 1800,
+            },
+        )
+        for idx in range(4)
+    ]
+
+    max_bytes = 5000
+    batches = list(manager._batch_points(points, max_batch_bytes=max_bytes))
+
+    assert len(batches) > 1
+    for batch in batches:
+        point_dicts = [
+            point.model_dump(exclude_none=True)
+            if hasattr(point, "model_dump")
+            else point.dict(exclude_none=True)
+            for point in batch
+        ]
+        serialized_size = len(
+            json.dumps({"points": point_dicts}, ensure_ascii=False).encode("utf-8")
+        )
+        assert serialized_size <= max_bytes + data_flow_module._POINT_BATCH_OVERHEAD
+        guard = data_flow_module._POINT_BATCH_OVERHEAD
+        for point in batch:
+            guard += manager._estimate_point_size(point)
+        assert guard <= max_bytes + data_flow_module._POINT_BATCH_OVERHEAD

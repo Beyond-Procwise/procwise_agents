@@ -20,6 +20,19 @@ class DiscrepancyDetectionAgent(BaseAgent):
     def run(self, context: AgentContext) -> AgentOutput:
         mismatches: List[Dict[str, Dict[str, str]]] = []
         docs: List[Dict] = context.input_data.get("extracted_docs", [])
+        processing_issues: List[Dict[str, str]] = context.input_data.get(
+            "processing_issues", []
+        )
+
+        if processing_issues:
+            for issue in processing_issues:
+                mismatches.append(
+                    {
+                        "doc_type": issue.get("doc_type", "Unknown"),
+                        "id": issue.get("record_id", "unknown"),
+                        "checks": {"processing_issue": issue.get("reason", "unspecified")},
+                    }
+                )
 
         def _detect_column(cur, connection, candidates: Iterable[str]) -> Optional[str]:
             """Return the first candidate column present in the invoice table."""

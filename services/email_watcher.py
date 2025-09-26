@@ -545,6 +545,7 @@ class SESEmailWatcher:
 
         if self.bucket:
             s3_messages = self._load_from_s3(remaining if remaining else None)
+
             messages.extend(s3_messages)
 
         remaining = None if limit is None else max(limit - len(messages), 0)
@@ -817,6 +818,7 @@ class SESEmailWatcher:
 
         return results
 
+
     def _load_from_s3(self, limit: Optional[int] = None) -> List[Dict[str, object]]:
         if not self.bucket:
             logger.warning("SES inbound bucket not configured; skipping poll")
@@ -1006,6 +1008,7 @@ class SESEmailWatcher:
             return None
         try:
             response = client.get_object(Bucket=bucket_name, Key=key)
+
             body = response["Body"].read()
             encoding = str(response.get("ContentEncoding", "") or "").lower()
             key_lower = key.lower()
@@ -1155,6 +1158,7 @@ class SESEmailWatcher:
         ):
             return dict(self._assumed_credentials)
 
+
         sts_kwargs = {"region_name": self.region} if self.region else {}
         sts_client = boto3.client("sts", **sts_kwargs)
         session_name = f"ProcWiseEmailWatcher-{uuid.uuid4().hex[:8]}"
@@ -1222,6 +1226,7 @@ class SESEmailWatcher:
             )
             self._sqs_client = None
         return self._sqs_client
+
 
     @staticmethod
     def _parse_region(endpoint: str) -> Optional[str]:

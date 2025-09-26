@@ -6,6 +6,8 @@ import json
 import logging
 import math
 import os
+from datetime import date, datetime
+from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -319,7 +321,14 @@ _INVOICE_TOTAL_COLUMNS: Tuple[str, ...] = (
 
 _SUPPLIER_FLOW_ID_LIMIT = 5
 _SUPPLIER_FLOW_ITEM_LIMIT = 5
+_SUMMARY_CHAR_LIMIT = 4096
+_TEXT_VALUE_CHAR_LIMIT = 2048
+_SEQUENCE_LENGTH_LIMIT = 50
+_MAPPING_SUMMARY_LIMIT = 32
 _SUPPLIER_SAMPLE_LIMIT = 200
+_POINT_PAYLOAD_SOFT_LIMIT = 256 * 1024
+_POINT_PAYLOAD_HARD_LIMIT = 384 * 1024
+_POINT_BATCH_OVERHEAD = 256  # safety margin for JSON envelope/metadata
 
 
 class DataFlowManager:
@@ -420,6 +429,9 @@ class DataFlowManager:
                 payload["source_table_alias"] = relation.get("source_table_alias")
             if relation.get("target_table_alias"):
                 payload["target_table_alias"] = relation.get("target_table_alias")
+            payload = self._sanitize_payload(payload)
+            payload = self._enforce_payload_limits(payload)
+
             points_by_id[point_id] = models.PointStruct(
                 id=point_id, vector=vector, payload=payload
             )
@@ -449,6 +461,9 @@ class DataFlowManager:
                 if resolved_aliases and resolved_aliases != canonical_path:
                     payload["resolved_aliases"] = list(resolved_aliases)
 
+                payload = self._sanitize_payload(payload)
+                payload = self._enforce_payload_limits(payload)
+
                 points_by_id[point_id] = models.PointStruct(
                     id=point_id, vector=vector, payload=payload
                 )
@@ -471,13 +486,19 @@ class DataFlowManager:
                     "supplier_name_normalized": self._normalise_key(flow.get("supplier_name")),
                     "coverage_ratio": flow.get("coverage_ratio"),
                 }
-                payload["summary"] = text
+                payload["summary"] = self._truncate_text(text, _SUMMARY_CHAR_LIMIT)
                 if mapping_summary:
-                    payload["mapping_summary"] = mapping_summary
+                    payload["mapping_summary"] = [
+                        self._truncate_text(item, _TEXT_VALUE_CHAR_LIMIT)
+                        for item in mapping_summary[:_MAPPING_SUMMARY_LIMIT]
+                        if isinstance(item, str)
+                    ]
                 for key in ("contracts", "purchase_orders", "invoices", "quotes", "products"):
                     value = flow.get(key)
                     if isinstance(value, dict):
                         payload[key] = value
+                payload = self._sanitize_payload(payload)
+                payload = self._enforce_payload_limits(payload)
                 points_by_id[point_id] = models.PointStruct(
                     id=point_id, vector=vector, payload=payload
                 )
@@ -774,6 +795,302 @@ class DataFlowManager:
             if len(results) >= limit:
                 break
         return results
+
+    def _truncate_text(self, text: Any, limit: int) -> str:
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        value = text.strip()
+        if limit <= 0 or len(value) <= limit:
+            return value
+        truncated = value[: max(1, limit - 1)].rstrip()
+        return f"{truncated}…"
+
+    def _sanitize_payload(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        def _sanitize(value: Any, depth: int = 0) -> Any:
+            if value is None:
+                return None
+            if depth > 6:
+                return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, str):
+                return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, (bool, int)):
+                return value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None
+                return value
+            if isinstance(value, Decimal):
+                try:
+                    numeric = float(value)
+                except Exception:
+                    return self._truncate_text(str(value), _TEXT_VALUE_CHAR_LIMIT)
+                if not math.isfinite(numeric):
+                    return None
+                return numeric
+            if isinstance(value, (datetime, date)):
+                try:
+                    return value.isoformat()
+                except Exception:
+                    return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, pd.Timestamp):
+                if pd.isna(value):
+                    return None
+                return value.to_pydatetime().isoformat()
+            if hasattr(value, "item") and callable(getattr(value, "item")):
+                try:
+                    return _sanitize(value.item(), depth + 1)
+                except Exception:
+                    return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, Mapping):
+                sanitized_dict: Dict[str, Any] = {}
+                for key, sub_value in value.items():
+                    sanitized = _sanitize(sub_value, depth + 1)
+                    if sanitized is None:
+                        continue
+                    sanitized_dict[str(key)] = sanitized
+                return sanitized_dict
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                sanitized_list: List[Any] = []
+                for item in list(value)[:_SEQUENCE_LENGTH_LIMIT]:
+                    sanitized = _sanitize(item, depth + 1)
+                    if sanitized is not None:
+                        sanitized_list.append(sanitized)
+                return sanitized_list
+            return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+
+        sanitized_payload = _sanitize(dict(payload))  # ensure shallow copy
+        if not isinstance(sanitized_payload, dict):
+            return {}
+        return sanitized_payload
+
+    def _payload_json_size(self, payload: Mapping[str, Any]) -> int:
+        try:
+            return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            try:
+                sanitized = self._sanitize_payload(
+                    payload if isinstance(payload, Mapping) else {}
+                )
+            except Exception:
+                return 0
+            if not sanitized:
+                return 0
+            return len(json.dumps(sanitized, ensure_ascii=False).encode("utf-8"))
+
+    def _enforce_payload_limits(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not payload:
+            return {}
+
+        doc_type = str(payload.get("document_type") or "").strip() or None
+        size = self._payload_json_size(payload)
+        if size <= _POINT_PAYLOAD_SOFT_LIMIT:
+            return payload
+
+        trimmed: Dict[str, Any]
+        if doc_type == "supplier_flow":
+            trimmed = self._shrink_supplier_flow_payload(dict(payload), _POINT_PAYLOAD_SOFT_LIMIT)
+        elif doc_type == "knowledge_graph_relation":
+            trimmed = self._shrink_relation_payload(dict(payload), _POINT_PAYLOAD_SOFT_LIMIT)
+        elif doc_type == "knowledge_graph_path":
+            trimmed = self._shrink_path_payload(dict(payload), _POINT_PAYLOAD_SOFT_LIMIT)
+        else:
+            trimmed = self._shrink_generic_payload(dict(payload), _POINT_PAYLOAD_SOFT_LIMIT)
+
+        if self._payload_json_size(trimmed) > _POINT_PAYLOAD_HARD_LIMIT:
+            minimal = self._minimal_payload(trimmed, doc_type)
+            if minimal:
+                trimmed = minimal
+
+        final_size = self._payload_json_size(trimmed)
+        if final_size > _POINT_PAYLOAD_HARD_LIMIT:
+            logger.warning(
+                "Knowledge graph payload remains large after trimming (doc_type=%s, size=%s bytes)",
+                doc_type,
+                final_size,
+            )
+        return trimmed
+
+    def _shrink_supplier_flow_payload(
+        self, payload: Dict[str, Any], limit: int
+    ) -> Dict[str, Any]:
+        trimmed = dict(payload)
+
+        summary = trimmed.get("summary")
+        if isinstance(summary, str):
+            trimmed["summary"] = self._truncate_text(summary, min(2048, _SUMMARY_CHAR_LIMIT))
+
+        mapping_summary = trimmed.get("mapping_summary")
+        if isinstance(mapping_summary, list):
+            trimmed["mapping_summary"] = [
+                self._truncate_text(item, 512)
+                for item in mapping_summary[: min(len(mapping_summary), 12)]
+                if isinstance(item, str)
+            ]
+
+        nested_fields: Dict[str, Tuple[str, ...]] = {
+            "contracts": ("count", "latest_end_date"),
+            "purchase_orders": ("count", "total_value_gbp", "latest_order_date"),
+            "invoices": ("count", "total_value_gbp", "latest_invoice_date"),
+            "quotes": ("count", "total_value_gbp"),
+        }
+        for key, allowed in nested_fields.items():
+            details = trimmed.get(key)
+            if isinstance(details, Mapping):
+                reduced = {
+                    field: details.get(field)
+                    for field in allowed
+                    if details.get(field) is not None
+                }
+                if reduced:
+                    trimmed[key] = reduced
+                else:
+                    trimmed.pop(key, None)
+
+        products = trimmed.get("products")
+        if isinstance(products, Mapping):
+            reduced_products: Dict[str, Any] = {}
+            if "unique_items" in products:
+                reduced_products["unique_items"] = products.get("unique_items")
+            top_items = products.get("top_items")
+            if isinstance(top_items, Sequence):
+                cleaned_items: List[Dict[str, Any]] = []
+                for item in list(top_items)[:3]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    cleaned_item: Dict[str, Any] = {}
+                    if "description" in item:
+                        cleaned_item["description"] = self._truncate_text(
+                            item.get("description"), 256
+                        )
+                    if item.get("spend_gbp") is not None:
+                        cleaned_item["spend_gbp"] = item.get("spend_gbp")
+                    if cleaned_item:
+                        cleaned_items.append(cleaned_item)
+                if cleaned_items:
+                    reduced_products["top_items"] = cleaned_items
+            if reduced_products:
+                trimmed["products"] = reduced_products
+            else:
+                trimmed.pop("products", None)
+
+        if self._payload_json_size(trimmed) > limit and "summary" in trimmed:
+            trimmed["summary"] = self._truncate_text(trimmed["summary"], 1024)
+
+        removal_priority = [
+            "products",
+            "mapping_summary",
+            "quotes",
+            "invoices",
+            "purchase_orders",
+            "contracts",
+        ]
+        for key in removal_priority:
+            if self._payload_json_size(trimmed) <= limit:
+                break
+            if key in trimmed:
+                trimmed.pop(key)
+
+        if (
+            self._payload_json_size(trimmed) > limit
+            and "summary" in trimmed
+            and isinstance(trimmed["summary"], str)
+        ):
+            trimmed["summary"] = self._truncate_text(trimmed["summary"], 512)
+
+        return trimmed
+
+    def _shrink_relation_payload(
+        self, payload: Dict[str, Any], limit: int
+    ) -> Dict[str, Any]:
+        trimmed = dict(payload)
+        samples = trimmed.get("sample_values")
+        if isinstance(samples, list):
+            trimmed["sample_values"] = [
+                self._truncate_text(item, 256) if isinstance(item, str) else item
+                for item in samples[: min(len(samples), 5)]
+            ]
+
+        if self._payload_json_size(trimmed) > limit and "description" in trimmed:
+            trimmed["description"] = self._truncate_text(trimmed["description"], 512)
+
+        if self._payload_json_size(trimmed) > limit:
+            trimmed.pop("sample_values", None)
+
+        if self._payload_json_size(trimmed) > limit and "description" in trimmed:
+            trimmed.pop("description")
+
+        return trimmed
+
+    def _shrink_path_payload(
+        self, payload: Dict[str, Any], limit: int
+    ) -> Dict[str, Any]:
+        trimmed = dict(payload)
+        aliases = trimmed.get("resolved_aliases")
+        if isinstance(aliases, list):
+            trimmed["resolved_aliases"] = aliases[: min(len(aliases), 8)]
+
+        if self._payload_json_size(trimmed) > limit:
+            trimmed.pop("resolved_aliases", None)
+
+        return trimmed
+
+    def _shrink_generic_payload(
+        self, payload: Dict[str, Any], limit: int
+    ) -> Dict[str, Any]:
+        trimmed = dict(payload)
+        summary = trimmed.get("summary")
+        if isinstance(summary, str):
+            trimmed["summary"] = self._truncate_text(summary, 2048)
+
+        optional_keys = [
+            key
+            for key in list(trimmed.keys())
+            if key not in {"document_type", "supplier_id", "supplier_name"}
+        ]
+        for key in optional_keys:
+            if self._payload_json_size(trimmed) <= limit:
+                break
+            if key in trimmed:
+                trimmed.pop(key)
+
+        return trimmed
+
+    def _minimal_payload(
+        self, payload: Mapping[str, Any], doc_type: Optional[str]
+    ) -> Dict[str, Any]:
+        base = dict(payload)
+        defaults: Dict[str, Tuple[str, ...]] = {
+            "supplier_flow": (
+                "document_type",
+                "supplier_id",
+                "supplier_name",
+                "supplier_name_normalized",
+                "coverage_ratio",
+            ),
+            "knowledge_graph_relation": (
+                "document_type",
+                "source_table",
+                "target_table",
+                "relationship_type",
+                "status",
+                "confidence",
+            ),
+            "knowledge_graph_path": (
+                "document_type",
+                "path",
+            ),
+        }
+        minimal_keys = defaults.get(doc_type or "", ("document_type",))
+        minimal: Dict[str, Any] = {}
+        for key in minimal_keys:
+            if key in base and base[key] is not None:
+                minimal[key] = base[key]
+        if "document_type" not in minimal and doc_type:
+            minimal["document_type"] = doc_type
+        return minimal
+
 
     def _format_timestamp(self, value: Any) -> Optional[str]:
         if value is None:
@@ -1405,7 +1722,7 @@ class DataFlowManager:
     def _batch_points(
         self,
         points: Sequence[models.PointStruct],
-        max_batch_bytes: int = 28 * 1024 * 1024,
+        max_batch_bytes: int = 20 * 1024 * 1024,
     ) -> Iterable[List[models.PointStruct]]:
         """Yield point batches that respect Qdrant payload size limits.
 
@@ -1414,20 +1731,20 @@ class DataFlowManager:
         """
 
         batch: List[models.PointStruct] = []
-        batch_bytes = 0
+        batch_bytes = _POINT_BATCH_OVERHEAD
         for point in points:
             point_bytes = self._estimate_point_size(point)
             if point_bytes >= max_batch_bytes:
                 if batch:
                     yield batch
                     batch = []
-                    batch_bytes = 0
+                    batch_bytes = _POINT_BATCH_OVERHEAD
                 yield [point]
                 continue
             if batch and batch_bytes + point_bytes > max_batch_bytes:
                 yield batch
                 batch = []
-                batch_bytes = 0
+                batch_bytes = _POINT_BATCH_OVERHEAD
             batch.append(point)
             batch_bytes += point_bytes
         if batch:
@@ -1436,15 +1753,42 @@ class DataFlowManager:
     def _estimate_point_size(self, point: models.PointStruct) -> int:
         """Estimate the serialized size of a Qdrant point."""
 
-        vector = getattr(point, "vector", None) or []
-        vector_len = len(vector)
-        vector_bytes = vector_len * 4  # float32 approximation
-        payload = getattr(point, "payload", {})
+        point_dict = self._point_as_dict(point)
         try:
-            payload_bytes = len(json.dumps(payload, ensure_ascii=False))
+            return len(json.dumps(point_dict, ensure_ascii=False).encode("utf-8")) + _POINT_BATCH_OVERHEAD
         except (TypeError, ValueError):  # pragma: no cover - fallback
-            payload_bytes = 0
-        return vector_bytes + payload_bytes + 512  # transport overhead buffer
+            payload = getattr(point, "payload", {})
+            sanitized_payload = (
+                self._sanitize_payload(payload if isinstance(payload, Mapping) else {})
+            )
+            fallback = {
+                "id": getattr(point, "id", None),
+                "vector": list(getattr(point, "vector", []) or []),
+                "payload": sanitized_payload,
+            }
+            return len(json.dumps(fallback, ensure_ascii=False).encode("utf-8")) + _POINT_BATCH_OVERHEAD
+
+    def _point_as_dict(self, point: models.PointStruct) -> Dict[str, Any]:
+        if hasattr(point, "model_dump") and callable(getattr(point, "model_dump")):
+            try:
+                return point.model_dump(exclude_none=True)
+            except TypeError:  # pragma: no cover - compatibility with older pydantic
+                return point.model_dump()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if hasattr(point, "dict") and callable(getattr(point, "dict")):
+            try:
+                return point.dict(exclude_none=True)
+            except TypeError:  # pragma: no cover - compatibility with older pydantic
+                return point.dict()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return {
+            "id": getattr(point, "id", None),
+            "vector": list(getattr(point, "vector", []) or []),
+            "payload": getattr(point, "payload", {}) or {},
+        }
+
 
     def _relation_to_text(self, relation: Dict[str, Any]) -> str:
         source = relation.get("source_table")

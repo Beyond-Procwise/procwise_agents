@@ -96,6 +96,10 @@ class SupplierInteractionAgent(BaseAgent):
 
         if should_wait:
             if not rfq_id:
+                logger.error(
+                    "Awaiting supplier response requires an RFQ identifier; subject=%s",
+                    subject,
+                )
                 rfq_id = self._extract_rfq_id(subject)
             if not rfq_id:
                 return AgentOutput(
@@ -132,6 +136,12 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
             if not wait_result:
+                logger.error(
+                    "Supplier response not received for RFQ %s (supplier=%s) before timeout=%ss",
+                    rfq_id,
+                    supplier_id,
+                    timeout,
+                )
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
@@ -140,10 +150,18 @@ class SupplierInteractionAgent(BaseAgent):
 
             supplier_status = str(wait_result.get("supplier_status") or "").lower()
             if supplier_status and supplier_status != AgentStatus.SUCCESS.value:
+                error_detail = wait_result.get("error") or "supplier response processing failed"
+                logger.error(
+                    "Supplier response for RFQ %s (supplier=%s) returned status=%s; error=%s",
+                    wait_result.get("rfq_id") or rfq_id,
+                    wait_result.get("supplier_id") or supplier_id,
+                    supplier_status,
+                    error_detail,
+                )
                 return AgentOutput(
                     status=AgentStatus.FAILED,
                     data={},
-                    error=wait_result.get("error") or "supplier response processing failed",
+                    error=error_detail,
                 )
 
             subject = str(wait_result.get("subject") or subject)
@@ -170,6 +188,11 @@ class SupplierInteractionAgent(BaseAgent):
             target_override = self._coerce_float(wait_result.get("target_price"))
 
         if not body:
+            logger.error(
+                "Supplier interaction failed because no message body was available (rfq_id=%s, supplier=%s)",
+                rfq_id,
+                supplier_id,
+            )
             return AgentOutput(status=AgentStatus.FAILED, data={}, error="message not provided")
 
         if not rfq_id:
@@ -336,9 +359,23 @@ class SupplierInteractionAgent(BaseAgent):
             and not getattr(self.agent_nick, "dispatch_service_started", False)
         ):
             logger.debug(
-                "Email watcher initialisation deferred until dispatch service starts."
+                "Email watcher initialisation deferred until dispatch service starts; waiting up to %ss",
+                timeout,
             )
-            return None
+            while time.time() <= deadline:
+                if getattr(self.agent_nick, "dispatch_service_started", False):
+                    break
+                remaining = max(0.0, deadline - time.time())
+                if remaining <= 0:
+                    break
+                time.sleep(min(1.0, remaining))
+            if not getattr(self.agent_nick, "dispatch_service_started", False):
+                logger.warning(
+                    "Dispatch service did not start before timeout while waiting for supplier response (rfq_id=%s, supplier=%s)",
+                    rfq_id,
+                    supplier_id,
+                )
+                return None
 
         active_watcher = watcher
         if active_watcher is None:
@@ -401,6 +438,32 @@ class SupplierInteractionAgent(BaseAgent):
                         sender = self._normalise_identifier(candidate.get("from_address"))
                         if sender and sender != sender_normalised:
                             continue
+                    status_value = str(candidate.get("supplier_status") or "").lower()
+                    payload_ready = candidate.get("supplier_output")
+                    if status_value in {"processing", "pending"} and not payload_ready:
+                        logger.debug(
+                            "Supplier response still processing for RFQ %s (supplier=%s); status=%s",
+                            candidate.get("rfq_id") or rfq_id,
+                            candidate.get("supplier_id") or supplier_id,
+                            status_value,
+                        )
+                        continue
+                    if status_value == AgentStatus.FAILED.value:
+                        error_detail = candidate.get("error") or "unknown_error"
+                        logger.error(
+                            "Supplier response poll detected failure for RFQ %s (supplier=%s): %s",
+                            candidate.get("rfq_id") or rfq_id,
+                            candidate.get("supplier_id") or supplier_id,
+                            error_detail,
+                        )
+                        result = candidate
+                        break
+                    if not payload_ready:
+                        logger.debug(
+                            "Supplier response for RFQ %s matched filters but has no payload yet; continuing to wait",
+                            candidate.get("rfq_id") or rfq_id,
+                        )
+                        continue
                     result = candidate
                     break
                 if result is None and not any(
@@ -416,6 +479,14 @@ class SupplierInteractionAgent(BaseAgent):
                 break
             time.sleep(
                 min(max(1, interval_value), max(0, deadline - time.time()))
+            )
+
+        if result is None:
+            logger.warning(
+                "Timed out waiting for supplier response (rfq_id=%s, supplier=%s) after %ss",
+                rfq_id,
+                supplier_id,
+                timeout,
             )
 
         return result
