@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
 import imaplib
 import logging
 import re
@@ -173,8 +174,19 @@ class SESEmailWatcher:
             getattr(self.settings, "imap_batch_size", 25), default=25, minimum=1
         )
 
-        # Lazily created S3 client to avoid mandatory AWS credentials during unit tests.
-        self._s3_client = None
+        # Prefer reusing the orchestrator's S3 client so we respect any
+        # endpoint overrides or credential sources initialised during startup.
+        shared_client = getattr(agent_nick, "s3_client", None)
+        self._s3_client = shared_client if shared_client is not None else None
+        self._s3_role_arn = (
+            getattr(self.settings, "ses_inbound_role_arn", None)
+            or getattr(self.settings, "ses_secret_role_arn", None)
+        )
+        if self._s3_role_arn:
+            # When a dedicated role is configured we assume it lazily on the
+            # first request to guarantee the mailbox bucket permissions are in
+            # place even if a shared client exists without the required rights.
+            self._s3_client = None
 
         logger.info(
             "Initialised email watcher for mailbox %s (bucket=%s, prefix=%s, poll_interval=%ss)",
@@ -690,7 +702,18 @@ class SESEmailWatcher:
     def _download_object(self, client, key: str) -> Optional[bytes]:
         try:
             response = client.get_object(Bucket=self.bucket, Key=key)
-            return response["Body"].read()
+            body = response["Body"].read()
+            encoding = str(response.get("ContentEncoding", "") or "").lower()
+            key_lower = key.lower()
+            if encoding == "gzip" or key_lower.endswith(".gz"):
+                try:
+                    body = gzip.decompress(body)
+                except OSError:
+                    logger.warning(
+                        "Failed to decompress gzip payload for %s; using raw bytes",
+                        key,
+                    )
+            return body
         except Exception:  # pragma: no cover - network/runtime
             logger.exception("Failed to download SES message %s", key)
             return None
@@ -744,12 +767,54 @@ class SESEmailWatcher:
         return match.group(0) if match else None
 
     def _get_s3_client(self):
-        if self._s3_client is None:
-            client_kwargs = {}
-            if self.region:
-                client_kwargs["region_name"] = self.region
-            self._s3_client = boto3.client("s3", **client_kwargs)
+        if self._s3_client is not None:
+            return self._s3_client
+
+        shared_client = getattr(self.agent_nick, "s3_client", None)
+        if shared_client is not None and self._s3_role_arn is None:
+            self._s3_client = shared_client
+            return self._s3_client
+
+        client_kwargs = {}
+        if self.region:
+            client_kwargs["region_name"] = self.region
+
+        if self._s3_role_arn:
+            try:
+                self._s3_client = self._s3_client_with_assumed_role(client_kwargs)
+                return self._s3_client
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Unable to assume role %s for inbound S3 access; falling back to default credentials",
+                    self._s3_role_arn,
+                )
+
+        self._s3_client = boto3.client("s3", **client_kwargs)
         return self._s3_client
+
+    def _s3_client_with_assumed_role(self, client_kwargs):
+        sts_kwargs = {"region_name": self.region} if self.region else {}
+        sts_client = boto3.client("sts", **sts_kwargs)
+        session_name = f"ProcWiseEmailWatcher-{uuid.uuid4().hex[:8]}"
+        response = sts_client.assume_role(
+            RoleArn=self._s3_role_arn,
+            RoleSessionName=session_name,
+        )
+        credentials = response.get("Credentials")
+        if not credentials:
+            raise ValueError("AssumeRole response missing credentials")
+        access_key = credentials.get("AccessKeyId")
+        secret_key = credentials.get("SecretAccessKey")
+        token = credentials.get("SessionToken")
+        if not all([access_key, secret_key, token]):
+            raise ValueError("Incomplete credentials returned from AssumeRole")
+        return boto3.client(
+            "s3",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=token,
+            **client_kwargs,
+        )
 
     @staticmethod
     def _parse_region(endpoint: str) -> Optional[str]:

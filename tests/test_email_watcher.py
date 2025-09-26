@@ -1,3 +1,4 @@
+import gzip
 import re
 from types import SimpleNamespace
 
@@ -317,3 +318,51 @@ def test_email_watcher_peek_recent_messages_uses_non_destructive_imap(monkeypatc
         }
     ]
     assert watcher.state_store._seen == {}
+
+
+def test_email_watcher_reuses_agent_s3_client():
+    nick = DummyNick()
+    nick.s3_client = object()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {},
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    assert watcher._get_s3_client() is nick.s3_client
+
+
+def test_email_watcher_downloads_and_decompresses_gzip():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {},
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    payload = gzip.compress(b"raw email bytes")
+
+    class DummyBody:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    class DummyClient:
+        def get_object(self, Bucket, Key):
+            return {"Body": DummyBody(payload), "ContentEncoding": "gzip"}
+
+    raw = watcher._download_object(DummyClient(), "ses/inbound/test.eml.gz")
+    assert raw == b"raw email bytes"
+
