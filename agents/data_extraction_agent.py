@@ -3,6 +3,7 @@ import logging
 import re
 import uuid
 import os
+import tempfile
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 import gzip
@@ -31,6 +32,10 @@ try:
     import easyocr  # GPU OCR (optional)
 except Exception:
     easyocr = None
+try:
+    import camelot  # type: ignore
+except Exception:
+    camelot = None
 _easyocr_reader = None
 
 from qdrant_client import models
@@ -1051,6 +1056,52 @@ class DataExtractionAgent(BaseAgent):
                     notes.append("invoice_total_incl_tax missing.")
             except Exception:
                 notes.append("Failed total reconciliation.")
+        elif doc_type == "Purchase_Order":
+            try:
+                line_total = sum(
+                    float(
+                        self._clean_numeric(
+                            li.get("line_total")
+                            or li.get("total_amount")
+                            or li.get("line_amount")
+                            or 0
+                        )
+                        or 0
+                    )
+                    for li in line_items
+                )
+                header_total = self._clean_numeric(
+                    header.get("total_amount") or header.get("po_total_value")
+                )
+                if header_total is not None:
+                    if abs(line_total - header_total) <= 0.02:
+                        conf += 0.06
+                    else:
+                        notes.append("Line totals do not match purchase order total_amount (±0.02).")
+            except Exception:
+                notes.append("Failed purchase order total reconciliation.")
+        elif doc_type == "Quote":
+            try:
+                line_total = sum(
+                    float(
+                        self._clean_numeric(
+                            li.get("total_amount")
+                            or li.get("line_total")
+                            or li.get("line_amount")
+                            or 0
+                        )
+                        or 0
+                    )
+                    for li in line_items
+                )
+                header_total = self._clean_numeric(header.get("total_amount"))
+                if header_total is not None:
+                    if abs(line_total - header_total) <= 0.02:
+                        conf += 0.05
+                    else:
+                        notes.append("Quote line totals do not match total_amount (±0.02).")
+            except Exception:
+                notes.append("Failed quote total reconciliation.")
         try:
             due = self._clean_date(header.get("due_date"))
             paid = self._clean_date(header.get("invoice_paid_date"))
@@ -1059,7 +1110,7 @@ class DataExtractionAgent(BaseAgent):
                 conf += 0.02
         except Exception:
             pass
-        overall_ok = len([n for n in notes if "do not match" in n]) == 0
+        overall_ok = len([n for n in notes if "do not match" in n or "Failed" in n]) == 0
         return overall_ok, min(1.0, conf), notes
 
     # ============================ HEADER PARSING ==========================
@@ -1177,6 +1228,51 @@ class DataExtractionAgent(BaseAgent):
     # ============================ LINE ITEMS ==============================
     def _extract_line_items_from_pdf_tables(self, file_bytes: bytes, doc_type: str) -> List[Dict]:
         items: List[Dict] = []
+        if camelot is not None:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+                    tmp.write(file_bytes)
+                    tmp.flush()
+                    tables = camelot.read_pdf(tmp.name, flavor="stream", pages="all")
+                for table in tables:
+                    df = table.df if hasattr(table, "df") else None
+                    if df is None or df.empty or df.shape[0] <= 1:
+                        continue
+                    header_map = self._map_table_headers(df.iloc[0].tolist())
+                    if len(header_map) < 2:
+                        continue
+                    for _, row in df.iloc[1:].iterrows():
+                        row_text = " ".join(str(cell).strip() for cell in row if isinstance(cell, str))
+                        if TOTALS_STOP_WORDS.search(row_text):
+                            break
+                        record: Dict[str, Any] = {}
+                        for idx, label in header_map.items():
+                            if idx >= len(row):
+                                continue
+                            value = str(row.iloc[idx]).strip()
+                            if not value or value.lower() in {"nan", "none"}:
+                                continue
+                            record[label] = value
+                        if not record:
+                            continue
+                        normalised = self._normalize_line_item_fields([record], doc_type)[0]
+                        for key in [
+                            "quantity",
+                            "unit_price",
+                            "line_amount",
+                            "tax_percent",
+                            "tax_amount",
+                            "total_amount_incl_tax",
+                            "line_total",
+                            "total_amount",
+                        ]:
+                            if key in normalised:
+                                normalised[key] = self._clean_numeric(normalised[key])
+                        items.append(normalised)
+                if items:
+                    return items
+            except Exception:
+                logger.debug("Camelot PDF table extraction failed", exc_info=True)
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
@@ -1261,6 +1357,18 @@ class DataExtractionAgent(BaseAgent):
             logger.warning("Layout line-item extraction failed: %s", exc)
         return items
 
+    def _map_table_headers(self, headers: List[Any]) -> Dict[int, str]:
+        mapping: Dict[int, str] = {}
+        for idx, raw in enumerate(headers):
+            text = str(raw).strip().lower()
+            if not text:
+                continue
+            for label, aliases in LINE_HEADERS_ALIASES.items():
+                if any(re.search(pattern, text, re.I) for pattern in aliases):
+                    mapping.setdefault(idx, label)
+                    break
+        return mapping
+
     # ============================ STRUCTURED FLOW =========================
     def _normalize_header_fields(self, header: Dict[str, Any], doc_type: str) -> Dict[str, Any]:
         if isinstance(header, str):
@@ -1276,6 +1384,11 @@ class DataExtractionAgent(BaseAgent):
                 "total_amount": "invoice_amount",
                 "total": "invoice_total_incl_tax",
                 "grand_total": "invoice_total_incl_tax",
+                "balance_due": "invoice_total_incl_tax",
+                "amount_due": "invoice_total_incl_tax",
+                "total_due": "invoice_total_incl_tax",
+                "total_amount_gbp": "invoice_total_incl_tax",
+                "total_amount_usd": "invoice_total_incl_tax",
                 "vendor": "vendor_name",
                 "supplier": "supplier_name",
                 "recipient": "receiver_name",
@@ -1293,6 +1406,9 @@ class DataExtractionAgent(BaseAgent):
                 "ship_to": "delivery_address_line1",
                 "bill_to": "buyer_id",
                 "to": "supplier_id",
+                "order_total": "total_amount",
+                "total_amount_gbp": "total_amount",
+                "total_value": "total_amount",
             },
             "Quote": {
                 "quote_number": "quote_id",
@@ -1310,6 +1426,9 @@ class DataExtractionAgent(BaseAgent):
                 "total": "total_amount",
                 "grand_total": "total_amount_incl_tax",
                 "amount_due": "total_amount_incl_tax",
+                "quote_total": "total_amount",
+                "net_total": "total_amount",
+                "total_amount_gbp": "total_amount",
             },
             "Contract": {
                 "title": "contract_title",
@@ -1717,6 +1836,19 @@ class DataExtractionAgent(BaseAgent):
                 merged.append(merged_row)
         return merged
 
+    def _infer_currency(self, text: str, header: Dict[str, Any]) -> Optional[str]:
+        candidate = header.get("currency") or header.get("_currency_hint")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().upper()
+        text_upper = text.upper()
+        if "GBP" in text_upper or "£" in text:
+            return "GBP"
+        if "EUR" in text_upper or "€" in text:
+            return "EUR"
+        if "USD" in text_upper or "$" in text:
+            return "USD"
+        return None
+
     def _schema_verification_notes(
         self,
         doc_type: str,
@@ -1859,12 +1991,18 @@ class DataExtractionAgent(BaseAgent):
         # Step 3: layout-driven extraction for headers and line items
         header_layout = self._parse_header(text, file_bytes)
         header = {**header_layout, **header_seed}
+        inferred_currency = self._infer_currency(text, header)
+        if inferred_currency:
+            header.setdefault("currency", inferred_currency)
         line_items = line_items_seed or self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
 
         # Step 4: LLM strict fill for any remaining gaps
         header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
+        inferred_currency = self._infer_currency(text, header)
+        if inferred_currency:
+            header.setdefault("currency", inferred_currency)
         header = self._sanitize_party_names(header)
         if doc_type == "Contract":
             header = self._enrich_contract_fields(text, header)

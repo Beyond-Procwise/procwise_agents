@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from models.opportunity_priority_model import OpportunityPriorityModel
 from services.data_flow_manager import DataFlowManager
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
@@ -253,6 +254,7 @@ class Finding:
     feedback_user: Optional[str] = None
     feedback_metadata: Optional[Dict[str, Any]] = None
     is_rejected: bool = False
+    ml_priority_score: Optional[float] = None
 
     def as_dict(self) -> Dict:
         d = self.__dict__.copy()
@@ -298,6 +300,7 @@ class OpportunityMinerAgent(BaseAgent):
         self._data_flow_snapshot: Dict[str, Any] = {}
         self._supplier_flow_index: Dict[str, Dict[str, Any]] = {}
         self._supplier_flow_name_index: Dict[str, Dict[str, Any]] = {}
+        self._priority_model = OpportunityPriorityModel()
 
         # GPU configuration
         self.device = configure_gpu()
@@ -593,7 +596,7 @@ class OpportunityMinerAgent(BaseAgent):
         self, per_policy: Dict[str, List[Finding]]
     ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
 
-        """Limit retained findings to at most two per category for each policy."""
+        """Retain the top findings per policy while keeping category insights."""
 
         aggregated: List[Finding] = []
         seen_ids: set[str] = set()
@@ -619,29 +622,18 @@ class OpportunityMinerAgent(BaseAgent):
                 reverse=True,
             )
 
-            categories: Dict[str, List[Finding]] = {}
+            top_findings = sorted_items[:2]
+            policy_categories: Dict[str, List[Finding]] = {"all": top_findings}
+
             for finding in sorted_items:
                 cat_raw = finding.category_id
                 category = str(cat_raw).strip() if cat_raw else "uncategorized"
-                categories.setdefault(category, []).append(finding)
+                policy_categories.setdefault(category, []).append(finding)
 
-            limited_by_category: Dict[str, List[Finding]] = {}
-            for category, cat_findings in categories.items():
-                top = cat_findings[:2]
-                if top:
-                    limited_by_category[category] = top
+            per_policy[display] = top_findings
+            category_map[display] = policy_categories
 
-            if not limited_by_category:
-                limited_by_category["uncategorized"] = [sorted_items[0]]
-
-            flattened: List[Finding] = []
-            for bucket in limited_by_category.values():
-                flattened.extend(bucket)
-
-            per_policy[display] = flattened
-            category_map[display] = limited_by_category
-
-            for finding in flattened:
+            for finding in top_findings:
                 key = finding.opportunity_id or f"{display}:{id(finding)}"
                 if key in seen_ids:
                     continue
@@ -1052,9 +1044,15 @@ class OpportunityMinerAgent(BaseAgent):
     # ------------------------------------------------------------------
     def process(self, context: AgentContext) -> AgentOutput:
         try:
+            input_data = context.input_data or {}
+            input_keys = sorted(input_data.keys()) if isinstance(input_data, dict) else []
+            preview = ", ".join(input_keys[:5]) if input_keys else "none"
+            if len(input_keys) > 5:
+                preview = f"{preview}, …"
             logger.info(
-                "OpportunityMinerAgent starting processing with input %s",
-                context.input_data,
+                "OpportunityMinerAgent starting processing with %d input field(s): %s",
+                len(input_keys),
+                preview,
             )
             qe = getattr(self.agent_nick, "query_engine", None)
             if qe and hasattr(qe, "train_procurement_context"):
@@ -1336,6 +1334,15 @@ class OpportunityMinerAgent(BaseAgent):
                 per_policy_retained
             )
 
+            try:
+                scores = self._priority_model.assign_scores(
+                    [finding.financial_impact_gbp for finding in filtered]
+                )
+                for finding, score in zip(filtered, scores):
+                    finding.ml_priority_score = float(score)
+            except Exception:  # pragma: no cover - defensive scoring
+                logger.exception("Priority model scoring failed")
+
             filtered = self._enrich_findings(filtered, tables)
             filtered = self._map_item_descriptions(filtered, tables)
             self._load_supplier_risk_map()
@@ -1534,7 +1541,8 @@ class OpportunityMinerAgent(BaseAgent):
                 len(filtered),
                 len(supplier_candidates),
             )
-            logger.debug("OpportunityMinerAgent findings: %s", data["findings"])
+            if getattr(self.settings, "verbose_agent_debug", False):
+                logger.debug("OpportunityMinerAgent findings: %s", data["findings"])
             logger.info("OpportunityMinerAgent finishing processing")
 
             return AgentOutput(

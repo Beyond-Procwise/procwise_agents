@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     # RAG workflows.
     embedding_model: str = "multi-qa-mpnet-base-dot-v1"
     vector_size: int = 768
+    ollama_quantized_model: Optional[str] = Field(
+        default="llama3.2:8b-instruct-q4_K_M", env="OLLAMA_QUANTIZED_MODEL"
+    )
+    ollama_gpu_layers: Optional[int] = Field(
+        default=None, env="OLLAMA_GPU_LAYERS"
+    )
+    ollama_num_batch: Optional[int] = Field(default=256, env="OLLAMA_NUM_BATCH")
 
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']
@@ -79,6 +86,9 @@ class Settings(BaseSettings):
 
     # Learning and optimization
     enable_learning: bool = Field(default=False, env="ENABLE_LEARNING")
+    verbose_agent_debug: bool = Field(
+        default=False, env="VERBOSE_AGENT_DEBUG"
+    )
 
     # Caching settings
     cache_enabled: bool = Field(default=False, env="CACHE_ENABLED")
