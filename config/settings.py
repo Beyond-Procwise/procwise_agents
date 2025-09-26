@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
     ses_inbound_bucket: Optional[str] = Field(default=None, env="SES_INBOUND_BUCKET")
     ses_inbound_prefix: str = Field(default="ses/inbound/", env="SES_INBOUND_PREFIX")
+    ses_inbound_queue_url: Optional[str] = Field(default=None, env="SES_INBOUND_QUEUE_URL")
+    ses_inbound_queue_wait_seconds: int = Field(
+        default=2, env="SES_INBOUND_QUEUE_WAIT_SECONDS"
+    )
+    ses_inbound_queue_max_messages: int = Field(
+        default=10, env="SES_INBOUND_QUEUE_MAX_MESSAGES"
+    )
+    ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
     ses_secret_role_arn: Optional[str] = Field(
         default=None, env="SES_SECRET_ROLE_ARN"
