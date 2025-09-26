@@ -365,3 +365,4 @@ def test_email_watcher_downloads_and_decompresses_gzip():
 
     raw = watcher._download_object(DummyClient(), "ses/inbound/test.eml.gz")
     assert raw == b"raw email bytes"
+
