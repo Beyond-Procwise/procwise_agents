@@ -443,6 +443,218 @@ class DataExtractionAgent(BaseAgent):
         super().__init__(agent_nick)
         self.extraction_model = self.settings.extraction_model
 
+    # --------------------------------------------------------------------
+    # Regex-based header extraction
+    # --------------------------------------------------------------------
+    def _extract_header_regex(self, text: str, doc_type: str) -> Dict[str, Any]:
+        """
+        Best-effort extraction of key header fields using simple regular expressions.
+        This is designed as a complementary heuristic to the schema-aware and
+        LLM-based extraction methods.  It searches the raw text for common
+        procurement identifiers and dates and returns any matches.  If a value
+        cannot be parsed into a standard format (e.g. a date), the raw string
+        is returned as-is.
+
+        Parameters
+        ----------
+        text : str
+            The complete document text.
+        doc_type : str
+            The canonical document type: "Invoice", "Purchase_Order", "Quote", or "Contract".
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary of extracted header fields keyed by canonical column names.
+        """
+        header: Dict[str, Any] = {}
+        # Normalize whitespace for easier pattern matching
+        # We keep a copy of the original text for case-sensitive matches
+        clean_text = " ".join(text.split())
+        # Helper to parse dates if possible
+        def _parse_date(raw: str) -> str:
+            raw = raw.strip()
+            try:
+                # parser.parse is tolerant of various date formats
+                dt = parser.parse(raw, dayfirst=False, fuzzy=True)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                return raw
+
+        if doc_type == "Invoice":
+            # Invoice ID: look for strings like INV123456 or "Invoice No: 12345"
+            m = re.search(r"\bINV[-\w]*\d+\b", clean_text, re.I)
+            if m:
+                header.setdefault("invoice_id", m.group(0).strip())
+            # PO reference on invoice: e.g. "PO12345" or "PO 12345"
+            m = re.search(r"\bPO\s*[-]?\s*\d+\b", clean_text, re.I)
+            if m:
+                header.setdefault("po_id", m.group(0).replace(" ", "").upper())
+            # Invoice date
+            m = re.search(r"(?:invoice\s+date|date\s+of\s+invoice)[:\-\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("invoice_date", _parse_date(m.group(1)))
+            # Due date
+            m = re.search(r"(?:due\s+date|payment\s+due)[:\-\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("due_date", _parse_date(m.group(1)))
+            # Currency: look for currency symbols and map to ISO codes
+            if "$" in text:
+                header.setdefault("currency", "USD")
+            if "£" in text or "GBP" in text:
+                header.setdefault("currency", "GBP")
+            if "€" in text or "EUR" in text:
+                header.setdefault("currency", "EUR")
+            # Capture totals by matching patterns like "Total 1,404.77" or "Grand Total: 1404.77"
+            m = re.search(r"(?:grand\s+total|invoice\s+total|total\s+including\s+tax|amount\s+due)[:\s]*([\d,\.]+)", text, re.I)
+            if m:
+                header.setdefault("invoice_total_incl_tax", m.group(1).replace(",", "").strip())
+            # Subtotal / invoice amount (pre-tax)
+            m = re.search(r"(?:subtotal|invoice\s+amount)[:\s]*([\d,\.]+)", text, re.I)
+            if m:
+                header.setdefault("invoice_amount", m.group(1).replace(",", "").strip())
+            # Tax amount
+            m = re.search(r"(?:tax\s+amount|tax)[:\s]*([\d,\.]+)", text, re.I)
+            if m:
+                header.setdefault("tax_amount", m.group(1).replace(",", "").strip())
+        elif doc_type == "Purchase_Order":
+            # PO ID
+            m = re.search(r"\bPO\s*[-]?\s*\d+\b", clean_text, re.I)
+            if m:
+                header.setdefault("po_id", m.group(0).replace(" ", "").upper())
+            # Order date
+            m = re.search(r"(?:order\s+date|po\s+date|date)[:\-\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("order_date", _parse_date(m.group(1)))
+            # Expected delivery date
+            m = re.search(r"(?:expected\s+delivery\s+date|delivery\s+date|ship\s+date)[:\-\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("expected_delivery_date", _parse_date(m.group(1)))
+            # Quote reference on PO: QUT123456
+            m = re.search(r"\bQUT\s*[-]?\s*\d+\b", clean_text, re.I)
+            if m:
+                header.setdefault("contract_id", m.group(0).replace(" ", "").upper())
+            # Total amount
+            m = re.search(r"(?:total\s+amount|grand\s+total|order\s+total)[:\s]*([\d,\.]+)", text, re.I)
+            if m:
+                header.setdefault("total_amount", m.group(1).replace(",", "").strip())
+            # Currency
+            if "£" in text or "GBP" in text:
+                header.setdefault("currency", "GBP")
+            if "€" in text or "EUR" in text:
+                header.setdefault("currency", "EUR")
+            if "$" in text and header.get("currency", "") != "USD":
+                header.setdefault("currency", "USD")
+        elif doc_type == "Quote":
+            # Quote ID
+            m = re.search(r"\bQUT\s*[-]?\s*\d+\b", clean_text, re.I)
+            if m:
+                header.setdefault("quote_id", m.group(0).replace(" ", "").upper())
+            # Quote date
+            m = re.search(r"(?:quote\s+date|date)[:\-\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("quote_date", _parse_date(m.group(1)))
+            # Validity / expiry date
+            m = re.search(r"(?:valid\s+until|validity\s+date|expiry\s+date|expiring\s+on)[:\s]*([A-Za-z0-9,./\\-]+)", text, re.I)
+            if m:
+                header.setdefault("validity_date", _parse_date(m.group(1)))
+            # Currency
+            if "£" in text or "GBP" in text:
+                header.setdefault("currency", "GBP")
+            if "€" in text or "EUR" in text:
+                header.setdefault("currency", "EUR")
+            if "$" in text and header.get("currency", "") != "USD":
+                header.setdefault("currency", "USD")
+            # Total amount in quote
+            m = re.search(r"(?:total\s+amount|grand\s+total|amount\s+due)[:\s]*([\d,\.]+)", text, re.I)
+            if m:
+                header.setdefault("total_amount", m.group(1).replace(",", "").strip())
+        return header
+
+    # --------------------------------------------------------------------
+    # Regex-based line item extraction
+    # --------------------------------------------------------------------
+    def _extract_line_items_regex(self, text: str, doc_type: str) -> List[Dict[str, Any]]:
+        """
+        Extract line items from raw text using heuristic patterns.
+        This fallback method searches for lines that contain a description followed by
+        numeric values (quantity, price, totals).  It stops scanning when it
+        encounters common subtotal/total keywords defined in TOTALS_STOP_WORDS.
+
+        Parameters
+        ----------
+        text : str
+            The complete document text.
+        doc_type : str
+            The canonical document type: "Invoice", "Purchase_Order", or "Quote".
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            A list of dictionaries representing line items.
+        """
+        items: List[Dict[str, Any]] = []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        # Patterns for 4-col lines: description, quantity, unit_price, total
+        pat4 = re.compile(r"^(.+?)\s+(\d+)\s+([\d,\.]+)\s+([\d,\.]+)\s*$")
+        # Patterns for 3-col lines: description, quantity, total (no explicit unit price)
+        pat3 = re.compile(r"^(.+?)\s+(\d+)\s+([\d,\.]+)\s*$")
+        for raw in lines:
+            # Stop if this line is a subtotal or total row
+            if TOTALS_STOP_WORDS.search(raw):
+                break
+            m4 = pat4.match(raw)
+            m3 = pat3.match(raw) if not m4 else None
+            if m4:
+                desc, qty, unit, total = m4.groups()
+                item: Dict[str, Any] = {}
+                item["item_description"] = desc.strip()
+                try:
+                    item["quantity"] = int(qty)
+                except Exception:
+                    item["quantity"] = qty.strip()
+                # Normalize numeric strings: remove commas and currency symbols
+                def _norm_num(val: str) -> str:
+                    return re.sub(r"[^0-9.]", "", val)
+                unit_price = _norm_num(unit)
+                total_amount = _norm_num(total)
+                if doc_type == "Invoice":
+                    item["unit_price"] = unit_price
+                    item["line_amount"] = total_amount
+                    item["total_amount_incl_tax"] = total_amount
+                elif doc_type == "Purchase_Order":
+                    # In POs, treat unit price as both unit_price and line_total
+                    item["unit_price"] = unit_price
+                    item["line_total"] = total_amount
+                    item["total_amount"] = total_amount
+                elif doc_type == "Quote":
+                    item["unit_price"] = unit_price
+                    item["total_amount"] = total_amount
+                items.append(item)
+            elif m3:
+                desc, qty, amount = m3.groups()
+                item = {}
+                item["item_description"] = desc.strip()
+                try:
+                    item["quantity"] = int(qty)
+                except Exception:
+                    item["quantity"] = qty.strip()
+                def _norm_num(val: str) -> str:
+                    return re.sub(r"[^0-9.]", "", val)
+                amount_clean = _norm_num(amount)
+                if doc_type == "Invoice":
+                    # Without unit price, treat value as line_amount and total
+                    item["line_amount"] = amount_clean
+                    item["total_amount_incl_tax"] = amount_clean
+                elif doc_type == "Purchase_Order":
+                    item["line_total"] = amount_clean
+                    item["total_amount"] = amount_clean
+                    item["unit_price"] = amount_clean
+                elif doc_type == "Quote":
+                    item["total_amount"] = amount_clean
+                items.append(item)
+        return items
+
     # ============================ PUBLIC API ==============================
     def run(self, context: AgentContext) -> AgentOutput:
         try:
@@ -1616,6 +1828,18 @@ class DataExtractionAgent(BaseAgent):
         structured = extract_structured_content(text, doc_type)
         header_seed = self._normalize_header_fields(structured.get("header", {}), doc_type)
         line_items_seed = self._normalize_line_item_fields(structured.get("line_items", []), doc_type)
+
+        # Supplement seeds with regex-based extraction prior to JSONification/LLM
+        try:
+            regex_header = self._extract_header_regex(text, doc_type)
+            if regex_header:
+                header_seed = self._merge_record_fields(header_seed, regex_header)
+            regex_lines = self._extract_line_items_regex(text, doc_type)
+            if regex_lines:
+                line_items_seed = self._merge_line_items(line_items_seed, regex_lines)
+        except Exception:
+            # Ensure regex extraction does not break pipeline
+            pass
 
         # Step 2: lightweight JSONifier to catch explicit key:value pairs
         data = convert_document_to_json(text, doc_type)
