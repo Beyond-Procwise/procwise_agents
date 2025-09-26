@@ -24,6 +24,8 @@ class RAGAgent(BaseAgent):
         "knowledge_graph_relation",
         "knowledge_graph_path",
         "supplier_flow",
+        "supplier_relationship",
+        "supplier_relationship_overview",
         "procurement_flow",
     )
 
@@ -79,6 +81,23 @@ class RAGAgent(BaseAgent):
                 if h.id not in seen_ids:
                     search_hits.append(h)
                     seen_ids.add(h.id)
+
+        if not doc_type and not any(
+            (getattr(hit, "payload", {}) or {}).get("document_type") == "supplier_relationship"
+            for hit in search_hits
+        ):
+            supplier_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document_type", match=models.MatchValue(value="supplier_relationship")
+                    )
+                ]
+            )
+            targeted_hits = self.rag_service.search(query, top_k=top_k, filters=supplier_filter)
+            for hit in targeted_hits:
+                if hit.id not in seen_ids:
+                    search_hits.append(hit)
+                    seen_ids.add(hit.id)
 
         documents, knowledge_hits = self._categorize_hits(search_hits)
         reranked_docs = self._rerank(query, documents, top_k) if documents else []
@@ -472,6 +491,64 @@ class RAGAgent(BaseAgent):
                     summaries.append(
                         "Supplier flow: " + ", ".join(parts).rstrip(", ") + "."
                     )
+                mapping_summary = payload.get("mapping_summary")
+                if isinstance(mapping_summary, list):
+                    for statement in mapping_summary:
+                        if isinstance(statement, str) and statement.strip():
+                            summaries.append(statement.strip().rstrip(".") + ".")
+            elif doc_type == "supplier_relationship":
+                statements = payload.get("relationship_statements")
+                if isinstance(statements, list) and statements:
+                    for statement in statements:
+                        if isinstance(statement, str) and statement.strip():
+                            summaries.append(statement.strip().rstrip(".") + ".")
+                summary_text = payload.get("summary") or payload.get("content")
+                if isinstance(summary_text, str) and summary_text.strip():
+                    summaries.append(self._truncate_text(summary_text.strip()))
+            elif doc_type == "supplier_relationship_overview":
+                total_suppliers = payload.get("total_suppliers")
+                average_cov = payload.get("average_coverage_ratio")
+                line = "Supplier relationship overview"
+                if isinstance(total_suppliers, (int, float)):
+                    line += f" covering {int(total_suppliers)} suppliers"
+                if isinstance(average_cov, (int, float)):
+                    line += f" with average coverage {average_cov * 100:.1f}%"
+                summaries.append(line.strip() + ".")
+                statements = payload.get("relationship_statements")
+                if isinstance(statements, list):
+                    for statement in statements:
+                        if isinstance(statement, str) and statement.strip():
+                            summaries.append(statement.strip().rstrip(".") + ".")
+                top_coverage = payload.get("top_suppliers_by_coverage")
+                if isinstance(top_coverage, list) and top_coverage:
+                    highlights: List[str] = []
+                    for item in top_coverage[:3]:
+                        if not isinstance(item, dict):
+                            continue
+                        supplier = item.get("supplier_name") or item.get("supplier_id")
+                        coverage = item.get("coverage_ratio")
+                        if supplier:
+                            if isinstance(coverage, (int, float)):
+                                highlights.append(f"{supplier} ({coverage * 100:.1f}% coverage)")
+                            else:
+                                highlights.append(str(supplier))
+                    if highlights:
+                        summaries.append("Highest coverage suppliers: " + ", ".join(highlights) + ".")
+                top_spend = payload.get("top_suppliers_by_spend")
+                if isinstance(top_spend, list) and top_spend:
+                    spend_highlights: List[str] = []
+                    for item in top_spend[:3]:
+                        if not isinstance(item, dict):
+                            continue
+                        supplier = item.get("supplier_name") or item.get("supplier_id")
+                        spend_value = item.get("total_value_gbp")
+                        if supplier:
+                            if isinstance(spend_value, (int, float)):
+                                spend_highlights.append(f"{supplier} ({spend_value:,.2f} GBP)")
+                            else:
+                                spend_highlights.append(str(supplier))
+                    if spend_highlights:
+                        summaries.append("Top spend suppliers: " + ", ".join(spend_highlights) + ".")
             elif doc_type.startswith("knowledge_graph"):
                 source = payload.get("source_table") or payload.get("path")
                 relationship = payload.get("relationship_type") or "relationship"

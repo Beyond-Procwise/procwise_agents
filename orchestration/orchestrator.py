@@ -20,6 +20,7 @@ from agents.base_agent import AgentContext, AgentStatus
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from services.process_routing_service import ProcessRoutingService
+from services.backend_scheduler import BackendScheduler
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 class Orchestrator:
-    """Main orchestrator for managing agent workflows"""
 
     # Default workflow hints for agents that historically relied on implicit
     # orchestration metadata.  Older process definitions for the opportunity
@@ -78,6 +78,7 @@ class Orchestrator:
         self.routing_engine = agent_nick.routing_engine
         self.routing_model = self.routing_engine.routing_model
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
+        self.backend_scheduler = BackendScheduler.ensure(agent_nick)
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
 
@@ -149,8 +150,6 @@ class Orchestrator:
             )
 
             training_service = self._get_model_training_service()
-            if training_service is not None:
-                training_service.dispatch_due_jobs()
 
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
@@ -426,7 +425,6 @@ class Orchestrator:
                 logger.exception("Failed to initialise model training service")
                 return None
         return service
-
 
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:

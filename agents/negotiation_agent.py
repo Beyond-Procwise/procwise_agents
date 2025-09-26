@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from services.supplier_relationship_service import SupplierRelationshipService
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,16 @@ class NegotiationAgent(BaseAgent):
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load supplier negotiation context")
 
+        relationship_service = SupplierRelationshipService(self.agent_nick)
+        relationship_payloads = relationship_service.fetch_relationship(
+            supplier_id=supplier_id,
+            supplier_name=supplier_name_hint,
+            limit=1,
+        )
+        if relationship_payloads:
+            summary["relationship"] = relationship_payloads[0]
+            summary["relationships"] = relationship_payloads
+
         return summary
 
     def _row_to_dict(self, cursor, row) -> Dict[str, Any]:
@@ -491,6 +502,18 @@ class NegotiationAgent(BaseAgent):
                     lines.append(note.strip())
         elif isinstance(additional_points, str) and additional_points.strip():
             lines.append(additional_points.strip())
+
+        relationship = supplier_context.get("relationship") or {}
+        coverage = relationship.get("coverage_ratio")
+        if isinstance(coverage, (int, float)) and coverage:
+            lines.append(
+                f"Supplier data coverage across contracts, purchase orders, invoices and quotes stands at {coverage:.2f}."
+            )
+        statements = relationship.get("relationship_statements")
+        if isinstance(statements, list):
+            for statement in statements:
+                if isinstance(statement, str) and statement.strip():
+                    lines.append(statement.strip())
 
         return lines
 
