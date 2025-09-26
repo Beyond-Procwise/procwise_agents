@@ -1,5 +1,3 @@
-"""Model training scheduler integrating workflow outputs with policy definitions."""
-
 from __future__ import annotations
 
 import json

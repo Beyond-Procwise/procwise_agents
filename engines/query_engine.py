@@ -18,6 +18,9 @@ import pandas as pd
 from .base_engine import BaseEngine
 from utils.db import read_sql_compat
 from utils.gpu import configure_gpu
+import services.data_flow_manager as data_flow_module
+import services.rag_service as rag_module
+import services.supplier_relationship_service as supplier_rel_module
 
 logger = logging.getLogger(__name__)
 
@@ -664,7 +667,7 @@ class QueryEngine(BaseEngine):
                 f"line {row.invoice_line_id}."
             )
 
-        rag = RAGService(self.agent_nick)
+        rag = rag_module.RAGService(self.agent_nick)
         rag.upsert_texts(summaries, metadata={"record_id": "procurement_flow"})
 
     # ------------------------------------------------------------------
@@ -673,10 +676,7 @@ class QueryEngine(BaseEngine):
     def train_procurement_context(self) -> pd.DataFrame:
         """Embed procurement tables, flows and knowledge graph for agent training."""
 
-        from services.data_flow_manager import DataFlowManager
-        from services.rag_service import RAGService
-
-        rag = RAGService(self.agent_nick)
+        rag = rag_module.RAGService(self.agent_nick)
         schema_descriptions: list[str] = []
         tables: dict[str, pd.DataFrame] = {}
         table_name_map: dict[str, str] = {}
@@ -721,11 +721,15 @@ class QueryEngine(BaseEngine):
         graph: dict[str, object] | None = None
         if tables:
             try:
-                manager = DataFlowManager(self.agent_nick)
+                manager = data_flow_module.DataFlowManager(self.agent_nick)
                 relations, graph = manager.build_data_flow_map(
                     tables, table_name_map=table_name_map
                 )
                 manager.persist_knowledge_graph(relations, graph)
+                supplier_flows = (graph or {}).get("supplier_flows") if graph else None
+                if supplier_flows:
+                    relationship_service = supplier_rel_module.SupplierRelationshipService(self.agent_nick)
+                    relationship_service.index_supplier_flows(supplier_flows)
             except Exception:
                 logger.exception("Failed to build or persist procurement knowledge graph")
 

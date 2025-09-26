@@ -468,6 +468,7 @@ class DataFlowManager:
                     "document_type": "supplier_flow",
                     "supplier_id": flow.get("supplier_id"),
                     "supplier_name": flow.get("supplier_name"),
+                    "supplier_name_normalized": self._normalise_key(flow.get("supplier_name")),
                     "coverage_ratio": flow.get("coverage_ratio"),
                 }
                 payload["summary"] = text
