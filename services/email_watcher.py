@@ -66,11 +66,33 @@ def _strip_html(value: str) -> str:
 
     if not value:
         return ""
+
+    # Preserve hidden RFQ annotations injected as HTML comments so that
+    # downstream RFQ pattern matching still works even when the supplier
+    # replies without keeping the identifier in the visible text.
+    comment_matches = re.findall(
+        r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->",
+        value,
+        flags=re.IGNORECASE,
+    )
+
     # Basic tag removal keeps the implementation lightweight without
     # introducing heavy dependencies such as BeautifulSoup for tests.
-    cleaned = re.sub(r"<\s*(script|style).*?>.*?<\s*/\s*\1\s*>", " ", value, flags=re.I | re.S)
+    cleaned = re.sub(
+        r"<\s*(script|style).*?>.*?<\s*/\s*\1\s*>",
+        " ",
+        value,
+        flags=re.I | re.S,
+    )
+    cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
+
+    if comment_matches:
+        # Prepend extracted identifiers to ensure they survive whitespace
+        # normalisation and can be detected by the RFQ regex.
+        return " ".join(comment_matches + [cleaned.strip()]).strip()
+
     return cleaned.strip()
 
 
