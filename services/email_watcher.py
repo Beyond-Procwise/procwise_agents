@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import gzip
+import imaplib
 import logging
 import re
 import time
@@ -66,11 +69,33 @@ def _strip_html(value: str) -> str:
 
     if not value:
         return ""
+
+    # Preserve hidden RFQ annotations injected as HTML comments so that
+    # downstream RFQ pattern matching still works even when the supplier
+    # replies without keeping the identifier in the visible text.
+    comment_matches = re.findall(
+        r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->",
+        value,
+        flags=re.IGNORECASE,
+    )
+
     # Basic tag removal keeps the implementation lightweight without
     # introducing heavy dependencies such as BeautifulSoup for tests.
-    cleaned = re.sub(r"<\s*(script|style).*?>.*?<\s*/\s*\1\s*>", " ", value, flags=re.I | re.S)
+    cleaned = re.sub(
+        r"<\s*(script|style).*?>.*?<\s*/\s*\1\s*>",
+        " ",
+        value,
+        flags=re.I | re.S,
+    )
+    cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
+
+    if comment_matches:
+        # Prepend extracted identifiers to ensure they survive whitespace
+        # normalisation and can be detected by the RFQ regex.
+        return " ".join(comment_matches + [cleaned.strip()]).strip()
+
     return cleaned.strip()
 
 
@@ -130,8 +155,38 @@ class SESEmailWatcher:
         )
         self.prefix = getattr(self.settings, "ses_inbound_prefix", "ses/inbound/")
 
-        # Lazily created S3 client to avoid mandatory AWS credentials during unit tests.
-        self._s3_client = None
+        # Optional IMAP fallback configuration for mailboxes that are not
+        # integrated with SES inbound rulesets (e.g. Microsoft 365 shared
+        # mailboxes). All attributes default to ``None`` or sensible values so
+        # existing deployments continue to rely on SES unless explicitly
+        # configured otherwise.
+        self._imap_host = getattr(self.settings, "imap_host", None)
+        self._imap_user = getattr(self.settings, "imap_user", None)
+        self._imap_password = getattr(self.settings, "imap_password", None)
+        self._imap_port = self._coerce_int(
+            getattr(self.settings, "imap_port", 993), default=993, minimum=1
+        )
+        self._imap_folder = getattr(self.settings, "imap_folder", "INBOX") or "INBOX"
+        self._imap_search = getattr(self.settings, "imap_search_criteria", "UNSEEN") or "UNSEEN"
+        self._imap_use_ssl = bool(getattr(self.settings, "imap_use_ssl", True))
+        self._imap_mark_seen = bool(getattr(self.settings, "imap_mark_seen", True))
+        self._imap_batch_size = self._coerce_int(
+            getattr(self.settings, "imap_batch_size", 25), default=25, minimum=1
+        )
+
+        # Prefer reusing the orchestrator's S3 client so we respect any
+        # endpoint overrides or credential sources initialised during startup.
+        shared_client = getattr(agent_nick, "s3_client", None)
+        self._s3_client = shared_client if shared_client is not None else None
+        self._s3_role_arn = (
+            getattr(self.settings, "ses_inbound_role_arn", None)
+            or getattr(self.settings, "ses_secret_role_arn", None)
+        )
+        if self._s3_role_arn:
+            # When a dedicated role is configured we assume it lazily on the
+            # first request to guarantee the mailbox bucket permissions are in
+            # place even if a shared client exists without the required rights.
+            self._s3_client = None
 
         logger.info(
             "Initialised email watcher for mailbox %s (bucket=%s, prefix=%s, poll_interval=%ss)",
@@ -169,8 +224,10 @@ class SESEmailWatcher:
         )
 
         try:
-            loader = self._custom_loader or self._load_from_s3
-            messages = loader(limit)
+            if self._custom_loader is not None:
+                messages = self._custom_loader(limit)
+            else:
+                messages = self._load_messages(limit, mark_seen=True)
         except Exception:  # pragma: no cover - network/runtime
             logger.exception("Failed to load inbound SES messages")
             return results
@@ -260,6 +317,38 @@ class SESEmailWatcher:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def peek_recent_messages(self, limit: int = 3) -> List[Dict[str, object]]:
+        """Return a non-destructive preview of the most recent inbound emails."""
+
+        try:
+            limit_int = max(0, int(limit))
+        except Exception:
+            limit_int = 3
+
+        if limit_int == 0:
+            return []
+
+        if self._custom_loader is not None:
+            messages = self._custom_loader(limit_int)
+        else:
+            messages = self._load_messages(limit_int, mark_seen=False)
+
+        preview: List[Dict[str, object]] = []
+        for message in messages[:limit_int]:
+            body = str(message.get("body") or "")
+            snippet = re.sub(r"\s+", " ", body).strip()
+            preview.append(
+                {
+                    "id": message.get("id"),
+                    "subject": message.get("subject"),
+                    "from": message.get("from"),
+                    "rfq_id": message.get("rfq_id"),
+                    "received_at": message.get("received_at"),
+                    "snippet": snippet[:160],
+                }
+            )
+        return preview
+
     def _process_message(self, message: Dict[str, object]) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
         body = str(message.get("body", ""))
@@ -421,6 +510,30 @@ class SESEmailWatcher:
 
         return details
 
+    def _load_messages(self, limit: Optional[int], *, mark_seen: bool) -> List[Dict[str, object]]:
+        messages: List[Dict[str, object]] = []
+
+        s3_limit = limit
+        if self.bucket:
+            s3_messages = self._load_from_s3(s3_limit)
+            messages.extend(s3_messages)
+
+        remaining = None if limit is None else max(limit - len(messages), 0)
+        if remaining == 0:
+            return messages[: limit or None]
+
+        if self._imap_configured():
+            imap_messages = self._load_from_imap(
+                remaining if remaining is not None and remaining > 0 else None,
+                mark_seen=mark_seen,
+            )
+            messages.extend(imap_messages)
+
+        if limit is not None and len(messages) > limit:
+            return messages[:limit]
+
+        return messages
+
     def _load_from_s3(self, limit: Optional[int] = None) -> List[Dict[str, object]]:
         if not self.bucket:
             logger.warning("SES inbound bucket not configured; skipping poll")
@@ -461,10 +574,146 @@ class SESEmailWatcher:
                     return messages
         return messages
 
+    def _load_from_imap(
+        self,
+        limit: Optional[int] = None,
+        *,
+        mark_seen: bool = False,
+    ) -> List[Dict[str, object]]:
+        if not self._imap_configured():
+            logger.debug(
+                "IMAP mailbox not configured; skipping fallback for %s",
+                self.mailbox_address,
+            )
+            return []
+
+        mailbox = self._imap_folder
+        search_criteria = self._imap_search
+        fetch_cap = limit if limit is not None else self._imap_batch_size
+
+        messages: List[Dict[str, object]] = []
+        try:
+            if self._imap_use_ssl:
+                client = imaplib.IMAP4_SSL(self._imap_host, self._imap_port)
+            else:
+                client = imaplib.IMAP4(self._imap_host, self._imap_port)
+        except Exception:
+            logger.exception(
+                "Failed to connect to IMAP server %s for mailbox %s",
+                self._imap_host,
+                self.mailbox_address,
+            )
+            return []
+
+        try:
+            client.login(self._imap_user, self._imap_password)
+        except Exception:
+            logger.exception(
+                "Failed to authenticate to IMAP mailbox %s", self.mailbox_address
+            )
+            with contextlib.suppress(Exception):
+                client.logout()
+            return []
+
+        try:
+            status, _ = client.select(mailbox)
+            if status != "OK":
+                logger.warning(
+                    "IMAP select failed for mailbox %s (folder %s): %s",
+                    self.mailbox_address,
+                    mailbox,
+                    status,
+                )
+                return []
+            status, data = client.search(None, search_criteria)
+            if status != "OK":
+                logger.warning(
+                    "IMAP search with criteria %s failed for mailbox %s: %s",
+                    search_criteria,
+                    self.mailbox_address,
+                    status,
+                )
+                return []
+
+            raw_ids = data[0].split() if data else []
+            if not raw_ids:
+                return []
+
+            # Fetch newest messages first.
+            raw_ids = list(reversed(raw_ids))
+            if fetch_cap is not None:
+                raw_ids = raw_ids[: max(fetch_cap, 0)]
+
+            for msg_num in raw_ids:
+                if limit is not None and len(messages) >= limit:
+                    break
+                try:
+                    status, parts = client.fetch(msg_num, "(RFC822 UID)")
+                except Exception:
+                    logger.exception(
+                        "Failed to fetch IMAP message %s for mailbox %s",
+                        msg_num,
+                        self.mailbox_address,
+                    )
+                    continue
+                if status != "OK" or not parts:
+                    continue
+
+                raw_bytes = None
+                uid = None
+                for part in parts:
+                    if not isinstance(part, tuple):
+                        continue
+                    header = part[0]
+                    if isinstance(header, bytes):
+                        header = header.decode(errors="ignore")
+                    match = re.search(r"UID (\d+)", str(header))
+                    if match:
+                        uid = match.group(1)
+                    raw_bytes = part[1]
+                    break
+
+                if raw_bytes is None:
+                    continue
+
+                parsed = self._parse_email(raw_bytes)
+                identifier = uid or parsed.get("message_id") or msg_num.decode(errors="ignore").strip()
+                if not identifier:
+                    identifier = str(uuid.uuid4())
+                store_key = f"imap:{identifier}"
+                if self.state_store and store_key in self.state_store:
+                    continue
+
+                parsed["id"] = store_key
+                messages.append(parsed)
+
+                if mark_seen and self._imap_mark_seen:
+                    try:
+                        client.store(msg_num, "+FLAGS", "(\\Seen)")
+                    except Exception:
+                        logger.debug("Failed to mark IMAP message %s as seen", msg_num, exc_info=True)
+
+        finally:
+            with contextlib.suppress(Exception):
+                client.logout()
+
+        return messages
+
     def _download_object(self, client, key: str) -> Optional[bytes]:
         try:
             response = client.get_object(Bucket=self.bucket, Key=key)
-            return response["Body"].read()
+            body = response["Body"].read()
+            encoding = str(response.get("ContentEncoding", "") or "").lower()
+            key_lower = key.lower()
+            if encoding == "gzip" or key_lower.endswith(".gz"):
+                try:
+                    body = gzip.decompress(body)
+                except OSError:
+                    logger.warning(
+                        "Failed to decompress gzip payload for %s; using raw bytes",
+                        key,
+                    )
+            return body
         except Exception:  # pragma: no cover - network/runtime
             logger.exception("Failed to download SES message %s", key)
             return None
@@ -482,6 +731,7 @@ class SESEmailWatcher:
             "body": body,
             "rfq_id": rfq_id,
             "received_at": message.get("date"),
+            "message_id": message.get("message-id"),
             "recipients": recipients,
         }
 
@@ -517,12 +767,54 @@ class SESEmailWatcher:
         return match.group(0) if match else None
 
     def _get_s3_client(self):
-        if self._s3_client is None:
-            client_kwargs = {}
-            if self.region:
-                client_kwargs["region_name"] = self.region
-            self._s3_client = boto3.client("s3", **client_kwargs)
+        if self._s3_client is not None:
+            return self._s3_client
+
+        shared_client = getattr(self.agent_nick, "s3_client", None)
+        if shared_client is not None and self._s3_role_arn is None:
+            self._s3_client = shared_client
+            return self._s3_client
+
+        client_kwargs = {}
+        if self.region:
+            client_kwargs["region_name"] = self.region
+
+        if self._s3_role_arn:
+            try:
+                self._s3_client = self._s3_client_with_assumed_role(client_kwargs)
+                return self._s3_client
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Unable to assume role %s for inbound S3 access; falling back to default credentials",
+                    self._s3_role_arn,
+                )
+
+        self._s3_client = boto3.client("s3", **client_kwargs)
         return self._s3_client
+
+    def _s3_client_with_assumed_role(self, client_kwargs):
+        sts_kwargs = {"region_name": self.region} if self.region else {}
+        sts_client = boto3.client("sts", **sts_kwargs)
+        session_name = f"ProcWiseEmailWatcher-{uuid.uuid4().hex[:8]}"
+        response = sts_client.assume_role(
+            RoleArn=self._s3_role_arn,
+            RoleSessionName=session_name,
+        )
+        credentials = response.get("Credentials")
+        if not credentials:
+            raise ValueError("AssumeRole response missing credentials")
+        access_key = credentials.get("AccessKeyId")
+        secret_key = credentials.get("SecretAccessKey")
+        token = credentials.get("SessionToken")
+        if not all([access_key, secret_key, token]):
+            raise ValueError("Incomplete credentials returned from AssumeRole")
+        return boto3.client(
+            "s3",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=token,
+            **client_kwargs,
+        )
 
     @staticmethod
     def _parse_region(endpoint: str) -> Optional[str]:
@@ -530,4 +822,17 @@ class SESEmailWatcher:
         if match:
             return match.group(1)
         return None
+
+    def _imap_configured(self) -> bool:
+        return bool(self._imap_host and self._imap_user and self._imap_password)
+
+    @staticmethod
+    def _coerce_int(value, *, default: int, minimum: Optional[int] = None) -> int:
+        try:
+            coerced = int(value)
+        except Exception:
+            coerced = default
+        if minimum is not None:
+            coerced = max(coerced, minimum)
+        return coerced
 

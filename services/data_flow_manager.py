@@ -431,6 +431,7 @@ class DataFlowManager:
                 payload["target_table_alias"] = relation.get("target_table_alias")
             payload = self._sanitize_payload(payload)
             payload = self._enforce_payload_limits(payload)
+
             points_by_id[point_id] = models.PointStruct(
                 id=point_id, vector=vector, payload=payload
             )
@@ -462,6 +463,7 @@ class DataFlowManager:
 
                 payload = self._sanitize_payload(payload)
                 payload = self._enforce_payload_limits(payload)
+
                 points_by_id[point_id] = models.PointStruct(
                     id=point_id, vector=vector, payload=payload
                 )
@@ -1088,6 +1090,7 @@ class DataFlowManager:
         if "document_type" not in minimal and doc_type:
             minimal["document_type"] = doc_type
         return minimal
+
 
     def _format_timestamp(self, value: Any) -> Optional[str]:
         if value is None:
@@ -1785,6 +1788,7 @@ class DataFlowManager:
             "vector": list(getattr(point, "vector", []) or []),
             "payload": getattr(point, "payload", {}) or {},
         }
+
 
     def _relation_to_text(self, relation: Dict[str, Any]) -> str:
         source = relation.get("source_table")
