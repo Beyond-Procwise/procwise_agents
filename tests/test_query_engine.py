@@ -415,10 +415,23 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
     import services.rag_service as rag_module
     import services.data_flow_manager as df_module
     import engines.query_engine as qe_module
+    import services.procurement_knowledge_service as pk_module
+
+    class DummyKnowledgeService:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load_briefs(self):
+            captured["knowledge_loaded"] = True
+            return [types.SimpleNamespace(identifier="brief-1", title="t", summary="s")]
+
+        def embed_briefs(self, briefs):
+            captured["knowledge_embedded"] = [b.identifier for b in briefs]
 
     monkeypatch.setattr(rag_module, "RAGService", DummyRAG)
     monkeypatch.setattr(df_module, "DataFlowManager", DummyManager)
     monkeypatch.setattr(qe_module, "read_sql_compat", fake_read_sql)
+    monkeypatch.setattr(pk_module, "ProcurementKnowledgeService", DummyKnowledgeService)
 
     engine.train_procurement_context()
 
@@ -429,6 +442,8 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
     assert captured["table_name_map"]["contracts"] == "proc.contracts"
     assert captured["persist"][0][0]["status"] == "linked"
     assert captured["embed"] is True
+    assert captured["knowledge_loaded"] is True
+    assert captured["knowledge_embedded"] == ["brief-1"]
 
 
 class DummyContext:

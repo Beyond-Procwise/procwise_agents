@@ -72,7 +72,7 @@ class DummyNick:
     def __init__(self):
         self.policy_engine = PolicyEngine(policy_rows=_supplier_policy_rows())
         self.settings = SimpleNamespace(
-            extraction_model="llama3", script_user="tester"
+            extraction_model="gpt-oss", script_user="tester"
         )
         # Minimal query engine stub for agent initialisation
         self.query_engine = SimpleNamespace(
@@ -210,7 +210,7 @@ def test_supplier_ranking_injects_missing_candidates(monkeypatch):
             return pd.DataFrame()
 
     nick = SimpleNamespace(
-        settings=SimpleNamespace(extraction_model="llama3", script_user="tester"),
+        settings=SimpleNamespace(extraction_model="gpt-oss", script_user="tester"),
         policy_engine=StubPolicyEngine(),
         query_engine=StubQueryEngine(),
     )
@@ -369,7 +369,7 @@ def test_supplier_ranking_limits_to_opportunity_directory(monkeypatch):
             return pd.DataFrame()
 
     nick = SimpleNamespace(
-        settings=SimpleNamespace(extraction_model="llama3", script_user="tester"),
+        settings=SimpleNamespace(extraction_model="gpt-oss", script_user="tester"),
         policy_engine=StubPolicyEngine(),
         query_engine=StubQueryEngine(),
     )
@@ -466,7 +466,7 @@ def test_supplier_ranking_instruction_overrides(monkeypatch):
             return pd.DataFrame()
 
     nick = SimpleNamespace(
-        settings=SimpleNamespace(extraction_model="llama3", script_user="tester"),
+        settings=SimpleNamespace(extraction_model="gpt-oss", script_user="tester"),
         policy_engine=StubPolicyEngine(),
         query_engine=StubQueryEngine(),
     )

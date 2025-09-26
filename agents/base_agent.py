@@ -156,7 +156,7 @@ class BaseAgent:
         on GPU-enabled systems.  When ``messages`` is provided the ``prompt`` is
         ignored.
         """
-        base_model = getattr(self.settings, "extraction_model", "llama3")
+        base_model = getattr(self.settings, "extraction_model", "gpt-oss")
         quantized = getattr(self.settings, "ollama_quantized_model", None)
 
         missing_models = getattr(self, "_missing_ollama_models", None)
@@ -175,12 +175,22 @@ class BaseAgent:
         num_batch = getattr(self.settings, "ollama_num_batch", None)
         if num_batch is not None:
             optimized_defaults["num_batch"] = int(num_batch)
+        context_window = getattr(self.settings, "ollama_context_window", None)
+        if context_window:
+            optimized_defaults["num_ctx"] = int(context_window)
         optimized_defaults.setdefault("num_thread", max(1, os.cpu_count() or 1))
         optimized_defaults.setdefault(
             "num_gpu", max(1, int(os.getenv("OLLAMA_NUM_GPU", "1")))
         )
         for key, value in optimized_defaults.items():
             options.setdefault(key, value)
+
+        tokenizer = getattr(self.settings, "ollama_tokenizer", None)
+        if tokenizer:
+            options.setdefault("tokenizer", tokenizer)
+        adapter = getattr(self.settings, "ollama_adapter", None)
+        if adapter:
+            options.setdefault("adapter", adapter)
 
         candidate_models: List[tuple[str, bool]] = []
         if (

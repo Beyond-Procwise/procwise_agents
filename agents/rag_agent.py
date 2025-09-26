@@ -156,7 +156,8 @@ class RAGAgent(BaseAgent):
 
         rag_prompt = (
             "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
-            "the USER QUESTION. if required use external knowledge beyond the context only related to procurement process.\n\n"
+            "the USER QUESTION. If you must rely on prior knowledge, limit it strictly to procurement topics and never infer "
+            "or manipulate customer-specific data beyond what is explicitly provided.\n\n"
             "Instructions:\n"
             "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
             "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"

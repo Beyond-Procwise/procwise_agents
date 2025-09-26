@@ -59,7 +59,11 @@ class RAGPipeline:
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         self.default_llm_model = settings.extraction_model
         self.rag = RAGService(agent_nick)
-        model_name = getattr(self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        model_name = getattr(
+            self.settings,
+            "reranker_model",
+            "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        )
         self._reranker = cross_encoder_cls(model_name, device=self.agent_nick.device)
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
@@ -92,8 +96,9 @@ class RAGPipeline:
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
         system = (
-            "You are a helpful assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
-            "where 'follow_ups' is a list of 3 to 5 short questions."
+            "You are a procurement-focused assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
+            "where 'follow_ups' is a list of 3 to 5 short questions. Use only the supplied context, "
+            "external procurement knowledge, and never manipulate or infer customer data beyond the prompt." 
         )
         messages = [
             {"role": "system", "content": system},
@@ -152,7 +157,7 @@ class RAGPipeline:
         ad_hoc_context = "\n\n".join(ad_hoc_context)
 
         # --- Retrieve from Vector DB ---
-        top_k = 5
+        top_k = 6
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
         retrieved_context = "\n---\n".join(
             [
@@ -176,6 +181,7 @@ class RAGPipeline:
                     "retrieved_documents": [],
                 }
             prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
+Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
@@ -199,6 +205,7 @@ class RAGPipeline:
 
         # When documents are found, prioritise them over chat history
         prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
+Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}

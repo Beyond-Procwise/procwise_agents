@@ -17,7 +17,7 @@ class DummyNick:
     def __init__(self):
         self.settings = SimpleNamespace(
             qdrant_collection_name="dummy",
-            extraction_model="llama3",
+            extraction_model="gpt-oss",
             script_user="tester",
             ses_default_sender="noreply@example.com",
         )

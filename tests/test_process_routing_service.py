@@ -160,7 +160,7 @@ def test_convert_agents_to_flow_normalises_properties():
                 "agent": "A1",
                 "status": "saved",
                 "agent_property": {
-                    "llm": "llama3.2:latest",
+                    "llm": "gpt-oss:latest",
                     "memory": "3.2B",
                     "prompts": ["1", "2", "1"],
                     "policies": [{"policyId": "3"}, "4"],
@@ -172,7 +172,7 @@ def test_convert_agents_to_flow_normalises_properties():
 
     flow = ProcessRoutingService.convert_agents_to_flow(details)
     props = flow["agent_property"]
-    assert props["llm"] == "llama3.2"
+    assert props["llm"] == "gpt-oss"
     assert props["prompts"] == [1, 2]
     assert props["policies"] == [3, 4]
     assert "memory" not in props
@@ -259,7 +259,7 @@ def test_get_process_details_enriches_agent_data():
         "status": "saved",
         "agent_type": "supplier_ranking_123",
         "agent_property": {
-            "llm": "llama3.2:latest",
+            "llm": "gpt-oss:latest",
             "memory": "3.2B",
             "prompts": [],
             "policies": [],
@@ -290,7 +290,7 @@ def test_get_process_details_enriches_agent_data():
     assert details["agent_type"] == "SupplierRankingAgent"
     assert details["agent_property"]["prompts"] == [1]
     assert details["agent_property"]["policies"] == [2]
-    assert details["agent_property"]["llm"] == "llama3.2"
+    assert details["agent_property"]["llm"] == "gpt-oss"
     assert "memory" not in details["agent_property"]
 
 
@@ -384,7 +384,7 @@ def test_enrich_node_applies_agent_defaults():
     prs = ProcessRoutingService(agent)
     prs._agent_defaults_cache = {
         "opportunity_miner": {
-            "llm": "llama3",
+            "llm": "gpt-oss",
             "prompts": [50],
             "policies": [9],
             "conditions": {"negotiation_window_days": 30},
@@ -403,7 +403,7 @@ def test_enrich_node_applies_agent_defaults():
     prs._enrich_node(node, agent_defs, prompt_map, policy_map)
 
     props = node["agent_property"]
-    assert props["llm"] == "llama3"
+    assert props["llm"] == "gpt-oss"
     assert props["prompts"] == [50, 51, 52]
     assert props["policies"] == [9, 10]
     assert props["conditions"]["negotiation_window_days"] == 60

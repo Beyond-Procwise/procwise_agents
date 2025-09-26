@@ -61,7 +61,7 @@ class Settings(BaseSettings):
         default=60, env="EMAIL_RESPONSE_POLL_SECONDS"
     )
 
-    extraction_model: str = "llama3.2"
+    extraction_model: str = "gpt-oss"
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
     # embeddings tailored for question/answer style retrieval.  Its
     # dimensionality (768) is smaller than ``all-roberta-large-v1`` which
@@ -69,13 +69,28 @@ class Settings(BaseSettings):
     # RAG workflows.
     embedding_model: str = "multi-qa-mpnet-base-dot-v1"
     vector_size: int = 768
+    reranker_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-12-v2", env="RERANKER_MODEL"
+    )
+    procurement_knowledge_path: Optional[str] = Field(
+        default=None, env="PROCUREMENT_KNOWLEDGE_PATH"
+    )
+    rag_chunk_chars: int = Field(default=1800, env="RAG_CHUNK_CHARS")
+    rag_chunk_overlap: int = Field(default=350, env="RAG_CHUNK_OVERLAP")
     ollama_quantized_model: Optional[str] = Field(
-        default="llama3.2:8b-instruct-q4_K_M", env="OLLAMA_QUANTIZED_MODEL"
+        default="gpt-oss:latest", env="OLLAMA_QUANTIZED_MODEL"
     )
     ollama_gpu_layers: Optional[int] = Field(
         default=None, env="OLLAMA_GPU_LAYERS"
     )
     ollama_num_batch: Optional[int] = Field(default=256, env="OLLAMA_NUM_BATCH")
+    ollama_context_window: int = Field(default=8192, env="OLLAMA_CONTEXT_WINDOW")
+    ollama_tokenizer: Optional[str] = Field(
+        default="llama3", env="OLLAMA_TOKENIZER"
+    )
+    ollama_adapter: Optional[str] = Field(
+        default=None, env="OLLAMA_ADAPTER"
+    )
 
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']
