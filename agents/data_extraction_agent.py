@@ -51,6 +51,7 @@ from utils.procurement_schema import (
     extract_structured_content,
 )
 
+
 logger = logging.getLogger(__name__)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 configure_gpu()
@@ -1629,6 +1630,7 @@ class DataExtractionAgent(BaseAgent):
         if not llm_line_df.empty:
             llm_line_items = self._dataframe_to_records(llm_line_df)
             line_items_seed = self._merge_line_items(line_items_seed, llm_line_items)
+
 
         # Step 3: layout-driven extraction for headers and line items
         header_layout = self._parse_header(text, file_bytes)
