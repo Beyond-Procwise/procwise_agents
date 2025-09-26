@@ -44,6 +44,7 @@ from utils.nlp import extract_entities
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from utils.gpu import configure_gpu
+from utils.procurement_schema import extract_structured_content
 
 logger = logging.getLogger(__name__)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -443,7 +444,24 @@ class DataExtractionAgent(BaseAgent):
             s3_object_key = context.input_data.get("s3_object_key")
             data = self._process_documents(s3_prefix, s3_object_key)
             docs = data.get("details", [])
-            discrepancy_result = self._run_discrepancy_detection(docs, context)
+            processing_issues = [
+                {
+                    "doc_type": doc.get("doc_type", "Unknown"),
+                    "record_id": doc.get("invoice_id")
+                    or doc.get("po_id")
+                    or doc.get("id")
+                    or doc.get("object_key"),
+                    "reason": "; ".join(doc.get("issues", [])) or "document not converted",
+                }
+                for doc in docs
+                if doc.get("status") in {"error", "failed"}
+            ]
+            if processing_issues:
+                discrepancy_result = self._run_discrepancy_detection(
+                    docs, context, processing_issues
+                )
+            else:
+                discrepancy_result = self._run_discrepancy_detection(docs, context)
 
             if discrepancy_result.status != AgentStatus.SUCCESS:
                 err = discrepancy_result.error or "discrepancy detection failed"
@@ -458,7 +476,8 @@ class DataExtractionAgent(BaseAgent):
             data["summary"] = {
                 "documents_provided": len(docs),
                 "documents_valid": len(docs) - len(mismatches),
-                "documents_with_discrepancies": len(mismatches),
+                "documents_with_discrepancies": len(mismatches)
+                + len(processing_issues),
             }
             if mismatches:
                 data["mismatches"] = mismatches
@@ -468,7 +487,12 @@ class DataExtractionAgent(BaseAgent):
             logger.error("DataExtractionAgent failed: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
 
-    def _run_discrepancy_detection(self, docs: List[Dict[str, Any]], context: AgentContext) -> AgentOutput:
+    def _run_discrepancy_detection(
+        self,
+        docs: List[Dict[str, Any]],
+        context: AgentContext,
+        processing_issues: List[Dict[str, str]] | None = None,
+    ) -> AgentOutput:
         if not docs:
             return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": []})
         disc_agent = DiscrepancyDetectionAgent(self.agent_nick)
@@ -476,7 +500,10 @@ class DataExtractionAgent(BaseAgent):
             workflow_id=context.workflow_id,
             agent_id="discrepancy_detection",
             user_id=context.user_id,
-            input_data={"extracted_docs": docs},
+            input_data={
+                "extracted_docs": docs,
+                "processing_issues": processing_issues or [],
+            },
             parent_agent=context.agent_id,
             routing_history=context.routing_history.copy(),
         )
@@ -1029,20 +1056,42 @@ class DataExtractionAgent(BaseAgent):
             "Invoice": {
                 "invoice_total": "invoice_amount",
                 "total_amount": "invoice_amount",
+                "total": "invoice_total_incl_tax",
+                "grand_total": "invoice_total_incl_tax",
                 "vendor": "vendor_name",
                 "supplier": "supplier_name",
                 "recipient": "receiver_name",
+                "bill_to": "buyer_id",
                 "to": "supplier_id",
-                "supplier_name": "supplier_name",
             },
             "Purchase_Order": {
                 "po_number": "po_id",
+                "po_no": "po_id",
                 "purchase_order_id": "po_id",
+                "order_number": "po_id",
                 "vendor": "vendor_name",
                 "supplier": "supplier_name",
                 "recipient": "receiver_name",
+                "ship_to": "delivery_address_line1",
+                "bill_to": "buyer_id",
                 "to": "supplier_id",
-                "supplier_name": "supplier_name",
+            },
+            "Quote": {
+                "quote_number": "quote_id",
+                "quote_no": "quote_id",
+                "quote#": "quote_id",
+                "quotation": "quote_id",
+                "supplier": "supplier_id",
+                "vendor": "supplier_id",
+                "vendor_name": "supplier_id",
+                "bill_to": "buyer_id",
+                "buyer": "buyer_id",
+                "valid_until": "validity_date",
+                "validity": "validity_date",
+                "expiry_date": "validity_date",
+                "total": "total_amount",
+                "grand_total": "total_amount_incl_tax",
+                "amount_due": "total_amount_incl_tax",
             },
             "Contract": {
                 "title": "contract_title",
@@ -1063,10 +1112,20 @@ class DataExtractionAgent(BaseAgent):
                 "payment terms": "payment_terms",
             },
         }
-        mapping = alias_map.get(doc_type, {})
+        mapping_raw = alias_map.get(doc_type, {})
+        def _norm_alias(name: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", name.lower())
+
+        mapping: Dict[str, str] = {}
+        for alias, target in mapping_raw.items():
+            mapping[_norm_alias(alias)] = target
+            mapping.setdefault(_norm_alias(target), target)
+
         normalised: Dict[str, Any] = {}
         for key, value in header.items():
-            normalised[mapping.get(key, key)] = value
+            norm_key = _norm_alias(key)
+            target = mapping.get(norm_key, key)
+            normalised[target] = value
         if normalised.get("vendor_name") and not normalised.get("supplier_id"):
             normalised["supplier_id"] = normalised["vendor_name"]
         return normalised
@@ -1080,24 +1139,204 @@ class DataExtractionAgent(BaseAgent):
             header["supplier_id"] = header["vendor_name"]
         return header
 
+    def _reconcile_header_from_lines(
+        self, header: Dict[str, Any], line_items: List[Dict[str, Any]], doc_type: str
+    ) -> Dict[str, Any]:
+        if not line_items:
+            return header
+
+        reconciled = dict(header)
+
+        def _sum_field(fields: List[str]) -> Optional[float]:
+            values: List[float] = []
+            for field in fields:
+                for item in line_items:
+                    raw = item.get(field)
+                    if raw in (None, ""):
+                        continue
+                    num = self._clean_numeric(raw)
+                    if num is not None:
+                        values.append(float(num))
+                if values:
+                    break
+            if values:
+                return float(sum(values))
+            return None
+
+        def _maybe_round(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            return round(value, 2)
+
+        currency_values = {
+            str(item.get("currency")).strip()
+            for item in line_items
+            if item.get("currency") not in (None, "")
+        }
+        if len(currency_values) == 1 and not reconciled.get("currency"):
+            reconciled["currency"] = currency_values.pop()
+
+        if doc_type == "Invoice":
+            subtotal = _sum_field(["line_amount", "line_total"])
+            tax_total = _sum_field(["tax_amount"])
+            gross = _sum_field(["total_amount_incl_tax", "total_amount"])
+            if gross is None and subtotal is not None and tax_total is not None:
+                gross = subtotal + tax_total
+            if subtotal is not None and not reconciled.get("invoice_amount"):
+                reconciled["invoice_amount"] = _maybe_round(subtotal)
+            if tax_total is not None and not reconciled.get("tax_amount"):
+                reconciled["tax_amount"] = _maybe_round(tax_total)
+            if gross is not None and not reconciled.get("invoice_total_incl_tax"):
+                reconciled["invoice_total_incl_tax"] = _maybe_round(gross)
+            if (
+                subtotal not in (None, 0)
+                and tax_total is not None
+                and not reconciled.get("tax_percent")
+            ):
+                try:
+                    reconciled["tax_percent"] = _maybe_round((tax_total / subtotal) * 100.0)
+                except ZeroDivisionError:
+                    pass
+        elif doc_type == "Purchase_Order":
+            total = _sum_field(["total_amount", "line_total"])
+            if total is not None and not reconciled.get("total_amount"):
+                reconciled["total_amount"] = _maybe_round(total)
+        elif doc_type == "Quote":
+            line_total = _sum_field(["line_total", "total_amount"])
+            if line_total is not None and not reconciled.get("total_amount"):
+                reconciled["total_amount"] = _maybe_round(line_total)
+            tax_total = _sum_field(["tax_amount"])
+            if tax_total is not None and not reconciled.get("tax_amount"):
+                reconciled["tax_amount"] = _maybe_round(tax_total)
+            if (
+                line_total not in (None, 0)
+                and tax_total is not None
+                and not reconciled.get("tax_percent")
+            ):
+                try:
+                    reconciled["tax_percent"] = _maybe_round((tax_total / line_total) * 100.0)
+                except ZeroDivisionError:
+                    pass
+            gross = _sum_field(["total_amount_incl_tax"])
+            if gross is None and line_total is not None and tax_total is not None:
+                gross = line_total + tax_total
+            if gross is not None and not reconciled.get("total_amount_incl_tax"):
+                reconciled["total_amount_incl_tax"] = _maybe_round(gross)
+
+        return reconciled
+
     def _normalize_line_item_fields(self, items: List[Dict[str, Any]], doc_type: str) -> List[Dict[str, Any]]:
         alias_map = {
             "Invoice": {
+                "line": "line_no",
+                "lineno": "line_no",
+                "linenumber": "line_no",
+                "item": "item_description",
                 "description": "item_description",
+                "itemdescription": "item_description",
+                "product": "item_description",
+                "part": "item_id",
+                "partno": "item_id",
+                "itemcode": "item_id",
+                "sku": "item_id",
                 "qty": "quantity",
+                "quantity": "quantity",
+                "units": "quantity",
+                "uom": "unit_of_measure",
+                "unit": "unit_of_measure",
+                "unitofmeasure": "unit_of_measure",
+                "unitprice": "unit_price",
                 "price": "unit_price",
+                "rate": "unit_price",
                 "amount": "line_amount",
+                "lineamount": "line_amount",
+                "extendedprice": "line_amount",
+                "subtotal": "line_amount",
                 "tax": "tax_amount",
+                "taxamount": "tax_amount",
+                "taxamt": "tax_amount",
+                "vat": "tax_amount",
+                "gst": "tax_amount",
+                "taxpercent": "tax_percent",
+                "taxrate": "tax_percent",
+                "taxpercentage": "tax_percent",
+                "total": "total_amount_incl_tax",
+                "totalamount": "total_amount_incl_tax",
+                "totalincltax": "total_amount_incl_tax",
+                "totalwithtax": "total_amount_incl_tax",
+                "totalamountincltax": "total_amount_incl_tax",
+                "currency": "currency",
             },
             "Purchase_Order": {
+                "line": "line_number",
+                "lineno": "line_number",
+                "linenumber": "line_number",
+                "item": "item_description",
                 "description": "item_description",
+                "itemdescription": "item_description",
+                "product": "item_description",
+                "part": "item_id",
+                "partno": "item_id",
+                "itemcode": "item_id",
+                "sku": "item_id",
                 "qty": "quantity",
+                "quantity": "quantity",
+                "units": "quantity",
+                "unitprice": "unit_price",
                 "price": "unit_price",
+                "rate": "unit_price",
+                "uom": "unit_of_measue",
+                "unit": "unit_of_measue",
+                "unitofmeasure": "unit_of_measue",
                 "amount": "line_total",
+                "lineamount": "line_total",
+                "linetotal": "line_total",
+                "total": "total_amount",
+                "totalamount": "total_amount",
+                "currency": "currency",
+                "quote": "quote_number",
+                "quoteno": "quote_number",
+            },
+            "Quote": {
+                "line": "line_number",
+                "lineno": "line_number",
+                "linenumber": "line_number",
+                "item": "item_description",
+                "description": "item_description",
+                "itemdescription": "item_description",
+                "product": "item_description",
+                "part": "item_id",
+                "partno": "item_id",
+                "itemcode": "item_id",
+                "sku": "item_id",
+                "qty": "quantity",
+                "quantity": "quantity",
+                "units": "quantity",
                 "uom": "unit_of_measure",
+                "unit": "unit_of_measure",
+                "unitofmeasure": "unit_of_measure",
+                "unitprice": "unit_price",
+                "price": "unit_price",
+                "rate": "unit_price",
+                "amount": "line_total",
+                "lineamount": "line_total",
+                "linetotal": "line_total",
+                "total": "total_amount",
+                "totalamount": "total_amount",
+                "totalincltax": "total_amount",
+                "currency": "currency",
             },
         }
-        mapping = alias_map.get(doc_type, {})
+        mapping_raw = alias_map.get(doc_type, {})
+
+        def _norm_key(key: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", key.lower())
+
+        mapping: Dict[str, str] = {}
+        for alias, target in mapping_raw.items():
+            mapping[_norm_key(alias)] = target
+            mapping.setdefault(_norm_key(target), target)
+
         normalised_items: List[Dict[str, Any]] = []
         for item in items:
             if isinstance(item, str):
@@ -1109,7 +1348,24 @@ class DataExtractionAgent(BaseAgent):
                 continue
             normalised: Dict[str, Any] = {}
             for key, value in item.items():
-                normalised[mapping.get(key, key)] = value
+                norm_key = _norm_key(str(key))
+                target = mapping.get(norm_key)
+                lower_key = str(key).lower()
+                if not target and "tax" in lower_key:
+                    if "%" in lower_key or "percent" in lower_key or "rate" in lower_key:
+                        target = mapping.get(_norm_key("tax_percent"), "tax_percent")
+                    else:
+                        target = mapping.get(_norm_key("tax_amount"), "tax_amount")
+                if not target and "total" in lower_key:
+                    if "incl" in lower_key or "with" in lower_key:
+                        target = mapping.get(_norm_key("total_amount_incl_tax"), "total_amount_incl_tax")
+                    elif doc_type in {"Purchase_Order", "Quote"}:
+                        target = mapping.get(_norm_key("total_amount"), "total_amount")
+                    else:
+                        target = mapping.get(_norm_key("line_amount"), "line_amount")
+                if not target and "amount" in lower_key and doc_type == "Invoice":
+                    target = mapping.get(_norm_key("line_amount"), "line_amount")
+                normalised[target or key] = value
             normalised_items.append(normalised)
         return normalised_items
 
@@ -1147,17 +1403,24 @@ class DataExtractionAgent(BaseAgent):
         return header
 
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        # seed via lightweight JSONifier
+        # Step 1: schema-aware extraction seeded from procurement reference
+        structured = extract_structured_content(text, doc_type)
+        header_seed = self._normalize_header_fields(structured.get("header", {}), doc_type)
+        line_items_seed = self._normalize_line_item_fields(structured.get("line_items", []), doc_type)
+
+        # Step 2: lightweight JSONifier to catch explicit key:value pairs
         data = convert_document_to_json(text, doc_type)
-        header_seed = self._normalize_header_fields(data.get("header_data", {}), doc_type)
-        # NEW: layout-first header (conf map inside)
+        header_seed.update(self._normalize_header_fields(data.get("header_data", {}), doc_type))
+
+        # Step 3: layout-driven extraction for headers and line items
         header_layout = self._parse_header(text, file_bytes)
         header = {**header_layout, **header_seed}
-        # Lines: layout-based
-        line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+        line_items = line_items_seed or self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+        header = self._reconcile_header_from_lines(header, line_items, doc_type)
 
-        # LLM strict fill for missing
+        # Step 4: LLM strict fill for any remaining gaps
         header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
+        header = self._reconcile_header_from_lines(header, line_items, doc_type)
         header = self._sanitize_party_names(header)
         if doc_type == "Contract":
             header = self._enrich_contract_fields(text, header)
