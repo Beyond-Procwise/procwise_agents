@@ -6,6 +6,8 @@ import json
 import logging
 import math
 import os
+from datetime import date, datetime
+from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -319,6 +321,10 @@ _INVOICE_TOTAL_COLUMNS: Tuple[str, ...] = (
 
 _SUPPLIER_FLOW_ID_LIMIT = 5
 _SUPPLIER_FLOW_ITEM_LIMIT = 5
+_SUMMARY_CHAR_LIMIT = 4096
+_TEXT_VALUE_CHAR_LIMIT = 2048
+_SEQUENCE_LENGTH_LIMIT = 50
+_MAPPING_SUMMARY_LIMIT = 32
 _SUPPLIER_SAMPLE_LIMIT = 200
 
 
@@ -420,6 +426,7 @@ class DataFlowManager:
                 payload["source_table_alias"] = relation.get("source_table_alias")
             if relation.get("target_table_alias"):
                 payload["target_table_alias"] = relation.get("target_table_alias")
+            payload = self._sanitize_payload(payload)
             points_by_id[point_id] = models.PointStruct(
                 id=point_id, vector=vector, payload=payload
             )
@@ -449,6 +456,7 @@ class DataFlowManager:
                 if resolved_aliases and resolved_aliases != canonical_path:
                     payload["resolved_aliases"] = list(resolved_aliases)
 
+                payload = self._sanitize_payload(payload)
                 points_by_id[point_id] = models.PointStruct(
                     id=point_id, vector=vector, payload=payload
                 )
@@ -471,13 +479,18 @@ class DataFlowManager:
                     "supplier_name_normalized": self._normalise_key(flow.get("supplier_name")),
                     "coverage_ratio": flow.get("coverage_ratio"),
                 }
-                payload["summary"] = text
+                payload["summary"] = self._truncate_text(text, _SUMMARY_CHAR_LIMIT)
                 if mapping_summary:
-                    payload["mapping_summary"] = mapping_summary
+                    payload["mapping_summary"] = [
+                        self._truncate_text(item, _TEXT_VALUE_CHAR_LIMIT)
+                        for item in mapping_summary[:_MAPPING_SUMMARY_LIMIT]
+                        if isinstance(item, str)
+                    ]
                 for key in ("contracts", "purchase_orders", "invoices", "quotes", "products"):
                     value = flow.get(key)
                     if isinstance(value, dict):
                         payload[key] = value
+                payload = self._sanitize_payload(payload)
                 points_by_id[point_id] = models.PointStruct(
                     id=point_id, vector=vector, payload=payload
                 )
@@ -774,6 +787,75 @@ class DataFlowManager:
             if len(results) >= limit:
                 break
         return results
+
+    def _truncate_text(self, text: Any, limit: int) -> str:
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        value = text.strip()
+        if limit <= 0 or len(value) <= limit:
+            return value
+        truncated = value[: max(1, limit - 1)].rstrip()
+        return f"{truncated}…"
+
+    def _sanitize_payload(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        def _sanitize(value: Any, depth: int = 0) -> Any:
+            if value is None:
+                return None
+            if depth > 6:
+                return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, str):
+                return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, (bool, int)):
+                return value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None
+                return value
+            if isinstance(value, Decimal):
+                try:
+                    numeric = float(value)
+                except Exception:
+                    return self._truncate_text(str(value), _TEXT_VALUE_CHAR_LIMIT)
+                if not math.isfinite(numeric):
+                    return None
+                return numeric
+            if isinstance(value, (datetime, date)):
+                try:
+                    return value.isoformat()
+                except Exception:
+                    return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, pd.Timestamp):
+                if pd.isna(value):
+                    return None
+                return value.to_pydatetime().isoformat()
+            if hasattr(value, "item") and callable(getattr(value, "item")):
+                try:
+                    return _sanitize(value.item(), depth + 1)
+                except Exception:
+                    return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+            if isinstance(value, Mapping):
+                sanitized_dict: Dict[str, Any] = {}
+                for key, sub_value in value.items():
+                    sanitized = _sanitize(sub_value, depth + 1)
+                    if sanitized is None:
+                        continue
+                    sanitized_dict[str(key)] = sanitized
+                return sanitized_dict
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                sanitized_list: List[Any] = []
+                for item in list(value)[:_SEQUENCE_LENGTH_LIMIT]:
+                    sanitized = _sanitize(item, depth + 1)
+                    if sanitized is not None:
+                        sanitized_list.append(sanitized)
+                return sanitized_list
+            return self._truncate_text(value, _TEXT_VALUE_CHAR_LIMIT)
+
+        sanitized_payload = _sanitize(dict(payload))  # ensure shallow copy
+        if not isinstance(sanitized_payload, dict):
+            return {}
+        return sanitized_payload
 
     def _format_timestamp(self, value: Any) -> Optional[str]:
         if value is None:
@@ -1443,7 +1525,8 @@ class DataFlowManager:
         try:
             payload_bytes = len(json.dumps(payload, ensure_ascii=False))
         except (TypeError, ValueError):  # pragma: no cover - fallback
-            payload_bytes = 0
+            sanitized = self._sanitize_payload(payload if isinstance(payload, Mapping) else {})
+            payload_bytes = len(json.dumps(sanitized, ensure_ascii=False)) if sanitized else 0
         return vector_bytes + payload_bytes + 512  # transport overhead buffer
 
     def _relation_to_text(self, relation: Dict[str, Any]) -> str:
