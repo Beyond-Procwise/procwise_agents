@@ -131,8 +131,20 @@ class NegotiationAgent(BaseAgent):
 
         logger.debug("NegotiationAgent prompt prepared")
         response = self.call_ollama(prompt=prompt)
+        if response.get("error"):
+            logger.error(
+                "NegotiationAgent LLM call returned error for supplier=%s, rfq_id=%s: %s",
+                supplier,
+                rfq_id,
+                response.get("error"),
+            )
         message = response.get("response", "").strip()
         if not message:
+            logger.warning(
+                "NegotiationAgent received empty response from model for supplier=%s, rfq_id=%s; using fallback",
+                supplier,
+                rfq_id,
+            )
             message = self._build_fallback_message(
                 supplier_context,
                 supplier,
