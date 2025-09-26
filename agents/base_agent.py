@@ -14,6 +14,7 @@ import psycopg2
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import ollama
+from ollama._types import ResponseError
 
 from config.settings import settings
 from orchestration.prompt_engine import PromptEngine
@@ -157,44 +158,85 @@ class BaseAgent:
         """
         base_model = getattr(self.settings, "extraction_model", "llama3")
         quantized = getattr(self.settings, "ollama_quantized_model", None)
-        model_to_use = model or base_model
-        if quantized and (model is None or model == base_model):
-            model_to_use = quantized
-        try:
-            options = kwargs.pop("options", {})
-            options = {**self.agent_nick.ollama_options(), **options}
-            optimized_defaults = {}
-            gpu_layers = getattr(self.settings, "ollama_gpu_layers", None)
-            if gpu_layers is not None:
-                optimized_defaults["gpu_layers"] = int(gpu_layers)
-            num_batch = getattr(self.settings, "ollama_num_batch", None)
-            if num_batch is not None:
-                optimized_defaults["num_batch"] = int(num_batch)
-            optimized_defaults.setdefault("num_thread", max(1, os.cpu_count() or 1))
-            optimized_defaults.setdefault(
-                "num_gpu", max(1, int(os.getenv("OLLAMA_NUM_GPU", "1")))
-            )
-            for key, value in optimized_defaults.items():
-                options.setdefault(key, value)
-            if messages is not None:
-                return ollama.chat(
+
+        missing_models = getattr(self, "_missing_ollama_models", None)
+        if missing_models is None:
+            missing_models = set()
+            self._missing_ollama_models = missing_models
+
+        options_from_kwargs = kwargs.pop("options", {})
+        base_kwargs = kwargs
+
+        options = {**self.agent_nick.ollama_options(), **options_from_kwargs}
+        optimized_defaults = {}
+        gpu_layers = getattr(self.settings, "ollama_gpu_layers", None)
+        if gpu_layers is not None:
+            optimized_defaults["gpu_layers"] = int(gpu_layers)
+        num_batch = getattr(self.settings, "ollama_num_batch", None)
+        if num_batch is not None:
+            optimized_defaults["num_batch"] = int(num_batch)
+        optimized_defaults.setdefault("num_thread", max(1, os.cpu_count() or 1))
+        optimized_defaults.setdefault(
+            "num_gpu", max(1, int(os.getenv("OLLAMA_NUM_GPU", "1")))
+        )
+        for key, value in optimized_defaults.items():
+            options.setdefault(key, value)
+
+        candidate_models: List[tuple[str, bool]] = []
+        if (
+            quantized
+            and (model is None or model == base_model)
+            and quantized not in missing_models
+        ):
+            candidate_models.append((quantized, True))
+        candidate_models.append((model or base_model, False))
+
+        last_error: Optional[Exception] = None
+        for model_to_use, is_quantized in candidate_models:
+            try:
+                attempt_options = dict(options)
+                if messages is not None:
+                    return ollama.chat(
+                        model=model_to_use,
+                        messages=messages,
+                        options=attempt_options,
+                        stream=False,
+                        **base_kwargs,
+                    )
+                return ollama.generate(
                     model=model_to_use,
-                    messages=messages,
-                    options=options,
+                    prompt=prompt or "",
+                    format=format,
                     stream=False,
-                    **kwargs,
+                    options=attempt_options,
+                    **base_kwargs,
                 )
-            return ollama.generate(
-                model=model_to_use,
-                prompt=prompt or "",
-                format=format,
-                stream=False,
-                options=options,
-                **kwargs,
-            )
-        except Exception as exc:  # pragma: no cover - network / runtime issues
-            logger.exception("Ollama call failed")
-            return {"response": "", "error": str(exc)}
+            except ResponseError as exc:
+                message = exc.args[0] if exc.args else ""
+                status_code = exc.args[1] if len(exc.args) > 1 else None
+                is_not_found = "not found" in str(message).lower() or status_code == 404
+                if is_quantized and is_not_found:
+                    missing_models.add(model_to_use)
+                    logger.warning(
+                        "Quantized Ollama model '%s' unavailable (status: %s); falling back to '%s'.",
+                        model_to_use,
+                        status_code,
+                        base_model,
+                    )
+                    continue
+                last_error = exc
+                break
+            except Exception as exc:  # pragma: no cover - network / runtime issues
+                last_error = exc
+                break
+
+        if last_error is not None:
+            logger.error("Ollama call failed", exc_info=last_error)
+            return {"response": "", "error": str(last_error)}
+
+        # Defensive fallback if the loop completes without returning (should not happen)
+        logger.error("Ollama call failed for unknown reasons")
+        return {"response": "", "error": "Unknown Ollama invocation failure"}
 
     def vector_search(self, query: str, top_k: int = 5):
         """Search the vector database for similar content.
