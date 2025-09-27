@@ -218,6 +218,18 @@ class SESEmailWatcher:
         )
 
         self._queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
+        queue_flag = getattr(self.settings, "ses_inbound_queue_enabled", None)
+        self._queue_enabled = bool(queue_flag) if queue_flag is not None else False
+        self._queue_disabled_reason: Optional[str] = None
+        if self._queue_url and not self._queue_enabled:
+            self._queue_disabled_reason = (
+                "temporarily disabled while inbound processing relies on direct S3 polling"
+            )
+            logger.info(
+                "SES inbound queue %s configured for mailbox %s but polling is temporarily disabled",
+                self._queue_url,
+                self.mailbox_address,
+            )
         self._queue_wait_seconds = self._coerce_int(
             getattr(self.settings, "ses_inbound_queue_wait_seconds", 2), default=2, minimum=0
         )
@@ -249,11 +261,12 @@ class SESEmailWatcher:
         self._last_s3_poll: Dict[str, Optional[datetime]] = {}
 
         logger.info(
-            "Initialised email watcher for mailbox %s (bucket=%s, prefixes=%s, queue=%s, poll_interval=%ss)",
+            "Initialised email watcher for mailbox %s (bucket=%s, prefixes=%s, queue=%s, queue_enabled=%s, poll_interval=%ss)",
             self.mailbox_address,
             self.bucket,
             ", ".join(self._prefixes),
             self._queue_url,
+            self._queue_enabled,
             self.poll_interval_seconds,
         )
 
@@ -666,7 +679,7 @@ class SESEmailWatcher:
         if remaining == 0:
             return messages[: limit or None]
 
-        if self._queue_url and mark_seen:
+        if self._queue_enabled and self._queue_url and mark_seen:
             queue_messages = self._load_from_queue(
                 remaining if remaining else None, mark_seen=mark_seen
             )
@@ -742,7 +755,7 @@ class SESEmailWatcher:
     def _load_from_queue(
         self, limit: Optional[int], *, mark_seen: bool
     ) -> List[Dict[str, object]]:
-        if not self._queue_url:
+        if not self._queue_enabled or not self._queue_url:
             return []
 
         client = self._get_sqs_client()
@@ -1229,6 +1242,9 @@ class SESEmailWatcher:
             return None
 
     def _acknowledge_queue_message(self, message: Dict[str, object], *, success: bool) -> None:
+        if not self._queue_enabled:
+            return
+
         ack_context = message.get("_queue_ack")
         if not isinstance(ack_context, dict):
             return
@@ -1422,7 +1438,7 @@ class SESEmailWatcher:
         return dict(self._assumed_credentials)
 
     def _get_sqs_client(self):
-        if not self._queue_url:
+        if not self._queue_enabled or not self._queue_url:
             return None
         if self._sqs_client is not None:
             return self._sqs_client
@@ -1497,6 +1513,18 @@ class SESEmailWatcher:
                 "arrive immediately instead of relying on eventual S3 polling",
                 self.bucket,
             )
+        elif not self._queue_enabled:
+            if self._queue_disabled_reason:
+                logger.info(
+                    "SES inbound queue %s polling disabled for mailbox %s: %s",
+                    self._queue_url,
+                    self.mailbox_address,
+                    self._queue_disabled_reason,
+                )
+            else:
+                logger.info(
+                    "SES inbound queue %s polling disabled for mailbox %s", self._queue_url, self.mailbox_address
+                )
         else:
             logger.debug(
                 "SES inbound queue %s is configured for bucket %s", self._queue_url, self.bucket
