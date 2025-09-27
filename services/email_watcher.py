@@ -8,7 +8,7 @@ import logging
 import re
 import time
 import uuid
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlparse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -152,10 +152,40 @@ class SESEmailWatcher:
 
         endpoint = getattr(self.settings, "ses_smtp_endpoint", "")
         self.region = getattr(self.settings, "ses_region", None) or self._parse_region(endpoint)
-        self.bucket = getattr(self.settings, "ses_inbound_bucket", None) or getattr(
+
+        uri_bucket: Optional[str] = None
+        uri_prefix: Optional[str] = None
+        inbound_s3_uri = getattr(self.settings, "ses_inbound_s3_uri", None)
+        if inbound_s3_uri:
+            try:
+                uri_bucket, uri_prefix = self._parse_s3_uri(inbound_s3_uri)
+            except ValueError:
+                logger.warning(
+                    "Invalid SES inbound S3 URI %r; falling back to explicit bucket/prefix configuration",
+                    inbound_s3_uri,
+                )
+
+        configured_bucket = getattr(self.settings, "ses_inbound_bucket", None)
+        if configured_bucket and uri_bucket and configured_bucket != uri_bucket:
+            logger.warning(
+                "SES inbound bucket %s overrides bucket %s derived from S3 URI",
+                configured_bucket,
+                uri_bucket,
+            )
+
+        self.bucket = configured_bucket or uri_bucket or getattr(
             self.settings, "s3_bucket_name", None
         )
-        raw_prefix = getattr(self.settings, "ses_inbound_prefix", "ses/inbound/")
+
+        raw_prefix = getattr(self.settings, "ses_inbound_prefix", None)
+        if raw_prefix is None:
+            raw_prefix = uri_prefix or "ses/inbound/"
+        else:
+            text_prefix = str(raw_prefix).strip()
+            if uri_prefix and text_prefix in {"", "ses/inbound/"}:
+                raw_prefix = uri_prefix
+            elif not text_prefix:
+                raw_prefix = uri_prefix or ""
         self._prefixes = self._build_prefixes(raw_prefix)
 
         # Optional IMAP fallback configuration for mailboxes that are not
@@ -1419,4 +1449,30 @@ class SESEmailWatcher:
                 seen.add(item)
                 result.append(item)
         return result
+
+    @staticmethod
+    def _parse_s3_uri(uri: str) -> Tuple[str, Optional[str]]:
+        """Parse an S3 URI into bucket and prefix components."""
+
+        if not uri:
+            raise ValueError("S3 URI must be a non-empty string")
+
+        parsed = urlparse(str(uri).strip())
+        if parsed.scheme and parsed.scheme.lower() != "s3":
+            raise ValueError(f"Unsupported scheme for S3 URI: {parsed.scheme}")
+
+        bucket = parsed.netloc or parsed.path.split("/", 1)[0]
+        if not bucket:
+            raise ValueError("S3 URI must include a bucket name")
+
+        prefix = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+        if parsed.netloc and prefix.startswith(bucket):
+            # Handle URIs like s3://bucket/bucket/... produced by naive joins.
+            prefix = prefix[len(bucket) :].lstrip("/")
+
+        prefix = prefix.strip()
+        if prefix and not prefix.endswith("/"):
+            prefix = f"{prefix}/"
+
+        return bucket, prefix or None
 

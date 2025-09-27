@@ -46,7 +46,9 @@ class DummyNick:
             ses_smtp_endpoint="email-smtp.eu-west-1.amazonaws.com",
             ses_smtp_secret_name="ses/smtp/credentials",
             ses_region="eu-west-1",
+            ses_inbound_bucket=None,
             ses_inbound_prefix="ses/inbound/",
+            ses_inbound_s3_uri=None,
             s3_bucket_name="bucket",
             ses_inbound_queue_url=None,
             ses_inbound_queue_wait_seconds=2,
@@ -520,3 +522,19 @@ def test_email_watcher_leaves_queue_message_on_processing_error(monkeypatch):
     assert results == []
     assert queue.deleted == []
     assert watcher.state_store.get("ses/inbound/message-error.eml") is None
+
+
+def test_email_watcher_uses_s3_uri_for_bucket_and_prefix():
+    nick = DummyNick()
+    nick.settings.s3_bucket_name = None
+    nick.settings.ses_inbound_bucket = None
+    nick.settings.ses_inbound_s3_uri = "s3://procwisemvp/emails/"
+
+    watcher = SESEmailWatcher(
+        nick,
+        message_loader=lambda limit=None: [],
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    assert watcher.bucket == "procwisemvp"
+    assert "emails/" in watcher._prefixes
