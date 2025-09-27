@@ -740,15 +740,26 @@ class DataExtractionAgent(BaseAgent):
             if s3_object_key and s3_object_key.startswith(prefix):
                 keys.append(s3_object_key)
             else:
-                resp = self.agent_nick.s3_client.list_objects_v2(
-                    Bucket=self.settings.s3_bucket_name, Prefix=prefix
-                )
+                with self._borrow_s3_client() as s3_client:
+                    resp = s3_client.list_objects_v2(
+                        Bucket=self.settings.s3_bucket_name, Prefix=prefix
+                    )
                 keys.extend(obj["Key"] for obj in resp.get("Contents", []))
 
         supported_exts = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
         keys = [k for k in keys if os.path.splitext(k)[1].lower() in supported_exts]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        max_workers_setting = int(getattr(self.settings, "data_extraction_max_workers", os.cpu_count() or 4))
+        pool_cap = getattr(self.agent_nick, "s3_pool_size", max_workers_setting)
+        max_workers = max(1, min(len(keys) or 1, max_workers_setting, pool_cap))
+        logger.info(
+            "Processing %d documents using %d worker threads (configured max=%d, s3_pool=%d)",
+            len(keys),
+            max_workers,
+            max_workers_setting,
+            pool_cap,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(self._process_single_document, k) for k in keys]
             for fut in concurrent.futures.as_completed(futures):
                 res = fut.result()
@@ -762,8 +773,21 @@ class DataExtractionAgent(BaseAgent):
             return None
         logger.info("Processing %s", object_key)
         try:
-            obj = self.agent_nick.s3_client.get_object(Bucket=self.settings.s3_bucket_name, Key=object_key)
-            file_bytes = obj["Body"].read()
+            with self._borrow_s3_client() as s3_client:
+                obj = s3_client.get_object(
+                    Bucket=self.settings.s3_bucket_name, Key=object_key
+                )
+            body = obj.get("Body")
+            if body is None:
+                logger.error("No body returned for %s", object_key)
+                return None
+            try:
+                file_bytes = body.read()
+            finally:
+                try:
+                    body.close()
+                except Exception:
+                    logger.debug("Failed to close streaming body for %s", object_key, exc_info=True)
         except Exception as exc:
             logger.error("Failed downloading %s: %s", object_key, exc)
             return None

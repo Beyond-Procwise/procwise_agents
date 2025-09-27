@@ -17,6 +17,9 @@ class Settings(BaseSettings):
 
     s3_bucket_name: str = Field(..., env="S3_BUCKET_NAME")
     s3_prefixes: List[str] = Field(..., env="S3_PREFIXES")
+    s3_max_pool_connections: int = Field(
+        default=64, env="S3_MAX_POOL_CONNECTIONS"
+    )
 
     qdrant_url: str = Field(..., env="QDRANT_URL")
     qdrant_api_key: str = Field(..., env="QDRANT_API_KEY")
@@ -98,6 +101,9 @@ class Settings(BaseSettings):
     # Worker and processing settings
     max_workers: int = Field(default=4, env="MAX_WORKERS")
     parallel_processing: bool = Field(default=False, env="PARALLEL_PROCESSING")
+    data_extraction_max_workers: int = Field(
+        default=16, env="DATA_EXTRACTION_MAX_WORKERS"
+    )
 
     # Learning and optimization
     enable_learning: bool = Field(default=False, env="ENABLE_LEARNING")
