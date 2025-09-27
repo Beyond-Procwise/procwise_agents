@@ -4,6 +4,12 @@ The `SESEmailWatcher` expects inbound supplier replies to arrive through Amazon
 SES and land in S3 with accompanying SQS notifications. Use the checklist below
 when onboarding a new mailbox or troubleshooting missed replies.
 
+> **Operational note (March 2025):** SQS polling is temporarily disabled in
+> production while the `procwise-inbound-queue` resource is unavailable. The
+> watcher now defaults to S3 polling only. Set
+> `ses_inbound_queue_enabled=True` once the queue is restored to re-enable the
+> push-based path described below.
+
 ## 1. Verify the domain and MX routing
 - Confirm that the sending domain is verified in SES and that the MX record for
 your mailbox points at `inbound-smtp.<region>.amazonaws.com`.
