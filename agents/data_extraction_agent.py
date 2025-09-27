@@ -45,7 +45,6 @@ import torch
 from datetime import datetime, timedelta
 from dateutil import parser
 
-from agents.document_jsonifier import convert_document_to_json
 from utils.nlp import extract_entities
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
@@ -54,7 +53,6 @@ from utils.procurement_schema import (
     DOC_TYPE_TO_TABLE,
     PROCUREMENT_SCHEMAS,
     TableSchema,
-    extract_structured_content,
 )
 
 
@@ -2054,109 +2052,125 @@ class DataExtractionAgent(BaseAgent):
         return header_df, line_df, cleaned_notes
 
     def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        # Step 1: schema-aware extraction seeded from procurement reference
-        structured = extract_structured_content(text, doc_type)
-        header_seed = self._normalize_header_fields(structured.get("header", {}), doc_type)
-        line_items_seed = self._normalize_line_item_fields(structured.get("line_items", []), doc_type)
+        """
+        Custom structured data extraction that prioritises deterministic methods and
+        avoids heavy LLM calls for faster and more consistent results.
 
-        # Supplement seeds with regex-based extraction prior to JSONification/LLM
+        This implementation performs the following steps:
+        1. Use regex and simple heuristics to extract header fields.
+        2. Parse tables using camelot/pdfplumber for line items; fall back to regex line parsing.
+        3. Normalise extracted fields and reconcile totals from line items.
+        4. Infer currency and vendor names, sanitise names, and enrich contract details.
+        5. Cast values to appropriate SQL types and compute a simple validation score.
+
+        Parameters
+        ----------
+        text : str
+            Raw document text extracted from the file.
+        file_bytes : bytes
+            Raw file contents; used for table parsing and layout heuristics.
+        doc_type : str
+            Canonical document type: "Invoice", "Purchase_Order", "Quote", or "Contract".
+
+        Returns
+        -------
+        Tuple[Dict[str, Any], List[Dict[str, Any]]]
+            Normalised header record and a list of normalised line item records.
+        """
+        # 1) Heuristic header extraction
+        header: Dict[str, Any] = {}
         try:
-            regex_header = self._extract_header_regex(text, doc_type)
-            if regex_header:
-                header_seed = self._merge_record_fields(header_seed, regex_header)
-            regex_lines = self._extract_line_items_regex(text, doc_type)
-            if regex_lines:
-                line_items_seed = self._merge_line_items(line_items_seed, regex_lines)
+            header_regex = self._extract_header_regex(text, doc_type) or {}
+            header.update(self._normalize_header_fields(header_regex, doc_type))
         except Exception:
-            # Ensure regex extraction does not break pipeline
+            pass
+        try:
+            header_layout = self._parse_header(text, file_bytes)
+            header = self._merge_record_fields(header_layout, header)
+        except Exception:
+            pass
+        try:
+            ner_header = self._extract_header_with_ner(text)
+            if ner_header:
+                header = self._merge_record_fields(header, ner_header)
+        except Exception:
             pass
 
-        # Step 2: lightweight JSONifier to catch explicit key:value pairs
-        data = convert_document_to_json(text, doc_type)
-        header_seed.update(self._normalize_header_fields(data.get("header_data", {}), doc_type))
+        if not header.get("vendor_name"):
+            from_match = re.search(r"\bfrom\s+([A-Za-z0-9&.,' ]{2,80})", text, re.I)
+            if from_match:
+                candidate = from_match.group(1)
+                candidate = re.split(r"\bfor\b", candidate, 1)[0]
+                candidate = re.sub(r"[^A-Za-z0-9&.,' ]", "", candidate).strip()
+                if candidate:
+                    header["vendor_name"] = candidate
+        if not header.get("vendor_name"):
+            vendor_guess = self._infer_vendor_name(text)
+            if vendor_guess:
+                header["vendor_name"] = vendor_guess
 
-        llm_text = self._prepare_llm_document(text, doc_type)
+        # 2) Line item extraction: table detection then regex fallback
+        line_items: List[Dict[str, Any]] = []
+        try:
+            if file_bytes:
+                line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type) or []
+        except Exception:
+            line_items = []
+        if not line_items:
+            try:
+                line_items = self._extract_line_items_regex(text, doc_type) or []
+            except Exception:
+                line_items = []
 
-        llm_header_df, llm_line_df, llm_notes = self._llm_structured_dataframes(
-            text, doc_type, header_seed, line_items_seed, llm_text=llm_text
-        )
-        if not llm_header_df.empty:
-            llm_header = self._dataframe_to_header(llm_header_df)
-            header_seed = self._merge_record_fields(header_seed, llm_header)
-        if not llm_line_df.empty:
-            llm_line_items = self._dataframe_to_records(llm_line_df)
-            line_items_seed = self._merge_line_items(line_items_seed, llm_line_items)
+        # Normalise and clean numeric fields
+        if line_items:
+            line_items = self._normalize_line_item_fields(line_items, doc_type)
+            for item in line_items:
+                for num_field in [
+                    "quantity",
+                    "unit_price",
+                    "line_amount",
+                    "tax_percent",
+                    "tax_amount",
+                    "total_amount_incl_tax",
+                    "line_total",
+                    "total_amount",
+                ]:
+                    if num_field in item:
+                        item[num_field] = self._clean_numeric(item[num_field])
 
-
-        # Step 3: layout-driven extraction for headers and line items
-        header_layout = self._parse_header(text, file_bytes)
-        header = {**header_layout, **header_seed}
-        inferred_currency = self._infer_currency(text, header)
-        if inferred_currency:
-            header.setdefault("currency", inferred_currency)
-        line_items = line_items_seed or self._extract_line_items_from_pdf_tables(file_bytes, doc_type)
+        # 3) Reconcile header using line totals
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
 
-        # Step 4: LLM strict fill for any remaining gaps
-        header, line_items = self._fill_missing_fields_with_llm(
-            text, doc_type, header, line_items, llm_text=llm_text
-        )
-        header = self._reconcile_header_from_lines(header, line_items, doc_type)
-        inferred_currency = self._infer_currency(text, header)
-        if inferred_currency:
-            header.setdefault("currency", inferred_currency)
+        # 4) Infer currency if missing
+        inferred_curr = self._infer_currency(text, header)
+        if inferred_curr:
+            header.setdefault("currency", inferred_curr)
+
+        # 5) Sanitise names and enrich contract fields
         header = self._sanitize_party_names(header)
         if doc_type == "Contract":
             header = self._enrich_contract_fields(text, header)
 
-        field_confidence = header.pop("_field_confidence", {})
-        prior_validation = header.pop("_validation", None)
-
+        # 6) Align with schema and cast values
         header_df, header_missing, header_extra = self._build_dataframe_from_records(header, doc_type, "header")
         header = self._dataframe_to_header(header_df)
-        if field_confidence:
-            header["_field_confidence"] = field_confidence
-
         line_df, line_missing, line_extra = self._build_dataframe_from_records(line_items, doc_type, "line_items")
         line_items = self._dataframe_to_records(line_df)
-
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
-        # Ensure field confidence is retained for validation reporting
-        if field_confidence and "_field_confidence" not in header:
-            header["_field_confidence"] = field_confidence
-
-        ok, conf_boost, business_notes = self._validate_business_rules(doc_type, header, line_items)
-        field_conf = header.pop("_field_confidence", field_confidence if isinstance(field_confidence, dict) else {})
-        base = np.mean(list(field_conf.values())) if field_conf else 0.75
-
-        schema_notes = self._schema_verification_notes(
-            doc_type, header_missing, header_extra, line_missing, line_extra
-        )
-        missing_penalty = 0.05 * (len(header_missing) + len(line_missing))
-        combined_notes: List[str] = []
-        if prior_validation and isinstance(prior_validation.get("notes"), list):
-            combined_notes.extend(prior_validation["notes"])
-        combined_notes.extend(business_notes)
-        combined_notes.extend(llm_notes)
-        combined_notes.extend(schema_notes)
-
-        ok = ok and (prior_validation.get("ok", True) if isinstance(prior_validation, dict) else True)
-        if header_missing or line_missing:
+        # 7) Compute validation and confidence
+        ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
+        total_missing = len(header_missing) + len(line_missing)
+        base_conf = 0.9 if total_missing == 0 else max(0.5, 0.9 - 0.05 * total_missing)
+        confidence = float(min(1.0, max(0.0, base_conf + conf_boost)))
+        if total_missing:
+            notes.append("Missing required fields")
             ok = False
-
-        overall_conf = float(min(1.0, max(0.0, base + conf_boost - missing_penalty)))
-        if isinstance(prior_validation, dict) and prior_validation.get("confidence") is not None:
-            try:
-                overall_conf = min(overall_conf, float(prior_validation["confidence"]))
-            except (TypeError, ValueError):
-                pass
-
         header["_validation"] = {
             "ok": ok,
-            "notes": combined_notes,
-            "confidence": overall_conf,
-            "field_confidence": field_conf,
+            "notes": notes,
+            "confidence": confidence,
         }
         return header, line_items
 
