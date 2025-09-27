@@ -1,6 +1,7 @@
 # ProcWise/agents/base_agent.py
 
 import boto3
+from botocore.config import Config
 import logging
 import os
 from contextlib import contextmanager
@@ -9,8 +10,11 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
+import threading
 
 import psycopg2
+from http import HTTPStatus
+
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import ollama
@@ -271,6 +275,18 @@ class BaseAgent:
             logger.exception("vector search failed")
             return []
 
+    @contextmanager
+    def _borrow_s3_client(self):
+        reserve = getattr(self.agent_nick, "reserve_s3_connection", None)
+        if callable(reserve):
+            with reserve() as client:
+                yield client
+                return
+        client = getattr(self.agent_nick, "s3_client", None)
+        if client is None:
+            raise AttributeError("AgentNick must provide an s3_client")
+        yield client
+
 class AgentNick:
     def __init__(self):
         logger.info("AgentNick is waking up...")
@@ -282,7 +298,21 @@ class AgentNick:
         self._db_engine = None
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
-        self.s3_client = boto3.client('s3')
+        s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
+        self._s3_pool_size = s3_pool
+        self.s3_client = boto3.client(
+            "s3",
+            config=Config(
+                max_pool_connections=s3_pool,
+                retries={"max_attempts": 10, "mode": "standard"},
+            ),
+        )
+        self._s3_semaphore: Optional[threading.BoundedSemaphore]
+        try:
+            self._s3_semaphore = threading.BoundedSemaphore(value=s3_pool)
+        except Exception:  # pragma: no cover - threading edge cases
+            logger.debug("Failed to allocate S3 semaphore", exc_info=True)
+            self._s3_semaphore = None
         logger.info("Clients initialized.")
 
         logger.info("Initializing core engines...")
@@ -296,6 +326,25 @@ class AgentNick:
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    @property
+    def s3_pool_size(self) -> int:
+        return getattr(self, "_s3_pool_size", 10)
+
+    @contextmanager
+    def reserve_s3_connection(self):
+        semaphore = getattr(self, "_s3_semaphore", None)
+        if semaphore is None:
+            yield self.s3_client
+            return
+        acquired = False
+        try:
+            semaphore.acquire()
+            acquired = True
+            yield self.s3_client
+        finally:
+            if acquired:
+                semaphore.release()
 
     def get_db_engine(self):
         """Return a cached SQLAlchemy engine when available.
@@ -368,27 +417,91 @@ class AgentNick:
 
     def _initialize_qdrant_collection(self):
         collection_name = self.settings.qdrant_collection_name
-        try:
-            collection_info = self.qdrant_client.get_collection(collection_name=collection_name)
-            logger.info(f"Qdrant collection '{collection_name}' already exists.")
-            existing_indexes = collection_info.payload_schema.keys()
-            required_indexes = {
-                "document_type": models.PayloadSchemaType.KEYWORD,
-                "product_type": models.PayloadSchemaType.KEYWORD,
-                "record_id": models.PayloadSchemaType.KEYWORD,
-            }
+        required_indexes = {
+            "document_type": models.PayloadSchemaType.KEYWORD,
+            "product_type": models.PayloadSchemaType.KEYWORD,
+            "record_id": models.PayloadSchemaType.KEYWORD,
+        }
+
+        def ensure_indexes(schema: Dict[str, Any]) -> None:
+            existing_indexes = set(schema.keys()) if schema else set()
             for field_name, field_schema in required_indexes.items():
-                if field_name not in existing_indexes:
-                    logger.warning(f"Index for '{field_name}' not found. Creating it now...")
-                    self.qdrant_client.create_payload_index(collection_name=collection_name, field_name=field_name, field_schema=field_schema, wait=True)
-                    logger.info(f"Successfully created index for '{field_name}'.")
-        except Exception:
-            logger.info(f"Creating Qdrant collection '{collection_name}'...")
+                if field_name in existing_indexes:
+                    continue
+                try:
+                    self.qdrant_client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=field_schema,
+                        wait=True,
+                    )
+                    logger.info("Successfully created index for '%s'.", field_name)
+                except Exception as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    if status_code == HTTPStatus.CONFLICT:
+                        logger.debug(
+                            "Payload index '%s' already exists for collection '%s'.",
+                            field_name,
+                            collection_name,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to create payload index '%s': %s",
+                            field_name,
+                            exc,
+                        )
+
+        try:
+            collection_info = self.qdrant_client.get_collection(
+                collection_name=collection_name
+            )
+            logger.info(
+                "Qdrant collection '%s' already exists.",
+                collection_name,
+            )
+            ensure_indexes(getattr(collection_info, "payload_schema", {}) or {})
+            return
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code != HTTPStatus.NOT_FOUND:
+                logger.warning(
+                    "Failed to fetch Qdrant collection '%s': %s",
+                    collection_name,
+                    exc,
+                )
+                return
+
+        logger.info("Creating Qdrant collection '%s'...", collection_name)
+        try:
             self.qdrant_client.create_collection(
                 collection_name=collection_name,
-                vectors_config=models.VectorParams(size=self.settings.vector_size, distance=models.Distance.COSINE),
+                vectors_config=models.VectorParams(
+                    size=self.settings.vector_size,
+                    distance=models.Distance.COSINE,
+                ),
             )
-            self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="document_type", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
-            self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="product_type", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
-            self.qdrant_client.create_payload_index(collection_name=collection_name, field_name="record_id", field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
-            logger.info("Collection and payload indexes created successfully.")
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code == HTTPStatus.CONFLICT:
+                logger.info(
+                    "Qdrant collection '%s' already existed during creation race.",
+                    collection_name,
+                )
+            else:
+                logger.warning(
+                    "Failed to create Qdrant collection '%s': %s",
+                    collection_name,
+                    exc,
+                )
+                return
+
+        try:
+            collection_info = self.qdrant_client.get_collection(
+                collection_name=collection_name
+            )
+            ensure_indexes(getattr(collection_info, "payload_schema", {}) or {})
+        except Exception:  # pragma: no cover - final guardrail
+            logger.exception(
+                "Failed to verify payload indexes for Qdrant collection '%s'",
+                collection_name,
+            )
