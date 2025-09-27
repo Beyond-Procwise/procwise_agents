@@ -24,14 +24,23 @@ class StubWatcher:
         return self.processed
 
 
-def test_preview_recent_emails_uses_peek_and_logs(caplog):
-    watcher = StubWatcher(preview=[{"id": "1"}, {"id": "2"}, {"id": "3"}, {"id": "4"}])
+def test_preview_recent_emails_trims_and_orders(caplog):
+    watcher = StubWatcher(
+        preview=[
+            {"id": "oldest", "received_at": "Mon, 01 Jan 2024 12:00:00 +0000"},
+            {"id": "newest", "received_at": "Wed, 03 Jan 2024 08:00:00 +0000"},
+            {"id": "middle", "received_at": "Tue, 02 Jan 2024 09:30:00 +0000"},
+            {"id": "stale"},
+        ]
+    )
+
 
     with caplog.at_level("INFO"):
         result = preview_recent_emails(watcher, limit=3)
 
     assert watcher.peek_calls == [3]
-    assert result == watcher.preview
+    assert [message["id"] for message in result] == ["newest", "middle", "oldest"]
+    assert all(entry["id"] != "stale" for entry in result)
     assert any("Previewing" in record.message for record in caplog.records)
 
 

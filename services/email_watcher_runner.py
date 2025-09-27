@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Dict, Iterable, List, Optional
+
 
 from agents.base_agent import AgentNick
 from services.email_watcher import SESEmailWatcher
@@ -50,6 +53,35 @@ def _log_preview(mailbox: str, preview: List[Dict[str, object]]) -> None:
         )
 
 
+def _parse_received_at(value: object) -> Optional[datetime]:
+    """Best-effort parsing of RFC822 timestamp strings into datetimes."""
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    if isinstance(value, str):
+        try:
+            parsed = parsedate_to_datetime(value)
+        except Exception:  # pragma: no cover - defensive against malformed headers
+            parsed = None
+        if parsed is not None and parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    return None
+
+
+def _sort_preview(messages: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Order messages by their ``received_at`` timestamp (newest first)."""
+
+    def sort_key(message: Dict[str, object]) -> datetime:
+        parsed = _parse_received_at(message.get("received_at"))
+        return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+    return sorted(messages, key=sort_key, reverse=True)
+
+
+
 def preview_recent_emails(
     watcher: SESEmailWatcher,
     *,
@@ -58,13 +90,26 @@ def preview_recent_emails(
     """Return a preview of recent inbound emails without marking them as read."""
 
     try:
-        preview = watcher.peek_recent_messages(limit=limit)
+        limit_int = max(0, int(limit))
+    except Exception:
+        limit_int = 3
+
+    if limit_int == 0:
+        return []
+
+    try:
+        preview = watcher.peek_recent_messages(limit=limit_int)
+
     except Exception:  # pragma: no cover - defensive against unexpected loaders
         logger.exception("Failed to preview recent emails for mailbox %s", watcher.mailbox_address)
         return []
 
-    _log_preview(watcher.mailbox_address, preview)
-    return preview
+    sorted_preview = _sort_preview(preview)
+    limited_preview = sorted_preview[:limit_int]
+
+    _log_preview(watcher.mailbox_address, limited_preview)
+    return limited_preview
+
 
 
 def preview_then_watch(
