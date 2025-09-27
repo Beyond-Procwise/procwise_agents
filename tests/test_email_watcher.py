@@ -217,6 +217,50 @@ def test_email_watcher_stops_after_matching_filters():
     assert watcher.state_store.get("msg-c") is None
 
 
+def test_email_watcher_returns_cached_processed_message_for_filters():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+    messages = [
+        {
+            "id": "msg-cache",
+            "subject": "Re: RFQ-20240101-cache",
+            "body": "Quoted price 500",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-cache",
+        }
+    ]
+
+    def loader(limit=None):
+        if messages:
+            return [messages.pop(0)]
+        return []
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        message_loader=loader,
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    first_batch = watcher.poll_once()
+
+    assert len(first_batch) == 1
+    assert first_batch[0]["rfq_id"] == "RFQ-20240101-cache"
+    assert first_batch[0]["message_body"].startswith("Quoted price")
+    assert len(supplier_agent.contexts) == 1
+
+    supplier_agent.contexts.clear()
+
+    cached_batch = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-cache"})
+
+    assert len(cached_batch) == 1
+    assert cached_batch[0]["rfq_id"] == "RFQ-20240101-cache"
+    assert cached_batch[0]["message_body"].startswith("Quoted price")
+    assert supplier_agent.contexts == []
+
+
 def test_email_watcher_skips_negotiation_when_price_within_target():
     nick = DummyNick()
     supplier_agent = StubSupplierInteractionAgent()
