@@ -5,6 +5,7 @@ import uuid
 import os
 import tempfile
 from io import BytesIO
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import gzip
 import concurrent.futures
@@ -799,15 +800,6 @@ class DataExtractionAgent(BaseAgent):
         vendor_name = self._infer_vendor_name(text, object_key)
         if not unique_id:
             unique_id = uuid.uuid4().hex[:8]
-
-        # Consult vector database for related documents to leverage prior context
-        similar_docs = self.vector_search(text, top_k=1)
-        if similar_docs:
-            logger.debug(
-                "Found similar document %s while processing %s",
-                similar_docs[0].id,
-                object_key,
-            )
 
         # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
@@ -1901,13 +1893,89 @@ class DataExtractionAgent(BaseAgent):
             )
         return notes
 
+    @staticmethod
+    @lru_cache(maxsize=16)
+    def _schema_keywords(doc_type: str) -> Tuple[str, ...]:
+        header_table, line_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))
+        keywords: set[str] = set()
+        for table_name in (header_table, line_table):
+            if not table_name:
+                continue
+            schema = PROCUREMENT_SCHEMAS.get(table_name)
+            if not schema:
+                continue
+            for column in schema.columns:
+                column = column.strip()
+                if column:
+                    keywords.add(column.lower())
+            for alias_list in schema.synonyms.values():
+                for alias in alias_list:
+                    alias = alias.strip()
+                    if alias:
+                        keywords.add(alias.lower())
+        return tuple(sorted({kw for kw in keywords if len(kw) > 2}))
+
+    def _prepare_llm_document(self, text: str, doc_type: str, max_chars: int = 7000) -> str:
+        if not text:
+            return ""
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if len(collapsed) <= max_chars:
+            return collapsed
+
+        snippets: List[str] = []
+        consumed = 0
+
+        def _append(segment: str) -> None:
+            nonlocal consumed
+            segment = re.sub(r"\s+", " ", segment).strip()
+            if not segment:
+                return
+            if segment in snippets:
+                return
+            remaining = max_chars - consumed
+            if remaining <= 0:
+                return
+            if len(segment) > remaining:
+                segment = segment[:remaining]
+            snippets.append(segment)
+            consumed += len(segment) + 1
+
+        head_span = max_chars // 3
+        _append(collapsed[:head_span])
+
+        lowered = text.lower()
+        keywords = self._schema_keywords(doc_type)
+        if keywords:
+            for keyword in keywords:
+                idx = lowered.find(keyword)
+                if idx == -1:
+                    continue
+                start = max(0, idx - 200)
+                end = min(len(text), idx + 400)
+                _append(text[start:end])
+                if consumed >= (max_chars * 2) // 3:
+                    break
+
+        tail_span = max_chars // 4
+        _append(collapsed[-tail_span:])
+
+        if not snippets:
+            return collapsed[:max_chars]
+
+        merged = "\n".join(snippets)
+        if len(merged) > max_chars:
+            merged = merged[:max_chars]
+        return merged
+
     def _llm_structured_dataframes(
         self,
         text: str,
         doc_type: str,
         header_seed: Dict[str, Any],
         line_items_seed: List[Dict[str, Any]],
+        llm_text: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+        llm_input = llm_text or self._prepare_llm_document(text, doc_type)
         schema = self._get_table_schema(doc_type, "header")
         line_schema = self._get_table_schema(doc_type, "line_items")
         header_columns = schema.columns if schema else []
@@ -1939,7 +2007,13 @@ class DataExtractionAgent(BaseAgent):
         for _ in range(3):
             try:
                 response = self.call_ollama(
-                    prompt=prompt + "\n\nInstructions:\n" + json.dumps(instructions) + "\n\nDocument:\n" + text,
+                    prompt=(
+                        prompt
+                        + "\n\nInstructions:\n"
+                        + json.dumps(instructions)
+                        + "\n\nDocument:\n"
+                        + llm_input
+                    ),
                     model=self.extraction_model,
                     format="json",
                 )
@@ -2001,8 +2075,10 @@ class DataExtractionAgent(BaseAgent):
         data = convert_document_to_json(text, doc_type)
         header_seed.update(self._normalize_header_fields(data.get("header_data", {}), doc_type))
 
+        llm_text = self._prepare_llm_document(text, doc_type)
+
         llm_header_df, llm_line_df, llm_notes = self._llm_structured_dataframes(
-            text, doc_type, header_seed, line_items_seed
+            text, doc_type, header_seed, line_items_seed, llm_text=llm_text
         )
         if not llm_header_df.empty:
             llm_header = self._dataframe_to_header(llm_header_df)
@@ -2022,7 +2098,9 @@ class DataExtractionAgent(BaseAgent):
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
 
         # Step 4: LLM strict fill for any remaining gaps
-        header, line_items = self._fill_missing_fields_with_llm(text, doc_type, header, line_items)
+        header, line_items = self._fill_missing_fields_with_llm(
+            text, doc_type, header, line_items, llm_text=llm_text
+        )
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
         inferred_currency = self._infer_currency(text, header)
         if inferred_currency:
@@ -2082,7 +2160,14 @@ class DataExtractionAgent(BaseAgent):
         }
         return header, line_items
 
-    def _fill_missing_fields_with_llm(self, text: str, doc_type: str, header: Dict[str, Any], line_items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    def _fill_missing_fields_with_llm(
+        self,
+        text: str,
+        doc_type: str,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        llm_text: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         schema = SCHEMA_MAP.get(doc_type, {})
         header_fields = list(schema.get("header", {}).keys())
         missing_header = [f for f in header_fields if not header.get(f)]
@@ -2092,6 +2177,7 @@ class DataExtractionAgent(BaseAgent):
             return header, line_items
 
         context_hint = DOC_TYPE_CONTEXT.get(doc_type, "")
+        llm_input = llm_text or self._prepare_llm_document(text, doc_type)
         prompt = (
             f"You are an information extraction engine for {doc_type}. {context_hint} "
             "Return ONLY valid JSON. Do not include explanations.\n"
@@ -2105,7 +2191,12 @@ class DataExtractionAgent(BaseAgent):
         )
         if need_items:
             prompt += "Also extract 'line_items' as a list of objects. Include description/qty/price amounts when available.\n"
-        prompt += "\nExisting data:\n" + json.dumps({"header_data": header, "line_items": line_items}) + "\n\nDocument:\n" + text
+        prompt += (
+            "\nExisting data:\n"
+            + json.dumps({"header_data": header, "line_items": line_items})
+            + "\n\nDocument:\n"
+            + llm_input
+        )
 
         payload = {}
         for _ in range(2):

@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     )
 
     extraction_model: str = "gpt-oss"
+    rag_model: str = Field(default="gpt-oss", env="RAG_LLM_MODEL")
     # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
     # embeddings tailored for question/answer style retrieval.  Its
     # dimensionality (768) is smaller than ``all-roberta-large-v1`` which

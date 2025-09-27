@@ -57,7 +57,10 @@ class RAGPipeline:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
-        self.default_llm_model = settings.extraction_model
+        default_rag_model = getattr(self.settings, "rag_model", None)
+        if not default_rag_model:
+            default_rag_model = getattr(self.settings, "extraction_model", settings.extraction_model)
+        self.default_llm_model = default_rag_model
         self.rag = RAGService(agent_nick)
         model_name = getattr(
             self.settings,
