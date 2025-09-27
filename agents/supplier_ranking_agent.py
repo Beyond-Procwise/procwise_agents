@@ -1,13 +1,3 @@
-"""Supplier ranking agent implementing policy driven scoring and enrichment.
-
-This module fulfils the end-to-end supplier ranking requirements by
-combining data from the contract, purchase order, invoice and quote
-pipeline.  It consumes the supplier identifiers surfaced by the
-``OpportunityMinerAgent`` and produces a ranked list alongside rich supplier
-profiles that downstream agents – notably ``EmailDraftingAgent`` – can use to
-tailor communications.
-"""
-
 from __future__ import annotations
 
 import json
@@ -15,9 +5,7 @@ import logging
 import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
-
 import pandas as pd
-
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 from utils.db import read_sql_compat
