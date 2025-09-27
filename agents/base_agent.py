@@ -1,6 +1,7 @@
 # ProcWise/agents/base_agent.py
 
 import boto3
+from botocore.config import Config
 import logging
 import os
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
+import threading
 
 import psycopg2
 from qdrant_client import QdrantClient, models
@@ -271,6 +273,18 @@ class BaseAgent:
             logger.exception("vector search failed")
             return []
 
+    @contextmanager
+    def _borrow_s3_client(self):
+        reserve = getattr(self.agent_nick, "reserve_s3_connection", None)
+        if callable(reserve):
+            with reserve() as client:
+                yield client
+                return
+        client = getattr(self.agent_nick, "s3_client", None)
+        if client is None:
+            raise AttributeError("AgentNick must provide an s3_client")
+        yield client
+
 class AgentNick:
     def __init__(self):
         logger.info("AgentNick is waking up...")
@@ -282,7 +296,21 @@ class AgentNick:
         self._db_engine = None
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
-        self.s3_client = boto3.client('s3')
+        s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
+        self._s3_pool_size = s3_pool
+        self.s3_client = boto3.client(
+            "s3",
+            config=Config(
+                max_pool_connections=s3_pool,
+                retries={"max_attempts": 10, "mode": "standard"},
+            ),
+        )
+        self._s3_semaphore: Optional[threading.BoundedSemaphore]
+        try:
+            self._s3_semaphore = threading.BoundedSemaphore(value=s3_pool)
+        except Exception:  # pragma: no cover - threading edge cases
+            logger.debug("Failed to allocate S3 semaphore", exc_info=True)
+            self._s3_semaphore = None
         logger.info("Clients initialized.")
 
         logger.info("Initializing core engines...")
@@ -296,6 +324,25 @@ class AgentNick:
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    @property
+    def s3_pool_size(self) -> int:
+        return getattr(self, "_s3_pool_size", 10)
+
+    @contextmanager
+    def reserve_s3_connection(self):
+        semaphore = getattr(self, "_s3_semaphore", None)
+        if semaphore is None:
+            yield self.s3_client
+            return
+        acquired = False
+        try:
+            semaphore.acquire()
+            acquired = True
+            yield self.s3_client
+        finally:
+            if acquired:
+                semaphore.release()
 
     def get_db_engine(self):
         """Return a cached SQLAlchemy engine when available.

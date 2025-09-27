@@ -283,10 +283,23 @@ class RAGAgent(BaseAgent):
             f"chat_history/{user_id}/{session_id}.json" if session_id else f"chat_history/{user_id}.json"
         )
         try:
-            s3_object = self.agent_nick.s3_client.get_object(
-                Bucket=self.settings.s3_bucket_name, Key=history_key
-            )
-            history = json.loads(s3_object["Body"].read().decode("utf-8"))
+            with self._borrow_s3_client() as s3_client:
+                s3_object = s3_client.get_object(
+                    Bucket=self.settings.s3_bucket_name, Key=history_key
+                )
+            body = s3_object.get("Body")
+            if body is None:
+                print(
+                    f"No body returned for chat history '{history_key}'. Starting new session."
+                )
+                return []
+            try:
+                history = json.loads(body.read().decode("utf-8"))
+            finally:
+                try:
+                    body.close()
+                except Exception:
+                    logger.debug("Failed to close chat history stream %s", history_key, exc_info=True)
             print(
                 f"Loaded {len(history)} items from chat history for user '{user_id}'"
                 + (f" session '{session_id}'" if session_id else "")
@@ -316,11 +329,12 @@ class RAGAgent(BaseAgent):
             )
             return
         try:
-            self.agent_nick.s3_client.put_object(
-                Bucket=bucket_name,
-                Key=history_key,
-                Body=json.dumps(history, indent=2),
-            )
+            with self._borrow_s3_client() as s3_client:
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=history_key,
+                    Body=json.dumps(history, indent=2),
+                )
             print(
                 f"Saved chat history for user '{user_id}'"
                 + (f" session '{session_id}'" if session_id else "")
