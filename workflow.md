@@ -21,3 +21,4 @@
 
 ## Maintenance Guidelines
 - Update this document whenever new agents, background jobs, or procurement data sources are introduced so downstream developers can quickly align enhancements with the existing workflow.
+- When commissioning a new supplier mailbox, follow `docs/ses_inbound_pipeline.md` to verify SES → S3 → SQS delivery so the `SESEmailWatcher` receives replies without delay.【F:docs/ses_inbound_pipeline.md†L1-L58】【F:services/email_watcher.py†L137-L214】

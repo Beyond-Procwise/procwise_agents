@@ -187,6 +187,8 @@ class SESEmailWatcher:
             minimum=1,
         )
 
+        self._validate_inbound_configuration(raw_prefix)
+
         # Prefer reusing the orchestrator's S3 client so we respect any
         # endpoint overrides or credential sources initialised during startup.
         shared_client = getattr(agent_nick, "s3_client", None)
@@ -1298,6 +1300,43 @@ class SESEmailWatcher:
         if minimum is not None:
             coerced = max(coerced, minimum)
         return coerced
+
+    def _validate_inbound_configuration(self, raw_prefix: object) -> None:
+        """Log actionable guidance for common SES inbound misconfigurations."""
+
+        if not self.bucket:
+            logger.warning(
+                "SES inbound bucket is not configured; configure 'ses_inbound_bucket' "
+                "or 's3_bucket_name' so the watcher can download supplier replies"
+            )
+            if self._queue_url:
+                logger.warning(
+                    "SES inbound queue %s is configured without a bucket; ensure "
+                    "the queue payload includes bucket overrides or align the "
+                    "bucket configuration",
+                    self._queue_url,
+                )
+            return
+
+        if not self._queue_url:
+            logger.warning(
+                "SES inbound queue URL is not configured for bucket %s. Configure "
+                "'ses_inbound_queue_url' and S3→SQS notifications so new emails "
+                "arrive immediately instead of relying on eventual S3 polling",
+                self.bucket,
+            )
+        else:
+            logger.debug(
+                "SES inbound queue %s is configured for bucket %s", self._queue_url, self.bucket
+            )
+
+        if raw_prefix is None:
+            return
+
+        expected_prefixes = ", ".join(self._prefixes)
+        logger.info(
+            "SES inbound prefixes normalised from %r: %s", raw_prefix, expected_prefixes or "<root>"
+        )
 
     def _build_prefixes(self, raw_prefix: object) -> List[str]:
         base_candidates = self._normalise_prefix_input(raw_prefix)
