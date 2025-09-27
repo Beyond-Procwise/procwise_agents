@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 import threading
@@ -107,9 +108,11 @@ class BaseAgent:
         end_ts = datetime.utcnow()
 
         status = result.status.value
+        logged_input = self._summarize_for_logging(context.input_data)
+        logged_output = self._summarize_for_logging(result.data)
         process_id = self.agent_nick.process_routing_service.log_process(
             process_name=self.__class__.__name__,
-            process_details={"input": context.input_data, "output": result.data},
+            process_details={"input": logged_input, "output": logged_output},
             user_id=context.user_id,
             user_name=self.agent_nick.settings.script_user,
             process_status=0,
@@ -118,7 +121,7 @@ class BaseAgent:
             run_id = self.agent_nick.process_routing_service.log_run_detail(
                 process_id=process_id,
                 process_status=status,
-                process_details={"input": context.input_data, "output": result.data},
+                process_details={"input": logged_input, "output": logged_output},
                 process_start_ts=start_ts,
                 process_end_ts=end_ts,
                 triggered_by=context.user_id,
@@ -126,8 +129,8 @@ class BaseAgent:
             action_id = self.agent_nick.process_routing_service.log_action(
                 process_id=process_id,
                 agent_type=self.__class__.__name__,
-                action_desc=context.input_data,
-                process_output=result.data,
+                action_desc=logged_input,
+                process_output=logged_output,
                 status="completed" if result.status == AgentStatus.SUCCESS else "failed",
                 run_id=run_id,
             )
@@ -146,6 +149,68 @@ class BaseAgent:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _summarize_for_logging(
+        self,
+        payload: Any,
+        *,
+        max_items: int = 3,
+        max_string_length: int = 200,
+    ) -> Any:
+        """Return a compact representation suitable for structured logging.
+
+        The helper trims large collections and long strings so operational
+        logging surfaces only the key data points instead of entire agent
+        payloads.  Non-serialisable objects are coerced to ``str``
+        representations as a last resort.
+        """
+
+        def _inner(value: Any, depth: int) -> Any:
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+
+            if isinstance(value, str):
+                if len(value) <= max_string_length:
+                    return value
+                overflow = len(value) - max_string_length
+                return f"{value[:max_string_length]}… (+{overflow} chars)"
+
+            if isinstance(value, (bytes, bytearray)):
+                return f"<binary {len(value)} bytes>"
+
+            if hasattr(value, "model_dump"):
+                try:
+                    return _inner(value.model_dump(), depth + 1)
+                except Exception:
+                    return str(value)
+
+            if isinstance(value, Mapping):
+                items = list(value.items())
+                summary: Dict[str, Any] = {}
+                for index, (key, item) in enumerate(items):
+                    if index >= max_items:
+                        summary["__truncated_keys__"] = f"… {len(items) - max_items} more key(s)"
+                        break
+                    summary[str(key)] = _inner(item, depth + 1)
+                return summary
+
+            sequence_types = (Sequence, set, frozenset)
+            if isinstance(value, sequence_types) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                iterable = list(value)
+                limited = [_inner(item, depth + 1) for item in iterable[:max_items]]
+                if len(iterable) > max_items:
+                    limited.append(f"… {len(iterable) - max_items} more item(s)")
+                return limited
+
+            return str(value)
+
+        try:
+            return _inner(payload, 0)
+        except Exception:  # pragma: no cover - defensive against unusual payloads
+            logger.debug("Failed to summarise payload for logging", exc_info=True)
+            return "<unserialisable payload>"
+
     def call_ollama(
         self,
         prompt: Optional[str] = None,
