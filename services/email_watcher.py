@@ -9,6 +9,8 @@ import re
 import time
 import uuid
 from urllib.parse import unquote_plus, urlparse
+from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -54,6 +56,9 @@ class EmailWatcherState(Protocol):
     def get(self, message_id: str) -> Optional[Dict[str, object]]:  # pragma: no cover - protocol
         ...
 
+    def items(self) -> Iterable[Tuple[str, Dict[str, object]]]:  # pragma: no cover - protocol
+        ...
+
 
 @dataclass
 class InMemoryEmailWatcherState:
@@ -69,6 +74,9 @@ class InMemoryEmailWatcherState:
 
     def get(self, message_id: str) -> Optional[Dict[str, object]]:
         return self._seen.get(message_id)
+
+    def items(self) -> Iterable[Tuple[str, Dict[str, object]]]:
+        return list(self._seen.items())
 
 
 def _strip_html(value: str) -> str:
@@ -219,7 +227,10 @@ class SESEmailWatcher:
 
         self._queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
         queue_flag = getattr(self.settings, "ses_inbound_queue_enabled", None)
-        self._queue_enabled = bool(queue_flag) if queue_flag is not None else False
+        if queue_flag is None:
+            self._queue_enabled = bool(self._queue_url)
+        else:
+            self._queue_enabled = bool(queue_flag)
         self._queue_disabled_reason: Optional[str] = None
         if self._queue_url and not self._queue_enabled:
             self._queue_disabled_reason = (
@@ -259,6 +270,12 @@ class SESEmailWatcher:
         self._assumed_credentials: Optional[Dict[str, str]] = None
         self._assumed_credentials_expiry: Optional[datetime] = None
         self._last_s3_poll: Dict[str, Optional[datetime]] = {}
+        self._processed_cache_limit = self._coerce_int(
+            getattr(self.settings, "email_processed_cache_limit", 200),
+            default=200,
+            minimum=1,
+        )
+        self._processed_cache: OrderedDict[str, Dict[str, object]] = OrderedDict()
 
         logger.info(
             "Initialised email watcher for mailbox %s (bucket=%s, prefixes=%s, queue=%s, queue_enabled=%s, poll_interval=%ss)",
@@ -302,6 +319,16 @@ class SESEmailWatcher:
             limit if limit is not None else "unbounded",
         )
 
+        if match_filters:
+            cached_matches = self._retrieve_cached_matches(match_filters, limit)
+            if cached_matches:
+                logger.info(
+                    "Returning %d previously processed message(s) matching filters for mailbox %s",
+                    len(cached_matches),
+                    self.mailbox_address,
+                )
+                return cached_matches
+
         try:
             if self._custom_loader is not None:
                 messages = self._custom_loader(limit)
@@ -343,14 +370,18 @@ class SESEmailWatcher:
                     processed.get("rfq_id"),
                     processed.get("from_address"),
                 )
-                results.append(processed)
+                processed_payload = self._record_processed_payload(message_id, processed)
+                results.append(processed_payload)
                 metadata = {
-                    "rfq_id": processed.get("rfq_id"),
-                    "supplier_id": processed.get("supplier_id"),
+                    "rfq_id": processed_payload.get("rfq_id"),
+                    "supplier_id": processed_payload.get("supplier_id"),
                     "processed_at": datetime.now(timezone.utc).isoformat(),
                     "status": "processed",
+                    "payload": processed_payload,
                 }
-                match_found = bool(match_filters and self._matches_filters(processed, match_filters))
+                match_found = bool(
+                    match_filters and self._matches_filters(processed_payload, match_filters)
+                )
             else:
                 logger.warning(
                     "Skipped message %s for mailbox %s: %s",
@@ -378,6 +409,71 @@ class SESEmailWatcher:
             self._acknowledge_queue_message(message, success=ack_success)
 
         return results
+
+    def _record_processed_payload(
+        self, message_id: str, payload: Dict[str, object]
+    ) -> Dict[str, object]:
+        """Persist processed payload snapshots for future filter matches."""
+
+        snapshot = deepcopy(payload)
+        if "message_id" not in snapshot:
+            snapshot["message_id"] = message_id
+        self._processed_cache[message_id] = snapshot
+        while len(self._processed_cache) > self._processed_cache_limit:
+            self._processed_cache.popitem(last=False)
+        return deepcopy(snapshot)
+
+    def _retrieve_cached_matches(
+        self, filters: Dict[str, object], limit: Optional[int]
+    ) -> List[Dict[str, object]]:
+        if not filters:
+            return []
+
+        try:
+            effective_limit = None if limit is None else max(int(limit), 0)
+        except Exception:
+            effective_limit = None if limit is None else 0
+
+        if effective_limit == 0:
+            return []
+
+        matches: List[Dict[str, object]] = []
+        seen_ids: Set[str] = set()
+
+        def _consider(message_id: str, payload: Dict[str, object]) -> None:
+            if not isinstance(payload, dict) or message_id in seen_ids:
+                return
+            if self._matches_filters(payload, filters):
+                matches.append(deepcopy(payload))
+                seen_ids.add(message_id)
+
+        for message_id in reversed(list(self._processed_cache.keys())):
+            payload = self._processed_cache.get(message_id)
+            if payload:
+                _consider(message_id, payload)
+            if effective_limit is not None and len(matches) >= effective_limit:
+                return matches[:effective_limit]
+
+        for message_id, metadata in self._iter_state_metadata():
+            payload = metadata.get("payload") if isinstance(metadata, dict) else None
+            if isinstance(payload, dict):
+                _consider(message_id, payload)
+            if effective_limit is not None and len(matches) >= effective_limit:
+                return matches[:effective_limit]
+
+        if effective_limit is not None:
+            return matches[:effective_limit]
+        return matches
+
+    def _iter_state_metadata(self) -> Iterable[Tuple[str, Dict[str, object]]]:
+        if not self.state_store:
+            return []
+        try:
+            items = self.state_store.items()
+        except Exception:
+            logger.debug("Email watcher state store does not expose items(); skipping cache lookup")
+            return []
+        return list(items)
 
     def watch(
         self,
@@ -542,6 +638,7 @@ class SESEmailWatcher:
                 "message_id": message.get("id"),
                 "subject": subject,
                 "from_address": from_address,
+                "message_body": body,
                 "target_price": target_price,
                 "negotiation_triggered": False,
                 "supplier_status": interaction_output.status.value,
@@ -592,6 +689,7 @@ class SESEmailWatcher:
             "message_id": message.get("id"),
             "subject": subject,
             "from_address": from_address,
+            "message_body": body,
             "price": interaction_output.data.get("price"),
             "lead_time": interaction_output.data.get("lead_time"),
             "target_price": target_price,
