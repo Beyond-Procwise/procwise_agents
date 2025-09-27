@@ -103,6 +103,33 @@ def test_supplier_interaction_wait_for_response():
     assert calls["count"] == 1
 
 
+def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypatch):
+    nick = DummyNick()
+    nick.settings.email_response_max_attempts = 3
+    agent = SupplierInteractionAgent(nick)
+
+    calls = {"count": 0}
+
+    def poll_once(limit=None, match_filters=None):
+        calls["count"] += 1
+        return []
+
+    watcher = SimpleNamespace(poll_once=poll_once)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
+
+    result = agent.wait_for_response(
+        watcher=watcher,
+        timeout=30,
+        poll_interval=None,
+        rfq_id="RFQ-20240101-missing",
+        max_attempts=None,
+    )
+
+    assert result is None
+    assert calls["count"] == 3
+
+
 def test_supplier_interaction_waits_using_drafts():
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)

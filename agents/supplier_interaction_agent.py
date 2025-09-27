@@ -349,10 +349,17 @@ class SupplierInteractionAgent(BaseAgent):
         supplier_id: Optional[str] = None,
         subject_hint: Optional[str] = None,
         from_address: Optional[str] = None,
+        max_attempts: Optional[int] = None,
     ) -> Optional[Dict]:
         """Wait for an inbound supplier email and return the processed result."""
 
         deadline = time.time() + max(timeout, 0)
+
+        attempt_cap = max_attempts
+        if attempt_cap is None:
+            attempt_cap = getattr(self.agent_nick.settings, "email_response_max_attempts", 3)
+        attempt_cap = self._coerce_int(attempt_cap, default=3)
+        attempts_made = 0
 
         if (
             watcher is None
@@ -425,6 +432,12 @@ class SupplierInteractionAgent(BaseAgent):
             match_filters["from_address"] = from_address
 
         while time.time() <= deadline:
+            if attempts_made >= attempt_cap:
+                logger.info(
+                    "Reached maximum email poll attempts (%s) while waiting for RFQ %s", attempt_cap, rfq_id
+                )
+                break
+            attempts_made += 1
             try:
                 if match_filters:
                     batch = active_watcher.poll_once(limit=limit, match_filters=match_filters)
@@ -495,11 +508,19 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
         if result is None:
-            logger.warning(
-                "Timed out waiting for supplier response (rfq_id=%s, supplier=%s) after %ss",
-                rfq_id,
-                supplier_id,
-                timeout,
+            if attempts_made >= attempt_cap:
+                logger.warning(
+                    "Stopped waiting for supplier response (rfq_id=%s, supplier=%s) after %s attempt(s)",
+                    rfq_id,
+                    supplier_id,
+                    attempts_made,
+                )
+            else:
+                logger.warning(
+                    "Timed out waiting for supplier response (rfq_id=%s, supplier=%s) after %ss",
+                    rfq_id,
+                    supplier_id,
+                    timeout,
             )
 
         return result

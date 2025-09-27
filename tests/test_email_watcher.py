@@ -1,6 +1,8 @@
 import gzip
 import json
+import logging
 import re
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from agents.base_agent import AgentOutput, AgentStatus, AgentContext
@@ -171,6 +173,23 @@ def test_email_watcher_triggers_negotiation_when_price_high():
 
     # Subsequent polls should skip already processed emails
     assert watcher.poll_once() == []
+
+
+def test_email_watcher_defaults_to_s3_polling_when_queue_missing(caplog):
+    nick = DummyNick()
+    nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
+
+    caplog.set_level(logging.INFO, logger="services.email_watcher")
+
+    watcher = SESEmailWatcher(
+        nick,
+        message_loader=lambda limit=None: [],
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    assert watcher._queue_enabled is False
+    assert watcher._queue_disabled_reason
+    assert any("polling is disabled" in message for message in caplog.messages)
 
 
 def test_email_watcher_stops_after_matching_filters():
@@ -413,7 +432,7 @@ def test_email_watcher_fallbacks_to_imap_when_s3_empty(monkeypatch):
         state_store=InMemoryEmailWatcherState(),
     )
 
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None: [])
+    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
 
     call_args = {}
 
@@ -449,7 +468,7 @@ def test_email_watcher_peek_recent_messages_uses_non_destructive_imap(monkeypatc
         state_store=InMemoryEmailWatcherState(),
     )
 
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None: [])
+    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
 
     def fake_imap(limit=None, mark_seen=False):
         assert mark_seen is False
@@ -544,11 +563,14 @@ def test_email_watcher_builds_prefix_variants_for_mailbox():
     assert "ses/inbound/" in watcher._prefixes
     assert "ses/inbound/supplierconnect@procwise.co.uk/" in watcher._prefixes
     assert "supplierconnect@procwise.co.uk/" in watcher._prefixes
+    assert "emails/" in watcher._processed_prefixes
+    assert "emails/supplierconnect@procwise.co.uk/" in watcher._processed_prefixes
 
 
 def test_email_watcher_processes_queue_messages_and_acknowledges(monkeypatch):
     nick = DummyNick()
     nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
+    nick.settings.ses_inbound_queue_enabled = True
     supplier_agent = StubSupplierInteractionAgent()
     negotiation_agent = StubNegotiationAgent()
 
@@ -588,7 +610,7 @@ def test_email_watcher_processes_queue_messages_and_acknowledges(monkeypatch):
 
     monkeypatch.setattr(watcher, "_get_sqs_client", lambda: queue)
     monkeypatch.setattr(watcher, "_get_s3_client", lambda: object())
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None: [])
+    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
     monkeypatch.setattr(
         watcher,
         "_download_object",
@@ -602,9 +624,108 @@ def test_email_watcher_processes_queue_messages_and_acknowledges(monkeypatch):
     assert watcher.state_store.get("ses/inbound/message-1.eml")["status"] == "processed"
 
 
+def test_email_watcher_polls_processed_messages_until_match(monkeypatch):
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {"supplier_id": "SUP-PROC", "target_price": 900},
+        state_store=InMemoryEmailWatcherState(),
+    )
+    watcher.poll_interval_seconds = 0
+
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(minutes=5)
+
+    base_pages = []
+    first_page = {prefix: [] for prefix in watcher._processed_prefixes}
+    first_page["emails/"] = [
+        {"Key": "emails/old.json", "LastModified": older},
+    ]
+    second_page = {prefix: [] for prefix in watcher._processed_prefixes}
+    second_page["emails/"] = [
+        {"Key": "emails/new.json", "LastModified": now},
+    ]
+    base_pages.extend([first_page, second_page])
+
+    old_payload = {
+        "subject": "Re: RFQ-20240101-old00001",
+        "from": "supplier@example.com",
+        "body": "Quoted price 1200",
+        "rfq_id": "RFQ-20240101-old00001",
+    }
+    new_payload = {
+        "subject": "Re: RFQ-20240101-target",
+        "from": "supplier@example.com",
+        "body": "Quoted price 950",
+        "rfq_id": "RFQ-20240101-target",
+    }
+
+    payloads = {
+        "emails/old.json": json.dumps(old_payload).encode("utf-8"),
+        "emails/new.json": json.dumps(new_payload).encode("utf-8"),
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+    class ProcessedS3Client:
+        def __init__(self, prefixes, pages, blobs):
+            self._prefixes = list(prefixes)
+            self._pages = list(pages)
+            self._blobs = blobs
+            self._call_index = 0
+            self.page_indices = []
+
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            outer = self
+
+            class _Paginator:
+                def __init__(self, owner):
+                    self._owner = owner
+
+                def paginate(self, Bucket, Prefix):
+                    count = max(1, len(self._owner._prefixes))
+                    attempt_idx = min(
+                        self._owner._call_index // count, len(self._owner._pages) - 1
+                    )
+                    self._owner._call_index += 1
+                    if self._owner._prefixes and Prefix == self._owner._prefixes[0]:
+                        self._owner.page_indices.append(attempt_idx)
+                    yield {"Contents": list(self._owner._pages[attempt_idx].get(Prefix, []))}
+
+            return _Paginator(outer)
+
+        def get_object(self, Bucket, Key):
+            return {"Body": DummyBody(self._blobs[Key])}
+
+    client = ProcessedS3Client(watcher._processed_prefixes, base_pages, payloads)
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: client)
+
+    results = watcher.poll_once(limit=1, match_filters={"rfq_id": "RFQ-20240101-target"})
+
+    assert len(results) == 2
+    assert results[0]["rfq_id"] == "RFQ-20240101-old00001"
+    assert results[-1]["rfq_id"] == "RFQ-20240101-target"
+    assert results[-1]["supplier_output"]["price"] == 950.0
+    assert client.page_indices[0] == 0
+    assert client.page_indices[-1] == 1
+    assert watcher.state_store.get("emails/new.json")["status"] == "processed"
+
+
 def test_email_watcher_leaves_queue_message_on_processing_error(monkeypatch):
     nick = DummyNick()
     nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
+    nick.settings.ses_inbound_queue_enabled = True
     supplier_agent = StubSupplierInteractionAgent()
     negotiation_agent = StubNegotiationAgent()
 
@@ -644,7 +765,7 @@ def test_email_watcher_leaves_queue_message_on_processing_error(monkeypatch):
 
     monkeypatch.setattr(watcher, "_get_sqs_client", lambda: queue)
     monkeypatch.setattr(watcher, "_get_s3_client", lambda: object())
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None: [])
+    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
     monkeypatch.setattr(
         watcher,
         "_download_object",
