@@ -34,6 +34,7 @@ def test_preview_recent_emails_trims_and_orders(caplog):
         ]
     )
 
+
     with caplog.at_level("INFO"):
         result = preview_recent_emails(watcher, limit=3)
 

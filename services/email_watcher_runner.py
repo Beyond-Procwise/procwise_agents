@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional
 
+
 from agents.base_agent import AgentNick
 from services.email_watcher import SESEmailWatcher
 from utils.gpu import configure_gpu
@@ -80,6 +81,7 @@ def _sort_preview(messages: Iterable[Dict[str, object]]) -> List[Dict[str, objec
     return sorted(messages, key=sort_key, reverse=True)
 
 
+
 def preview_recent_emails(
     watcher: SESEmailWatcher,
     *,
@@ -97,6 +99,7 @@ def preview_recent_emails(
 
     try:
         preview = watcher.peek_recent_messages(limit=limit_int)
+
     except Exception:  # pragma: no cover - defensive against unexpected loaders
         logger.exception("Failed to preview recent emails for mailbox %s", watcher.mailbox_address)
         return []
@@ -106,6 +109,7 @@ def preview_recent_emails(
 
     _log_preview(watcher.mailbox_address, limited_preview)
     return limited_preview
+
 
 
 def preview_then_watch(
