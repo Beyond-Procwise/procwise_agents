@@ -11,7 +11,7 @@ from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
 from .rag_service import RAGService
-from utils.gpu import configure_gpu
+from utils.gpu import configure_gpu, load_cross_encoder
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,9 @@ class RAGPipeline:
             "reranker_model",
             "cross-encoder/ms-marco-MiniLM-L-12-v2",
         )
-        self._reranker = cross_encoder_cls(model_name, device=self.agent_nick.device)
+        self._reranker = load_cross_encoder(
+            model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
+        )
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
         """Return extracted text for each uploaded PDF."""

@@ -9,7 +9,7 @@ from sentence_transformers import CrossEncoder
 
 from services.rag_service import RAGService
 from .base_agent import BaseAgent
-from utils.gpu import configure_gpu
+from utils.gpu import configure_gpu, load_cross_encoder
 
 configure_gpu()
 
@@ -35,7 +35,9 @@ class RAGAgent(BaseAgent):
             self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
         )
         # Cross encoder ensures accurate ranking while utilising the GPU
-        self._reranker = CrossEncoder(model_name, device=self.agent_nick.device)
+        self._reranker = load_cross_encoder(
+            model_name, CrossEncoder, getattr(self.agent_nick, "device", None)
+        )
         # Thread pool enables parallel answer and follow-up generation
         self._executor = ThreadPoolExecutor(max_workers=2)
         # Service providing FAISS and BM25 retrieval

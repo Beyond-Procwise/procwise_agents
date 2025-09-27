@@ -1055,11 +1055,7 @@ class OpportunityMinerAgent(BaseAgent):
                 preview,
             )
             qe = getattr(self.agent_nick, "query_engine", None)
-            if qe and hasattr(qe, "train_procurement_context"):
-                try:
-                    qe.train_procurement_context()
-                except Exception:  # pragma: no cover - best effort
-                    logger.exception("Failed to train procurement context")
+            workflow_completed = False
             self._data_profile = {}
             tables = self._ingest_data()
             tables = self._validate_data(tables)
@@ -1544,6 +1540,7 @@ class OpportunityMinerAgent(BaseAgent):
             if getattr(self.settings, "verbose_agent_debug", False):
                 logger.debug("OpportunityMinerAgent findings: %s", data["findings"])
             logger.info("OpportunityMinerAgent finishing processing")
+            workflow_completed = True
 
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
@@ -1554,6 +1551,16 @@ class OpportunityMinerAgent(BaseAgent):
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("OpportunityMinerAgent error: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+        finally:
+            if (
+                workflow_completed
+                and qe
+                and hasattr(qe, "train_procurement_context")
+            ):
+                try:
+                    qe.train_procurement_context()
+                except Exception:  # pragma: no cover - best effort
+                    logger.exception("Failed to train procurement context")
 
     # ------------------------------------------------------------------
     # Data ingestion and preparation

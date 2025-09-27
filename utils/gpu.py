@@ -4,12 +4,20 @@ This module centralises GPU-related environment setup so that all agents
 and services can rely on a single, consistent configuration.  The
 ``configure_gpu`` function is idempotent – it will apply settings only
 once and return the detected device (``"cuda"`` or ``"cpu"``).
+
+The module also exposes :func:`load_cross_encoder` which initialises
+``sentence_transformers`` cross encoders with a graceful fallback for the
+``meta`` tensor initialisation error introduced in newer versions of
+PyTorch.  When this happens the model is first constructed on CPU and
+then moved to the requested GPU, ensuring that GPU acceleration remains
+available without crashing the agent.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional
+from typing import Optional, Any
 
 try:  # ``torch`` is optional at import time for some environments
     import torch  # type: ignore
@@ -18,6 +26,8 @@ except Exception:  # pragma: no cover - optional dependency
 
 _CONFIGURED: bool = False
 _DEVICE: Optional[str] = None
+
+logger = logging.getLogger(__name__)
 
 
 def configure_gpu() -> str:
@@ -53,3 +63,64 @@ def configure_gpu() -> str:
 
     _CONFIGURED = True
     return _DEVICE
+
+
+def load_cross_encoder(
+    model_name: str,
+    cross_encoder_cls: Any,
+    device: Any | None,
+):
+    """Initialise a cross encoder on the desired device with GPU fallback.
+
+    Parameters
+    ----------
+    model_name:
+        Hugging Face model identifier.
+    cross_encoder_cls:
+        The class (typically ``sentence_transformers.CrossEncoder``) used to
+        construct the reranker.
+    device:
+        Preferred device descriptor supplied by the agent.  It can be a
+        string (``"cuda"``) or :class:`torch.device` instance.
+
+    Returns
+    -------
+    Any
+        An initialised cross encoder instance.
+
+    Notes
+    -----
+    Recent PyTorch releases raise ``NotImplementedError`` when moving a
+    module containing ``meta`` tensors directly to CUDA.  Some Hugging
+    Face models trigger this pathway even though the system has a GPU
+    available.  When this happens we retry the initialisation on CPU and
+    then move the fully materialised model to the requested device.
+    """
+
+    target_device = None if device is None else str(device)
+    try:
+        return cross_encoder_cls(model_name, device=target_device)
+    except NotImplementedError as exc:  # pragma: no cover - hardware dependent
+        if "meta tensor" not in str(exc):
+            raise
+        logger.warning(
+            "Cross encoder initialisation failed on device %s due to meta tensor copy; "
+            "retrying via CPU fallback.",
+            target_device,
+        )
+        encoder = cross_encoder_cls(model_name, device="cpu")
+        if target_device and target_device != "cpu":
+            try:
+                encoder.to(target_device)
+            except NotImplementedError:
+                logger.exception(
+                    "Cross encoder could not be moved to device %s after CPU initialisation; "
+                    "continuing on CPU.",
+                    target_device,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Unexpected error moving cross encoder to device %s; continuing on CPU.",
+                    target_device,
+                )
+        return encoder

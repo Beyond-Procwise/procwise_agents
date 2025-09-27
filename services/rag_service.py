@@ -8,7 +8,7 @@ import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from qdrant_client import models
-from utils.gpu import configure_gpu
+from utils.gpu import configure_gpu, load_cross_encoder
 
 configure_gpu()
 
@@ -38,7 +38,9 @@ class RAGService:
             "reranker_model",
             "cross-encoder/ms-marco-MiniLM-L-12-v2",
         )
-        self._reranker = cross_encoder_cls(model_name, device=self.agent_nick.device)
+        self._reranker = load_cross_encoder(
+            model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
+        )
 
     # ------------------------------------------------------------------
     # Embedding helpers
