@@ -172,6 +172,10 @@ class BaseAgent:
         base_kwargs = kwargs
 
         options = {**self.agent_nick.ollama_options(), **options_from_kwargs}
+        def _is_gpt_oss(name: Optional[str]) -> bool:
+            return bool(name and "gpt-oss" in name)
+        if _is_gpt_oss(model) or _is_gpt_oss(base_model) or _is_gpt_oss(quantized):
+            options.setdefault("reasoning_effort", "medium")
         optimized_defaults = {}
         gpu_layers = getattr(self.settings, "ollama_gpu_layers", None)
         if gpu_layers is not None:
