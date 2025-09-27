@@ -17,6 +17,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence,
 
 import boto3
 
+try:  # pragma: no cover - optional dependency during tests
+    from psycopg2 import errors as psycopg2_errors
+except Exception:  # pragma: no cover - psycopg2 may be unavailable in tests
+    psycopg2_errors = None  # type: ignore[assignment]
+
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -551,15 +556,32 @@ class SESEmailWatcher:
                                 details["target_price"] = float(row[0])
                             if len(row) > 1 and row[1] is not None:
                                 details["round"] = int(row[1])
-                    except Exception:
+                    except Exception as exc:
+                        # Reset the transaction so that subsequent queries remain usable even
+                        # when the rfq_targets table is absent (older schemas) or another
+                        # transient issue occurs.
+                        try:
+                            conn.rollback()
+                        except Exception:  # pragma: no cover - defensive
+                            logger.debug("Rollback failed after rfq target lookup for %s", rfq_id)
+
+                        if psycopg2_errors and isinstance(exc, psycopg2_errors.UndefinedTable):
+                            logger.debug(
+                                "RFQ targets table missing; skipping direct target metadata for %s",
+                                rfq_id,
+                            )
+                        else:
+                            logger.exception("Failed to load rfq_targets metadata for %s", rfq_id)
+
                         # Fallback to any historic negotiation sessions to estimate the round.
-                        cur.execute(
-                            "SELECT COALESCE(MAX(round), 0) + 1 FROM proc.negotiation_sessions WHERE rfq_id = %s",
-                            (rfq_id,),
-                        )
-                        row = cur.fetchone()
-                        if row and row[0]:
-                            details.setdefault("round", int(row[0]))
+                        with conn.cursor() as fallback_cur:
+                            fallback_cur.execute(
+                                "SELECT COALESCE(MAX(round), 0) + 1 FROM proc.negotiation_sessions WHERE rfq_id = %s",
+                                (rfq_id,),
+                            )
+                            row = fallback_cur.fetchone()
+                            if row and row[0]:
+                                details.setdefault("round", int(row[0]))
         except Exception:
             logger.exception("Failed to load RFQ metadata for %s", rfq_id)
 
@@ -568,9 +590,11 @@ class SESEmailWatcher:
     def _load_messages(self, limit: Optional[int], *, mark_seen: bool) -> List[Dict[str, object]]:
         messages: List[Dict[str, object]] = []
 
-        if self._queue_url and mark_seen:
-            queue_messages = self._load_from_queue(limit, mark_seen=mark_seen)
-            messages.extend(queue_messages)
+        # Temporarily disable SQS based retrieval to rely solely on the S3 bucket
+        # for inbound email processing.
+        # if self._queue_url and mark_seen:
+        #     queue_messages = self._load_from_queue(limit, mark_seen=mark_seen)
+        #     messages.extend(queue_messages)
 
         remaining = None if limit is None else max(limit - len(messages), 0)
         if remaining == 0:
