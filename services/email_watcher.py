@@ -193,6 +193,11 @@ class SESEmailWatcher:
                 raw_prefix = uri_prefix or ""
         self._prefixes = self._build_prefixes(raw_prefix)
 
+        # Ensure supporting negotiation tables exist so metadata lookups do
+        # not fail on freshly provisioned databases.  The statements are safe
+        # to run repeatedly thanks to ``IF NOT EXISTS`` guards.
+        self._ensure_negotiation_tables()
+
         # Optional IMAP fallback configuration for mailboxes that are not
         # integrated with SES inbound rulesets (e.g. Microsoft 365 shared
         # mailboxes). All attributes default to ``None`` or sensible values so
@@ -255,7 +260,12 @@ class SESEmailWatcher:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def poll_once(self, limit: Optional[int] = None) -> List[Dict[str, object]]:
+    def poll_once(
+        self,
+        limit: Optional[int] = None,
+        *,
+        match_filters: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
         """Process a single batch of inbound emails.
 
         Parameters
@@ -312,6 +322,7 @@ class SESEmailWatcher:
                 processed, reason = None, "processing_error"
 
             metadata: Dict[str, object]
+            match_found = False
             if processed:
                 logger.info(
                     "Processed message %s for RFQ %s from %s",
@@ -326,6 +337,7 @@ class SESEmailWatcher:
                     "processed_at": datetime.now(timezone.utc).isoformat(),
                     "status": "processed",
                 }
+                match_found = bool(match_filters and self._matches_filters(processed, match_filters))
             else:
                 logger.warning(
                     "Skipped message %s for mailbox %s: %s",
@@ -341,6 +353,13 @@ class SESEmailWatcher:
 
             if self.state_store and reason != "processing_error":
                 self.state_store.add(message_id, metadata)
+
+            if match_found:
+                logger.debug(
+                    "Stopping poll once after matching filters for message %s", message_id
+                )
+                self._acknowledge_queue_message(message, success=True)
+                break
 
             ack_success = bool(processed) or (reason is not None and reason != "processing_error")
             self._acknowledge_queue_message(message, success=ack_success)
@@ -408,6 +427,53 @@ class SESEmailWatcher:
                 }
             )
         return preview
+
+    # ------------------------------------------------------------------
+    # Database bootstrapping helpers
+    # ------------------------------------------------------------------
+    def _ensure_negotiation_tables(self) -> None:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.rfq_targets (
+                            rfq_id TEXT NOT NULL,
+                            supplier_id TEXT,
+                            target_price NUMERIC(18, 2),
+                            negotiation_round INTEGER NOT NULL DEFAULT 1,
+                            notes TEXT,
+                            created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            CONSTRAINT rfq_targets_pk PRIMARY KEY (rfq_id, negotiation_round)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.negotiation_sessions (
+                            rfq_id TEXT NOT NULL,
+                            supplier_id TEXT NOT NULL,
+                            round INTEGER NOT NULL,
+                            counter_offer NUMERIC(18, 2),
+                            created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            CONSTRAINT negotiation_sessions_pk PRIMARY KEY (rfq_id, supplier_id, round)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS negotiation_sessions_rfq_supplier_idx
+                            ON proc.negotiation_sessions (rfq_id, supplier_id)
+                        """
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to ensure negotiation support tables exist")
 
     def _process_message(self, message: Dict[str, object]) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
@@ -600,6 +666,16 @@ class SESEmailWatcher:
         if remaining == 0:
             return messages[: limit or None]
 
+        if self._queue_url and mark_seen:
+            queue_messages = self._load_from_queue(
+                remaining if remaining else None, mark_seen=mark_seen
+            )
+            messages.extend(queue_messages)
+
+        remaining = None if limit is None else max(limit - len(messages), 0)
+        if remaining == 0:
+            return messages[: limit or None]
+
         if self.bucket:
             s3_messages = self._load_from_s3(remaining if remaining else None)
 
@@ -620,6 +696,48 @@ class SESEmailWatcher:
             return messages[:limit]
 
         return messages
+
+    @staticmethod
+    def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
+        if not filters:
+            return False
+
+        def _normalise(value: object) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                text = str(value).strip()
+            except Exception:
+                return None
+            lowered = text.lower()
+            return lowered or None
+
+        payload_rfq = _normalise(payload.get("rfq_id"))
+        payload_supplier = _normalise(payload.get("supplier_id"))
+        payload_subject = _normalise(payload.get("subject")) or ""
+        payload_sender = _normalise(payload.get("from_address"))
+        payload_message = _normalise(payload.get("message_id")) or _normalise(payload.get("id"))
+
+        for key, expected in filters.items():
+            if expected in (None, ""):
+                continue
+            if key == "rfq_id":
+                if payload_rfq != _normalise(expected):
+                    return False
+            elif key == "supplier_id":
+                if payload_supplier != _normalise(expected):
+                    return False
+            elif key == "from_address":
+                if payload_sender != _normalise(expected):
+                    return False
+            elif key == "subject_contains":
+                needle = _normalise(expected)
+                if needle and needle not in payload_subject:
+                    return False
+            elif key == "message_id":
+                if payload_message != _normalise(expected):
+                    return False
+        return True
 
     def _load_from_queue(
         self, limit: Optional[int], *, mark_seen: bool
