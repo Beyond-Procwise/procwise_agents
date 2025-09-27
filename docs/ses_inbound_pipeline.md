@@ -6,7 +6,10 @@ when onboarding a new mailbox or troubleshooting missed replies.
 
 > **Operational note (March 2025):** SQS polling is temporarily disabled in
 > production while the `procwise-inbound-queue` resource is unavailable. The
-> watcher now defaults to S3 polling only. Set
+> watcher now defaults to S3 polling only unless `ses_inbound_queue_enabled`
+> is explicitly set to `True`. Processed email snapshots are retrieved from the
+> `emails/` prefix within the `procwisemvp` bucket, and the watcher performs up
+> to three rapid polls for a matching RFQ before giving up. Set
 > `ses_inbound_queue_enabled=True` once the queue is restored to re-enable the
 > push-based path described below.
 
