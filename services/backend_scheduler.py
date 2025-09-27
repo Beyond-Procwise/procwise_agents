@@ -15,6 +15,8 @@ class _ScheduledJob:
         runner: Callable[[], None],
         interval: timedelta,
         initial_delay: Optional[timedelta] = None,
+        *,
+        one_shot: bool = False,
     ) -> None:
         self.name = name
         self.runner = runner
@@ -22,6 +24,7 @@ class _ScheduledJob:
         delay = initial_delay or timedelta(0)
         self.next_run = datetime.now(timezone.utc) + delay
         self._lock = threading.Lock()
+        self.one_shot = one_shot
 
     def due(self, moment: datetime) -> bool:
         with self._lock:
@@ -90,10 +93,35 @@ class BackendScheduler:
         runner: Callable[[], None],
         interval: timedelta,
         initial_delay: Optional[timedelta] = None,
+        *,
+        one_shot: bool = False,
     ) -> None:
-        job = _ScheduledJob(name, runner, interval, initial_delay)
+        job = _ScheduledJob(
+            name,
+            runner,
+            interval,
+            initial_delay,
+            one_shot=one_shot,
+        )
         with self._lock:
             self._jobs[name] = job
+
+    def submit_once(
+        self,
+        name: str,
+        runner: Callable[[], None],
+        *,
+        initial_delay: Optional[timedelta] = None,
+    ) -> None:
+        """Schedule ``runner`` to execute once in the background."""
+
+        self.register_job(
+            name,
+            runner,
+            interval=timedelta(days=365 * 100),
+            initial_delay=initial_delay,
+            one_shot=True,
+        )
 
     def _register_default_jobs(self) -> None:
         from services.model_training_service import ModelTrainingService
@@ -122,13 +150,23 @@ class BackendScheduler:
             for job in jobs_snapshot:
                 if not job.due(now):
                     continue
-                try:
-                    configure_gpu()
-                    job.runner()
-                except Exception:
-                    logger.exception("Backend job %s failed", job.name)
-                finally:
-                    job.mark_executed(datetime.now(timezone.utc))
+                self._execute_job(job)
+
+    def _deregister_job(self, name: str) -> None:
+        with self._lock:
+            self._jobs.pop(name, None)
+
+    def _execute_job(self, job: _ScheduledJob) -> None:
+        try:
+            configure_gpu()
+            job.runner()
+        except Exception:
+            logger.exception("Backend job %s failed", job.name)
+        finally:
+            executed_at = datetime.now(timezone.utc)
+            job.mark_executed(executed_at)
+            if job.one_shot:
+                self._deregister_job(job.name)
 
     def _run_supplier_refresh(self) -> None:
         scheduler = self._relationship_scheduler

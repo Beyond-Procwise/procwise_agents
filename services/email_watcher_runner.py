@@ -41,16 +41,13 @@ def _log_preview(mailbox: str, preview: List[Dict[str, object]]) -> None:
         logger.info("No recent inbound emails available for mailbox %s", mailbox)
         return
 
-    logger.info("Previewing %d recent inbound email(s) for mailbox %s", len(preview), mailbox)
+    logger.info(
+        "Previewing %d recent inbound email(s) for mailbox %s", len(preview), mailbox
+    )
     for index, message in enumerate(preview, start=1):
-        logger.info(
-            "[%d] %s → %s at %s | snippet=%s",
-            index,
-            message.get("from") or "<unknown>",
-            message.get("subject") or "<no subject>",
-            message.get("received_at") or "<unknown>",
-            message.get("snippet") or "",
-        )
+        subject = message.get("subject") or "<no subject>"
+        received_at = message.get("received_at") or "<unknown>"
+        logger.info("[%d] subject=%s | received_at=%s", index, subject, received_at)
 
 
 def _parse_received_at(value: object) -> Optional[datetime]:
@@ -85,7 +82,7 @@ def _sort_preview(messages: Iterable[Dict[str, object]]) -> List[Dict[str, objec
 def preview_recent_emails(
     watcher: SESEmailWatcher,
     *,
-    limit: int = 3,
+    limit: int = 5,
 ) -> List[Dict[str, object]]:
     """Return a preview of recent inbound emails without marking them as read."""
 
@@ -115,7 +112,7 @@ def preview_recent_emails(
 def preview_then_watch(
     agent_nick: AgentNick,
     *,
-    preview_limit: int = 3,
+    preview_limit: int = 5,
     watch_limit: Optional[int] = None,
     watch_interval: Optional[int] = None,
     stop_after: Optional[int] = None,
