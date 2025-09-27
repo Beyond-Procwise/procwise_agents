@@ -414,9 +414,22 @@ class SupplierInteractionAgent(BaseAgent):
         subject_norm = str(subject_hint or "").strip().lower()
         sender_normalised = self._normalise_identifier(from_address)
 
+        match_filters: Dict[str, object] = {}
+        if rfq_id:
+            match_filters["rfq_id"] = rfq_id
+        if supplier_id:
+            match_filters["supplier_id"] = supplier_id
+        if subject_hint:
+            match_filters["subject_contains"] = subject_hint
+        if from_address:
+            match_filters["from_address"] = from_address
+
         while time.time() <= deadline:
             try:
-                batch = active_watcher.poll_once(limit=limit)
+                if match_filters:
+                    batch = active_watcher.poll_once(limit=limit, match_filters=match_filters)
+                else:
+                    batch = active_watcher.poll_once(limit=limit)
             except Exception:  # pragma: no cover - best effort
                 logger.exception("wait_for_response poll failed")
                 batch = []

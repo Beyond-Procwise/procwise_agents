@@ -39,6 +39,38 @@ class StubNegotiationAgent:
 
 
 class DummyNick:
+    class _DummyCursor:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, *args, **kwargs):
+            self._owner.ddl_statements.append(statement.strip())
+
+        def fetchone(self):
+            return None
+
+    class _DummyConn:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return DummyNick._DummyCursor(self._owner)
+
+        def commit(self):
+            pass
+
     def __init__(self):
         self.settings = SimpleNamespace(
             script_user="AgentNick",
@@ -65,9 +97,10 @@ class DummyNick:
             imap_batch_size=25,
         )
         self.agents = {}
+        self.ddl_statements = []
 
-    def get_db_connection(self):  # pragma: no cover - safety
-        raise AssertionError("DB access not expected in tests")
+    def get_db_connection(self):
+        return DummyNick._DummyConn(self)
 
 
 class DummyQueue:
@@ -84,6 +117,24 @@ class DummyQueue:
 
     def delete_message(self, QueueUrl, ReceiptHandle):
         self.deleted.append((QueueUrl, ReceiptHandle))
+
+
+def test_email_watcher_bootstraps_negotiation_tables():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        message_loader=lambda limit=None: [],
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    ddl_statements = "\n".join(nick.ddl_statements)
+    assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in ddl_statements
+    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in ddl_statements
 
 
 def test_email_watcher_triggers_negotiation_when_price_high():
@@ -120,6 +171,50 @@ def test_email_watcher_triggers_negotiation_when_price_high():
 
     # Subsequent polls should skip already processed emails
     assert watcher.poll_once() == []
+
+
+def test_email_watcher_stops_after_matching_filters():
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+    messages = [
+        {
+            "id": "msg-a",
+            "subject": "Re: RFQ-20240101-aaaa1111",
+            "body": "Quoted price 1200",
+            "from": "first@example.com",
+            "rfq_id": "RFQ-20240101-aaaa1111",
+        },
+        {
+            "id": "msg-b",
+            "subject": "Re: RFQ-20240101-target",
+            "body": "Quoted price 950",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-target",
+        },
+        {
+            "id": "msg-c",
+            "subject": "Re: RFQ-20240101-extra",
+            "body": "Quoted price 800",
+            "from": "other@example.com",
+            "rfq_id": "RFQ-20240101-extra",
+        },
+    ]
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        message_loader=lambda limit=None: list(messages),
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-target"})
+
+    assert len(results) == 2
+    assert results[-1]["rfq_id"] == "RFQ-20240101-target"
+    assert len(supplier_agent.contexts) == 2
+    assert watcher.state_store.get("msg-c") is None
 
 
 def test_email_watcher_skips_negotiation_when_price_within_target():

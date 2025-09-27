@@ -82,7 +82,7 @@ def test_supplier_interaction_wait_for_response():
 
     calls = {"count": 0}
 
-    def poll_once(limit=None):
+    def poll_once(limit=None, match_filters=None):
         calls["count"] += 1
         if calls["count"] == 1:
             return [

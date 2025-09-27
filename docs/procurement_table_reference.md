@@ -363,3 +363,25 @@ id bigint NOT NULL DEFAULT nextval('proc.draft_rfq_emails_id_seq'::regclass),
     updated_on timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT draft_rfq_emails_pkey PRIMARY KEY (id)
 ```
+
+### `proc.rfq_targets`
+```
+rfq_id text NOT NULL,
+    supplier_id text,
+    target_price numeric(18,2),
+    negotiation_round integer NOT NULL DEFAULT 1,
+    notes text,
+    created_on timestamp with time zone NOT NULL DEFAULT now(),
+    updated_on timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT rfq_targets_pk PRIMARY KEY (rfq_id, negotiation_round)
+```
+
+### `proc.negotiation_sessions`
+```
+rfq_id text NOT NULL,
+    supplier_id text NOT NULL,
+    round integer NOT NULL,
+    counter_offer numeric(18,2),
+    created_on timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT negotiation_sessions_pk PRIMARY KEY (rfq_id, supplier_id, round)
+```
