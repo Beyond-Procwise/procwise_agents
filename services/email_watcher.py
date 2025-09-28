@@ -351,6 +351,24 @@ class SESEmailWatcher:
                 )
                 return cached_matches
 
+            rfq_filter = match_filters.get("rfq_id") if isinstance(match_filters, dict) else None
+            if rfq_filter:
+                attempt_cap = max(1, min(max_attempts, 3))
+                processed_results = self._poll_recent_processed_match(
+                    limit=limit,
+                    match_filters=match_filters,
+                    attempt_cap=attempt_cap,
+                )
+                if processed_results:
+                    return processed_results
+                logger.info(
+                    "Processed mailbox %s %d time(s) without matching RFQ %s",
+                    self.mailbox_address,
+                    attempt_cap,
+                    rfq_filter,
+                )
+                return []
+
         while attempt < max_attempts:
             attempt += 1
             messages: List[Dict[str, object]] = []
@@ -488,6 +506,112 @@ class SESEmailWatcher:
         while len(self._processed_cache) > self._processed_cache_limit:
             self._processed_cache.popitem(last=False)
         return deepcopy(snapshot)
+
+    def _poll_recent_processed_match(
+        self,
+        *,
+        limit: Optional[int],
+        match_filters: Dict[str, object],
+        attempt_cap: int,
+    ) -> List[Dict[str, object]]:
+        use_loader = self._custom_loader is not None
+        if not use_loader and (not self.bucket or not self._processed_prefixes):
+            return []
+
+        try:
+            effective_limit = max(1, int(limit) if limit is not None else 1)
+        except Exception:
+            effective_limit = 1
+
+        attempts = 0
+        checked: Set[str] = set()
+        results: List[Dict[str, object]] = []
+        expected_rfq = str(match_filters.get("rfq_id") or "").strip().lower()
+
+        retry_delay = min(float(self.poll_interval_seconds), 1.0)
+        while attempts < attempt_cap:
+            attempts += 1
+            try:
+                if use_loader:
+                    messages = self._custom_loader(None)  # type: ignore[arg-type]
+                else:
+                    messages = self._load_processed_messages(None)
+            except Exception:
+                logger.exception("Failed to load processed SES messages")
+                messages = []
+
+            if not messages:
+                if attempts < attempt_cap and retry_delay > 0:
+                    time.sleep(retry_delay)
+                continue
+
+            matched = False
+            for raw_message in messages:
+                message_id = str(
+                    raw_message.get("message_id")
+                    or raw_message.get("id")
+                    or uuid.uuid4()
+                )
+                if message_id in checked:
+                    continue
+                checked.add(message_id)
+
+                payload = dict(raw_message)
+                payload.setdefault("message_id", message_id)
+                candidate_rfq = payload.get("rfq_id")
+                if not isinstance(candidate_rfq, str) or not candidate_rfq.strip():
+                    subject = str(payload.get("subject") or "")
+                    body = str(payload.get("body") or "")
+                    candidate_rfq = self._extract_rfq_id(f"{subject} {body}") or ""
+                candidate_norm = str(candidate_rfq or "").strip().lower()
+                if not candidate_norm or candidate_norm != expected_rfq:
+                    logger.debug(
+                        "Processed email %s did not match RFQ %s", message_id, expected_rfq or "<none>"
+                    )
+                    continue
+
+                already_processed = isinstance(payload.get("supplier_output"), dict) or (
+                    payload.get("negotiation_output") is not None
+                )
+
+                processed_payload: Optional[Dict[str, object]] = None
+                reason: Optional[str] = None
+                if already_processed:
+                    processed_payload = payload
+                else:
+                    try:
+                        processed_payload, reason = self._process_message(payload)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("Failed to process SES message %s", message_id)
+                        processed_payload, reason = None, "processing_error"
+
+                if not processed_payload:
+                    logger.debug(
+                        "Skipping processed email %s due to %s", message_id, reason or "unknown"
+                    )
+                    continue
+
+                recorded = self._record_processed_payload(message_id, processed_payload)
+                if self.state_store:
+                    metadata = {
+                        "rfq_id": recorded.get("rfq_id"),
+                        "supplier_id": recorded.get("supplier_id"),
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "processed",
+                        "payload": recorded,
+                    }
+                    self.state_store.add(message_id, metadata)
+                results.append(recorded)
+                matched = True
+                break
+
+            if matched:
+                break
+
+            if attempts < attempt_cap and retry_delay > 0:
+                time.sleep(retry_delay)
+
+        return results
 
     def _retrieve_cached_matches(
         self, filters: Dict[str, object], limit: Optional[int]

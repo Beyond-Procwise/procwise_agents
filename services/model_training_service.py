@@ -173,9 +173,15 @@ class ModelTrainingService:
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to enqueue model training job")
 
-    def dispatch_due_jobs(self, moment: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    def dispatch_due_jobs(
+        self,
+        moment: Optional[datetime] = None,
+        *,
+        force: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         moment = (moment or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        if not self._is_non_business_hour(moment):
+        if not force and not self._is_non_business_hour(moment):
             logger.info("Skipping training dispatch; current time within business hours")
             return []
 
@@ -184,15 +190,36 @@ class ModelTrainingService:
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT job_id, workflow_id, agent_slug, policy_id, payload
-                        FROM proc.agent_training_queue
-                        WHERE status = 'pending' AND scheduled_for <= %s
-                        ORDER BY scheduled_for, job_id
-                        """,
-                        (moment,),
-                    )
+                    params: List[Any]
+                    if force:
+                        query = (
+                            """
+                            SELECT job_id, workflow_id, agent_slug, policy_id, payload
+                              FROM proc.agent_training_queue
+                             WHERE status = 'pending'
+                             ORDER BY scheduled_for, job_id
+                            """
+                        )
+                        params = []
+                    else:
+                        query = (
+                            """
+                            SELECT job_id, workflow_id, agent_slug, policy_id, payload
+                              FROM proc.agent_training_queue
+                             WHERE status = 'pending' AND scheduled_for <= %s
+                             ORDER BY scheduled_for, job_id
+                            """
+                        )
+                        params = [moment]
+                    if limit is not None:
+                        try:
+                            limit_value = int(limit)
+                        except Exception:
+                            limit_value = 0
+                        if limit_value > 0:
+                            query += " LIMIT %s"
+                            params.append(limit_value)
+                    cur.execute(query, params)  # type: ignore[arg-type]
                     rows = cur.fetchall() or []
                 for row in rows:
                     job_payload = {
