@@ -1545,12 +1545,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "policy_category_opportunities": policy_category_opportunities,
                 "policy_suppliers": policy_suppliers,
                 "policy_supplier_gaps": policy_supplier_gaps,
-                "policy_metadata": policy_metadata,
-                "policy_top_opportunities": policy_top_summary,
             }
-            if self._data_profile:
-                data["data_profile"] = self._data_profile
-            data["data_flow_snapshot"] = self._data_flow_snapshot
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
                 str(s["supplier_id"]).strip()
@@ -1567,38 +1562,6 @@ class OpportunityMinerAgent(BaseAgent):
                         supplier_candidates.add(supplier)
             data["supplier_candidates"] = list(supplier_candidates)
 
-            directory_map: Dict[str, Dict[str, Any]] = {}
-
-            def _register_supplier(supplier_id: Optional[str], supplier_name: Optional[str]) -> None:
-                if not supplier_id:
-                    return
-                sid = str(supplier_id).strip()
-                if not sid:
-                    return
-                entry = directory_map.setdefault(sid, {"supplier_id": sid})
-                if supplier_name and not entry.get("supplier_name"):
-                    entry["supplier_name"] = str(supplier_name).strip()
-
-            for f in filtered:
-                _register_supplier(f.supplier_id, f.supplier_name)
-                for candidate in f.candidate_suppliers:
-                    _register_supplier(
-                        candidate.get("supplier_id"), candidate.get("supplier_name")
-                    )
-
-            lookup = getattr(self, "_supplier_lookup", {})
-            if lookup:
-                for sid, entry in directory_map.items():
-                    if entry.get("supplier_name"):
-                        continue
-                    supplier_name = lookup.get(sid)
-                    if supplier_name:
-                        entry["supplier_name"] = supplier_name
-
-            if directory_map:
-                data["supplier_directory"] = sorted(
-                    directory_map.values(), key=lambda entry: entry["supplier_id"]
-                )
             data["notifications"] = sorted(notifications)
             logger.info(
                 "OpportunityMinerAgent produced %d findings and %d candidate suppliers",

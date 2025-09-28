@@ -200,13 +200,28 @@ def test_supplier_ranking_injects_missing_candidates(monkeypatch):
             ]
 
     class StubQueryEngine:
-        def fetch_purchase_order_data(self):
+        def fetch_purchase_order_data(
+            self,
+            intent=None,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
-        def fetch_invoice_data(self):
+        def fetch_invoice_data(
+            self,
+            intent=None,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
-        def fetch_procurement_flow(self, embed: bool = False):
+        def fetch_procurement_flow(
+            self,
+            embed: bool = False,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
     nick = SimpleNamespace(
@@ -217,7 +232,7 @@ def test_supplier_ranking_injects_missing_candidates(monkeypatch):
 
     agent = SupplierRankingAgent(nick)
     monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
-    monkeypatch.setattr(agent, "_read_table", lambda table: pd.DataFrame())
+    monkeypatch.setattr(agent, "_read_table", lambda *args, **kwargs: pd.DataFrame())
 
     supplier_df = pd.DataFrame(
         {
@@ -359,13 +374,28 @@ def test_supplier_ranking_limits_to_opportunity_directory(monkeypatch):
             ]
 
     class StubQueryEngine:
-        def fetch_purchase_order_data(self):
+        def fetch_purchase_order_data(
+            self,
+            intent=None,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
-        def fetch_invoice_data(self):
+        def fetch_invoice_data(
+            self,
+            intent=None,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
-        def fetch_procurement_flow(self, embed: bool = False):
+        def fetch_procurement_flow(
+            self,
+            embed: bool = False,
+            supplier_ids=None,
+            supplier_names=None,
+        ):
             return pd.DataFrame()
 
     nick = SimpleNamespace(
@@ -376,7 +406,7 @@ def test_supplier_ranking_limits_to_opportunity_directory(monkeypatch):
 
     agent = SupplierRankingAgent(nick)
     monkeypatch.setattr(agent, "_generate_justification", lambda row, criteria: "ok")
-    monkeypatch.setattr(agent, "_read_table", lambda table: pd.DataFrame())
+    monkeypatch.setattr(agent, "_read_table", lambda *args, **kwargs: pd.DataFrame())
 
     supplier_df = pd.DataFrame(
         {

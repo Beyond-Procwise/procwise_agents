@@ -2122,6 +2122,10 @@ class DataExtractionAgent(BaseAgent):
             except Exception:
                 line_items = []
 
+        header, line_items = self._fill_missing_fields_with_llm(
+            text, doc_type, header, line_items
+        )
+
         # Normalise and clean numeric fields
         if line_items:
             line_items = self._normalize_line_item_fields(line_items, doc_type)

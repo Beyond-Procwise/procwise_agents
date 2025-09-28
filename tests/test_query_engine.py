@@ -406,7 +406,7 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
         def persist_knowledge_graph(self, relations, graph):
             captured["persist"] = (relations, graph)
 
-    def fake_flow(self, embed=False):
+    def fake_flow(self, embed=False, supplier_ids=None, supplier_names=None):
         captured["embed"] = embed
         return pd.DataFrame()
 

@@ -329,10 +329,6 @@ def test_ranking_workflow_runs_full_supplier_flow():
             payload = {
                 "supplier_candidates": ["S1", "S2"],
                 "findings": findings,
-                "supplier_directory": [
-                    {"supplier_id": "S1", "supplier_name": "Supplier S1"},
-                    {"supplier_id": "S2", "supplier_name": "Supplier S2"},
-                ],
             }
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
@@ -417,10 +413,7 @@ def test_ranking_workflow_runs_full_supplier_flow():
         "quote_evaluation",
     ]
     assert ranking_agent.candidates == ["S1", "S2"]
-    assert ranking_agent.directory == [
-        {"supplier_id": "S1", "supplier_name": "Supplier S1"},
-        {"supplier_id": "S2", "supplier_name": "Supplier S2"},
-    ]
+    assert ranking_agent.directory is None
     assert quote_agent.ranking_seen[0]["supplier_id"] == "S1"
     assert quote_agent.category_seen == "Raw Materials"
 
@@ -515,9 +508,6 @@ def test_supplier_ranking_flow_applies_agent_prompts_and_policies():
             seen["opportunity_policies"] = context.input_data.get("policies")
             pass_fields = {
                 "supplier_candidates": ["S1"],
-                "supplier_directory": [
-                    {"supplier_id": "S1", "supplier_name": "Acme Corp"}
-                ],
                 "findings": [],
             }
             return AgentOutput(

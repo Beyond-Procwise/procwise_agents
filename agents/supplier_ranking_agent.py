@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
@@ -365,7 +365,12 @@ class SupplierRankingAgent(BaseAgent):
 
         policy_bundle = self._resolve_policy_bundle(context)
 
-        directory_entries = context.input_data.get("supplier_directory") or []
+        raw_directory = context.input_data.get("supplier_directory")
+        directory_entries: List[Dict[str, Any]] = []
+        if isinstance(raw_directory, list):
+            directory_entries = [entry for entry in raw_directory if isinstance(entry, dict)]
+        if not directory_entries:
+            directory_entries = self._build_directory_from_dataframe(df)
         directory_lookup: Dict[str, Dict[str, Any]] = {}
         directory_map: Dict[str, Optional[str]] = {}
         for entry in directory_entries:
@@ -429,16 +434,38 @@ class SupplierRankingAgent(BaseAgent):
             canonical_names = df["supplier_id"].map(self._supplier_lookup.get)
             df["supplier_name"] = canonical_names.combine_first(df["supplier_name"])
 
-        tables = self._load_procurement_tables(candidate_set)
+        supplier_scope = set()
+        if candidate_set:
+            supplier_scope = {sid for sid in candidate_set if sid}
+        if not supplier_scope and "supplier_id" in df.columns:
+            supplier_scope = {
+                sid
+                for sid in (
+                    self._coerce_supplier_id(value) for value in df["supplier_id"]
+                )
+                if sid
+            }
+        tables = self._load_procurement_tables(supplier_scope, df)
         df = self._merge_supplier_metrics(df, tables)
         profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
 
+        coverage_series = self._derive_metric_coverage(df)
+        if not coverage_series.empty:
+            df["flow_coverage"] = coverage_series
+        else:
+            if "flow_coverage" not in df.columns:
+                df["flow_coverage"] = 0.0
+
         flow_payload = context.input_data.get("data_flow_snapshot")
-        if not isinstance(flow_payload, dict):
-            flow_payload = context.input_data
-        flow_index, flow_name_index = self._build_flow_index(flow_payload)
+        if isinstance(flow_payload, dict):
+            flow_index, flow_name_index = self._build_flow_index(flow_payload)
+        else:
+            flow_index, flow_name_index = self._build_flow_index(context.input_data)
         alias_tokens_map = self._alias_tokens_by_supplier()
-        df = self._annotate_flow_coverage(df, flow_index, flow_name_index, alias_tokens_map)
+        if flow_index or flow_name_index:
+            df = self._annotate_flow_coverage(
+                df, flow_index, flow_name_index, alias_tokens_map
+            )
 
         intent = context.input_data.get("intent", {})
         requested = intent.get("parameters", {}).get("criteria", [])
@@ -621,6 +648,28 @@ class SupplierRankingAgent(BaseAgent):
             text = str(value).strip()
         return text or None
 
+    def _build_directory_from_dataframe(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        if "supplier_id" not in df.columns:
+            return []
+
+        entries: Dict[str, Dict[str, Any]] = {}
+        names: pd.Series
+        if "supplier_name" in df.columns:
+            names = df["supplier_name"]
+        else:
+            names = pd.Series([None] * len(df), index=df.index, dtype="object")
+
+        for supplier_id, supplier_name in zip(df["supplier_id"], names):
+            sid = self._coerce_supplier_id(supplier_id)
+            if not sid:
+                continue
+            entry = entries.setdefault(sid, {"supplier_id": sid})
+            if isinstance(supplier_name, str) and supplier_name.strip():
+                entry.setdefault("supplier_name", supplier_name.strip())
+        return list(entries.values())
+
     def _prime_supplier_aliases(
         self, supplier_df: pd.DataFrame, directory_entries: Iterable[Dict[str, Any]]
     ) -> None:
@@ -765,26 +814,90 @@ class SupplierRankingAgent(BaseAgent):
             combined["supplier_id"] = combined["supplier_id"].astype(str).str.strip()
         return combined
 
-    def _load_procurement_tables(self, supplier_ids: Iterable[str]) -> Dict[str, pd.DataFrame]:
+    def _load_procurement_tables(
+        self, supplier_ids: Iterable[str], supplier_df: Optional[pd.DataFrame] = None
+    ) -> Dict[str, pd.DataFrame]:
         suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}
+        supplier_names: set[str] = set()
+        if isinstance(supplier_df, pd.DataFrame) and not supplier_df.empty:
+            if "supplier_name" in supplier_df.columns:
+                supplier_names = {
+                    str(name).strip().lower()
+                    for name in supplier_df["supplier_name"].dropna()
+                    if str(name).strip()
+                }
+
         tables: Dict[str, pd.DataFrame] = {}
+
         try:
-            po_df = self.query_engine.fetch_purchase_order_data()
+            po_df = self.query_engine.fetch_purchase_order_data(
+                supplier_ids=suppliers or None,
+                supplier_names=supplier_names or None,
+            )
         except Exception:
             logger.exception("Failed to load purchase orders")
             po_df = pd.DataFrame()
         tables["purchase_orders"] = self._map_supplier_ids(po_df, ("supplier_name",))
+
         try:
-            invoice_df = self.query_engine.fetch_invoice_data()
+            invoice_df = self.query_engine.fetch_invoice_data(
+                supplier_ids=suppliers or None,
+                supplier_names=supplier_names or None,
+            )
         except Exception:
             logger.exception("Failed to load invoices")
             invoice_df = pd.DataFrame()
         tables["invoices"] = self._map_supplier_ids(invoice_df, ("supplier_name",))
 
-        tables["po_lines"] = self._read_table("proc.po_line_items_agent")
-        tables["invoice_lines"] = self._read_table("proc.invoice_line_items_agent")
+        po_ids: List[str] = []
+        if not po_df.empty and "po_id" in po_df.columns:
+            po_ids = [
+                str(value).strip()
+                for value in po_df["po_id"].dropna()
+                if str(value).strip()
+            ]
+        invoice_ids: List[str] = []
+        if not invoice_df.empty and "invoice_id" in invoice_df.columns:
+            invoice_ids = [
+                str(value).strip()
+                for value in invoice_df["invoice_id"].dropna()
+                if str(value).strip()
+            ]
+
+        tables["po_lines"] = self._read_table(
+            "proc.po_line_items_agent",
+            "po_id = ANY(%s)" if po_ids else None,
+            [po_ids] if po_ids else None,
+            columns=(
+                "po_id",
+                "po_line_id",
+                "line_number",
+                "item_id",
+                "item_description",
+                "quantity",
+                "unit_price",
+                "line_total",
+                "total_amount",
+            ),
+        )
+        tables["invoice_lines"] = self._read_table(
+            "proc.invoice_line_items_agent",
+            "invoice_id = ANY(%s)" if invoice_ids else None,
+            [invoice_ids] if invoice_ids else None,
+            columns=(
+                "invoice_id",
+                "invoice_line_id",
+                "po_id",
+                "item_description",
+                "total_amount_incl_tax",
+            ),
+        )
         try:
-            flow = self.query_engine.fetch_procurement_flow(embed=False)
+            flow = self.query_engine.fetch_procurement_flow(
+                embed=False,
+                supplier_ids=suppliers or None,
+                supplier_names=supplier_names or None,
+            )
         except Exception:
             logger.exception("Failed to load procurement flow")
             flow = pd.DataFrame()
@@ -797,15 +910,24 @@ class SupplierRankingAgent(BaseAgent):
         tables["procurement_flow"] = flow
         return tables
 
-    def _read_table(self, table: str) -> pd.DataFrame:
-        sql = f"SELECT * FROM {table}"
+    def _read_table(
+        self,
+        table: str,
+        where: Optional[str] = None,
+        params: Optional[Any] = None,
+        columns: Optional[Iterable[str]] = None,
+    ) -> pd.DataFrame:
+        column_sql = ", ".join(columns) if columns else "*"
+        sql = f"SELECT {column_sql} FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
         pandas_conn = getattr(self.agent_nick, "pandas_connection", None)
         try:
             if callable(pandas_conn):
                 with pandas_conn() as conn:
-                    return read_sql_compat(sql, conn)
+                    return read_sql_compat(sql, conn, params=params)
             with self.agent_nick.get_db_connection() as conn:
-                return read_sql_compat(sql, conn)
+                return read_sql_compat(sql, conn, params=params)
         except Exception:
             logger.exception("Failed to read table %s", table)
             return pd.DataFrame()
@@ -885,6 +1007,46 @@ class SupplierRankingAgent(BaseAgent):
             result["payment_terms"] = result["po_payment_terms"]
 
         return result
+
+    def _derive_metric_coverage(self, df: pd.DataFrame) -> pd.Series:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.Series(dtype="float64")
+
+        def _signal(columns: Tuple[str, ...]) -> Optional[pd.Series]:
+            series_list: List[pd.Series] = []
+            for column in columns:
+                if column not in df.columns:
+                    continue
+                series = pd.to_numeric(df[column], errors="coerce")
+                if series.isna().all():
+                    continue
+                series_list.append(series.fillna(0.0))
+            if not series_list:
+                return None
+            combined = sum(series_list)
+            if isinstance(combined, pd.Series):
+                return (combined.fillna(0.0) > 0).astype(float)
+            return None
+
+        signals: List[pd.Series] = []
+        for cols in (
+            ("po_total_value", "po_line_spend"),
+            ("invoice_total_value", "invoice_count"),
+            ("invoice_item_count", "invoice_count"),
+            ("total_spend",),
+        ):
+            signal = _signal(cols)
+            if signal is not None:
+                signals.append(signal)
+
+        if not signals:
+            return pd.Series(0.0, index=df.index, dtype="float64")
+
+        combined = sum(signals)
+        if not isinstance(combined, pd.Series):
+            return pd.Series(0.0, index=df.index, dtype="float64")
+
+        return (combined / len(signals)).clip(lower=0.0, upper=1.0)
 
     def _summarise_purchase_orders(self, po_df: pd.DataFrame) -> pd.DataFrame:
         if po_df.empty:
@@ -1354,7 +1516,16 @@ class SupplierRankingAgent(BaseAgent):
                 alias_tokens,
             )
             coverage_values.append(self._coverage_from_flow_entry(entry))
-        annotated["flow_coverage"] = coverage_values
+        if "flow_coverage" in annotated.columns:
+            baseline = (
+                pd.to_numeric(annotated["flow_coverage"], errors="coerce")
+                .fillna(0.0)
+                .tolist()
+            )
+        else:
+            baseline = [0.0] * len(annotated)
+        combined = [max(base, cov) for base, cov in zip(baseline, coverage_values)]
+        annotated["flow_coverage"] = combined
         return annotated
 
     def _apply_flow_bonus(
