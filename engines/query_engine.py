@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from difflib import SequenceMatcher
 
 import pandas as pd
+from typing import Any, Iterable, List, Optional
 
 from .base_engine import BaseEngine
 from utils.db import read_sql_compat
@@ -396,10 +397,39 @@ class QueryEngine(BaseEngine):
             logger.exception("fetch_supplier_data failed")
             raise RuntimeError("fetch_supplier_data failed") from exc
 
-    def fetch_invoice_data(self, intent: dict | None = None) -> pd.DataFrame:
-        """Return invoice headers from ``proc.invoice_agent`` with supplier IDs."""
+    def fetch_invoice_data(
+        self,
+        intent: dict | None = None,
+        supplier_ids: Iterable[str] | None = None,
+        supplier_names: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return invoice headers from ``proc.invoice_agent`` with optional supplier filters."""
 
-        sql = """
+        supplier_id_list = [
+            str(value).strip()
+            for value in (supplier_ids or [])
+            if str(value).strip()
+        ]
+        supplier_name_list = [
+            str(value).strip().lower()
+            for value in (supplier_names or [])
+            if str(value).strip()
+        ]
+
+        params: List[Any] = []
+        filters: List[str] = []
+        if supplier_id_list:
+            filters.append("sl.supplier_id = ANY(%s)")
+            params.append(supplier_id_list)
+        if supplier_name_list:
+            filters.append("LOWER(NULLIF(BTRIM(i.supplier_name), '')) = ANY(%s)")
+            params.append(supplier_name_list)
+
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " OR ".join(filters)
+
+        sql = f"""
             WITH supplier_lookup AS (
                 SELECT supplier_id,
                        LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm,
@@ -411,11 +441,12 @@ class QueryEngine(BaseEngine):
                    sl.supplier_name_master
             FROM proc.invoice_agent i
             LEFT JOIN supplier_lookup sl
-              ON LOWER(NULLIF(BTRIM(i.supplier_name), '')) = sl.supplier_name_norm;
+              ON LOWER(NULLIF(BTRIM(i.supplier_name), '')) = sl.supplier_name_norm
+            {where_clause};
         """
 
         with self._pandas_reader() as conn:
-            df = read_sql_compat(sql, conn)
+            df = read_sql_compat(sql, conn, params=params if params else None)
 
         if "supplier_id_lookup" in df.columns and "supplier_id" not in df.columns:
             df = df.rename(columns={"supplier_id_lookup": "supplier_id"})
@@ -431,10 +462,39 @@ class QueryEngine(BaseEngine):
 
         return df
 
-    def fetch_purchase_order_data(self, intent: dict | None = None) -> pd.DataFrame:
-        """Return purchase order headers from ``proc.purchase_order_agent`` with supplier IDs."""
+    def fetch_purchase_order_data(
+        self,
+        intent: dict | None = None,
+        supplier_ids: Iterable[str] | None = None,
+        supplier_names: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return purchase orders with optional supplier filters applied."""
 
-        sql = """
+        supplier_id_list = [
+            str(value).strip()
+            for value in (supplier_ids or [])
+            if str(value).strip()
+        ]
+        supplier_name_list = [
+            str(value).strip().lower()
+            for value in (supplier_names or [])
+            if str(value).strip()
+        ]
+
+        params: List[Any] = []
+        filters: List[str] = []
+        if supplier_id_list:
+            filters.append("sl.supplier_id = ANY(%s)")
+            params.append(supplier_id_list)
+        if supplier_name_list:
+            filters.append("LOWER(NULLIF(BTRIM(p.supplier_name), '')) = ANY(%s)")
+            params.append(supplier_name_list)
+
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " OR ".join(filters)
+
+        sql = f"""
             WITH supplier_lookup AS (
                 SELECT supplier_id,
                        LOWER(NULLIF(BTRIM(supplier_name), '')) AS supplier_name_norm,
@@ -446,11 +506,12 @@ class QueryEngine(BaseEngine):
                    sl.supplier_name_master
             FROM proc.purchase_order_agent p
             LEFT JOIN supplier_lookup sl
-              ON LOWER(NULLIF(BTRIM(p.supplier_name), '')) = sl.supplier_name_norm;
+              ON LOWER(NULLIF(BTRIM(p.supplier_name), '')) = sl.supplier_name_norm
+            {where_clause};
         """
 
         with self._pandas_reader() as conn:
-            df = read_sql_compat(sql, conn)
+            df = read_sql_compat(sql, conn, params=params if params else None)
 
         if "supplier_id_lookup" in df.columns and "supplier_id" not in df.columns:
             df = df.rename(columns={"supplier_id_lookup": "supplier_id"})
@@ -466,7 +527,12 @@ class QueryEngine(BaseEngine):
 
         return df
 
-    def fetch_procurement_flow(self, embed: bool = False) -> pd.DataFrame:
+    def fetch_procurement_flow(
+        self,
+        embed: bool = False,
+        supplier_ids: Iterable[str] | None = None,
+        supplier_names: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
         """Return enriched procurement data across multiple tables.
 
         The query implements the following flow:
@@ -496,7 +562,31 @@ class QueryEngine(BaseEngine):
             and invoice references for downstream agents.
         """
 
-        sql = """
+        supplier_id_list = [
+            str(value).strip()
+            for value in (supplier_ids or [])
+            if str(value).strip()
+        ]
+        supplier_name_list = [
+            str(value).strip().lower()
+            for value in (supplier_names or [])
+            if str(value).strip()
+        ]
+
+        params: List[Any] = []
+        filters: List[str] = []
+        if supplier_id_list:
+            filters.append("pe.supplier_id = ANY(%s)")
+            params.append(supplier_id_list)
+        if supplier_name_list:
+            filters.append("LOWER(NULLIF(BTRIM(pe.supplier_name), '')) = ANY(%s)")
+            params.append(supplier_name_list)
+
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " OR ".join(filters)
+
+        sql = f"""
             WITH supplier_lookup AS (
                 SELECT supplier_id,
                        supplier_name,
@@ -556,6 +646,7 @@ class QueryEngine(BaseEngine):
             LEFT JOIN inv ON pe.po_id = inv.po_id
             LEFT JOIN proc.invoice_line_items_agent ili
                 ON inv.invoice_id = ili.invoice_id
+            {where_clause}
         """
 
         category_sql = """
@@ -570,7 +661,7 @@ class QueryEngine(BaseEngine):
         """
 
         with self._pandas_reader() as conn:
-            df = read_sql_compat(sql, conn)
+            df = read_sql_compat(sql, conn, params=params if params else None)
             category_df = read_sql_compat(category_sql, conn)
 
         df = self._assign_procurement_categories(df, category_df)

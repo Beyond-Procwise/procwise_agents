@@ -328,14 +328,13 @@ def test_fill_missing_fields_with_llm(monkeypatch):
     agent = DataExtractionAgent(nick)
 
     # Heuristic extractors return nothing
-    monkeypatch.setattr(
-        "agents.data_extraction_agent.convert_document_to_json",
-        lambda text, dt: {"header_data": {}, "line_items": []},
-    )
+    monkeypatch.setattr(agent, "_extract_header_regex", lambda text, dt: {})
+    monkeypatch.setattr(agent, "_extract_header_with_ner", lambda text: {})
     monkeypatch.setattr(agent, "_parse_header", lambda text, file_bytes=None: {})
     monkeypatch.setattr(
         agent, "_extract_line_items_from_pdf_tables", lambda b, dt: []
     )
+    monkeypatch.setattr(agent, "_extract_line_items_regex", lambda text, dt: [])
 
     llm_payload = {
         "response": json.dumps(

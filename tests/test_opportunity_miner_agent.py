@@ -697,12 +697,11 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     pb = [f for f in output.data["findings"] if f["detector_type"] == "Price Benchmark Variance"]
     assert pb
     assert pb[0]["supplier_name"] == "Supplier One"
-    directory = output.data.get("supplier_directory")
-    assert directory
-    assert any(
-        entry["supplier_id"] == "SI0001" and entry.get("supplier_name") == "Supplier One"
-        for entry in directory
-    )
+    assert "supplier_directory" not in output.data
+    assert "policy_metadata" not in output.data
+    assert "policy_top_opportunities" not in output.data
+    assert "data_profile" not in output.data
+    assert "data_flow_snapshot" not in output.data
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
@@ -902,17 +901,8 @@ def test_dynamic_policies_surface_opportunities(monkeypatch):
             if entries:
                 assert 1 <= len(entries) <= 2
     assert output.data.get("supplier_candidates")
-    top_summary = output.data.get("policy_top_opportunities")
-    assert top_summary
-    for policy_name, summary in top_summary.items():
-        assert "top_opportunities" in summary
-        assert summary["total_opportunities"] >= len(summary["top_opportunities"])
-        if summary["top_opportunities"]:
-            impacts = [entry["financial_impact_gbp"] for entry in summary["top_opportunities"]]
-            assert impacts == sorted(impacts, reverse=True)
-    snapshot = output.data.get("data_flow_snapshot")
-    assert snapshot
-    assert snapshot.get("relationships") is not None
+    assert "policy_top_opportunities" not in output.data
+    assert "data_flow_snapshot" not in output.data
 
 
 def test_policy_supplier_gap_reason_when_no_suppliers(monkeypatch):
