@@ -1176,6 +1176,8 @@ class OpportunityMinerAgent(BaseAgent):
 
             policy_runs: Dict[str, Dict[str, Any]] = {}
             aggregated_findings: List[Finding] = []
+            display_counts: Dict[str, int] = {}
+            display_variants: Dict[str, List[str]] = {}
 
             for key in requested_keys:
                 policy_cfg = policy_registry.get(key)
@@ -1222,14 +1224,35 @@ class OpportunityMinerAgent(BaseAgent):
                     or policy_cfg.get("detector")
                     or key
                 )
+                counter = display_counts.get(display_name, 0)
+                unique_display = display_name
+                if counter:
+                    suffix_parts: List[str] = []
+                    policy_id = policy_cfg.get("policy_id")
+                    if policy_id:
+                        suffix_parts.append(str(policy_id))
+                    slug = policy_cfg.get("policy_slug") or key
+                    if slug and str(slug) not in suffix_parts:
+                        suffix_parts.append(str(slug))
+                    suffix = " / ".join(part for part in suffix_parts if part)
+                    if not suffix:
+                        suffix = str(counter + 1)
+                    unique_display = f"{display_name} ({suffix})"
+                display_counts[display_name] = counter + 1
+                display_variants.setdefault(display_name, []).append(unique_display)
                 policy_runs[key] = {
                     "policy_cfg": policy_cfg,
-                    "display": display_name,
+                    "display": unique_display,
                     "findings": findings,
                 }
 
             if not policy_runs and aggregated_findings:
                 display = workflow_name or "opportunity_policy"
+                counter = display_counts.get(display, 0)
+                if counter:
+                    display = f"{display} ({counter + 1})"
+                display_counts[display] = counter + 1
+                display_variants.setdefault(display, []).append(display)
                 policy_runs[display] = {
                     "policy_cfg": {
                         "policy_id": "unknown",
@@ -1417,6 +1440,49 @@ class OpportunityMinerAgent(BaseAgent):
                     },
                 )
                 policy_metadata.setdefault(display, {})
+
+            for root_display, variants in display_variants.items():
+                variant_suppliers = sorted(
+                    {
+                        supplier
+                        for variant in variants
+                        for supplier in policy_suppliers.get(variant, [])
+                    }
+                )
+                if variant_suppliers and (
+                    root_display not in policy_suppliers
+                    or not policy_suppliers[root_display]
+                ):
+                    policy_suppliers[root_display] = variant_suppliers
+
+                variant_opportunities = [
+                    entry
+                    for variant in variants
+                    for entry in policy_opportunities.get(variant, [])
+                ]
+                if variant_opportunities and (
+                    root_display not in policy_opportunities
+                    or not policy_opportunities[root_display]
+                ):
+                    policy_opportunities[root_display] = variant_opportunities
+
+                category_union: Dict[str, List[Dict[str, Any]]] = {}
+                for variant in variants:
+                    categories = policy_category_opportunities.get(variant, {})
+                    for category, entries in categories.items():
+                        category_union.setdefault(category, []).extend(entries)
+                if category_union and (
+                    root_display not in policy_category_opportunities
+                    or not policy_category_opportunities[root_display]
+                ):
+                    policy_category_opportunities[root_display] = category_union
+
+                for variant in variants:
+                    if (
+                        root_display not in policy_metadata
+                        and variant in policy_metadata
+                    ):
+                        policy_metadata[root_display] = dict(policy_metadata[variant])
 
             policy_supplier_gaps: Dict[str, str] = {}
             for display, suppliers in policy_suppliers.items():

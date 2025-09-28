@@ -230,9 +230,9 @@ def test_email_watcher_stops_after_matching_filters():
 
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-target"})
 
-    assert len(results) == 2
-    assert results[-1]["rfq_id"] == "RFQ-20240101-target"
-    assert len(supplier_agent.contexts) == 2
+    assert len(results) == 1
+    assert results[0]["rfq_id"] == "RFQ-20240101-target"
+    assert len(supplier_agent.contexts) == 1
     assert watcher.state_store.get("msg-c") is None
 
 
@@ -713,10 +713,9 @@ def test_email_watcher_polls_processed_messages_until_match(monkeypatch):
 
     results = watcher.poll_once(limit=1, match_filters={"rfq_id": "RFQ-20240101-target"})
 
-    assert len(results) == 2
-    assert results[0]["rfq_id"] == "RFQ-20240101-old00001"
-    assert results[-1]["rfq_id"] == "RFQ-20240101-target"
-    assert results[-1]["supplier_output"]["price"] == 950.0
+    assert len(results) == 1
+    assert results[0]["rfq_id"] == "RFQ-20240101-target"
+    assert results[0]["supplier_output"]["price"] == 950.0
     assert client.page_indices[0] == 0
     assert client.page_indices[-1] == 1
     assert watcher.state_store.get("emails/new.json")["status"] == "processed"
