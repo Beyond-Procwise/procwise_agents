@@ -229,6 +229,79 @@ PROCUREMENT_FLOW_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("proc.purchase_order_agent", "proc.invoice_agent", "proc.invoice_line_items_agent"),
 )
 
+AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
+    "OpportunityMinerAgent": {
+        "description": (
+            "Analyses spend, invoices, quotes and contracts to surface procurement savings opportunities and supplier gaps."
+        ),
+        "tables": {
+            "proc.purchase_order_agent",
+            "proc.po_line_items_agent",
+            "proc.invoice_agent",
+            "proc.invoice_line_items_agent",
+            "proc.contracts",
+            "proc.quote_agent",
+            "proc.quote_line_items_agent",
+            "proc.supplier",
+        },
+        "outputs": ["policy_opportunities", "supplier_candidates", "knowledge_graph"],
+        "include_flows": True,
+    },
+    "SupplierRankingAgent": {
+        "description": (
+            "Scores suppliers shared by upstream opportunity mining using purchase history, invoice performance and risk metrics."
+        ),
+        "tables": {
+            "proc.supplier",
+            "proc.purchase_order_agent",
+            "proc.po_line_items_agent",
+            "proc.invoice_agent",
+            "proc.invoice_line_items_agent",
+            "proc.contracts",
+            "proc.quote_agent",
+        },
+        "outputs": ["supplier_rankings", "supplier_profiles"],
+        "include_flows": True,
+    },
+    "SupplierInteractionAgent": {
+        "description": (
+            "Processes inbound RFQ responses from suppliers and prepares negotiation hand-offs."
+        ),
+        "tables": {
+            "proc.rfq_targets",
+            "proc.negotiation_sessions",
+            "proc.purchase_order_agent",
+            "proc.quote_agent",
+        },
+        "outputs": ["rfq_responses", "negotiation_prompts"],
+        "include_flows": False,
+    },
+    "NegotiationAgent": {
+        "description": (
+            "Generates counter offers based on RFQ targets, supplier quotes and historical spend insights."
+        ),
+        "tables": {
+            "proc.rfq_targets",
+            "proc.negotiation_sessions",
+            "proc.purchase_order_agent",
+            "proc.invoice_agent",
+        },
+        "outputs": ["negotiation_outcomes"],
+        "include_flows": False,
+    },
+    "RAGAgent": {
+        "description": (
+            "Answers procurement questions by combining document embeddings with the knowledge graph relationships."
+        ),
+        "tables": {
+            "procwise_document_embeddings",
+            "procwise_knowledge_graph",
+        },
+        "outputs": ["rag_answers", "agentic_plan"],
+        "include_flows": True,
+    },
+}
+
 _SUPPLIER_ID_ALIASES: Tuple[str, ...] = (
     "supplier",
     "supplier_identifier",
@@ -340,7 +413,10 @@ class DataFlowManager:
         self.agent_nick = agent_nick
         settings = getattr(agent_nick, "settings", None)
         if collection_name is None:
-            collection_name = getattr(settings, "qdrant_collection_name", None) or "Knowledge Graph"
+            collection_name = (
+                getattr(settings, "knowledge_graph_collection_name", None)
+                or "procwise_knowledge_graph"
+            )
         self.collection_name = collection_name
         self.qdrant_client = getattr(agent_nick, "qdrant_client", None)
         self.embedding_model = getattr(agent_nick, "embedding_model", None)
@@ -545,6 +621,13 @@ class DataFlowManager:
                     id=point_id, vector=vector, payload=payload
                 )
 
+        agent_points = self._agent_relationship_points(relations, graph)
+        for point_id, point in agent_points.items():
+            if point_id in seen_point_ids:
+                continue
+            seen_point_ids.add(point_id)
+            points_by_id.setdefault(point_id, point)
+
         points = list(points_by_id.values())
         if not points:
             logger.debug("No knowledge graph points generated for persistence")
@@ -563,6 +646,174 @@ class DataFlowManager:
     # ------------------------------------------------------------------
     # Relationship analysis helpers
     # ------------------------------------------------------------------
+    def _agent_relationship_points(
+        self,
+        relations: Iterable[Dict[str, Any]],
+        graph: Optional[Dict[str, Any]] = None,
+    ) -> Dict[int, models.PointStruct]:
+        """Construct payloads summarising how agents interact with the graph."""
+
+        relation_list: List[Dict[str, Any]] = [
+            dict(relation)
+            for relation in relations
+            if isinstance(relation, Mapping)
+        ]
+        if not relation_list:
+            return {}
+
+        table_relations: Dict[str, List[Dict[str, Any]]] = {}
+        for relation in relation_list:
+            source = str(relation.get("source_table") or "").strip()
+            target = str(relation.get("target_table") or "").strip()
+            if not source or not target:
+                continue
+            table_relations.setdefault(source.lower(), []).append(relation)
+            table_relations.setdefault(target.lower(), []).append(relation)
+
+        supplier_flows = []
+        if isinstance(graph, Mapping):
+            flows = graph.get("supplier_flows")
+            if isinstance(flows, Sequence):
+                supplier_flows = [flow for flow in flows if isinstance(flow, Mapping)]
+
+        points: Dict[int, models.PointStruct] = {}
+
+        for agent_name, meta in AGENT_RELATIONSHIP_SUMMARIES.items():
+            tables = {
+                str(table).strip().lower()
+                for table in meta.get("tables", set())
+                if str(table).strip()
+            }
+            if not tables:
+                continue
+
+            statements: List[str] = []
+            seen_pairs: set[Tuple[str, str, str, str]] = set()
+            for table in tables:
+                for relation in table_relations.get(table, []):
+                    status = str(relation.get("status") or "").lower()
+                    if status not in {"linked", "no_overlap"}:
+                        continue
+                    source = str(relation.get("source_table") or "").strip()
+                    target = str(relation.get("target_table") or "").strip()
+                    if not source or not target:
+                        continue
+                    source_key = source.lower()
+                    target_key = target.lower()
+                    agent_as_source = source_key in tables
+                    agent_as_target = target_key in tables
+                    if not agent_as_source and not agent_as_target:
+                        continue
+
+                    if agent_as_source and agent_as_target:
+                        continue
+
+                    if agent_as_source:
+                        counterpart = target
+                        source_col = relation.get("source_column_resolved") or relation.get(
+                            "source_column"
+                        )
+                        target_col = relation.get("target_column_resolved") or relation.get(
+                            "target_column"
+                        )
+                    else:
+                        counterpart = source
+                        source_col = relation.get("target_column_resolved") or relation.get(
+                            "target_column"
+                        )
+                        target_col = relation.get("source_column_resolved") or relation.get(
+                            "source_column"
+                        )
+
+                    pair_key = (
+                        source.lower(),
+                        counterpart.lower(),
+                        str(source_col).lower() if source_col else "",
+                        str(target_col).lower() if target_col else "",
+                    )
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
+                    relation_type = relation.get("relationship_type") or "links to"
+                    confidence = relation.get("confidence")
+                    confidence_clause = (
+                        f" (confidence {float(confidence):.2f})"
+                        if isinstance(confidence, (int, float))
+                        else ""
+                    )
+                    descriptor: List[str] = [
+                        f"{source} {relation_type} {counterpart}"
+                    ]
+                    if source_col or target_col:
+                        descriptor.append(
+                            f"via {source_col or '<unknown>'} → {target_col or '<unknown>'}"
+                        )
+                    samples = relation.get("sample_values") or []
+                    if isinstance(samples, Sequence) and samples:
+                        descriptor.append(
+                            "e.g. "
+                            + ", ".join(
+                                str(value) for value in list(samples)[:3] if value is not None
+                            )
+                        )
+                    descriptor.append(confidence_clause)
+                    statements.append(" ".join(part for part in descriptor if part).strip())
+
+            summary_parts: List[str] = []
+            description = meta.get("description")
+            if description:
+                summary_parts.append(str(description).strip())
+            if statements:
+                summary_parts.append(
+                    "Key data relationships include "
+                    + "; ".join(statements[:3]).rstrip(";")
+                    + "."
+                )
+            elif tables:
+                summary_parts.append(
+                    "Key data sources: " + ", ".join(sorted(meta.get("tables", []))) + "."
+                )
+            outputs = meta.get("outputs")
+            if outputs:
+                summary_parts.append(
+                    "Primary outputs: " + ", ".join(str(o) for o in outputs) + "."
+                )
+
+            if meta.get("include_flows") and supplier_flows:
+                summary_parts.append(
+                    f"Knowledge graph currently tracks {len(supplier_flows)} supplier flow"
+                    f"{'s' if len(supplier_flows) != 1 else ''}."
+                )
+
+            summary_text = " ".join(part for part in summary_parts if part).strip()
+            if not summary_text:
+                continue
+
+            vector = self._embed_text(summary_text)
+            if vector is None:
+                continue
+
+            payload: Dict[str, Any] = {
+                "document_type": "agent_relationship_summary",
+                "agent_name": agent_name,
+                "related_tables": sorted(meta.get("tables", [])),
+                "summary": summary_text,
+            }
+            if statements:
+                payload["relationship_statements"] = statements
+            if supplier_flows and meta.get("include_flows"):
+                payload["flow_snapshot_size"] = len(supplier_flows)
+
+            point_id = self._deterministic_id(f"agent:{agent_name.lower()}")
+            points[point_id] = models.PointStruct(
+                id=point_id,
+                vector=vector,
+                payload=self._enforce_payload_limits(self._sanitize_payload(payload)),
+            )
+
+        return points
+
     def _analyse_relationship(
         self,
         config: RelationshipConfig,

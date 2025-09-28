@@ -644,6 +644,42 @@ class OpportunityMinerAgent(BaseAgent):
 
         return aggregated, category_map
 
+    def _serialize_findings(
+        self, findings: Iterable[Finding], *, limit: int = 2
+    ) -> List[Dict[str, Any]]:
+        ordered = sorted(
+            [f for f in findings if isinstance(f, Finding)],
+            key=lambda f: f.financial_impact_gbp,
+            reverse=True,
+        )
+        if limit <= 0:
+            return [f.as_dict() for f in ordered]
+        return [f.as_dict() for f in ordered[:limit]]
+
+    def _limit_opportunity_dicts(
+        self, entries: Iterable[Dict[str, Any]], *, limit: int = 2
+    ) -> List[Dict[str, Any]]:
+        valid: List[Dict[str, Any]] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                valid.append(entry)
+        if not valid:
+            return []
+
+        def _impact(value: Dict[str, Any]) -> float:
+            raw = value.get("financial_impact_gbp")
+            if raw is None:
+                raw = value.get("financialImpactGBP")
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+
+        ordered = sorted(valid, key=_impact, reverse=True)
+        if limit <= 0:
+            return ordered
+        return ordered[:limit]
+
     def _get_data_flow_manager(self) -> Optional[DataFlowManager]:
         if self._data_flow_manager is None:
             try:
@@ -1392,7 +1428,9 @@ class OpportunityMinerAgent(BaseAgent):
                     continue
                 display = payload.get("display", key)
                 retained = per_policy_retained.get(display, [])
-                policy_opportunities[display] = [f.as_dict() for f in retained]
+                policy_opportunities[display] = self._serialize_findings(
+                    retained, limit=2
+                )
                 policy_suppliers[display] = sorted(
                     {
                         str(f.supplier_id).strip()
@@ -1402,7 +1440,7 @@ class OpportunityMinerAgent(BaseAgent):
                 )
                 categories = per_policy_categories.get(display, {})
                 policy_category_opportunities[display] = {
-                    category: [f.as_dict() for f in findings]
+                    category: self._serialize_findings(findings, limit=2)
                     for category, findings in categories.items()
                 }
                 policy_cfg = payload.get("policy_cfg", {})
@@ -1419,7 +1457,8 @@ class OpportunityMinerAgent(BaseAgent):
 
             for display, retained in per_policy_retained.items():
                 policy_opportunities.setdefault(
-                    display, [f.as_dict() for f in retained]
+                    display,
+                    self._serialize_findings(retained, limit=2),
                 )
                 policy_suppliers.setdefault(
                     display,
@@ -1435,7 +1474,7 @@ class OpportunityMinerAgent(BaseAgent):
                 policy_category_opportunities.setdefault(
                     display,
                     {
-                        category: [f.as_dict() for f in findings]
+                        category: self._serialize_findings(findings, limit=2)
                         for category, findings in categories.items()
                     },
                 )
@@ -1455,27 +1494,34 @@ class OpportunityMinerAgent(BaseAgent):
                 ):
                     policy_suppliers[root_display] = variant_suppliers
 
-                variant_opportunities = [
-                    entry
-                    for variant in variants
-                    for entry in policy_opportunities.get(variant, [])
-                ]
-                if variant_opportunities and (
+                variant_opportunities = []
+                for variant in variants:
+                    variant_entries = policy_opportunities.get(variant, [])
+                    if isinstance(variant_entries, list):
+                        variant_opportunities.extend(variant_entries)
+                limited_variant = self._limit_opportunity_dicts(
+                    variant_opportunities, limit=2
+                )
+                if limited_variant and (
                     root_display not in policy_opportunities
                     or not policy_opportunities[root_display]
                 ):
-                    policy_opportunities[root_display] = variant_opportunities
+                    policy_opportunities[root_display] = limited_variant
 
                 category_union: Dict[str, List[Dict[str, Any]]] = {}
                 for variant in variants:
                     categories = policy_category_opportunities.get(variant, {})
                     for category, entries in categories.items():
-                        category_union.setdefault(category, []).extend(entries)
+                        if isinstance(entries, list):
+                            category_union.setdefault(category, []).extend(entries)
                 if category_union and (
                     root_display not in policy_category_opportunities
                     or not policy_category_opportunities[root_display]
                 ):
-                    policy_category_opportunities[root_display] = category_union
+                    policy_category_opportunities[root_display] = {
+                        category: self._limit_opportunity_dicts(entries, limit=2)
+                        for category, entries in category_union.items()
+                    }
 
                 for variant in variants:
                     if (

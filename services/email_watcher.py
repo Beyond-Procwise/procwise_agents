@@ -696,12 +696,14 @@ class SESEmailWatcher:
         interval: Optional[int] = None,
         limit: Optional[int] = None,
         stop_after: Optional[int] = None,
+        timeout_seconds: Optional[int] = 900,
     ) -> int:
         """Continuously poll for messages until ``stop_after`` iterations."""
 
         iterations = 0
         processed_total = 0
         poll_delay = self.poll_interval_seconds if interval is None else max(interval, 1)
+        start_time = time.time()
         while True:
             batch = self.poll_once(limit=limit)
             processed_total += len(batch)
@@ -712,8 +714,23 @@ class SESEmailWatcher:
                 len(batch),
                 processed_total,
             )
+            if batch:
+                logger.info(
+                    "Email watcher exiting after processing %d new message(s) in iteration %d",
+                    len(batch),
+                    iterations,
+                )
+                break
             if stop_after is not None and iterations >= stop_after:
                 break
+            if timeout_seconds is not None and timeout_seconds > 0:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout_seconds:
+                    logger.info(
+                        "Email watcher reached timeout after %.1f seconds without new messages",
+                        elapsed,
+                    )
+                    break
             time.sleep(poll_delay)
         return processed_total
 

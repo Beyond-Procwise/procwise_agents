@@ -11,6 +11,7 @@ from utils.instructions import parse_instruction_sources
 from utils.db import read_sql_compat
 from utils.reference_loader import load_reference_dataset
 from models.supplier_ranking_trainer import SupplierRankingTrainer
+from services.supplier_relationship_service import SupplierRelationshipService
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
 # Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
@@ -44,6 +45,14 @@ class SupplierRankingAgent(BaseAgent):
         self._supplier_lookup: Dict[str, Optional[str]] = {}
         self._scoring_reference = load_reference_dataset("supplier_scoring_reference")
         self._trainer = SupplierRankingTrainer()
+        try:
+            self._relationship_service = SupplierRelationshipService(agent_nick)
+        except Exception:
+            logger.debug(
+                "SupplierRankingAgent failed to initialise SupplierRelationshipService",
+                exc_info=True,
+            )
+            self._relationship_service = None
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -448,6 +457,10 @@ class SupplierRankingAgent(BaseAgent):
         tables = self._load_procurement_tables(supplier_scope, df)
         df = self._merge_supplier_metrics(df, tables)
         profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
+
+        contexts_by_id, contexts_by_name = self._fetch_relationship_context(df)
+        if contexts_by_id or contexts_by_name:
+            df = self._merge_relationship_context(df, contexts_by_id, contexts_by_name)
 
         coverage_series = self._derive_metric_coverage(df)
         if not coverage_series.empty:
@@ -1607,6 +1620,21 @@ class SupplierRankingAgent(BaseAgent):
         coverage = row.get("flow_coverage")
         if isinstance(coverage, (int, float)):
             entry["flow_coverage"] = float(coverage)
+        relationship_cov = row.get("relationship_coverage")
+        if isinstance(relationship_cov, (int, float)):
+            entry["relationship_coverage"] = float(relationship_cov)
+        relationship_summary = row.get("relationship_summary")
+        if isinstance(relationship_summary, str) and relationship_summary.strip():
+            entry["relationship_summary"] = relationship_summary.strip()
+        relationship_statements = row.get("relationship_statements")
+        if isinstance(relationship_statements, list) and relationship_statements:
+            cleaned_statements = [
+                statement.strip()
+                for statement in relationship_statements
+                if isinstance(statement, str) and statement.strip()
+            ]
+            if cleaned_statements:
+                entry["relationship_statements"] = cleaned_statements
         if profile:
             entry.update(
                 {
@@ -1640,4 +1668,114 @@ class SupplierRankingAgent(BaseAgent):
         ]
         counter = Counter(cleaned)
         return [val for val, _ in counter.most_common(limit)]
+
+    def _fetch_relationship_context(
+        self, df: pd.DataFrame
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        service = getattr(self, "_relationship_service", None)
+        if service is None or df.empty:
+            return {}, {}
+
+        contexts_by_id: Dict[str, Dict[str, Any]] = {}
+        contexts_by_name: Dict[str, Dict[str, Any]] = {}
+        seen: set[Tuple[str, str]] = set()
+
+        for row in df.itertuples(index=False):
+            sid = str(getattr(row, "supplier_id", "") or "").strip()
+            name = getattr(row, "supplier_name", None)
+            key = (sid, str(name or "").strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                payloads = service.fetch_relationship(
+                    supplier_id=sid or None,
+                    supplier_name=name,
+                    limit=1,
+                )
+            except Exception:
+                logger.exception("Failed to load relationship context for supplier %s", sid or name)
+                continue
+            if not payloads:
+                continue
+            payload = payloads[0]
+            if sid:
+                contexts_by_id[sid] = payload
+            token = self._normalise_supplier_token(name)
+            if token:
+                contexts_by_name[token] = payload
+
+        return contexts_by_id, contexts_by_name
+
+    def _merge_relationship_context(
+        self,
+        df: pd.DataFrame,
+        contexts_by_id: Dict[str, Dict[str, Any]],
+        contexts_by_name: Dict[str, Dict[str, Any]],
+    ) -> pd.DataFrame:
+        if df.empty:
+            return df
+
+        augmented = df.copy()
+        summaries: List[Optional[str]] = []
+        statements_list: List[List[str]] = []
+        coverage_values: List[Optional[float]] = []
+
+        for _, row in augmented.iterrows():
+            sid = str(row.get("supplier_id") or "").strip()
+            name = row.get("supplier_name")
+            payload = contexts_by_id.get(sid)
+            if payload is None:
+                token = self._normalise_supplier_token(name)
+                if token:
+                    payload = contexts_by_name.get(token)
+
+            if isinstance(payload, dict):
+                summary = payload.get("summary") or payload.get("content")
+                summaries.append(summary.strip() if isinstance(summary, str) else None)
+                rel_statements_raw = payload.get("relationship_statements")
+                if isinstance(rel_statements_raw, list):
+                    cleaned = [
+                        statement.strip()
+                        for statement in rel_statements_raw
+                        if isinstance(statement, str) and statement.strip()
+                    ]
+                else:
+                    cleaned = []
+                statements_list.append(cleaned)
+                coverage_raw = payload.get("coverage_ratio")
+                try:
+                    coverage_values.append(float(coverage_raw))
+                except (TypeError, ValueError):
+                    coverage_values.append(None)
+            else:
+                summaries.append(None)
+                statements_list.append([])
+                coverage_values.append(None)
+
+        augmented["relationship_summary"] = summaries
+        augmented["relationship_statements"] = statements_list
+
+        if "flow_coverage" in augmented.columns:
+            merged_coverage: List[Optional[float]] = []
+            for base, extra in zip(augmented["flow_coverage"], coverage_values):
+                if isinstance(extra, (int, float)):
+                    base_val = float(base) if isinstance(base, (int, float)) else 0.0
+                    merged_coverage.append(max(base_val, float(extra)))
+                else:
+                    merged_coverage.append(
+                        float(base) if isinstance(base, (int, float)) else 0.0
+                    )
+            augmented["flow_coverage"] = merged_coverage
+        else:
+            augmented["flow_coverage"] = [
+                float(value) if isinstance(value, (int, float)) else 0.0
+                for value in coverage_values
+            ]
+        augmented["relationship_coverage"] = [
+            float(value) if isinstance(value, (int, float)) else None
+            for value in coverage_values
+        ]
+
+        return augmented
 

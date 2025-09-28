@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     qdrant_url: str = Field(..., env="QDRANT_URL")
     qdrant_api_key: str = Field(..., env="QDRANT_API_KEY")
     qdrant_collection_name: str = Field(
-        default="ProcWise_document_embeddings", env="QDRANT_COLLECTION_NAME"
+        default="procwise_document_embeddings", env="QDRANT_COLLECTION_NAME"
+    )
+    knowledge_graph_collection_name: str = Field(
+        default="procwise_knowledge_graph", env="KNOWLEDGE_GRAPH_COLLECTION_NAME"
     )
 
     # Email settings
@@ -65,14 +68,15 @@ class Settings(BaseSettings):
         default=60, env="EMAIL_RESPONSE_POLL_SECONDS"
     )
 
-    extraction_model: str = "gpt-oss"
-    rag_model: str = Field(default="gpt-oss", env="RAG_LLM_MODEL")
-    # ``multi-qa-mpnet-base-dot-v1`` provides high-quality semantic
-    # embeddings tailored for question/answer style retrieval.  Its
-    # dimensionality (768) is smaller than ``all-roberta-large-v1`` which
-    # reduces storage requirements while typically yielding better recall for
-    # RAG workflows.
-    embedding_model: str = "multi-qa-mpnet-base-dot-v1"
+    extraction_model: str = "gpt-oss:20b"
+    document_extraction_model: str = Field(
+        default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
+    )
+    rag_model: str = Field(default="gpt-oss:20b", env="RAG_LLM_MODEL")
+    # ``nomic-embed-text`` offers competitive retrieval quality with a compact
+    # footprint (768 dimensions) and is optimised for procurement-style
+    # documents, making it a better default for document extraction pipelines.
+    embedding_model: str = "nomic-embed-text"
     vector_size: int = 768
     reranker_model: str = Field(
         default="cross-encoder/ms-marco-MiniLM-L-12-v2", env="RERANKER_MODEL"
@@ -83,7 +87,7 @@ class Settings(BaseSettings):
     rag_chunk_chars: int = Field(default=1800, env="RAG_CHUNK_CHARS")
     rag_chunk_overlap: int = Field(default=350, env="RAG_CHUNK_OVERLAP")
     ollama_quantized_model: Optional[str] = Field(
-        default="gpt-oss:latest", env="OLLAMA_QUANTIZED_MODEL"
+        default=None, env="OLLAMA_QUANTIZED_MODEL"
     )
     ollama_gpu_layers: Optional[int] = Field(
         default=None, env="OLLAMA_GPU_LAYERS"
