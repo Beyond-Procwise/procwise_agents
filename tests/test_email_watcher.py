@@ -9,6 +9,7 @@ from agents.base_agent import AgentOutput, AgentStatus, AgentContext
 from services.email_watcher import (
     InMemoryEmailWatcherState,
     SESEmailWatcher,
+    S3ObjectWatcher,
 )
 
 
@@ -719,6 +720,79 @@ def test_email_watcher_polls_processed_messages_until_match(monkeypatch):
     assert client.page_indices[0] == 0
     assert client.page_indices[-1] == 1
     assert watcher.state_store.get("emails/new.json")["status"] == "processed"
+
+
+def test_email_watcher_detects_new_s3_objects_even_with_same_timestamp(monkeypatch):
+    nick = DummyNick()
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    watcher = SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        metadata_provider=lambda _: {"supplier_id": "SUP-PROC", "target_price": 900},
+        state_store=InMemoryEmailWatcherState(),
+    )
+
+    shared_ts = datetime.now(timezone.utc)
+    base_prefix = "emails/" if "emails/" in watcher._processed_prefixes else watcher._processed_prefixes[0]
+
+    watcher._s3_prefix_watchers[base_prefix] = S3ObjectWatcher(limit=4)
+    watcher._s3_prefix_watchers[base_prefix].mark_known("emails/old.json", shared_ts)
+    watcher.state_store.add("emails/old.json", {"status": "processed"})
+
+    new_payload = {
+        "subject": "Re: RFQ-20240101-target",
+        "from": "supplier@example.com",
+        "body": "Quoted price 950",
+        "rfq_id": "RFQ-20240101-target",
+    }
+
+    payloads = {
+        "emails/new.json": json.dumps(new_payload).encode("utf-8"),
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+    class StubS3Client:
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+
+            class _Paginator:
+                def paginate(self_inner, Bucket, Prefix):
+                    if Prefix == base_prefix:
+                        yield {
+                            "Contents": [
+                                {"Key": "emails/old.json", "LastModified": shared_ts},
+                                {"Key": "emails/new.json", "LastModified": shared_ts},
+                            ]
+                        }
+                    else:
+                        yield {"Contents": []}
+
+            return _Paginator()
+
+        def get_object(self, Bucket, Key):
+            return {"Body": DummyBody(payloads[Key])}
+
+    client = StubS3Client()
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: client)
+
+    results = watcher._load_processed_messages(limit=None)
+
+    assert len(results) == 1
+    assert results[0]["id"] == "emails/new.json"
+    assert results[0]["rfq_id"] == "RFQ-20240101-target"
+
+    prefix_state = watcher._s3_prefix_watchers[base_prefix]
+    assert isinstance(prefix_state, S3ObjectWatcher)
+    assert list(prefix_state.known.keys()) == ["emails/old.json", "emails/new.json"]
 
 
 def test_email_watcher_leaves_queue_message_on_processing_error(monkeypatch):
