@@ -116,6 +116,7 @@ def preview_then_watch(
     watch_limit: Optional[int] = None,
     watch_interval: Optional[int] = None,
     stop_after: Optional[int] = None,
+    watch_timeout: Optional[int] = None,
     watcher: Optional[SESEmailWatcher] = None,
     run_in_background: bool = False,
 ) -> EmailWatcherStartupResult:
@@ -130,6 +131,7 @@ def preview_then_watch(
             interval=watch_interval,
             limit=watch_limit,
             stop_after=stop_after,
+            timeout_seconds=watch_timeout,
         )
 
     if run_in_background:

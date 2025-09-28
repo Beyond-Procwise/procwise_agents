@@ -4,8 +4,10 @@ import re
 import uuid
 import os
 import tempfile
+import textwrap
 from io import BytesIO
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import gzip
 import concurrent.futures
@@ -53,6 +55,7 @@ from utils.procurement_schema import (
     DOC_TYPE_TO_TABLE,
     PROCUREMENT_SCHEMAS,
     TableSchema,
+    extract_structured_content,
 )
 
 
@@ -61,6 +64,28 @@ logging.getLogger("pdfminer").setLevel(logging.ERROR)
 configure_gpu()
 
 HITL_CONFIDENCE_THRESHOLD = 0.85
+
+REFERENCE_PATH = Path(__file__).resolve().parents[1] / "docs" / "procurement_table_reference.md"
+_TABLE_SECTION_PATTERN = re.compile(r"### `([^`]+)`'?[\r\n]+```(.*?)```", re.DOTALL)
+
+
+@lru_cache(maxsize=1)
+def _table_reference_sections() -> Dict[str, str]:
+    if not REFERENCE_PATH.exists():
+        return {}
+    try:
+        text = REFERENCE_PATH.read_text(encoding="utf-8")
+    except Exception:
+        logger.warning("Unable to read procurement table reference at %s", REFERENCE_PATH)
+        return {}
+
+    sections: Dict[str, str] = {}
+    for match in _TABLE_SECTION_PATTERN.finditer(text):
+        table_name = match.group(1).strip().strip("'")
+        block = textwrap.dedent(match.group(2)).strip()
+        if table_name and block:
+            sections[table_name] = block
+    return sections
 
 # ---------------------------------------------------------------------------
 # SCHEMAS
@@ -445,7 +470,11 @@ def _initialize_qdrant_collection_idempotent(client, collection_name: str, vecto
 class DataExtractionAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.extraction_model = self.settings.extraction_model
+        self.extraction_model = getattr(
+            self.settings,
+            "document_extraction_model",
+            self.settings.extraction_model,
+        )
 
     # --------------------------------------------------------------------
     # Regex-based header extraction
@@ -1043,6 +1072,7 @@ class DataExtractionAgent(BaseAgent):
             "semantic_regex": 0.80,
             "table_detector": 0.85,
             "llm_fill": 0.70,
+            "llm_structured": 0.75,
             "ner": 0.60
         }.get(method, 0.50)
         return base
@@ -1913,6 +1943,44 @@ class DataExtractionAgent(BaseAgent):
                         keywords.add(alias.lower())
         return tuple(sorted({kw for kw in keywords if len(kw) > 2}))
 
+    def _schema_llm_context(self, doc_type: str) -> str:
+        header_table, line_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))
+        sections: List[str] = []
+        reference_sections = _table_reference_sections()
+
+        for table_name, label in (
+            (header_table, "header"),
+            (line_table, "line items"),
+        ):
+            if not table_name:
+                continue
+            schema = PROCUREMENT_SCHEMAS.get(table_name)
+            details: List[str] = []
+            if schema:
+                required = ", ".join(schema.required) if schema.required else "None"
+                details.append(f"Required fields: {required}")
+                if schema.columns:
+                    displayed = ", ".join(schema.columns[:40])
+                    if len(schema.columns) > 40:
+                        displayed += " ..."
+                    details.append("Columns: " + displayed)
+            snippet = reference_sections.get(table_name)
+            if snippet:
+                lines = snippet.splitlines()[:24]
+                formatted = "\n".join(
+                    f"    {line}" for line in lines if line.strip()
+                )
+                if formatted:
+                    details.append(
+                        "Definition excerpt from procurement_table_reference.md:\n"
+                        + formatted
+                    )
+            if details:
+                sections.append(
+                    f"Table `{table_name}` ({label}) guidance:\n" + "\n".join(details)
+                )
+        return "\n\n".join(sections)
+
     def _prepare_llm_document(self, text: str, doc_type: str, max_chars: int = 7000) -> str:
         if not text:
             return ""
@@ -1993,6 +2061,9 @@ class DataExtractionAgent(BaseAgent):
             "existing_header": header_seed,
             "existing_line_items": line_items_seed,
         }
+        schema_context = self._schema_llm_context(doc_type)
+        if schema_context:
+            instructions["schema_context"] = schema_context
 
         prompt = (
             "You are a procurement data expert. Convert the provided document text into structured tabular data. "
@@ -2000,6 +2071,11 @@ class DataExtractionAgent(BaseAgent):
             "Use the column lists exactly as provided. Fill missing values with null instead of guessing. "
             "Include at most one header row. Preserve numeric precision (no currency symbols)."
         )
+        if schema_context:
+            prompt += (
+                " Schema guidance from procurement_table_reference.md is provided in the instructions block;"
+                " respect the required columns and data types."
+            )
 
         payload: Dict[str, Any] = {}
         for _ in range(3):
@@ -2077,16 +2153,55 @@ class DataExtractionAgent(BaseAgent):
         Tuple[Dict[str, Any], List[Dict[str, Any]]]
             Normalised header record and a list of normalised line item records.
         """
-        # 1) Heuristic header extraction
+        # 1) LLM-guided structural extraction to capture contextual values first
         header: Dict[str, Any] = {}
+        line_items: List[Dict[str, Any]] = []
+        llm_structured = self._llm_structured_extraction(text, doc_type)
+        llm_header = self._normalize_header_fields(
+            (llm_structured.get("header_data") if isinstance(llm_structured, dict) else {})
+            or {},
+            doc_type,
+        )
+        if llm_header:
+            header = self._merge_record_fields(header, llm_header)
+            confidence = header.setdefault("_field_confidence", {})
+            llm_conf = self._confidence_from_method("llm_structured")
+            for key in llm_header:
+                if key.startswith("_"):
+                    continue
+                confidence[key] = max(confidence.get(key, 0.0), llm_conf)
+        llm_line_items = []
+        if isinstance(llm_structured, dict):
+            raw_items = llm_structured.get("line_items") or []
+            if raw_items:
+                try:
+                    llm_line_items = self._normalize_line_item_fields(raw_items, doc_type)
+                except Exception:
+                    llm_line_items = []
+            raw_context = llm_structured.get("field_contexts")
+            if isinstance(raw_context, dict):
+                context_map = {
+                    key: value
+                    for key, value in raw_context.items()
+                    if isinstance(value, str) and value.strip()
+                }
+                if context_map:
+                    header["_field_context"] = context_map
+        if llm_line_items:
+            line_items = self._merge_line_items(line_items, llm_line_items)
+
+        # 2) Heuristic header extraction layered on top of LLM results
         try:
             header_regex = self._extract_header_regex(text, doc_type) or {}
-            header.update(self._normalize_header_fields(header_regex, doc_type))
+            header = self._merge_record_fields(
+                header,
+                self._normalize_header_fields(header_regex, doc_type),
+            )
         except Exception:
             pass
         try:
             header_layout = self._parse_header(text, file_bytes)
-            header = self._merge_record_fields(header_layout, header)
+            header = self._merge_record_fields(header, header_layout)
         except Exception:
             pass
         try:
@@ -2095,6 +2210,20 @@ class DataExtractionAgent(BaseAgent):
                 header = self._merge_record_fields(header, ner_header)
         except Exception:
             pass
+
+        try:
+            structured = extract_structured_content(text, doc_type)
+            schema_header = structured.get("header") or {}
+            schema_lines = structured.get("line_items") or []
+            if schema_header:
+                header = self._merge_record_fields(
+                    header,
+                    self._normalize_header_fields(schema_header, doc_type),
+                )
+            if schema_lines:
+                line_items = self._merge_line_items(line_items, schema_lines)
+        except Exception:
+            logger.debug("Schema-guided extraction fallback failed", exc_info=True)
 
         if not header.get("vendor_name"):
             from_match = re.search(r"\bfrom\s+([A-Za-z0-9&.,' ]{2,80})", text, re.I)
@@ -2109,8 +2238,7 @@ class DataExtractionAgent(BaseAgent):
             if vendor_guess:
                 header["vendor_name"] = vendor_guess
 
-        # 2) Line item extraction: table detection then regex fallback
-        line_items: List[Dict[str, Any]] = []
+        # 3) Line item extraction: table detection then regex fallback
         try:
             if file_bytes:
                 line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type) or []
@@ -2121,10 +2249,6 @@ class DataExtractionAgent(BaseAgent):
                 line_items = self._extract_line_items_regex(text, doc_type) or []
             except Exception:
                 line_items = []
-
-        header, line_items = self._fill_missing_fields_with_llm(
-            text, doc_type, header, line_items
-        )
 
         # Normalise and clean numeric fields
         if line_items:
@@ -2142,6 +2266,10 @@ class DataExtractionAgent(BaseAgent):
                 ]:
                     if num_field in item:
                         item[num_field] = self._clean_numeric(item[num_field])
+
+        # Preserve LLM-derived metadata before schema alignment
+        meta_confidence = dict(header.get("_field_confidence", {}))
+        meta_context = dict(header.get("_field_context", {}))
 
         # 3) Reconcile header using line totals
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
@@ -2163,6 +2291,15 @@ class DataExtractionAgent(BaseAgent):
         line_items = self._dataframe_to_records(line_df)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
+        if meta_confidence:
+            existing_conf = header.get("_field_confidence", {}) or {}
+            if not isinstance(existing_conf, dict):
+                existing_conf = {}
+            merged_conf = {**meta_confidence, **existing_conf}
+            header["_field_confidence"] = merged_conf
+        if meta_context:
+            header["_field_context"] = meta_context
+
         # 7) Compute validation and confidence
         ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
         total_missing = len(header_missing) + len(line_missing)
@@ -2176,68 +2313,128 @@ class DataExtractionAgent(BaseAgent):
             "notes": notes,
             "confidence": confidence,
         }
+        self._log_structured_analysis(doc_type, header, line_items)
         return header, line_items
 
-    def _fill_missing_fields_with_llm(
+    def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
+        """Run a single LLM pass to capture field-level context for the document."""
+
+        schema = SCHEMA_MAP.get(doc_type, {})
+        header_fields = list(schema.get("header", {}).keys())
+        line_schema = schema.get("line_items", {})
+        line_fields = list(line_schema.keys())
+
+        context_hint = DOC_TYPE_CONTEXT.get(doc_type, "")
+        llm_input = self._prepare_llm_document(text, doc_type)
+        schema_context = self._schema_llm_context(doc_type)
+
+        header_field_str = ", ".join(header_fields) if header_fields else "(none)"
+        line_field_str = ", ".join(line_fields) if line_fields else "(none)"
+
+        prompt_parts = [
+            f"You are an information extraction engine for {doc_type}. {context_hint}",
+            "Return ONLY valid JSON in the following structure:",
+            "{\n  \"header_data\": { ... },\n  \"line_items\": [ ... ],\n  \"field_contexts\": { ... }\n}",
+            "Rules:",
+            "- header_data MUST include only the canonical fields listed below and use null when a value cannot be located.",
+            "- line_items MUST be a list of objects containing only the permitted line item fields in the order supplied.",
+            "- field_contexts MUST map each header field to a short snippet (<=160 chars) of the supporting text.",
+            "- Dates must use YYYY-MM-DD, currency must be a 3-letter ISO code, and numeric values must be plain decimals.",
+            f"Header fields: {header_field_str}",
+            f"Line item fields: {line_field_str}",
+        ]
+        if schema_context:
+            prompt_parts.append(
+                "Schema guidance sourced from procurement_table_reference.md:\n" + schema_context
+            )
+        prompt_parts.append("Document:\n" + llm_input)
+        prompt = "\n".join(part for part in prompt_parts if part)
+
+        try:
+            response = self.call_ollama(
+                prompt=prompt,
+                model=self.extraction_model,
+                format="json",
+            )
+            payload = json.loads(response.get("response", "{}"))
+            if not isinstance(payload, dict):
+                raise ValueError("LLM structured payload is not a JSON object")
+            return payload
+        except Exception:
+            logger.debug("LLM structured extraction failed", exc_info=True)
+            return {}
+
+    def _structured_output_metrics(
         self,
-        text: str,
         doc_type: str,
         header: Dict[str, Any],
         line_items: List[Dict[str, Any]],
-        llm_text: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        schema = SCHEMA_MAP.get(doc_type, {})
-        header_fields = list(schema.get("header", {}).keys())
-        missing_header = [f for f in header_fields if not header.get(f)]
-        need_items = (not line_items) and bool(schema.get("line_items"))
+    ) -> List[Dict[str, Any]]:
+        metrics: List[Dict[str, Any]] = []
+        header_table, line_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))
 
-        if not missing_header and not need_items:
-            return header, line_items
+        if header_table:
+            schema = PROCUREMENT_SCHEMAS.get(header_table)
+            if schema and schema.required:
+                missing = [col for col in schema.required if not header.get(col)]
+                metrics.append(
+                    {
+                        "table": header_table,
+                        "segment": "header",
+                        "filled": len(schema.required) - len(missing),
+                        "total": len(schema.required),
+                        "missing": missing,
+                    }
+                )
+        if line_table and line_items:
+            schema = PROCUREMENT_SCHEMAS.get(line_table)
+            if schema and schema.required:
+                filled_rows = 0
+                for row in line_items:
+                    if all(row.get(col) for col in schema.required):
+                        filled_rows += 1
+                metrics.append(
+                    {
+                        "table": line_table,
+                        "segment": "line_items",
+                        "filled": filled_rows,
+                        "total": len(line_items),
+                        "missing": [],
+                    }
+                )
+        return metrics
 
-        context_hint = DOC_TYPE_CONTEXT.get(doc_type, "")
-        llm_input = llm_text or self._prepare_llm_document(text, doc_type)
-        prompt = (
-            f"You are an information extraction engine for {doc_type}. {context_hint} "
-            "Return ONLY valid JSON. Do not include explanations.\n"
-            "Rules:\n"
-            "- Fill ONLY the missing header fields listed below; leave others as provided.\n"
-            "- For dates, use YYYY-MM-DD.\n"
-            "- Currency must be a 3-letter ISO code.\n"
-            "- Numbers must be plain decimals without commas or symbols.\n"
-            "- If unknown, set null (do not guess).\n\n"
-            f"Missing header fields: {', '.join(missing_header) if missing_header else 'none'}\n"
-        )
-        if need_items:
-            prompt += "Also extract 'line_items' as a list of objects. Include description/qty/price amounts when available.\n"
-        prompt += (
-            "\nExisting data:\n"
-            + json.dumps({"header_data": header, "line_items": line_items})
-            + "\n\nDocument:\n"
-            + llm_input
-        )
-
-        payload = {}
-        for _ in range(2):
-            try:
-                resp = self.call_ollama(prompt=prompt, model=self.extraction_model, format="json")
-                payload = json.loads(resp.get("response", "{}"))
-                if isinstance(payload, dict) and "header_data" in payload and "line_items" in payload:
-                    break
-            except Exception:
+    def _log_structured_analysis(
+        self,
+        doc_type: str,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+    ) -> None:
+        metrics = self._structured_output_metrics(doc_type, header, line_items)
+        for metric in metrics:
+            total = metric.get("total", 0) or 0
+            filled = metric.get("filled", 0)
+            if not total:
                 continue
-
-        llm_header = self._normalize_header_fields(payload.get("header_data", {}), doc_type)
-        for key in missing_header:
-            if key in llm_header and llm_header[key] not in (None, "", []):
-                header[key] = llm_header[key]
-                header.setdefault("_field_confidence", {})[key] = self._confidence_from_method("llm_fill")
-
-        if need_items and isinstance(payload.get("line_items"), list) and payload["line_items"]:
-            llm_items = self._normalize_line_item_fields(payload["line_items"], doc_type)
-            if llm_items:
-                line_items = llm_items
-
-        return header, line_items
+            coverage = filled / total if total else 1.0
+            table = metric.get("table", "unknown")
+            segment = metric.get("segment", "header")
+            missing = metric.get("missing", [])
+            if missing:
+                logger.warning(
+                    "Document extraction coverage %.0f%% for %s (%s); missing required fields: %s",
+                    coverage * 100,
+                    table,
+                    segment,
+                    ", ".join(missing),
+                )
+            else:
+                logger.info(
+                    "Document extraction coverage %.0f%% for %s (%s)",
+                    coverage * 100,
+                    table,
+                    segment,
+                )
 
     # ============================ VECTORIZING =============================
     def _ensure_qdrant_collection(self) -> None:

@@ -355,7 +355,10 @@ def test_train_procurement_context_embeds_schema(monkeypatch):
 
     agent = types.SimpleNamespace(
         get_db_connection=lambda: DummyConnection(),
-        settings=types.SimpleNamespace(qdrant_collection_name="ProcWise_document_embeddings"),
+        settings=types.SimpleNamespace(
+            qdrant_collection_name="procwise_document_embeddings",
+            knowledge_graph_collection_name="procwise_knowledge_graph",
+        ),
     )
     engine = QueryEngine(agent_nick=agent)
 

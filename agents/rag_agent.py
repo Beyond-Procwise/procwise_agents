@@ -1,7 +1,7 @@
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from botocore.exceptions import ClientError
 from qdrant_client import models
@@ -27,6 +27,7 @@ class RAGAgent(BaseAgent):
         "supplier_relationship",
         "supplier_relationship_overview",
         "procurement_flow",
+        "agent_relationship_summary",
     )
 
     def __init__(self, agent_nick):
@@ -83,6 +84,15 @@ class RAGAgent(BaseAgent):
                 if h.id not in seen_ids:
                     search_hits.append(h)
                     seen_ids.add(h.id)
+
+        kg_collection = getattr(self.settings, "knowledge_graph_collection_name", None)
+        if kg_collection:
+            for q in query_variants:
+                kg_hits = self._search_knowledge_graph(q, top_k=top_k, filters=qdrant_filter)
+                for hit in kg_hits:
+                    if hit.id not in seen_ids:
+                        search_hits.append(hit)
+                        seen_ids.add(hit.id)
 
         if not doc_type and not any(
             (getattr(hit, "payload", {}) or {}).get("document_type") == "supplier_relationship"
@@ -176,8 +186,11 @@ class RAGAgent(BaseAgent):
         )
 
         # Generate answer and follow-up suggestions in parallel
+        answer_model = getattr(
+            self.settings, "rag_model", getattr(self.settings, "extraction_model", None)
+        )
         answer_future = self._executor.submit(
-            self.call_ollama, rag_prompt, model=self.settings.extraction_model
+            self.call_ollama, rag_prompt, model=answer_model
         )
         combined_context = "\n\n".join(
             part for part in (outline, knowledge_summary, document_context) if part
@@ -387,6 +400,55 @@ class RAGAgent(BaseAgent):
                 documents.append(hit)
         return documents, knowledge
 
+    def _search_knowledge_graph(
+        self, query: str, top_k: int = 5, filters: Optional[models.Filter] = None
+    ):
+        """Search the dedicated knowledge graph collection for supporting context."""
+
+        collection = getattr(self.settings, "knowledge_graph_collection_name", None)
+        client = getattr(self.agent_nick, "qdrant_client", None)
+        embedder = getattr(self.agent_nick, "embedding_model", None)
+        if not all([collection, client, embedder]) or not hasattr(client, "search"):
+            return []
+        try:
+            vector = embedder.encode(query, normalize_embeddings=True).tolist()
+        except Exception:
+            logger.exception("Failed to encode query for knowledge graph search")
+            return []
+
+        search_params = models.SearchParams(hnsw_ef=256, exact=False)
+        try:
+            hits = client.search(
+                collection_name=collection,
+                query_vector=vector,
+                query_filter=filters,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+                search_params=search_params,
+            )
+        except Exception:
+            logger.exception("Knowledge graph search failed")
+            return []
+
+        if hits:
+            return hits
+
+        try:
+            exact_params = models.SearchParams(hnsw_ef=256, exact=True)
+            return client.search(
+                collection_name=collection,
+                query_vector=vector,
+                query_filter=filters,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+                search_params=exact_params,
+            )
+        except Exception:
+            logger.exception("Exact knowledge graph search failed")
+            return []
+
     def _build_document_context(self, hits: Sequence[Any]) -> str:
         """Render a structured textual context from reranked document hits."""
 
@@ -578,6 +640,22 @@ class RAGAgent(BaseAgent):
                 if description:
                     sentence += f" – {description}"
                 summaries.append(sentence.strip() + ".")
+            elif doc_type == "agent_relationship_summary":
+                agent = payload.get("agent_name") or "Agent"
+                agent_summary = payload.get("summary")
+                if isinstance(agent_summary, str) and agent_summary.strip():
+                    summaries.append(f"{agent}: {self._truncate_text(agent_summary.strip(), 280)}")
+                statements = payload.get("relationship_statements")
+                if isinstance(statements, list):
+                    for statement in statements[:5]:
+                        if isinstance(statement, str) and statement.strip():
+                            summaries.append(statement.strip().rstrip(".") + ".")
+                flow_snapshot = payload.get("flow_snapshot_size")
+                if isinstance(flow_snapshot, (int, float)) and flow_snapshot:
+                    summaries.append(
+                        f"Knowledge graph snapshot covers {int(flow_snapshot)} supplier flow"
+                        f"{'s' if int(flow_snapshot) != 1 else ''}."
+                    )
             else:
                 description = payload.get("description") or payload.get("summary")
                 if description:

@@ -320,14 +320,13 @@ def test_run_propagates_discrepancy_fail(monkeypatch):
     assert output.error == "db down"
 
 
-def test_fill_missing_fields_with_llm(monkeypatch):
-    """LLM call fills only missing fields after heuristic parsing."""
-
+def test_llm_structured_pass_populates_header(monkeypatch):
+    """Initial LLM pass should provide structured values and context."""
 
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
 
-    # Heuristic extractors return nothing
+    # Heuristic extractors return nothing to ensure LLM data is used
     monkeypatch.setattr(agent, "_extract_header_regex", lambda text, dt: {})
     monkeypatch.setattr(agent, "_extract_header_with_ner", lambda text: {})
     monkeypatch.setattr(agent, "_parse_header", lambda text, file_bytes=None: {})
@@ -339,7 +338,10 @@ def test_fill_missing_fields_with_llm(monkeypatch):
     llm_payload = {
         "response": json.dumps(
             {
-                "header_data": {"invoice_id": "INV1", "vendor_name": "ACME"},
+                "header_data": {
+                    "invoice_id": "INV1",
+                    "vendor_name": "ACME",
+                },
                 "line_items": [
                     {
                         "item_id": "A1",
@@ -347,17 +349,32 @@ def test_fill_missing_fields_with_llm(monkeypatch):
                         "quantity": "1",
                     }
                 ],
+                "field_contexts": {
+                    "invoice_id": "Invoice number INV1",
+                    "vendor_name": "Supplier ACME Pty",
+                },
             }
         )
     }
-    monkeypatch.setattr(agent, "call_ollama", lambda **kwargs: llm_payload)
+
+    captured_prompt = {}
+
+    def fake_call(prompt, model, format=None):
+        captured_prompt["prompt"] = prompt
+        return llm_payload
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
 
     header, items = agent._extract_structured_data(
         "Invoice INV1 from ACME for 1 Widget", b"", "Invoice"
     )
+
     assert header["invoice_id"] == "INV1"
     assert header["vendor_name"] == "ACME"
+    assert "invoice_id" in header.get("_field_context", {})
+    assert header.get("_field_confidence", {}).get("invoice_id", 0) >= 0.7
     assert items and items[0]["item_id"] == "A1"
+    assert "header_data" in captured_prompt["prompt"].lower()
 
 
 def test_classify_doc_type_keyword_scoring(monkeypatch):
@@ -413,8 +430,8 @@ def test_classification_prompt_includes_context(monkeypatch):
     assert "buyer sends a purchase order" in captured["prompt"].lower()
 
 
-def test_fill_missing_fields_prompt_includes_context(monkeypatch):
-    """LLM field completion should receive doc-type specific context."""
+def test_llm_structured_prompt_includes_context(monkeypatch):
+    """Structured extraction prompt should include procurement guidance."""
 
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
@@ -423,12 +440,18 @@ def test_fill_missing_fields_prompt_includes_context(monkeypatch):
 
     def fake_call(prompt, model, format=None):
         captured["prompt"] = prompt
-        return {"response": json.dumps({"header_data": {}, "line_items": []})}
+        return {
+            "response": json.dumps(
+                {"header_data": {}, "line_items": [], "field_contexts": {}}
+            )
+        }
 
     monkeypatch.setattr(agent, "call_ollama", fake_call)
 
-    agent._fill_missing_fields_with_llm("text", "Invoice", {}, [])
-    assert "vendor sends an invoice" in captured["prompt"].lower()
+    agent._llm_structured_extraction("text", "Invoice")
+    prompt_lower = captured["prompt"].lower()
+    assert "vendor sends an invoice" in prompt_lower
+    assert "field_contexts" in prompt_lower
 
 
 def test_persist_to_postgres_sanitizes_values(monkeypatch):

@@ -154,13 +154,17 @@ def test_data_flow_manager_builds_graph_and_persists():
 
     assert nick.qdrant_client.collections
     assert nick.qdrant_client.upserts
-    assert all(entry["collection"] == "Knowledge Graph" for entry in nick.qdrant_client.upserts)
+    assert all(
+        entry["collection"] == "procwise_knowledge_graph"
+        for entry in nick.qdrant_client.upserts
+    )
     payload_types = {
         point.payload.get("document_type")
         for entry in nick.qdrant_client.upserts
         for point in entry["points"]
     }
     assert "supplier_flow" in payload_types
+    assert "agent_relationship_summary" in payload_types
 
     supplier_points = [
         point
