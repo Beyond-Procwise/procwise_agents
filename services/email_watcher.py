@@ -80,6 +80,26 @@ class InMemoryEmailWatcherState:
         return list(self._seen.items())
 
 
+@dataclass
+class S3ObjectWatcher:
+    """Remember previously observed keys for an S3 prefix."""
+
+    limit: int = 512
+    known: "OrderedDict[str, datetime]" = field(default_factory=OrderedDict)
+
+    def is_new(self, key: str) -> bool:
+        return bool(key) and key not in self.known
+
+    def mark_known(self, key: str, last_modified: Optional[datetime]) -> None:
+        if not key:
+            return
+        timestamp = last_modified if isinstance(last_modified, datetime) else datetime.now(timezone.utc)
+        self.known[key] = timestamp
+        self.known.move_to_end(key)
+        while self.limit > 0 and len(self.known) > self.limit:
+            self.known.popitem(last=False)
+
+
 def _strip_html(value: str) -> str:
     """Convert HTML content to a whitespace normalised string."""
 
@@ -283,7 +303,12 @@ class SESEmailWatcher:
         self._sqs_client = None
         self._assumed_credentials: Optional[Dict[str, str]] = None
         self._assumed_credentials_expiry: Optional[datetime] = None
-        self._last_s3_poll: Dict[str, Optional[datetime]] = {}
+        self._s3_watch_history_limit = self._coerce_int(
+            getattr(self.settings, "email_s3_watch_history_limit", 512),
+            default=512,
+            minimum=10,
+        )
+        self._s3_prefix_watchers: Dict[str, S3ObjectWatcher] = {}
         self._processed_cache_limit = self._coerce_int(
             getattr(self.settings, "email_processed_cache_limit", 200),
             default=200,
@@ -1346,9 +1371,11 @@ class SESEmailWatcher:
         parser_fn = parser or self._parse_email
 
         for prefix in active_prefixes:
+            watcher = self._s3_prefix_watchers.get(prefix)
+            if watcher is None:
+                watcher = S3ObjectWatcher(limit=self._s3_watch_history_limit)
+                self._s3_prefix_watchers[prefix] = watcher
             iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            last_seen = self._last_s3_poll.get(prefix)
-            newest_seen: Optional[datetime] = last_seen
             for page in iterator:
                 contents = page.get("Contents", [])
                 contents.sort(key=lambda item: item.get("LastModified"))
@@ -1356,10 +1383,16 @@ class SESEmailWatcher:
                     key = obj.get("Key")
                     if not key or key in seen_keys:
                         continue
+                    last_modified_raw = obj.get("LastModified")
+                    last_modified = (
+                        last_modified_raw
+                        if isinstance(last_modified_raw, datetime)
+                        else None
+                    )
                     if self.state_store and key in self.state_store:
+                        watcher.mark_known(key, last_modified)
                         continue
-                    last_modified = obj.get("LastModified")
-                    if last_seen and last_modified and last_modified <= last_seen:
+                    if not watcher.is_new(key):
                         continue
                     raw = self._download_object(client, key, bucket=self.bucket)
                     if raw is None:
@@ -1368,26 +1401,18 @@ class SESEmailWatcher:
                     parsed["id"] = key
                     collected.append((last_modified, parsed))
                     seen_keys.add(key)
+                    watcher.mark_known(key, last_modified)
                     logger.debug(
                         "Queued message %s for processing from mailbox %s",
                         key,
                         self.mailbox_address,
                     )
-                    if last_modified and (
-                        newest_seen is None or last_modified > newest_seen
-                    ):
-                        newest_seen = last_modified
                     if limit is not None and len(collected) >= limit:
                         break
                 if limit is not None and len(collected) >= limit:
                     break
             if limit is not None and len(collected) >= limit:
                 break
-
-            if newest_seen:
-                previous = self._last_s3_poll.get(prefix)
-                if not previous or newest_seen > previous:
-                    self._last_s3_poll[prefix] = newest_seen
 
         collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
         messages = [payload for _, payload in collected]
