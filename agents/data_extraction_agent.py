@@ -2370,6 +2370,7 @@ class DataExtractionAgent(BaseAgent):
                     break
             if tax_candidate is not None:
                 item["tax_amount"] = tax_candidate
+
             elif diff > 0.02:
                 item["tax_amount"] = round(diff, 2)
 

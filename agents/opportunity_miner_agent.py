@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import uuid
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from contextlib import closing
@@ -18,7 +17,6 @@ import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from models.opportunity_priority_model import OpportunityPriorityModel
-from services.backend_scheduler import BackendScheduler
 from services.data_flow_manager import DataFlowManager
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
@@ -1696,26 +1694,6 @@ class OpportunityMinerAgent(BaseAgent):
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("OpportunityMinerAgent error: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
-        finally:
-            if (
-                workflow_completed
-                and qe
-                and hasattr(qe, "train_procurement_context")
-            ):
-                try:
-                    scheduler = BackendScheduler.ensure(self.agent_nick)
-                    job_name = f"train-procurement-context-{uuid.uuid4()}"
-
-                    def _run_training(target=qe) -> None:
-                        target.train_procurement_context()
-
-                    scheduler.submit_once(job_name, _run_training)
-                    logger.debug(
-                        "Scheduled deferred procurement context training as job %s",
-                        job_name,
-                    )
-                except Exception:  # pragma: no cover - best effort
-                    logger.exception("Failed to schedule procurement context training")
 
     # ------------------------------------------------------------------
     # Data ingestion and preparation
