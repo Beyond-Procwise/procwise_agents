@@ -57,7 +57,7 @@ def _get_training_service(request: Request) -> ModelTrainingService:
     service = getattr(agent_nick, "model_training_service", None)
     if service is None:
         try:
-            service = ModelTrainingService(agent_nick)
+            service = ModelTrainingService(agent_nick, auto_subscribe=False)
             setattr(agent_nick, "model_training_service", service)
         except Exception as exc:  # pragma: no cover - defensive initialisation
             raise HTTPException(
