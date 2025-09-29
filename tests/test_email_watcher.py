@@ -383,7 +383,7 @@ def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
     assert any("without matching filters" in record.message for record in caplog.records)
 
 
-def test_poll_once_waits_for_new_s3_object(monkeypatch):
+def test_poll_once_with_filters_scans_existing_objects(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
     watcher.bucket = "procwisemvp"
@@ -451,7 +451,9 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
     first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert first_results == []
+    assert len(first_results) == 1
+    assert first_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert first_results[0]["message_id"] == "emails/existing.eml"
 
     dynamic_objects.append(
         {"Key": "emails/new.eml", "LastModified": datetime.now(timezone.utc)}
@@ -460,6 +462,7 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
     second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
     assert len(second_results) == 1
     assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert second_results[0]["message_id"] == "emails/new.eml"
 
 
 def test_load_from_s3_prioritises_newest_objects(monkeypatch):
