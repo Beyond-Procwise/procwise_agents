@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import List
 
 import pytest
 
@@ -87,6 +88,7 @@ class DummyNick:
             ses_inbound_s3_uri=None,
             s3_bucket_name=None,
             email_response_poll_seconds=1,
+            email_inbound_initial_wait_seconds=0,
         )
         self.agents = {}
         self.ddl_statements = []
@@ -170,10 +172,12 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     watcher = _make_watcher(nick)
 
     captured_limits = []
+    captured_prefixes = []
 
 
     def fake_load(limit=None, *, prefixes=None, parser=None, newest_first=False):
         captured_limits.append(limit)
+        captured_prefixes.append(prefixes)
         return [
             {
                 "id": "emails/msg-1.eml",
@@ -190,6 +194,63 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
 
     assert len(results) == 1
     assert captured_limits == [None]
+    assert captured_prefixes[0][0] == "emails/RFQ-20240101-ABCD1234/ingest/"
+    assert captured_prefixes[0][1] == "emails/"
+
+
+def test_bucket_prefix_uses_uri_prefix_when_config_default():
+    nick = DummyNick()
+    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
+    nick.settings.ses_inbound_prefix = "emails/"
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    assert watcher.bucket == "custom-bucket"
+    assert watcher._prefixes[0] == "inbound/"
+
+
+def test_bucket_prefix_honours_explicit_override():
+    nick = DummyNick()
+    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
+    nick.settings.ses_inbound_prefix = "supplier-emails/"
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    assert watcher.bucket == "custom-bucket"
+    assert watcher._prefixes[0] == "supplier-emails/"
+
+
+def test_poll_once_respects_dispatch_wait(monkeypatch):
+    import services.email_watcher as email_watcher_module
+
+    nick = DummyNick()
+    nick.settings.email_inbound_initial_wait_seconds = 5
+
+    fake_clock = {"now": 0.0}
+    sleep_calls: List[float] = []
+
+    def fake_time() -> float:
+        return fake_clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        fake_clock["now"] += seconds
+
+    monkeypatch.setattr(
+        email_watcher_module,
+        "time",
+        SimpleNamespace(time=fake_time, sleep=fake_sleep),
+    )
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.record_dispatch_timestamp()
+
+    watcher.poll_once()
+    assert sleep_calls == [pytest.approx(5.0)]
+
+    sleep_calls.clear()
+    watcher.poll_once()
+    assert sleep_calls == []
 
 
 def test_watch_retries_until_message_found(monkeypatch):
@@ -250,6 +311,38 @@ def test_cached_match_is_returned_without_reprocessing(monkeypatch):
     second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
     assert len(second_results) == 1
     assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+
+
+def test_poll_once_processes_new_messages_before_using_cache():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    first_batch = [
+        {
+            "id": "emails/msg-1.eml",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 700",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+        }
+    ]
+
+    batches = [first_batch, []]
+    call_tracker = {"count": 0}
+
+    def loader(limit=None):
+        call_tracker["count"] += 1
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(first_results) == 1
+    assert call_tracker["count"] == 1
+
+    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(second_results) == 1
+    assert call_tracker["count"] == 2
 
 
 def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
@@ -317,10 +410,12 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
         def read(self) -> bytes:
             return self._buffer.getvalue()
 
+    expected_ingest_prefix = watcher._ensure_trailing_slash("emails/RFQ-20240101-ABCD1234/ingest")
+
     class DummyPaginator:
         def paginate(self, *, Bucket, Prefix):
             assert Bucket == watcher.bucket
-            assert Prefix == watcher._prefixes[0]
+            assert Prefix in {expected_ingest_prefix, watcher._prefixes[0]}
             return [{"Contents": list(dynamic_objects)}]
 
     class DummyClient:
