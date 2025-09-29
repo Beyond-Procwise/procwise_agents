@@ -309,6 +309,9 @@ class SESEmailWatcher:
 
         results: List[Dict[str, object]] = []
         match_found = False
+        target_rfq_normalised: Optional[str] = None
+        if match_filters:
+            target_rfq_normalised = self._normalise_filter_value(match_filters.get("rfq_id"))
 
         logger.info(
             "Scanning %s for new supplier responses (limit=%s)",
@@ -341,26 +344,33 @@ class SESEmailWatcher:
 
                 metadata: Dict[str, object]
                 message_match = False
+                rfq_match = False
+                processed_payload: Optional[Dict[str, object]] = None
                 if processed:
+                    processed_payload = self._record_processed_payload(message_id, processed)
                     if match_filters:
-                        self._apply_filter_defaults(processed, match_filters)
+                        original_rfq = processed_payload.get("rfq_id") if processed_payload else None
+                        rfq_match = bool(
+                            target_rfq_normalised
+                            and self._normalise_filter_value(original_rfq) == target_rfq_normalised
+                        )
+                        self._apply_filter_defaults(processed_payload, match_filters)
+                        message_match = bool(
+                            self._matches_filters(processed_payload, match_filters)
+                        )
                     logger.info(
                         "Processed message %s for RFQ %s from %s",
                         message_id,
                         processed.get("rfq_id"),
                         processed.get("from_address"),
                     )
-                    processed_payload = self._record_processed_payload(message_id, processed)
                     metadata = {
-                        "rfq_id": processed_payload.get("rfq_id"),
-                        "supplier_id": processed_payload.get("supplier_id"),
+                        "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
+                        "supplier_id": processed_payload.get("supplier_id") if processed_payload else None,
                         "processed_at": datetime.now(timezone.utc).isoformat(),
                         "status": "processed",
                         "payload": processed_payload,
                     }
-                    message_match = bool(
-                        match_filters and self._matches_filters(processed_payload, match_filters)
-                    )
                 else:
                     logger.warning(
                         "Skipped message %s for mailbox %s: %s",
@@ -378,7 +388,9 @@ class SESEmailWatcher:
                     self.state_store.add(message_id, metadata)
 
                 should_stop = False
-                if processed and (not match_filters or message_match):
+                if processed_payload and (
+                    not match_filters or message_match or rfq_match
+                ):
                     results.append(processed_payload)
                     if limit is not None:
                         try:
@@ -388,12 +400,20 @@ class SESEmailWatcher:
                         if effective_limit and len(results) >= effective_limit:
                             should_stop = True
 
-                if message_match:
+                if message_match or rfq_match:
                     match_found = True
                     should_stop = True
-                    logger.debug(
-                        "Stopping poll once after matching filters for message %s", message_id
-                    )
+                    if message_match:
+                        logger.debug(
+                            "Stopping poll once after matching filters for message %s",
+                            message_id,
+                        )
+                    else:
+                        logger.debug(
+                            "Stopping poll after RFQ-only match for message %s (filters=%s)",
+                            message_id,
+                            match_filters,
+                        )
 
                 return should_stop
 
@@ -857,44 +877,45 @@ class SESEmailWatcher:
         )
 
     @staticmethod
+    def _normalise_filter_value(value: object) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        lowered = text.lower()
+        return lowered or None
+
+    @staticmethod
     def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
         if not filters:
             return False
 
-        def _normalise(value: object) -> Optional[str]:
-            if value is None:
-                return None
-            try:
-                text = str(value).strip()
-            except Exception:
-                return None
-            lowered = text.lower()
-            return lowered or None
-
-        payload_rfq = _normalise(payload.get("rfq_id"))
-        payload_supplier = _normalise(payload.get("supplier_id"))
-        payload_subject = _normalise(payload.get("subject")) or ""
-        payload_sender = _normalise(payload.get("from_address"))
-        payload_message = _normalise(payload.get("message_id")) or _normalise(payload.get("id"))
+        payload_rfq = SESEmailWatcher._normalise_filter_value(payload.get("rfq_id"))
+        payload_supplier = SESEmailWatcher._normalise_filter_value(payload.get("supplier_id"))
+        payload_subject = SESEmailWatcher._normalise_filter_value(payload.get("subject")) or ""
+        payload_sender = SESEmailWatcher._normalise_filter_value(payload.get("from_address"))
+        payload_message = SESEmailWatcher._normalise_filter_value(payload.get("message_id")) or SESEmailWatcher._normalise_filter_value(payload.get("id"))
 
         for key, expected in filters.items():
             if expected in (None, ""):
                 continue
             if key == "rfq_id":
-                if payload_rfq != _normalise(expected):
+                if payload_rfq != SESEmailWatcher._normalise_filter_value(expected):
                     return False
             elif key == "supplier_id":
-                if payload_supplier != _normalise(expected):
+                if payload_supplier != SESEmailWatcher._normalise_filter_value(expected):
                     return False
             elif key == "from_address":
-                if payload_sender != _normalise(expected):
+                if payload_sender != SESEmailWatcher._normalise_filter_value(expected):
                     return False
             elif key == "subject_contains":
-                needle = _normalise(expected)
+                needle = SESEmailWatcher._normalise_filter_value(expected)
                 if needle and needle not in payload_subject:
                     return False
             elif key == "message_id":
-                if payload_message != _normalise(expected):
+                if payload_message != SESEmailWatcher._normalise_filter_value(expected):
                     return False
         return True
 

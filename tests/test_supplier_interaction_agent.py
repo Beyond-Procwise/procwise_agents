@@ -103,6 +103,50 @@ def test_supplier_interaction_wait_for_response():
     assert calls["count"] == 1
 
 
+def test_wait_for_response_returns_first_rfq_match_even_when_supplier_diff():
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    batches = [
+        [
+            {
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "supplier_id": "OTHER",
+                "supplier_status": "success",
+                "supplier_output": {"price": 1200},
+            }
+        ],
+        [
+            {
+                "rfq_id": "RFQ-20240101-eeeeffff",
+                "supplier_id": "S2",
+                "supplier_status": "success",
+                "supplier_output": {"price": 900},
+            }
+        ],
+    ]
+
+    calls = {"count": 0}
+
+    def poll_once(limit=None, match_filters=None):
+        calls["count"] += 1
+        return batches.pop(0) if batches else []
+
+    watcher = SimpleNamespace(poll_once=poll_once)
+
+    result = agent.wait_for_response(
+        watcher=watcher,
+        timeout=1,
+        poll_interval=0,
+        rfq_id="RFQ-20240101-abcd1234",
+        supplier_id="S1",
+    )
+
+    assert result is not None
+    assert result["rfq_id"] == "RFQ-20240101-abcd1234"
+    assert calls["count"] == 1
+
+
 def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypatch):
     nick = DummyNick()
     nick.settings.email_response_max_attempts = 3
