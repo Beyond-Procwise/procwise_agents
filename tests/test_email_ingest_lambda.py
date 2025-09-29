@@ -6,8 +6,16 @@ import boto3
 import pytest
 from botocore.stub import Stubber
 
+import io
+import json
 import sys
+from email.message import EmailMessage
 from pathlib import Path
+
+import boto3
+import pytest
+from botocore.stub import Stubber
+
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -89,7 +97,20 @@ class _FakeTable:
         return {}
 
 
-def test_process_record_tags_and_copies_object(monkeypatch):
+@pytest.fixture(autouse=True)
+def stub_upsert(monkeypatch):
+    calls = []
+
+    def fake_upsert(rfq_id, metadata):
+        calls.append((rfq_id, metadata))
+
+    monkeypatch.setattr(ingest, "_upsert_supplier_reply", fake_upsert)
+    yield calls
+    calls.clear()
+
+
+def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
+
     bucket = "procwisemvp"
     key = "emails/random-object"
     email_bytes = _build_email(subject="Re: RFQ-20240101-abc12345", body="Price 1200")
@@ -100,14 +121,15 @@ def test_process_record_tags_and_copies_object(monkeypatch):
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
 
-    assert result == {
-        "rfq_id": "RFQ-20240101-ABC12345",
-        "s3_key": "emails/RFQ-20240101-ABC12345/ingest/random-object",
-        "status": "ok",
-    }
+    assert result["rfq_id"] == "RFQ-20240101-ABC12345"
+    assert result["s3_key"] == "emails/RFQ-20240101-ABC12345/ingest/random-object"
+    assert result["status"] == "ok"
+    assert result["metadata"]["subject"].lower().startswith("re: rfq-20240101")
+    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240101-ABC12345"
 
 
-def test_process_record_uses_thread_lookup(monkeypatch):
+def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert):
+
     bucket = "procwisemvp"
     key = "emails/random-object-2"
     email_bytes = _build_email(subject="Re: Quote", body="No RFQ", **{"In-Reply-To": "<thread-123>"})
@@ -121,9 +143,11 @@ def test_process_record_uses_thread_lookup(monkeypatch):
     assert result["rfq_id"] == "RFQ-20240202-THREAD12"
     assert result["status"] == "ok"
     assert result["s3_key"].endswith("random-object-2")
+    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240202-THREAD12"
 
 
-def test_process_record_moves_to_unmatched_when_missing_rfq():
+def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
+
     bucket = "procwisemvp"
     key = "emails/random-object-3"
     email_bytes = _build_email(subject="Quote", body="No identifier present")
@@ -134,14 +158,14 @@ def test_process_record_moves_to_unmatched_when_missing_rfq():
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
 
-    assert result == {
-        "rfq_id": None,
-        "s3_key": "emails/_unmatched/random-object-3",
-        "status": "needs_review",
-    }
+    assert result["rfq_id"] is None
+    assert result["s3_key"] == "emails/_unmatched/random-object-3"
+    assert result["status"] == "needs_review"
+    assert stub_upsert == []
 
 
-def test_lambda_handler_processes_sqs_envelope(monkeypatch):
+def test_lambda_handler_processes_sqs_envelope(monkeypatch, stub_upsert):
+
     bucket = "procwisemvp"
     key = "emails/random-object-4"
     email_bytes = _build_email(subject="Re: RFQ-20240102-beefcafe", body="Confirming order")
@@ -164,6 +188,36 @@ def test_lambda_handler_processes_sqs_envelope(monkeypatch):
     response = ingest.lambda_handler(sqs_event, context=None)
 
     assert response["processed"][0]["rfq_id"] == "RFQ-20240102-BEEFCAFE"
+    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240102-BEEFCAFE"
+
+
+def test_process_record_persists_metadata(monkeypatch, stub_upsert):
+    bucket = "procwisemvp"
+    key = "emails/random-object-5"
+    email_bytes = _build_email(
+        subject="Re: RFQ-20240103-deadbeef",
+        body="Please find quote attached",
+        **{
+            "From": "Supplier <supplier@example.com>",
+            "To": "ProcWise <supplierconnect@procwise.co.uk>",
+            "Date": "Mon, 03 Feb 2025 10:00:00 +0000",
+            "Message-ID": "<deadbeef@example.com>",
+        },
+    )
+
+    _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240103-DEADBEEF")
+    ingest._DDB_TABLE = _FakeTable({})
+
+    record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
+    result = ingest.process_record(record)
+
+    assert result["metadata"]["mailbox"].lower().startswith("procwise")
+    assert result["metadata"]["message_id"] == "<deadbeef@example.com>"
+    rfq_id, metadata = stub_upsert[0]
+    assert rfq_id == "RFQ-20240103-DEADBEEF"
+    assert metadata["s3_key"].endswith("random-object-5")
+    assert metadata["received_at"].isoformat().startswith("2025-02-03T10:00:00")
+
 
 
 @pytest.fixture(autouse=True)
@@ -171,6 +225,9 @@ def reset_clients():
     yield
     ingest._S3_CLIENT = None
     ingest._DDB_TABLE = None
+    ingest._DB_CONNECTION = None
+    ingest._SUPPLIER_TABLE_INITIALISED = False
+
     while _ACTIVE_STUBBERS:
         stub = _ACTIVE_STUBBERS.pop()
         stub.deactivate()
