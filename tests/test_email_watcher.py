@@ -167,6 +167,42 @@ def test_poll_once_filters_by_rfq_id():
     assert "msg-1" in state
 
 
+def test_poll_once_stops_after_rfq_match_even_with_supplier_mismatch():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    messages = [
+        {
+            "id": "msg-1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 1000",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+        },
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-eeeeffff",
+            "body": "Price 950",
+            "from": "other@example.com",
+            "rfq_id": "RFQ-20240101-eeeeffff",
+        },
+    ]
+
+    def loader(limit=None):
+        return list(messages)
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "S1"}
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert len(watcher.supplier_agent.contexts) == 1
+    assert "msg-1" in state
+
+
 def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
