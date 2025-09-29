@@ -984,50 +984,30 @@ class SESEmailWatcher:
         paginator = client.get_paginator("list_objects_v2")
 
         collected: List[Tuple[Optional[datetime], Dict[str, object]]] = []
-        seen_keys = set()
+        seen_keys: Set[str] = set()
 
         active_prefixes = list(prefixes) if prefixes is not None else list(self._prefixes)
         parser_fn = parser or self._parse_inbound_object
 
-        require_new = self._require_new_s3_objects
+        bypass_known_filters = bool(self._require_new_s3_objects)
+
+        object_refs: List[Tuple[str, str, Optional[datetime]]] = []
 
         for prefix in active_prefixes:
             watcher = self._s3_prefix_watchers.get(prefix)
             if watcher is None:
                 watcher = S3ObjectWatcher(limit=self._s3_watch_history_limit)
                 self._s3_prefix_watchers[prefix] = watcher
+
             iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
             for page in iterator:
                 contents = page.get("Contents", [])
                 if not contents:
-                    if require_new and not watcher.primed:
-                        watcher.primed = True
-                    continue
-
-                contents.sort(
-                    key=lambda item: item.get("LastModified") or datetime.min,
-                    reverse=True,
-                )
-
-                prime_existing = require_new and not watcher.primed
-                if prime_existing:
-                    for obj in contents:
-                        key = obj.get("Key")
-                        if not key:
-                            continue
-                        last_modified_raw = obj.get("LastModified")
-                        last_modified = (
-                            last_modified_raw
-                            if isinstance(last_modified_raw, datetime)
-                            else None
-                        )
-                        watcher.mark_known(key, last_modified)
-                    watcher.primed = True
                     continue
 
                 for obj in contents:
                     key = obj.get("Key")
-                    if not key or key in seen_keys:
+                    if not key:
                         continue
                     last_modified_raw = obj.get("LastModified")
                     last_modified = (
@@ -1035,31 +1015,75 @@ class SESEmailWatcher:
                         if isinstance(last_modified_raw, datetime)
                         else None
                     )
-                    if self.state_store and key in self.state_store:
-                        watcher.mark_known(key, last_modified)
-                        continue
-                    if not watcher.is_new(key):
-                        continue
-                    raw = self._download_object(client, key, bucket=self.bucket)
-                    if raw is None:
-                        continue
-                    parsed = self._invoke_parser(parser_fn, raw, key)
-                    parsed["id"] = key
-                    collected.append((last_modified, parsed))
-                    seen_keys.add(key)
-                    watcher.mark_known(key, last_modified)
-                    logger.debug(
-                        "Queued message %s for processing from mailbox %s",
-                        key,
-                        self.mailbox_address,
-                    )
-                    if limit is not None and len(collected) >= limit:
-                        break
+                    object_refs.append((prefix, key, last_modified))
 
-                if limit is not None and len(collected) >= limit:
-                    break
+        if not object_refs:
+            return []
+
+        object_refs.sort(
+            key=lambda item: ((item[2] or datetime.min), item[1]),
+            reverse=True,
+        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            preview = ", ".join(
+                f"{key} (prefix={prefix})" for prefix, key, _ in object_refs[:5]
+            )
+            logger.debug(
+                "Discovered %d S3 object(s) for mailbox %s: %s",
+                len(object_refs),
+                self.mailbox_address,
+                preview or "<none>",
+            )
+
+        processed_prefixes: Dict[str, bool] = {prefix: False for prefix in active_prefixes}
+
+        for prefix, key, last_modified in object_refs:
+            if key in seen_keys:
+                continue
+
+            watcher = self._s3_prefix_watchers[prefix]
+
+            skip_known_checks = not bypass_known_filters or watcher.primed
+
+            if skip_known_checks:
+                if self.state_store and key in self.state_store:
+                    watcher.mark_known(key, last_modified)
+                    continue
+                if not watcher.is_new(key):
+                    continue
+
+            raw = self._download_object(client, key, bucket=self.bucket)
+            if raw is None:
+                continue
+
+            parsed = self._invoke_parser(parser_fn, raw, key)
+            parsed["id"] = key
+            collected.append((last_modified, parsed))
+            seen_keys.add(key)
+            watcher.mark_known(key, last_modified)
+            processed_prefixes[prefix] = True
+            logger.debug(
+                "Queued message %s for processing from mailbox %s",
+                key,
+                self.mailbox_address,
+            )
             if limit is not None and len(collected) >= limit:
                 break
+
+        if bypass_known_filters:
+            for prefix, processed in processed_prefixes.items():
+                if processed:
+                    watcher = self._s3_prefix_watchers.get(prefix)
+                    if watcher is not None and not watcher.primed:
+                        watcher.primed = True
+
+        if limit is not None and len(collected) >= limit:
+            logger.debug(
+                "Reached processing limit (%s) for mailbox %s",
+                limit,
+                self.mailbox_address,
+            )
 
         collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
         messages = [payload for _, payload in collected]
