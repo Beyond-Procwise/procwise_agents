@@ -303,8 +303,6 @@ class SESEmailWatcher:
 
         results: List[Dict[str, object]] = []
         match_found = False
-        attempt = 0
-        max_attempts = self._match_poll_attempts if match_filters else 1
 
         logger.info(
             "Scanning S3 bucket %s/%s for new supplier responses (limit=%s)",
@@ -327,123 +325,88 @@ class SESEmailWatcher:
                     )
                     return cached_matches
 
-            while attempt < max_attempts:
-                attempt += 1
-                messages: List[Dict[str, object]] = []
-                try:
-                    if self._custom_loader is not None:
-                        messages = self._custom_loader(limit)
-                    else:
-                        messages = self._load_messages(limit, mark_seen=True)
-                except Exception:  # pragma: no cover - network/runtime
-                    logger.exception("Failed to load inbound SES messages")
-                    if match_filters and attempt < max_attempts:
-                        if self.poll_interval_seconds > 0:
-                            time.sleep(self.poll_interval_seconds)
-                        continue
-                    return results
+            try:
+                if self._custom_loader is not None:
+                    messages = self._custom_loader(limit)
+                else:
+                    messages = self._load_messages(limit, mark_seen=True)
+            except Exception:  # pragma: no cover - network/runtime
+                logger.exception("Failed to load inbound SES messages")
+                return results
 
-                logger.info(
-                    "Retrieved %d new message(s) for mailbox %s on attempt %d/%d",
-                    len(messages),
-                    self.mailbox_address,
-                    attempt,
-                    max_attempts,
-                )
+            logger.info(
+                "Retrieved %d candidate message(s) from S3 for mailbox %s",
+                len(messages),
+                self.mailbox_address,
+            )
 
-                if not messages and match_filters and attempt < max_attempts:
+            for message in messages:
+                message_id = str(message.get("id") or uuid.uuid4())
+                if self.state_store and message_id in self.state_store:
                     logger.debug(
                         "No messages returned for mailbox %s on attempt %d/%d; retrying",
                         self.mailbox_address,
                         attempt,
                         max_attempts,
                     )
-                    if self.poll_interval_seconds > 0:
-                        time.sleep(self.poll_interval_seconds)
                     continue
 
-                batch_match_found = False
-                for message in messages:
-                    message_id = str(message.get("id") or uuid.uuid4())
-                    if self.state_store and message_id in self.state_store:
-                        logger.debug(
-                            "Skipping message %s for mailbox %s as it was already processed",
-                            message_id,
-                            self.mailbox_address,
-                        )
-                        continue
+                try:
+                    processed, reason = self._process_message(message)
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("Failed to process SES message %s", message_id)
+                    processed, reason = None, "processing_error"
 
-                    try:
-                        processed, reason = self._process_message(message)
-                    except Exception:  # pragma: no cover - defensive
-                        logger.exception("Failed to process SES message %s", message_id)
-                        processed, reason = None, "processing_error"
-
-                    metadata: Dict[str, object]
-                    message_match = False
-                    if processed:
-                        logger.info(
-                            "Processed message %s for RFQ %s from %s",
-                            message_id,
-                            processed.get("rfq_id"),
-                            processed.get("from_address"),
-                        )
-                        processed_payload = self._record_processed_payload(message_id, processed)
-                        metadata = {
-                            "rfq_id": processed_payload.get("rfq_id"),
-                            "supplier_id": processed_payload.get("supplier_id"),
-                            "processed_at": datetime.now(timezone.utc).isoformat(),
-                            "status": "processed",
-                            "payload": processed_payload,
-                        }
-                        message_match = bool(
-                            match_filters and self._matches_filters(processed_payload, match_filters)
-                        )
-                    else:
-                        logger.warning(
-                            "Skipped message %s for mailbox %s: %s",
-                            message_id,
-                            self.mailbox_address,
-                            reason or "unknown",
-                        )
-                        metadata = {
-                            "processed_at": datetime.now(timezone.utc).isoformat(),
-                            "status": "skipped",
-                            "reason": reason or "unknown",
-                        }
-
-                    if self.state_store and reason != "processing_error":
-                        self.state_store.add(message_id, metadata)
-
-                    if processed and (not match_filters or message_match):
-                        results.append(processed_payload)
-
-                    if message_match:
-                        match_found = True
-                        batch_match_found = True
-                        logger.debug(
-                            "Stopping poll once after matching filters for message %s", message_id
-                        )
-                        break
-
-                if batch_match_found or not match_filters:
-                    break
-
-                if attempt < max_attempts:
-                    logger.debug(
-                        "No messages matched filters for mailbox %s on attempt %d/%d; waiting %ss before retry",
-                        self.mailbox_address,
-                        attempt,
-                        max_attempts,
-                        self.poll_interval_seconds,
+                metadata: Dict[str, object]
+                message_match = False
+                if processed:
+                    logger.info(
+                        "Processed message %s for RFQ %s from %s",
+                        message_id,
+                        processed.get("rfq_id"),
+                        processed.get("from_address"),
                     )
-                    if self.poll_interval_seconds > 0:
-                        time.sleep(self.poll_interval_seconds)
+                    processed_payload = self._record_processed_payload(message_id, processed)
+                    metadata = {
+                        "rfq_id": processed_payload.get("rfq_id"),
+                        "supplier_id": processed_payload.get("supplier_id"),
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "processed",
+                        "payload": processed_payload,
+                    }
+                    message_match = bool(
+                        match_filters and self._matches_filters(processed_payload, match_filters)
+                    )
+                else:
+                    logger.warning(
+                        "Skipped message %s for mailbox %s: %s",
+                        message_id,
+                        self.mailbox_address,
+                        reason or "unknown",
+                    )
+                    metadata = {
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "skipped",
+                        "reason": reason or "unknown",
+                    }
+
+                if self.state_store and reason != "processing_error":
+                    self.state_store.add(message_id, metadata)
+
+                if processed and (not match_filters or message_match):
+                    results.append(processed_payload)
+
+                if message_match:
+                    match_found = True
+                    logger.debug(
+                        "Stopping poll once after matching filters for message %s", message_id
+                    )
+                    break
 
             if match_filters and not match_found:
                 logger.info(
-                    "Exhausted %d attempt(s) polling mailbox %s without matching filters",
-                    attempt,
+                    "Completed S3 scan for mailbox %s without matching filters",
+
                     self.mailbox_address,
                 )
 

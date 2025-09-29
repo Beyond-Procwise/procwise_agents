@@ -171,6 +171,7 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
 
     captured_limits = []
 
+
     def fake_load(limit=None, *, prefixes=None, parser=None, newest_first=False):
         captured_limits.append(limit)
         return [
@@ -233,10 +234,7 @@ def test_cached_match_is_returned_without_reprocessing(monkeypatch):
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
         }
-
     ]
-    state = InMemoryEmailWatcherState()
-    watcher = _make_watcher(nick, loader=lambda limit=None: messages, state_store=state)
 
     batches = [first_batch, []]
 

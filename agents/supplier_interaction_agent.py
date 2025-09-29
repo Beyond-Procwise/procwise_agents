@@ -355,10 +355,21 @@ class SupplierInteractionAgent(BaseAgent):
 
         deadline = time.time() + max(timeout, 0)
 
-        attempt_cap = max_attempts
-        if attempt_cap is None:
-            attempt_cap = getattr(self.agent_nick.settings, "email_response_max_attempts", 3)
-        attempt_cap = self._coerce_int(attempt_cap, default=3)
+        attempt_cap_value = max_attempts
+        if attempt_cap_value is None:
+            legacy_setting = getattr(
+                self.agent_nick.settings, "email_response_max_attempts", None
+            )
+            if legacy_setting is not None:
+                logger.debug(
+                    "Ignoring legacy email_response_max_attempts=%s in favour of timeout-based S3 polling",
+                    legacy_setting,
+                )
+            attempt_cap = None
+        else:
+            attempt_cap = self._coerce_int(attempt_cap_value, default=0)
+            if attempt_cap <= 0:
+                attempt_cap = None
         attempts_made = 0
 
         if (
@@ -432,9 +443,11 @@ class SupplierInteractionAgent(BaseAgent):
             match_filters["from_address"] = from_address
 
         while time.time() <= deadline:
-            if attempts_made >= attempt_cap:
+            if attempt_cap is not None and attempts_made >= attempt_cap:
                 logger.info(
-                    "Reached maximum email poll attempts (%s) while waiting for RFQ %s", attempt_cap, rfq_id
+                    "Reached maximum email poll attempts (%s) while waiting for RFQ %s",
+                    attempt_cap,
+                    rfq_id,
                 )
                 break
             attempts_made += 1
@@ -508,7 +521,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
         if result is None:
-            if attempts_made >= attempt_cap:
+            if attempt_cap is not None and attempts_made >= attempt_cap:
                 logger.warning(
                     "Stopped waiting for supplier response (rfq_id=%s, supplier=%s) after %s attempt(s)",
                     rfq_id,
@@ -521,7 +534,7 @@ class SupplierInteractionAgent(BaseAgent):
                     rfq_id,
                     supplier_id,
                     timeout,
-            )
+                )
 
         return result
 

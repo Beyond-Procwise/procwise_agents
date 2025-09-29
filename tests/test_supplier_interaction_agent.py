@@ -123,7 +123,7 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
         timeout=30,
         poll_interval=None,
         rfq_id="RFQ-20240101-missing",
-        max_attempts=None,
+        max_attempts=3,
     )
 
     assert result is None
