@@ -340,8 +340,7 @@ class Orchestrator:
             catalog = prompt_engine.prompts_by_id()
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load prompts from prompt engine")
-            self._prompt_cache = {}
-            return {}
+            catalog = {}
 
         prompts: Dict[int, Dict[str, Any]] = {}
         for pid, prompt in catalog.items():
@@ -356,6 +355,9 @@ class Orchestrator:
 
         for pid, entry in self._load_prompt_fixtures().items():
             prompts.setdefault(pid, entry)
+
+        if not prompts:
+            logger.warning("Prompt catalog empty; falling back to bundled fixtures")
 
         self._prompt_cache = dict(prompts)
         return dict(prompts)
@@ -462,20 +464,33 @@ class Orchestrator:
         return dict(policies)
 
     def _get_model_training_service(self):
-        service = getattr(self.agent_nick, "model_training_service", None)
-        if service is None:
-            try:
-                from services.model_training_service import ModelTrainingService
+        try:
+            from services.model_training_service import ModelTrainingService
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to import model training service")
+            return None
 
-                service = ModelTrainingService(self.agent_nick, auto_subscribe=False)
+        service = getattr(self.agent_nick, "model_training_service", None)
+        settings = getattr(self.agent_nick, "settings", None)
+        learning_enabled = bool(getattr(settings, "enable_learning", False))
+        if not isinstance(service, ModelTrainingService):
+            try:
+                service = ModelTrainingService(
+                    self.agent_nick, auto_subscribe=learning_enabled
+                )
                 setattr(self.agent_nick, "model_training_service", service)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to initialise model training service")
                 return None
         try:
-            service.disable_workflow_capture()
+            if learning_enabled:
+                service.enable_workflow_capture()
+            else:
+                service.disable_workflow_capture()
         except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to disable workflow capture on model training service")
+            logger.exception(
+                "Failed to synchronise workflow capture on model training service"
+            )
         return service
 
     @staticmethod

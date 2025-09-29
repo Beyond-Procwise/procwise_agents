@@ -846,6 +846,27 @@ def test_load_prompts_uses_fixture_when_catalog_empty():
     assert prompts[1]["promptId"] == 1
 
 
+def test_load_prompts_recovers_when_engine_errors():
+    class BrokenEngine:
+        def prompts_by_id(self):
+            raise RuntimeError("boom")
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        prompt_engine=BrokenEngine(),
+    )
+
+    orchestrator = Orchestrator(nick)
+    prompts = orchestrator._load_prompts()
+
+    assert 1 in prompts
+    assert prompts[1]["promptId"] == 1
+
+
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
         "status": "saved",
