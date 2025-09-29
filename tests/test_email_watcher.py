@@ -1,5 +1,7 @@
+import io
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,7 +137,6 @@ def test_email_watcher_triggers_negotiation_when_price_high():
     assert result["negotiation_triggered"] is True
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
-
 def test_poll_once_filters_by_rfq_id():
     nick = DummyNick()
     messages = [
@@ -232,7 +233,10 @@ def test_cached_match_is_returned_without_reprocessing(monkeypatch):
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
         }
+
     ]
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: messages, state_store=state)
 
     batches = [first_batch, []]
 
@@ -269,3 +273,80 @@ def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
 
     assert results == []
     assert any("without matching filters" in record.message for record in caplog.records)
+
+
+def test_poll_once_waits_for_new_s3_object(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    watcher.bucket = "procwisemvp"
+    watcher._prefixes = ["emails/"]
+    watcher._match_poll_attempts = 1
+    watcher.poll_interval_seconds = 0
+
+    base_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    existing_objects = [
+        {"Key": "emails/existing.eml", "LastModified": base_time},
+    ]
+    dynamic_objects = list(existing_objects)
+
+    raw_existing = (
+        b"Subject: Re: RFQ-20240101-abcd1234\n"
+        b"From: supplier@example.com\n"
+        b"To: agent@example.com\n"
+        b"Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
+        b"Message-ID: <existing@example.com>\n\n"
+        b"Quoted price 1200"
+    )
+    raw_new = (
+        b"Subject: Re: RFQ-20240101-abcd1234\n"
+        b"From: supplier@example.com\n"
+        b"To: agent@example.com\n"
+        b"Date: Mon, 01 Jan 2024 12:05:00 +0000\n"
+        b"Message-ID: <new@example.com>\n\n"
+        b"Quoted price 900"
+    )
+
+    object_store = {
+        "emails/existing.eml": raw_existing,
+        "emails/new.eml": raw_new,
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes) -> None:
+            self._buffer = io.BytesIO(data)
+
+        def read(self) -> bytes:
+            return self._buffer.getvalue()
+
+    class DummyPaginator:
+        def paginate(self, *, Bucket, Prefix):
+            assert Bucket == watcher.bucket
+            assert Prefix == watcher._prefixes[0]
+            return [{"Contents": list(dynamic_objects)}]
+
+    class DummyClient:
+        def __init__(self):
+            self.paginator = DummyPaginator()
+
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return self.paginator
+
+        def get_object(self, *, Bucket, Key):
+            data = object_store[Key]
+            return {"Body": DummyBody(data)}
+
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert first_results == []
+
+    dynamic_objects.append(
+        {"Key": "emails/new.eml", "LastModified": datetime.now(timezone.utc)}
+    )
+
+    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(second_results) == 1
+    assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"

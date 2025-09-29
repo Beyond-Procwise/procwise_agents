@@ -82,6 +82,7 @@ class S3ObjectWatcher:
 
     limit: int = 512
     known: "OrderedDict[str, datetime]" = field(default_factory=OrderedDict)
+    primed: bool = False
 
     def is_new(self, key: str) -> bool:
         return bool(key) and key not in self.known
@@ -267,6 +268,7 @@ class SESEmailWatcher:
             default=3,
             minimum=1,
         )
+        self._require_new_s3_objects = False
 
         logger.info(
             "Initialised email watcher for mailbox %s using S3 bucket %s and prefix %s (poll_interval=%ss)",
@@ -311,137 +313,143 @@ class SESEmailWatcher:
             limit if limit is not None else "unbounded",
         )
 
-        if match_filters:
-            cached_matches = self._retrieve_cached_matches(match_filters, limit)
-            if cached_matches:
-                logger.info(
-                    "Returning %d previously processed message(s) matching filters for mailbox %s",
-                    len(cached_matches),
-                    self.mailbox_address,
-                )
-                return cached_matches
+        previous_new_flag = self._require_new_s3_objects
+        self._require_new_s3_objects = bool(match_filters)
 
-        while attempt < max_attempts:
-            attempt += 1
-            messages: List[Dict[str, object]] = []
-            try:
-                if self._custom_loader is not None:
-                    messages = self._custom_loader(limit)
-                else:
-                    messages = self._load_messages(limit, mark_seen=True)
-            except Exception:  # pragma: no cover - network/runtime
-                logger.exception("Failed to load inbound SES messages")
-                if match_filters and attempt < max_attempts:
+        try:
+            if match_filters:
+                cached_matches = self._retrieve_cached_matches(match_filters, limit)
+                if cached_matches:
+                    logger.info(
+                        "Returning %d previously processed message(s) matching filters for mailbox %s",
+                        len(cached_matches),
+                        self.mailbox_address,
+                    )
+                    return cached_matches
+
+            while attempt < max_attempts:
+                attempt += 1
+                messages: List[Dict[str, object]] = []
+                try:
+                    if self._custom_loader is not None:
+                        messages = self._custom_loader(limit)
+                    else:
+                        messages = self._load_messages(limit, mark_seen=True)
+                except Exception:  # pragma: no cover - network/runtime
+                    logger.exception("Failed to load inbound SES messages")
+                    if match_filters and attempt < max_attempts:
+                        if self.poll_interval_seconds > 0:
+                            time.sleep(self.poll_interval_seconds)
+                        continue
+                    return results
+
+                logger.info(
+                    "Retrieved %d new message(s) for mailbox %s on attempt %d/%d",
+                    len(messages),
+                    self.mailbox_address,
+                    attempt,
+                    max_attempts,
+                )
+
+                if not messages and match_filters and attempt < max_attempts:
+                    logger.debug(
+                        "No messages returned for mailbox %s on attempt %d/%d; retrying",
+                        self.mailbox_address,
+                        attempt,
+                        max_attempts,
+                    )
                     if self.poll_interval_seconds > 0:
                         time.sleep(self.poll_interval_seconds)
                     continue
-                return results
 
-            logger.info(
-                "Retrieved %d new message(s) for mailbox %s on attempt %d/%d",
-                len(messages),
-                self.mailbox_address,
-                attempt,
-                max_attempts,
-            )
+                batch_match_found = False
+                for message in messages:
+                    message_id = str(message.get("id") or uuid.uuid4())
+                    if self.state_store and message_id in self.state_store:
+                        logger.debug(
+                            "Skipping message %s for mailbox %s as it was already processed",
+                            message_id,
+                            self.mailbox_address,
+                        )
+                        continue
 
-            if not messages and match_filters and attempt < max_attempts:
-                logger.debug(
-                    "No messages returned for mailbox %s on attempt %d/%d; retrying",
-                    self.mailbox_address,
-                    attempt,
-                    max_attempts,
-                )
-                if self.poll_interval_seconds > 0:
-                    time.sleep(self.poll_interval_seconds)
-                continue
+                    try:
+                        processed, reason = self._process_message(message)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("Failed to process SES message %s", message_id)
+                        processed, reason = None, "processing_error"
 
-            batch_match_found = False
-            for message in messages:
-                message_id = str(message.get("id") or uuid.uuid4())
-                if self.state_store and message_id in self.state_store:
-                    logger.debug(
-                        "Skipping message %s for mailbox %s as it was already processed",
-                        message_id,
-                        self.mailbox_address,
-                    )
-                    continue
+                    metadata: Dict[str, object]
+                    message_match = False
+                    if processed:
+                        logger.info(
+                            "Processed message %s for RFQ %s from %s",
+                            message_id,
+                            processed.get("rfq_id"),
+                            processed.get("from_address"),
+                        )
+                        processed_payload = self._record_processed_payload(message_id, processed)
+                        metadata = {
+                            "rfq_id": processed_payload.get("rfq_id"),
+                            "supplier_id": processed_payload.get("supplier_id"),
+                            "processed_at": datetime.now(timezone.utc).isoformat(),
+                            "status": "processed",
+                            "payload": processed_payload,
+                        }
+                        message_match = bool(
+                            match_filters and self._matches_filters(processed_payload, match_filters)
+                        )
+                    else:
+                        logger.warning(
+                            "Skipped message %s for mailbox %s: %s",
+                            message_id,
+                            self.mailbox_address,
+                            reason or "unknown",
+                        )
+                        metadata = {
+                            "processed_at": datetime.now(timezone.utc).isoformat(),
+                            "status": "skipped",
+                            "reason": reason or "unknown",
+                        }
 
-                try:
-                    processed, reason = self._process_message(message)
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception("Failed to process SES message %s", message_id)
-                    processed, reason = None, "processing_error"
+                    if self.state_store and reason != "processing_error":
+                        self.state_store.add(message_id, metadata)
 
-                metadata: Dict[str, object]
-                message_match = False
-                if processed:
-                    logger.info(
-                        "Processed message %s for RFQ %s from %s",
-                        message_id,
-                        processed.get("rfq_id"),
-                        processed.get("from_address"),
-                    )
-                    processed_payload = self._record_processed_payload(message_id, processed)
-                    metadata = {
-                        "rfq_id": processed_payload.get("rfq_id"),
-                        "supplier_id": processed_payload.get("supplier_id"),
-                        "processed_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "processed",
-                        "payload": processed_payload,
-                    }
-                    message_match = bool(
-                        match_filters and self._matches_filters(processed_payload, match_filters)
-                    )
-                else:
-                    logger.warning(
-                        "Skipped message %s for mailbox %s: %s",
-                        message_id,
-                        self.mailbox_address,
-                        reason or "unknown",
-                    )
-                    metadata = {
-                        "processed_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "skipped",
-                        "reason": reason or "unknown",
-                    }
+                    if processed and (not match_filters or message_match):
+                        results.append(processed_payload)
 
-                if self.state_store and reason != "processing_error":
-                    self.state_store.add(message_id, metadata)
+                    if message_match:
+                        match_found = True
+                        batch_match_found = True
+                        logger.debug(
+                            "Stopping poll once after matching filters for message %s", message_id
+                        )
+                        break
 
-                if processed and (not match_filters or message_match):
-                    results.append(processed_payload)
-
-                if message_match:
-                    match_found = True
-                    batch_match_found = True
-                    logger.debug(
-                        "Stopping poll once after matching filters for message %s", message_id
-                    )
+                if batch_match_found or not match_filters:
                     break
 
-            if batch_match_found or not match_filters:
-                break
+                if attempt < max_attempts:
+                    logger.debug(
+                        "No messages matched filters for mailbox %s on attempt %d/%d; waiting %ss before retry",
+                        self.mailbox_address,
+                        attempt,
+                        max_attempts,
+                        self.poll_interval_seconds,
+                    )
+                    if self.poll_interval_seconds > 0:
+                        time.sleep(self.poll_interval_seconds)
 
-            if attempt < max_attempts:
-                logger.debug(
-                    "No messages matched filters for mailbox %s on attempt %d/%d; waiting %ss before retry",
-                    self.mailbox_address,
+            if match_filters and not match_found:
+                logger.info(
+                    "Exhausted %d attempt(s) polling mailbox %s without matching filters",
                     attempt,
-                    max_attempts,
-                    self.poll_interval_seconds,
+                    self.mailbox_address,
                 )
-                if self.poll_interval_seconds > 0:
-                    time.sleep(self.poll_interval_seconds)
 
-        if match_filters and not match_found:
-            logger.info(
-                "Exhausted %d attempt(s) polling mailbox %s without matching filters",
-                attempt,
-                self.mailbox_address,
-            )
-
-        return results
+            return results
+        finally:
+            self._require_new_s3_objects = previous_new_flag
 
     def _record_processed_payload(
         self, message_id: str, payload: Dict[str, object]
@@ -902,6 +910,8 @@ class SESEmailWatcher:
         active_prefixes = list(prefixes) if prefixes is not None else list(self._prefixes)
         parser_fn = parser or self._parse_email
 
+        require_new = self._require_new_s3_objects
+
         for prefix in active_prefixes:
             watcher = self._s3_prefix_watchers.get(prefix)
             if watcher is None:
@@ -911,6 +921,10 @@ class SESEmailWatcher:
             for page in iterator:
                 contents = page.get("Contents", [])
                 contents.sort(key=lambda item: item.get("LastModified"))
+                prime_existing = require_new and not watcher.primed
+                if prime_existing and not contents:
+                    watcher.primed = True
+                    continue
                 for obj in contents:
                     key = obj.get("Key")
                     if not key or key in seen_keys:
@@ -921,6 +935,9 @@ class SESEmailWatcher:
                         if isinstance(last_modified_raw, datetime)
                         else None
                     )
+                    if prime_existing:
+                        watcher.mark_known(key, last_modified)
+                        continue
                     if self.state_store and key in self.state_store:
                         watcher.mark_known(key, last_modified)
                         continue
@@ -941,8 +958,11 @@ class SESEmailWatcher:
                     )
                     if limit is not None and len(collected) >= limit:
                         break
-                if limit is not None and len(collected) >= limit:
-                    break
+                if prime_existing:
+                    watcher.primed = True
+                    continue
+            if limit is not None and len(collected) >= limit:
+                break
             if limit is not None and len(collected) >= limit:
                 break
 
@@ -983,6 +1003,25 @@ class SESEmailWatcher:
                 bucket_name,
             )
             return None
+
+    def _parse_email(self, raw_bytes: bytes) -> Dict[str, object]:
+        message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+        subject = message.get("subject", "")
+        from_address = message.get("from", "")
+        recipients = message.get_all("to", [])
+        body = self._extract_body(message)
+        rfq_id = self._extract_rfq_id(f"{subject} {body}")
+        attachments = self._extract_attachments(message)
+        return {
+            "subject": subject,
+            "from": from_address,
+            "body": body,
+            "rfq_id": rfq_id,
+            "received_at": message.get("date"),
+            "message_id": message.get("message-id"),
+            "recipients": recipients,
+            "attachments": attachments,
+        }
 
     def _extract_body(self, message) -> str:
         if message.is_multipart():
