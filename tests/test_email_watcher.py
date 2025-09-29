@@ -175,10 +175,17 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     captured_prefixes = []
 
 
-    def fake_load(limit=None, *, prefixes=None, parser=None, newest_first=False):
+    def fake_load(
+        limit=None,
+        *,
+        prefixes=None,
+        parser=None,
+        newest_first=False,
+        on_message=None,
+    ):
         captured_limits.append(limit)
         captured_prefixes.append(prefixes)
-        return [
+        payloads = [
             {
                 "id": "emails/msg-1.eml",
                 "subject": "Re: RFQ-20240101-abcd1234",
@@ -187,6 +194,10 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
                 "rfq_id": "RFQ-20240101-abcd1234",
             }
         ]
+        if on_message is not None:
+            for payload in payloads:
+                on_message(payload, None)
+        return payloads
 
     monkeypatch.setattr(watcher, "_load_from_s3", fake_load)
 
@@ -383,7 +394,7 @@ def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
     assert any("without matching filters" in record.message for record in caplog.records)
 
 
-def test_poll_once_waits_for_new_s3_object(monkeypatch):
+def test_poll_once_with_filters_scans_existing_objects(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
     watcher.bucket = "procwisemvp"
@@ -451,7 +462,9 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
     first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert first_results == []
+    assert len(first_results) == 1
+    assert first_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert first_results[0]["message_id"] == "emails/existing.eml"
 
     dynamic_objects.append(
         {"Key": "emails/new.eml", "LastModified": datetime.now(timezone.utc)}
@@ -460,6 +473,115 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
     second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
     assert len(second_results) == 1
     assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert second_results[0]["message_id"] == "emails/new.eml"
+
+
+def test_poll_once_stops_after_matching_rfq(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    watcher.bucket = "procwisemvp"
+    watcher._prefixes = ["emails/"]
+
+    now = datetime.now(timezone.utc)
+    s3_objects = [
+        {"Key": "emails/newest.eml", "LastModified": now},
+        {"Key": "emails/matching.eml", "LastModified": now - timedelta(seconds=30)},
+        {"Key": "emails/older.eml", "LastModified": now - timedelta(minutes=5)},
+    ]
+
+    raw_non_match = (
+        b"Subject: General update\n"
+        b"From: supplier@example.com\n\n"
+        b"No RFQ reference here."
+    )
+    raw_match = (
+        b"Subject: Re: RFQ-20240101-abcd1234\n"
+        b"From: supplier@example.com\n"
+        b"Message-ID: <matching@example.com>\n\n"
+        b"Quoted price 950"
+    )
+    raw_older = (
+        b"Subject: Re: RFQ-20231231-deadbeef\n"
+        b"From: supplier@example.com\n\n"
+        b"Some other offer"
+    )
+
+    object_store = {
+        "emails/newest.eml": raw_non_match,
+        "emails/matching.eml": raw_match,
+        "emails/older.eml": raw_older,
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes) -> None:
+            self._buffer = io.BytesIO(data)
+
+        def read(self) -> bytes:
+            return self._buffer.getvalue()
+
+    expected_ingest_prefix = watcher._ensure_trailing_slash(
+        "emails/RFQ-20240101-ABCD1234/ingest"
+    )
+
+    class DummyPaginator:
+        def paginate(self, *, Bucket, Prefix):
+            assert Bucket == watcher.bucket
+            if Prefix == expected_ingest_prefix:
+                return [{"Contents": []}]
+            assert Prefix == watcher._prefixes[0]
+            return [{"Contents": list(s3_objects)}]
+
+    requested_keys: List[str] = []
+
+    class DummyClient:
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return DummyPaginator()
+
+        def get_object(self, *, Bucket, Key):
+            assert Bucket == watcher.bucket
+            requested_keys.append(Key)
+            return {"Body": DummyBody(object_store[Key])}
+
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
+
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+
+    assert len(results) == 1
+    assert results[0]["message_id"] == "emails/matching.eml"
+    assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
+
+
+def test_poll_once_enriches_missing_supplier_from_filters(caplog):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "emails/msg-1.eml",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 925",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    caplog.set_level("INFO", logger="services.email_watcher")
+
+    filters = {"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SI001005"}
+    results = watcher.poll_once(match_filters=filters)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["supplier_id"] == "SI001005"
+    assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert not any("without matching filters" in record.message for record in caplog.records)
+
+    metadata = state.get("emails/msg-1.eml") or {}
+    payload = metadata.get("payload") if isinstance(metadata, dict) else {}
+    assert payload.get("supplier_id") == "SI001005"
 
 
 def test_load_from_s3_prioritises_newest_objects(monkeypatch):
