@@ -144,6 +144,38 @@ def test_poll_once_triggers_supplier_agent_on_match():
     assert "msg-1" in state
 
 
+def test_poll_once_continues_until_all_filters_match():
+    nick = DummyNick()
+    messages = [
+        {
+            "id": "msg-1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Initial response 1100",
+            "from": "supplier-a@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Preferred supplier 900",
+            "from": "supplier-b@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-2",
+        },
+    ]
+
+    def loader(limit=None):
+        return list(messages)
+
+    watcher = _make_watcher(nick, loader=loader)
+    results = watcher.poll_once(
+        match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-2"}
+    )
+
+    assert [result["supplier_id"] for result in results] == ["SUP-2"]
+    assert len(watcher.supplier_agent.contexts) == 2
+
 def test_poll_once_retries_until_target_found(monkeypatch):
     nick = DummyNick()
     batches = [

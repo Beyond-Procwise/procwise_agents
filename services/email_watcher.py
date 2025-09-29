@@ -318,14 +318,14 @@ class SESEmailWatcher:
 
             def _process_candidate(message: Dict[str, object]) -> bool:
                 nonlocal match_found
-                matched, should_stop = self._process_candidate_message(
+                matched, should_stop, rfq_matched = self._process_candidate_message(
                     message,
                     match_filters=filters,
                     target_rfq_normalised=target_rfq_normalised,
                     results=results,
                     effective_limit=effective_limit,
                 )
-                if matched:
+                if matched or (rfq_matched and not filters):
                     match_found = True
                 return should_stop
 
@@ -409,7 +409,7 @@ class SESEmailWatcher:
         target_rfq_normalised: Optional[str],
         results: List[Dict[str, object]],
         effective_limit: Optional[int],
-    ) -> Tuple[bool, bool]:
+    ) -> Tuple[bool, bool, bool]:
         message_id = str(message.get("id") or uuid.uuid4())
         if self.state_store and message_id in self.state_store:
             logger.debug(
@@ -469,12 +469,18 @@ class SESEmailWatcher:
         if self.state_store and reason != "processing_error":
             self.state_store.add(message_id, metadata)
 
-        matched = bool(message_match or rfq_match)
+        matched = bool(message_match)
         should_stop = False
 
-        if processed_payload and (not match_filters or matched):
-            if effective_limit != 0:
-                results.append(processed_payload)
+        include_payload = False
+        if processed_payload:
+            if not match_filters:
+                include_payload = True
+            elif matched:
+                include_payload = True
+
+        if include_payload and effective_limit != 0:
+            results.append(processed_payload)
             if (
                 effective_limit is not None
                 and effective_limit != 0
@@ -484,19 +490,18 @@ class SESEmailWatcher:
 
         if matched:
             should_stop = True
-            if message_match:
-                logger.debug(
-                    "Stopping poll once after matching filters for message %s",
-                    message_id,
-                )
-            else:
-                logger.debug(
-                    "Stopping poll after RFQ match for message %s (filters=%s)",
-                    message_id,
-                    match_filters or {},
-                )
+            logger.debug(
+                "Stopping poll once after matching filters for message %s",
+                message_id,
+            )
+        elif rfq_match and not match_filters:
+            should_stop = True
+            logger.debug(
+                "Stopping poll after RFQ match for message %s (no additional filters)",
+                message_id,
+            )
 
-        return matched, should_stop
+        return matched, should_stop, bool(rfq_match)
 
     def _record_processed_payload(
         self, message_id: str, payload: Dict[str, object]
