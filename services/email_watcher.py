@@ -335,6 +335,7 @@ class SESEmailWatcher:
             total_candidates = 0
             total_processed = 0
 
+
             while attempts < max_attempts and not match_found:
                 attempts += 1
                 try:
@@ -363,6 +364,7 @@ class SESEmailWatcher:
                             if matched or (rfq_matched and not filters):
                                 match_found = True
                             if should_stop:
+
                                 break
                     else:
                         processed_batch: List[Dict[str, object]] = []
@@ -388,6 +390,7 @@ class SESEmailWatcher:
                             if matched or (rfq_matched and not filters):
                                 match_found = True
                             return should_stop
+
 
                         messages = self._load_messages(
                             limit,
@@ -534,6 +537,7 @@ class SESEmailWatcher:
                 processed.get("from_address"),
             )
             was_processed = True
+
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
                 "supplier_id": processed_payload.get("supplier_id") if processed_payload else None,
@@ -594,6 +598,7 @@ class SESEmailWatcher:
             )
 
         return matched, should_stop, bool(rfq_match), was_processed
+
 
     def _record_processed_payload(
         self, message_id: str, payload: Dict[str, object]

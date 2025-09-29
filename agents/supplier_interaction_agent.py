@@ -460,26 +460,36 @@ class SupplierInteractionAgent(BaseAgent):
                 logger.exception("wait_for_response poll failed")
                 batch = []
             if batch:
+                rfq_only_match: Optional[Dict[str, object]] = None
                 for candidate in batch:
                     if rfq_normalised and self._normalise_identifier(
                         candidate.get("rfq_id")
                     ) != rfq_normalised:
                         continue
+                    rfq_matches = bool(rfq_normalised)
                     if supplier_normalised and self._normalise_identifier(
                         candidate.get("supplier_id")
                     ) != supplier_normalised:
+                        if rfq_matches and rfq_only_match is None:
+                            rfq_only_match = candidate
                         continue
                     if subject_norm:
                         subj = str(candidate.get("subject") or "").lower()
                         if subject_norm not in subj:
+                            if rfq_matches and rfq_only_match is None:
+                                rfq_only_match = candidate
                             continue
                     if sender_normalised:
                         sender = self._normalise_identifier(candidate.get("from_address"))
                         if sender and sender != sender_normalised:
+                            if rfq_matches and rfq_only_match is None:
+                                rfq_only_match = candidate
                             continue
                     status_value = str(candidate.get("supplier_status") or "").lower()
                     payload_ready = candidate.get("supplier_output")
                     if status_value in {"processing", "pending"} and not payload_ready:
+                        if rfq_matches and rfq_only_match is None:
+                            rfq_only_match = candidate
                         logger.debug(
                             "Supplier response still processing for RFQ %s (supplier=%s); status=%s",
                             candidate.get("rfq_id") or rfq_id,
@@ -498,6 +508,8 @@ class SupplierInteractionAgent(BaseAgent):
                         result = candidate
                         break
                     if not payload_ready:
+                        if rfq_matches and rfq_only_match is None:
+                            rfq_only_match = candidate
                         logger.debug(
                             "Supplier response for RFQ %s matched filters but has no payload yet; continuing to wait",
                             candidate.get("rfq_id") or rfq_id,
@@ -505,6 +517,12 @@ class SupplierInteractionAgent(BaseAgent):
                         continue
                     result = candidate
                     break
+                if result is None and rfq_only_match is not None:
+                    logger.info(
+                        "Returning RFQ-matched response for %s despite secondary filter mismatch",
+                        rfq_id,
+                    )
+                    result = rfq_only_match
                 if result is None and not any(
                     [rfq_normalised, supplier_normalised, subject_norm, sender_normalised]
                 ):

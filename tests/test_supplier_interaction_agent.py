@@ -149,7 +149,6 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
     assert result["supplier_output"]["price"] == 900
     assert calls["count"] == 2
 
-
 def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypatch):
     nick = DummyNick()
     nick.settings.email_response_max_attempts = 3

@@ -121,6 +121,7 @@ def test_email_watcher_bootstraps_negotiation_tables():
     assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
 
 
+
 def test_poll_once_triggers_supplier_agent_on_match():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
@@ -274,6 +275,7 @@ def test_poll_once_returns_empty_after_attempts(monkeypatch):
         return []
 
     watcher = _make_watcher(nick, loader=loader)
+
     watcher.poll_interval_seconds = 0
     watcher._match_poll_attempts = 2
 
