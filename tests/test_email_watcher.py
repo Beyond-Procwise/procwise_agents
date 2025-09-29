@@ -313,6 +313,38 @@ def test_cached_match_is_returned_without_reprocessing(monkeypatch):
     assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
 
+def test_poll_once_processes_new_messages_before_using_cache():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    first_batch = [
+        {
+            "id": "emails/msg-1.eml",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 700",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+        }
+    ]
+
+    batches = [first_batch, []]
+    call_tracker = {"count": 0}
+
+    def loader(limit=None):
+        call_tracker["count"] += 1
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(first_results) == 1
+    assert call_tracker["count"] == 1
+
+    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(second_results) == 1
+    assert call_tracker["count"] == 2
+
+
 def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
     nick = DummyNick()
     messages = [

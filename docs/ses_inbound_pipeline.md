@@ -28,7 +28,6 @@ troubleshooting delayed replies.
 - Each processed message is upserted into Postgres (`proc.supplier_replies`) so
   the orchestrator can reconcile supplier replies without re-downloading from
   S3.
-
 - Replies that cannot be matched to an RFQ are copied into
   `emails/_unmatched/` with the tag `needs-review=true` for manual triage.
 

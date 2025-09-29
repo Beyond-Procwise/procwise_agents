@@ -320,16 +320,6 @@ class SESEmailWatcher:
 
         try:
             self._respect_post_dispatch_wait()
-            if match_filters:
-                cached_matches = self._retrieve_cached_matches(match_filters, limit)
-                if cached_matches:
-                    logger.info(
-                        "Returning %d previously processed message(s) matching filters for mailbox %s",
-                        len(cached_matches),
-                        self.mailbox_address,
-                    )
-                    return cached_matches
-
             prefixes = self._derive_prefixes_for_filters(match_filters)
             try:
                 if self._custom_loader is not None:
@@ -409,6 +399,15 @@ class SESEmailWatcher:
                     break
 
             if match_filters and not match_found:
+                cached_matches = self._retrieve_cached_matches(match_filters, limit)
+                if cached_matches:
+                    logger.info(
+                        "Returning %d previously processed message(s) matching filters for mailbox %s",
+                        len(cached_matches),
+                        self.mailbox_address,
+                    )
+                    return cached_matches
+
                 logger.info(
                     "Completed S3 scan for mailbox %s without matching filters",
 
