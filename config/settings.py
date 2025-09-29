@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     ses_smtp_port: int = Field(default=587, env="SES_SMTP_PORT")
     ses_default_sender: str = Field(..., env="SES_DEFAULT_SENDER")
     ses_inbound_bucket: Optional[str] = Field(default=None, env="SES_INBOUND_BUCKET")
-    ses_inbound_prefix: str = Field(default="ses/inbound/", env="SES_INBOUND_PREFIX")
+    ses_inbound_prefix: str = Field(default="emails/", env="SES_INBOUND_PREFIX")
     ses_inbound_s3_uri: Optional[str] = Field(default=None, env="SES_INBOUND_S3_URI")
     ses_inbound_queue_url: Optional[str] = Field(default=None, env="SES_INBOUND_QUEUE_URL")
     ses_inbound_queue_wait_seconds: int = Field(
@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     )
     email_response_poll_seconds: int = Field(
         default=60, env="EMAIL_RESPONSE_POLL_SECONDS"
+    )
+    email_inbound_initial_wait_seconds: int = Field(
+        default=60, env="EMAIL_INBOUND_INITIAL_WAIT_SECONDS"
     )
 
     extraction_model: str = "gpt-oss:20b"

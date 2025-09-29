@@ -213,19 +213,15 @@ class SESEmailWatcher:
             getattr(self.settings, "s3_bucket_name", None),
             default_bucket,
         ]
-        self.bucket = next((candidate for candidate in bucket_candidates if candidate), default_bucket)
+        configured_prefix = getattr(self.settings, "ses_inbound_prefix", None)
+        self.bucket, prefix_value = self._resolve_bucket_and_prefix(
+            bucket_candidates,
+            configured_prefix=configured_prefix,
+            uri_prefix=uri_prefix,
+            default_bucket=default_bucket,
+            default_prefix=default_prefix,
+        )
 
-        raw_prefix = getattr(self.settings, "ses_inbound_prefix", None)
-        if raw_prefix is None:
-            raw_prefix = uri_prefix or default_prefix
-        else:
-            text_prefix = str(raw_prefix).strip()
-            if uri_prefix and text_prefix in {"", default_prefix}:
-                raw_prefix = uri_prefix
-            elif not text_prefix:
-                raw_prefix = uri_prefix or default_prefix
-
-        prefix_value = str(raw_prefix or default_prefix)
         self._prefixes = [self._ensure_trailing_slash(prefix_value)]
 
         # Ensure supporting negotiation tables exist so metadata lookups do
@@ -269,12 +265,21 @@ class SESEmailWatcher:
             minimum=1,
         )
         self._require_new_s3_objects = False
+        self._dispatch_wait_seconds = max(
+            0,
+            self._coerce_int(
+                getattr(self.settings, "email_inbound_initial_wait_seconds", 60),
+                default=60,
+                minimum=0,
+            ),
+        )
+        self._last_dispatch_notified_at: Optional[float] = None
+        self._last_dispatch_wait_acknowledged: Optional[float] = None
 
         logger.info(
-            "Initialised email watcher for mailbox %s using S3 bucket %s and prefix %s (poll_interval=%ss)",
+            "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
             self.mailbox_address,
-            self.bucket,
-            ", ".join(self._prefixes),
+            self._format_bucket_prefixes(),
             self.poll_interval_seconds,
         )
 
@@ -305,9 +310,8 @@ class SESEmailWatcher:
         match_found = False
 
         logger.info(
-            "Scanning S3 bucket %s/%s for new supplier responses (limit=%s)",
-            self.bucket,
-            ", ".join(self._prefixes) or "<root>",
+            "Scanning %s for new supplier responses (limit=%s)",
+            self._format_bucket_prefixes(),
             limit if limit is not None else "unbounded",
         )
 
@@ -315,6 +319,7 @@ class SESEmailWatcher:
         self._require_new_s3_objects = bool(match_filters)
 
         try:
+            self._respect_post_dispatch_wait()
             if match_filters:
                 cached_matches = self._retrieve_cached_matches(match_filters, limit)
                 if cached_matches:
@@ -325,11 +330,12 @@ class SESEmailWatcher:
                     )
                     return cached_matches
 
+            prefixes = self._derive_prefixes_for_filters(match_filters)
             try:
                 if self._custom_loader is not None:
                     messages = self._custom_loader(limit)
                 else:
-                    messages = self._load_messages(limit, mark_seen=True)
+                    messages = self._load_messages(limit, mark_seen=True, prefixes=prefixes)
             except Exception:  # pragma: no cover - network/runtime
                 logger.exception("Failed to load inbound SES messages")
                 return results
@@ -344,10 +350,9 @@ class SESEmailWatcher:
                 message_id = str(message.get("id") or uuid.uuid4())
                 if self.state_store and message_id in self.state_store:
                     logger.debug(
-                        "No messages returned for mailbox %s on attempt %d/%d; retrying",
+                        "Skipping previously processed message %s for mailbox %s",
+                        message_id,
                         self.mailbox_address,
-                        attempt,
-                        max_attempts,
                     )
                     continue
 
@@ -540,7 +545,7 @@ class SESEmailWatcher:
         if self._custom_loader is not None:
             messages = self._custom_loader(limit_int)
         else:
-            messages = self._load_messages(limit_int, mark_seen=False)
+            messages = self._load_messages(limit_int, mark_seen=False, prefixes=None)
 
         preview: List[Dict[str, object]] = []
         for message in messages[:limit_int]:
@@ -785,7 +790,13 @@ class SESEmailWatcher:
 
         return details
 
-    def _load_messages(self, limit: Optional[int], *, mark_seen: bool) -> List[Dict[str, object]]:
+    def _load_messages(
+        self,
+        limit: Optional[int],
+        *,
+        mark_seen: bool,
+        prefixes: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, object]]:
         del mark_seen  # unused in S3-only polling
 
         if limit is not None:
@@ -802,7 +813,8 @@ class SESEmailWatcher:
             logger.warning("S3 bucket not configured; unable to load inbound messages")
             return []
 
-        return self._load_from_s3(effective_limit)
+        self._respect_post_dispatch_wait()
+        return self._load_from_s3(effective_limit, prefixes=prefixes)
 
     @staticmethod
     def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
@@ -846,6 +858,111 @@ class SESEmailWatcher:
                     return False
         return True
 
+    def _format_bucket_prefixes(
+        self, prefixes: Optional[Sequence[str]] = None
+    ) -> str:
+        bucket = self.bucket or "<unset>"
+        active_prefixes = list(prefixes) if prefixes is not None else list(self._prefixes)
+        if not active_prefixes:
+            active_prefixes = [""]
+
+        entries: List[str] = []
+        for raw_prefix in active_prefixes:
+            prefix = (raw_prefix or "").lstrip("/")
+            if prefix:
+                uri = f"s3://{bucket}/{prefix}"
+            else:
+                uri = f"s3://{bucket}/"
+            if not uri.endswith("/"):
+                uri = f"{uri}/"
+            entries.append(uri)
+
+        return ", ".join(entries)
+
+    def _derive_prefixes_for_filters(
+        self, filters: Optional[Dict[str, object]]
+    ) -> Optional[List[str]]:
+        if not filters or not self._prefixes:
+            return None
+
+        rfq_value = filters.get("rfq_id") or filters.get("RFQ_ID")
+        if not rfq_value:
+            return None
+
+        try:
+            rfq_text = str(rfq_value).strip()
+        except Exception:
+            return None
+
+        if not rfq_text:
+            return None
+
+        base_prefix = self._prefixes[0] if self._prefixes else ""
+        base = base_prefix.rstrip("/")
+        candidate = self._ensure_trailing_slash(f"{base}/{rfq_text.upper()}/ingest") if base else None
+        if not candidate:
+            return None
+
+        prefixes = [candidate]
+        if candidate not in self._prefixes:
+            prefixes.append(base_prefix)
+        return prefixes
+
+    def record_dispatch_timestamp(self, dispatched_at: Optional[float] = None) -> None:
+        """Record the moment an outbound email dispatch completed."""
+
+        timestamp: Optional[float]
+        if dispatched_at is None:
+            timestamp = time.time()
+        else:
+            try:
+                timestamp = float(dispatched_at)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid dispatch timestamp %r", dispatched_at)
+                return
+
+        if timestamp is None:
+            return
+
+        self._last_dispatch_notified_at = timestamp
+        try:
+            setattr(self.agent_nick, "email_dispatch_last_sent_at", timestamp)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Unable to persist dispatch timestamp on agent context")
+
+    def _respect_post_dispatch_wait(self) -> None:
+        if self._dispatch_wait_seconds <= 0:
+            return
+
+        candidate_time: Optional[float] = self._last_dispatch_notified_at
+        agent_time = getattr(self.agent_nick, "email_dispatch_last_sent_at", None)
+        if isinstance(agent_time, (int, float)):
+            agent_value = float(agent_time)
+            candidate_time = agent_value if candidate_time is None else max(candidate_time, agent_value)
+
+        if candidate_time is None:
+            return
+
+        if (
+            self._last_dispatch_wait_acknowledged is not None
+            and candidate_time <= self._last_dispatch_wait_acknowledged
+        ):
+            return
+
+        now = time.time()
+        elapsed = now - candidate_time
+        remaining = self._dispatch_wait_seconds - elapsed
+        if remaining > 0:
+            logger.info(
+                "Delaying S3 poll for %.1fs after email dispatch (target=%s, mailbox=%s)",
+                remaining,
+                self._format_bucket_prefixes(),
+                self.mailbox_address,
+            )
+            time.sleep(remaining)
+
+        self._last_dispatch_wait_acknowledged = candidate_time
+
     def _load_from_s3(
         self,
         limit: Optional[int] = None,
@@ -860,9 +977,8 @@ class SESEmailWatcher:
 
         client = self._get_s3_client()
         logger.debug(
-            "Listing inbound emails from bucket=%s, prefixes=%s for mailbox %s",
-            self.bucket,
-            ", ".join(prefixes) if prefixes is not None else ", ".join(self._prefixes),
+            "Listing inbound emails from %s for mailbox %s",
+            self._format_bucket_prefixes(prefixes),
             self.mailbox_address,
         )
         paginator = client.get_paginator("list_objects_v2")
@@ -1147,10 +1263,9 @@ class SESEmailWatcher:
             )
             return
 
-        prefix_summary = ", ".join(self._prefixes) or "<root>"
+        prefix_summary = self._format_bucket_prefixes()
         logger.info(
-            "Email watcher will poll s3://%s%s for mailbox %s",
-            self.bucket,
+            "Email watcher will poll %s for mailbox %s",
             prefix_summary,
             self.mailbox_address,
         )
@@ -1167,6 +1282,80 @@ class SESEmailWatcher:
         if not text:
             return ""
         return text if text.endswith("/") else f"{text}/"
+
+    def _resolve_bucket_and_prefix(
+        self,
+        bucket_candidates: Sequence[Optional[str]],
+        *,
+        configured_prefix: Optional[str],
+        uri_prefix: Optional[str],
+        default_bucket: str,
+        default_prefix: str,
+    ) -> Tuple[str, str]:
+        default_prefix_normalised = self._ensure_trailing_slash(default_prefix)
+        prefix_candidate: Optional[str]
+        explicit_prefix_supplied = False
+
+        if configured_prefix is None:
+            prefix_candidate = uri_prefix or default_prefix_normalised
+        else:
+            trimmed = str(configured_prefix).strip()
+            if not trimmed:
+                prefix_candidate = uri_prefix or default_prefix_normalised
+            else:
+                normalised_configured = self._ensure_trailing_slash(trimmed)
+                if normalised_configured.lower() != default_prefix_normalised.lower():
+                    prefix_candidate = normalised_configured
+                    explicit_prefix_supplied = True
+                else:
+                    prefix_candidate = uri_prefix or normalised_configured
+
+        resolved_bucket: Optional[str] = None
+        resolved_prefix = str(prefix_candidate or default_prefix_normalised)
+
+        for candidate in bucket_candidates:
+            bucket_text = str(candidate).strip() if candidate else ""
+            if not bucket_text:
+                continue
+            bucket_value, derived_prefix = self._split_bucket_candidate(
+                bucket_text, default_bucket=default_bucket
+            )
+            if bucket_value and not resolved_bucket:
+                resolved_bucket = bucket_value
+            if derived_prefix and not explicit_prefix_supplied:
+                resolved_prefix = derived_prefix
+            if resolved_bucket:
+                break
+
+        if not resolved_bucket:
+            resolved_bucket = default_bucket
+
+        resolved_prefix = self._ensure_trailing_slash(resolved_prefix or default_prefix)
+        return resolved_bucket, resolved_prefix
+
+    @staticmethod
+    def _split_bucket_candidate(
+        value: str,
+        *,
+        default_bucket: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        text = value.strip()
+        if not text:
+            return None, None
+        if text.lower().startswith("s3://"):
+            bucket, prefix = SESEmailWatcher._parse_s3_uri(text)
+            return bucket, prefix or None
+        if "/" in text:
+            bucket, suffix = text.split("/", 1)
+            return bucket or None, (suffix or None)
+        lower_default = default_bucket.lower()
+        if lower_default and text.lower().startswith(lower_default) and text.lower() != lower_default:
+            suffix = text[len(default_bucket) :].lstrip("-_./")
+            if suffix:
+                if not suffix.endswith("/"):
+                    suffix = f"{suffix}/"
+                return default_bucket, suffix
+        return text, None
 
     @staticmethod
     def _parse_s3_uri(uri: str) -> Tuple[str, Optional[str]]:

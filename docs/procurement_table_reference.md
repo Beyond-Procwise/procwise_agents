@@ -385,3 +385,20 @@ rfq_id text NOT NULL,
     created_on timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT negotiation_sessions_pk PRIMARY KEY (rfq_id, supplier_id, round)
 ```
+
+### `proc.supplier_replies`
+```
+rfq_id text NOT NULL,
+    message_id text NOT NULL,
+    mailbox text,
+    subject text,
+    from_address text,
+    reply_body text,
+    s3_key text,
+    received_at timestamp with time zone,
+    headers jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT supplier_replies_pk PRIMARY KEY (rfq_id, message_id)
+```
+Stores normalised inbound RFQ replies captured by the SES ingestion Lambda.

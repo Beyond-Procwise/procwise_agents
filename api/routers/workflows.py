@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import asyncio
 import logging
 from functools import partial
@@ -477,8 +478,14 @@ async def send_email(
         )
         result = await run_in_threadpool(dispatch_call)
 
+        dispatch_timestamp = time.time()
         setattr(agent_nick, "dispatch_service_started", True)
-        ensure_email_watcher(agent_nick)
+        setattr(agent_nick, "email_dispatch_last_sent_at", dispatch_timestamp)
+        watcher = ensure_email_watcher(agent_nick)
+        if watcher is not None:
+            record_dispatch = getattr(watcher, "record_dispatch_timestamp", None)
+            if callable(record_dispatch):
+                record_dispatch(dispatch_timestamp)
 
         prs.log_action(
             process_id=process_id,
