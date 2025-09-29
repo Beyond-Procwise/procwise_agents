@@ -231,6 +231,39 @@ def test_poll_once_respects_dispatch_wait(monkeypatch):
     assert sleep_calls == []
 
 
+def test_poll_once_respects_dispatch_wait(monkeypatch):
+    import services.email_watcher as email_watcher_module
+
+    nick = DummyNick()
+    nick.settings.email_inbound_initial_wait_seconds = 5
+
+    fake_clock = {"now": 0.0}
+    sleep_calls: List[float] = []
+
+    def fake_time() -> float:
+        return fake_clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        fake_clock["now"] += seconds
+
+    monkeypatch.setattr(
+        email_watcher_module,
+        "time",
+        SimpleNamespace(time=fake_time, sleep=fake_sleep),
+    )
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.record_dispatch_timestamp()
+
+    watcher.poll_once()
+    assert sleep_calls == [pytest.approx(5.0)]
+
+    sleep_calls.clear()
+    watcher.poll_once()
+    assert sleep_calls == []
+
+
 def test_watch_retries_until_message_found(monkeypatch):
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
