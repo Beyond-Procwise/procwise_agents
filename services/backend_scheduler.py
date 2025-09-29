@@ -217,6 +217,7 @@ class BackendScheduler:
                     "Failed to synchronise workflow capture state on training service"
                 )
             return service
+
         except Exception:
             logger.exception("Failed to initialise ModelTrainingService")
             return None

@@ -866,7 +866,6 @@ def test_load_prompts_recovers_when_engine_errors():
     assert 1 in prompts
     assert prompts[1]["promptId"] == 1
 
-
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
         "status": "saved",

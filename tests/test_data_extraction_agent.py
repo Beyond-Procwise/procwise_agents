@@ -44,6 +44,21 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
     assert payload["content"] == "hello world"
 
 
+def test_validate_and_cast_truncates_varchar_fields():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    long_terms = "Payment due 45 days post receipt of compliant invoice"
+    header, _ = agent._validate_and_cast(
+        {"payment_terms": long_terms},
+        [],
+        "Purchase_Order",
+    )
+
+    assert len(header["payment_terms"]) == 30
+    assert header["payment_terms"] == long_terms[:30]
+
+
 def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
     """Contracts should be persisted and vectorized even without line items."""
 
@@ -166,6 +181,15 @@ def test_invoice_row_numeric_repair():
     )
     assert repaired_tax["tax_amount"] == approx(6.0)
     assert repaired_tax["total_amount_incl_tax"] == approx(36.0)
+
+    row_implicit_tax = {"item_description": "Widget", "quantity": "2"}
+    repaired_implicit_tax = agent._repair_invoice_line_values(
+        row_implicit_tax,
+        "Widget Service 2 15.00 30.00 36.00",
+        "Invoice",
+    )
+    assert repaired_implicit_tax["tax_amount"] == approx(6.0)
+    assert repaired_implicit_tax["unit_price"] == approx(15.0)
 
 
 def test_po_line_items_unit_mapping(monkeypatch):

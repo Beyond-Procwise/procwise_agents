@@ -2370,8 +2370,7 @@ class DataExtractionAgent(BaseAgent):
                     break
             if tax_candidate is not None:
                 item["tax_amount"] = tax_candidate
-            elif remaining:
-                item["tax_amount"] = max(remaining)
+
             elif diff > 0.02:
                 item["tax_amount"] = round(diff, 2)
 
@@ -3528,6 +3527,21 @@ class DataExtractionAgent(BaseAgent):
             if "timestamp" in sql_type:
                 dt = parser.parse(str(value))
                 return dt.isoformat()
+            char_match = re.match(r"(?:character varying|varchar|char)\((\d+)\)", sql_type)
+            if char_match:
+                max_len = int(char_match.group(1))
+                text_value = str(value)
+                if len(text_value) > max_len:
+                    logger.debug(
+                        "Truncating value for SQL type %s from %d to %d characters",
+                        sql_type,
+                        len(text_value),
+                        max_len,
+                    )
+                    text_value = text_value[:max_len]
+                return text_value
+            if sql_type in {"character varying", "varchar", "char", "text"}:
+                return str(value)
         except Exception:
             return None
         return value
