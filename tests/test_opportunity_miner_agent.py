@@ -157,8 +157,10 @@ def test_build_finding_includes_policy_identifier():
     assert finding_a.policy_id == "policy_9"
     assert finding_b.policy_id == "policy_10"
     assert finding_a.opportunity_id != finding_b.opportunity_id
-    assert "policy_9" in finding_a.opportunity_id
-    assert "policy_10" in finding_b.opportunity_id
+    assert finding_a.opportunity_id == "1"
+    assert finding_b.opportunity_id == "2"
+    assert "policy_9" in finding_a.opportunity_ref_id
+    assert "policy_10" in finding_b.opportunity_ref_id
 
 
 def test_build_finding_normalises_decimal_inputs():

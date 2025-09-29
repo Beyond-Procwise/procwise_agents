@@ -34,6 +34,19 @@ class ModelTrainingService:
         self._supplier_trainer = SupplierRankingTrainer()
         self._subscribe_to_events()
 
+    def _get_relationship_scheduler(self):
+        try:
+            from services.supplier_relationship_service import SupplierRelationshipScheduler
+
+            scheduler = getattr(self.agent_nick, "supplier_relationship_scheduler", None)
+            if not isinstance(scheduler, SupplierRelationshipScheduler):
+                scheduler = SupplierRelationshipScheduler(self.agent_nick)
+                setattr(self.agent_nick, "supplier_relationship_scheduler", scheduler)
+            return scheduler
+        except Exception:
+            logger.exception("Failed to initialise SupplierRelationshipScheduler for training dispatch")
+            return None
+
     # ------------------------------------------------------------------
     # Database utilities
     # ------------------------------------------------------------------
@@ -242,6 +255,31 @@ class ModelTrainingService:
                 logger.exception("Training job %s failed", job["job_id"])
                 self._update_job_status(job["job_id"], "failed", str(exc))
         return jobs
+
+    def dispatch_training_and_refresh(
+        self,
+        *,
+        force: bool = True,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch model training jobs and refresh supplier relationships together."""
+
+        training_jobs = self.dispatch_due_jobs(force=force, limit=limit)
+        relationship_jobs: List[Dict[str, Any]] = []
+        scheduler = self._get_relationship_scheduler()
+        if scheduler is not None:
+            try:
+                relationship_jobs = scheduler.dispatch_due_jobs(force=force)
+                if not relationship_jobs:
+                    summary = scheduler.run_immediate_refresh()
+                    if summary:
+                        relationship_jobs = [summary]
+            except Exception:
+                logger.exception("Supplier relationship refresh during dispatch failed")
+        return {
+            "training_jobs": training_jobs,
+            "relationship_jobs": relationship_jobs,
+        }
 
     def record_workflow_outcome(
         self, workflow_name: str, workflow_id: str, result: Dict[str, Any]
