@@ -149,7 +149,7 @@ def test_execute_ranking_flow_extracts_criteria_from_query():
     assert nick.policy_engine.last_input["criteria"] == ["price"]
 
 
-def test_supplier_ranking_trains_when_possible(monkeypatch):
+def test_supplier_ranking_does_not_train_query_engine(monkeypatch):
     class Nick(DummyNick):
         def __init__(self):
             super().__init__()
@@ -181,7 +181,7 @@ def test_supplier_ranking_trains_when_possible(monkeypatch):
 
     agent.run(context)
 
-    assert nick.trained is True
+    assert nick.trained is False
 
 
 def test_supplier_ranking_injects_missing_candidates(monkeypatch):
