@@ -182,6 +182,15 @@ def test_invoice_row_numeric_repair():
     assert repaired_tax["tax_amount"] == approx(6.0)
     assert repaired_tax["total_amount_incl_tax"] == approx(36.0)
 
+    row_implicit_tax = {"item_description": "Widget", "quantity": "2"}
+    repaired_implicit_tax = agent._repair_invoice_line_values(
+        row_implicit_tax,
+        "Widget Service 2 15.00 30.00 36.00",
+        "Invoice",
+    )
+    assert repaired_implicit_tax["tax_amount"] == approx(6.0)
+    assert repaired_implicit_tax["unit_price"] == approx(15.0)
+
 
 def test_po_line_items_unit_mapping(monkeypatch):
     executed = []
