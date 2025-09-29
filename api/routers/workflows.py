@@ -205,6 +205,10 @@ class OpportunityRejectionRequest(BaseModel):
         default=None,
         description="Additional metadata to persist alongside the feedback.",
     )
+    opportunity_ref_id: Optional[str] = Field(
+        default=None,
+        description="Original opportunity reference identifier from the mining agent.",
+    )
 
 
 router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
@@ -319,6 +323,7 @@ def reject_opportunity(
         record = record_opportunity_feedback(
             agent_nick,
             opportunity_id.strip(),
+            opportunity_ref_id=req.opportunity_ref_id,
             status="rejected",
             reason=req.reason,
             user_id=req.user_id,
@@ -338,6 +343,7 @@ def reject_opportunity(
 
     payload = {
         "opportunity_id": record.get("opportunity_id"),
+        "opportunity_ref_id": record.get("opportunity_ref_id"),
         "status": record.get("status"),
         "reason": record.get("reason"),
         "user_id": record.get("user_id"),

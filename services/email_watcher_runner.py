@@ -127,12 +127,21 @@ def preview_then_watch(
     preview = preview_recent_emails(email_watcher, limit=preview_limit)
 
     def _run_watch() -> int:
-        return email_watcher.watch(
-            interval=watch_interval,
-            limit=watch_limit,
-            stop_after=stop_after,
-            timeout_seconds=watch_timeout,
-        )
+        try:
+            return email_watcher.watch(
+                interval=watch_interval,
+                limit=watch_limit,
+                stop_after=stop_after,
+                timeout_seconds=watch_timeout,
+            )
+        except TypeError as exc:
+            if "timeout_seconds" not in str(exc):
+                raise
+            return email_watcher.watch(
+                interval=watch_interval,
+                limit=watch_limit,
+                stop_after=stop_after,
+            )
 
     if run_in_background:
         thread = threading.Thread(target=_run_watch, name="ses-email-watcher", daemon=True)

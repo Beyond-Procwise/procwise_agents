@@ -124,22 +124,9 @@ class BackendScheduler:
         )
 
     def _register_default_jobs(self) -> None:
-        from services.model_training_service import ModelTrainingService
-        from services.supplier_relationship_service import SupplierRelationshipScheduler
-
-        if isinstance(self._relationship_scheduler, SupplierRelationshipScheduler):
-            self.register_job(
-                "supplier_relationship_refresh",
-                self._run_supplier_refresh,
-                interval=timedelta(minutes=30),
-            )
-        if isinstance(self._training_service, ModelTrainingService):
-            self.register_job(
-                "model_training_dispatch",
-                self._run_model_training,
-                interval=timedelta(minutes=30),
-                initial_delay=timedelta(minutes=5),
-            )
+        logger.debug(
+            "BackendScheduler default jobs disabled; training and relationship refresh handled via explicit dispatch"
+        )
 
     def _run_loop(self) -> None:
         while not self._stop_event.wait(self._poll_seconds):

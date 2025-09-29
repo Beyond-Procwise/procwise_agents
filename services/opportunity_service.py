@@ -20,6 +20,7 @@ def _ensure_feedback_table(conn) -> None:
                 """
                 CREATE TABLE IF NOT EXISTS proc.opportunity_feedback (
                     opportunity_id TEXT PRIMARY KEY,
+                    opportunity_ref_id TEXT,
                     status TEXT NOT NULL,
                     reason TEXT,
                     user_id TEXT,
@@ -27,6 +28,12 @@ def _ensure_feedback_table(conn) -> None:
                     created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE proc.opportunity_feedback
+                ADD COLUMN IF NOT EXISTS opportunity_ref_id TEXT
                 """
             )
             cur.execute(
@@ -48,6 +55,7 @@ def record_opportunity_feedback(
     agent_nick,
     opportunity_id: str,
     *,
+    opportunity_ref_id: Optional[str] = None,
     status: str,
     reason: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -64,19 +72,21 @@ def record_opportunity_feedback(
                 cur.execute(
                     """
                     INSERT INTO proc.opportunity_feedback
-                        (opportunity_id, status, reason, user_id, metadata, updated_on)
-                    VALUES (%s, %s, %s, %s, %s::jsonb, NOW())
+                        (opportunity_id, opportunity_ref_id, status, reason, user_id, metadata, updated_on)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
                     ON CONFLICT (opportunity_id)
                     DO UPDATE SET
+                        opportunity_ref_id = EXCLUDED.opportunity_ref_id,
                         status = EXCLUDED.status,
                         reason = EXCLUDED.reason,
                         user_id = EXCLUDED.user_id,
                         metadata = EXCLUDED.metadata,
                         updated_on = NOW()
-                    RETURNING opportunity_id, status, reason, user_id, metadata, updated_on
+                    RETURNING opportunity_id, opportunity_ref_id, status, reason, user_id, metadata, updated_on
                     """,
                     (
                         opportunity_id,
+                        opportunity_ref_id or opportunity_id,
                         status,
                         reason,
                         user_id,
@@ -90,11 +100,12 @@ def record_opportunity_feedback(
 
         payload = {
             "opportunity_id": row[0],
-            "status": row[1],
-            "reason": row[2],
-            "user_id": row[3],
-            "metadata": _deserialize_metadata(row[4]),
-            "updated_on": _coerce_datetime(row[5]),
+            "opportunity_ref_id": row[1],
+            "status": row[2],
+            "reason": row[3],
+            "user_id": row[4],
+            "metadata": _deserialize_metadata(row[5]),
+            "updated_on": _coerce_datetime(row[6]),
         }
     except Exception:
         logger.exception("Failed to persist opportunity feedback")
@@ -112,7 +123,7 @@ def load_opportunity_feedback(agent_nick) -> Dict[str, Dict[str, Any]]:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT opportunity_id, status, reason, user_id, metadata, updated_on
+                    SELECT opportunity_id, opportunity_ref_id, status, reason, user_id, metadata, updated_on
                     FROM proc.opportunity_feedback
                     """
                 )
@@ -121,13 +132,19 @@ def load_opportunity_feedback(agent_nick) -> Dict[str, Dict[str, Any]]:
             opportunity_id = row[0]
             if not opportunity_id:
                 continue
-            feedback[opportunity_id] = {
-                "status": row[1],
-                "reason": row[2],
-                "user_id": row[3],
-                "metadata": _deserialize_metadata(row[4]),
-                "updated_on": _coerce_datetime(row[5]),
+            opportunity_ref = row[1] or opportunity_id
+            record = {
+                "opportunity_id": opportunity_id,
+                "opportunity_ref_id": opportunity_ref,
+                "status": row[2],
+                "reason": row[3],
+                "user_id": row[4],
+                "metadata": _deserialize_metadata(row[5]),
+                "updated_on": _coerce_datetime(row[6]),
             }
+            feedback[opportunity_id] = record
+            if opportunity_ref and opportunity_ref not in feedback:
+                feedback[opportunity_ref] = record
     except Exception:  # pragma: no cover - best effort
         logger.exception("Failed to load opportunity feedback")
     return feedback
