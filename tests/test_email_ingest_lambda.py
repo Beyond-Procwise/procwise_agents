@@ -15,8 +15,6 @@ from pathlib import Path
 import boto3
 import pytest
 from botocore.stub import Stubber
-
-
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from services import email_ingest_lambda as ingest
@@ -110,7 +108,6 @@ def stub_upsert(monkeypatch):
 
 
 def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
-
     bucket = "procwisemvp"
     key = "emails/random-object"
     email_bytes = _build_email(subject="Re: RFQ-20240101-abc12345", body="Price 1200")
@@ -129,7 +126,6 @@ def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
 
 
 def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert):
-
     bucket = "procwisemvp"
     key = "emails/random-object-2"
     email_bytes = _build_email(subject="Re: Quote", body="No RFQ", **{"In-Reply-To": "<thread-123>"})
@@ -147,7 +143,6 @@ def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert):
 
 
 def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
-
     bucket = "procwisemvp"
     key = "emails/random-object-3"
     email_bytes = _build_email(subject="Quote", body="No identifier present")
@@ -165,7 +160,6 @@ def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
 
 
 def test_lambda_handler_processes_sqs_envelope(monkeypatch, stub_upsert):
-
     bucket = "procwisemvp"
     key = "emails/random-object-4"
     email_bytes = _build_email(subject="Re: RFQ-20240102-beefcafe", body="Confirming order")
@@ -219,7 +213,6 @@ def test_process_record_persists_metadata(monkeypatch, stub_upsert):
     assert metadata["received_at"].isoformat().startswith("2025-02-03T10:00:00")
 
 
-
 @pytest.fixture(autouse=True)
 def reset_clients():
     yield
@@ -227,7 +220,6 @@ def reset_clients():
     ingest._DDB_TABLE = None
     ingest._DB_CONNECTION = None
     ingest._SUPPLIER_TABLE_INITIALISED = False
-
     while _ACTIVE_STUBBERS:
         stub = _ACTIVE_STUBBERS.pop()
         stub.deactivate()

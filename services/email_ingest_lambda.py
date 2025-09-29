@@ -56,7 +56,6 @@ _DDB_TABLE = None
 _DB_CONNECTION = None
 _SUPPLIER_TABLE_INITIALISED = False
 
-
 RFQ_SUBJECT_RE = re.compile(r"\bRFQ[-_](\d{8})[-_]?([A-Za-z0-9\-]+)", re.IGNORECASE)
 RFQ_HTML_COMMENT_RE = re.compile(r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->", re.IGNORECASE)
 
@@ -76,7 +75,6 @@ def _sanitise_table_name(name: Optional[str]) -> str:
 
 
 SUPPLIER_REPLY_TABLE = _sanitise_table_name(_RAW_SUPPLIER_REPLY_TABLE)
-
 
 
 def _get_s3_client():
@@ -373,7 +371,6 @@ def _upsert_supplier_reply(rfq_id: str, metadata: Dict[str, object]) -> None:
             cursor.execute(sql, params)
     except Exception:
         logger.exception("Failed to upsert supplier reply for RFQ %s", rfq_id)
-
 
 
 def _tag_object(s3_client, bucket: str, key: str, rfq_id: str) -> None:

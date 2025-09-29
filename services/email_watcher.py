@@ -1292,16 +1292,26 @@ class SESEmailWatcher:
         default_bucket: str,
         default_prefix: str,
     ) -> Tuple[str, str]:
+        default_prefix_normalised = self._ensure_trailing_slash(default_prefix)
         prefix_candidate: Optional[str]
+        explicit_prefix_supplied = False
+
         if configured_prefix is None:
-            prefix_candidate = uri_prefix or default_prefix
+            prefix_candidate = uri_prefix or default_prefix_normalised
         else:
             trimmed = str(configured_prefix).strip()
-            prefix_candidate = trimmed if trimmed else (uri_prefix or default_prefix)
+            if not trimmed:
+                prefix_candidate = uri_prefix or default_prefix_normalised
+            else:
+                normalised_configured = self._ensure_trailing_slash(trimmed)
+                if normalised_configured.lower() != default_prefix_normalised.lower():
+                    prefix_candidate = normalised_configured
+                    explicit_prefix_supplied = True
+                else:
+                    prefix_candidate = uri_prefix or normalised_configured
 
         resolved_bucket: Optional[str] = None
-        resolved_prefix = str(prefix_candidate or default_prefix)
-        explicit_prefix_supplied = bool(str(configured_prefix or "").strip())
+        resolved_prefix = str(prefix_candidate or default_prefix_normalised)
 
         for candidate in bucket_candidates:
             bucket_text = str(candidate).strip() if candidate else ""

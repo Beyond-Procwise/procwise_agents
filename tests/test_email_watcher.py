@@ -198,37 +198,26 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     assert captured_prefixes[0][1] == "emails/"
 
 
-def test_poll_once_respects_dispatch_wait(monkeypatch):
-    import services.email_watcher as email_watcher_module
-
+def test_bucket_prefix_uses_uri_prefix_when_config_default():
     nick = DummyNick()
-    nick.settings.email_inbound_initial_wait_seconds = 5
-
-    fake_clock = {"now": 0.0}
-    sleep_calls: List[float] = []
-
-    def fake_time() -> float:
-        return fake_clock["now"]
-
-    def fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-        fake_clock["now"] += seconds
-
-    monkeypatch.setattr(
-        email_watcher_module,
-        "time",
-        SimpleNamespace(time=fake_time, sleep=fake_sleep),
-    )
+    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
+    nick.settings.ses_inbound_prefix = "emails/"
 
     watcher = _make_watcher(nick, loader=lambda limit=None: [])
-    watcher.record_dispatch_timestamp()
 
-    watcher.poll_once()
-    assert sleep_calls == [pytest.approx(5.0)]
+    assert watcher.bucket == "custom-bucket"
+    assert watcher._prefixes[0] == "inbound/"
 
-    sleep_calls.clear()
-    watcher.poll_once()
-    assert sleep_calls == []
+
+def test_bucket_prefix_honours_explicit_override():
+    nick = DummyNick()
+    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
+    nick.settings.ses_inbound_prefix = "supplier-emails/"
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    assert watcher.bucket == "custom-bucket"
+    assert watcher._prefixes[0] == "supplier-emails/"
 
 
 def test_poll_once_respects_dispatch_wait(monkeypatch):
