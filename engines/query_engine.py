@@ -321,25 +321,33 @@ class QueryEngine(BaseEngine):
                     else ""
                 )
 
+                candidate_list = sorted(candidate_ids)
+                supplier_filter_clause = (
+                    "WHERE src.supplier_id = ANY(%s)" if candidate_list else ""
+                )
+
                 sql = f"""
                 WITH supplier_lookup AS (
                     SELECT {supplier_lookup_select}
                     FROM proc.supplier src
+                    {supplier_filter_clause}
                 ), po AS (
-                    SELECT LOWER(NULLIF(BTRIM(p.supplier_name), '')) AS supplier_name_norm,
+                    SELECT sl.supplier_id,
                            SUM({po_price} * {po_qty}) AS po_spend
                     FROM proc.po_line_items_agent li
                     JOIN proc.purchase_order_agent p ON p.po_id = li.po_id
-                    WHERE NULLIF(BTRIM(p.supplier_name), '') IS NOT NULL
-                    GROUP BY LOWER(NULLIF(BTRIM(p.supplier_name), ''))
+                    JOIN supplier_lookup sl
+                      ON sl.supplier_name_norm = LOWER(NULLIF(BTRIM(p.supplier_name), ''))
+                    GROUP BY sl.supplier_id
                 ), inv AS (
-                    SELECT LOWER(NULLIF(BTRIM(i.supplier_name), '')) AS supplier_name_norm,
+                    SELECT sl.supplier_id,
                            SUM({inv_price} * {inv_qty}) AS invoice_spend,
                            COUNT(DISTINCT i.invoice_id) AS invoice_count
                     FROM proc.invoice_agent i
                     LEFT JOIN proc.invoice_line_items_agent ili ON i.invoice_id = ili.invoice_id
-                    WHERE NULLIF(BTRIM(i.supplier_name), '') IS NOT NULL
-                    GROUP BY LOWER(NULLIF(BTRIM(i.supplier_name), ''))
+                    JOIN supplier_lookup sl
+                      ON sl.supplier_name_norm = LOWER(NULLIF(BTRIM(i.supplier_name), ''))
+                    GROUP BY sl.supplier_id
                 )
                 SELECT
                     s.supplier_id,
@@ -350,11 +358,20 @@ class QueryEngine(BaseEngine):
                     COALESCE(inv.invoice_count, 0) AS invoice_count,
                     {on_time_expr}{additional_fields}
                 FROM supplier_lookup s
-                LEFT JOIN po ON po.supplier_name_norm = s.supplier_name_norm
-                LEFT JOIN inv ON inv.supplier_name_norm = s.supplier_name_norm
+                LEFT JOIN po ON po.supplier_id = s.supplier_id
+                LEFT JOIN inv ON inv.supplier_id = s.supplier_id
                 """
             with self._pandas_reader() as reader:
-                df = read_sql_compat(sql, reader)
+                params = [candidate_list] if candidate_list else None
+                try:
+                    df = read_sql_compat(sql, reader, params=params)
+                except TypeError:
+                    if not candidate_list:
+                        raise
+                    logger.debug(
+                        "read_sql_compat does not support parametrised execution; falling back to client-side filtering"
+                    )
+                    df = read_sql_compat(sql, reader)
 
             base_columns = list(df.columns)
 

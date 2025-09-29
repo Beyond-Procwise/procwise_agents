@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import uuid
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from contextlib import closing
@@ -18,7 +17,6 @@ import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from models.opportunity_priority_model import OpportunityPriorityModel
-from services.backend_scheduler import BackendScheduler
 from services.data_flow_manager import DataFlowManager
 from services.opportunity_service import load_opportunity_feedback
 from utils.gpu import configure_gpu
@@ -244,6 +242,7 @@ class Finding:
     calculation_details: Dict
     source_records: List[str]
     detected_on: datetime
+    opportunity_ref_id: Optional[str] = None
     supplier_name: Optional[str] = None
     weightage: float = 0.0
     candidate_suppliers: List[Dict[str, Any]] = field(default_factory=list)
@@ -258,19 +257,77 @@ class Finding:
     is_rejected: bool = False
     ml_priority_score: Optional[float] = None
 
-    def as_dict(self) -> Dict:
-        d = self.__dict__.copy()
-        detected = self.detected_on
-        if isinstance(detected, datetime):
-            d["detected_on"] = detected.isoformat()
-        else:
-            d["detected_on"] = str(detected)
-        updated = self.feedback_updated_at
-        if isinstance(updated, datetime):
-            d["feedback_updated_at"] = updated.isoformat()
-        elif updated is not None:
-            d["feedback_updated_at"] = str(updated)
-        return d
+    _PUBLIC_FIELDS: Tuple[str, ...] = (
+        "opportunity_id",
+        "opportunity_ref_id",
+        "detector_type",
+        "policy_id",
+        "supplier_id",
+        "supplier_name",
+        "category_id",
+        "item_id",
+        "item_reference",
+        "financial_impact_gbp",
+        "calculation_details",
+        "source_records",
+        "detected_on",
+        "weightage",
+        "candidate_suppliers",
+        "context_documents",
+        "ml_priority_score",
+        "feedback_status",
+        "feedback_reason",
+        "feedback_updated_at",
+        "feedback_user",
+        "feedback_metadata",
+        "is_rejected",
+    )
+
+    _ALWAYS_INCLUDE: Tuple[str, ...] = (
+        "calculation_details",
+        "source_records",
+        "candidate_suppliers",
+        "context_documents",
+    )
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a serialisable representation limited to public fields."""
+
+        serialised: Dict[str, Any] = {}
+        for field_name in self._PUBLIC_FIELDS:
+            value = getattr(self, field_name, None)
+
+            if isinstance(value, datetime):
+                serialised[field_name] = value.isoformat()
+                continue
+
+            if value is None:
+                if field_name in self._ALWAYS_INCLUDE:
+                    # Preserve structural fields even when empty.
+                    serialised[field_name] = [] if field_name.endswith("records") else {}
+                continue
+
+            if field_name in self._ALWAYS_INCLUDE:
+                serialised[field_name] = value
+                continue
+
+            if isinstance(value, (list, dict)):
+                if not value and field_name not in self._ALWAYS_INCLUDE:
+                    continue
+                serialised[field_name] = value
+                continue
+
+            serialised[field_name] = value
+
+        # Ensure empty defaults for always-included structured fields when the
+        # dataclass attribute was present but falsey (e.g. ``[]`` or ``{}``).
+        for field_name in self._ALWAYS_INCLUDE:
+            if field_name not in serialised:
+                serialised[field_name] = (
+                    [] if field_name in {"source_records", "candidate_suppliers", "context_documents"} else {}
+                )
+
+        return serialised
 
 
 class OpportunityMinerAgent(BaseAgent):
@@ -279,6 +336,7 @@ class OpportunityMinerAgent(BaseAgent):
     def __init__(self, agent_nick, min_financial_impact: float = 100.0) -> None:
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
+        self._opportunity_sequence: int = 0
         self._supplier_lookup: Dict[str, Optional[str]] = {}
         self._supplier_alias_lookup: Dict[str, List[str]] = {}
         self._supplier_reference_lookup: Dict[str, Dict[str, Any]] = {}
@@ -636,7 +694,11 @@ class OpportunityMinerAgent(BaseAgent):
             category_map[display] = policy_categories
 
             for finding in top_findings:
-                key = finding.opportunity_id or f"{display}:{id(finding)}"
+                key = (
+                    finding.opportunity_ref_id
+                    or finding.opportunity_id
+                    or f"{display}:{id(finding)}"
+                )
                 if key in seen_ids:
                     continue
                 seen_ids.add(key)
@@ -776,6 +838,7 @@ class OpportunityMinerAgent(BaseAgent):
                     {
                         "rank": index + 1,
                         "opportunity_id": finding.opportunity_id,
+                        "opportunity_ref_id": finding.opportunity_ref_id,
                         "detector_type": finding.detector_type,
                         "supplier_id": finding.supplier_id,
                         "supplier_name": finding.supplier_name,
@@ -1092,6 +1155,7 @@ class OpportunityMinerAgent(BaseAgent):
                 len(input_keys),
                 preview,
             )
+            self._opportunity_sequence = 0
             qe = getattr(self.agent_nick, "query_engine", None)
             workflow_completed = False
             self._data_profile = {}
@@ -1339,6 +1403,7 @@ class OpportunityMinerAgent(BaseAgent):
                             {
                                 "min_financial_impact": min_impact_threshold,
                                 "opportunity_id": best.opportunity_id,
+                                "opportunity_ref_id": best.opportunity_ref_id,
                             },
                         )
                     else:
@@ -1382,6 +1447,7 @@ class OpportunityMinerAgent(BaseAgent):
                                 {
                                     "min_financial_impact": min_impact_threshold,
                                     "opportunity_id": best.opportunity_id,
+                                    "opportunity_ref_id": best.opportunity_ref_id,
                                 },
                             )
                     else:
@@ -1628,26 +1694,6 @@ class OpportunityMinerAgent(BaseAgent):
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("OpportunityMinerAgent error: %s", exc)
             return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
-        finally:
-            if (
-                workflow_completed
-                and qe
-                and hasattr(qe, "train_procurement_context")
-            ):
-                try:
-                    scheduler = BackendScheduler.ensure(self.agent_nick)
-                    job_name = f"train-procurement-context-{uuid.uuid4()}"
-
-                    def _run_training(target=qe) -> None:
-                        target.train_procurement_context()
-
-                    scheduler.submit_once(job_name, _run_training)
-                    logger.debug(
-                        "Scheduled deferred procurement context training as job %s",
-                        job_name,
-                    )
-                except Exception:  # pragma: no cover - best effort
-                    logger.exception("Failed to schedule procurement context training")
 
     # ------------------------------------------------------------------
     # Data ingestion and preparation
@@ -1742,6 +1788,12 @@ class OpportunityMinerAgent(BaseAgent):
         if isinstance(value, tuple):
             return tuple(self._normalise_numeric_value(v) for v in value)
         return value
+
+    def _next_opportunity_id(self) -> str:
+        """Return the next sequential opportunity identifier as a string."""
+
+        self._opportunity_sequence += 1
+        return str(self._opportunity_sequence)
 
     def _normalise_supplier_key(self, value: Any) -> Optional[str]:
         if value is None:
@@ -3566,7 +3618,8 @@ class OpportunityMinerAgent(BaseAgent):
         )
 
         finding = Finding(
-            opportunity_id=opportunity_id,
+            opportunity_id=self._next_opportunity_id(),
+            opportunity_ref_id=opportunity_id,
             detector_type=detector,
             supplier_id=supplier_id,
             category_id=category_id,
@@ -3580,8 +3633,9 @@ class OpportunityMinerAgent(BaseAgent):
         )
 
         logger.debug(
-            "Built finding %s for supplier %s, category %s, item %s with impact %s",
+            "Built finding %s (ref %s) for supplier %s, category %s, item %s with impact %s",
             finding.opportunity_id,
+            finding.opportunity_ref_id,
             supplier_id,
             category_id,
             item_id,
@@ -5801,7 +5855,14 @@ class OpportunityMinerAgent(BaseAgent):
             return
 
         for finding in findings:
-            info = feedback_map.get(finding.opportunity_id)
+            info = None
+            for key in (
+                finding.opportunity_id,
+                finding.opportunity_ref_id,
+            ):
+                if key and key in feedback_map:
+                    info = feedback_map[key]
+                    break
             if not info:
                 continue
 
@@ -5817,7 +5878,8 @@ class OpportunityMinerAgent(BaseAgent):
                     finding.feedback_updated_at = datetime.fromisoformat(str(updated))
                 except Exception:  # pragma: no cover - defensive parsing
                     logger.debug(
-                        "Unable to parse feedback timestamp for %s", finding.opportunity_id
+                        "Unable to parse feedback timestamp for %s",
+                        finding.opportunity_ref_id or finding.opportunity_id,
                     )
             finding.is_rejected = (
                 str(info.get("status") or "").strip().lower() == "rejected"

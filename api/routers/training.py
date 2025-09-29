@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -40,6 +40,10 @@ class TrainingDispatchResponse(BaseModel):
     jobs: List[TrainingJobSummary] = Field(
         default_factory=list,
         description="Summaries of the dispatched training jobs",
+    )
+    relationship_jobs: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Summaries of supplier relationship refresh executions",
     )
 
 
@@ -79,7 +83,9 @@ def trigger_training_dispatch(
     """Trigger queued model training jobs on demand."""
 
     limit = request.limit
-    jobs = service.dispatch_due_jobs(force=True, limit=limit)
+    result = service.dispatch_training_and_refresh(force=True, limit=limit)
+    jobs = result.get("training_jobs", [])
+    relationship_jobs = result.get("relationship_jobs", [])
     summaries = [
         TrainingJobSummary(
             job_id=job.get("job_id"),
@@ -89,4 +95,6 @@ def trigger_training_dispatch(
         )
         for job in jobs
     ]
-    return TrainingDispatchResponse(dispatched=len(summaries), jobs=summaries)
+    return TrainingDispatchResponse(
+        dispatched=len(summaries), jobs=summaries, relationship_jobs=relationship_jobs
+    )

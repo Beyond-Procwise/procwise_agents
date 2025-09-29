@@ -10,7 +10,6 @@ from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 from utils.db import read_sql_compat
 from utils.reference_loader import load_reference_dataset
-from models.supplier_ranking_trainer import SupplierRankingTrainer
 from services.supplier_relationship_service import SupplierRelationshipService
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
@@ -44,7 +43,6 @@ class SupplierRankingAgent(BaseAgent):
         self._supplier_alias_map: Dict[str, str] = {}
         self._supplier_lookup: Dict[str, Optional[str]] = {}
         self._scoring_reference = load_reference_dataset("supplier_scoring_reference")
-        self._trainer = SupplierRankingTrainer()
         try:
             self._relationship_service = SupplierRelationshipService(agent_nick)
         except Exception:
@@ -310,12 +308,6 @@ class SupplierRankingAgent(BaseAgent):
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("SupplierRankingAgent: Starting ranking...")
 
-        if hasattr(self.query_engine, "train_procurement_context"):
-            try:
-                self.query_engine.train_procurement_context()
-            except Exception:  # pragma: no cover - best effort
-                logger.exception("Failed to train procurement context")
-
         supplier_data = context.input_data.get("supplier_data")
         if supplier_data is None:
             try:
@@ -538,10 +530,6 @@ class SupplierRankingAgent(BaseAgent):
         if normalised_weights:
             weights = normalised_weights
 
-        learned_weights = self._trainer.train(scored_df, weights.keys())
-        if learned_weights:
-            weights = self._trainer.blend_with_policy(weights, learned_weights)
-
         scored_df["final_score"] = 0.0
         for crit, weight in weights.items():
             score_col = f"{crit}_score"
@@ -604,25 +592,17 @@ class SupplierRankingAgent(BaseAgent):
             "SupplierRankingAgent: Ranking complete with %d entries", len(ranking)
         )
 
-        training_snapshot = self._trainer.build_training_snapshot(
-            scored_df, list(weights.keys()), weights
-        )
-
         output_data = {
             "ranking": ranking,
             "supplier_profiles": profiles,
             "rank_count": total_rankings,
         }
-        if training_snapshot:
-            output_data["training_snapshot"] = training_snapshot
         pass_fields = {
             "ranking": ranking,
             "supplier_profiles": profiles,
         }
         if total_rankings:
             pass_fields["rank_count"] = total_rankings
-        if training_snapshot:
-            pass_fields["training_snapshot"] = training_snapshot
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=output_data,

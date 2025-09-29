@@ -448,9 +448,14 @@ class SupplierRelationshipScheduler:
         except Exception:
             logger.exception("Failed to schedule supplier relationship refresh job")
 
-    def dispatch_due_jobs(self, moment: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    def dispatch_due_jobs(
+        self,
+        moment: Optional[datetime] = None,
+        *,
+        force: bool = False,
+    ) -> List[Dict[str, Any]]:
         moment = (moment or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        if not self._is_non_business_hour(moment):
+        if not force and not self._is_non_business_hour(moment):
             logger.info("Skipping supplier relationship refresh; within business hours")
             return []
 
