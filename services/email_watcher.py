@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import mimetypes
 import re
 import time
 import uuid
@@ -986,7 +987,7 @@ class SESEmailWatcher:
         seen_keys = set()
 
         active_prefixes = list(prefixes) if prefixes is not None else list(self._prefixes)
-        parser_fn = parser or self._parse_email
+        parser_fn = parser or self._parse_inbound_object
 
         require_new = self._require_new_s3_objects
 
@@ -1024,7 +1025,7 @@ class SESEmailWatcher:
                     raw = self._download_object(client, key, bucket=self.bucket)
                     if raw is None:
                         continue
-                    parsed = parser_fn(raw)
+                    parsed = self._invoke_parser(parser_fn, raw, key)
                     parsed["id"] = key
                     collected.append((last_modified, parsed))
                     seen_keys.add(key)
@@ -1047,6 +1048,15 @@ class SESEmailWatcher:
         collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
         messages = [payload for _, payload in collected]
         return messages
+
+    @staticmethod
+    def _invoke_parser(
+        parser: Callable[..., Dict[str, object]], raw: bytes, key: Optional[str]
+    ) -> Dict[str, object]:
+        try:
+            return parser(raw, key=key)  # type: ignore[misc]
+        except TypeError:
+            return parser(raw)
 
     def _download_object(
         self, client, key: str, *, bucket: Optional[str] = None
@@ -1082,6 +1092,38 @@ class SESEmailWatcher:
             )
             return None
 
+    def _parse_inbound_object(
+        self, raw_bytes: bytes, *, key: Optional[str] = None
+    ) -> Dict[str, object]:
+        """Parse an inbound S3 object into an email-like payload.
+
+        The watcher historically only consumed raw ``.eml`` payloads written by
+        SES.  Some suppliers now upload structured responses (for example PDFs
+        or spreadsheets) directly into the monitored prefix.  In those cases we
+        still want to kick off downstream processing even though the payload
+        does not look like an RFC5322 message.  This helper first attempts to
+        parse the object as an email and falls back to a generic file wrapper
+        when no meaningful headers or body are present.
+        """
+
+        try:
+            parsed_email = self._parse_email(raw_bytes)
+        except Exception:
+            logger.debug(
+                "Treating S3 object %s as binary attachment after email parse failure",
+                key or "<unknown>",
+            )
+            return self._build_file_payload(raw_bytes, key=key)
+
+        if self._email_payload_has_content(parsed_email):
+            return parsed_email
+
+        logger.debug(
+            "Treating S3 object %s as binary attachment due to empty email payload",
+            key or "<unknown>",
+        )
+        return self._build_file_payload(raw_bytes, key=key, base_payload=parsed_email)
+
     def _parse_email(self, raw_bytes: bytes) -> Dict[str, object]:
         message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
         subject = message.get("subject", "")
@@ -1099,6 +1141,94 @@ class SESEmailWatcher:
             "message_id": message.get("message-id"),
             "recipients": recipients,
             "attachments": attachments,
+        }
+
+    @staticmethod
+    def _email_payload_has_content(payload: Dict[str, object]) -> bool:
+        subject = str(payload.get("subject") or "").strip()
+        attachments = payload.get("attachments") or []
+        if isinstance(attachments, list) and attachments:
+            return True
+
+        from_hint = str(payload.get("from") or "").strip()
+        recipients = payload.get("recipients") or []
+        message_id = str(payload.get("message_id") or "").strip()
+
+        if subject or from_hint or message_id:
+            return True
+        if isinstance(recipients, list) and recipients:
+            return True
+
+        return False
+
+    def _build_file_payload(
+        self,
+        raw_bytes: bytes,
+        *,
+        key: Optional[str] = None,
+        base_payload: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        filename = None
+        if key:
+            filename = key.rsplit("/", 1)[-1]
+        if not filename:
+            filename = "inbound-object"
+
+        preview_bytes = raw_bytes[:4096]
+        try:
+            preview_text = preview_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            preview_text = ""
+
+        rfq_sources: List[str] = []
+        if key:
+            rfq_sources.append(key)
+        if base_payload:
+            for candidate in (base_payload.get("subject"), base_payload.get("body")):
+                if isinstance(candidate, str):
+                    rfq_sources.append(candidate)
+        if preview_text:
+            rfq_sources.append(preview_text)
+
+        rfq_id: Optional[str] = None
+        for source in rfq_sources:
+            rfq_id = self._extract_rfq_id(source)
+            if rfq_id:
+                break
+
+        guessed_type, _ = mimetypes.guess_type(filename)
+        attachment = {
+            "filename": filename,
+            "content_type": guessed_type or "application/octet-stream",
+            "content": raw_bytes,
+            "size": len(raw_bytes),
+            "disposition": "attachment",
+        }
+
+        subject = filename
+        from_hint = ""
+        received_at = None
+        message_id = None
+        recipients: List[str] = []
+
+        if base_payload:
+            subject = base_payload.get("subject") or subject
+            from_hint = str(base_payload.get("from") or "")
+            received_at = base_payload.get("received_at")
+            message_id = base_payload.get("message_id")
+            base_recipients = base_payload.get("recipients")
+            if isinstance(base_recipients, list):
+                recipients = list(base_recipients)
+
+        return {
+            "subject": subject,
+            "from": from_hint,
+            "body": preview_text,
+            "rfq_id": rfq_id,
+            "received_at": received_at,
+            "message_id": message_id,
+            "recipients": recipients,
+            "attachments": [attachment],
         }
 
     def _extract_body(self, message) -> str:

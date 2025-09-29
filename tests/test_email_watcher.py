@@ -198,6 +198,23 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     assert captured_prefixes[0][1] == "emails/"
 
 
+def test_parse_inbound_object_handles_non_email_payload():
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    raw_bytes = b"RFQ-20240101-abcd1234 supplier uploaded attachment"
+    payload = watcher._parse_inbound_object(
+        raw_bytes, key="emails/RFQ-20240101-ABCD1234/ingest/offer.pdf"
+    )
+
+    assert payload["subject"] == "offer.pdf"
+    assert payload["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert payload["attachments"]
+    attachment = payload["attachments"][0]
+    assert attachment["filename"] == "offer.pdf"
+    assert attachment["size"] == len(raw_bytes)
+
+
 def test_bucket_prefix_uses_uri_prefix_when_config_default():
     nick = DummyNick()
     nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
