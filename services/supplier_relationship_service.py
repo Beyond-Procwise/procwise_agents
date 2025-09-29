@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Iterable, Mapping
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from qdrant_client import models
 
@@ -117,15 +117,20 @@ class SupplierRelationshipService:
                 with_vectors=False,
                 limit=limit,
             )
-        except Exception:
+        except Exception as exc:
+            if self._is_missing_index_error(exc):
+                logger.warning(
+                    "SupplierRelationshipService: missing Qdrant index detected. Falling back to in-memory filtering.",
+                    exc_info=True,
+                )
+                return self._fetch_relationship_without_index(
+                    supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
+                )
+
             logger.exception("Failed to load supplier relationship from Qdrant")
             return []
 
-        payloads: List[Dict[str, Any]] = []
-        for point in results or []:
-            payload = getattr(point, "payload", None) or {}
-            payloads.append(dict(payload))
-        return payloads
+        return self._extract_payloads(results or [])
 
     def fetch_overview(self) -> Optional[Dict[str, Any]]:
         if not self.client or not self.collection_name or not hasattr(self.client, "scroll"):
@@ -393,6 +398,74 @@ class SupplierRelationshipService:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    def _fetch_relationship_without_index(
+        self,
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not self.client or not self.collection_name:
+            return []
+
+        target_id = str(supplier_id) if supplier_id else None
+        target_name = self._normalise_key(supplier_name) if supplier_name else None
+
+        # Fetch a slightly larger page size to reduce the number of fall-back scans
+        page_size = max(limit, 50)
+        next_offset = None
+        matches: List[Dict[str, Any]] = []
+
+        while True:
+            try:
+                results, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=None,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=page_size,
+                    offset=next_offset,
+                )
+            except Exception:
+                logger.exception(
+                    "SupplierRelationshipService fallback scroll failed while loading supplier relationship"
+                )
+                break
+
+            if not results:
+                break
+
+            for payload in self._extract_payloads(results):
+                if target_id and str(payload.get("supplier_id")) != target_id:
+                    continue
+                if target_name:
+                    payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
+                        payload.get("supplier_name")
+                    )
+                    if payload_name != target_name:
+                        continue
+                matches.append(payload)
+                if len(matches) >= limit:
+                    return matches
+
+            if next_offset is None:
+                break
+
+        return matches
+
+    @staticmethod
+    def _is_missing_index_error(exc: Exception) -> bool:
+        message = str(getattr(exc, "message", "") or exc)
+        message = message.lower()
+        return "index required but not found" in message
+
+    @staticmethod
+    def _extract_payloads(points: Sequence[Any]) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            payloads.append(dict(payload))
+        return payloads
 
 
 class SupplierRelationshipScheduler:
