@@ -48,7 +48,6 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT", "5432")
 _RAW_SUPPLIER_REPLY_TABLE = os.getenv("SUPPLIER_REPLY_TABLE", "proc.supplier_replies")
-
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
 _S3_CLIENT = None
 _DDB_TABLE = None

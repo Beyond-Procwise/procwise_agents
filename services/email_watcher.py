@@ -320,7 +320,6 @@ class SESEmailWatcher:
 
         try:
             self._respect_post_dispatch_wait()
-
             prefixes = self._derive_prefixes_for_filters(match_filters)
             try:
                 if self._custom_loader is not None:
