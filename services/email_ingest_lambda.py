@@ -49,6 +49,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT", "5432")
 _RAW_SUPPLIER_REPLY_TABLE = os.getenv("SUPPLIER_REPLY_TABLE", "proc.supplier_replies")
 
+
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
 _S3_CLIENT = None
 _DDB_TABLE = None
@@ -420,6 +421,7 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
 
     metadata = _build_reply_metadata(message, bucket, decoded_key)
     subject = metadata.get("subject") or ""
+
     rfq_id = (message.get("X-Procwise-RFQ-ID") or "").strip() or _extract_rfq_from_subject(subject)
     if not rfq_id:
         rfq_id = _lookup_rfq_from_thread(message.get("In-Reply-To"), message.get("References"))

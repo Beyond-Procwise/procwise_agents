@@ -15,7 +15,6 @@ from pathlib import Path
 import boto3
 import pytest
 from botocore.stub import Stubber
-
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from services import email_ingest_lambda as ingest

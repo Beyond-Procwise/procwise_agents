@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Iterable, Mapping
 from datetime import datetime, time, timedelta, timezone
+from http import HTTPStatus
 from typing import Any, Dict, List, Optional, Sequence
 
 from qdrant_client import models
@@ -22,6 +23,7 @@ class SupplierRelationshipService:
             self.rag_service = None
         self.collection_name = getattr(self.settings, "qdrant_collection_name", None)
         self.client = getattr(agent_nick, "qdrant_client", None)
+        self._ensure_payload_indexes()
 
     # ------------------------------------------------------------------
     # Public API
@@ -163,6 +165,57 @@ class SupplierRelationshipService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _ensure_payload_indexes(self) -> None:
+        if not self.client or not self.collection_name:
+            return
+
+        get_collection = getattr(self.client, "get_collection", None)
+        create_index = getattr(self.client, "create_payload_index", None)
+        if not callable(get_collection) or not callable(create_index):
+            return
+
+        required_indexes = {
+            "supplier_id": models.PayloadSchemaType.KEYWORD,
+            "supplier_name_normalized": models.PayloadSchemaType.KEYWORD,
+        }
+
+        try:
+            collection = get_collection(collection_name=self.collection_name)
+        except Exception:
+            logger.debug(
+                "SupplierRelationshipService could not fetch Qdrant collection metadata", exc_info=True
+            )
+            return
+
+        payload_schema = getattr(collection, "payload_schema", {}) or {}
+        existing = set(payload_schema.keys())
+
+        for field, schema in required_indexes.items():
+            if field in existing:
+                continue
+            try:
+                create_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                    wait=True,
+                )
+                logger.info(
+                    "SupplierRelationshipService created missing Qdrant index for '%s'", field
+                )
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code == HTTPStatus.CONFLICT:
+                    logger.debug(
+                        "SupplierRelationshipService index '%s' already exists", field
+                    )
+                    continue
+                logger.warning(
+                    "SupplierRelationshipService failed to create Qdrant index '%s': %s",
+                    field,
+                    exc,
+                )
+
     def _summarise_flow(self, flow: Mapping[str, Any]) -> tuple[str, List[str]]:
         supplier_id = flow.get("supplier_id")
         supplier_name = str(flow.get("supplier_name") or "").strip()

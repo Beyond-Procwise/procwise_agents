@@ -704,7 +704,32 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     assert "policy_top_opportunities" not in output.data
     assert "data_profile" not in output.data
     assert "data_flow_snapshot" not in output.data
+
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
+
+
+def test_price_variance_blocks_when_supplier_missing(monkeypatch):
+    agent = create_agent(monkeypatch)
+    context = build_context(
+        "price_variance_check",
+        {
+            "actual_price": 12.5,
+            "benchmark_price": 9.5,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert not output.data["findings"]
+    events = output.data.get("policy_events") or []
+    assert events
+    blocked = [evt for evt in events if evt["status"] == "blocked"]
+    assert blocked
+    message = blocked[0]["message"]
+    assert "supplier" in message.lower()
+    details = blocked[0].get("details", {})
+    assert "supplier_id" in details.get("missing_fields", [])
 
 
 def test_price_variance_infers_supplier_from_contract(monkeypatch):
@@ -1127,6 +1152,7 @@ def test_supplier_risk_alert_threshold(monkeypatch):
     alerts = [f for f in output.data["findings"] if f["detector_type"] == "Supplier Risk Alert"]
     assert alerts
     assert alerts[0]["supplier_id"] == "SI0001"
+
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
@@ -1196,6 +1222,7 @@ def test_esg_opportunity_creates_event(monkeypatch):
     esg = [f for f in output.data["findings"] if f["detector_type"] == "ESG Opportunity"]
     assert esg
     assert esg[0]["supplier_id"] == "SI0003"
+
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
 
 
