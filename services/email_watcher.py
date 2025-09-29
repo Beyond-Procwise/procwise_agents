@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import base64
-import contextlib
 import gzip
-import imaplib
-import json
 import logging
 import re
 import time
@@ -187,6 +183,9 @@ class SESEmailWatcher:
         endpoint = getattr(self.settings, "ses_smtp_endpoint", "")
         self.region = getattr(self.settings, "ses_region", None) or self._parse_region(endpoint)
 
+        default_bucket = "procwisemvp"
+        default_prefix = "emails/"
+
         uri_bucket: Optional[str] = None
         uri_prefix: Optional[str] = None
         inbound_s3_uri = getattr(self.settings, "ses_inbound_s3_uri", None)
@@ -195,7 +194,7 @@ class SESEmailWatcher:
                 uri_bucket, uri_prefix = self._parse_s3_uri(inbound_s3_uri)
             except ValueError:
                 logger.warning(
-                    "Invalid SES inbound S3 URI %r; falling back to explicit bucket/prefix configuration",
+                    "Invalid SES inbound S3 URI %r; falling back to default bucket and prefix",
                     inbound_s3_uri,
                 )
 
@@ -207,84 +206,33 @@ class SESEmailWatcher:
                 uri_bucket,
             )
 
-        self.bucket = configured_bucket or uri_bucket or getattr(
-            self.settings, "s3_bucket_name", None
-        )
+        bucket_candidates = [
+            configured_bucket,
+            uri_bucket,
+            getattr(self.settings, "s3_bucket_name", None),
+            default_bucket,
+        ]
+        self.bucket = next((candidate for candidate in bucket_candidates if candidate), default_bucket)
 
         raw_prefix = getattr(self.settings, "ses_inbound_prefix", None)
         if raw_prefix is None:
-            raw_prefix = uri_prefix or "ses/inbound/"
+            raw_prefix = uri_prefix or default_prefix
         else:
             text_prefix = str(raw_prefix).strip()
-            if uri_prefix and text_prefix in {"", "ses/inbound/"}:
+            if uri_prefix and text_prefix in {"", default_prefix}:
                 raw_prefix = uri_prefix
             elif not text_prefix:
-                raw_prefix = uri_prefix or ""
-        self._prefixes = self._build_prefixes(raw_prefix)
-        processed_prefix_setting = getattr(self.settings, "ses_processed_prefix", "emails/")
-        self._processed_prefixes = self._build_prefixes(processed_prefix_setting)
+                raw_prefix = uri_prefix or default_prefix
+
+        prefix_value = str(raw_prefix or default_prefix)
+        self._prefixes = [self._ensure_trailing_slash(prefix_value)]
 
         # Ensure supporting negotiation tables exist so metadata lookups do
         # not fail on freshly provisioned databases.  The statements are safe
         # to run repeatedly thanks to ``IF NOT EXISTS`` guards.
         self._ensure_negotiation_tables()
 
-        # Optional IMAP fallback configuration for mailboxes that are not
-        # integrated with SES inbound rulesets (e.g. Microsoft 365 shared
-        # mailboxes). All attributes default to ``None`` or sensible values so
-        # existing deployments continue to rely on SES unless explicitly
-        # configured otherwise.
-        self._imap_host = getattr(self.settings, "imap_host", None)
-        self._imap_user = getattr(self.settings, "imap_user", None)
-        self._imap_password = getattr(self.settings, "imap_password", None)
-        self._imap_port = self._coerce_int(
-            getattr(self.settings, "imap_port", 993), default=993, minimum=1
-        )
-        self._imap_folder = getattr(self.settings, "imap_folder", "INBOX") or "INBOX"
-        self._imap_search = getattr(self.settings, "imap_search_criteria", "UNSEEN") or "UNSEEN"
-        self._imap_use_ssl = bool(getattr(self.settings, "imap_use_ssl", True))
-        self._imap_mark_seen = bool(getattr(self.settings, "imap_mark_seen", True))
-        self._imap_batch_size = self._coerce_int(
-            getattr(self.settings, "imap_batch_size", 25), default=25, minimum=1
-        )
-
-        self._queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
-        queue_flag = getattr(self.settings, "ses_inbound_queue_enabled", None)
-        self._queue_disabled_reason: Optional[str] = None
-        if queue_flag is None:
-            # Default to S3-based polling even when an SQS queue URL is configured.
-            # Production infrastructure currently relies on processed email snapshots
-            # written to S3 and no queue is provisioned, so attempting to contact SQS
-            # only yields noisy errors.  Operators can explicitly opt back in by
-            # setting ``ses_inbound_queue_enabled=True`` once the queue is restored.
-            self._queue_enabled = False
-            if self._queue_url:
-                self._queue_disabled_reason = (
-                    "temporarily disabled while inbound processing relies on processed S3 emails"
-                )
-        else:
-            self._queue_enabled = bool(queue_flag)
-            if self._queue_url and not self._queue_enabled:
-                self._queue_disabled_reason = (
-                    "disabled via configuration; relying on processed S3 emails"
-                )
-        if self._queue_url and not self._queue_enabled:
-            logger.info(
-                "SES inbound queue %s configured for mailbox %s but polling is disabled (%s)",
-                self._queue_url,
-                self.mailbox_address,
-                self._queue_disabled_reason or "no reason provided",
-            )
-        self._queue_wait_seconds = self._coerce_int(
-            getattr(self.settings, "ses_inbound_queue_wait_seconds", 2), default=2, minimum=0
-        )
-        self._queue_max_messages = self._coerce_int(
-            getattr(self.settings, "ses_inbound_queue_max_messages", 10),
-            default=10,
-            minimum=1,
-        )
-
-        self._validate_inbound_configuration(raw_prefix)
+        self._validate_inbound_configuration(prefix_value)
 
         # Prefer reusing the orchestrator's S3 client so we respect any
         # endpoint overrides or credential sources initialised during startup.
@@ -300,7 +248,6 @@ class SESEmailWatcher:
             # place even if a shared client exists without the required rights.
             self._s3_client = None
 
-        self._sqs_client = None
         self._assumed_credentials: Optional[Dict[str, str]] = None
         self._assumed_credentials_expiry: Optional[datetime] = None
         self._s3_watch_history_limit = self._coerce_int(
@@ -322,13 +269,10 @@ class SESEmailWatcher:
         )
 
         logger.info(
-            "Initialised email watcher for mailbox %s (bucket=%s, prefixes=%s, processed_prefixes=%s, queue=%s, queue_enabled=%s, poll_interval=%ss)",
+            "Initialised email watcher for mailbox %s using S3 bucket %s and prefix %s (poll_interval=%ss)",
             self.mailbox_address,
             self.bucket,
             ", ".join(self._prefixes),
-            ", ".join(self._processed_prefixes),
-            self._queue_url,
-            self._queue_enabled,
             self.poll_interval_seconds,
         )
 
@@ -361,8 +305,9 @@ class SESEmailWatcher:
         max_attempts = self._match_poll_attempts if match_filters else 1
 
         logger.info(
-            "Polling inbound mailbox %s with limit=%s",
-            self.mailbox_address,
+            "Scanning S3 bucket %s/%s for new supplier responses (limit=%s)",
+            self.bucket,
+            ", ".join(self._prefixes) or "<root>",
             limit if limit is not None else "unbounded",
         )
 
@@ -375,24 +320,6 @@ class SESEmailWatcher:
                     self.mailbox_address,
                 )
                 return cached_matches
-
-            rfq_filter = match_filters.get("rfq_id") if isinstance(match_filters, dict) else None
-            if rfq_filter:
-                attempt_cap = max(1, min(max_attempts, 3))
-                processed_results = self._poll_recent_processed_match(
-                    limit=limit,
-                    match_filters=match_filters,
-                    attempt_cap=attempt_cap,
-                )
-                if processed_results:
-                    return processed_results
-                logger.info(
-                    "Processed mailbox %s %d time(s) without matching RFQ %s",
-                    self.mailbox_address,
-                    attempt_cap,
-                    rfq_filter,
-                )
-                return []
 
         while attempt < max_attempts:
             attempt += 1
@@ -438,7 +365,6 @@ class SESEmailWatcher:
                         message_id,
                         self.mailbox_address,
                     )
-                    self._acknowledge_queue_message(message, success=True)
                     continue
 
                 try:
@@ -457,7 +383,6 @@ class SESEmailWatcher:
                         processed.get("from_address"),
                     )
                     processed_payload = self._record_processed_payload(message_id, processed)
-                    results.append(processed_payload)
                     metadata = {
                         "rfq_id": processed_payload.get("rfq_id"),
                         "supplier_id": processed_payload.get("supplier_id"),
@@ -484,17 +409,16 @@ class SESEmailWatcher:
                 if self.state_store and reason != "processing_error":
                     self.state_store.add(message_id, metadata)
 
+                if processed and (not match_filters or message_match):
+                    results.append(processed_payload)
+
                 if message_match:
                     match_found = True
                     batch_match_found = True
                     logger.debug(
                         "Stopping poll once after matching filters for message %s", message_id
                     )
-                    self._acknowledge_queue_message(message, success=True)
                     break
-
-                ack_success = bool(processed) or (reason is not None and reason != "processing_error")
-                self._acknowledge_queue_message(message, success=ack_success)
 
             if batch_match_found or not match_filters:
                 break
@@ -531,112 +455,6 @@ class SESEmailWatcher:
         while len(self._processed_cache) > self._processed_cache_limit:
             self._processed_cache.popitem(last=False)
         return deepcopy(snapshot)
-
-    def _poll_recent_processed_match(
-        self,
-        *,
-        limit: Optional[int],
-        match_filters: Dict[str, object],
-        attempt_cap: int,
-    ) -> List[Dict[str, object]]:
-        use_loader = self._custom_loader is not None
-        if not use_loader and (not self.bucket or not self._processed_prefixes):
-            return []
-
-        try:
-            effective_limit = max(1, int(limit) if limit is not None else 1)
-        except Exception:
-            effective_limit = 1
-
-        attempts = 0
-        checked: Set[str] = set()
-        results: List[Dict[str, object]] = []
-        expected_rfq = str(match_filters.get("rfq_id") or "").strip().lower()
-
-        retry_delay = min(float(self.poll_interval_seconds), 1.0)
-        while attempts < attempt_cap:
-            attempts += 1
-            try:
-                if use_loader:
-                    messages = self._custom_loader(None)  # type: ignore[arg-type]
-                else:
-                    messages = self._load_processed_messages(None)
-            except Exception:
-                logger.exception("Failed to load processed SES messages")
-                messages = []
-
-            if not messages:
-                if attempts < attempt_cap and retry_delay > 0:
-                    time.sleep(retry_delay)
-                continue
-
-            matched = False
-            for raw_message in messages:
-                message_id = str(
-                    raw_message.get("message_id")
-                    or raw_message.get("id")
-                    or uuid.uuid4()
-                )
-                if message_id in checked:
-                    continue
-                checked.add(message_id)
-
-                payload = dict(raw_message)
-                payload.setdefault("message_id", message_id)
-                candidate_rfq = payload.get("rfq_id")
-                if not isinstance(candidate_rfq, str) or not candidate_rfq.strip():
-                    subject = str(payload.get("subject") or "")
-                    body = str(payload.get("body") or "")
-                    candidate_rfq = self._extract_rfq_id(f"{subject} {body}") or ""
-                candidate_norm = str(candidate_rfq or "").strip().lower()
-                if not candidate_norm or candidate_norm != expected_rfq:
-                    logger.debug(
-                        "Processed email %s did not match RFQ %s", message_id, expected_rfq or "<none>"
-                    )
-                    continue
-
-                already_processed = isinstance(payload.get("supplier_output"), dict) or (
-                    payload.get("negotiation_output") is not None
-                )
-
-                processed_payload: Optional[Dict[str, object]] = None
-                reason: Optional[str] = None
-                if already_processed:
-                    processed_payload = payload
-                else:
-                    try:
-                        processed_payload, reason = self._process_message(payload)
-                    except Exception:  # pragma: no cover - defensive
-                        logger.exception("Failed to process SES message %s", message_id)
-                        processed_payload, reason = None, "processing_error"
-
-                if not processed_payload:
-                    logger.debug(
-                        "Skipping processed email %s due to %s", message_id, reason or "unknown"
-                    )
-                    continue
-
-                recorded = self._record_processed_payload(message_id, processed_payload)
-                if self.state_store:
-                    metadata = {
-                        "rfq_id": recorded.get("rfq_id"),
-                        "supplier_id": recorded.get("supplier_id"),
-                        "processed_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "processed",
-                        "payload": recorded,
-                    }
-                    self.state_store.add(message_id, metadata)
-                results.append(recorded)
-                matched = True
-                break
-
-            if matched:
-                break
-
-            if attempts < attempt_cap and retry_delay > 0:
-                time.sleep(retry_delay)
-
-        return results
 
     def _retrieve_cached_matches(
         self, filters: Dict[str, object], limit: Optional[int]
@@ -997,64 +815,23 @@ class SESEmailWatcher:
         return details
 
     def _load_messages(self, limit: Optional[int], *, mark_seen: bool) -> List[Dict[str, object]]:
-        messages: List[Dict[str, object]] = []
+        del mark_seen  # unused in S3-only polling
 
-        remaining = None if limit is None else max(limit - len(messages), 0)
-        if remaining == 0:
-            return messages[: limit or None]
+        if limit is not None:
+            try:
+                effective_limit = max(int(limit), 0)
+            except Exception:
+                effective_limit = 0
+            if effective_limit == 0:
+                return []
+        else:
+            effective_limit = None
 
-        if self.bucket and self._processed_prefixes:
-            processed_messages = self._load_processed_messages(
-                remaining if remaining else None
-            )
-            messages.extend(processed_messages)
-
-        remaining = None if limit is None else max(limit - len(messages), 0)
-        if remaining == 0:
-            return messages[: limit or None]
-
-        if self._queue_enabled and self._queue_url and mark_seen:
-            queue_messages = self._load_from_queue(
-                remaining if remaining else None, mark_seen=mark_seen
-            )
-            messages.extend(queue_messages)
-
-        remaining = None if limit is None else max(limit - len(messages), 0)
-        if remaining == 0:
-            return messages[: limit or None]
-
-        if self.bucket:
-            s3_messages = self._load_from_s3(remaining if remaining else None)
-
-            messages.extend(s3_messages)
-
-        remaining = None if limit is None else max(limit - len(messages), 0)
-        if remaining == 0:
-            return messages[: limit or None]
-
-        if self._imap_configured():
-            imap_messages = self._load_from_imap(
-                remaining if remaining is not None and remaining > 0 else None,
-                mark_seen=mark_seen,
-            )
-            messages.extend(imap_messages)
-
-        if limit is not None and len(messages) > limit:
-            return messages[:limit]
-
-        return messages
-
-    def _load_processed_messages(self, limit: Optional[int]) -> List[Dict[str, object]]:
-        if not self.bucket or not self._processed_prefixes:
+        if not self.bucket:
+            logger.warning("S3 bucket not configured; unable to load inbound messages")
             return []
 
-        messages = self._load_from_s3(
-            limit,
-            prefixes=self._processed_prefixes,
-            parser=self._parse_processed_payload,
-            newest_first=True,
-        )
-        return messages
+        return self._load_from_s3(effective_limit)
 
     @staticmethod
     def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
@@ -1097,268 +874,6 @@ class SESEmailWatcher:
                 if payload_message != _normalise(expected):
                     return False
         return True
-
-    def _load_from_queue(
-        self, limit: Optional[int], *, mark_seen: bool
-    ) -> List[Dict[str, object]]:
-        if not self._queue_enabled or not self._queue_url:
-            return []
-
-        client = self._get_sqs_client()
-        if client is None:
-            return []
-
-        s3_client = None
-        messages: List[Dict[str, object]] = []
-
-        while True:
-            if limit is not None and len(messages) >= limit:
-                break
-
-            max_batch = self._queue_max_messages
-            if limit is not None:
-                max_batch = max(1, min(self._queue_max_messages, limit - len(messages)))
-
-            try:
-                response = client.receive_message(
-                    QueueUrl=self._queue_url,
-                    MaxNumberOfMessages=max_batch,
-                    WaitTimeSeconds=self._queue_wait_seconds,
-                    MessageAttributeNames=["All"],
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to receive messages from queue %s for mailbox %s",
-                    self._queue_url,
-                    self.mailbox_address,
-                )
-                self._queue_enabled = False
-                if not self._queue_disabled_reason:
-                    self._queue_disabled_reason = "receive failures"
-                logger.info(
-                    "Disabling SES inbound queue polling for mailbox %s after receive failures", 
-                    self.mailbox_address,
-                )
-                break
-
-            sqs_messages = response.get("Messages", [])
-            if not sqs_messages:
-                break
-
-            for sqs_message in sqs_messages:
-                if limit is not None and len(messages) >= limit:
-                    break
-
-                payloads = self._extract_queue_objects(sqs_message)
-                if not payloads:
-                    logger.debug(
-                        "Queue message %s did not contain any S3 payload references",
-                        sqs_message.get("MessageId"),
-                    )
-                    continue
-
-                parsed_messages: List[Dict[str, object]] = []
-                had_failures = False
-
-                for bucket_name, key in payloads:
-                    bucket_name = bucket_name or self.bucket
-                    if not key:
-                        had_failures = True
-                        continue
-
-                    store_key = key
-                    if self.state_store and store_key in self.state_store:
-                        # Include a lightweight stub so the ack logic can
-                        # progress even when the email was already processed.
-                        parsed_messages.append({"id": store_key})
-                        continue
-
-                    if s3_client is None:
-                        s3_client = self._get_s3_client()
-
-                    raw = self._download_object(s3_client, store_key, bucket=bucket_name)
-                    if raw is None:
-                        had_failures = True
-                        continue
-
-                    try:
-                        parsed = self._parse_email(raw)
-                    except Exception:
-                        had_failures = True
-                        logger.exception(
-                            "Failed to parse inbound email from %s for mailbox %s",
-                            store_key,
-                            self.mailbox_address,
-                        )
-                        continue
-
-                    parsed["id"] = store_key
-                    parsed_messages.append(parsed)
-
-                if not parsed_messages:
-                    # Nothing to process from this queue entry; leave it for a
-                    # future attempt (visibility timeout will re-expose it).
-                    continue
-
-                ack_context = {
-                    "receipt_handle": sqs_message.get("ReceiptHandle"),
-                    "queue_url": self._queue_url,
-                    "pending": len(parsed_messages),
-                    "failed": had_failures,
-                }
-
-                for parsed in parsed_messages:
-                    parsed["_queue_ack"] = ack_context
-                    messages.append(parsed)
-
-            if limit is None:
-                # Allow another long poll to run in the same cycle to drain the
-                # queue quickly when burst traffic arrives.
-                continue
-
-            if len(messages) >= limit:
-                break
-
-        return messages
-
-    def _extract_queue_objects(
-        self, sqs_message: Dict[str, object]
-    ) -> List[Tuple[Optional[str], str]]:
-        objects: List[Tuple[Optional[str], str]] = []
-        seen: Set[Tuple[Optional[str], str]] = set()
-
-        body = sqs_message.get("Body") if isinstance(sqs_message, dict) else None
-        for bucket, key in self._parse_sqs_payload(body):
-            if not key:
-                continue
-            decoded_key = unquote_plus(key)
-            bucket_name = bucket or self.bucket
-            identifier = (bucket_name, decoded_key)
-            if identifier in seen:
-                continue
-            seen.add(identifier)
-            objects.append((bucket_name, decoded_key))
-
-        if objects:
-            return objects
-
-        attributes = sqs_message.get("MessageAttributes") if isinstance(sqs_message, dict) else None
-        if isinstance(attributes, dict):
-            bucket_attr = attributes.get("bucket") or attributes.get("Bucket")
-            key_attr = attributes.get("key") or attributes.get("Key")
-            bucket_name = None
-            if isinstance(bucket_attr, dict):
-                bucket_name = bucket_attr.get("StringValue")
-            key_value = None
-            if isinstance(key_attr, dict):
-                key_value = key_attr.get("StringValue")
-            if key_value:
-                objects.append((bucket_name or self.bucket, unquote_plus(key_value)))
-
-        return objects
-
-    def _parse_sqs_payload(
-        self, payload: Optional[object]
-    ) -> Iterable[Tuple[Optional[str], str]]:
-        if payload is None:
-            return []
-
-        stack: List[object] = [payload]
-        results: List[Tuple[Optional[str], str]] = []
-
-        while stack:
-            current = stack.pop()
-            if current is None:
-                continue
-            if isinstance(current, str):
-                text = current.strip()
-                if not text:
-                    continue
-                try:
-                    parsed = json.loads(text)
-                except ValueError:
-                    results.append((None, text))
-                    continue
-                stack.append(parsed)
-                continue
-
-            if isinstance(current, dict):
-                records = current.get("Records")
-                if isinstance(records, list):
-                    stack.extend(records)
-
-                message = current.get("Message")
-                if message is not None:
-                    stack.append(message)
-
-                receipt = current.get("receipt")
-                if isinstance(receipt, dict):
-                    action = receipt.get("action")
-                    if isinstance(action, dict):
-                        bucket_name = (
-                            action.get("bucketName")
-                            or action.get("bucket")
-                            or action.get("s3BucketName")
-                        )
-                        object_key = (
-                            action.get("objectKey")
-                            or action.get("key")
-                            or action.get("s3ObjectKey")
-                        )
-                        if object_key:
-                            results.append((bucket_name, object_key))
-
-                action = current.get("action")
-                if isinstance(action, dict):
-                    bucket_name = (
-                        action.get("bucketName")
-                        or action.get("bucket")
-                        or action.get("s3BucketName")
-                    )
-                    object_key = (
-                        action.get("objectKey")
-                        or action.get("key")
-                        or action.get("s3ObjectKey")
-                    )
-                    if object_key:
-                        results.append((bucket_name, object_key))
-
-                s3_section = current.get("s3")
-                if isinstance(s3_section, dict):
-                    bucket = s3_section.get("bucket")
-                    bucket_name = None
-                    if isinstance(bucket, dict):
-                        bucket_name = bucket.get("name")
-                    elif isinstance(bucket, str):
-                        bucket_name = bucket
-                    obj = s3_section.get("object")
-                    key_value = obj.get("key") if isinstance(obj, dict) else None
-                    if key_value:
-                        results.append((bucket_name, key_value))
-
-                bucket_name = (
-                    current.get("bucketName")
-                    or current.get("bucket")
-                    or current.get("s3BucketName")
-                )
-                object_key = (
-                    current.get("objectKey")
-                    or current.get("key")
-                    or current.get("s3ObjectKey")
-                )
-                if object_key:
-                    results.append((bucket_name, object_key))
-
-                for value in current.values():
-                    if isinstance(value, (dict, list)):
-                        stack.append(value)
-                continue
-
-            if isinstance(current, list):
-                stack.extend(current)
-
-        return results
-
 
     def _load_from_s3(
         self,
@@ -1435,141 +950,6 @@ class SESEmailWatcher:
         messages = [payload for _, payload in collected]
         return messages
 
-    def _load_from_imap(
-        self,
-        limit: Optional[int] = None,
-        *,
-        mark_seen: bool = False,
-    ) -> List[Dict[str, object]]:
-        if not self._imap_configured():
-            logger.debug(
-                "IMAP mailbox not configured; skipping fallback for %s",
-                self.mailbox_address,
-            )
-            return []
-
-        mailbox = self._imap_folder
-        search_criteria = self._imap_search
-        fetch_cap = limit if limit is not None else self._imap_batch_size
-
-        messages: List[Dict[str, object]] = []
-        try:
-            if self._imap_use_ssl:
-                client = imaplib.IMAP4_SSL(self._imap_host, self._imap_port)
-            else:
-                client = imaplib.IMAP4(self._imap_host, self._imap_port)
-        except Exception:
-            logger.exception(
-                "Failed to connect to IMAP server %s for mailbox %s",
-                self._imap_host,
-                self.mailbox_address,
-            )
-            return []
-
-        try:
-            client.login(self._imap_user, self._imap_password)
-        except Exception:
-            logger.exception(
-                "Failed to authenticate to IMAP mailbox %s", self.mailbox_address
-            )
-            with contextlib.suppress(Exception):
-                client.logout()
-            return []
-
-        try:
-            status, _ = client.select(mailbox)
-            if status != "OK":
-                logger.warning(
-                    "IMAP select failed for mailbox %s (folder %s): %s",
-                    self.mailbox_address,
-                    mailbox,
-                    status,
-                )
-                return []
-            status, data = client.search(None, search_criteria)
-            if status != "OK":
-                logger.warning(
-                    "IMAP search with criteria %s failed for mailbox %s: %s",
-                    search_criteria,
-                    self.mailbox_address,
-                    status,
-                )
-                return []
-
-            raw_ids = data[0].split() if data else []
-            if not raw_ids and search_criteria.upper() != "ALL":
-                logger.debug(
-                    "IMAP search for %s returned no results with criteria %s; retrying with ALL",
-                    self.mailbox_address,
-                    search_criteria,
-                )
-                status, data = client.search(None, "ALL")
-                if status == "OK":
-                    raw_ids = data[0].split() if data else []
-
-            if not raw_ids:
-                return []
-
-            # Fetch newest messages first.
-            raw_ids = list(reversed(raw_ids))
-            if fetch_cap is not None:
-                raw_ids = raw_ids[: max(fetch_cap, 0)]
-
-            for msg_num in raw_ids:
-                if limit is not None and len(messages) >= limit:
-                    break
-                try:
-                    status, parts = client.fetch(msg_num, "(RFC822 UID)")
-                except Exception:
-                    logger.exception(
-                        "Failed to fetch IMAP message %s for mailbox %s",
-                        msg_num,
-                        self.mailbox_address,
-                    )
-                    continue
-                if status != "OK" or not parts:
-                    continue
-
-                raw_bytes = None
-                uid = None
-                for part in parts:
-                    if not isinstance(part, tuple):
-                        continue
-                    header = part[0]
-                    if isinstance(header, bytes):
-                        header = header.decode(errors="ignore")
-                    match = re.search(r"UID (\d+)", str(header))
-                    if match:
-                        uid = match.group(1)
-                    raw_bytes = part[1]
-                    break
-
-                if raw_bytes is None:
-                    continue
-
-                parsed = self._parse_email(raw_bytes)
-                identifier = uid or parsed.get("message_id") or msg_num.decode(errors="ignore").strip()
-                if not identifier:
-                    identifier = str(uuid.uuid4())
-                store_key = f"imap:{identifier}"
-                if self.state_store and store_key in self.state_store:
-                    continue
-
-                parsed["id"] = store_key
-                messages.append(parsed)
-
-                if mark_seen and self._imap_mark_seen:
-                    try:
-                        client.store(msg_num, "+FLAGS", "(\\Seen)")
-                    except Exception:
-                        logger.debug("Failed to mark IMAP message %s as seen", msg_num, exc_info=True)
-
-        finally:
-            with contextlib.suppress(Exception):
-                client.logout()
-
-        return messages
-
     def _download_object(
         self, client, key: str, *, bucket: Optional[str] = None
     ) -> Optional[bytes]:
@@ -1603,201 +983,6 @@ class SESEmailWatcher:
                 bucket_name,
             )
             return None
-
-    def _acknowledge_queue_message(self, message: Dict[str, object], *, success: bool) -> None:
-        if not self._queue_enabled:
-            return
-
-        ack_context = message.get("_queue_ack")
-        if not isinstance(ack_context, dict):
-            return
-
-        pending = ack_context.get("pending")
-        if isinstance(pending, int):
-            pending = max(0, pending - 1)
-        else:
-            pending = 0
-        ack_context["pending"] = pending
-
-        if not success:
-            ack_context["failed"] = True
-
-        if pending > 0:
-            return
-
-        if ack_context.get("failed"):
-            return
-
-        receipt = ack_context.get("receipt_handle")
-        queue_url = ack_context.get("queue_url") or self._queue_url
-        if not receipt or not queue_url:
-            return
-
-        try:
-            client = self._get_sqs_client()
-            if client is None:
-                return
-            client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
-            ack_context["receipt_handle"] = None
-        except Exception:
-            logger.exception(
-                "Failed to delete queue message for mailbox %s (queue=%s)",
-                self.mailbox_address,
-                queue_url,
-            )
-
-    def _parse_processed_payload(self, raw_bytes: bytes) -> Dict[str, object]:
-        """Parse processed email snapshots stored as JSON in S3."""
-
-        text: Optional[str] = None
-        try:
-            text = raw_bytes.decode("utf-8")
-        except Exception:
-            text = None
-
-        if text is not None:
-            with contextlib.suppress(json.JSONDecodeError):
-                payload = json.loads(text)
-                if isinstance(payload, dict):
-                    if isinstance(payload.get("payload"), dict):
-                        payload = payload["payload"]
-                    return self._normalise_processed_json(payload)
-
-        return self._parse_email(raw_bytes)
-
-    def _normalise_processed_json(self, payload: Dict[str, object]) -> Dict[str, object]:
-        def _first_string(
-            keys: Sequence[str], *, source: Optional[Dict[str, object]] = None
-        ) -> str:
-            target = payload if source is None else source
-            for key in keys:
-                value = target.get(key) if isinstance(target, dict) else None
-                if value is None:
-                    continue
-                if isinstance(value, str):
-                    text = value.strip()
-                    if text:
-                        return text
-                elif isinstance(value, (int, float)):
-                    return str(value)
-            return ""
-
-        def _extract_text(value: object) -> str:
-            if isinstance(value, str):
-                return value
-            if isinstance(value, dict):
-                for candidate in ("text", "body", "content", "value"):
-                    inner = value.get(candidate)
-                    if isinstance(inner, str):
-                        return inner
-            return ""
-
-        subject = _first_string(["subject", "Subject", "email_subject"])
-        from_address = _first_string(
-            ["from", "from_address", "fromAddress", "sender", "sender_email", "fromEmail"]
-        )
-
-        text_body = _extract_text(
-            payload.get("body")
-            or payload.get("text_body")
-            or payload.get("text")
-            or payload.get("message")
-        )
-        html_body = _extract_text(payload.get("html_body") or payload.get("html"))
-        if not text_body and html_body:
-            text_body = _strip_html(html_body)
-        body = text_body or html_body or ""
-
-        rfq_id = _first_string(["rfq_id", "rfqId", "rfq"])
-        if not rfq_id:
-            rfq_id = self._extract_rfq_id(" ".join(filter(None, [subject, body])))
-
-        received_at = payload.get("received_at") or payload.get("receivedAt")
-        message_id = _first_string(["message_id", "messageId", "id"])
-
-        recipients_value = payload.get("recipients") or payload.get("to") or payload.get("To")
-        if isinstance(recipients_value, str):
-            recipients = [recipients_value]
-        elif isinstance(recipients_value, Sequence):
-            recipients = [
-                str(item)
-                for item in recipients_value
-                if isinstance(item, (str, int, float)) and str(item).strip()
-            ]
-        else:
-            recipients = []
-
-        attachments: List[Dict[str, object]] = []
-        attachment_candidates = payload.get("attachments") or payload.get("Attachments")
-        if isinstance(attachment_candidates, list):
-            for item in attachment_candidates:
-                if not isinstance(item, dict):
-                    continue
-                filename = _first_string(
-                    ["filename", "name", "file_name"], source=item
-                )
-                content_value = item.get("content") or item.get("data") or item.get("body")
-                content_bytes: bytes = b""
-                if isinstance(content_value, bytes):
-                    content_bytes = content_value
-                elif isinstance(content_value, str):
-                    stripped = content_value.strip()
-                    if stripped:
-                        with contextlib.suppress(Exception):
-                            decoded = base64.b64decode(stripped, validate=True)
-                            content_bytes = decoded
-                        if not content_bytes:
-                            content_bytes = stripped.encode()
-                else:
-                    with contextlib.suppress(Exception):
-                        content_bytes = bytes(content_value)
-                    if not isinstance(content_bytes, bytes):
-                        content_bytes = b""
-                disposition = _first_string(
-                    ["disposition", "content_disposition"], source=item
-                ) or "attachment"
-                content_type = _first_string(
-                    ["content_type", "mime_type", "type"], source=item
-                )
-                attachments.append(
-                    {
-                        "filename": filename or None,
-                        "content_type": content_type or None,
-                        "content": content_bytes,
-                        "size": len(content_bytes),
-                        "disposition": disposition or "attachment",
-                    }
-                )
-
-        return {
-            "subject": subject,
-            "from": from_address,
-            "body": body,
-            "rfq_id": rfq_id,
-            "received_at": received_at,
-            "message_id": message_id,
-            "recipients": recipients,
-            "attachments": attachments,
-        }
-
-    def _parse_email(self, raw_bytes: bytes) -> Dict[str, object]:
-        message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-        subject = message.get("subject", "")
-        from_address = message.get("from", "")
-        recipients = message.get_all("to", [])
-        body = self._extract_body(message)
-        rfq_id = self._extract_rfq_id(f"{subject} {body}")
-        attachments = self._extract_attachments(message)
-        return {
-            "subject": subject,
-            "from": from_address,
-            "body": body,
-            "rfq_id": rfq_id,
-            "received_at": message.get("date"),
-            "message_id": message.get("message-id"),
-            "recipients": recipients,
-            "attachments": attachments,
-        }
 
     def _extract_body(self, message) -> str:
         if message.is_multipart():
@@ -1934,47 +1119,12 @@ class SESEmailWatcher:
         self._assumed_credentials_expiry = expiry_dt
         return dict(self._assumed_credentials)
 
-    def _get_sqs_client(self):
-        if not self._queue_enabled or not self._queue_url:
-            return None
-        if self._sqs_client is not None:
-            return self._sqs_client
-
-        client_kwargs: Dict[str, object] = {}
-        if self.region:
-            client_kwargs["region_name"] = self.region
-
-        if self._s3_role_arn:
-            try:
-                credentials = self._assume_role_credentials()
-                client_kwargs.update(credentials)
-            except Exception:
-                logger.exception(
-                    "Unable to assume role %s for SQS access; using default credentials",
-                    self._s3_role_arn,
-                )
-
-        try:
-            self._sqs_client = boto3.client("sqs", **client_kwargs)
-        except Exception:
-            logger.exception(
-                "Failed to create SQS client for mailbox %s (queue=%s)",
-                self.mailbox_address,
-                self._queue_url,
-            )
-            self._sqs_client = None
-        return self._sqs_client
-
-
     @staticmethod
     def _parse_region(endpoint: str) -> Optional[str]:
         match = re.search(r"email-smtp\.([a-z0-9-]+)\.amazonaws.com", endpoint)
         if match:
             return match.group(1)
         return None
-
-    def _imap_configured(self) -> bool:
-        return bool(self._imap_host and self._imap_user and self._imap_password)
 
     @staticmethod
     def _coerce_int(value, *, default: int, minimum: Optional[int] = None) -> int:
@@ -1987,112 +1137,27 @@ class SESEmailWatcher:
         return coerced
 
     def _validate_inbound_configuration(self, raw_prefix: object) -> None:
-        """Log actionable guidance for common SES inbound misconfigurations."""
+        """Emit logging about the active S3 polling configuration."""
 
         if not self.bucket:
             logger.warning(
-                "SES inbound bucket is not configured; configure 'ses_inbound_bucket' "
-                "or 's3_bucket_name' so the watcher can download supplier replies"
+                "Email watcher cannot poll for supplier replies because no S3 bucket is configured"
             )
-            if self._queue_url:
-                logger.warning(
-                    "SES inbound queue %s is configured without a bucket; ensure "
-                    "the queue payload includes bucket overrides or align the "
-                    "bucket configuration",
-                    self._queue_url,
-                )
             return
 
-        if not self._queue_url:
-            logger.warning(
-                "SES inbound queue URL is not configured for bucket %s. Configure "
-                "'ses_inbound_queue_url' and S3→SQS notifications so new emails "
-                "arrive immediately instead of relying on eventual S3 polling",
-                self.bucket,
-            )
-        elif not self._queue_enabled:
-            if self._queue_disabled_reason:
-                logger.info(
-                    "SES inbound queue %s polling disabled for mailbox %s: %s",
-                    self._queue_url,
-                    self.mailbox_address,
-                    self._queue_disabled_reason,
-                )
-            else:
-                logger.info(
-                    "SES inbound queue %s polling disabled for mailbox %s", self._queue_url, self.mailbox_address
-                )
-        else:
-            logger.debug(
-                "SES inbound queue %s is configured for bucket %s", self._queue_url, self.bucket
-            )
+        prefix_summary = ", ".join(self._prefixes) or "<root>"
+        logger.info(
+            "Email watcher will poll s3://%s%s for mailbox %s",
+            self.bucket,
+            prefix_summary,
+            self.mailbox_address,
+        )
 
         if raw_prefix is None:
-            return
-
-        expected_prefixes = ", ".join(self._prefixes)
-        logger.info(
-            "SES inbound prefixes normalised from %r: %s", raw_prefix, expected_prefixes or "<root>"
-        )
-        logger.info(
-            "SES processed email prefixes: %s",
-            ", ".join(self._processed_prefixes) or "<none>",
-        )
-
-    def _build_prefixes(self, raw_prefix: object) -> List[str]:
-        base_candidates = self._normalise_prefix_input(raw_prefix)
-        base_normalised: List[str] = []
-        include_empty = False
-
-        for candidate in base_candidates:
-            if not candidate:
-                include_empty = True
-                continue
-            base_normalised.append(self._ensure_trailing_slash(candidate))
-
-        if not base_normalised and include_empty:
-            base_normalised.append("")
-
-        mailbox_variants: List[str] = []
-        mailbox = (self.mailbox_address or "").strip()
-        if mailbox:
-            mailbox_variants.append(mailbox)
-            mailbox_variants.append(mailbox.replace("@", "/"))
-
-        derived: List[str] = []
-        bases = base_normalised or [""]
-        for base in bases:
-            derived.append(self._ensure_trailing_slash(base))
-            for variant in mailbox_variants:
-                combined = self._join_prefix(base, variant)
-                if combined:
-                    derived.append(combined)
-
-        for variant in mailbox_variants:
-            derived.append(self._ensure_trailing_slash(variant))
-
-        cleaned = [item if item is not None else "" for item in derived]
-        unique = self._unique_preserve(cleaned)
-        return unique or [""]
-
-    @staticmethod
-    def _normalise_prefix_input(value: object) -> List[str]:
-        if value is None:
-            return [""]
-        if isinstance(value, str):
-            parts = [part.strip() for part in value.split(",")]
-            return parts if parts else [""]
-        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-            results: List[str] = []
-            for item in value:
-                if item is None:
-                    continue
-                text = str(item).strip()
-                if text:
-                    results.append(text)
-            return results or [""]
-        text = str(value).strip()
-        return [text] if text else [""]
+            logger.info(
+                "No custom SES prefix supplied; defaulting to %s",
+                prefix_summary,
+            )
 
     @staticmethod
     def _ensure_trailing_slash(value: str) -> str:
@@ -2100,26 +1165,6 @@ class SESEmailWatcher:
         if not text:
             return ""
         return text if text.endswith("/") else f"{text}/"
-
-    @staticmethod
-    def _join_prefix(prefix: str, suffix: str) -> str:
-        base = SESEmailWatcher._ensure_trailing_slash(prefix)
-        clean_suffix = (suffix or "").strip().strip("/")
-        if not clean_suffix:
-            return base
-        if base:
-            return f"{base}{clean_suffix}/"
-        return f"{clean_suffix}/"
-
-    @staticmethod
-    def _unique_preserve(items: Iterable[str]) -> List[str]:
-        seen: Set[str] = set()
-        result: List[str] = []
-        for item in items:
-            if item not in seen:
-                seen.add(item)
-                result.append(item)
-        return result
 
     @staticmethod
     def _parse_s3_uri(uri: str) -> Tuple[str, Optional[str]]:
