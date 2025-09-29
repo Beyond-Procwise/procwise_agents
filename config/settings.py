@@ -110,6 +110,9 @@ class Settings(BaseSettings):
     data_extraction_max_workers: int = Field(
         default=16, env="DATA_EXTRACTION_MAX_WORKERS"
     )
+    force_ocr_vendors: List[str] = Field(
+        default_factory=list, env="FORCE_OCR_VENDORS"
+    )
 
     # Learning and optimization
     enable_learning: bool = Field(default=False, env="ENABLE_LEARNING")

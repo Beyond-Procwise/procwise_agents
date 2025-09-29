@@ -7,7 +7,7 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.data_extraction_agent import DataExtractionAgent
+from agents.data_extraction_agent import DataExtractionAgent, DocumentTextBundle
 
 
 def test_vectorize_document_normalizes_labels(monkeypatch):
@@ -68,7 +68,16 @@ def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
 
     agent = DataExtractionAgent(nick)
 
-    monkeypatch.setattr(agent, "_extract_text", lambda b, k: "contract text")
+    monkeypatch.setattr(
+        agent,
+        "_extract_text",
+        lambda b, k, force_ocr=False: DocumentTextBundle(
+            full_text="contract text",
+            page_results=[],
+            raw_text="contract text",
+            ocr_text="",
+        ),
+    )
     monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Contract")
     monkeypatch.setattr(agent, "_classify_product_type", lambda t: "it hardware")
     monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "C123")
@@ -331,7 +340,7 @@ def test_llm_structured_pass_populates_header(monkeypatch):
     monkeypatch.setattr(agent, "_extract_header_with_ner", lambda text: {})
     monkeypatch.setattr(agent, "_parse_header", lambda text, file_bytes=None: {})
     monkeypatch.setattr(
-        agent, "_extract_line_items_from_pdf_tables", lambda b, dt: []
+        agent, "_extract_line_items_from_pdf_tables", lambda b, dt: ([], None, [])
     )
     monkeypatch.setattr(agent, "_extract_line_items_regex", lambda text, dt: [])
 
@@ -365,15 +374,18 @@ def test_llm_structured_pass_populates_header(monkeypatch):
 
     monkeypatch.setattr(agent, "call_ollama", fake_call)
 
-    header, items = agent._extract_structured_data(
+    result = agent._extract_structured_data(
         "Invoice INV1 from ACME for 1 Widget", b"", "Invoice"
     )
 
+    header = result.header
+    items = result.line_items
     assert header["invoice_id"] == "INV1"
     assert header["vendor_name"] == "ACME"
     assert "invoice_id" in header.get("_field_context", {})
     assert header.get("_field_confidence", {}).get("invoice_id", 0) >= 0.7
     assert items and items[0]["item_id"] == "A1"
+    assert result.report["table_method"] == "none"
     assert "header_data" in captured_prompt["prompt"].lower()
 
 

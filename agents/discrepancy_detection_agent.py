@@ -168,7 +168,35 @@ class DiscrepancyDetectionAgent(BaseAgent):
             )
 
         self._persist_mismatches(mismatches)
-        return AgentOutput(status=AgentStatus.SUCCESS, data={"mismatches": mismatches})
+
+        processed_ids: set[str] = set()
+        for doc in docs:
+            identifier = doc.get("id") or doc.get("record_id") or doc.get("invoice_id") or doc.get("po_id") or doc.get("contract_id") or doc.get("quote_id")
+            if identifier is None:
+                continue
+            processed_ids.add(str(identifier))
+
+        failed_ids: set[str] = set()
+        for mis in mismatches:
+            mid = mis.get("id")
+            if mid is None:
+                continue
+            sid = str(mid)
+            if sid in processed_ids:
+                failed_ids.add(sid)
+
+        summary = {
+            "documents_processed": len(processed_ids) if processed_ids else len(docs),
+            "documents_successful": max(0, (len(processed_ids) if processed_ids else len(docs)) - len(failed_ids)),
+            "documents_with_issues": len(failed_ids),
+        }
+        if processing_issues:
+            summary["processing_issues"] = len(processing_issues)
+
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={"mismatches": mismatches, "summary": summary},
+        )
 
     def _persist_mismatches(self, mismatches: List[Dict]) -> None:
         """Store discrepancies in proc.data_discrepancy for auditing."""

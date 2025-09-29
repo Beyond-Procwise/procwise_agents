@@ -88,7 +88,8 @@ class DocumentVectorAgent(DataExtractionAgent):
         except Exception as exc:  # pragma: no cover - network failures
             logger.error("Failed downloading %s: %s", object_key, exc)
             return None
-        text = self._extract_text(file_bytes, object_key)
+        text_bundle = self._extract_text(file_bytes, object_key)
+        text = text_bundle.full_text
         doc_type = self._classify_doc_type(text)
         self._vectorize_document(text, None, doc_type, None, object_key)
         return {
