@@ -322,22 +322,8 @@ class SESEmailWatcher:
         try:
             self._respect_post_dispatch_wait()
             prefixes = self._derive_prefixes_for_filters(match_filters)
-            try:
-                if self._custom_loader is not None:
-                    messages = self._custom_loader(limit)
-                else:
-                    messages = self._load_messages(limit, mark_seen=True, prefixes=prefixes)
-            except Exception:  # pragma: no cover - network/runtime
-                logger.exception("Failed to load inbound SES messages")
-                return results
-
-            logger.info(
-                "Retrieved %d candidate message(s) from S3 for mailbox %s",
-                len(messages),
-                self.mailbox_address,
-            )
-
-            for message in messages:
+            def _process_and_record(message: Dict[str, object]) -> bool:
+                nonlocal match_found
                 message_id = str(message.get("id") or uuid.uuid4())
                 if self.state_store and message_id in self.state_store:
                     logger.debug(
@@ -345,7 +331,7 @@ class SESEmailWatcher:
                         message_id,
                         self.mailbox_address,
                     )
-                    continue
+                    return False
 
                 try:
                     processed, reason = self._process_message(message)
@@ -356,6 +342,8 @@ class SESEmailWatcher:
                 metadata: Dict[str, object]
                 message_match = False
                 if processed:
+                    if match_filters:
+                        self._apply_filter_defaults(processed, match_filters)
                     logger.info(
                         "Processed message %s for RFQ %s from %s",
                         message_id,
@@ -389,15 +377,62 @@ class SESEmailWatcher:
                 if self.state_store and reason != "processing_error":
                     self.state_store.add(message_id, metadata)
 
+                should_stop = False
                 if processed and (not match_filters or message_match):
                     results.append(processed_payload)
+                    if limit is not None:
+                        try:
+                            effective_limit = max(int(limit), 0)
+                        except Exception:
+                            effective_limit = 0
+                        if effective_limit and len(results) >= effective_limit:
+                            should_stop = True
 
                 if message_match:
                     match_found = True
+                    should_stop = True
                     logger.debug(
                         "Stopping poll once after matching filters for message %s", message_id
                     )
-                    break
+
+                return should_stop
+
+            try:
+                if self._custom_loader is not None:
+                    messages = self._custom_loader(limit)
+                    logger.info(
+                        "Retrieved %d candidate message(s) from S3 for mailbox %s",
+                        len(messages),
+                        self.mailbox_address,
+                    )
+                    for message in messages:
+                        if _process_and_record(message):
+                            break
+                else:
+                    processed_batch: List[Dict[str, object]] = []
+
+                    def _on_message(parsed: Dict[str, object], *_args) -> bool:
+                        processed_batch.append(parsed)
+                        return _process_and_record(parsed)
+
+                    messages = self._load_messages(
+                        limit,
+                        mark_seen=True,
+                        prefixes=prefixes,
+                        on_message=_on_message,
+                    )
+                    logger.info(
+                        "Retrieved %d candidate message(s) from S3 for mailbox %s",
+                        len(processed_batch) if match_filters else len(messages),
+                        self.mailbox_address,
+                    )
+                    if not match_filters:
+                        for message in messages:
+                            if _process_and_record(message):
+                                break
+            except Exception:  # pragma: no cover - network/runtime
+                logger.exception("Failed to load inbound SES messages")
+                return results
 
             if match_filters and not match_found:
                 cached_matches = self._retrieve_cached_matches(match_filters, limit)
@@ -796,6 +831,7 @@ class SESEmailWatcher:
         *,
         mark_seen: bool,
         prefixes: Optional[Sequence[str]] = None,
+        on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
         del mark_seen  # unused in S3-only polling
 
@@ -814,7 +850,11 @@ class SESEmailWatcher:
             return []
 
         self._respect_post_dispatch_wait()
-        return self._load_from_s3(effective_limit, prefixes=prefixes)
+        return self._load_from_s3(
+            effective_limit,
+            prefixes=prefixes,
+            on_message=on_message,
+        )
 
     @staticmethod
     def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
@@ -857,6 +897,33 @@ class SESEmailWatcher:
                 if payload_message != _normalise(expected):
                     return False
         return True
+
+    @staticmethod
+    def _apply_filter_defaults(
+        payload: Dict[str, object], filters: Dict[str, object]
+    ) -> None:
+        if not isinstance(payload, dict) or not filters:
+            return
+
+        def _should_fill(key: str) -> bool:
+            value = payload.get(key)
+            if value is None:
+                return True
+            try:
+                return str(value).strip() == ""
+            except Exception:
+                return False
+
+        for field in ("rfq_id", "supplier_id", "from_address"):
+            if field in filters and _should_fill(field):
+                candidate = filters.get(field)
+                if candidate not in (None, ""):
+                    payload[field] = candidate
+
+        if "message_id" in filters and _should_fill("message_id"):
+            candidate = filters.get("message_id")
+            if candidate not in (None, ""):
+                payload["message_id"] = candidate
 
     def _format_bucket_prefixes(
         self, prefixes: Optional[Sequence[str]] = None
@@ -970,6 +1037,7 @@ class SESEmailWatcher:
         prefixes: Optional[Sequence[str]] = None,
         parser: Optional[Callable[[bytes], Dict[str, object]]] = None,
         newest_first: bool = True,
+        on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
         if not self.bucket:
             logger.warning("SES inbound bucket not configured; skipping poll")
@@ -1068,7 +1136,18 @@ class SESEmailWatcher:
                 key,
                 self.mailbox_address,
             )
+
+            should_stop = False
+            if on_message is not None:
+                try:
+                    should_stop = bool(on_message(parsed, last_modified))
+                except Exception:
+                    logger.exception("on_message callback failed for %s", key)
+
             if limit is not None and len(collected) >= limit:
+                break
+
+            if should_stop:
                 break
 
         if bypass_known_filters:
