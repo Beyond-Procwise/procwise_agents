@@ -9,6 +9,7 @@ from io import BytesIO
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 import gzip
 import concurrent.futures
 import pdfplumber
@@ -86,6 +87,38 @@ def _table_reference_sections() -> Dict[str, str]:
         if table_name and block:
             sections[table_name] = block
     return sections
+
+
+@dataclass
+class PageExtractionResult:
+    page_number: int
+    route: str
+    digital_text: str = ""
+    ocr_text: str = ""
+    char_count: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def combined_text(self) -> str:
+        return (self.digital_text or "").strip() or (self.ocr_text or "").strip()
+
+
+@dataclass
+class DocumentTextBundle:
+    full_text: str
+    page_results: List[PageExtractionResult] = field(default_factory=list)
+    raw_text: str = ""
+    ocr_text: str = ""
+    routing_log: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class StructuredExtractionResult:
+    header: Dict[str, Any]
+    line_items: List[Dict[str, Any]]
+    header_df: pd.DataFrame
+    line_df: pd.DataFrame
+    report: Dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # SCHEMAS
@@ -304,11 +337,100 @@ DOC_TYPE_KEYWORDS = {
     "Contract": ["contract", "agreement", "terms"],
 }
 
+DOC_TYPE_EXTRA_KEYWORDS = {
+    "Invoice": ["supplier", "vendor", "remit to", "from", "sold by", "ship from"],
+    "Purchase_Order": ["supplier", "vendor", "sold by", "ship from", "ship to"],
+    "Quote": ["supplier", "vendor", "prepared by"],
+    "Contract": [
+        "supplier",
+        "vendor",
+        "party",
+        "parties",
+        "effective date",
+        "term",
+        "duration",
+        "payment terms",
+        "renewal",
+        "governing law",
+        "jurisdiction",
+        "signature",
+    ],
+}
+
+SUPPLIER_EXTRACTION_GUIDANCE = (
+    "Always identify the supplier/vendor/contracting party names by reading the header, footer, and signature blocks. "
+    "If a clear supplier or company name appears anywhere in those sections, populate supplier_name and supplier_id with "
+    "the most complete legal name rather than returning null."
+)
+
+DOC_TYPE_EXTRA_INSTRUCTIONS = {
+    "Invoice": (
+        "Invoices typically show the supplier in header or footer panels such as 'From', 'Vendor', or 'Supplier'. "
+        "Use those cues along with remit-to details when extracting supplier fields."
+    ),
+    "Purchase_Order": (
+        "Purchase orders display the selling supplier or vendor in the top banner and sometimes in the closing footer. "
+        "Capture that identity even if it only appears once."
+    ),
+    "Contract": (
+        "Contracts describe the supplier party, contract title, term, total value, payment terms, renewal language, and "
+        "governing law within the introductory clauses and signature pages. Read those sections carefully so the "
+        "extracted fields reflect the actual agreement context."
+    ),
+}
+
 UNIQUE_ID_PATTERNS = {
     "Invoice": r"invoice\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
     "Purchase_Order": r"(?:purchase order|po)\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
     "Quote": r"quote\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
     "Contract": r"contract\s*(?:number|no\.|#)?\s*[:#-]?\s*([A-Za-z0-9-]+)",
+}
+
+PATTERN_MAPPING = {
+    "invoice_no": [
+        r"\binvoice\s*(?:no\.?|number|#)\b",
+        r"\bTax\s*Invoice\s*(?:No\.?|Number)\b",
+        r"\bInvoice\s*#\b",
+    ],
+    "po_no": [
+        r"\bpo\s*(?:no\.?|number|#)\b",
+        r"\bpurchase\s*order\s*(?:no\.?|number)\b",
+    ],
+    "invoice_date": [
+        r"\binvoice\s*date\b",
+        r"\bbilling\s*date\b",
+        r"\bdate\s*of\s*invoice\b",
+    ],
+    "due_date": [r"\bdue\s*date\b", r"\bpayment\s*due\b"],
+    "supplier_name": [
+        r"\bsupplier\s*(?:name)?\b",
+        r"\bvendor\s*(?:name)?\b",
+        r"\bfrom\b",
+    ],
+    "buyer": [r"\bbuyer\b", r"\bbill\s*to\b"],
+    "currency": [r"\bcurrency\b", r"\bcur\.\b"],
+    "invoice_total": [
+        r"\bgrand\s*total\b",
+        r"\binvoice\s*total\b",
+        r"\bamount\s*due\b",
+    ],
+    "tax_amount": [r"\btax\s*amount\b", r"\bvat\b", r"\bgst\b"],
+    "po_total": [r"\border\s*total\b", r"\btotal\s*amount\b"],
+    "quote_total": [r"\bquote\s*total\b", r"\bnet\s*total\b"],
+}
+
+PATTERN_TARGETS = {
+    "invoice_no": "invoice_id",
+    "po_no": "po_id",
+    "invoice_date": "invoice_date",
+    "due_date": "due_date",
+    "supplier_name": "vendor_name",
+    "buyer": "buyer_id",
+    "currency": "currency",
+    "invoice_total": "invoice_total_incl_tax",
+    "tax_amount": "tax_amount",
+    "po_total": "total_amount",
+    "quote_total": "total_amount",
 }
 
 # ---------------------------------------------------------------------------
@@ -513,6 +635,31 @@ class DataExtractionAgent(BaseAgent):
                 return dt.strftime("%Y-%m-%d")
             except Exception:
                 return raw
+
+        for pattern_key, regexes in PATTERN_MAPPING.items():
+            target_field = PATTERN_TARGETS.get(pattern_key)
+            if not target_field or header.get(target_field):
+                continue
+            for pattern in regexes:
+                m = re.search(pattern, text, re.I)
+                if not m:
+                    continue
+                start = m.end()
+                snippet = text[start : start + 160]
+                snippet_line = snippet.splitlines()[0] if snippet else ""
+                candidate = snippet_line.lstrip(" :#-").strip()
+                candidate = re.split(r"\s{2,}", candidate)[0].strip()
+                candidate = re.split(r"\b(?:date|number|no|#)\b", candidate, 1)[0].strip()
+                if not candidate:
+                    continue
+                header.setdefault(target_field, candidate)
+                logger.info(
+                    "header_source=pattern field=%s pattern=%s value=%s",
+                    target_field,
+                    pattern,
+                    candidate,
+                )
+                break
 
         if doc_type == "Invoice":
             # Invoice ID: look for strings like INV123456 or "Invoice No: 12345"
@@ -820,7 +967,14 @@ class DataExtractionAgent(BaseAgent):
             logger.error("Failed downloading %s: %s", object_key, exc)
             return None
 
-        text = self._extract_text(file_bytes, object_key)
+        force_ocr_vendors = set(
+            vendor.lower() for vendor in getattr(self.settings, "force_ocr_vendors", [])
+        )
+        force_ocr = any(
+            vendor and vendor in object_key.lower() for vendor in force_ocr_vendors
+        )
+        text_bundle = self._extract_text(file_bytes, object_key, force_ocr=force_ocr)
+        text = text_bundle.full_text
         doc_type = self._classify_doc_type(text)
         product_type = self._classify_product_type(text)
         unique_id = self._extract_unique_id(text, doc_type)
@@ -835,11 +989,17 @@ class DataExtractionAgent(BaseAgent):
         if vendor_name:
             header["vendor_name"] = vendor_name
         line_items: List[Dict[str, Any]] = []
+        table_report: Dict[str, Any] = {}
         pk_value = unique_id
         data: Optional[Dict[str, Any]] = None
 
         if doc_type in {"Purchase_Order", "Invoice", "Quote", "Contract"}:
-            header, line_items = self._extract_structured_data(text, file_bytes, doc_type)
+            structured = self._extract_structured_data(
+                text, file_bytes, doc_type
+            )
+            header = structured.header
+            line_items = structured.line_items
+            table_report = structured.report
             header["doc_type"] = doc_type
             header["product_type"] = product_type
 
@@ -871,11 +1031,14 @@ class DataExtractionAgent(BaseAgent):
             data = {
                 "header_data": header,
                 "line_items": line_items,
+                "header_df": structured.header_df.replace({pd.NA: None}).to_dict("records"),
+                "lines_df": structured.line_df.replace({pd.NA: None}).to_dict("records"),
                 "validation": {
                     "is_valid": bool(ok),
                     "confidence_score": float(conf),
                     "notes": "; ".join(notes) if notes else "ok",
                 },
+                "report": table_report,
             }
 
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
@@ -883,77 +1046,200 @@ class DataExtractionAgent(BaseAgent):
 
         result = {"object_key": object_key, "id": pk_value or object_key, "doc_type": doc_type or "", "status": "success"}
         if data:
+            data["raw_text"] = text_bundle.raw_text
+            data["ocr_text"] = text_bundle.ocr_text
+            data["page_routes"] = text_bundle.routing_log
             result["data"] = data
         return result
 
     # ============================ EXTRACTION HELPERS ======================
-    def _extract_text_from_pdf(self, file_bytes: bytes) -> str:
+    def _extract_pdf_text_bundle(
+        self, file_bytes: bytes, force_ocr: bool = False
+    ) -> DocumentTextBundle:
         file_bytes = _maybe_decompress(file_bytes)
         if not file_bytes.startswith(b"%PDF"):
-            logger.warning("Provided bytes do not look like a PDF; attempting image extraction")
-            return self._extract_text_from_image(file_bytes, allow_pdf_fallback=False)
+            logger.warning(
+                "Provided bytes do not look like a PDF; attempting image extraction"
+            )
+            ocr_text = self._extract_text_from_image(
+                file_bytes, allow_pdf_fallback=False
+            )
+            page_result = PageExtractionResult(
+                page_number=1, route="ocr", ocr_text=ocr_text, char_count=len(ocr_text)
+            )
+            return DocumentTextBundle(
+                full_text=ocr_text,
+                page_results=[page_result],
+                raw_text="",
+                ocr_text=ocr_text,
+                routing_log=[{"page": 1, "route": "ocr", "chars": len(ocr_text)}],
+            )
 
-        lines: List[str] = []
+        page_results: List[PageExtractionResult] = []
+        routing_log: List[Dict[str, Any]] = []
+        pdf = None
         try:
-            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    words = page.extract_words() or []
-                    row_dict: Dict[float, Dict[str, List[str]]] = {}
-                    for word in words:
-                        row_y = round(word["top"], 0)
-                        x_center = (word["x0"] + word["x1"]) / 2
-                        if row_y not in row_dict:
-                            row_dict[row_y] = {"left": [], "right": []}
-                        side = "left" if x_center < page.width / 2 else "right"
-                        row_dict[row_y][side].append(word["text"])
-                    if row_dict:
-                        for y in sorted(row_dict.keys()):
-                            left_text = " ".join(row_dict[y]["left"]).strip()
-                            right_text = " ".join(row_dict[y]["right"]).strip()
-                            if right_text:
-                                lines.append(f"{left_text} | {right_text}".strip())
-                            elif left_text:
-                                lines.append(left_text)
-                        for table in page.extract_tables() or []:
-                            for row in table:
-                                row_text = " ".join(cell or "" for cell in row).strip()
-                                if row_text:
-                                    lines.append(row_text)
-                    else:
-                        # OCR fallback
-                        if easyocr is not None:
-                            try:
-                                page_image = page.to_image(resolution=300).original
-                                img_arr = np.array(page_image)
-                                reader = _get_easyocr_reader()
-                                ocr_lines = reader.readtext(img_arr, detail=0, paragraph=True)
-                                lines.extend(ln.strip() for ln in ocr_lines if ln.strip())
-                            except Exception as ocr_exc:
-                                logger.warning("EasyOCR failed: %s", ocr_exc)
-                        elif Image is not None and pytesseract is not None:
-                            try:
-                                page_image = page.to_image(resolution=300).original
-                                ocr_text = pytesseract.image_to_string(page_image)
-                                lines.extend(ln.strip() for ln in ocr_text.splitlines() if ln.strip())
-                            except Exception as ocr_exc:
-                                logger.warning("OCR failed: %s", ocr_exc)
+            pdf = fitz.open(stream=file_bytes, filetype="pdf") if fitz else None
         except Exception as exc:
-            logger.warning("pdfplumber failed: %s", exc)
+            logger.debug("PyMuPDF open failed: %s", exc)
+            pdf = None
 
-        if not lines and fitz is not None:
+        try:
+            with pdfplumber.open(BytesIO(file_bytes)) as plumber_doc:
+                for idx, page in enumerate(plumber_doc.pages, start=1):
+                    warnings_local: List[str] = []
+                    digital_text = page.extract_text() or ""
+                    char_count = len(digital_text.strip())
+                    route = "digital"
+                    ocr_text = ""
+                    if not digital_text.strip():
+                        digital_text = page.extract_text(x_tolerance=1.5, y_tolerance=1.5) or ""
+                        char_count = len(digital_text.strip())
+
+                    if force_ocr or char_count < 24:
+                        route = "ocr"
+                    if route == "digital" and not digital_text.strip():
+                        route = "ocr"
+
+                    if route == "ocr":
+                        image = self._render_pdf_page(pdf, page, idx)
+                        if image is None:
+                            warnings_local.append("render_failed")
+                            logger.warning(
+                                "Page %s could not be rendered for OCR; falling back to digital text",
+                                idx,
+                            )
+                            route = "digital"
+                        else:
+                            processed = self._prepare_ocr_image(image)
+                            ocr_text = self._perform_ocr(processed)
+                            if not ocr_text.strip() and digital_text.strip():
+                                warnings_local.append("ocr_empty")
+                                route = "digital"
+                            elif not ocr_text.strip():
+                                warnings_local.append("ocr_empty")
+                    routing_log.append(
+                        {
+                            "page": idx,
+                            "route": route,
+                            "digital_chars": char_count,
+                            "ocr_chars": len(ocr_text.strip()),
+                        }
+                    )
+                    logger.info(
+                        "page_route decision=%s page=%d digital_chars=%d ocr_chars=%d",
+                        route,
+                        idx,
+                        char_count,
+                        len(ocr_text.strip()),
+                    )
+                    page_results.append(
+                        PageExtractionResult(
+                            page_number=idx,
+                            route=route,
+                            digital_text=digital_text,
+                            ocr_text=ocr_text,
+                            char_count=char_count,
+                            warnings=warnings_local,
+                        )
+                    )
+        except Exception as exc:
+            logger.warning("pdfplumber failed during page routing: %s", exc)
+
+        if pdf is not None:
             try:
-                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                    text = "\n".join(page.get_text() for page in doc)
-                    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            except Exception as exc:
-                logger.error("PyMuPDF failed extracting text: %s", exc)
-                img_text = self._extract_text_from_image(file_bytes, allow_pdf_fallback=False)
-                return img_text
-        elif not lines:
-            logger.warning("No text extracted from PDF; PyMuPDF not installed")
-            return ""
+                pdf.close()
+            except Exception:
+                pass
 
-        return "\n".join(lines)
+        raw_text = "\n".join(
+            result.digital_text.strip() for result in page_results if result.digital_text
+        )
+        ocr_text = "\n".join(
+            result.ocr_text.strip() for result in page_results if result.ocr_text
+        )
+        full_text_parts: List[str] = []
+        for result in page_results:
+            primary = result.digital_text.strip() if result.route == "digital" else ""
+            if not primary:
+                primary = result.combined_text
+            if primary:
+                full_text_parts.append(primary)
+        full_text = "\n".join(part for part in full_text_parts if part)
+        if not full_text and raw_text:
+            full_text = raw_text
+        if not full_text and ocr_text:
+            full_text = ocr_text
+        return DocumentTextBundle(
+            full_text=full_text,
+            page_results=page_results,
+            raw_text=raw_text,
+            ocr_text=ocr_text,
+            routing_log=routing_log,
+        )
+
+    def _render_pdf_page(
+        self,
+        fitz_doc,
+        plumber_page,
+        page_number: int,
+        dpi: int = 360,
+    ) -> Optional[Image.Image]:
+        if Image is None:
+            return None
+        try:
+            if fitz_doc is not None:
+                page = fitz_doc.load_page(page_number - 1)
+                zoom = dpi / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                mode = "RGB" if pix.n < 4 else "RGBA"
+                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                if mode == "RGBA":
+                    img = img.convert("RGB")
+                return img
+            if hasattr(plumber_page, "to_image"):
+                rendered = plumber_page.to_image(resolution=dpi).original
+                if rendered.mode != "RGB":
+                    rendered = rendered.convert("RGB")
+                return rendered
+        except Exception as exc:
+            logger.debug("Failed to render page %d: %s", page_number, exc)
+        return None
+
+    def _prepare_ocr_image(self, image: Image.Image) -> Image.Image:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        width, height = image.size
+        upscale_factor = max(1, int(360 / 72))
+        new_size = (width * upscale_factor, height * upscale_factor)
+        if new_size != image.size:
+            image = image.resize(new_size, Image.BICUBIC)
+        if pytesseract is not None:
+            try:
+                osd = pytesseract.image_to_osd(image, output_type=pytesseract.Output.DICT)
+                rotate = osd.get("rotate", 0)
+                if rotate:
+                    image = image.rotate(-rotate, expand=True)
+            except Exception as exc:
+                logger.debug("Deskew failed: %s", exc)
+        return image
+
+    def _perform_ocr(self, image: Image.Image) -> str:
+        if pytesseract is not None:
+            try:
+                return pytesseract.image_to_string(image)
+            except Exception as exc:
+                logger.error("pytesseract OCR failed: %s", exc)
+        if easyocr is not None:
+            try:
+                reader = _get_easyocr_reader()
+                if reader is not None:
+                    lines = reader.readtext(np.array(image), detail=0, paragraph=True)
+                    return "\n".join(lines)
+            except Exception as exc:
+                logger.warning("EasyOCR failed: %s", exc)
+        return ""
 
     def _extract_text_from_docx(self, file_bytes: bytes) -> str:
         if docx is None:
@@ -975,7 +1261,8 @@ class DataExtractionAgent(BaseAgent):
         except UnidentifiedImageError:
             if allow_pdf_fallback:
                 logger.warning("Not a valid image; attempting PDF extraction fallback")
-                return self._extract_text_from_pdf(file_bytes)
+                bundle = self._extract_pdf_text_bundle(file_bytes)
+                return bundle.full_text
             logger.warning("Provided bytes are not a valid image")
             return ""
         except Exception as exc:
@@ -998,16 +1285,44 @@ class DataExtractionAgent(BaseAgent):
         logger.warning("pytesseract not installed; cannot OCR image")
         return ""
 
-    def _extract_text(self, file_bytes: bytes, object_key: str) -> str:
+    def _extract_text(
+        self, file_bytes: bytes, object_key: str, force_ocr: bool = False
+    ) -> DocumentTextBundle:
         ext = os.path.splitext(object_key)[1].lower()
         if ext == ".pdf":
-            return self._extract_text_from_pdf(file_bytes)
+            return self._extract_pdf_text_bundle(file_bytes, force_ocr=force_ocr)
         if ext in {".doc", ".docx"}:
-            return self._extract_text_from_docx(file_bytes)
+            text = self._extract_text_from_docx(file_bytes)
+            page_result = PageExtractionResult(
+                page_number=1,
+                route="digital",
+                digital_text=text,
+                char_count=len(text or ""),
+            )
+            return DocumentTextBundle(
+                full_text=text,
+                page_results=[page_result],
+                raw_text=text,
+                ocr_text="",
+                routing_log=[{"page": 1, "route": "digital", "digital_chars": len(text)}],
+            )
         if ext in {".png", ".jpg", ".jpeg"}:
-            return self._extract_text_from_image(file_bytes)
+            text = self._extract_text_from_image(file_bytes)
+            page_result = PageExtractionResult(
+                page_number=1,
+                route="ocr",
+                ocr_text=text,
+                char_count=len(text or ""),
+            )
+            return DocumentTextBundle(
+                full_text=text,
+                page_results=[page_result],
+                raw_text="",
+                ocr_text=text,
+                routing_log=[{"page": 1, "route": "ocr", "ocr_chars": len(text)}],
+            )
         logger.warning("Unsupported document type '%s' for %s", ext, object_key)
-        return ""
+        return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
 
     # ============================ NEW LAYOUT HELPERS ======================
     def _extract_layout_blocks(self, file_bytes: bytes) -> List[Dict[str, Any]]:
@@ -1095,7 +1410,9 @@ class DataExtractionAgent(BaseAgent):
                     if ok:
                         conf += 0.08
                     else:
-                        notes.append("Line totals + tax do not match invoice_total_incl_tax (±0.02).")
+                        msg = "Line totals + tax do not match invoice_total_incl_tax (±0.02)."
+                        notes.append(msg)
+                        logger.warning("validation_diff doc_type=%s detail=%s", doc_type, msg)
                 else:
                     notes.append("invoice_total_incl_tax missing.")
             except Exception:
@@ -1121,7 +1438,9 @@ class DataExtractionAgent(BaseAgent):
                     if abs(line_total - header_total) <= 0.02:
                         conf += 0.06
                     else:
-                        notes.append("Line totals do not match purchase order total_amount (±0.02).")
+                        msg = "Line totals do not match purchase order total_amount (±0.02)."
+                        notes.append(msg)
+                        logger.warning("validation_diff doc_type=%s detail=%s", doc_type, msg)
             except Exception:
                 notes.append("Failed purchase order total reconciliation.")
         elif doc_type == "Quote":
@@ -1143,7 +1462,9 @@ class DataExtractionAgent(BaseAgent):
                     if abs(line_total - header_total) <= 0.02:
                         conf += 0.05
                     else:
-                        notes.append("Quote line totals do not match total_amount (±0.02).")
+                        msg = "Quote line totals do not match total_amount (±0.02)."
+                        notes.append(msg)
+                        logger.warning("validation_diff doc_type=%s detail=%s", doc_type, msg)
             except Exception:
                 notes.append("Failed quote total reconciliation.")
         try:
@@ -1270,136 +1591,308 @@ class DataExtractionAgent(BaseAgent):
         return header
 
     # ============================ LINE ITEMS ==============================
-    def _extract_line_items_from_pdf_tables(self, file_bytes: bytes, doc_type: str) -> List[Dict]:
-        items: List[Dict] = []
+    def _extract_line_items_from_pdf_tables(
+        self, file_bytes: bytes, doc_type: str
+    ) -> Tuple[List[Dict], Optional[str], List[str]]:
+        warnings: List[str] = []
         if camelot is not None:
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-                    tmp.write(file_bytes)
-                    tmp.flush()
-                    tables = camelot.read_pdf(tmp.name, flavor="stream", pages="all")
-                for table in tables:
-                    df = table.df if hasattr(table, "df") else None
-                    if df is None or df.empty or df.shape[0] <= 1:
+            for flavor in ("lattice", "stream"):
+                try:
+                    tables = self._run_camelot_tables(file_bytes, flavor)
+                    if not tables:
                         continue
-                    header_map = self._map_table_headers(df.iloc[0].tolist())
-                    if len(header_map) < 2:
-                        continue
-                    for _, row in df.iloc[1:].iterrows():
-                        row_text = " ".join(str(cell).strip() for cell in row if isinstance(cell, str))
-                        if TOTALS_STOP_WORDS.search(row_text):
-                            break
-                        record: Dict[str, Any] = {}
-                        for idx, label in header_map.items():
-                            if idx >= len(row):
-                                continue
-                            value = str(row.iloc[idx]).strip()
-                            if not value or value.lower() in {"nan", "none"}:
-                                continue
-                            record[label] = value
-                        if not record:
-                            continue
-                        normalised = self._normalize_line_item_fields([record], doc_type)[0]
-                        for key in [
-                            "quantity",
-                            "unit_price",
-                            "line_amount",
-                            "tax_percent",
-                            "tax_amount",
-                            "total_amount_incl_tax",
-                            "line_total",
-                            "total_amount",
-                        ]:
-                            if key in normalised:
-                                normalised[key] = self._clean_numeric(normalised[key])
-                        items.append(normalised)
-                if items:
-                    return items
-            except Exception:
-                logger.debug("Camelot PDF table extraction failed", exc_info=True)
+                    items = self._camelot_tables_to_items(tables, doc_type)
+                    if items:
+                        logger.info(
+                            "table_extractor=%s rows=%d", f"camelot-{flavor}", len(items)
+                        )
+                        return items, f"camelot-{flavor}", warnings
+                except Exception as exc:
+                    warnings.append(f"camelot-{flavor}-error")
+                    logger.debug("Camelot %s extraction failed: %s", flavor, exc)
         try:
-            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    words = page.extract_words() or []
-                    if not words:
-                        continue
-                    # find header row
-                    header_row = None
-                    for y in sorted(set(round(w["top"], 0) for w in words)):
-                        row_words = [w for w in words if round(w["top"], 0) == y]
-                        header_text = " ".join(w["text"].strip().lower() for w in row_words)
-                        hits = 0
-                        required = ["item_description", "quantity", "unit_price"]
-                        for req in required:
-                            aliases = LINE_HEADERS_ALIASES.get(req, [])
-                            if any(re.search(p, header_text, re.I) for p in aliases):
-                                hits += 1
-                        if hits >= 2:
-                            header_row = row_words
-                            break
-                    if not header_row:
-                        continue
-
-                    # columns spans
-                    header_spans: List[Tuple[float, float, str]] = []
-                    for logical_col, aliases in LINE_HEADERS_ALIASES.items():
-                        for w in header_row:
-                            txt = w["text"].lower()
-                            if any(re.search(p, txt, re.I) for p in aliases):
-                                header_spans.append((w["x0"], w["x1"], logical_col))
-                                break
-                    header_spans = sorted(header_spans, key=lambda t: (t[0] + t[1]) / 2.0)
-                    if not header_spans:
-                        continue
-
-                    # rows below header
-                    below_rows = [w for w in words if w["top"] > min(w["top"] for w in header_row) + 2]
-                    by_y: Dict[int, List[Dict[str, Any]]] = {}
-                    for w in below_rows:
-                        y = int(round(w["top"], 0))
-                        by_y.setdefault(y, []).append(w)
-
-                    pending_desc = None
-                    for y in sorted(by_y.keys()):
-                        row = by_y[y]
-                        row_text = " ".join(w["text"] for w in row).strip()
-                        if TOTALS_STOP_WORDS.search(row_text):
-                            break
-                        row_obj: Dict[str, Any] = {}
-                        for w in row:
-                            mid = (w["x0"] + w["x1"]) / 2.0
-                            best = None
-                            bestd = 1e9
-                            for (x0, x1, label) in header_spans:
-                                cx = (x0 + x1) / 2.0
-                                d = abs(mid - cx)
-                                if d < bestd:
-                                    bestd = d
-                                    best = label
-                            if best:
-                                row_obj.setdefault(best, [])
-                                row_obj[best].append(w["text"])
-                        row_obj = {k: " ".join(v).strip() for k, v in row_obj.items()}
-
-                        non_desc_keys = [k for k in row_obj.keys() if k != "item_description" and row_obj[k]]
-                        if ("item_description" in row_obj and row_obj.get("item_description") and not non_desc_keys):
-                            if items:
-                                items[-1]["item_description"] = f'{items[-1].get("item_description","")} {row_obj["item_description"]}'.strip()
-                            else:
-                                pending_desc = row_obj["item_description"]
-                            continue
-                        if pending_desc and "item_description" in row_obj:
-                            row_obj["item_description"] = f'{pending_desc} {row_obj["item_description"]}'.strip()
-                            pending_desc = None
-
-                        row_norm = self._normalize_line_item_fields([row_obj], doc_type)[0]
-                        for k in ["quantity", "unit_price", "line_amount", "tax_percent", "tax_amount", "total_amount_incl_tax", "line_total", "total_amount"]:
-                            if k in row_norm:
-                                row_norm[k] = self._clean_numeric(row_norm[k])
-                        items.append(row_norm)
+            pdf_items = self._pdfplumber_tables_to_items(file_bytes, doc_type)
+            if pdf_items:
+                logger.info(
+                    "table_extractor=pdfplumber rows=%d", len(pdf_items)
+                )
+                return pdf_items, "pdfplumber", warnings
         except Exception as exc:
-            logger.warning("Layout line-item extraction failed: %s", exc)
+            warnings.append("pdfplumber-table-error")
+            logger.debug("pdfplumber table parsing failed: %s", exc)
+
+        ocr_items, ocr_warnings = self._extract_line_items_ocr_grid(file_bytes, doc_type)
+        warnings.extend(ocr_warnings)
+        if ocr_items:
+            logger.info("table_extractor=ocr-grid rows=%d", len(ocr_items))
+            return ocr_items, "ocr-grid", warnings
+        return [], None, warnings
+
+    def _run_camelot_tables(self, file_bytes: bytes, flavor: str):
+        if camelot is None:
+            return []
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp.flush()
+            return camelot.read_pdf(tmp.name, flavor=flavor, pages="all")
+
+    def _camelot_tables_to_items(self, tables, doc_type: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for table in tables or []:
+            df = getattr(table, "df", None)
+            if df is None or df.empty:
+                continue
+            header_row = df.iloc[0].tolist()
+            header_map = self._map_table_headers(header_row)
+            if len(header_map) < 2:
+                continue
+            pending_desc: Optional[str] = None
+            for _, row in df.iloc[1:].iterrows():
+                row_text = " ".join(str(cell).strip() for cell in row if isinstance(cell, str))
+                if TOTALS_STOP_WORDS.search(row_text):
+                    break
+                record: Dict[str, Any] = {}
+                for idx, label in header_map.items():
+                    if idx >= len(row):
+                        continue
+                    value = str(row.iloc[idx]).strip()
+                    if not value or value.lower() in {"nan", "none"}:
+                        continue
+                    record[label] = value
+                if not record:
+                    continue
+                if (
+                    "item_description" in record
+                    and not any(k for k in record if k != "item_description")
+                ):
+                    pending_desc = (
+                        f"{pending_desc} {record['item_description']}".strip()
+                        if pending_desc
+                        else record["item_description"]
+                    )
+                    continue
+                if pending_desc and "item_description" in record:
+                    record["item_description"] = (
+                        f"{pending_desc} {record['item_description']}".strip()
+                    )
+                    pending_desc = None
+                normalised = self._normalize_line_item_fields([record], doc_type)[0]
+                for key in [
+                    "quantity",
+                    "unit_price",
+                    "line_amount",
+                    "tax_percent",
+                    "tax_amount",
+                    "total_amount_incl_tax",
+                    "line_total",
+                    "total_amount",
+                ]:
+                    if key in normalised:
+                        normalised[key] = self._clean_numeric(normalised[key])
+                items.append(normalised)
         return items
+
+    def _pdfplumber_tables_to_items(
+        self, file_bytes: bytes, doc_type: str
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words() or []
+                if not words:
+                    continue
+                header_row = None
+                for y in sorted(set(round(w["top"], 0) for w in words)):
+                    row_words = [w for w in words if round(w["top"], 0) == y]
+                    header_text = " ".join(w["text"].strip().lower() for w in row_words)
+                    hits = 0
+                    required = ["item_description", "quantity", "unit_price"]
+                    for req in required:
+                        aliases = LINE_HEADERS_ALIASES.get(req, [])
+                        if any(re.search(p, header_text, re.I) for p in aliases):
+                            hits += 1
+                    if hits >= 2:
+                        header_row = row_words
+                        break
+                if not header_row:
+                    continue
+                header_spans: List[Tuple[float, float, str]] = []
+                for logical_col, aliases in LINE_HEADERS_ALIASES.items():
+                    for w in header_row:
+                        txt = w["text"].lower()
+                        if any(re.search(p, txt, re.I) for p in aliases):
+                            header_spans.append((w["x0"], w["x1"], logical_col))
+                            break
+                header_spans = sorted(header_spans, key=lambda t: (t[0] + t[1]) / 2.0)
+                if not header_spans:
+                    continue
+                below_rows = [
+                    w for w in words if w["top"] > min(w["top"] for w in header_row) + 2
+                ]
+                by_y: Dict[int, List[Dict[str, Any]]] = {}
+                for w in below_rows:
+                    y = int(round(w["top"], 0))
+                    by_y.setdefault(y, []).append(w)
+
+                pending_desc: Optional[str] = None
+                for y in sorted(by_y.keys()):
+                    row = by_y[y]
+                    row_text = " ".join(w["text"] for w in row).strip()
+                    if TOTALS_STOP_WORDS.search(row_text):
+                        break
+                    row_obj: Dict[str, Any] = {}
+                    for w in row:
+                        mid = (w["x0"] + w["x1"]) / 2.0
+                        best = None
+                        bestd = 1e9
+                        for (x0, x1, label) in header_spans:
+                            cx = (x0 + x1) / 2.0
+                            d = abs(mid - cx)
+                            if d < bestd:
+                                bestd = d
+                                best = label
+                        if best:
+                            row_obj.setdefault(best, [])
+                            row_obj[best].append(w["text"])
+                    row_obj = {k: " ".join(v).strip() for k, v in row_obj.items()}
+
+                    non_desc_keys = [
+                        k for k in row_obj.keys() if k != "item_description" and row_obj[k]
+                    ]
+                    if (
+                        "item_description" in row_obj
+                        and row_obj.get("item_description")
+                        and not non_desc_keys
+                    ):
+                        if items:
+                            items[-1]["item_description"] = (
+                                f"{items[-1].get('item_description','')} {row_obj['item_description']}"
+                            ).strip()
+                        else:
+                            pending_desc = row_obj["item_description"]
+                        continue
+                    if pending_desc and "item_description" in row_obj:
+                        row_obj["item_description"] = (
+                            f"{pending_desc} {row_obj['item_description']}"
+                        ).strip()
+                        pending_desc = None
+
+                    row_norm = self._normalize_line_item_fields([row_obj], doc_type)[0]
+                    for k in [
+                        "quantity",
+                        "unit_price",
+                        "line_amount",
+                        "tax_percent",
+                        "tax_amount",
+                        "total_amount_incl_tax",
+                        "line_total",
+                        "total_amount",
+                    ]:
+                        if k in row_norm:
+                            row_norm[k] = self._clean_numeric(row_norm[k])
+                    items.append(row_norm)
+        return items
+
+    def _extract_line_items_ocr_grid(
+        self, file_bytes: bytes, doc_type: str
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        warnings: List[str] = []
+        items: List[Dict[str, Any]] = []
+        if pytesseract is None or Image is None:
+            warnings.append("ocr-unavailable")
+            return items, warnings
+        if fitz is None:
+            warnings.append("pymupdf-missing")
+            return items, warnings
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+        except Exception as exc:
+            warnings.append("ocr-open-failed")
+            logger.debug("PyMuPDF open failed for OCR grid: %s", exc)
+            return items, warnings
+
+        try:
+            whitespace_positions: List[float] = []
+            page_lines: List[List[str]] = []
+            for page_index in range(doc.page_count):
+                page = doc.load_page(page_index)
+                mat = fitz.Matrix(4, 4)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes(
+                    "RGB" if pix.n < 4 else "RGBA",
+                    [pix.width, pix.height],
+                    pix.samples,
+                )
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                text = pytesseract.image_to_string(img)
+                line_candidates = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+                page_lines.append(line_candidates)
+                for line in line_candidates:
+                    for match in re.finditer(r"\s{2,}", line):
+                        pos = match.start() / max(1, len(line))
+                        whitespace_positions.append(pos)
+
+            boundaries: List[float] = []
+            if whitespace_positions:
+                hist, edges = np.histogram(
+                    whitespace_positions, bins=min(12, len(whitespace_positions))
+                )
+                peak_indices = np.argsort(hist)[-4:]
+                boundaries = sorted(
+                    {
+                        (edges[i] + edges[i + 1]) / 2
+                        for i in peak_indices
+                        if i < len(edges) - 1
+                    }
+                )
+
+            column_targets = [
+                "item_description",
+                "quantity",
+                "unit_price",
+                "line_amount",
+                "total_amount",
+            ]
+            for lines in page_lines:
+                for line in lines:
+                    if TOTALS_STOP_WORDS.search(line):
+                        continue
+                    splits = re.split(r"\s{2,}", line)
+                    if len(splits) == 1 and boundaries:
+                        indices = [int(round(b * len(line))) for b in boundaries]
+                        pieces: List[str] = []
+                        start = 0
+                        for boundary in indices:
+                            boundary = max(boundary, start)
+                            pieces.append(line[start:boundary].strip())
+                            start = boundary
+                        pieces.append(line[start:].strip())
+                    else:
+                        pieces = [segment.strip() for segment in splits if segment.strip()]
+                    if not pieces:
+                        continue
+                    record: Dict[str, Any] = {}
+                    for idx, piece in enumerate(pieces):
+                        if idx >= len(column_targets):
+                            target = column_targets[-1]
+                        else:
+                            target = column_targets[idx]
+                        record.setdefault(target, piece)
+                    if "item_description" not in record:
+                        continue
+                    items.append(record)
+        except Exception as exc:
+            warnings.append("ocr-grid-error")
+            logger.debug("OCR grid extraction failed: %s", exc)
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if items:
+            items = self._normalize_line_item_fields(items, doc_type)
+        return items, warnings
 
     def _map_table_headers(self, headers: List[Any]) -> Dict[int, str]:
         mapping: Dict[int, str] = {}
@@ -1984,51 +2477,82 @@ class DataExtractionAgent(BaseAgent):
     def _prepare_llm_document(self, text: str, doc_type: str, max_chars: int = 7000) -> str:
         if not text:
             return ""
-        collapsed = re.sub(r"\s+", " ", text).strip()
-        if len(collapsed) <= max_chars:
-            return collapsed
 
-        snippets: List[str] = []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if not lines:
+            return collapsed[:max_chars]
+
+        snippets: List[Tuple[str, str]] = []
+        seen_segments: set[str] = set()
         consumed = 0
 
-        def _append(segment: str) -> None:
+        def _append(label: str, segment: str) -> None:
             nonlocal consumed
-            segment = re.sub(r"\s+", " ", segment).strip()
-            if not segment:
+            cleaned_lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+            if not cleaned_lines:
                 return
-            if segment in snippets:
+            cleaned = "\n".join(cleaned_lines)
+            if cleaned in seen_segments:
                 return
             remaining = max_chars - consumed
             if remaining <= 0:
                 return
-            if len(segment) > remaining:
-                segment = segment[:remaining]
-            snippets.append(segment)
-            consumed += len(segment) + 1
+            if len(cleaned) > remaining:
+                cleaned = cleaned[:remaining]
+            snippets.append((label, cleaned))
+            seen_segments.add(cleaned)
+            consumed += len(cleaned) + len(label) + 4
 
-        head_span = max_chars // 3
-        _append(collapsed[:head_span])
+        header_limit = max(1, max_chars // 3)
+        header_lines = lines[: min(len(lines), 40)]
+        if header_lines:
+            header_text = "\n".join(header_lines)
+            _append("HEADER SECTION", header_text[:header_limit])
 
         lowered = text.lower()
-        keywords = self._schema_keywords(doc_type)
-        if keywords:
-            for keyword in keywords:
-                idx = lowered.find(keyword)
-                if idx == -1:
-                    continue
-                start = max(0, idx - 200)
-                end = min(len(text), idx + 400)
-                _append(text[start:end])
-                if consumed >= (max_chars * 2) // 3:
-                    break
+        keyword_candidates: List[str] = list(self._schema_keywords(doc_type))
+        keyword_candidates.extend(DOC_TYPE_KEYWORDS.get(doc_type, []))
+        keyword_candidates.extend(DOC_TYPE_EXTRA_KEYWORDS.get(doc_type, []))
+        keyword_candidates.extend(["supplier", "vendor"])
 
-        tail_span = max_chars // 4
-        _append(collapsed[-tail_span:])
+        keywords: List[str] = []
+        seen_kw: set[str] = set()
+        for candidate in keyword_candidates:
+            candidate_lower = candidate.lower()
+            if len(candidate_lower) <= 2 or candidate_lower in seen_kw:
+                continue
+            seen_kw.add(candidate_lower)
+            keywords.append(candidate_lower)
+
+        for keyword in keywords:
+            idx = lowered.find(keyword)
+            if idx == -1:
+                continue
+            start = max(0, idx - 240)
+            end = min(len(text), idx + 360)
+            label_keyword = keyword.replace("_", " ")[:32].upper()
+            _append(f"CONTEXT NEAR '{label_keyword}'", text[start:end])
+            if consumed >= int(max_chars * 0.8):
+                break
+
+        if consumed < int(max_chars * 0.85):
+            midpoint = len(text) // 2
+            span = max_chars // 6
+            body_start = max(0, midpoint - span)
+            body_end = min(len(text), midpoint + span)
+            _append("BODY SECTION", text[body_start:body_end])
+
+        footer_limit = max(1, max_chars // 3)
+        footer_lines = lines[-min(len(lines), 40) :]
+        if footer_lines:
+            footer_text = "\n".join(footer_lines)
+            _append("FOOTER SECTION", footer_text[-footer_limit:])
 
         if not snippets:
             return collapsed[:max_chars]
 
-        merged = "\n".join(snippets)
+        merged = "\n---\n".join(f"{label}:\n{segment}" for label, segment in snippets)
         if len(merged) > max_chars:
             merged = merged[:max_chars]
         return merged
@@ -2127,7 +2651,9 @@ class DataExtractionAgent(BaseAgent):
 
         return header_df, line_df, cleaned_notes
 
-    def _extract_structured_data(self, text: str, file_bytes: bytes, doc_type: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    def _extract_structured_data(
+        self, text: str, file_bytes: bytes, doc_type: str
+    ) -> StructuredExtractionResult:
         """
         Custom structured data extraction that prioritises deterministic methods and
         avoids heavy LLM calls for faster and more consistent results.
@@ -2156,6 +2682,9 @@ class DataExtractionAgent(BaseAgent):
         # 1) LLM-guided structural extraction to capture contextual values first
         header: Dict[str, Any] = {}
         line_items: List[Dict[str, Any]] = []
+        table_method: Optional[str] = None
+        table_warnings: List[str] = []
+        field_sources: Dict[str, str] = {}
         llm_structured = self._llm_structured_extraction(text, doc_type)
         llm_header = self._normalize_header_fields(
             (llm_structured.get("header_data") if isinstance(llm_structured, dict) else {})
@@ -2163,6 +2692,7 @@ class DataExtractionAgent(BaseAgent):
             doc_type,
         )
         if llm_header:
+            before_keys = set(header.keys())
             header = self._merge_record_fields(header, llm_header)
             confidence = header.setdefault("_field_confidence", {})
             llm_conf = self._confidence_from_method("llm_structured")
@@ -2170,6 +2700,9 @@ class DataExtractionAgent(BaseAgent):
                 if key.startswith("_"):
                     continue
                 confidence[key] = max(confidence.get(key, 0.0), llm_conf)
+            gained = set(header.keys()) - before_keys
+            for key in gained:
+                field_sources.setdefault(key, "llm_structured")
         llm_line_items = []
         if isinstance(llm_structured, dict):
             raw_items = llm_structured.get("line_items") or []
@@ -2193,23 +2726,36 @@ class DataExtractionAgent(BaseAgent):
         # 2) Heuristic header extraction layered on top of LLM results
         try:
             header_regex = self._extract_header_regex(text, doc_type) or {}
-            header = self._merge_record_fields(
-                header,
-                self._normalize_header_fields(header_regex, doc_type),
-            )
+            normalized = self._normalize_header_fields(header_regex, doc_type)
+            before_keys = set(header.keys())
+            header = self._merge_record_fields(header, normalized)
+            gained = set(header.keys()) - before_keys
+            if gained:
+                field_sources.update({key: "regex" for key in gained})
+                logger.info("header_source=regex fields=%s", sorted(gained))
         except Exception:
-            pass
+            logger.debug("Regex header extraction failed", exc_info=True)
         try:
             header_layout = self._parse_header(text, file_bytes)
+            before_keys = set(header.keys())
             header = self._merge_record_fields(header, header_layout)
+            gained = set(header.keys()) - before_keys
+            if gained:
+                field_sources.update({key: "layout" for key in gained})
+                logger.info("header_source=layout fields=%s", sorted(gained))
         except Exception:
-            pass
+            logger.debug("Layout header extraction failed", exc_info=True)
         try:
             ner_header = self._extract_header_with_ner(text)
             if ner_header:
+                before_keys = set(header.keys())
                 header = self._merge_record_fields(header, ner_header)
+                gained = set(header.keys()) - before_keys
+                if gained:
+                    field_sources.update({key: "ner" for key in gained})
+                    logger.info("header_source=ner fields=%s", sorted(gained))
         except Exception:
-            pass
+            logger.debug("NER header extraction failed", exc_info=True)
 
         try:
             structured = extract_structured_content(text, doc_type)
@@ -2241,14 +2787,25 @@ class DataExtractionAgent(BaseAgent):
         # 3) Line item extraction: table detection then regex fallback
         try:
             if file_bytes:
-                line_items = self._extract_line_items_from_pdf_tables(file_bytes, doc_type) or []
-        except Exception:
-            line_items = []
+                extracted, method, warnings = self._extract_line_items_from_pdf_tables(
+                    file_bytes, doc_type
+                )
+                if extracted:
+                    line_items = extracted
+                table_method = method or table_method
+                table_warnings.extend(warnings)
+        except Exception as exc:
+            table_warnings.append("table_extraction_exception")
+            logger.debug("Table extraction failed: %s", exc)
         if not line_items:
             try:
-                line_items = self._extract_line_items_regex(text, doc_type) or []
-            except Exception:
-                line_items = []
+                regex_items = self._extract_line_items_regex(text, doc_type) or []
+                if regex_items:
+                    line_items = regex_items
+                    table_method = table_method or "regex-lines"
+            except Exception as exc:
+                table_warnings.append("regex_line_extract_exception")
+                logger.debug("Regex line extraction failed: %s", exc)
 
         # Normalise and clean numeric fields
         if line_items:
@@ -2285,9 +2842,15 @@ class DataExtractionAgent(BaseAgent):
             header = self._enrich_contract_fields(text, header)
 
         # 6) Align with schema and cast values
-        header_df, header_missing, header_extra = self._build_dataframe_from_records(header, doc_type, "header")
+        header_df, header_missing, header_extra = self._build_dataframe_from_records(
+            header, doc_type, "header"
+        )
+        header_df_out = header_df.copy()
         header = self._dataframe_to_header(header_df)
-        line_df, line_missing, line_extra = self._build_dataframe_from_records(line_items, doc_type, "line_items")
+        line_df, line_missing, line_extra = self._build_dataframe_from_records(
+            line_items, doc_type, "line_items"
+        )
+        line_df_out = line_df.copy()
         line_items = self._dataframe_to_records(line_df)
         header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
@@ -2313,8 +2876,33 @@ class DataExtractionAgent(BaseAgent):
             "notes": notes,
             "confidence": confidence,
         }
+        schema_notes = self._schema_verification_notes(
+            doc_type, header_missing, header_extra, line_missing, line_extra
+        )
+        if schema_notes:
+            notes.extend(schema_notes)
         self._log_structured_analysis(doc_type, header, line_items)
-        return header, line_items
+        report = {
+            "table_method": table_method or "none",
+            "table_warnings": table_warnings,
+            "header_missing": header_missing,
+            "line_missing": line_missing,
+            "validation_notes": notes,
+            "quality_score": confidence,
+            "field_confidence": header.get("_field_confidence", {}),
+            "field_sources": field_sources,
+            "line_items_detected": len(line_items),
+            "fields_failed": sorted(set(header_missing + line_missing)),
+        }
+        if schema_notes:
+            report["manual_review"] = schema_notes
+        return StructuredExtractionResult(
+            header=header,
+            line_items=line_items,
+            header_df=header_df_out,
+            line_df=line_df_out,
+            report=report,
+        )
 
     def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
         """Run a single LLM pass to capture field-level context for the document."""
@@ -2343,6 +2931,14 @@ class DataExtractionAgent(BaseAgent):
             f"Header fields: {header_field_str}",
             f"Line item fields: {line_field_str}",
         ]
+        prompt_parts.append(SUPPLIER_EXTRACTION_GUIDANCE)
+        extra_instruction = DOC_TYPE_EXTRA_INSTRUCTIONS.get(doc_type)
+        if extra_instruction:
+            prompt_parts.append(extra_instruction)
+        prompt_parts.append(
+            "If a supplier or contracting party name appears anywhere in the header, footer, or signature blocks, "
+            "capture it instead of leaving supplier fields null."
+        )
         if schema_context:
             prompt_parts.append(
                 "Schema guidance sourced from procurement_table_reference.md:\n" + schema_context

@@ -178,7 +178,7 @@ def test_data_flow_manager_builds_graph_and_persists():
         assert isinstance(summary, str) and summary.strip()
         mapping_summary = point.payload.get("mapping_summary")
         assert isinstance(mapping_summary, list) and mapping_summary
-        assert any("proc." in statement for statement in mapping_summary)
+        assert all("proc." not in statement for statement in mapping_summary)
 
 
 def test_supplier_flow_payload_is_trimmed_below_limit(monkeypatch):

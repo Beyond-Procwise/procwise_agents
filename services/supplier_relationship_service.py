@@ -171,7 +171,8 @@ class SupplierRelationshipService:
             end = contracts.get("latest_end_date")
             suffix = f" ending by {end}" if end else ""
             statements.append(
-                f"Contracts table holds {int(contracts['count'])} record{'s' if contracts['count'] != 1 else ''}{ids}{suffix}."
+                f"Company contract records show {int(contracts['count'])} agreement"
+                f"{'s' if contracts['count'] != 1 else ''}{ids}{suffix}."
             )
 
         purchase_orders = flow.get("purchase_orders") if isinstance(flow.get("purchase_orders"), Mapping) else {}
@@ -182,7 +183,7 @@ class SupplierRelationshipService:
             recent = purchase_orders.get("latest_order_date")
             suffix = f" latest order {recent}" if recent else ""
             statements.append(
-                f"Purchase orders reference the supplier via supplier_id across {int(purchase_orders['count'])} order"
+                f"Purchase order records link to the supplier identifier across {int(purchase_orders['count'])} order"
                 f"{'s' if purchase_orders['count'] != 1 else ''}{ids}{total_clause}{suffix}."
             )
 
@@ -194,7 +195,7 @@ class SupplierRelationshipService:
             recent = invoices.get("latest_invoice_date")
             suffix = f" latest invoice {recent}" if recent else ""
             statements.append(
-                f"Invoices link back to purchase orders through po_id covering {int(invoices['count'])} invoice"
+                f"Accounts payable records connect to the supplier's purchase orders across {int(invoices['count'])} invoice"
                 f"{'s' if invoices['count'] != 1 else ''}{ids}{total_clause}{suffix}."
             )
 
@@ -204,7 +205,7 @@ class SupplierRelationshipService:
             total = quotes.get("total_value_gbp")
             total_clause = f" valued at {total:,.2f} GBP" if isinstance(total, (int, float)) and total else ""
             statements.append(
-                f"Quotes catalogue {int(quotes['count'])} submission{'s' if quotes['count'] != 1 else ''}{ids}{total_clause}."
+                f"Quote exchanges capture {int(quotes['count'])} submission{'s' if quotes['count'] != 1 else ''}{ids}{total_clause}."
             )
 
         products = flow.get("products") if isinstance(flow.get("products"), Mapping) else {}

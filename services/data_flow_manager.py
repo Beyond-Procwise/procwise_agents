@@ -1790,7 +1790,7 @@ class DataFlowManager:
                 latest = contracts.get("latest_end_date")
                 timeline = f" ending by {latest}" if latest else ""
                 statements.append(
-                    f"{supplier_display} links to `proc.contracts` via `supplier_id`, covering {int(contract_count)} contract"
+                    f"Company contract records link to {supplier_display}, covering {int(contract_count)} contract"
                     f"{'s' if contract_count != 1 else ''}{ids_clause}{timeline}."
                 )
 
@@ -1804,7 +1804,7 @@ class DataFlowManager:
                 latest = purchase_orders.get("latest_order_date")
                 timeline = f" with the latest order on {latest}" if latest else ""
                 statements.append(
-                    f"Purchase orders in `proc.purchase_order_agent` reference {supplier_display} via `supplier_id`, covering {int(po_count)} order"
+                    f"Operational purchase orders reference {supplier_display} via the shared supplier identifier, covering {int(po_count)} order"
                     f"{'s' if po_count != 1 else ''}{ids_clause}{value_clause}{timeline}."
                 )
 
@@ -1818,7 +1818,7 @@ class DataFlowManager:
                 latest = invoices.get("latest_invoice_date")
                 timeline = f" with the latest invoice on {latest}" if latest else ""
                 statements.append(
-                    f"Invoices in `proc.invoice_agent` connect to {supplier_display}'s purchase orders via `po_id`, covering {int(invoice_count)} invoice"
+                    f"Invoice documents trace back to {supplier_display}'s purchase orders via purchase order references, covering {int(invoice_count)} invoice"
                     f"{'s' if invoice_count != 1 else ''}{ids_clause}{value_clause}{timeline}."
                 )
 
@@ -1830,7 +1830,7 @@ class DataFlowManager:
                 total_value = self._safe_float(quotes.get("total_value_gbp"))
                 value_clause = f" valued at {total_value:,.2f} GBP" if total_value else ""
                 statements.append(
-                    f"Quotes in `proc.quote_agent` align with {supplier_display} through shared supplier details, covering {int(quote_count)} quote"
+                    f"Quote interactions with {supplier_display} capture {int(quote_count)} proposal"
                     f"{'s' if quote_count != 1 else ''}{ids_clause}{value_clause}."
                 )
 
@@ -1852,7 +1852,7 @@ class DataFlowManager:
                         highlighted.append(desc)
                 if highlighted:
                     statements.append(
-                        f"Line items in `proc.po_line_items_agent` join on `po_id` to {supplier_display}'s purchase orders, highlighting {', '.join(highlighted)}."
+                        f"Purchase order line items for {supplier_display} highlight {', '.join(highlighted)}."
                     )
             unique = products.get("unique_items")
             if isinstance(unique, (int, float)) and unique:
