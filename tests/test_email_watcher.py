@@ -169,14 +169,12 @@ def test_poll_once_continues_until_all_filters_match():
         return list(messages)
 
     watcher = _make_watcher(nick, loader=loader)
-
     results = watcher.poll_once(
         match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-2"}
     )
 
     assert [result["supplier_id"] for result in results] == ["SUP-2"]
     assert len(watcher.supplier_agent.contexts) == 2
-
 
 def test_poll_once_retries_until_target_found(monkeypatch):
     nick = DummyNick()
