@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # ``nomic-embed-text`` offers competitive retrieval quality with a compact
     # footprint (768 dimensions) and is optimised for procurement-style
     # documents, making it a better default for document extraction pipelines.
-    embedding_model: str = "nomic-embed-text"
+    embedding_model: str = "multi-qa-mpnet-base-dot-v1"
     vector_size: int = 768
     reranker_model: str = Field(
         default="cross-encoder/ms-marco-MiniLM-L-12-v2", env="RERANKER_MODEL"
