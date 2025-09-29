@@ -63,7 +63,7 @@ class Orchestrator:
         "comparisons": "quote_comparison",
     }
 
-    def __init__(self, agent_nick):
+    def __init__(self, agent_nick, *, training_endpoint=None):
         # Ensure GPU environment is initialised before any agent execution.
         # ``configure_gpu`` is idempotent so repeated calls are safe and allow
         # both the orchestrator and individual agents to run on the same
@@ -79,7 +79,10 @@ class Orchestrator:
         self.routing_engine = agent_nick.routing_engine
         self.routing_model = self.routing_engine.routing_model
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
-        self.backend_scheduler = BackendScheduler.ensure(agent_nick)
+        self.model_training_endpoint = training_endpoint
+        self.backend_scheduler = BackendScheduler.ensure(
+            agent_nick, training_endpoint=training_endpoint
+        )
         self.event_bus = get_event_bus()
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -464,34 +467,21 @@ class Orchestrator:
         return dict(policies)
 
     def _get_model_training_service(self):
-        try:
-            from services.model_training_service import ModelTrainingService
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to import model training service")
+        endpoint = getattr(self, "model_training_endpoint", None)
+        if endpoint is None:
             return None
 
-        service = getattr(self.agent_nick, "model_training_service", None)
         settings = getattr(self.agent_nick, "settings", None)
         learning_enabled = bool(getattr(settings, "enable_learning", False))
-        if not isinstance(service, ModelTrainingService):
-            try:
-                service = ModelTrainingService(
-                    self.agent_nick, auto_subscribe=learning_enabled
-                )
-                setattr(self.agent_nick, "model_training_service", service)
-            except Exception:  # pragma: no cover - defensive
-                logger.exception("Failed to initialise model training service")
-                return None
         try:
-            if learning_enabled:
-                service.enable_workflow_capture()
-            else:
-                service.disable_workflow_capture()
+            endpoint.configure_capture(learning_enabled)
         except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                "Failed to synchronise workflow capture on model training service"
-            )
-        return service
+            logger.exception("Failed to synchronise workflow capture via training endpoint")
+        try:
+            return endpoint.get_service()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to resolve model training service from endpoint")
+            return None
 
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:

@@ -3,6 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Optional
 
+from services.model_training_endpoint import ModelTrainingEndpoint
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -40,32 +41,54 @@ class BackendScheduler:
     _instance_lock = threading.Lock()
     _poll_seconds: float = 60.0
 
-    def __init__(self, agent_nick) -> None:
+    def __init__(
+        self,
+        agent_nick,
+        *,
+        training_endpoint: Optional[ModelTrainingEndpoint] = None,
+    ) -> None:
         self.agent_nick = agent_nick
         self._jobs: Dict[str, _ScheduledJob] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._relationship_scheduler = self._init_relationship_scheduler()
-        self._training_service = self._init_training_service()
+        self._training_endpoint = training_endpoint
         self._register_default_jobs()
         self.start()
 
     @classmethod
-    def ensure(cls, agent_nick) -> "BackendScheduler":
+    def ensure(
+        cls,
+        agent_nick,
+        *,
+        training_endpoint: Optional[ModelTrainingEndpoint] = None,
+    ) -> "BackendScheduler":
         with cls._instance_lock:
             if cls._instance is None:
-                cls._instance = cls(agent_nick)
+                cls._instance = cls(
+                    agent_nick, training_endpoint=training_endpoint
+                )
             else:
-                cls._instance._update_agent(agent_nick)
+                cls._instance._update_agent(
+                    agent_nick, training_endpoint=training_endpoint
+                )
         return cls._instance
 
-    def _update_agent(self, agent_nick) -> None:
+    def _update_agent(
+        self,
+        agent_nick,
+        *,
+        training_endpoint: Optional[ModelTrainingEndpoint] = None,
+    ) -> None:
         if self.agent_nick is agent_nick:
+            if training_endpoint is not None:
+                self._training_endpoint = training_endpoint
             return
         self.agent_nick = agent_nick
         self._relationship_scheduler = self._init_relationship_scheduler()
-        self._training_service = self._init_training_service()
+        if training_endpoint is not None:
+            self._training_endpoint = training_endpoint
 
     def start(self) -> None:
         with self._lock:
@@ -169,14 +192,11 @@ class BackendScheduler:
             logger.exception("Supplier relationship refresh dispatch failed")
 
     def _run_model_training(self) -> None:
-        service = self._training_service
-        if service is None:
-            service = self._init_training_service()
-            self._training_service = service
-        if service is None:
+        endpoint = self._resolve_training_endpoint()
+        if endpoint is None:
             return
         try:
-            service.dispatch_due_jobs()
+            endpoint.dispatch(force=False)
         except Exception:
             logger.exception("Model training dispatch failed")
 
@@ -193,31 +213,14 @@ class BackendScheduler:
             logger.exception("Failed to initialise SupplierRelationshipScheduler")
             return None
 
-    def _init_training_service(self):
+    def _resolve_training_endpoint(self) -> Optional[ModelTrainingEndpoint]:
+        endpoint = self._training_endpoint
+        if isinstance(endpoint, ModelTrainingEndpoint):
+            return endpoint
         try:
-            from services.model_training_service import ModelTrainingService
-
-            service = getattr(self.agent_nick, "model_training_service", None)
-            settings = getattr(self.agent_nick, "settings", None)
-            learning_enabled = bool(getattr(settings, "enable_learning", False))
-
-            if not isinstance(service, ModelTrainingService):
-                service = ModelTrainingService(
-                    self.agent_nick, auto_subscribe=learning_enabled
-                )
-                setattr(self.agent_nick, "model_training_service", service)
-
-            try:
-                if learning_enabled:
-                    service.enable_workflow_capture()
-                else:
-                    service.disable_workflow_capture()
-            except Exception:
-                logger.exception(
-                    "Failed to synchronise workflow capture state on training service"
-                )
-            return service
-
-        except Exception:
-            logger.exception("Failed to initialise ModelTrainingService")
+            endpoint = ModelTrainingEndpoint(self.agent_nick)
+            self._training_endpoint = endpoint
+            return endpoint
+        except Exception:  # pragma: no cover - defensive import/initialisation
+            logger.exception("Failed to initialise ModelTrainingEndpoint")
             return None
