@@ -103,6 +103,53 @@ def test_supplier_interaction_wait_for_response():
     assert calls["count"] == 1
 
 
+def test_wait_for_response_waits_until_payload_ready(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    batches = [
+        [
+            {
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "supplier_id": "S1",
+                "supplier_status": "processing",
+                "supplier_output": None,
+            }
+        ],
+        [
+            {
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "supplier_id": "S1",
+                "supplier_status": "success",
+                "supplier_output": {"price": 900},
+            }
+        ],
+    ]
+
+    calls = {"count": 0}
+
+    def poll_once(limit=None, match_filters=None):
+        calls["count"] += 1
+        return batches.pop(0) if batches else []
+
+    watcher = SimpleNamespace(poll_once=poll_once)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
+
+    result = agent.wait_for_response(
+        watcher=watcher,
+        timeout=5,
+        poll_interval=0,
+        rfq_id="RFQ-20240101-abcd1234",
+        supplier_id="S1",
+    )
+
+    assert result is not None
+    assert result["supplier_status"] == "success"
+    assert result["supplier_output"]["price"] == 900
+    assert calls["count"] == 2
+
+
 def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypatch):
     nick = DummyNick()
     nick.settings.email_response_max_attempts = 3

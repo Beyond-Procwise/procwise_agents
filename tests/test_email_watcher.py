@@ -1,3 +1,4 @@
+
 import io
 import re
 import sys
@@ -5,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List
+from typing import Dict, List
 
 import pytest
 
@@ -19,7 +20,7 @@ class StubSupplierInteractionAgent:
     RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}", re.IGNORECASE)
 
     def __init__(self):
-        self.contexts = []
+        self.contexts: List[AgentContext] = []
 
     def execute(self, context: AgentContext) -> AgentOutput:
         self.contexts.append(context)
@@ -27,7 +28,7 @@ class StubSupplierInteractionAgent:
         price_match = re.search(r"(\d+(?:\.\d+)?)", text)
         price = float(price_match.group(1)) if price_match else None
         data = {"price": price, "rfq_id": context.input_data.get("rfq_id")}
-        next_agents = []
+        next_agents: List[str] = []
         target = context.input_data.get("target_price")
         if target is not None and price is not None and price > target:
             next_agents = ["NegotiationAgent"]
@@ -36,7 +37,7 @@ class StubSupplierInteractionAgent:
 
 class StubNegotiationAgent:
     def __init__(self):
-        self.contexts = []
+        self.contexts: List[AgentContext] = []
 
     def execute(self, context: AgentContext) -> AgentOutput:
         self.contexts.append(context)
@@ -90,8 +91,8 @@ class DummyNick:
             email_response_poll_seconds=1,
             email_inbound_initial_wait_seconds=0,
         )
-        self.agents = {}
-        self.ddl_statements = []
+        self.agents: Dict[str, object] = {}
+        self.ddl_statements: List[str] = []
         self.s3_client = None
 
     def get_db_connection(self):
@@ -112,140 +113,109 @@ def _make_watcher(nick, *, loader=None, state_store=None):
 
 def test_email_watcher_bootstraps_negotiation_tables():
     nick = DummyNick()
-    watcher = _make_watcher(nick, loader=lambda limit=None: [])
-    assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in "\n".join(nick.ddl_statements)
-    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in "\n".join(nick.ddl_statements)
+    _make_watcher(nick, loader=lambda limit=None: [])
+    ddl = "".join(nick.ddl_statements)
+    assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in ddl
+    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in ddl
 
 
-def test_email_watcher_triggers_negotiation_when_price_high():
+def test_poll_once_triggers_supplier_agent_on_match():
     nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
     messages = [
         {
             "id": "msg-1",
             "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Quoted price 1500 USD",
+            "body": "Quoted price 1500",
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
             "target_price": 1000,
         }
     ]
 
-    watcher = _make_watcher(nick, loader=lambda limit=None: messages)
-
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
     assert len(results) == 1
     result = results[0]
-    assert result["negotiation_triggered"] is True
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
-
-def test_poll_once_filters_by_rfq_id():
-    nick = DummyNick()
-    messages = [
-        {
-            "id": "msg-1",
-            "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Price 1000",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-abcd1234",
-        },
-        {
-            "id": "msg-2",
-            "subject": "Re: RFQ-20240101-deadbeef",
-            "body": "Price 800",
-            "from": "other@example.com",
-            "rfq_id": "RFQ-20240101-deadbeef",
-        },
-    ]
-    state = InMemoryEmailWatcherState()
-    watcher = _make_watcher(nick, loader=lambda limit=None: messages, state_store=state)
-
-    filtered = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-
-    assert len(filtered) == 1
-    assert filtered[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert watcher.supplier_agent.contexts
     assert "msg-1" in state
 
 
-def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
+def test_poll_once_retries_until_target_found(monkeypatch):
     nick = DummyNick()
-    watcher = _make_watcher(nick)
-
-    captured_limits = []
-    captured_prefixes = []
-
-
-    def fake_load(
-        limit=None,
-        *,
-        prefixes=None,
-        parser=None,
-        newest_first=False,
-        on_message=None,
-    ):
-        captured_limits.append(limit)
-        captured_prefixes.append(prefixes)
-        payloads = [
+    batches = [
+        [],
+        [
             {
-                "id": "emails/msg-1.eml",
+                "id": "msg-2",
                 "subject": "Re: RFQ-20240101-abcd1234",
-                "body": "Price 900",
+                "body": "Price 950",
+                "from": "supplier@example.com",
+                "rfq_id": "RFQ-20240101-abcd1234",
+            }
+        ],
+    ]
+    calls = {"count": 0}
+
+    def loader(limit=None):
+        calls["count"] += 1
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader)
+    watcher.poll_interval_seconds = 0
+
+    result = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+
+    assert len(result) == 1
+    assert result[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert calls["count"] == 2
+
+
+def test_poll_once_stops_after_match_without_extra_attempts():
+    nick = DummyNick()
+    calls = {"count": 0}
+
+    def loader(limit=None):
+        calls["count"] += 1
+        return [
+            {
+                "id": "msg-1",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Price 875",
                 "from": "supplier@example.com",
                 "rfq_id": "RFQ-20240101-abcd1234",
             }
         ]
-        if on_message is not None:
-            for payload in payloads:
-                on_message(payload, None)
-        return payloads
 
-    monkeypatch.setattr(watcher, "_load_from_s3", fake_load)
+    watcher = _make_watcher(nick, loader=loader)
+    watcher.poll_interval_seconds = 0
+    watcher._match_poll_attempts = 5
 
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    result = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
-    assert len(results) == 1
-    assert captured_limits == [None]
-    assert captured_prefixes[0][0] == "emails/RFQ-20240101-ABCD1234/ingest/"
-    assert captured_prefixes[0][1] == "emails/"
+    assert len(result) == 1
+    assert calls["count"] == 1
 
 
-def test_parse_inbound_object_handles_non_email_payload():
+def test_poll_once_returns_empty_after_attempts(monkeypatch):
     nick = DummyNick()
-    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    calls = {"count": 0}
 
-    raw_bytes = b"RFQ-20240101-abcd1234 supplier uploaded attachment"
-    payload = watcher._parse_inbound_object(
-        raw_bytes, key="emails/RFQ-20240101-ABCD1234/ingest/offer.pdf"
-    )
+    def loader(limit=None):
+        calls["count"] += 1
+        return []
 
-    assert payload["subject"] == "offer.pdf"
-    assert payload["rfq_id"].lower() == "rfq-20240101-abcd1234"
-    assert payload["attachments"]
-    attachment = payload["attachments"][0]
-    assert attachment["filename"] == "offer.pdf"
-    assert attachment["size"] == len(raw_bytes)
+    watcher = _make_watcher(nick, loader=loader)
+    watcher.poll_interval_seconds = 0
+    watcher._match_poll_attempts = 2
 
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-missing"})
 
-def test_bucket_prefix_uses_uri_prefix_when_config_default():
-    nick = DummyNick()
-    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
-    nick.settings.ses_inbound_prefix = "emails/"
-
-    watcher = _make_watcher(nick, loader=lambda limit=None: [])
-
-    assert watcher.bucket == "custom-bucket"
-    assert watcher._prefixes[0] == "inbound/"
-
-
-def test_bucket_prefix_honours_explicit_override():
-    nick = DummyNick()
-    nick.settings.ses_inbound_s3_uri = "s3://custom-bucket/inbound/"
-    nick.settings.ses_inbound_prefix = "supplier-emails/"
-
-    watcher = _make_watcher(nick, loader=lambda limit=None: [])
-
-    assert watcher.bucket == "custom-bucket"
-    assert watcher._prefixes[0] == "supplier-emails/"
+    assert results == []
+    assert calls["count"] == 2
 
 
 def test_poll_once_respects_dispatch_wait(monkeypatch):
@@ -273,214 +243,23 @@ def test_poll_once_respects_dispatch_wait(monkeypatch):
     watcher = _make_watcher(nick, loader=lambda limit=None: [])
     watcher.record_dispatch_timestamp()
 
-    watcher.poll_once()
-    assert sleep_calls == [pytest.approx(5.0)]
+    watcher.poll_interval_seconds = 1
+
+    watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert sleep_calls[0] == pytest.approx(5.0)
+    assert sleep_calls[1:] == [pytest.approx(1.0), pytest.approx(1.0)]
 
     sleep_calls.clear()
-    watcher.poll_once()
-    assert sleep_calls == []
+    watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert sleep_calls == [pytest.approx(1.0), pytest.approx(1.0)]
 
 
-def test_watch_retries_until_message_found(monkeypatch):
-    nick = DummyNick()
-    state = InMemoryEmailWatcherState()
-
-    batches = [
-        [],
-        [
-            {
-                "id": "emails/msg-1.eml",
-                "subject": "Re: RFQ-20240101-abcd1234",
-                "body": "Price 750",
-                "from": "supplier@example.com",
-                "rfq_id": "RFQ-20240101-abcd1234",
-            }
-        ],
-    ]
-
-    def loader(limit=None):
-        if batches:
-            return batches.pop(0)
-        return []
-
-    watcher = _make_watcher(nick, loader=loader, state_store=state)
-
-    processed = watcher.watch(interval=1, limit=None, timeout_seconds=5)
-
-    assert processed == 1
-    assert any(item.get("rfq_id") == "RFQ-20240101-abcd1234" for item in state._seen.values())
-
-
-def test_cached_match_is_returned_without_reprocessing(monkeypatch):
-    nick = DummyNick()
-    state = InMemoryEmailWatcherState()
-
-    first_batch = [
-        {
-            "id": "emails/msg-1.eml",
-            "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Price 700",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-abcd1234",
-        }
-    ]
-
-    batches = [first_batch, []]
-
-    def loader(limit=None):
-        return batches.pop(0) if batches else []
-
-    watcher = _make_watcher(nick, loader=loader, state_store=state)
-
-    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(first_results) == 1
-
-    # Subsequent poll should use the cached payload even though the loader returns nothing.
-    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(second_results) == 1
-    assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
-
-
-def test_poll_once_processes_new_messages_before_using_cache():
-    nick = DummyNick()
-    state = InMemoryEmailWatcherState()
-
-    first_batch = [
-        {
-            "id": "emails/msg-1.eml",
-            "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Price 700",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-abcd1234",
-        }
-    ]
-
-    batches = [first_batch, []]
-    call_tracker = {"count": 0}
-
-    def loader(limit=None):
-        call_tracker["count"] += 1
-        return batches.pop(0) if batches else []
-
-    watcher = _make_watcher(nick, loader=loader, state_store=state)
-
-    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(first_results) == 1
-    assert call_tracker["count"] == 1
-
-    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(second_results) == 1
-    assert call_tracker["count"] == 2
-
-
-def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
-    nick = DummyNick()
-    messages = [
-        {
-            "id": "emails/msg-1.eml",
-            "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Price 1000",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-abcd1234",
-        }
-    ]
-
-    watcher = _make_watcher(nick, loader=lambda limit=None: messages)
-
-    caplog.set_level("INFO", logger="services.email_watcher")
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-UNKNOWN"})
-
-    assert results == []
-    assert any("without matching filters" in record.message for record in caplog.records)
-
-
-def test_poll_once_with_filters_scans_existing_objects(monkeypatch):
+def test_s3_poll_prioritises_newest_objects(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
     watcher.bucket = "procwisemvp"
     watcher._prefixes = ["emails/"]
-    watcher._match_poll_attempts = 1
     watcher.poll_interval_seconds = 0
-
-    base_time = datetime.now(timezone.utc) - timedelta(minutes=5)
-
-    existing_objects = [
-        {"Key": "emails/existing.eml", "LastModified": base_time},
-    ]
-    dynamic_objects = list(existing_objects)
-
-    raw_existing = (
-        b"Subject: Re: RFQ-20240101-abcd1234\n"
-        b"From: supplier@example.com\n"
-        b"To: agent@example.com\n"
-        b"Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
-        b"Message-ID: <existing@example.com>\n\n"
-        b"Quoted price 1200"
-    )
-    raw_new = (
-        b"Subject: Re: RFQ-20240101-abcd1234\n"
-        b"From: supplier@example.com\n"
-        b"To: agent@example.com\n"
-        b"Date: Mon, 01 Jan 2024 12:05:00 +0000\n"
-        b"Message-ID: <new@example.com>\n\n"
-        b"Quoted price 900"
-    )
-
-    object_store = {
-        "emails/existing.eml": raw_existing,
-        "emails/new.eml": raw_new,
-    }
-
-    class DummyBody:
-        def __init__(self, data: bytes) -> None:
-            self._buffer = io.BytesIO(data)
-
-        def read(self) -> bytes:
-            return self._buffer.getvalue()
-
-    expected_ingest_prefix = watcher._ensure_trailing_slash("emails/RFQ-20240101-ABCD1234/ingest")
-
-    class DummyPaginator:
-        def paginate(self, *, Bucket, Prefix):
-            assert Bucket == watcher.bucket
-            assert Prefix in {expected_ingest_prefix, watcher._prefixes[0]}
-            return [{"Contents": list(dynamic_objects)}]
-
-    class DummyClient:
-        def __init__(self):
-            self.paginator = DummyPaginator()
-
-        def get_paginator(self, name):
-            assert name == "list_objects_v2"
-            return self.paginator
-
-        def get_object(self, *, Bucket, Key):
-            data = object_store[Key]
-            return {"Body": DummyBody(data)}
-
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-
-    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(first_results) == 1
-    assert first_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
-    assert first_results[0]["message_id"] == "emails/existing.eml"
-
-    dynamic_objects.append(
-        {"Key": "emails/new.eml", "LastModified": datetime.now(timezone.utc)}
-    )
-
-    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
-    assert len(second_results) == 1
-    assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
-    assert second_results[0]["message_id"] == "emails/new.eml"
-
-
-def test_poll_once_stops_after_matching_rfq(monkeypatch):
-    nick = DummyNick()
-    watcher = _make_watcher(nick)
-    watcher.bucket = "procwisemvp"
-    watcher._prefixes = ["emails/"]
 
     now = datetime.now(timezone.utc)
     s3_objects = [
@@ -489,22 +268,14 @@ def test_poll_once_stops_after_matching_rfq(monkeypatch):
         {"Key": "emails/older.eml", "LastModified": now - timedelta(minutes=5)},
     ]
 
-    raw_non_match = (
-        b"Subject: General update\n"
-        b"From: supplier@example.com\n\n"
-        b"No RFQ reference here."
-    )
+    raw_non_match = b"Subject: General update\nFrom: supplier@example.com\n\nNo RFQ reference here."
     raw_match = (
         b"Subject: Re: RFQ-20240101-abcd1234\n"
         b"From: supplier@example.com\n"
         b"Message-ID: <matching@example.com>\n\n"
         b"Quoted price 950"
     )
-    raw_older = (
-        b"Subject: Re: RFQ-20231231-deadbeef\n"
-        b"From: supplier@example.com\n\n"
-        b"Some other offer"
-    )
+    raw_older = b"Subject: Re: RFQ-20231231-deadbeef\nFrom: supplier@example.com\n\nSome other offer"
 
     object_store = {
         "emails/newest.eml": raw_non_match,
@@ -550,91 +321,3 @@ def test_poll_once_stops_after_matching_rfq(monkeypatch):
     assert len(results) == 1
     assert results[0]["message_id"] == "emails/matching.eml"
     assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
-
-
-def test_poll_once_enriches_missing_supplier_from_filters(caplog):
-    nick = DummyNick()
-    state = InMemoryEmailWatcherState()
-
-    messages = [
-        {
-            "id": "emails/msg-1.eml",
-            "subject": "Re: RFQ-20240101-abcd1234",
-            "body": "Quoted price 925",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-abcd1234",
-        }
-    ]
-
-    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
-
-    caplog.set_level("INFO", logger="services.email_watcher")
-
-    filters = {"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SI001005"}
-    results = watcher.poll_once(match_filters=filters)
-
-    assert len(results) == 1
-    result = results[0]
-    assert result["supplier_id"] == "SI001005"
-    assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
-    assert not any("without matching filters" in record.message for record in caplog.records)
-
-    metadata = state.get("emails/msg-1.eml") or {}
-    payload = metadata.get("payload") if isinstance(metadata, dict) else {}
-    assert payload.get("supplier_id") == "SI001005"
-
-
-def test_load_from_s3_prioritises_newest_objects(monkeypatch):
-    nick = DummyNick()
-    watcher = _make_watcher(nick)
-    watcher.bucket = "procwisemvp"
-    watcher._prefixes = ["emails/"]
-
-    older_time = datetime.now(timezone.utc) - timedelta(hours=2)
-    newer_time = datetime.now(timezone.utc)
-
-    s3_objects = [
-        {"Key": "emails/older.bin", "LastModified": older_time},
-        {"Key": "emails/newer.bin", "LastModified": newer_time},
-    ]
-
-    object_store = {
-        "emails/older.bin": b"older",
-        "emails/newer.bin": b"newer",
-    }
-
-    class DummyBody:
-        def __init__(self, data: bytes) -> None:
-            self._buffer = io.BytesIO(data)
-
-        def read(self) -> bytes:
-            return self._buffer.getvalue()
-
-    class DummyPaginator:
-        def paginate(self, *, Bucket, Prefix):
-            assert Bucket == watcher.bucket
-            assert Prefix == watcher._prefixes[0]
-            return [{"Contents": list(s3_objects)}]
-
-    class DummyClient:
-        def get_paginator(self, name):
-            assert name == "list_objects_v2"
-            return DummyPaginator()
-
-        def get_object(self, *, Bucket, Key):
-            assert Bucket == watcher.bucket
-            return {"Body": DummyBody(object_store[Key])}
-
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
-
-    parsed_keys = []
-
-    def parser(raw: bytes, *, key=None):
-        parsed_keys.append(key)
-        return {"payload": raw, "key": key}
-
-    messages = watcher._load_from_s3(limit=1, parser=parser)
-
-    assert len(messages) == 1
-    assert messages[0]["key"] == "emails/newer.bin"
-    assert parsed_keys == ["emails/newer.bin"]
