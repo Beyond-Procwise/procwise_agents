@@ -117,6 +117,9 @@ def test_email_watcher_bootstraps_negotiation_tables():
     ddl = "".join(nick.ddl_statements)
     assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in ddl
     assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in ddl
+    assert "CREATE TABLE IF NOT EXISTS proc.processed_emails" in ddl
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
+
 
 
 def test_poll_once_triggers_supplier_agent_on_match():
@@ -169,12 +172,14 @@ def test_poll_once_continues_until_all_filters_match():
         return list(messages)
 
     watcher = _make_watcher(nick, loader=loader)
+
     results = watcher.poll_once(
         match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-2"}
     )
 
     assert [result["supplier_id"] for result in results] == ["SUP-2"]
     assert len(watcher.supplier_agent.contexts) == 2
+
 
 def test_poll_once_retries_until_target_found(monkeypatch):
     nick = DummyNick()
@@ -204,6 +209,35 @@ def test_poll_once_retries_until_target_found(monkeypatch):
     assert len(result) == 1
     assert result[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
     assert calls["count"] == 2
+
+
+def test_poll_once_stops_future_polls_after_match():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    calls = {"count": 0}
+
+    message = {
+        "id": "msg-1",
+        "subject": "Re: RFQ-20240101-abcd1234",
+        "body": "Quoted price 1500",
+        "from": "supplier@example.com",
+        "rfq_id": "RFQ-20240101-ABCD1234",
+    }
+
+    def loader(limit=None):
+        calls["count"] += 1
+        return [message]
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+    watcher.poll_interval_seconds = 0
+
+    first = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+    assert first and first[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert calls["count"] == 1
+
+    second = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+    assert second == []
+    assert calls["count"] == 1
 
 
 def test_poll_once_stops_after_match_without_extra_attempts():
@@ -241,6 +275,7 @@ def test_poll_once_returns_empty_after_attempts(monkeypatch):
         return []
 
     watcher = _make_watcher(nick, loader=loader)
+
     watcher.poll_interval_seconds = 0
     watcher._match_poll_attempts = 2
 
@@ -353,3 +388,5 @@ def test_s3_poll_prioritises_newest_objects(monkeypatch):
     assert len(results) == 1
     assert results[0]["message_id"] == "emails/matching.eml"
     assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
+    assert watcher._last_watermark_key == "emails/newest.eml"
+    assert watcher._last_watermark_ts is not None

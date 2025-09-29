@@ -229,6 +229,7 @@ class SESEmailWatcher:
         # not fail on freshly provisioned databases.  The statements are safe
         # to run repeatedly thanks to ``IF NOT EXISTS`` guards.
         self._ensure_negotiation_tables()
+        self._ensure_processed_registry_table()
 
         self._validate_inbound_configuration(prefix_value)
 
@@ -260,6 +261,9 @@ class SESEmailWatcher:
             minimum=1,
         )
         self._processed_cache: OrderedDict[str, Dict[str, object]] = OrderedDict()
+        self._completed_targets: Set[str] = set()
+        self._last_watermark_ts: Optional[datetime] = None
+        self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
             getattr(self.settings, "email_match_poll_attempts", 3),
             default=3,
@@ -316,43 +320,77 @@ class SESEmailWatcher:
 
             match_found = False
 
-            def _process_candidate(message: Dict[str, object]) -> bool:
-                nonlocal match_found
-                matched, should_stop, rfq_matched = self._process_candidate_message(
-                    message,
-                    match_filters=filters,
-                    target_rfq_normalised=target_rfq_normalised,
-                    results=results,
-                    effective_limit=effective_limit,
+            if target_rfq_normalised and target_rfq_normalised in self._completed_targets:
+                logger.info(
+                    "RFQ %s already processed for mailbox %s; skipping poll",
+                    target_rfq_normalised,
+                    self.mailbox_address,
                 )
-                if matched or (rfq_matched and not filters):
-                    match_found = True
-                return should_stop
+                return []
 
             self._respect_post_dispatch_wait()
 
             max_attempts = self._match_poll_attempts if target_rfq_normalised else 1
             attempts = 0
+            total_candidates = 0
+            total_processed = 0
+
 
             while attempts < max_attempts and not match_found:
                 attempts += 1
                 try:
                     if self._custom_loader is not None:
                         messages = self._custom_loader(limit)
+                        candidate_batch = list(messages)
                         logger.info(
                             "Retrieved %d candidate message(s) from loader for mailbox %s",
-                            len(messages),
+                            len(candidate_batch),
                             self.mailbox_address,
                         )
-                        for message in messages:
-                            if _process_candidate(message):
+                        for message in candidate_batch:
+                            last_modified_hint = message.get("_last_modified")
+                            if isinstance(last_modified_hint, datetime):
+                                self._update_watermark(last_modified_hint, str(message.get("id") or ""))
+                            total_candidates += 1
+                            matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                                message,
+                                match_filters=filters,
+                                target_rfq_normalised=target_rfq_normalised,
+                                results=results,
+                                effective_limit=effective_limit,
+                            )
+                            if was_processed:
+                                total_processed += 1
+                            if matched or (rfq_matched and not filters):
+                                match_found = True
+                            if should_stop:
+
                                 break
                     else:
                         processed_batch: List[Dict[str, object]] = []
 
-                        def _on_message(parsed: Dict[str, object], *_args) -> bool:
+                        def _on_message(
+                            parsed: Dict[str, object],
+                            last_modified: Optional[datetime] = None,
+                        ) -> bool:
+                            nonlocal total_processed, total_candidates, match_found
+                            total_candidates += 1
                             processed_batch.append(parsed)
-                            return _process_candidate(parsed)
+                            matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                                parsed,
+                                match_filters=filters,
+                                target_rfq_normalised=target_rfq_normalised,
+                                results=results,
+                                effective_limit=effective_limit,
+                            )
+                            if last_modified is not None:
+                                self._update_watermark(last_modified, str(parsed.get("id") or ""))
+                            if was_processed:
+                                total_processed += 1
+                            if matched or (rfq_matched and not filters):
+                                match_found = True
+                            return should_stop
+
 
                         messages = self._load_messages(
                             limit,
@@ -368,7 +406,22 @@ class SESEmailWatcher:
                         )
                         if not filters:
                             for message in messages:
-                                if _process_candidate(message):
+                                last_modified_hint = message.get("_last_modified")
+                                if isinstance(last_modified_hint, datetime):
+                                    self._update_watermark(last_modified_hint, str(message.get("id") or ""))
+                                total_candidates += 1
+                                matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                                    message,
+                                    match_filters=filters,
+                                    target_rfq_normalised=target_rfq_normalised,
+                                    results=results,
+                                    effective_limit=effective_limit,
+                                )
+                                if was_processed:
+                                    total_processed += 1
+                                if matched or (rfq_matched and not filters):
+                                    match_found = True
+                                if should_stop:
                                     break
                 except Exception:  # pragma: no cover - network/runtime
                     logger.exception("Failed to load inbound SES messages")
@@ -389,12 +442,35 @@ class SESEmailWatcher:
                         self.poll_interval_seconds,
                     )
                     if self.poll_interval_seconds > 0:
-                        time.sleep(self.poll_interval_seconds)
+                        time.sleep(max(0.5, min(self.poll_interval_seconds, 5)))
 
-            if target_rfq_normalised and not match_found:
+            if target_rfq_normalised and match_found:
+                self._completed_targets.add(target_rfq_normalised)
+                if results:
+                    match_key = results[-1].get("message_id")
+                else:
+                    match_key = None
                 logger.info(
-                    "Completed S3 scan for mailbox %s without matching filters",
+                    "RFQ %s matched at %s — stopping watcher for mailbox %s",
+                    target_rfq_normalised,
+                    match_key or "<unknown>",
                     self.mailbox_address,
+                )
+                logger.info(
+                    "Scan summary for mailbox %s (candidates=%d, processed=%d, matched=True). Watermark=%s",
+                    self.mailbox_address,
+                    total_candidates,
+                    total_processed,
+                    self._format_watermark(),
+                )
+            else:
+                logger.info(
+                    "Completed scan for mailbox %s (candidates=%d, processed=%d, matched=%s). Watermark=%s",
+                    self.mailbox_address,
+                    total_candidates,
+                    total_processed,
+                    match_found,
+                    self._format_watermark(),
                 )
 
             return results
@@ -409,15 +485,28 @@ class SESEmailWatcher:
         target_rfq_normalised: Optional[str],
         results: List[Dict[str, object]],
         effective_limit: Optional[int],
-    ) -> Tuple[bool, bool, bool]:
+    ) -> Tuple[bool, bool, bool, bool]:
         message_id = str(message.get("id") or uuid.uuid4())
+        bucket = getattr(self, "bucket", None)
+        s3_key = message.get("id") if isinstance(message.get("id"), str) else message.get("s3_key")
+        etag = message.get("_s3_etag") or message.get("s3_etag")
+
         if self.state_store and message_id in self.state_store:
             logger.debug(
                 "Skipping previously processed message %s for mailbox %s",
                 message_id,
                 self.mailbox_address,
             )
-            return False, False
+            return False, False, False, False
+
+        if self._is_processed_in_registry(bucket, s3_key, etag):
+            logger.debug(
+                "Skipping S3 object %s (etag=%s) for mailbox %s; already processed",
+                s3_key,
+                etag,
+                self.mailbox_address,
+            )
+            return False, False, False, False
 
         try:
             processed, reason = self._process_message(message)
@@ -429,6 +518,7 @@ class SESEmailWatcher:
         processed_payload: Optional[Dict[str, object]] = None
         message_match = False
         rfq_match = False
+        was_processed = False
 
         if processed:
             processed_payload = self._record_processed_payload(message_id, processed)
@@ -446,6 +536,8 @@ class SESEmailWatcher:
                 processed.get("rfq_id"),
                 processed.get("from_address"),
             )
+            was_processed = True
+
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
                 "supplier_id": processed_payload.get("supplier_id") if processed_payload else None,
@@ -468,6 +560,10 @@ class SESEmailWatcher:
 
         if self.state_store and reason != "processing_error":
             self.state_store.add(message_id, metadata)
+
+        if was_processed and processed_payload:
+            rfq_id = processed_payload.get("rfq_id")
+            self._record_processed_in_registry(bucket, s3_key, etag, rfq_id)
 
         matched = bool(message_match)
         should_stop = False
@@ -501,7 +597,8 @@ class SESEmailWatcher:
                 message_id,
             )
 
-        return matched, should_stop, bool(rfq_match)
+        return matched, should_stop, bool(rfq_match), was_processed
+
 
     def _record_processed_payload(
         self, message_id: str, payload: Dict[str, object]
@@ -641,6 +738,102 @@ class SESEmailWatcher:
                 conn.commit()
         except Exception:
             logger.exception("Failed to ensure negotiation support tables exist")
+
+    def _ensure_processed_registry_table(self) -> None:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.processed_emails (
+                            bucket TEXT NOT NULL,
+                            key TEXT NOT NULL,
+                            etag TEXT NOT NULL DEFAULT '',
+                            rfq_id TEXT,
+                            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE proc.processed_emails
+                            ALTER COLUMN etag SET DEFAULT ''
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx
+                            ON proc.processed_emails (bucket, key, etag)
+                        """
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to ensure processed email registry table exists")
+
+    def _is_processed_in_registry(
+        self,
+        bucket: Optional[str],
+        key: Optional[str],
+        etag: Optional[str],
+    ) -> bool:
+        if not bucket or not key:
+            return False
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return False
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM proc.processed_emails
+                        WHERE bucket = %s AND key = %s AND etag = COALESCE(%s, '')
+                        LIMIT 1
+                        """,
+                        (bucket, key, etag or ""),
+                    )
+                    row = cur.fetchone()
+                    return bool(row)
+        except Exception:
+            logger.exception("Failed to check processed email registry for %s", key)
+        return False
+
+    def _record_processed_in_registry(
+        self,
+        bucket: Optional[str],
+        key: Optional[str],
+        etag: Optional[str],
+        rfq_id: Optional[str],
+    ) -> None:
+        if not bucket or not key:
+            return
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proc.processed_emails (bucket, key, etag, rfq_id, processed_at)
+                        VALUES (%s, %s, COALESCE(%s, ''), %s, NOW())
+                        ON CONFLICT (bucket, key, etag)
+                        DO UPDATE SET rfq_id = EXCLUDED.rfq_id, processed_at = NOW()
+                        """,
+                        (bucket, key, etag or "", rfq_id),
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to record processed email %s in registry", key)
 
     def _process_message(self, message: Dict[str, object]) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
@@ -1027,13 +1220,15 @@ class SESEmailWatcher:
         elapsed = now - candidate_time
         remaining = self._dispatch_wait_seconds - elapsed
         if remaining > 0:
-            logger.info(
-                "Delaying S3 poll for %.1fs after email dispatch (target=%s, mailbox=%s)",
-                remaining,
+            pause_seconds = min(remaining, 5.0)
+            logger.debug(
+                "Short pause %.1fs after email dispatch (remaining %.1fs; target=%s, mailbox=%s)",
+                pause_seconds,
+                max(remaining - pause_seconds, 0.0),
                 self._format_bucket_prefixes(),
                 self.mailbox_address,
             )
-            time.sleep(remaining)
+            time.sleep(pause_seconds)
 
         self._last_dispatch_wait_acknowledged = candidate_time
 
@@ -1066,7 +1261,9 @@ class SESEmailWatcher:
 
         bypass_known_filters = bool(self._require_new_s3_objects)
 
-        object_refs: List[Tuple[str, str, Optional[datetime]]] = []
+        object_refs: List[Tuple[str, str, Optional[datetime], Optional[str]]] = []
+        watermark_ts = self._last_watermark_ts
+        watermark_key = self._last_watermark_key
 
         for prefix in active_prefixes:
             watcher = self._s3_prefix_watchers.get(prefix)
@@ -1084,13 +1281,18 @@ class SESEmailWatcher:
                     key = obj.get("Key")
                     if not key:
                         continue
+                    if key.endswith("/") or "AMAZON_SES_SETUP_NOTIFICATION" in key:
+                        continue
                     last_modified_raw = obj.get("LastModified")
                     last_modified = (
                         last_modified_raw
                         if isinstance(last_modified_raw, datetime)
                         else None
                     )
-                    object_refs.append((prefix, key, last_modified))
+                    if not self._is_newer_than_watermark(last_modified, key, watermark_ts, watermark_key):
+                        continue
+                    etag_value = obj.get("ETag") if isinstance(obj.get("ETag"), str) else None
+                    object_refs.append((prefix, key, last_modified, etag_value))
 
         if not object_refs:
             return []
@@ -1113,7 +1315,7 @@ class SESEmailWatcher:
 
         processed_prefixes: Dict[str, bool] = {prefix: False for prefix in active_prefixes}
 
-        for prefix, key, last_modified in object_refs:
+        for prefix, key, last_modified, etag in object_refs:
             if key in seen_keys:
                 continue
 
@@ -1134,6 +1336,9 @@ class SESEmailWatcher:
 
             parsed = self._invoke_parser(parser_fn, raw, key)
             parsed["id"] = key
+            parsed["s3_key"] = key
+            parsed["_s3_etag"] = etag
+            parsed["_last_modified"] = last_modified
             collected.append((last_modified, parsed))
             seen_keys.add(key)
             watcher.mark_known(key, last_modified)
@@ -1174,6 +1379,59 @@ class SESEmailWatcher:
         collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
         messages = [payload for _, payload in collected]
         return messages
+
+    def _is_newer_than_watermark(
+        self,
+        last_modified: Optional[datetime],
+        key: str,
+        watermark_ts: Optional[datetime],
+        watermark_key: str,
+    ) -> bool:
+        if last_modified is None:
+            return watermark_ts is None
+        candidate = last_modified
+        if candidate.tzinfo is None:
+            candidate = candidate.replace(tzinfo=timezone.utc)
+        if watermark_ts is None:
+            return True
+        reference = watermark_ts
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        if candidate > reference:
+            return True
+        if candidate == reference and key > watermark_key:
+            return True
+        return False
+
+    def _update_watermark(self, last_modified: datetime, key: str) -> None:
+        if last_modified.tzinfo is None:
+            candidate = last_modified.replace(tzinfo=timezone.utc)
+        else:
+            candidate = last_modified.astimezone(timezone.utc)
+
+        if self._last_watermark_ts is None:
+            self._last_watermark_ts = candidate
+            self._last_watermark_key = key
+            return
+
+        reference = self._last_watermark_ts
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+
+        if candidate > reference:
+            self._last_watermark_ts = candidate
+            self._last_watermark_key = key
+        elif candidate == reference and key > self._last_watermark_key:
+            self._last_watermark_ts = candidate
+            self._last_watermark_key = key
+
+    def _format_watermark(self) -> str:
+        if self._last_watermark_ts is None:
+            return "<unset>"
+        timestamp = self._last_watermark_ts
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return f"{timestamp.isoformat()}::{self._last_watermark_key or '<none>'}"
 
     @staticmethod
     def _invoke_parser(
