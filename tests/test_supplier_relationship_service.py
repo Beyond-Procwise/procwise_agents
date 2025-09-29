@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+from typing import Any
 
 import pytest
 
@@ -89,3 +90,26 @@ def test_fetch_relationship_missing_index_without_match(monkeypatch):
 
     assert results == []
     assert client.calls >= 2
+
+
+def test_service_creates_missing_payload_indexes(monkeypatch):
+    created: list[tuple[str, Any]] = []
+
+    class DummyCollection:
+        def __init__(self):
+            self.payload_schema = {"document_type": {"type": "keyword"}}
+
+    class DummyClient:
+        def get_collection(self, collection_name):
+            assert collection_name == "supplier-relationships"
+            return DummyCollection()
+
+        def create_payload_index(self, *, collection_name, field_name, field_schema, wait):
+            assert wait is True
+            created.append((collection_name, field_name, field_schema))
+
+    client = DummyClient()
+    SupplierRelationshipService(DummyNick(client))
+
+    created_fields = {field for _, field, _ in created}
+    assert created_fields == {"supplier_id", "supplier_name_normalized"}

@@ -1299,6 +1299,47 @@ class OpportunityMinerAgent(BaseAgent):
                 )
 
 
+                requires_supplier = "supplier_id" in (
+                    policy_cfg.get("required_fields") or []
+                )
+                if requires_supplier:
+                    conditions = policy_input.get("conditions", {})
+                    supplier_metadata: Optional[Dict[str, Any]] = None
+                    supplier_token = (
+                        conditions.get("supplier_id") if isinstance(conditions, dict) else None
+                    )
+                    if not self._is_condition_value(supplier_token):
+                        resolved_supplier, supplier_metadata = self._resolve_policy_supplier(policy_input)
+                        conditions = policy_input.get("conditions", {})
+                        supplier_token = (
+                            conditions.get("supplier_id") if isinstance(conditions, dict) else None
+                        )
+                        if resolved_supplier:
+                            supplier_metadata = None
+                            supplier_token = resolved_supplier
+
+                    if not self._is_condition_value(supplier_token):
+                        policy_id = policy_cfg.get("policy_id", "unknown")
+                        message = (
+                            supplier_metadata.get("message")
+                            if supplier_metadata and isinstance(supplier_metadata, dict)
+                            else None
+                        )
+                        if not message:
+                            message = "Supplier identifier missing from policy conditions"
+                        details: Dict[str, Any] = {}
+                        if isinstance(supplier_metadata, dict):
+                            details.update(supplier_metadata)
+                        details.setdefault("missing_fields", ["supplier_id"])
+                        self._log_policy_event(
+                            policy_id,
+                            None,
+                            "blocked",
+                            message,
+                            details,
+                        )
+                        continue
+
                 if not isinstance(context.input_data.get("conditions"), dict):
                     context.input_data["conditions"] = {}
                 if isinstance(context.input_data.get("conditions"), dict):
