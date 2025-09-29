@@ -344,9 +344,10 @@ class SESEmailWatcher:
                 message_id = str(message.get("id") or uuid.uuid4())
                 if self.state_store and message_id in self.state_store:
                     logger.debug(
-                        "Skipping message %s for mailbox %s as it was already processed",
-                        message_id,
+                        "No messages returned for mailbox %s on attempt %d/%d; retrying",
                         self.mailbox_address,
+                        attempt,
+                        max_attempts,
                     )
                     continue
 
@@ -405,6 +406,7 @@ class SESEmailWatcher:
             if match_filters and not match_found:
                 logger.info(
                     "Completed S3 scan for mailbox %s without matching filters",
+
                     self.mailbox_address,
                 )
 

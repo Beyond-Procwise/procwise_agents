@@ -137,7 +137,6 @@ def test_email_watcher_triggers_negotiation_when_price_high():
     assert result["negotiation_triggered"] is True
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
-
 def test_poll_once_filters_by_rfq_id():
     nick = DummyNick()
     messages = [
@@ -171,6 +170,7 @@ def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     watcher = _make_watcher(nick)
 
     captured_limits = []
+
 
     def fake_load(limit=None, *, prefixes=None, parser=None, newest_first=False):
         captured_limits.append(limit)

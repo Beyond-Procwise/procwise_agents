@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from services.model_training_service import ModelTrainingService
+from services.model_training_endpoint import ModelTrainingEndpoint
 
 router = APIRouter(prefix="/training", tags=["Model Training"])
 
@@ -47,24 +47,24 @@ class TrainingDispatchResponse(BaseModel):
     )
 
 
-def _get_training_service(request: Request) -> ModelTrainingService:
+def _get_training_endpoint(request: Request) -> ModelTrainingEndpoint:
     agent_nick = getattr(request.app.state, "agent_nick", None)
     if agent_nick is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent context is not initialised",
         )
-    service = getattr(agent_nick, "model_training_service", None)
-    if service is None:
+    endpoint = getattr(request.app.state, "model_training_endpoint", None)
+    if not isinstance(endpoint, ModelTrainingEndpoint):
         try:
-            service = ModelTrainingService(agent_nick, auto_subscribe=False)
-            setattr(agent_nick, "model_training_service", service)
+            endpoint = ModelTrainingEndpoint(agent_nick)
+            request.app.state.model_training_endpoint = endpoint
         except Exception as exc:  # pragma: no cover - defensive initialisation
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to initialise training service: {exc}",
             ) from exc
-    return service
+    return endpoint
 
 
 @router.post(
@@ -78,12 +78,12 @@ def trigger_training_dispatch(
         default_factory=TrainingDispatchRequest,
         description="Optional dispatch configuration",
     ),
-    service: ModelTrainingService = Depends(_get_training_service),
+    endpoint: ModelTrainingEndpoint = Depends(_get_training_endpoint),
 ) -> TrainingDispatchResponse:
     """Trigger queued model training jobs on demand."""
 
     limit = request.limit
-    result = service.dispatch_training_and_refresh(force=True, limit=limit)
+    result = endpoint.dispatch(force=True, limit=limit)
     jobs = result.get("training_jobs", [])
     relationship_jobs = result.get("relationship_jobs", [])
     summaries = [

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
+from services.model_training_endpoint import ModelTrainingEndpoint
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
@@ -74,7 +75,11 @@ async def lifespan(app: FastAPI):
             }
         )
         app.state.agent_nick = agent_nick
-        app.state.orchestrator = Orchestrator(agent_nick)
+        app.state.model_training_endpoint = ModelTrainingEndpoint(agent_nick)
+        app.state.orchestrator = Orchestrator(
+            agent_nick,
+            training_endpoint=app.state.model_training_endpoint,
+        )
         app.state.rag_pipeline = RAGPipeline(agent_nick)
         logger.info("System initialized successfully.")
     except Exception as e:
@@ -83,6 +88,8 @@ async def lifespan(app: FastAPI):
     yield
     if hasattr(app.state, "agent_nick"):
         app.state.agent_nick = None
+    if hasattr(app.state, "model_training_endpoint"):
+        app.state.model_training_endpoint = None
     logger.info("API shutting down.")
 
 app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)
