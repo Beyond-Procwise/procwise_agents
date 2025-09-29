@@ -137,7 +137,6 @@ def test_email_watcher_triggers_negotiation_when_price_high():
     assert result["negotiation_triggered"] is True
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
-
 def test_poll_once_filters_by_rfq_id():
     nick = DummyNick()
     messages = [
@@ -234,7 +233,10 @@ def test_cached_match_is_returned_without_reprocessing(monkeypatch):
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
         }
+
     ]
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: messages, state_store=state)
 
     batches = [first_batch, []]
 
