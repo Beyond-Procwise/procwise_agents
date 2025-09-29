@@ -198,13 +198,26 @@ class BackendScheduler:
             from services.model_training_service import ModelTrainingService
 
             service = getattr(self.agent_nick, "model_training_service", None)
-            if isinstance(service, ModelTrainingService):
-                try:
+            settings = getattr(self.agent_nick, "settings", None)
+            learning_enabled = bool(getattr(settings, "enable_learning", False))
+
+            if not isinstance(service, ModelTrainingService):
+                service = ModelTrainingService(
+                    self.agent_nick, auto_subscribe=learning_enabled
+                )
+                setattr(self.agent_nick, "model_training_service", service)
+
+            try:
+                if learning_enabled:
+                    service.enable_workflow_capture()
+                else:
                     service.disable_workflow_capture()
-                except Exception:
-                    logger.exception("Failed to disable workflow capture on training service")
-                return service
-            return None
+            except Exception:
+                logger.exception(
+                    "Failed to synchronise workflow capture state on training service"
+                )
+            return service
+
         except Exception:
             logger.exception("Failed to initialise ModelTrainingService")
             return None

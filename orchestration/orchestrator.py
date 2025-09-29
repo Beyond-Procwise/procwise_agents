@@ -340,8 +340,7 @@ class Orchestrator:
             catalog = prompt_engine.prompts_by_id()
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to load prompts from prompt engine")
-            self._prompt_cache = {}
-            return {}
+            catalog = {}
 
         prompts: Dict[int, Dict[str, Any]] = {}
         for pid, prompt in catalog.items():
@@ -354,8 +353,52 @@ class Orchestrator:
             entry["agents"] = self._get_agent_details(linked_spec)
             prompts[int(pid)] = entry
 
+        for pid, entry in self._load_prompt_fixtures().items():
+            prompts.setdefault(pid, entry)
+
+        if not prompts:
+            logger.warning("Prompt catalog empty; falling back to bundled fixtures")
+
         self._prompt_cache = dict(prompts)
         return dict(prompts)
+
+    def _load_prompt_fixtures(self) -> Dict[int, Dict[str, Any]]:
+        """Load bundled prompt fixtures as a fallback when the database is empty."""
+
+        fixtures: Dict[int, Dict[str, Any]] = {}
+        base_dir = Path(__file__).resolve().parent.parent
+        fallback_file = base_dir / "prompts" / "prompts.json"
+        try:
+            with fallback_file.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except Exception:  # pragma: no cover - defensive parsing
+            logger.exception("Failed to load prompt fixtures from %s", fallback_file)
+            return {}
+
+        templates = payload.get("templates")
+        if not isinstance(templates, list):
+            return {}
+
+        for entry in templates:
+            if not isinstance(entry, dict):
+                continue
+            pid = entry.get("promptId") or entry.get("prompt_id")
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                continue
+            prompt = dict(entry)
+            linked = prompt.get("linked_agents") or prompt.get("agents")
+            if isinstance(linked, (list, tuple, set)):
+                linked_spec = "{" + ",".join(str(item) for item in linked) + "}"
+            else:
+                linked_spec = linked
+            prompt["agents"] = self._get_agent_details(linked_spec)
+            fixtures[pid_int] = prompt
+
+        return fixtures
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
@@ -421,20 +464,33 @@ class Orchestrator:
         return dict(policies)
 
     def _get_model_training_service(self):
-        service = getattr(self.agent_nick, "model_training_service", None)
-        if service is None:
-            try:
-                from services.model_training_service import ModelTrainingService
+        try:
+            from services.model_training_service import ModelTrainingService
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to import model training service")
+            return None
 
-                service = ModelTrainingService(self.agent_nick, auto_subscribe=False)
+        service = getattr(self.agent_nick, "model_training_service", None)
+        settings = getattr(self.agent_nick, "settings", None)
+        learning_enabled = bool(getattr(settings, "enable_learning", False))
+        if not isinstance(service, ModelTrainingService):
+            try:
+                service = ModelTrainingService(
+                    self.agent_nick, auto_subscribe=learning_enabled
+                )
                 setattr(self.agent_nick, "model_training_service", service)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to initialise model training service")
                 return None
         try:
-            service.disable_workflow_capture()
+            if learning_enabled:
+                service.enable_workflow_capture()
+            else:
+                service.disable_workflow_capture()
         except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to disable workflow capture on model training service")
+            logger.exception(
+                "Failed to synchronise workflow capture on model training service"
+            )
         return service
 
     @staticmethod

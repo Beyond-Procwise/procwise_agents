@@ -427,6 +427,10 @@ class DataFlowManager:
         self._cached_vector_size: Optional[int] = None
         self._event_bus = get_event_bus()
 
+    def _is_learning_enabled(self) -> bool:
+        settings = getattr(self, "settings", None)
+        return bool(getattr(settings, "enable_learning", False))
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -468,6 +472,12 @@ class DataFlowManager:
         graph: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist relations either immediately or after workflow completion."""
+
+        if not self._is_learning_enabled():
+            logger.debug(
+                "Skipping knowledge graph persistence; learning mode is disabled"
+            )
+            return
 
         relations_list = list(relations)
         if not relations_list:

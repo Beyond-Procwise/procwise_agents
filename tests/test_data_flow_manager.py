@@ -44,8 +44,11 @@ class DummyQdrant:
 
 
 class DummyNick:
-    def __init__(self):
-        self.settings = SimpleNamespace()
+    def __init__(self, *, enable_learning: bool = True):
+        self.settings = SimpleNamespace(
+            enable_learning=enable_learning,
+            knowledge_graph_collection_name="procwise_knowledge_graph",
+        )
         self.qdrant_client = DummyQdrant()
         self.embedding_model = DummyEmbedder()
 
@@ -115,7 +118,7 @@ def _tables_fixture():
 
 
 def test_data_flow_manager_builds_graph_and_persists():
-    nick = DummyNick()
+    nick = DummyNick(enable_learning=True)
     manager = DataFlowManager(nick)
     tables = _tables_fixture()
 
@@ -179,6 +182,25 @@ def test_data_flow_manager_builds_graph_and_persists():
         mapping_summary = point.payload.get("mapping_summary")
         assert isinstance(mapping_summary, list) and mapping_summary
         assert all("proc." not in statement for statement in mapping_summary)
+
+
+def test_persist_knowledge_graph_skips_when_learning_disabled():
+    nick = DummyNick(enable_learning=False)
+    manager = DataFlowManager(nick)
+
+    relations = [
+        {
+            "source_table": "proc.contracts",
+            "target_table": "proc.supplier",
+            "relationship_type": "references",
+            "status": "linked",
+        }
+    ]
+    graph = {"paths": [], "supplier_flows": []}
+
+    manager.persist_knowledge_graph(relations, graph)
+
+    assert nick.qdrant_client.upserts == []
 
 
 def test_supplier_flow_payload_is_trimmed_below_limit(monkeypatch):
