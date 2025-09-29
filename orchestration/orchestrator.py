@@ -151,11 +151,6 @@ class Orchestrator:
                 input_data=enriched_input,
             )
 
-            # Ensure the model training service is initialised so it can
-            # subscribe to workflow events even if no immediate action is
-            # required during execution.
-            _ = self._get_model_training_service()
-
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
                 return {
@@ -431,11 +426,15 @@ class Orchestrator:
             try:
                 from services.model_training_service import ModelTrainingService
 
-                service = ModelTrainingService(self.agent_nick)
+                service = ModelTrainingService(self.agent_nick, auto_subscribe=False)
                 setattr(self.agent_nick, "model_training_service", service)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to initialise model training service")
                 return None
+        try:
+            service.disable_workflow_capture()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to disable workflow capture on model training service")
         return service
 
     @staticmethod
@@ -1014,15 +1013,23 @@ class Orchestrator:
 
             prompt_objs = []
             for pid in props.get("prompts", []):
-                if pid not in prompts:
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid prompt id '{pid}' for agent '{agent_class}'")
+                if pid_int not in prompts:
                     raise ValueError(f"Unknown prompt id '{pid}'")
-                prompt_objs.append(prompts[pid])
+                prompt_objs.append(prompts[pid_int])
 
             policy_objs = []
             for pid in props.get("policies", []):
-                if pid not in policies:
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid policy id '{pid}' for agent '{agent_class}'")
+                if pid_int not in policies:
                     raise ValueError(f"Unknown policy id '{pid}'")
-                policy_objs.append(policies[pid])
+                policy_objs.append(policies[pid_int])
 
             # Merge inherited pass fields with agent properties.  Any fields
             # produced by upstream agents become part of the child's input

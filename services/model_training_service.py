@@ -17,7 +17,7 @@ class ModelTrainingService:
     NON_BUSINESS_START: time = time(19, 0)  # 19:00 UTC
     NON_BUSINESS_END: time = time(7, 0)  # 07:00 UTC
 
-    def __init__(self, agent_nick: Any) -> None:
+    def __init__(self, agent_nick: Any, *, auto_subscribe: bool = False) -> None:
         self.agent_nick = agent_nick
         self.policy_engine = getattr(agent_nick, "policy_engine", None)
         if self.policy_engine is None:
@@ -32,7 +32,8 @@ class ModelTrainingService:
         self._event_bus = get_event_bus()
         self._subscription_registered = False
         self._supplier_trainer = SupplierRankingTrainer()
-        self._subscribe_to_events()
+        if auto_subscribe:
+            self.enable_workflow_capture()
 
     def _get_relationship_scheduler(self):
         try:
@@ -100,7 +101,9 @@ class ModelTrainingService:
     # ------------------------------------------------------------------
     # Event handling
     # ------------------------------------------------------------------
-    def _subscribe_to_events(self) -> None:
+    def enable_workflow_capture(self) -> None:
+        """Register listeners that queue training jobs from workflow outcomes."""
+
         if self._subscription_registered:
             return
         try:
@@ -108,6 +111,18 @@ class ModelTrainingService:
             self._subscription_registered = True
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to subscribe to workflow completion events")
+
+    def disable_workflow_capture(self) -> None:
+        """Detach workflow listeners so training never hooks into live flows."""
+
+        if not self._subscription_registered:
+            return
+        try:
+            self._event_bus.unsubscribe("workflow.complete", self._handle_workflow_complete)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to unsubscribe from workflow completion events")
+        finally:
+            self._subscription_registered = False
 
     def _handle_workflow_complete(self, event: Dict[str, Any]) -> None:
         if not isinstance(event, dict):
