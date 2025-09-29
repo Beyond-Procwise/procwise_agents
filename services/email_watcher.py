@@ -969,7 +969,7 @@ class SESEmailWatcher:
         *,
         prefixes: Optional[Sequence[str]] = None,
         parser: Optional[Callable[[bytes], Dict[str, object]]] = None,
-        newest_first: bool = False,
+        newest_first: bool = True,
     ) -> List[Dict[str, object]]:
         if not self.bucket:
             logger.warning("SES inbound bucket not configured; skipping poll")
@@ -999,11 +999,32 @@ class SESEmailWatcher:
             iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
             for page in iterator:
                 contents = page.get("Contents", [])
-                contents.sort(key=lambda item: item.get("LastModified"))
+                if not contents:
+                    if require_new and not watcher.primed:
+                        watcher.primed = True
+                    continue
+
+                contents.sort(
+                    key=lambda item: item.get("LastModified") or datetime.min,
+                    reverse=True,
+                )
+
                 prime_existing = require_new and not watcher.primed
-                if prime_existing and not contents:
+                if prime_existing:
+                    for obj in contents:
+                        key = obj.get("Key")
+                        if not key:
+                            continue
+                        last_modified_raw = obj.get("LastModified")
+                        last_modified = (
+                            last_modified_raw
+                            if isinstance(last_modified_raw, datetime)
+                            else None
+                        )
+                        watcher.mark_known(key, last_modified)
                     watcher.primed = True
                     continue
+
                 for obj in contents:
                     key = obj.get("Key")
                     if not key or key in seen_keys:
@@ -1014,9 +1035,6 @@ class SESEmailWatcher:
                         if isinstance(last_modified_raw, datetime)
                         else None
                     )
-                    if prime_existing:
-                        watcher.mark_known(key, last_modified)
-                        continue
                     if self.state_store and key in self.state_store:
                         watcher.mark_known(key, last_modified)
                         continue
@@ -1037,11 +1055,9 @@ class SESEmailWatcher:
                     )
                     if limit is not None and len(collected) >= limit:
                         break
-                if prime_existing:
-                    watcher.primed = True
-                    continue
-            if limit is not None and len(collected) >= limit:
-                break
+
+                if limit is not None and len(collected) >= limit:
+                    break
             if limit is not None and len(collected) >= limit:
                 break
 

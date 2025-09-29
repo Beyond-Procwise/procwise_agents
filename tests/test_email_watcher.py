@@ -460,3 +460,59 @@ def test_poll_once_waits_for_new_s3_object(monkeypatch):
     second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
     assert len(second_results) == 1
     assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+
+
+def test_load_from_s3_prioritises_newest_objects(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    watcher.bucket = "procwisemvp"
+    watcher._prefixes = ["emails/"]
+
+    older_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    newer_time = datetime.now(timezone.utc)
+
+    s3_objects = [
+        {"Key": "emails/older.bin", "LastModified": older_time},
+        {"Key": "emails/newer.bin", "LastModified": newer_time},
+    ]
+
+    object_store = {
+        "emails/older.bin": b"older",
+        "emails/newer.bin": b"newer",
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes) -> None:
+            self._buffer = io.BytesIO(data)
+
+        def read(self) -> bytes:
+            return self._buffer.getvalue()
+
+    class DummyPaginator:
+        def paginate(self, *, Bucket, Prefix):
+            assert Bucket == watcher.bucket
+            assert Prefix == watcher._prefixes[0]
+            return [{"Contents": list(s3_objects)}]
+
+    class DummyClient:
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return DummyPaginator()
+
+        def get_object(self, *, Bucket, Key):
+            assert Bucket == watcher.bucket
+            return {"Body": DummyBody(object_store[Key])}
+
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
+
+    parsed_keys = []
+
+    def parser(raw: bytes, *, key=None):
+        parsed_keys.append(key)
+        return {"payload": raw, "key": key}
+
+    messages = watcher._load_from_s3(limit=1, parser=parser)
+
+    assert len(messages) == 1
+    assert messages[0]["key"] == "emails/newer.bin"
+    assert parsed_keys == ["emails/newer.bin"]
