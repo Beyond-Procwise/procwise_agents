@@ -151,11 +151,6 @@ class Orchestrator:
                 input_data=enriched_input,
             )
 
-            # Ensure the model training service is initialised so it can
-            # subscribe to workflow events even if no immediate action is
-            # required during execution.
-            _ = self._get_model_training_service()
-
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
                 return {
@@ -359,8 +354,49 @@ class Orchestrator:
             entry["agents"] = self._get_agent_details(linked_spec)
             prompts[int(pid)] = entry
 
+        for pid, entry in self._load_prompt_fixtures().items():
+            prompts.setdefault(pid, entry)
+
         self._prompt_cache = dict(prompts)
         return dict(prompts)
+
+    def _load_prompt_fixtures(self) -> Dict[int, Dict[str, Any]]:
+        """Load bundled prompt fixtures as a fallback when the database is empty."""
+
+        fixtures: Dict[int, Dict[str, Any]] = {}
+        base_dir = Path(__file__).resolve().parent.parent
+        fallback_file = base_dir / "prompts" / "prompts.json"
+        try:
+            with fallback_file.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except Exception:  # pragma: no cover - defensive parsing
+            logger.exception("Failed to load prompt fixtures from %s", fallback_file)
+            return {}
+
+        templates = payload.get("templates")
+        if not isinstance(templates, list):
+            return {}
+
+        for entry in templates:
+            if not isinstance(entry, dict):
+                continue
+            pid = entry.get("promptId") or entry.get("prompt_id")
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                continue
+            prompt = dict(entry)
+            linked = prompt.get("linked_agents") or prompt.get("agents")
+            if isinstance(linked, (list, tuple, set)):
+                linked_spec = "{" + ",".join(str(item) for item in linked) + "}"
+            else:
+                linked_spec = linked
+            prompt["agents"] = self._get_agent_details(linked_spec)
+            fixtures[pid_int] = prompt
+
+        return fixtures
 
     def _load_policies(self) -> Dict[int, Dict[str, Any]]:
         """Aggregate policy definitions keyed by their ID.
@@ -431,11 +467,15 @@ class Orchestrator:
             try:
                 from services.model_training_service import ModelTrainingService
 
-                service = ModelTrainingService(self.agent_nick)
+                service = ModelTrainingService(self.agent_nick, auto_subscribe=False)
                 setattr(self.agent_nick, "model_training_service", service)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to initialise model training service")
                 return None
+        try:
+            service.disable_workflow_capture()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to disable workflow capture on model training service")
         return service
 
     @staticmethod
@@ -1014,15 +1054,23 @@ class Orchestrator:
 
             prompt_objs = []
             for pid in props.get("prompts", []):
-                if pid not in prompts:
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid prompt id '{pid}' for agent '{agent_class}'")
+                if pid_int not in prompts:
                     raise ValueError(f"Unknown prompt id '{pid}'")
-                prompt_objs.append(prompts[pid])
+                prompt_objs.append(prompts[pid_int])
 
             policy_objs = []
             for pid in props.get("policies", []):
-                if pid not in policies:
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid policy id '{pid}' for agent '{agent_class}'")
+                if pid_int not in policies:
                     raise ValueError(f"Unknown policy id '{pid}'")
-                policy_objs.append(policies[pid])
+                policy_objs.append(policies[pid_int])
 
             # Merge inherited pass fields with agent properties.  Any fields
             # produced by upstream agents become part of the child's input

@@ -681,6 +681,43 @@ def test_execute_agent_flow_accepts_class_name():
     assert agent.ran is True
 
 
+def test_execute_workflow_never_initialises_training_service():
+    class DummyAgent:
+        def execute(self, context):
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    class AllowAllPolicy:
+        def validate_workflow(self, *_, **__):
+            return {"allowed": True}
+
+    for enable_learning in (False, True):
+        nick = SimpleNamespace(
+            settings=SimpleNamespace(
+                script_user="tester",
+                max_workers=1,
+                parallel_processing=False,
+                enable_learning=enable_learning,
+            ),
+            agents={"generic": DummyAgent()},
+            policy_engine=AllowAllPolicy(),
+            query_engine=SimpleNamespace(),
+            routing_engine=SimpleNamespace(routing_model={}),
+        )
+
+        orchestrator = Orchestrator(nick)
+        called = False
+
+        def fake_training():
+            nonlocal called
+            called = True
+
+        orchestrator._get_model_training_service = fake_training
+
+        orchestrator.execute_workflow("generic", {})
+
+        assert called is False
+
+
 def test_execute_legacy_flow_injects_workflow_metadata():
     captured = {}
 
@@ -748,6 +785,66 @@ def test_execute_legacy_flow_leaves_workflow_unset_for_opportunity_miner():
     assert "workflow" not in captured["input"]
     conditions = captured["input"].get("conditions")
     assert not conditions or "negotiation_window_days" not in conditions
+
+
+def test_execute_legacy_flow_coerces_prompt_and_policy_ids():
+    class DummyAgent:
+        def __init__(self):
+            self.seen_prompts = None
+            self.seen_policies = None
+
+        def execute(self, context):
+            self.seen_prompts = context.input_data.get("prompts")
+            self.seen_policies = context.input_data.get("policies")
+            return AgentOutput(status=AgentStatus.SUCCESS, data={})
+
+    class AllowAllPolicy:
+        def validate_workflow(self, *_, **__):
+            return {"allowed": True}
+
+    agent = DummyAgent()
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1, parallel_processing=False),
+        agents={"dummy": agent},
+        policy_engine=AllowAllPolicy(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model={}),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator._load_agent_definitions = lambda: {"dummy": "DummyAgent"}
+    orchestrator._load_prompts = lambda: {1: {"promptId": 1, "template": "hello"}}
+    orchestrator._load_policies = lambda: {2: {"policyId": 2, "policyName": "Test"}}
+
+    flow = {
+        "status": "pending",
+        "agent_type": "dummy",
+        "agent_property": {"prompts": ["1"], "policies": ["2"]},
+    }
+
+    result = orchestrator._execute_legacy_flow(flow)
+
+    assert result["status"] == 100
+    assert agent.seen_prompts and agent.seen_prompts[0]["promptId"] == 1
+    assert agent.seen_policies and agent.seen_policies[0]["policyId"] == 2
+
+
+def test_load_prompts_uses_fixture_when_catalog_empty():
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(script_user="tester", max_workers=1),
+        agents={},
+        policy_engine=SimpleNamespace(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model=None),
+        prompt_engine=SimpleNamespace(prompts_by_id=lambda: {}),
+    )
+
+    orchestrator = Orchestrator(nick)
+    prompts = orchestrator._load_prompts()
+
+    assert 1 in prompts
+    assert prompts[1]["promptId"] == 1
+
 
 def test_convert_agents_to_flow_promotes_root_workflow():
     details = {
