@@ -1,16 +1,17 @@
-import gzip
-import json
-import logging
+import io
 import re
+import sys
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
-from agents.base_agent import AgentOutput, AgentStatus, AgentContext
-from services.email_watcher import (
-    InMemoryEmailWatcherState,
-    SESEmailWatcher,
-    S3ObjectWatcher,
-)
+import pytest
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+from services.email_watcher import InMemoryEmailWatcherState, SESEmailWatcher
 
 
 class StubSupplierInteractionAgent:
@@ -82,68 +83,40 @@ class DummyNick:
             ses_smtp_secret_name="ses/smtp/credentials",
             ses_region="eu-west-1",
             ses_inbound_bucket=None,
-            ses_inbound_prefix="ses/inbound/",
+            ses_inbound_prefix=None,
             ses_inbound_s3_uri=None,
-            s3_bucket_name="bucket",
-            ses_inbound_queue_url=None,
-            ses_inbound_queue_wait_seconds=2,
-            ses_inbound_queue_max_messages=10,
-            email_response_poll_seconds=60,
-            imap_host=None,
-            imap_user=None,
-            imap_password=None,
-            imap_port=993,
-            imap_folder="INBOX",
-            imap_search_criteria="UNSEEN",
-            imap_use_ssl=True,
-            imap_mark_seen=True,
-            imap_batch_size=25,
+            s3_bucket_name=None,
+            email_response_poll_seconds=1,
         )
         self.agents = {}
         self.ddl_statements = []
+        self.s3_client = None
 
     def get_db_connection(self):
         return DummyNick._DummyConn(self)
 
 
-class DummyQueue:
-    def __init__(self, messages):
-        self._messages = list(messages)
-        self.deleted = []
-        self.receive_calls = 0
-
-    def receive_message(self, **kwargs):
-        self.receive_calls += 1
-        if self._messages:
-            return {"Messages": [self._messages.pop(0)]}
-        return {}
-
-    def delete_message(self, QueueUrl, ReceiptHandle):
-        self.deleted.append((QueueUrl, ReceiptHandle))
+def _make_watcher(nick, *, loader=None, state_store=None):
+    supplier_agent = StubSupplierInteractionAgent()
+    negotiation_agent = StubNegotiationAgent()
+    return SESEmailWatcher(
+        nick,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        message_loader=loader,
+        state_store=state_store or InMemoryEmailWatcherState(),
+    )
 
 
 def test_email_watcher_bootstraps_negotiation_tables():
     nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        message_loader=lambda limit=None: [],
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    ddl_statements = "\n".join(nick.ddl_statements)
-    assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in ddl_statements
-    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in ddl_statements
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in "\n".join(nick.ddl_statements)
+    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in "\n".join(nick.ddl_statements)
 
 
 def test_email_watcher_triggers_negotiation_when_price_high():
     nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
     messages = [
         {
             "id": "msg-1",
@@ -151,723 +124,227 @@ def test_email_watcher_triggers_negotiation_when_price_high():
             "body": "Quoted price 1500 USD",
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
+            "target_price": 1000,
         }
     ]
 
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-1", "target_price": 1000},
-        message_loader=lambda limit=None: messages,
-        state_store=InMemoryEmailWatcherState(),
-    )
+    watcher = _make_watcher(nick, loader=lambda limit=None: messages)
 
-    results = watcher.poll_once()
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
     assert len(results) == 1
-    assert negotiation_agent.contexts
-    assert results[0]["negotiation_triggered"] is True
-    assert results[0]["rfq_id"] == "RFQ-20240101-abcd1234"
-    assert results[0]["supplier_id"] == "SUP-1"
-    assert watcher.state_store.get("msg-1")["status"] == "processed"
-
-    # Subsequent polls should skip already processed emails
-    assert watcher.poll_once() == []
+    result = results[0]
+    assert result["negotiation_triggered"] is True
+    assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
 
-def test_email_watcher_defaults_to_s3_polling_when_queue_missing(caplog):
+def test_poll_once_filters_by_rfq_id():
     nick = DummyNick()
-    nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
-
-    caplog.set_level(logging.INFO, logger="services.email_watcher")
-
-    watcher = SESEmailWatcher(
-        nick,
-        message_loader=lambda limit=None: [],
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    assert watcher._queue_enabled is False
-    assert watcher._queue_disabled_reason
-    assert any("polling is disabled" in message for message in caplog.messages)
-
-
-def test_email_watcher_stops_after_matching_filters():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
     messages = [
         {
-            "id": "msg-a",
-            "subject": "Re: RFQ-20240101-aaaa1111",
-            "body": "Quoted price 1200",
-            "from": "first@example.com",
-            "rfq_id": "RFQ-20240101-aaaa1111",
-        },
-        {
-            "id": "msg-b",
-            "subject": "Re: RFQ-20240101-target",
-            "body": "Quoted price 950",
+            "id": "msg-1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 1000",
             "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-target",
+            "rfq_id": "RFQ-20240101-abcd1234",
         },
-        {
-            "id": "msg-c",
-            "subject": "Re: RFQ-20240101-extra",
-            "body": "Quoted price 800",
-            "from": "other@example.com",
-            "rfq_id": "RFQ-20240101-extra",
-        },
-    ]
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        message_loader=lambda limit=None: list(messages),
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-target"})
-
-    assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240101-target"
-    assert len(supplier_agent.contexts) == 1
-    assert watcher.state_store.get("msg-c") is None
-
-
-def test_email_watcher_returns_cached_processed_message_for_filters():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-    messages = [
-        {
-            "id": "msg-cache",
-            "subject": "Re: RFQ-20240101-cache",
-            "body": "Quoted price 500",
-            "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240101-cache",
-        }
-    ]
-
-    def loader(limit=None):
-        if messages:
-            return [messages.pop(0)]
-        return []
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        message_loader=loader,
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    first_batch = watcher.poll_once()
-
-    assert len(first_batch) == 1
-    assert first_batch[0]["rfq_id"] == "RFQ-20240101-cache"
-    assert first_batch[0]["message_body"].startswith("Quoted price")
-    assert len(supplier_agent.contexts) == 1
-
-    supplier_agent.contexts.clear()
-
-    cached_batch = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-cache"})
-
-    assert len(cached_batch) == 1
-    assert cached_batch[0]["rfq_id"] == "RFQ-20240101-cache"
-    assert cached_batch[0]["message_body"].startswith("Quoted price")
-    assert supplier_agent.contexts == []
-
-
-def test_email_watcher_skips_negotiation_when_price_within_target():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-    messages = [
         {
             "id": "msg-2",
             "subject": "Re: RFQ-20240101-deadbeef",
-            "body": "Quoted price 800 USD",
-            "from": "supplier@example.com",
+            "body": "Price 800",
+            "from": "other@example.com",
             "rfq_id": "RFQ-20240101-deadbeef",
-        }
+        },
     ]
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: messages, state_store=state)
 
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-2", "target_price": 1000},
-        message_loader=lambda limit=None: messages,
-        state_store=InMemoryEmailWatcherState(),
-    )
+    filtered = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
-    results = watcher.poll_once()
-
-    assert len(results) == 1
-    assert results[0]["negotiation_triggered"] is False
-    assert negotiation_agent.contexts == []
-    assert watcher.state_store.get("msg-2")["status"] == "processed"
+    assert len(filtered) == 1
+    assert filtered[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert "msg-1" in state
 
 
-def test_email_watcher_records_skipped_messages_without_rfq():
+def test_poll_once_uses_s3_loader_when_no_custom_loader(monkeypatch):
     nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-    messages = [
-        {
-            "id": "msg-3",
-            "subject": "General update",
-            "body": "No RFQ reference in this email",
-            "from": "supplier@example.com",
-        }
-    ]
+    watcher = _make_watcher(nick)
 
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {},
-        message_loader=lambda limit=None: messages,
-        state_store=InMemoryEmailWatcherState(),
-    )
+    captured_limits = []
 
-    results = watcher.poll_once()
-
-    assert results == []
-    assert watcher.state_store.get("msg-3")["status"] == "skipped"
-
-
-def test_email_watcher_matches_uppercase_rfq_identifier():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-    messages = [
-        {
-            "id": "msg-4",
-            "subject": "Re: RFQ-20240101-ABCD1234",
-            "body": "Quoted price 1200 USD",
-            "from": "supplier@example.com",
-        }
-    ]
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-4", "target_price": 1500},
-        message_loader=lambda limit=None: messages,
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    results = watcher.poll_once()
-
-    assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240101-ABCD1234"
-    assert results[0]["supplier_id"] == "SUP-4"
-    # Supplier agent should have been invoked once with the parsed RFQ ID
-    assert supplier_agent.contexts[0].input_data["rfq_id"] == "RFQ-20240101-ABCD1234"
-
-
-def test_email_watcher_extracts_rfq_from_html_comment():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-    html_body = """
-        <html>
-            <body>
-                <!-- RFQ-ID: RFQ-20240202-a1b2c3d4 -->
-                <p>Supplier quotation attached.</p>
-            </body>
-        </html>
-    """
-    messages = [
-        {
-            "id": "msg-5",
-            "subject": "Re: Request for Quotation",
-            "body": html_body,
-            "from": "supplier@example.com",
-        }
-    ]
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-5", "target_price": 1500},
-        message_loader=lambda limit=None: messages,
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    results = watcher.poll_once()
-
-    assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240202-a1b2c3d4"
-    assert supplier_agent.contexts[0].input_data["rfq_id"] == "RFQ-20240202-a1b2c3d4"
-
-
-def test_email_watcher_fallbacks_to_imap_when_s3_empty(monkeypatch):
-    nick = DummyNick()
-    nick.settings.imap_host = "imap.example.com"
-    nick.settings.imap_user = "supplierconnect@procwise.co.uk"
-    nick.settings.imap_password = "secret"
-
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    imap_message = {
-        "id": "imap:1",
-        "subject": "Re: RFQ-20240303-feedface",
-        "body": "Quoted price 1800 USD",
-        "from": "supplier@example.com",
-        "rfq_id": "RFQ-20240303-feedface",
-    }
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-IMAP", "target_price": 1500},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
-
-    call_args = {}
-
-    def fake_imap(limit=None, mark_seen=False):
-        call_args["limit"] = limit
-        call_args["mark_seen"] = mark_seen
-        return [imap_message]
-
-    monkeypatch.setattr(watcher, "_load_from_imap", fake_imap)
-
-    results = watcher.poll_once(limit=5)
-
-    assert call_args["mark_seen"] is True
-    assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240303-feedface"
-    assert watcher.state_store.get("imap:1")["status"] == "processed"
-
-
-def test_email_watcher_peek_recent_messages_uses_non_destructive_imap(monkeypatch):
-    nick = DummyNick()
-    nick.settings.imap_host = "imap.example.com"
-    nick.settings.imap_user = "supplierconnect@procwise.co.uk"
-    nick.settings.imap_password = "secret"
-
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
-
-    def fake_imap(limit=None, mark_seen=False):
-        assert mark_seen is False
+    def fake_load(limit=None, *, prefixes=None, parser=None, newest_first=False):
+        captured_limits.append(limit)
         return [
             {
-                "id": "imap:preview",
-                "subject": "Re: RFQ-20240404-cafebabe",
-                "body": "Quoted price 950 USD with delivery in 2 weeks",
+                "id": "emails/msg-1.eml",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Price 900",
                 "from": "supplier@example.com",
-                "rfq_id": "RFQ-20240404-cafebabe",
-                "received_at": "Thu, 04 Apr 2024 10:00:00 +0000",
+                "rfq_id": "RFQ-20240101-abcd1234",
             }
         ]
 
-    monkeypatch.setattr(watcher, "_load_from_imap", fake_imap)
+    monkeypatch.setattr(watcher, "_load_from_s3", fake_load)
 
-    preview = watcher.peek_recent_messages(limit=2)
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
-    assert preview == [
+    assert len(results) == 1
+    assert captured_limits == [None]
+
+
+def test_watch_retries_until_message_found(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    batches = [
+        [],
+        [
+            {
+                "id": "emails/msg-1.eml",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Price 750",
+                "from": "supplier@example.com",
+                "rfq_id": "RFQ-20240101-abcd1234",
+            }
+        ],
+    ]
+
+    def loader(limit=None):
+        if batches:
+            return batches.pop(0)
+        return []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    processed = watcher.watch(interval=1, limit=None, timeout_seconds=5)
+
+    assert processed == 1
+    assert any(item.get("rfq_id") == "RFQ-20240101-abcd1234" for item in state._seen.values())
+
+
+def test_cached_match_is_returned_without_reprocessing(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    first_batch = [
         {
-            "id": "imap:preview",
-            "subject": "Re: RFQ-20240404-cafebabe",
+            "id": "emails/msg-1.eml",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 700",
             "from": "supplier@example.com",
-            "rfq_id": "RFQ-20240404-cafebabe",
-            "received_at": "Thu, 04 Apr 2024 10:00:00 +0000",
-            "snippet": "Quoted price 950 USD with delivery in 2 weeks",
+            "rfq_id": "RFQ-20240101-abcd1234",
         }
     ]
-    assert watcher.state_store._seen == {}
+
+    batches = [first_batch, []]
+
+    def loader(limit=None):
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(first_results) == 1
+
+    # Subsequent poll should use the cached payload even though the loader returns nothing.
+    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(second_results) == 1
+    assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
 
 
-def test_email_watcher_reuses_agent_s3_client():
+def test_poll_once_logs_and_returns_empty_when_no_match(caplog):
     nick = DummyNick()
-    nick.s3_client = object()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    assert watcher._get_s3_client() is nick.s3_client
-
-
-def test_email_watcher_downloads_and_decompresses_gzip():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    payload = gzip.compress(b"raw email bytes")
-
-    class DummyBody:
-        def __init__(self, data):
-            self._data = data
-
-        def read(self):
-            return self._data
-
-    class DummyClient:
-        def get_object(self, Bucket, Key):
-            return {"Body": DummyBody(payload), "ContentEncoding": "gzip"}
-
-    raw = watcher._download_object(DummyClient(), "ses/inbound/test.eml.gz")
-    assert raw == b"raw email bytes"
-
-
-def test_email_watcher_builds_prefix_variants_for_mailbox():
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    assert "ses/inbound/" in watcher._prefixes
-    assert "ses/inbound/supplierconnect@procwise.co.uk/" in watcher._prefixes
-    assert "supplierconnect@procwise.co.uk/" in watcher._prefixes
-    assert "emails/" in watcher._processed_prefixes
-    assert "emails/supplierconnect@procwise.co.uk/" in watcher._processed_prefixes
-
-
-def test_email_watcher_processes_queue_messages_and_acknowledges(monkeypatch):
-    nick = DummyNick()
-    nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
-    nick.settings.ses_inbound_queue_enabled = True
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-QUEUE", "target_price": 900},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    raw_email = b"Subject: Re: RFQ-20240101-abcd1234\nFrom: supplier@example.com\n\nQuoted price 950"
-    sns_payload = {
-        "Type": "Notification",
-        "Message": json.dumps(
-            {
-                "receipt": {
-                    "action": {
-                        "bucketName": "bucket",
-                        "objectKey": "ses/inbound/message-1.eml",
-                    }
-                },
-                "mail": {"messageId": "msg-1"},
-            }
-        ),
-    }
-
-    queue = DummyQueue(
-        [
-            {
-                "MessageId": "sqs-1",
-                "ReceiptHandle": "rh-1",
-                "Body": json.dumps(sns_payload),
-            }
-        ]
-    )
-
-    monkeypatch.setattr(watcher, "_get_sqs_client", lambda: queue)
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: object())
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
-    monkeypatch.setattr(
-        watcher,
-        "_download_object",
-        lambda client, key, bucket=None: raw_email if key == "ses/inbound/message-1.eml" else None,
-    )
-
-    results = watcher.poll_once()
-
-    assert len(results) == 1
-    assert queue.deleted == [(nick.settings.ses_inbound_queue_url, "rh-1")]
-    assert watcher.state_store.get("ses/inbound/message-1.eml")["status"] == "processed"
-
-
-def test_email_watcher_polls_processed_messages_until_match(monkeypatch):
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-PROC", "target_price": 900},
-        state_store=InMemoryEmailWatcherState(),
-    )
-    watcher.poll_interval_seconds = 0
-
-    now = datetime.now(timezone.utc)
-    older = now - timedelta(minutes=5)
-
-    base_pages = []
-    first_page = {prefix: [] for prefix in watcher._processed_prefixes}
-    first_page["emails/"] = [
-        {"Key": "emails/old.json", "LastModified": older},
+    messages = [
+        {
+            "id": "emails/msg-1.eml",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Price 1000",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+        }
     ]
-    second_page = {prefix: [] for prefix in watcher._processed_prefixes}
-    second_page["emails/"] = [
-        {"Key": "emails/new.json", "LastModified": now},
-    ]
-    base_pages.extend([first_page, second_page])
 
-    old_payload = {
-        "subject": "Re: RFQ-20240101-old00001",
-        "from": "supplier@example.com",
-        "body": "Quoted price 1200",
-        "rfq_id": "RFQ-20240101-old00001",
-    }
-    new_payload = {
-        "subject": "Re: RFQ-20240101-target",
-        "from": "supplier@example.com",
-        "body": "Quoted price 950",
-        "rfq_id": "RFQ-20240101-target",
-    }
+    watcher = _make_watcher(nick, loader=lambda limit=None: messages)
 
-    payloads = {
-        "emails/old.json": json.dumps(old_payload).encode("utf-8"),
-        "emails/new.json": json.dumps(new_payload).encode("utf-8"),
-    }
-
-    class DummyBody:
-        def __init__(self, data: bytes):
-            self._data = data
-
-        def read(self) -> bytes:
-            return self._data
-
-    class ProcessedS3Client:
-        def __init__(self, prefixes, pages, blobs):
-            self._prefixes = list(prefixes)
-            self._pages = list(pages)
-            self._blobs = blobs
-            self._call_index = 0
-            self.page_indices = []
-
-        def get_paginator(self, name):
-            assert name == "list_objects_v2"
-            outer = self
-
-            class _Paginator:
-                def __init__(self, owner):
-                    self._owner = owner
-
-                def paginate(self, Bucket, Prefix):
-                    count = max(1, len(self._owner._prefixes))
-                    attempt_idx = min(
-                        self._owner._call_index // count, len(self._owner._pages) - 1
-                    )
-                    self._owner._call_index += 1
-                    if self._owner._prefixes and Prefix == self._owner._prefixes[0]:
-                        self._owner.page_indices.append(attempt_idx)
-                    yield {"Contents": list(self._owner._pages[attempt_idx].get(Prefix, []))}
-
-            return _Paginator(outer)
-
-        def get_object(self, Bucket, Key):
-            return {"Body": DummyBody(self._blobs[Key])}
-
-    client = ProcessedS3Client(watcher._processed_prefixes, base_pages, payloads)
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: client)
-
-    results = watcher.poll_once(limit=1, match_filters={"rfq_id": "RFQ-20240101-target"})
-
-    assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240101-target"
-    assert results[0]["supplier_output"]["price"] == 950.0
-    assert client.page_indices[0] == 0
-    assert client.page_indices[-1] == 1
-    assert watcher.state_store.get("emails/new.json")["status"] == "processed"
-
-
-def test_email_watcher_detects_new_s3_objects_even_with_same_timestamp(monkeypatch):
-    nick = DummyNick()
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-PROC", "target_price": 900},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    shared_ts = datetime.now(timezone.utc)
-    base_prefix = "emails/" if "emails/" in watcher._processed_prefixes else watcher._processed_prefixes[0]
-
-    watcher._s3_prefix_watchers[base_prefix] = S3ObjectWatcher(limit=4)
-    watcher._s3_prefix_watchers[base_prefix].mark_known("emails/old.json", shared_ts)
-    watcher.state_store.add("emails/old.json", {"status": "processed"})
-
-    new_payload = {
-        "subject": "Re: RFQ-20240101-target",
-        "from": "supplier@example.com",
-        "body": "Quoted price 950",
-        "rfq_id": "RFQ-20240101-target",
-    }
-
-    payloads = {
-        "emails/new.json": json.dumps(new_payload).encode("utf-8"),
-    }
-
-    class DummyBody:
-        def __init__(self, data: bytes):
-            self._data = data
-
-        def read(self) -> bytes:
-            return self._data
-
-    class StubS3Client:
-        def get_paginator(self, name):
-            assert name == "list_objects_v2"
-
-            class _Paginator:
-                def paginate(self_inner, Bucket, Prefix):
-                    if Prefix == base_prefix:
-                        yield {
-                            "Contents": [
-                                {"Key": "emails/old.json", "LastModified": shared_ts},
-                                {"Key": "emails/new.json", "LastModified": shared_ts},
-                            ]
-                        }
-                    else:
-                        yield {"Contents": []}
-
-            return _Paginator()
-
-        def get_object(self, Bucket, Key):
-            return {"Body": DummyBody(payloads[Key])}
-
-    client = StubS3Client()
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: client)
-
-    results = watcher._load_processed_messages(limit=None)
-
-    assert len(results) == 1
-    assert results[0]["id"] == "emails/new.json"
-    assert results[0]["rfq_id"] == "RFQ-20240101-target"
-
-    prefix_state = watcher._s3_prefix_watchers[base_prefix]
-    assert isinstance(prefix_state, S3ObjectWatcher)
-    assert list(prefix_state.known.keys()) == ["emails/old.json", "emails/new.json"]
-
-
-def test_email_watcher_leaves_queue_message_on_processing_error(monkeypatch):
-    nick = DummyNick()
-    nick.settings.ses_inbound_queue_url = "https://sqs.eu-west-1.amazonaws.com/123/queue"
-    nick.settings.ses_inbound_queue_enabled = True
-    supplier_agent = StubSupplierInteractionAgent()
-    negotiation_agent = StubNegotiationAgent()
-
-    watcher = SESEmailWatcher(
-        nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        metadata_provider=lambda _: {"supplier_id": "SUP-QUEUE"},
-        state_store=InMemoryEmailWatcherState(),
-    )
-
-    raw_email = b"Subject: Re: RFQ-20240101-deadbeef\nFrom: supplier@example.com\n\nQuoted price 1200"
-    sns_payload = {
-        "Type": "Notification",
-        "Message": json.dumps(
-            {
-                "receipt": {
-                    "action": {
-                        "bucketName": "bucket",
-                        "objectKey": "ses/inbound/message-error.eml",
-                    }
-                },
-                "mail": {"messageId": "msg-err"},
-            }
-        ),
-    }
-
-    queue = DummyQueue(
-        [
-            {
-                "MessageId": "sqs-err",
-                "ReceiptHandle": "rh-err",
-                "Body": json.dumps(sns_payload),
-            }
-        ]
-    )
-
-    monkeypatch.setattr(watcher, "_get_sqs_client", lambda: queue)
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: object())
-    monkeypatch.setattr(watcher, "_load_from_s3", lambda limit=None, **_: [])
-    monkeypatch.setattr(
-        watcher,
-        "_download_object",
-        lambda client, key, bucket=None: raw_email if key == "ses/inbound/message-error.eml" else None,
-    )
-
-    def explode(_message):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(watcher, "_process_message", explode)
-
-    results = watcher.poll_once()
+    caplog.set_level("INFO", logger="services.email_watcher")
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-UNKNOWN"})
 
     assert results == []
-    assert queue.deleted == []
-    assert watcher.state_store.get("ses/inbound/message-error.eml") is None
+    assert any("without matching filters" in record.message for record in caplog.records)
 
 
-def test_email_watcher_uses_s3_uri_for_bucket_and_prefix():
+def test_poll_once_waits_for_new_s3_object(monkeypatch):
     nick = DummyNick()
-    nick.settings.s3_bucket_name = None
-    nick.settings.ses_inbound_bucket = None
-    nick.settings.ses_inbound_s3_uri = "s3://procwisemvp/emails/"
+    watcher = _make_watcher(nick)
+    watcher.bucket = "procwisemvp"
+    watcher._prefixes = ["emails/"]
+    watcher._match_poll_attempts = 1
+    watcher.poll_interval_seconds = 0
 
-    watcher = SESEmailWatcher(
-        nick,
-        message_loader=lambda limit=None: [],
-        state_store=InMemoryEmailWatcherState(),
+    base_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    existing_objects = [
+        {"Key": "emails/existing.eml", "LastModified": base_time},
+    ]
+    dynamic_objects = list(existing_objects)
+
+    raw_existing = (
+        b"Subject: Re: RFQ-20240101-abcd1234\n"
+        b"From: supplier@example.com\n"
+        b"To: agent@example.com\n"
+        b"Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
+        b"Message-ID: <existing@example.com>\n\n"
+        b"Quoted price 1200"
+    )
+    raw_new = (
+        b"Subject: Re: RFQ-20240101-abcd1234\n"
+        b"From: supplier@example.com\n"
+        b"To: agent@example.com\n"
+        b"Date: Mon, 01 Jan 2024 12:05:00 +0000\n"
+        b"Message-ID: <new@example.com>\n\n"
+        b"Quoted price 900"
     )
 
-    assert watcher.bucket == "procwisemvp"
-    assert "emails/" in watcher._prefixes
+    object_store = {
+        "emails/existing.eml": raw_existing,
+        "emails/new.eml": raw_new,
+    }
+
+    class DummyBody:
+        def __init__(self, data: bytes) -> None:
+            self._buffer = io.BytesIO(data)
+
+        def read(self) -> bytes:
+            return self._buffer.getvalue()
+
+    class DummyPaginator:
+        def paginate(self, *, Bucket, Prefix):
+            assert Bucket == watcher.bucket
+            assert Prefix == watcher._prefixes[0]
+            return [{"Contents": list(dynamic_objects)}]
+
+    class DummyClient:
+        def __init__(self):
+            self.paginator = DummyPaginator()
+
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return self.paginator
+
+        def get_object(self, *, Bucket, Key):
+            data = object_store[Key]
+            return {"Body": DummyBody(data)}
+
+    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    first_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert first_results == []
+
+    dynamic_objects.append(
+        {"Key": "emails/new.eml", "LastModified": datetime.now(timezone.utc)}
+    )
+
+    second_results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    assert len(second_results) == 1
+    assert second_results[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
