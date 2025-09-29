@@ -459,16 +459,51 @@ LINE_HEADERS_ALIASES = {
     "line_no": [r"\bLine\s*#\b", r"\bLine\b", r"\bItem\s*#\b"],
     "item_id": [r"\bItem\s*(?:Code|ID)\b", r"\bSKU\b", r"\bPart\s*No\b", r"\bProduct\s*Code\b"],
     "item_description": [r"\bDescription\b", r"\bItem\s*Description\b"],
-    "quantity": [r"\bQty\b", r"\bQuantity\b"],
-    "unit_of_measure": [r"\bUOM\b", r"\bUnit\b", r"\bUnit\s*of\s*Measure\b"],
-    "unit_price": [r"\bUnit\s*Price\b", r"\bRate\b", r"\bPrice\b", r"\bUnit\s*Cost\b"],
-    "line_amount": [r"\bLine\s*Total\b", r"\bLine\s*Amount\b", r"\bAmount\b"],
-    "tax_percent": [r"\bTax\s*%\b", r"\bVAT\s*%\b"],
-    "tax_amount": [r"\bTax\s*Amt\b", r"\bTax\b", r"\bVAT\b"],
-    "total_amount_incl_tax": [r"\bTotal\b", r"\bTotal\s*Incl\s*Tax\b", r"\bGross\b"],
+    "quantity": [r"\bQty\b", r"\bQuantity\b", r"\bHours\b", r"\bDays\b"],
+    "unit_of_measure": [
+        r"\bUOM\b",
+        r"\bUnit\b",
+        r"\bUnit\s*of\s*Measure\b",
+        r"\bMeasure\b",
+    ],
+    "unit_price": [
+        r"\bUnit\s*Price\b",
+        r"\bUnit\s*Cost\b",
+        r"\bUnit\s*Rate\b",
+        r"\bRate\b",
+        r"\bPrice\b",
+        r"\bPrice\s*Each\b",
+        r"\bCost\s*Each\b",
+        r"\bPrice\s*Per\s*Unit\b",
+        r"\bNet\s*Price\b",
+        r"\bUnit\s*Net\b",
+    ],
+    "line_amount": [
+        r"\bLine\s*Total\b",
+        r"\bLine\s*Amount\b",
+        r"\bAmount\b",
+        r"\bNet\s*Amount\b",
+        r"\bSubtotal\b",
+    ],
+    "tax_percent": [r"\bTax\s*%\b", r"\bVAT\s*%\b", r"\bGST\s*%\b"],
+    "tax_amount": [
+        r"\bTax\s*Amt\b",
+        r"\bTax\b",
+        r"\bVAT\b",
+        r"\bVAT\s*Amount\b",
+        r"\bGST\s*Amount\b",
+    ],
+    "total_amount_incl_tax": [
+        r"\bTotal\b",
+        r"\bTotal\s*Incl\s*Tax\b",
+        r"\bGross\b",
+        r"\bTotal\s*Payable\b",
+        r"\bTotal\s*Incl\s*VAT\b",
+        r"\bTotal\s*Due\b",
+    ],
     "currency": [r"\bCurrency\b"],
     "line_total": [r"\bLine\s*Total\b", r"\bAmount\b", r"\bTotal\b"],
-    "total_amount": [r"\bTotal\b", r"\bTotal\s*Amount\b"]
+    "total_amount": [r"\bTotal\b", r"\bTotal\s*Amount\b", r"\bOrder\s*Total\b"],
 }
 TOTALS_STOP_WORDS = re.compile(r"\b(Subtotal|Tax|VAT|GST|Total|Amount\s*Due)\b", re.I)
 
@@ -1636,19 +1671,37 @@ class DataExtractionAgent(BaseAgent):
             tmp.flush()
             return camelot.read_pdf(tmp.name, flavor=flavor, pages="all")
 
+    def _select_table_header(self, df: pd.DataFrame) -> Tuple[int, Dict[int, str]]:
+        """Pick the most likely header row within the first few rows of a table."""
+        if df is None or df.empty:
+            return -1, {}
+        best_idx = -1
+        best_map: Dict[int, str] = {}
+        best_score = 0
+        for idx in range(min(5, len(df))):
+            row = df.iloc[idx].tolist()
+            header_map = self._map_table_headers(row)
+            score = len(header_map)
+            if score > best_score:
+                best_idx = idx
+                best_map = header_map
+                best_score = score
+            if score >= 3:
+                break
+        return best_idx, best_map
+
     def _camelot_tables_to_items(self, tables, doc_type: str) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for table in tables or []:
             df = getattr(table, "df", None)
             if df is None or df.empty:
                 continue
-            header_row = df.iloc[0].tolist()
-            header_map = self._map_table_headers(header_row)
+            header_idx, header_map = self._select_table_header(df)
             if len(header_map) < 2:
                 continue
             pending_desc: Optional[str] = None
-            for _, row in df.iloc[1:].iterrows():
-                row_text = " ".join(str(cell).strip() for cell in row if isinstance(cell, str))
+            for row_idx, row in df.iloc[header_idx + 1 :].iterrows():
+                row_text = " ".join(str(cell).strip() for cell in row.tolist())
                 if TOTALS_STOP_WORDS.search(row_text):
                     break
                 record: Dict[str, Any] = {}
@@ -1677,6 +1730,9 @@ class DataExtractionAgent(BaseAgent):
                     )
                     pending_desc = None
                 normalised = self._normalize_line_item_fields([record], doc_type)[0]
+                normalised = self._repair_invoice_line_values(
+                    normalised, row_text, doc_type
+                )
                 for key in [
                     "quantity",
                     "unit_price",
@@ -1771,13 +1827,17 @@ class DataExtractionAgent(BaseAgent):
                         else:
                             pending_desc = row_obj["item_description"]
                         continue
-                    if pending_desc and "item_description" in row_obj:
-                        row_obj["item_description"] = (
-                            f"{pending_desc} {row_obj['item_description']}"
-                        ).strip()
-                        pending_desc = None
+                if pending_desc and "item_description" in row_obj:
+                    row_obj["item_description"] = (
+                        f"{pending_desc} {row_obj['item_description']}"
+                    ).strip()
+                    pending_desc = None
 
                     row_norm = self._normalize_line_item_fields([row_obj], doc_type)[0]
+                    row_text = " ".join(w["text"] for w in row).strip()
+                    row_norm = self._repair_invoice_line_values(
+                        row_norm, row_text, doc_type
+                    )
                     for k in [
                         "quantity",
                         "unit_price",
@@ -2242,6 +2302,98 @@ class DataExtractionAgent(BaseAgent):
                 normalised[target or key] = value
             normalised_items.append(normalised)
         return normalised_items
+
+    def _repair_invoice_line_values(
+        self, item: Dict[str, Any], row_text: str, doc_type: str
+    ) -> Dict[str, Any]:
+        if doc_type != "Invoice":
+            return item
+
+        value_fields = ["unit_price", "line_amount", "tax_amount", "total_amount_incl_tax"]
+        if not any(item.get(field) in (None, "") for field in value_fields):
+            return item
+
+        numbers = []
+        for match in re.finditer(r"[-+]?\d[\d,]*\.?\d*", row_text):
+            num = self._clean_numeric(match.group())
+            if num is None:
+                continue
+            numbers.append(num)
+
+        if not numbers:
+            return item
+
+        qty = self._clean_numeric(item.get("quantity")) if item.get("quantity") not in (None, "") else None
+        deduped: List[float] = []
+        for num in numbers:
+            if qty is not None and abs(num - qty) < 1e-6:
+                continue
+            if not any(abs(num - existing) < 1e-6 for existing in deduped):
+                deduped.append(num)
+
+        if not deduped:
+            return item
+
+        sorted_vals = sorted(deduped)
+        total = sorted_vals[-1]
+        if item.get("total_amount_incl_tax") in (None, ""):
+            item["total_amount_incl_tax"] = total
+
+        remaining = [n for n in sorted_vals[:-1] if abs(n - total) > 1e-6]
+
+        def _is_close(a: float, b: float) -> bool:
+            return abs(a - b) <= max(0.02, 0.01 * max(abs(a), abs(b), 1.0))
+
+        unit_candidate: Optional[float] = None
+        if qty not in (None, 0):
+            for num in list(remaining):
+                if _is_close(num * qty, total):
+                    unit_candidate = num
+                    remaining.remove(num)
+                    break
+
+        line_candidate: Optional[float] = None
+        if remaining:
+            line_candidate = max(remaining)
+            remaining.remove(line_candidate)
+
+        if item.get("line_amount") in (None, ""):
+            item["line_amount"] = line_candidate if line_candidate is not None else total
+
+        if item.get("tax_amount") in (None, ""):
+            diff = item["total_amount_incl_tax"] - item["line_amount"]
+            tax_candidate = None
+            for num in list(remaining):
+                if _is_close(num, diff) and diff > 0:
+                    tax_candidate = num
+                    remaining.remove(num)
+                    break
+            if tax_candidate is not None:
+                item["tax_amount"] = tax_candidate
+            elif remaining:
+                item["tax_amount"] = max(remaining)
+            elif diff > 0.02:
+                item["tax_amount"] = round(diff, 2)
+
+        if item.get("unit_price") in (None, ""):
+            if unit_candidate is not None:
+                item["unit_price"] = unit_candidate
+            elif (
+                item.get("line_amount") not in (None, "")
+                and qty not in (None, 0)
+            ):
+                item["unit_price"] = round(item["line_amount"] / qty, 2)
+
+        if (
+            item.get("total_amount_incl_tax") in (None, "")
+            and item.get("line_amount") not in (None, "")
+            and item.get("tax_amount") not in (None, "")
+        ):
+            item["total_amount_incl_tax"] = round(
+                item["line_amount"] + item["tax_amount"], 2
+            )
+
+        return item
 
     def _enrich_contract_fields(self, text: str, header: Dict[str, Any]) -> Dict[str, Any]:
         # Best-effort patterns for common contract fields

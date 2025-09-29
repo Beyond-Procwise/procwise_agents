@@ -3,10 +3,11 @@ import sys
 import json
 from types import SimpleNamespace
 
-from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+from pytest import approx
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.data_extraction_agent import DataExtractionAgent, DocumentTextBundle
 
 
@@ -145,6 +146,26 @@ def test_contextual_field_normalisation():
     assert normalised_items[0]["item_description"] == "Widget"
     assert normalised_items[0]["quantity"] == "2"
     assert normalised_items[0]["unit_price"] == "5"
+
+
+def test_invoice_row_numeric_repair():
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    row = {"item_description": "Widget", "quantity": "2"}
+    repaired = agent._repair_invoice_line_values(row, "Widget Service 2 15.00 30.00", "Invoice")
+    assert repaired["line_amount"] == approx(30.0)
+    assert repaired["unit_price"] == approx(15.0)
+    assert repaired["total_amount_incl_tax"] == approx(30.0)
+
+    row_with_tax = {"item_description": "Widget", "quantity": "2"}
+    repaired_tax = agent._repair_invoice_line_values(
+        row_with_tax,
+        "Widget Service 2 15.00 30.00 6.00 36.00",
+        "Invoice",
+    )
+    assert repaired_tax["tax_amount"] == approx(6.0)
+    assert repaired_tax["total_amount_incl_tax"] == approx(36.0)
 
 
 def test_po_line_items_unit_mapping(monkeypatch):
