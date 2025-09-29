@@ -1,53 +1,29 @@
 import os
 import sys
-import types
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import services.backend_scheduler as backend_scheduler
 
 
-def test_submit_once_executes_and_removes_job(monkeypatch):
-    backend_scheduler.BackendScheduler._instance = None
-    monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: "gpu")
-    monkeypatch.setattr(
-        backend_scheduler.BackendScheduler,
-        "_register_default_jobs",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        backend_scheduler.BackendScheduler,
-        "_init_relationship_scheduler",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        backend_scheduler.BackendScheduler,
-        "_init_training_service",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        backend_scheduler.BackendScheduler,
-        "start",
-        lambda self: None,
-    )
+class DummyTrainingEndpoint:
+    def __init__(self):
+        self.dispatched = []
 
-    scheduler = backend_scheduler.BackendScheduler(types.SimpleNamespace())
+    def dispatch(self, *, force=True, limit=None):
+        self.dispatched.append({"force": force, "limit": limit})
+        return {"training_jobs": [], "relationship_jobs": []}
 
-    executed = []
+    def configure_capture(self, enable):  # pragma: no cover - not used in these tests
+        self.capture_state = enable
 
-    scheduler.submit_once("once", lambda: executed.append("ran"))
-
-    job = scheduler._jobs["once"]
-    scheduler._execute_job(job)
-
-    assert executed == ["ran"]
-    assert "once" not in scheduler._jobs
-
-    scheduler.stop()
-    backend_scheduler.BackendScheduler._instance = None
+    def get_service(self):  # pragma: no cover - helper to satisfy interface
+        return Mock()
 
 
-def _prepare_scheduler(monkeypatch, nick):
+def _prepare_scheduler(monkeypatch, nick, endpoint=None):
     backend_scheduler.BackendScheduler._instance = None
     monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: None)
     monkeypatch.setattr(
@@ -65,78 +41,109 @@ def _prepare_scheduler(monkeypatch, nick):
         "start",
         lambda self: None,
     )
-    return backend_scheduler.BackendScheduler(nick)
+    if endpoint is not None:
+        monkeypatch.setattr(
+            backend_scheduler.BackendScheduler,
+            "_resolve_training_endpoint",
+            lambda self: endpoint,
+        )
+    return backend_scheduler.BackendScheduler(nick, training_endpoint=endpoint)
 
 
-def test_init_training_service_disables_capture_when_learning_off(monkeypatch):
-    events = {"disabled": 0, "enabled": 0, "auto": []}
+def test_submit_once_executes_and_removes_job(monkeypatch):
+    scheduler = _prepare_scheduler(monkeypatch, SimpleNamespace())
 
-    import services.model_training_service as training_module
+    executed = []
 
-    class DummyService:
-        def __init__(self, *_args, auto_subscribe=False, **_kwargs):
-            events["auto"].append(auto_subscribe)
-            if auto_subscribe:
-                self.enable_workflow_capture()
+    scheduler.submit_once("once", lambda: executed.append("ran"))
 
-        def disable_workflow_capture(self):
-            events["disabled"] += 1
+    job = scheduler._jobs["once"]
+    scheduler._execute_job(job)
 
-        def enable_workflow_capture(self):
-            events["enabled"] += 1
-
-        def dispatch_due_jobs(self):  # pragma: no cover - helper stub
-            return []
-
-    monkeypatch.setattr(training_module, "ModelTrainingService", DummyService)
-
-    nick = types.SimpleNamespace(
-        settings=types.SimpleNamespace(enable_learning=False)
-    )
-
-    scheduler = _prepare_scheduler(monkeypatch, nick)
-
-    assert isinstance(getattr(nick, "model_training_service", None), DummyService)
-    assert events["auto"] == [False]
-    assert events["disabled"] == 1
-    assert events["enabled"] == 0
+    assert executed == ["ran"]
+    assert "once" not in scheduler._jobs
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None
 
 
-def test_init_training_service_enables_capture_when_learning_on(monkeypatch):
-    events = {"disabled": 0, "enabled": 0, "auto": []}
-
-    import services.model_training_service as training_module
-
-    class DummyService:
-        def __init__(self, *_args, auto_subscribe=False, **_kwargs):
-            events["auto"].append(auto_subscribe)
-            if auto_subscribe:
-                self.enable_workflow_capture()
-
-        def disable_workflow_capture(self):
-            events["disabled"] += 1
-
-        def enable_workflow_capture(self):
-            events["enabled"] += 1
-
-        def dispatch_due_jobs(self):  # pragma: no cover - helper stub
-            return []
-
-    monkeypatch.setattr(training_module, "ModelTrainingService", DummyService)
-
-    nick = types.SimpleNamespace(
-        settings=types.SimpleNamespace(enable_learning=True)
+def test_run_model_training_dispatches_via_endpoint(monkeypatch):
+    endpoint = DummyTrainingEndpoint()
+    scheduler = _prepare_scheduler(
+        monkeypatch,
+        SimpleNamespace(),
+        endpoint=endpoint,
     )
 
-    scheduler = _prepare_scheduler(monkeypatch, nick)
+    scheduler._run_model_training()
 
-    assert isinstance(getattr(nick, "model_training_service", None), DummyService)
-    assert events["auto"] == [True]
-    assert events["enabled"] >= 1
-    assert events["disabled"] == 0
+    assert endpoint.dispatched == [{"force": False, "limit": None}]
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None
+
+
+def test_ensure_updates_training_endpoint_reference(monkeypatch):
+    backend_scheduler.BackendScheduler._instance = None
+    monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: None)
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_register_default_jobs",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_init_relationship_scheduler",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "start",
+        lambda self: None,
+    )
+
+    first_endpoint = DummyTrainingEndpoint()
+    scheduler = backend_scheduler.BackendScheduler.ensure(
+        SimpleNamespace(), training_endpoint=first_endpoint
+    )
+    assert scheduler._training_endpoint is first_endpoint
+
+    second_endpoint = DummyTrainingEndpoint()
+    backend_scheduler.BackendScheduler.ensure(
+        SimpleNamespace(), training_endpoint=second_endpoint
+    )
+    assert scheduler._training_endpoint is second_endpoint
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
+
+def test_resolve_training_endpoint_creates_instance(monkeypatch):
+    backend_scheduler.BackendScheduler._instance = None
+    monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: None)
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_register_default_jobs",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_init_relationship_scheduler",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "start",
+        lambda self: None,
+    )
+
+    scheduler = backend_scheduler.BackendScheduler(SimpleNamespace())
+    endpoint = scheduler._resolve_training_endpoint()
+
+    from services.model_training_endpoint import ModelTrainingEndpoint
+
+    assert isinstance(endpoint, ModelTrainingEndpoint)
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
