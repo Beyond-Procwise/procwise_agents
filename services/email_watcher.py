@@ -388,7 +388,8 @@ class SESEmailWatcher:
                             if matched or (rfq_matched and not filters):
                                 match_found = True
                             if should_stop:
-
+                                if not match_found:
+                                    match_found = True
                                 break
                     else:
                         processed_batch: List[Dict[str, object]] = []
