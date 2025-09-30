@@ -1248,9 +1248,6 @@ class SESEmailWatcher:
                     if candidate
                 ):
                     return False
-            elif key == "from_address_like":
-                if not _like(payload_sender, expected):
-                    return False
             elif key == "subject_contains":
                 needle = SESEmailWatcher._normalise_filter_value(expected)
                 if needle and needle not in payload_subject:
@@ -1407,6 +1404,7 @@ class SESEmailWatcher:
         *,
         watermark_ts: Optional[datetime],
         watermark_key: str,
+        enforce_window: bool = True,
     ) -> List[Tuple[str, str, Optional[datetime], Optional[str]]]:
         object_refs: List[Tuple[str, str, Optional[datetime], Optional[str]]] = []
         newest_seen: Optional[datetime] = None
@@ -1441,11 +1439,12 @@ class SESEmailWatcher:
                     if last_modified is not None:
                         if newest_seen is None or last_modified > newest_seen:
                             newest_seen = last_modified
-                        if last_modified < window_start:
+                        if enforce_window and last_modified < window_start:
                             continue
                     else:
                         # Unable to determine age; skip to avoid processing stale data.
-                        continue
+                        if enforce_window:
+                            continue
 
                     if not self._is_newer_than_watermark(
                         last_modified, key, watermark_ts, watermark_key
@@ -1456,7 +1455,7 @@ class SESEmailWatcher:
                     object_refs.append((prefix, key, last_modified, etag_value))
 
         if not object_refs:
-            if newest_seen is None or newest_seen < window_start:
+            if enforce_window and (newest_seen is None or newest_seen < window_start):
                 newest_text = newest_seen.isoformat() if newest_seen else "<none>"
                 sleep_hint = (
                     self.poll_interval_seconds
@@ -1578,11 +1577,20 @@ class SESEmailWatcher:
                     limit=self._s3_watch_history_limit
                 )
 
+        enforce_recent_window = watermark_ts is not None
+        if not enforce_recent_window:
+            enforce_recent_window = all(
+                self._s3_prefix_watchers[prefix].primed
+                or bool(self._s3_prefix_watchers[prefix].known)
+                for prefix in active_prefixes
+            )
+
         object_refs = self._scan_recent_s3_objects(
             client,
             active_prefixes,
             watermark_ts=watermark_ts,
             watermark_key=watermark_key,
+            enforce_window=enforce_recent_window,
         )
 
         if not object_refs:

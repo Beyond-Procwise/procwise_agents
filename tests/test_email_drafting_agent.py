@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import pytest
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents import email_drafting_agent as module
 from agents.base_agent import AgentContext, AgentStatus
