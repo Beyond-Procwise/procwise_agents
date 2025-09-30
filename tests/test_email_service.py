@@ -121,7 +121,8 @@ def test_send_email_retries_with_previous_secret_on_auth_failure():
             sender="from@example.com",
         )
 
-    assert result is True
+    assert result.success is True
+    assert result.message_id
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
     rotate_mock.assert_not_called()
@@ -163,7 +164,8 @@ def test_send_email_returns_false_when_retry_also_fails_authentication():
             sender="from@example.com",
         )
 
-    assert result is False
+    assert result.success is False
+    assert result.message_id
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
     rotate_mock.assert_called_once()
@@ -215,7 +217,8 @@ def test_send_email_rotates_credentials_after_auth_failures():
             sender="from@example.com",
         )
 
-    assert result is True
+    assert result.success is True
+    assert result.message_id
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
     rotate_mock.assert_called_once_with()
@@ -283,7 +286,8 @@ def test_rotated_credentials_retry_until_propagation_succeeds():
             sender="from@example.com",
         )
 
-    assert result is True
+    assert result.success is True
+    assert result.message_id
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
     assert fetch_mock.call_args_list[2] == call()
@@ -353,7 +357,8 @@ def test_rotated_credentials_retry_exhausts_attempts():
             sender="from@example.com",
         )
 
-    assert result is False
+    assert result.success is False
+    assert result.message_id
     assert fetch_mock.call_args_list[0] == call()
     assert fetch_mock.call_args_list[1] == call(version_stage="AWSPREVIOUS")
     assert fetch_mock.call_args_list[2] == call()

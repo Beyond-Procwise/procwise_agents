@@ -8,6 +8,10 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
 from utils.gpu import configure_gpu
 
 from .email_service import EmailService
@@ -19,6 +23,10 @@ logger = logging.getLogger(__name__)
 _RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 
 
+_DEFAULT_THREAD_TABLE = "procwise_outbound_emails"
+_BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
+
+
 class EmailDispatchService:
     """Send persisted RFQ drafts via Amazon SES and update their status."""
 
@@ -27,6 +35,12 @@ class EmailDispatchService:
         self.email_service = EmailService(agent_nick)
         self.settings = agent_nick.settings
         self.logger = logging.getLogger(__name__)
+        self._thread_table_name = (
+            getattr(self.settings, "email_thread_table", None)
+            or _DEFAULT_THREAD_TABLE
+        )
+        self._thread_table = None
+        self._ddb_resource = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,13 +109,22 @@ class EmailDispatchService:
                 }
             )
 
-            sent = self.email_service.send_email(
+            headers = {"X-Procwise-RFQ-ID": rfq_id}
+            mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
+            if mailbox_header:
+                headers["X-Procwise-Mailbox"] = mailbox_header
+
+            send_result = self.email_service.send_email(
                 subject,
                 body,
                 recipient_list,
                 sender_email,
                 attachments,
+                headers=headers,
             )
+
+            sent = send_result.success
+            message_id = send_result.message_id
 
             self._update_draft_status(
                 conn,
@@ -123,6 +146,20 @@ class EmailDispatchService:
             dispatch_payload["sent_status"] = bool(sent)
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
+                dispatch_payload["message_id"] = message_id
+                try:
+                    self._record_thread_mapping(
+                        message_id,
+                        rfq_id,
+                        draft.get("supplier_id"),
+                        recipient_list,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    self.logger.exception(
+                        "Failed to persist thread mapping for RFQ %s", rfq_id
+                    )
+            elif message_id:
+                dispatch_payload["message_id"] = message_id
 
             return {
                 "rfq_id": rfq_id,
@@ -131,6 +168,7 @@ class EmailDispatchService:
                 "sender": sender_email,
                 "subject": subject,
                 "body": body,
+                "message_id": message_id,
                 "thread_index": dispatch_payload.get("thread_index"),
                 "draft": dispatch_payload,
             }
@@ -301,6 +339,63 @@ class EmailDispatchService:
                 action_id,
                 rfq_id,
             )
+
+    # ------------------------------------------------------------------
+    # Outbound thread mapping helpers
+    # ------------------------------------------------------------------
+    def _record_thread_mapping(
+        self,
+        message_id: Optional[str],
+        rfq_id: str,
+        supplier_id: Optional[str],
+        recipients: Sequence[str],
+    ) -> None:
+        if not message_id:
+            return
+
+        table = self._get_thread_table()
+        if table is None:
+            return
+
+        item: Dict[str, Any] = {
+            "message_id": str(message_id),
+            "rfq_id": str(rfq_id),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        if supplier_id:
+            item["supplier_id"] = str(supplier_id)
+        if recipients:
+            item["recipients"] = list(recipients)
+
+        try:
+            table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(message_id)",
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code") if isinstance(exc.response, dict) else None
+            if error_code == "ConditionalCheckFailedException":
+                self.logger.debug(
+                    "Thread mapping for message %s already exists", message_id
+                )
+                return
+            raise
+
+    def _get_thread_table(self):
+        if not self._thread_table_name:
+            return None
+
+        if self._thread_table is None:
+            region = getattr(self.settings, "ses_region", None)
+            resource_kwargs = {"config": _BOTO_CONFIG}
+            if region:
+                resource_kwargs["region_name"] = region
+            self._ddb_resource = self._ddb_resource or boto3.resource(
+                "dynamodb",
+                **resource_kwargs,
+            )
+            self._thread_table = self._ddb_resource.Table(self._thread_table_name)
+        return self._thread_table
 
     @staticmethod
     def _extract_action_id(payload: Dict[str, Any]) -> Optional[str]:
