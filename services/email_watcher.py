@@ -322,6 +322,8 @@ class SESEmailWatcher:
         )
         self._processed_cache: OrderedDict[str, Dict[str, object]] = OrderedDict()
         self._completed_targets: Set[str] = set()
+        self._rfq_run_counts: Dict[str, int] = {}
+        self._rfq_index_hits: Dict[str, str] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
@@ -372,6 +374,56 @@ class SESEmailWatcher:
         target_rfq_normalised: Optional[str] = None
         if filters:
             target_rfq_normalised = self._normalise_filter_value(filters.get("rfq_id"))
+
+        run_count = 0
+        if target_rfq_normalised:
+            run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
+            self._rfq_run_counts[target_rfq_normalised] = run_count
+            if run_count > 1 and target_rfq_normalised in self._completed_targets:
+                logger.info(
+                    "RFQ %s requested again for mailbox %s (run %s); resetting completion state",
+                    target_rfq_normalised,
+                    self.mailbox_address,
+                    run_count,
+                )
+                self._completed_targets.discard(target_rfq_normalised)
+        if target_rfq_normalised:
+            hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
+            if hit:
+                cached_key = self._rfq_index_hits.get(target_rfq_normalised)
+                if cached_key and cached_key == hit["key"]:
+                    logger.info(
+                        "RFQ %s index entry %s already surfaced on a prior run (run %s); continuing with S3 scan",
+                        target_rfq_normalised,
+                        cached_key,
+                        run_count or 1,
+                    )
+                else:
+                    self._rfq_index_hits[target_rfq_normalised] = hit["key"]
+                    results.append(
+                        {
+                            "rfq_id": hit["rfq_id"],
+                            "supplier_id": None,
+                            "message_id": None,
+                            "subject": None,
+                            "from_address": None,
+                            "message_body": None,
+                            "target_price": None,
+                            "negotiation_triggered": False,
+                            "supplier_status": None,
+                            "negotiation_status": None,
+                            "supplier_output": None,
+                            "negotiation_output": None,
+                            "canonical_s3_key": hit["key"],
+                        }
+                    )
+                    logger.info(
+                        "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
+                        target_rfq_normalised,
+                        hit["processed_at"],
+                        self.mailbox_address,
+                    )
+                    return results
 
         logger.info(
             "Scanning %s for new supplier responses (limit=%s)",
@@ -657,6 +709,8 @@ class SESEmailWatcher:
             if canonical_key:
                 processed_payload["canonical_s3_key"] = canonical_key
                 processed["canonical_s3_key"] = canonical_key
+                if target_rfq_normalised:
+                    self._rfq_index_hits[target_rfq_normalised] = canonical_key
 
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
@@ -886,6 +940,18 @@ class SESEmailWatcher:
                             ON proc.processed_emails (bucket, key, etag)
                         """
                     )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS processed_emails_rfq_ts_idx
+                            ON proc.processed_emails (rfq_id, processed_at DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS processed_emails_rfq_key_idx
+                            ON proc.processed_emails (rfq_id, key)
+                        """
+                    )
                 conn.commit()
         except Exception:
             logger.exception("Failed to ensure processed email registry table exists")
@@ -920,6 +986,35 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("Failed to check processed email registry for %s", key)
         return False
+
+    def _lookup_rfq_hit_pg(self, rfq_id_norm: str) -> Optional[Dict[str, str]]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT rfq_id, key, processed_at
+                        FROM proc.processed_emails
+                        WHERE rfq_id = %s
+                        ORDER BY processed_at DESC
+                        LIMIT 1
+                        """,
+                        (_canon_id(rfq_id_norm),),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "rfq_id": row[0],
+                        "key": row[1],
+                        "processed_at": row[2].isoformat(),
+                    }
+        except Exception:
+            logger.exception("RFQ index lookup failed for %s", rfq_id_norm)
+            return None
 
     def _record_processed_in_registry(
         self,

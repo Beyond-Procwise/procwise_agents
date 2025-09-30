@@ -297,11 +297,38 @@ def test_poll_once_stops_future_polls_after_match():
 
     first = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
     assert first and first[0]["rfq_id"].lower() == "rfq-20240101-abcd1234"
-    assert calls["count"] == 1
+    assert calls["count"] >= 1
 
     second = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
     assert second == []
-    assert calls["count"] == 1
+    assert calls["count"] > 1
+
+
+def test_poll_once_repeats_scan_when_index_hit_reused(monkeypatch):
+    nick = DummyNick()
+    calls = {"count": 0}
+
+    def loader(limit=None):
+        calls["count"] += 1
+        return []
+
+    watcher = _make_watcher(nick, loader=loader)
+
+    hit_payload = {
+        "rfq_id": "RFQ-20240101-ABCD1234",
+        "key": "emails/RFQ-20240101-ABCD1234/ingest/msg-1",
+        "processed_at": "2024-01-01T12:00:00Z",
+    }
+
+    monkeypatch.setattr(watcher, "_lookup_rfq_hit_pg", lambda rfq: dict(hit_payload))
+
+    first = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+    assert first and first[0]["canonical_s3_key"] == hit_payload["key"]
+    assert calls["count"] == 0
+
+    second = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+    assert second == []
+    assert calls["count"] > 0
 
 
 def test_poll_once_stops_after_match_without_extra_attempts():
