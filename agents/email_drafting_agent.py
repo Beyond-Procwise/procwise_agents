@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import requests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
-
-
 # -----------------------
 # Config & small utilities
 # -----------------------
@@ -275,7 +273,7 @@ class EmailDraftingAgent:
             )
 
         default_subject = _trim_subject_prefixes(
-            f"RFQ {context.rfq_id} – Counter Offer & Next Steps"
+            f"{context.rfq_id} – Counter Offer & Next Steps"
         )
         subject = _first_line_subject_fallback(body, default_subject)
         body = re.sub(r"(?i)^subject:.*\n", "", body).strip()
@@ -309,7 +307,7 @@ class EmailDraftingAgent:
             rfq_id = match.group(1).replace(" ", "") if match else "RFQ"
 
         subject = _first_line_subject_fallback(
-            body, _trim_subject_prefixes(f"RFQ {rfq_id} – Follow-up")
+            body, _trim_subject_prefixes(f"{rfq_id} – Follow-up")
         )
         body = re.sub(r"(?i)^subject:.*\n", "", body).strip()
 

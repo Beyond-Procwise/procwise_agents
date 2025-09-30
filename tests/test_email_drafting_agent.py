@@ -60,9 +60,16 @@ def test_from_decision_subject_fallback(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     agent = EmailDraftingAgent()
     result = agent.from_decision({"rfq_id": "ABC"})
-    assert result["subject"] == "RFQ ABC – Counter Offer & Next Steps"
+    assert result["subject"] == "ABC – Counter Offer & Next Steps"
     assert result["text"] == "Body without explicit subject"
 
+
+def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    agent = EmailDraftingAgent()
+    rfq_id = "RFQ-20250930-84d44c85"
+    result = agent.from_decision({"rfq_id": rfq_id})
+    assert result["subject"] == f"{rfq_id} – Counter Offer & Next Steps"
 
 def test_prompt_mode_with_polish(monkeypatch):
     responses = iter([
@@ -168,4 +175,3 @@ def test_execute_infers_recipients_and_counter_price(monkeypatch):
     assert draft["to"] == "primary@example.com"
     assert draft["cc"] == ["cc1@example.com"]
     assert draft["metadata"]["counter_price"] == 11.75
-
