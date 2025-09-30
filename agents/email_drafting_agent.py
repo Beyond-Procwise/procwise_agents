@@ -9,8 +9,12 @@ import string
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
 import requests
-from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+
+
+logger = logging.getLogger(__name__)
 
 
 logger = logging.getLogger(__name__)
@@ -258,7 +262,7 @@ If an RFQ id appears, include it in the subject and opening line.
 # -----------------------
 
 
-class EmailDraftingAgent:
+class EmailDraftingAgent(BaseAgent):
     """Email drafting helper backed by an Ollama chat model."""
 
     def __init__(
@@ -268,17 +272,33 @@ class EmailDraftingAgent:
         *_,
         **kwargs,
     ) -> None:
+        agent_nick = kwargs.pop("agent_nick", None)
+
         # Backwards compatibility for legacy initialisation ``EmailDraftingAgent(agent_nick)``.
         if compose_model is not None and not isinstance(compose_model, str):
-            kwargs.setdefault("agent_nick", compose_model)
+            agent_nick = compose_model
             compose_model = MODEL_COMPOSE
         if polish_model is not None and not isinstance(polish_model, str):
-            kwargs.setdefault("agent_nick", polish_model)
+            agent_nick = polish_model
             polish_model = MODEL_POLISH
+
+        if agent_nick is None:
+            noop_service = SimpleNamespace(
+                log_process=lambda **_: None,
+                log_run_detail=lambda **_: None,
+                log_action=lambda **_: None,
+            )
+            agent_nick = SimpleNamespace(
+                settings=SimpleNamespace(script_user=None),
+                process_routing_service=noop_service,
+                prompt_engine=None,
+                ollama_options=lambda: {},
+            )
+
+        super().__init__(agent_nick)
 
         self.compose_model = compose_model or MODEL_COMPOSE
         self.polish_model = (polish_model or MODEL_POLISH) if ENABLE_POLISH else None
-        self.agent_nick = kwargs.get("agent_nick")
 
     # Connected mode (NegotiationAgent -> EmailDraftingAgent)
     def from_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -349,15 +369,8 @@ class EmailDraftingAgent:
         return _build_output(context, subject, body)
 
     # Legacy orchestrator compatibility -------------------------------------------------
-    def execute(self, context: AgentContext) -> AgentOutput:
-        """Legacy orchestration shim.
-
-        The refreshed drafting helper exposes :meth:`from_decision` and
-        :meth:`from_prompt` for direct usage.  Legacy flows, however, still call
-        :meth:`execute` with an :class:`AgentContext`.  This adapter keeps those
-        flows functional by extracting drafting inputs from ``context`` and
-        delegating to the lightweight helpers.
-        """
+    def run(self, context: AgentContext) -> AgentOutput:
+        """Execute the drafting workflow within the shared agent lifecycle."""
 
         start_ts = datetime.utcnow()
         input_data: Dict[str, Any] = getattr(context, "input_data", {}) or {}
@@ -385,6 +398,8 @@ class EmailDraftingAgent:
 
         pass_fields = dict(input_data)
         pass_fields["drafts"] = drafts
+        if errors:
+            pass_fields.setdefault("errors", errors)
 
         result = AgentOutput(status=status, data=payload, pass_fields=pass_fields)
         end_ts = datetime.utcnow()
