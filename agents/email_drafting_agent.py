@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -10,6 +11,9 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import requests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+
+
+logger = logging.getLogger(__name__)
 
 # -----------------------
 # Config & small utilities
@@ -355,6 +359,7 @@ class EmailDraftingAgent:
         delegating to the lightweight helpers.
         """
 
+        start_ts = datetime.utcnow()
         input_data: Dict[str, Any] = getattr(context, "input_data", {}) or {}
 
         drafts: List[Dict[str, Any]] = []
@@ -381,7 +386,75 @@ class EmailDraftingAgent:
         pass_fields = dict(input_data)
         pass_fields["drafts"] = drafts
 
-        return AgentOutput(status=status, data=payload, pass_fields=pass_fields)
+        result = AgentOutput(status=status, data=payload, pass_fields=pass_fields)
+        end_ts = datetime.utcnow()
+        self._log_execution(context, result, start_ts, end_ts)
+        return result
+
+    def _log_execution(
+        self,
+        context: AgentContext,
+        result: AgentOutput,
+        start_ts: datetime,
+        end_ts: datetime,
+    ) -> None:
+        """Persist execution metadata when a process routing service is available."""
+
+        agent_nick = getattr(self, "agent_nick", None)
+        if agent_nick is None:
+            return
+
+        process_service = getattr(agent_nick, "process_routing_service", None)
+        if process_service is None:
+            return
+
+        settings = getattr(agent_nick, "settings", None)
+        script_user = getattr(settings, "script_user", None)
+
+        logged_input = getattr(context, "input_data", {}) or {}
+        logged_output = result.data if isinstance(result.data, dict) else {}
+
+        try:
+            process_id = process_service.log_process(
+                process_name=self.__class__.__name__,
+                process_details={"input": logged_input, "output": logged_output},
+                user_id=context.user_id,
+                user_name=script_user,
+                process_status=0,
+            )
+            if process_id is None:
+                return
+
+            run_id = process_service.log_run_detail(
+                process_id=process_id,
+                process_status=result.status.value,
+                process_details={"input": logged_input, "output": logged_output},
+                process_start_ts=start_ts,
+                process_end_ts=end_ts,
+                triggered_by=context.user_id,
+            )
+
+            action_status = "completed" if result.status == AgentStatus.SUCCESS else "failed"
+            action_id = process_service.log_action(
+                process_id=process_id,
+                agent_type=self.__class__.__name__,
+                action_desc=logged_input,
+                process_output=logged_output,
+                status=action_status,
+                run_id=run_id,
+            )
+
+            if action_id:
+                result.action_id = action_id
+                if isinstance(result.data, dict):
+                    result.data.setdefault("action_id", action_id)
+                    drafts = result.data.get("drafts")
+                    if isinstance(drafts, list):
+                        for draft in drafts:
+                            if isinstance(draft, dict):
+                                draft.setdefault("action_id", action_id)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to log EmailDraftingAgent execution")
 
     # -----------------------
     # helpers
