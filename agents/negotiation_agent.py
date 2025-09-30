@@ -1,33 +1,96 @@
+import json
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
-from services.supplier_relationship_service import SupplierRelationshipService
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
+COMPOSE_SYSTEM_PROMPT = (
+    "You are a procurement negotiator. Be concise, professional, and specific.\n"
+    "Keep emails under 140 words. Include currency symbols. Use bullet points for lists.\n"
+    "Do not invent numbers not provided in the JSON. Always reference the RFQ id."
+)
+
+POLISH_SYSTEM_PROMPT = (
+    "Polish the email for warmth and clarity without changing numbers or commitments.\n"
+    "Cap at 140 words. Keep bullet points. British English."
+)
+
+
+def decide_strategy(
+    price: Optional[float],
+    target: Optional[float],
+    lead_weeks: Optional[float] = None,
+    constraints: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Deterministic negotiation logic shared across tests and runtime."""
+
+    if price is None or target is None:
+        return {
+            "strategy": "clarify",
+            "counter_price": None,
+            "asks": [
+                "Confirm unit price, currency, tiered price @ 100/250/500."
+            ],
+            "lead_time_request": None,
+            "rationale": "Price missing; request structured quote.",
+        }
+
+    gap = (price - target) / target
+    asks: List[str] = []
+    lead_req = None
+
+    if lead_weeks and lead_weeks > 3:
+        lead_req = "≤ 2 weeks or split shipment (20–30% now, balance later)"
+        asks.append("Split shipment or expedite option")
+
+    if gap <= 0:
+        counter = round(min(price, target * 0.99), 2)
+        return {
+            "strategy": "accept-with-sweetener",
+            "counter_price": counter,
+            "asks": asks
+            + ["Net-30 (or 1–2% discount)", "Volume price break @ 100/250/500"],
+            "lead_time_request": lead_req,
+            "rationale": "Offer meets or beats target; seek small concession.",
+        }
+
+    if gap <= 0.10:
+        counter = round((price + target) / 2, 2)
+        return {
+            "strategy": "midpoint",
+            "counter_price": counter,
+            "asks": asks + ["Volume price break @ 100/250/500"],
+            "lead_time_request": lead_req,
+            "rationale": "Narrow gap; split the difference with rationale.",
+        }
+
+    counter = round(max(target, price * 0.88), 2)
+    return {
+        "strategy": "anchor-lower",
+        "counter_price": counter,
+        "asks": asks
+        + ["Volume price break @ 100/250/500", "Alternative part/brand if needed"],
+        "lead_time_request": lead_req,
+        "rationale": "Wide gap; anchor lower and open multiple paths.",
+    }
+
 
 class NegotiationAgent(BaseAgent):
-    """Generate supplier counter proposals using an LLM.
-
-    This agent encapsulates the negotiation flow described in the business
-    requirements.  It consumes supplier proposals and negotiation context and
-    produces structured counter-proposal options alongside a recommended message
-    ready for a drafting agent.
-    """
+    """Generate deterministic negotiation decisions and LLM-composed emails."""
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
-        self.policy_engine = getattr(agent_nick, "policy_engine", None)
         self._negotiation_counts: Dict[Tuple[str, Optional[str]], int] = {}
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
+
         supplier = context.input_data.get("supplier")
-        current_offer = context.input_data.get("current_offer")
-        target_price = context.input_data.get("target_price")
         rfq_id = context.input_data.get("rfq_id")
         round_no = int(context.input_data.get("round", 1))
         item_reference = (
@@ -36,41 +99,39 @@ class NegotiationAgent(BaseAgent):
             or context.input_data.get("primary_item")
         )
 
-        if supplier is None or current_offer is None or target_price is None:
-            """Gracefully handle missing negotiation inputs.
+        price_raw = (
+            context.input_data.get("current_offer")
+            if context.input_data.get("current_offer") is not None
+            else context.input_data.get("price")
+        )
+        target_raw = context.input_data.get("target_price")
+        currency = self._normalise_currency(
+            context.input_data.get("currency")
+            or context.input_data.get("current_offer_currency")
+            or context.input_data.get("price_currency")
+        )
+        currency_conf = self._coerce_float(
+            context.input_data.get("currency_confidence")
+            or context.input_data.get("current_offer_currency_confidence")
+        )
 
-            Some flows may branch to the negotiation agent even when the
-            necessary fields are absent (e.g. no quote returned).  Rather than
-            failing the workflow we return a success with an explanatory
-            message so downstream steps can decide how to proceed.
-            """
-            logger.warning("NegotiationAgent missing input data; skipping negotiation")
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={
-                    "supplier": supplier,
-                    "counter_proposals": [],
-                    "strategy": None,
-                    "savings_score": 0.0,
-                    "decision_log": "no negotiation data provided",
-                    "message": "",
-                    "transcript": [],
-                    "references": [],
-                    "interaction_type": "negotiation",
-                },
-                pass_fields={
-                    "supplier": supplier,
-                    "counter_proposals": [],
-                    "strategy": None,
-                    "savings_score": 0.0,
-                    "decision_log": "no negotiation data provided",
-                    "message": "",
-                    "transcript": [],
-                    "references": [],
-                    "interaction_type": "negotiation",
-                },
-                next_agents=[],
+        price = self._coerce_float(price_raw)
+        target_price = self._coerce_float(target_raw)
+
+        if currency_conf is not None and currency_conf < 0.5:
+            logger.warning(
+                "Currency confidence %.2f below threshold; withholding price data", currency_conf
             )
+            currency = None
+            price = None
+
+        lead_weeks = self._parse_lead_weeks(
+            context.input_data.get("lead_time_weeks")
+            or context.input_data.get("lead_time")
+            or context.input_data.get("lead_time_days")
+        )
+
+        constraints = self._ensure_list(context.input_data.get("constraints"))
 
         negotiation_key = (str(supplier), str(item_reference or rfq_id))
         db_rounds = self._count_existing_rounds(rfq_id, supplier)
@@ -85,13 +146,9 @@ class NegotiationAgent(BaseAgent):
                 "rfq_id": rfq_id,
                 "round": round_no,
                 "counter_proposals": [],
-                "strategy": None,
-                "savings_score": 0.0,
-                "decision_log": "negotiation limit reached",
-                "message": "",
-                "transcript": [],
-                "references": [],
+                "decision": decide_strategy(None, None),
                 "negotiation_allowed": False,
+                "message": "",
                 "interaction_type": "negotiation",
             }
             return AgentOutput(
@@ -101,114 +158,122 @@ class NegotiationAgent(BaseAgent):
                 next_agents=[],
             )
 
-        # Retrieve negotiation strategy from Postgres
-        strategy = "counter"
-        try:
-            with self.agent_nick.get_db_connection() as conn:  # pragma: no cover - network
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT strategy FROM negotiation_strategies WHERE supplier = %s",
-                        (supplier,),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        strategy = row[0]
-        except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to fetch negotiation strategy")
+        decision = decide_strategy(price, target_price, lead_weeks=lead_weeks, constraints=constraints)
+        decision.setdefault("strategy", "clarify")
+        decision.setdefault("counter_price", None)
+        decision.setdefault("asks", [])
+        decision.setdefault("lead_time_request", None)
+        decision.setdefault("rationale", "")
+        decision["round"] = round_no
 
-        supplier_context = self._load_supplier_context(supplier, context.input_data)
+        supplier_snippets = self._collect_supplier_snippets(context.input_data)
+        price_breaks = self._ensure_list(context.input_data.get("price_breaks"))
+        moq = self._coerce_float(context.input_data.get("moq"))
+        incoterms = context.input_data.get("incoterms")
+        payment_terms = context.input_data.get("payment_terms")
 
-        prompt = self._build_prompt(
-            supplier,
-            rfq_id,
-            round_no,
-            current_offer,
-            target_price,
-            item_reference,
-            context.input_data,
-            supplier_context,
+        email_body = ""
+        compose_payload = {
+            "rfq_id": rfq_id,
+            "supplier": supplier,
+            "target_price": target_price,
+            "current_offer": price,
+            "lead_time_weeks": lead_weeks,
+            "currency": currency,
+            "decision": decision,
+            "moq": moq,
+            "incoterms": incoterms,
+            "payment_terms": payment_terms,
+            "price_breaks": price_breaks,
+        }
+
+        compose_messages = [
+            {"role": "system", "content": COMPOSE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": self._build_compose_prompt(compose_payload, supplier_snippets),
+            },
+        ]
+
+        compose_response = self.call_ollama(
+            model="llama3.2",
+            messages=compose_messages,
+            options={"temperature": 0.3, "top_p": 0.9, "num_ctx": 4096},
         )
+        email_body = self._extract_message(compose_response)
 
-        logger.debug("NegotiationAgent prompt prepared")
-        response = self.call_ollama(prompt=prompt)
-        if response.get("error"):
-            logger.error(
-                "NegotiationAgent LLM call returned error for supplier=%s, rfq_id=%s: %s",
-                supplier,
-                rfq_id,
-                response.get("error"),
-            )
-        message = response.get("response", "").strip()
-        if not message:
+        if not email_body:
             logger.warning(
-                "NegotiationAgent received empty response from model for supplier=%s, rfq_id=%s; using fallback",
+                "NegotiationAgent compose model returned empty response for supplier=%s rfq_id=%s",
                 supplier,
                 rfq_id,
             )
-            message = self._build_fallback_message(
-                supplier_context,
-                supplier,
-                rfq_id,
-                current_offer,
-                target_price,
-                item_reference,
-                context.input_data,
-            )
-        logger.info("NegotiationAgent generated negotiation guidance")
+            email_body = self._build_fallback_email(rfq_id, decision, currency)
 
-        # Retrieve relevant references from Qdrant
-        references: list[str] = []
-        try:
-            vector = self.agent_nick.embedding_model.encode(message).tolist()
-            hits = self.agent_nick.qdrant_client.search(
-                collection_name=self.settings.qdrant_collection_name,
-                query_vector=vector,
-                limit=1,
+        should_polish = bool(
+            context.input_data.get("polish_email")
+            or getattr(self.settings, "negotiation_polish_enabled", False)
+        )
+        if should_polish and email_body:
+            polish_messages = [
+                {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Original:\n<<<\n{email_body}\n<<<",
+                },
+            ]
+            polish_response = self.call_ollama(
+                model="gemma3",
+                messages=polish_messages,
+                options={"temperature": 0.2, "num_ctx": 2048, "max_tokens": 260},
             )
-            references = [h.payload.get("document_type") for h in hits]
-        except Exception:  # pragma: no cover - external dependency
-            logger.exception("qdrant search failed")
+            polished = self._extract_message(polish_response)
+            if polished:
+                email_body = polished
 
         savings_score = 0.0
-        try:
-            savings_score = (current_offer - target_price) / float(current_offer)
-        except Exception:  # pragma: no cover - defensive maths errors
-            pass
+        if price and price > 0 and target_price is not None:
+            try:
+                savings_score = (price - target_price) / float(price)
+            except ZeroDivisionError:
+                savings_score = 0.0
 
-        decision_log = self._build_decision_log(
-            supplier,
-            rfq_id,
-            current_offer,
-            target_price,
-            supplier_context,
-        )
-        counter_options = [{"price": target_price, "terms": None, "bundle": None}]
+        counter_options: List[Dict[str, Any]] = []
+        counter_price = decision.get("counter_price")
+        if counter_price is not None:
+            counter_options.append({"price": counter_price, "terms": None, "bundle": None})
 
-        self._store_session(rfq_id, supplier, round_no, target_price)
+        if counter_price is not None and supplier and rfq_id:
+            self._store_session(rfq_id, supplier, round_no, counter_price)
+
         self._negotiation_counts[negotiation_key] = total_rounds + 1
+
+        decision_log = self._build_decision_log(supplier, rfq_id, price, target_price, decision)
+        email_subject = self._build_subject(rfq_id, supplier)
 
         data = {
             "supplier": supplier,
             "rfq_id": rfq_id,
             "round": round_no,
             "counter_proposals": counter_options,
-            "strategy": strategy,
+            "decision": decision,
             "savings_score": savings_score,
             "decision_log": decision_log,
-            "message": message,
-            "transcript": [message],
-            "references": references,
-            "item_reference": item_reference,
+            "message": email_body,
+            "email_subject": email_subject,
+            "email_body": email_body,
+            "supplier_snippets": supplier_snippets,
             "negotiation_allowed": True,
             "interaction_type": "negotiation",
         }
-        logger.debug(
-            "NegotiationAgent output compiled with keys: %s",
-            sorted(data.keys()),
-        )
+
         logger.info(
-            "NegotiationAgent produced %d counter proposals", len(counter_options)
+            "NegotiationAgent generated strategy '%s' for supplier=%s rfq_id=%s",
+            decision.get("strategy"),
+            supplier,
+            rfq_id,
         )
+
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=data,
@@ -216,65 +281,20 @@ class NegotiationAgent(BaseAgent):
             next_agents=["EmailDraftingAgent"],
         )
 
-    def _build_prompt(
-        self,
-        supplier: str,
-        rfq_id: str,
-        round_no: int,
-        current_offer: float,
-        target_price: float,
-        item_reference: Optional[str],
-        context: Dict,
-        supplier_context: Dict[str, Any],
+    def _build_compose_prompt(
+        self, payload: Dict[str, Any], supplier_snippets: List[str]
     ) -> str:
-        guidelines: list[str] = []
-        if self.policy_engine is not None:
-            policies = getattr(self.policy_engine, "opportunity_policies", [])
-            for policy in policies:
-                if not policy.get("is_active", True):
-                    continue
-                description = policy.get("description")
-                suggestion = (
-                    policy.get("details", {})
-                    .get("rules", {})
-                    .get("output_suggestion")
-                )
-                if description:
-                    guidelines.append(description)
-                if suggestion:
-                    guidelines.append(suggestion.replace("{supplier_name}", str(supplier)))
-        supplier_response = context.get("response_text")
-        if supplier_response:
-            guidelines.append(f"Supplier response: {supplier_response}")
-
-        supplier_profile = supplier_context.get("profile") or {}
-        supplier_name = (
-            supplier_profile.get("supplier_name")
-            or context.get("supplier_name")
-            or str(supplier)
+        body = ["Context (JSON):", json.dumps(payload, ensure_ascii=False, default=self._json_default)]
+        if supplier_snippets:
+            body.append("Supplier snippets:")
+            for snippet in supplier_snippets:
+                body.append(f"- {snippet}")
+        body.append(
+            "Write a short email to the supplier proposing the counter-offer."
+            " Include: counter price (if present), requested lead time (if any),"
+            " and 1–2 alternative paths from decision. Ask for confirmation within 3 days."
         )
-
-        context_lines = self._build_context_lines(
-            supplier_context,
-            current_offer,
-            target_price,
-            item_reference,
-            context,
-        )
-        if context_lines:
-            guidelines = context_lines + guidelines
-
-        prompt = (
-            f"You are negotiating with supplier {supplier_name} for RFQ {rfq_id}. "
-            f"This is round {round_no}. Their current offer is {current_offer}. "
-            f"Craft a concise professional counter-proposal aiming for {target_price}."
-        )
-        if item_reference:
-            prompt += f" The discussion concerns item {item_reference}."
-        if guidelines:
-            prompt += " Consider the following context:\n- " + "\n- ".join(guidelines)
-        prompt += " Keep recommendations within policy limits and propose next steps."
-        return prompt
+        return "\n".join(body)
 
     def _count_existing_rounds(self, rfq_id: Optional[str], supplier: Optional[str]) -> int:
         if not rfq_id or not supplier:
@@ -312,313 +332,137 @@ class NegotiationAgent(BaseAgent):
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store negotiation session")
 
-    def _load_supplier_context(
-        self, supplier: Optional[str], context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        summary: Dict[str, Any] = {"profile": {}, "spend": {}, "contracts": []}
-        get_conn = getattr(self.agent_nick, "get_db_connection", None)
-        if not callable(get_conn):
-            return summary
+    def _collect_supplier_snippets(self, payload: Dict[str, Any]) -> List[str]:
+        snippets: List[str] = []
+        for key in (
+            "supplier_snippets",
+            "snippets",
+            "highlights",
+            "supplier_highlights",
+            "response_text",
+            "message",
+            "raw_email",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                snippets.extend(str(item).strip() for item in value if str(item).strip())
+            elif isinstance(value, str) and value.strip():
+                snippets.append(value.strip())
+        return snippets[:5]
 
-        supplier_id = supplier or context.get("supplier_id")
-        supplier_name_hint = (
-            context.get("supplier_name")
-            or context.get("supplier_company")
-            or context.get("supplier")
-        )
-
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    profile = None
-                    if supplier_id:
-                        cur.execute(
-                            """
-                            SELECT supplier_id, supplier_name, risk_score, default_currency,
-                                   delivery_lead_time_days, is_preferred_supplier,
-                                   contact_name_1, contact_email_1
-                            FROM proc.supplier
-                            WHERE supplier_id = %s
-                            LIMIT 1
-                            """,
-                            (supplier_id,),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            profile = self._row_to_dict(cur, row)
-
-                    if profile is None and supplier_name_hint:
-                        cur.execute(
-                            """
-                            SELECT supplier_id, supplier_name, risk_score, default_currency,
-                                   delivery_lead_time_days, is_preferred_supplier,
-                                   contact_name_1, contact_email_1
-                            FROM proc.supplier
-                            WHERE LOWER(supplier_name) = LOWER(%s)
-                            LIMIT 1
-                            """,
-                            (supplier_name_hint,),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            profile = self._row_to_dict(cur, row)
-
-                    if profile:
-                        summary["profile"] = profile
-                        supplier_name_hint = profile.get("supplier_name") or supplier_name_hint
-                        supplier_id = profile.get("supplier_id") or supplier_id
-
-                    if supplier_name_hint:
-                        cur.execute(
-                            """
-                            SELECT
-                                COALESCE(SUM(total_amount), 0) AS total_amount,
-                                COUNT(*) AS po_count,
-                                COALESCE(AVG(total_amount), 0) AS avg_order_value,
-                                MAX(order_date) AS last_order_date
-                            FROM proc.purchase_order_agent
-                            WHERE LOWER(supplier_name) = LOWER(%s)
-                            """,
-                            (supplier_name_hint,),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            summary["spend"] = self._row_to_dict(cur, row)
-
-                    if supplier_id:
-                        cur.execute(
-                            """
-                            SELECT contract_id, contract_title, contract_end_date,
-                                   total_contract_value
-                            FROM proc.contracts
-                            WHERE supplier_id = %s
-                            ORDER BY contract_end_date DESC NULLS LAST
-                            LIMIT 3
-                            """,
-                            (supplier_id,),
-                        )
-                        rows = cur.fetchall()
-                        if rows:
-                            columns = [desc[0] for desc in cur.description]
-                            summary["contracts"] = [
-                                {columns[i]: row[i] for i in range(len(columns))}
-                                for row in rows
-                            ]
-        except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to load supplier negotiation context")
-
-        relationship_service = SupplierRelationshipService(self.agent_nick)
-        relationship_payloads = relationship_service.fetch_relationship(
-            supplier_id=supplier_id,
-            supplier_name=supplier_name_hint,
-            limit=1,
-        )
-        if relationship_payloads:
-            summary["relationship"] = relationship_payloads[0]
-            summary["relationships"] = relationship_payloads
-
-        return summary
-
-    def _row_to_dict(self, cursor, row) -> Dict[str, Any]:
-        columns = [desc[0] for desc in cursor.description]
-        return {columns[i]: row[i] for i in range(len(columns))}
-
-    def _build_context_lines(
-        self,
-        supplier_context: Dict[str, Any],
-        current_offer: Optional[float],
-        target_price: Optional[float],
-        item_reference: Optional[str],
-        context: Dict[str, Any],
-    ) -> List[str]:
-        lines: List[str] = []
-        profile = supplier_context.get("profile") or {}
-        currency = profile.get("default_currency") or context.get("currency")
-
-        risk_score = profile.get("risk_score")
-        if risk_score:
-            lines.append(f"Supplier risk rating: {risk_score}.")
-
-        lead_time = profile.get("delivery_lead_time_days")
-        if lead_time:
-            lines.append(f"Average lead time {lead_time} days in supplier record.")
-
-        if profile.get("is_preferred_supplier"):
-            lines.append("Supplier is designated as preferred in master data.")
-
-        spend = supplier_context.get("spend") or {}
-        total_amount = spend.get("total_amount")
-        total_text = self._format_currency(total_amount, currency)
-        if total_text:
-            lines.append(f"Historic purchase orders total {total_text}.")
-
-        po_count = spend.get("po_count")
-        try:
-            count_value = int(po_count) if po_count is not None else None
-        except (TypeError, ValueError):
-            count_value = None
-        if count_value:
-            lines.append(f"Recorded {count_value} purchase orders to date.")
-
-        last_order = spend.get("last_order_date")
-        if last_order:
-            if hasattr(last_order, "isoformat"):
-                order_text = last_order.isoformat()
-            else:
-                order_text = str(last_order)
-            if order_text:
-                lines.append(f"Most recent order issued on {order_text}.")
-
-        contracts = supplier_context.get("contracts") or []
-        if contracts:
-            contract = contracts[0]
-            end_date = contract.get("contract_end_date")
-            if hasattr(end_date, "isoformat"):
-                end_text = end_date.isoformat()
-            else:
-                end_text = str(end_date) if end_date else ""
-            value_text = self._format_currency(
-                contract.get("total_contract_value"), currency
+    def _build_fallback_email(
+        self, rfq_id: Optional[str], decision: Dict[str, Any], currency: Optional[str]
+    ) -> str:
+        parts = [f"Thank you for your response on RFQ {rfq_id}."]
+        counter_price = decision.get("counter_price")
+        if counter_price is not None:
+            parts.append(
+                f"We would like to align on pricing at {self._format_currency(counter_price, currency)}."
             )
-            snippet = "Latest contract"
-            if contract.get("contract_id"):
-                snippet += f" {contract['contract_id']}"
-            if end_text:
-                snippet += f" ends {end_text}"
-            if value_text:
-                snippet += f" valued at {value_text}"
-            lines.append(snippet + ".")
-
-        benchmark = context.get("benchmark_price")
-        benchmark_text = self._format_currency(benchmark, currency)
-        if benchmark_text:
-            lines.append(f"Internal benchmark price is {benchmark_text}.")
-
-        try:
-            if current_offer and target_price and float(current_offer) > 0:
-                savings_ratio = (float(current_offer) - float(target_price)) / float(current_offer)
-                if savings_ratio > 0:
-                    lines.append(
-                        f"Achieving the target unlocks approximately {savings_ratio * 100:.1f}% savings."
-                    )
-        except Exception:
-            pass
-
-        if item_reference and context.get("item_summary"):
-            lines.append(f"Item {item_reference}: {context.get('item_summary')}")
-
-        additional_points = context.get("negotiation_notes")
-        if isinstance(additional_points, list):
-            for note in additional_points:
-                if isinstance(note, str) and note.strip():
-                    lines.append(note.strip())
-        elif isinstance(additional_points, str) and additional_points.strip():
-            lines.append(additional_points.strip())
-
-        relationship = supplier_context.get("relationship") or {}
-        coverage = relationship.get("coverage_ratio")
-        if isinstance(coverage, (int, float)) and coverage:
-            lines.append(
-                f"Supplier data coverage across contracts, purchase orders, invoices and quotes stands at {coverage:.2f}."
-            )
-        statements = relationship.get("relationship_statements")
-        if isinstance(statements, list):
-            for statement in statements:
-                if isinstance(statement, str) and statement.strip():
-                    lines.append(statement.strip())
-
-        return lines
+        lead_request = decision.get("lead_time_request")
+        if lead_request:
+            parts.append(f"Please confirm if the following lead time works: {lead_request}.")
+        asks = decision.get("asks") or []
+        if asks:
+            parts.append("Key requests: " + "; ".join(asks))
+        parts.append("Could you confirm within 3 days? Many thanks.")
+        return " ".join(filter(None, parts))
 
     def _build_decision_log(
         self,
         supplier: Optional[str],
         rfq_id: Optional[str],
-        current_offer: Optional[float],
+        price: Optional[float],
         target_price: Optional[float],
-        supplier_context: Dict[str, Any],
+        decision: Dict[str, Any],
     ) -> str:
         base = (
-            f"Targeting {target_price} against current offer {current_offer} "
-            f"from {supplier} for {rfq_id}."
+            f"Strategy={decision.get('strategy')} counter={decision.get('counter_price')}"
+            f" target={target_price} current={price} supplier={supplier} rfq={rfq_id}."
         )
-
-        extras: List[str] = []
-        profile = supplier_context.get("profile") or {}
-        spend = supplier_context.get("spend") or {}
-        currency = profile.get("default_currency")
-        spend_text = self._format_currency(spend.get("total_amount"), currency)
-        if spend_text:
-            extras.append(f"Historic spend snapshot: {spend_text}.")
-
-        contracts = supplier_context.get("contracts") or []
-        if contracts:
-            contract = contracts[0]
-            end_date = contract.get("contract_end_date")
-            if hasattr(end_date, "isoformat"):
-                end_text = end_date.isoformat()
-            else:
-                end_text = str(end_date) if end_date else ""
-            if end_text:
-                extras.append(f"Latest contract milestone ends {end_text}.")
-
-        if extras:
-            return " ".join([base] + extras)
+        rationale = decision.get("rationale")
+        if rationale:
+            return f"{base} {rationale}"
         return base
 
-    def _build_fallback_message(
-        self,
-        supplier_context: Dict[str, Any],
-        supplier: Optional[str],
-        rfq_id: Optional[str],
-        current_offer: Optional[float],
-        target_price: Optional[float],
-        item_reference: Optional[str],
-        context: Dict[str, Any],
-    ) -> str:
-        profile = supplier_context.get("profile") or {}
-        currency = profile.get("default_currency") or context.get("currency")
-        supplier_name = (
-            profile.get("supplier_name")
-            or context.get("supplier_name")
-            or str(supplier or "supplier")
-        )
+    def _build_subject(self, rfq_id: Optional[str], supplier: Optional[str]) -> str:
+        rfq_text = rfq_id or "RFQ"
+        supplier_text = supplier or "Supplier"
+        return f"Re: {rfq_text} – Updated terms for {supplier_text}"
 
-        target_text = self._format_currency(target_price, currency) or str(target_price)
-        current_text = self._format_currency(current_offer, currency) or str(current_offer)
-
-        opening = f"Thank you for the quotation provided for RFQ {rfq_id}."
-        if item_reference:
-            opening += f" We appreciate your proposal covering {item_reference}."
-
-        request = ""
-        if target_text:
-            request = f"To progress the evaluation we are aiming for pricing closer to {target_text}."
-        if current_text:
-            request += f" Your current proposal of {current_text} provides a helpful baseline for this conversation."
-
-        spend = supplier_context.get("spend") or {}
-        spend_text = self._format_currency(spend.get("total_amount"), currency)
-        if spend_text:
-            request += (
-                f" Historic collaboration with {supplier_name} totals {spend_text}, and we hope to continue this partnership with competitive terms."
-            )
-
-        closing = (
-            "Please let us know if you can revise the pricing or suggest alternative value drivers such as lead time or service enhancements."
-        )
-
-        return " ".join(part for part in (opening, request, closing) if part)
-
-    def _format_currency(self, value: Any, currency: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
+    def _format_currency(self, value: Optional[float], currency: Optional[str]) -> str:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return ""
         try:
             amount = float(value)
         except (TypeError, ValueError):
-            return None
+            return ""
         code = (currency or "GBP").upper()
-        symbol = "£" if code == "GBP" else "$" if code == "USD" else ""
+        symbol = "£" if code == "GBP" else "$" if code == "USD" else "€" if code == "EUR" else "₹" if code == "INR" else ""
         formatted = f"{amount:,.2f}"
-        if symbol:
-            return f"{symbol}{formatted}"
-        return f"{formatted} {code}"
+        return f"{symbol}{formatted}" if symbol else f"{formatted} {code}"
+
+    def _normalise_currency(self, value: Any) -> Optional[str]:
+        if not value:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip().upper()
+            if len(trimmed) == 3:
+                return trimmed
+        return None
+
+    def _parse_lead_weeks(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+            return number if number <= 12 else round(number / 7.0, 2)
+        except ValueError:
+            pass
+        lowered = text.lower()
+        digits = "".join(ch for ch in lowered if (ch.isdigit() or ch == "."))
+        try:
+            numeric = float(digits)
+        except ValueError:
+            return None
+        if "week" in lowered:
+            return numeric
+        if "day" in lowered or "business" in lowered:
+            return round(numeric / 7.0, 2)
+        return None
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _ensure_list(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _extract_message(self, response: Dict[str, Any]) -> str:
+        if not response:
+            return ""
+        message = response.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+        content = response.get("response")
+        if isinstance(content, str):
+            return content.strip()
+        return ""
+
+    def _json_default(self, value: Any) -> Any:
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return value
