@@ -30,6 +30,8 @@ def test_from_decision_formats_payload(monkeypatch):
         )
 
     monkeypatch.setattr(module, "_chat", fake_chat)
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "RFQ00001")
 
     agent = EmailDraftingAgent()
     decision = {
@@ -54,14 +56,16 @@ def test_from_decision_formats_payload(monkeypatch):
     assert result["headers"]["In-Reply-To"] == "<msg1>"
     assert result["headers"]["References"] == "<msg0>"
     assert result["metadata"]["supplier_id"] == "S-1"
-    assert calls[0]["payload"]["rfq_id"] == "RFQ-001"
+    assert calls[0]["payload"]["rfq_id"] == "RFQ-20250930-RFQ00001"
 
 
 def test_from_decision_subject_fallback(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "RFQ00001")
     agent = EmailDraftingAgent()
     result = agent.from_decision({"rfq_id": "ABC"})
-    assert result["subject"] == "ABC – Counter Offer & Next Steps"
+    assert result["subject"] == "RFQ-20250930-RFQ00001 – Counter Offer & Next Steps"
     assert result["text"] == "Body without explicit subject"
 
 
@@ -70,7 +74,31 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     agent = EmailDraftingAgent()
     rfq_id = "RFQ-20250930-84d44c85"
     result = agent.from_decision({"rfq_id": rfq_id})
-    assert result["subject"] == f"{rfq_id} – Counter Offer & Next Steps"
+    assert result["subject"] == "RFQ-20250930-84D44C85 – Counter Offer & Next Steps"
+
+
+def test_from_decision_generates_unique_rfq_id(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "UN1QUEID")
+
+    agent = EmailDraftingAgent()
+    decision = {"rfq_id": None, "supplier_id": "S-42"}
+
+    result = agent.from_decision(decision)
+
+    assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
+    assert result["headers"]["X-Procwise-RFQ-ID"] == "RFQ-20250930-UN1QUEID"
+    assert result["subject"] == "RFQ-20250930-UN1QUEID – Counter Offer & Next Steps"
+
+
+def test_from_decision_normalises_lowercase_rfq_id(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    agent = EmailDraftingAgent()
+
+    result = agent.from_decision({"rfq_id": "rfq-20250930-abc12345"})
+
+    assert result["rfq_id"] == "RFQ-20250930-ABC12345"
 
 
 def test_prompt_mode_with_polish(monkeypatch):
@@ -83,6 +111,8 @@ def test_prompt_mode_with_polish(monkeypatch):
         return next(responses)
 
     monkeypatch.setattr(module, "_chat", fake_chat)
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "96F5YFY9")
 
     agent = EmailDraftingAgent()
     agent.polish_model = "gemma3"
@@ -91,7 +121,7 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     assert result["subject"] == "RFQ XYZ follow-up"
     assert result["text"] == "Polished draft referencing RFQ XYZ"
-    assert result["rfq_id"].lower().startswith("rfq xyz".replace(" ", ""))
+    assert result["rfq_id"] == "RFQ-20250930-96F5YFY9"
 
 
 def test_decision_context_to_public_json():
@@ -154,6 +184,22 @@ def test_execute_falls_back_to_prompt(monkeypatch):
 
     agent = EmailDraftingAgent()
     context = _make_context({"prompt": "Please follow up", "rfq_id": "RFQ-XYZ"})
+
+    result = agent.execute(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"][0]["subject"] == "Follow-up"
+
+
+def test_execute_prompt_payload_skips_decision_fallback(monkeypatch):
+    def fake_chat(model, system, user, **kwargs):
+        assert system != module.SYSTEM_COMPOSE, "prompt payload should not use decision pathway"
+        return "Subject: Follow-up\nBody"
+
+    monkeypatch.setattr(module, "_chat", fake_chat)
+
+    agent = EmailDraftingAgent()
+    context = _make_context({"prompt": "Prompt only flow", "rfq_id": "RFQ-XYZ"})
 
     result = agent.execute(context)
 
