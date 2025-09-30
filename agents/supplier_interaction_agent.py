@@ -518,11 +518,16 @@ class SupplierInteractionAgent(BaseAgent):
                     result = candidate
                     break
                 if result is None and rfq_only_match is not None:
-                    logger.info(
-                        "Returning RFQ-matched response for %s despite secondary filter mismatch",
-                        rfq_id,
-                    )
-                    result = rfq_only_match
+                    fallback_status = str(rfq_only_match.get("supplier_status") or "").lower()
+                    fallback_payload_ready = rfq_only_match.get("supplier_output")
+                    if fallback_status in {"processing", "pending"} and not fallback_payload_ready:
+                        rfq_only_match = None
+                    else:
+                        logger.info(
+                            "Returning RFQ-matched response for %s despite secondary filter mismatch",
+                            rfq_id,
+                        )
+                        result = rfq_only_match
                 if result is None and not any(
                     [rfq_normalised, supplier_normalised, subject_norm, sender_normalised]
                 ):

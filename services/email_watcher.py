@@ -284,9 +284,17 @@ class SESEmailWatcher:
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
-            getattr(self.settings, "email_match_poll_attempts", 0),
-            default=0,
+            getattr(self.settings, "email_match_poll_attempts", 3),
+            default=3,
             minimum=0,
+        )
+        self._match_poll_timeout_seconds = max(
+            0,
+            self._coerce_int(
+                getattr(self.settings, "email_match_poll_timeout_seconds", 300),
+                default=300,
+                minimum=0,
+            ),
         )
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
@@ -350,12 +358,16 @@ class SESEmailWatcher:
             self._respect_post_dispatch_wait()
 
             attempts = 0
+            poll_deadline: Optional[float] = None
             if target_rfq_normalised:
                 unlimited_attempts = self._match_poll_attempts <= 0
                 max_attempts = self._match_poll_attempts if self._match_poll_attempts > 0 else 0
+                if self._match_poll_timeout_seconds > 0:
+                    poll_deadline = time.time() + self._match_poll_timeout_seconds
             else:
                 unlimited_attempts = False
                 max_attempts = 1
+                poll_deadline = None
             total_candidates = 0
             total_processed = 0
 
@@ -465,6 +477,15 @@ class SESEmailWatcher:
                         self.mailbox_address,
                         attempts,
                         max_attempts,
+                    )
+                    break
+
+                if poll_deadline is not None and time.time() >= poll_deadline:
+                    logger.debug(
+                        "RFQ %s not found in mailbox %s within %.1fs; reached polling deadline",
+                        target_rfq_normalised,
+                        self.mailbox_address,
+                        self._match_poll_timeout_seconds,
                     )
                     break
 
