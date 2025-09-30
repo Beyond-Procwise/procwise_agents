@@ -1248,6 +1248,9 @@ class SESEmailWatcher:
                     if candidate
                 ):
                     return False
+            elif key == "from_address_like":
+                if not _like(payload_sender, expected):
+                    return False
             elif key == "subject_contains":
                 needle = SESEmailWatcher._normalise_filter_value(expected)
                 if needle and needle not in payload_subject:
