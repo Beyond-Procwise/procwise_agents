@@ -243,6 +243,34 @@ def test_poll_once_supports_like_filters():
     assert "msg-like" in state
 
 
+def test_poll_once_matches_display_name_sender_with_plain_filter():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-display",
+            "subject": "Re: RFQ-20240101-abcd1234 clarification",
+            "body": "Quoted 1200",
+            "from": "Muthu Subramanian <muthu.subramanian@dhsit.co.uk>",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "from_address": "muthu.subramanian@dhsit.co.uk",
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["from_address"].startswith("Muthu Subramanian")
+    assert "msg-display" in state
+
+
 def test_poll_once_stops_future_polls_after_match():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
