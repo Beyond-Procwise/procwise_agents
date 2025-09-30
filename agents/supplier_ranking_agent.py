@@ -5,6 +5,8 @@ import logging
 import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
 import pandas as pd
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
@@ -28,6 +30,85 @@ with warnings.catch_warnings():
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_payment_terms_days(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if not s:
+        return None
+
+    if any(keyword in s for keyword in ("immediate", "due on receipt", "upon receipt")):
+        return 0.0
+
+    match = re.search(r"(\d+)\s*(?:day|days|d)?", s)
+    if match:
+        try:
+            return float(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_days_to_score(
+    days: Optional[float], min_days: float = 0.0, max_days: float = 90.0
+) -> Optional[float]:
+    if days is None or (isinstance(days, float) and np.isnan(days)):
+        return None
+    try:
+        numeric = float(days)
+    except (TypeError, ValueError):
+        return None
+    clamped = max(min_days, min(max_days, numeric))
+    if max_days == min_days:
+        return 100.0
+    score = (1.0 - (clamped - min_days) / (max_days - min_days)) * 100
+    return float(round(score, 2))
+
+
+def ensure_payment_terms_score(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    if "payment_terms_days" not in df.columns or df["payment_terms_days"].isna().all():
+        source_cols = [
+            column
+            for column in df.columns
+            if column.lower() in {"payment_terms", "terms", "pay_terms"}
+        ]
+        if source_cols:
+            src = source_cols[0]
+            df["payment_terms_days"] = df[src].apply(_parse_payment_terms_days)
+        else:
+            df["payment_terms_days"] = np.nan
+
+    for column in df.columns:
+        if column.lower() in {
+            "payment_terms_days",
+            "payment_terms_in_days",
+            "pt_days",
+        }:
+            df["payment_terms_days"] = pd.to_numeric(df[column], errors="coerce")
+            break
+
+    needs_score = "payment_terms_score" not in df.columns or df[
+        "payment_terms_score"
+    ].isna().all()
+    if needs_score:
+        df["payment_terms_score"] = df["payment_terms_days"].apply(
+            _normalize_days_to_score
+        )
+
+    na_mask = df["payment_terms_score"].isna()
+    if na_mask.any():
+        logger.warning(
+            "Imputing neutral payment_terms_score=50 for %d row(s) with unknown terms",
+            int(na_mask.sum()),
+        )
+        df.loc[na_mask, "payment_terms_score"] = 50.0
+
+    return df
 
 
 class SupplierRankingAgent(BaseAgent):
@@ -521,6 +602,7 @@ class SupplierRankingAgent(BaseAgent):
                 weights = {metric: equal_weight for metric in fallback_metrics}
 
         df = self._prepare_scoring_columns(df, weights)
+        df = ensure_payment_terms_score(df)
         scored_df = self._score_categorical_criteria(df, weights.keys(), policy_bundle)
         norm_policy = self._find_policy(policy_bundle, "NormalizationDirectionPolicy")
         direction_map = self._extract_policy_rules(norm_policy)
