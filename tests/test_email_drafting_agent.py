@@ -1,12 +1,10 @@
 import json
 import os
 import sys
-
 import pytest
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from agents import email_drafting_agent as module
+from agents.base_agent import AgentContext, AgentStatus
 from agents.email_drafting_agent import DecisionContext, EmailDraftingAgent, ThreadHeaders
 
 
@@ -107,3 +105,67 @@ def test_decision_context_to_public_json():
     data = ctx.to_public_json()
     assert data["rfq_id"] == "R1"
     assert data["asks"] == ["item"]
+
+
+def _make_context(payload: dict) -> AgentContext:
+    return AgentContext(
+        workflow_id="wf-1",
+        agent_id="email_drafting",
+        user_id="tester",
+        input_data=payload,
+    )
+
+
+def test_execute_uses_decision_payload(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Update\nBody line")
+
+    agent = EmailDraftingAgent()
+    context = _make_context(
+        {
+            "decision": {
+                "rfq_id": "RFQ-900",
+                "supplier_id": "S-900",
+                "to": "buyer@example.com",
+                "counter_price": 42.5,
+            }
+        }
+    )
+
+    result = agent.execute(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"]
+    draft = result.data["drafts"][0]
+    assert draft["subject"] == "Update"
+    assert draft["metadata"]["counter_price"] == 42.5
+
+
+def test_execute_falls_back_to_prompt(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Follow-up\nBody")
+
+    agent = EmailDraftingAgent()
+    context = _make_context({"prompt": "Please follow up", "rfq_id": "RFQ-XYZ"})
+
+    result = agent.execute(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"][0]["subject"] == "Follow-up"
+
+
+def test_execute_infers_recipients_and_counter_price(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody")
+
+    agent = EmailDraftingAgent()
+    payload = {
+        "rfq_id": "RFQ-321",
+        "recipients": ["primary@example.com", "cc1@example.com"],
+        "counter_proposals": [{"price": 11.75}],
+        "decision_log": "Request revision",
+    }
+    result = agent.execute(_make_context(payload))
+
+    draft = result.data["drafts"][0]
+    assert draft["to"] == "primary@example.com"
+    assert draft["cc"] == ["cc1@example.com"]
+    assert draft["metadata"]["counter_price"] == 11.75
+

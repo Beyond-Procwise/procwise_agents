@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import requests
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import requests
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+
 
 # -----------------------
 # Config & small utilities
@@ -315,10 +317,43 @@ class EmailDraftingAgent:
         return _build_output(context, subject, body)
 
     # Legacy orchestrator compatibility -------------------------------------------------
-    def execute(self, context: Any) -> Any:  # pragma: no cover - legacy flow support
-        raise NotImplementedError(
-            "EmailDraftingAgent.execute is not supported in the lightweight implementation."
-        )
+    def execute(self, context: AgentContext) -> AgentOutput:
+        """Legacy orchestration shim.
+
+        The refreshed drafting helper exposes :meth:`from_decision` and
+        :meth:`from_prompt` for direct usage.  Legacy flows, however, still call
+        :meth:`execute` with an :class:`AgentContext`.  This adapter keeps those
+        flows functional by extracting drafting inputs from ``context`` and
+        delegating to the lightweight helpers.
+        """
+
+        input_data: Dict[str, Any] = getattr(context, "input_data", {}) or {}
+
+        drafts: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        for decision in self._extract_decisions(input_data):
+            try:
+                drafts.append(self.from_decision(decision))
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append(f"decision draft failed: {exc}")
+
+        if not drafts:
+            for prompt_text, rfq_id in self._extract_prompts(input_data):
+                try:
+                    drafts.append(self.from_prompt(prompt_text, rfq_id=rfq_id))
+                except Exception as exc:  # pragma: no cover - defensive
+                    errors.append(f"prompt draft failed: {exc}")
+
+        status = AgentStatus.SUCCESS if drafts or not errors else AgentStatus.FAILED
+        payload: Dict[str, Any] = {"drafts": drafts}
+        if errors:
+            payload["errors"] = errors
+
+        pass_fields = dict(input_data)
+        pass_fields["drafts"] = drafts
+
+        return AgentOutput(status=status, data=payload, pass_fields=pass_fields)
 
     # -----------------------
     # helpers
@@ -349,6 +384,165 @@ class EmailDraftingAgent:
             rationale=payload.get("rationale"),
             thread=thread,
         )
+
+    # ------------------------------------------------------------------
+    # Legacy context helpers
+    # ------------------------------------------------------------------
+
+    def _extract_decisions(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Normalise decision-like payloads for :meth:`from_decision`."""
+
+        decisions: List[Dict[str, Any]] = []
+
+        def _append(candidate: Optional[Dict[str, Any]]) -> None:
+            if not isinstance(candidate, dict):
+                return
+            if not candidate.get("rfq_id"):
+                return
+            decisions.append(self._normalise_decision_payload(candidate))
+
+        _append(payload.get("decision"))
+
+        decision_list = payload.get("decisions")
+        if isinstance(decision_list, Sequence) and not isinstance(decision_list, (str, bytes)):
+            for item in decision_list:
+                _append(item if isinstance(item, dict) else None)
+
+        ranking = payload.get("ranking")
+        if isinstance(ranking, Sequence) and not isinstance(ranking, (str, bytes)):
+            for entry in ranking:
+                if isinstance(entry, dict):
+                    _append(entry.get("decision"))
+
+        # Fallback: treat the full payload as a decision when it resembles the
+        # negotiation agent's pass-through structure.
+        if not decisions and payload.get("rfq_id"):
+            _append(payload)
+
+        return decisions
+
+    def _extract_prompts(self, payload: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
+        """Normalise prompt style drafting requests."""
+
+        prompts: List[Tuple[str, Optional[str]]] = []
+
+        direct_prompt = payload.get("prompt") or payload.get("email_prompt")
+        if isinstance(direct_prompt, str) and direct_prompt.strip():
+            prompts.append((direct_prompt.strip(), payload.get("rfq_id")))
+
+        prompt_entries = payload.get("prompts")
+        if isinstance(prompt_entries, Sequence) and not isinstance(prompt_entries, (str, bytes)):
+            for entry in prompt_entries:
+                if isinstance(entry, dict):
+                    text = entry.get("prompt") or entry.get("template")
+                    if isinstance(text, str) and text.strip():
+                        prompts.append((text.strip(), entry.get("rfq_id") or payload.get("rfq_id")))
+                elif isinstance(entry, str) and entry.strip():
+                    prompts.append((entry.strip(), payload.get("rfq_id")))
+
+        return prompts
+
+    def _normalise_decision_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract recognised decision fields with sensible fallbacks."""
+
+        decision: Dict[str, Any] = {"rfq_id": str(payload.get("rfq_id"))}
+
+        def _first_non_empty(keys: Iterable[str]) -> Optional[Any]:
+            for key in keys:
+                if key not in payload:
+                    continue
+                value = payload.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    candidate = value.strip()
+                    if candidate:
+                        return candidate
+                elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                    sequence = [item for item in value if item]
+                    if sequence:
+                        return sequence
+                else:
+                    return value
+            return None
+
+        recipients = payload.get("recipients")
+        if isinstance(recipients, Sequence) and not isinstance(recipients, (str, bytes)):
+            recipients_list = [str(item).strip() for item in recipients if str(item).strip()]
+        else:
+            recipients_list = []
+            if isinstance(recipients, str) and recipients.strip():
+                recipients_list = [recipients.strip()]
+
+        to_address: Optional[str] = _first_non_empty(
+            ["to", "recipient", "recipient_email", "supplier_email"]
+        )
+        if not to_address and recipients_list:
+            to_address = recipients_list[0]
+            recipients_list = recipients_list[1:]
+
+        if to_address:
+            decision["to"] = to_address
+        if recipients_list:
+            decision["cc"] = recipients_list
+
+        cc_value = payload.get("cc")
+        if isinstance(cc_value, Sequence) and not isinstance(cc_value, (str, bytes)):
+            decision["cc"] = [str(item).strip() for item in cc_value if str(item).strip()]
+        elif isinstance(cc_value, str) and cc_value.strip():
+            decision["cc"] = [chunk.strip() for chunk in cc_value.split(",") if chunk.strip()]
+
+        for key in (
+            "supplier_id",
+            "supplier_name",
+            "currency",
+            "lead_time_weeks",
+            "target_price",
+            "round",
+            "strategy",
+            "counter_price",
+            "lead_time_request",
+            "rationale",
+        ):
+            if key in payload and payload.get(key) is not None:
+                decision[key] = payload.get(key)
+
+        if "current_offer" in payload and payload.get("current_offer") is not None:
+            decision["current_offer"] = payload.get("current_offer")
+
+        if "counter_price" not in decision:
+            counter_opts = payload.get("counter_proposals")
+            if isinstance(counter_opts, Sequence) and not isinstance(counter_opts, (str, bytes)):
+                for option in counter_opts:
+                    if isinstance(option, dict) and option.get("price") is not None:
+                        decision["counter_price"] = option.get("price")
+                        break
+
+        asks_value = payload.get("asks")
+        if isinstance(asks_value, Sequence) and not isinstance(asks_value, (str, bytes)):
+            decision["asks"] = [str(item) for item in asks_value if str(item).strip()]
+        elif isinstance(asks_value, str) and asks_value.strip():
+            decision["asks"] = [chunk.strip() for chunk in asks_value.split("\n") if chunk.strip()]
+
+        if "rationale" not in decision:
+            rationale = _first_non_empty(["decision_log", "notes"])
+            if rationale:
+                decision["rationale"] = rationale
+
+        thread_info = payload.get("thread")
+        if not isinstance(thread_info, dict):
+            thread_info = {
+                "message_id": _first_non_empty(["in_reply_to", "message_id"]),
+                "references": payload.get("references"),
+            }
+        if isinstance(thread_info, dict):
+            decision["thread"] = {
+                key: value
+                for key, value in thread_info.items()
+                if value
+            }
+
+        return decision
 
 
 def _num_or_none(value: Any) -> Optional[float]:
