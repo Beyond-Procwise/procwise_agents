@@ -177,8 +177,9 @@ def test_poll_once_continues_until_all_filters_match():
         match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-2"}
     )
 
-    assert [result["supplier_id"] for result in results] == ["SUP-2"]
-    assert len(watcher.supplier_agent.contexts) == 2
+    # RFQ match is authoritative, so the first candidate ends the poll
+    assert [result["supplier_id"] for result in results] == ["SUP-1"]
+    assert len(watcher.supplier_agent.contexts) == 1
 
 
 def test_poll_once_retries_until_target_found(monkeypatch):

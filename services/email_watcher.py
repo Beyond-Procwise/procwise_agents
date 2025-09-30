@@ -439,7 +439,8 @@ class SESEmailWatcher:
                                 self._update_watermark(last_modified, str(parsed.get("id") or ""))
                             if was_processed:
                                 total_processed += 1
-                            if matched or (rfq_matched and not filters):
+                            # Treat RFQ match as authoritative regardless of additional filters
+                            if matched or rfq_matched:
                                 match_found = True
                             return should_stop
 
@@ -471,7 +472,8 @@ class SESEmailWatcher:
                                 )
                                 if was_processed:
                                     total_processed += 1
-                                if matched or (rfq_matched and not filters):
+                                # RFQ match is authoritative even when filters are present
+                                if matched or rfq_matched:
                                     match_found = True
                                 if should_stop:
                                     break
@@ -610,6 +612,9 @@ class SESEmailWatcher:
                 )
                 self._apply_filter_defaults(processed_payload, match_filters)
                 message_match = self._matches_filters(processed_payload, match_filters)
+                # Treat RFQ match as authoritative even if other filters fail
+                if target_rfq_normalised and rfq_match:
+                    message_match = True
             logger.info(
                 "Processed message %s for RFQ %s from %s",
                 message_id,
@@ -655,9 +660,7 @@ class SESEmailWatcher:
 
         include_payload = False
         if processed_payload:
-            if not match_filters:
-                include_payload = True
-            elif matched:
+            if not match_filters or matched or (target_rfq_normalised and rfq_match):
                 include_payload = True
 
         if include_payload and effective_limit != 0:
@@ -669,18 +672,16 @@ class SESEmailWatcher:
             ):
                 should_stop = True
 
+        # Stop conditions: either a filter match or an RFQ match should stop polling
         if matched:
             should_stop = True
             logger.debug(
                 "Stopping poll once after matching filters for message %s",
                 message_id,
             )
-        elif rfq_match and not match_filters:
+        elif rfq_match:
             should_stop = True
-            logger.debug(
-                "Stopping poll after RFQ match for message %s (no additional filters)",
-                message_id,
-            )
+            logger.debug("Stopping poll after RFQ match for message %s", message_id)
 
         return matched, should_stop, bool(rfq_match), was_processed
 
