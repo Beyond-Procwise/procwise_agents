@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import re
 import time
+import unicodedata
 import uuid
 from urllib.parse import unquote_plus, urlparse
 from collections import OrderedDict
@@ -32,6 +33,30 @@ from utils.gpu import configure_gpu
 
 
 logger = logging.getLogger(__name__)
+
+_DASH_CLASS = r"[-\u2010\u2011\u2012\u2013\u2014\u2015\u2212]"
+_ZW_RE = re.compile(r"[\u200B\u200C\u200D\uFEFF\u2060\u200E\u200F]")
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(value: str) -> str:
+    """Normalise textual content for RFQ comparisons."""
+
+    if not value:
+        return ""
+
+    text = unicodedata.normalize("NFKC", value)
+    text = _ZW_RE.sub("", text)
+    text = re.sub(_DASH_CLASS, "-", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text
+
+
+def _canon_id(value: str) -> str:
+    return _norm(value).upper()
+
+
+RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
 
 # Ensure GPU related environment flags are consistently applied even when the
 # watcher is used standalone (e.g. in a scheduled job).
@@ -925,10 +950,16 @@ class SESEmailWatcher:
     def _process_message(self, message: Dict[str, object]) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
         body = str(message.get("body", ""))
+        subject_normalised = _norm(subject)
+        body_normalised = _norm(body)
         from_address = str(message.get("from", ""))
         rfq_id = message.get("rfq_id")
         if not isinstance(rfq_id, str) or not rfq_id:
-            rfq_id = self._extract_rfq_id(subject + " " + body)
+            rfq_id = self._extract_rfq_id(
+                f"{subject_normalised} {body_normalised}",
+                raw_subject=subject,
+                normalised_subject=subject_normalised,
+            )
         if not rfq_id:
             logger.debug("Skipping email without RFQ identifier: %s", subject)
             return None, "missing_rfq_id"
@@ -1147,7 +1178,7 @@ class SESEmailWatcher:
         if value is None:
             return None
         try:
-            text = str(value).strip()
+            text = _norm(str(value))
         except Exception:
             return None
         lowered = text.lower()
@@ -1793,14 +1824,20 @@ class SESEmailWatcher:
 
     def _parse_email(self, raw_bytes: bytes) -> Dict[str, object]:
         message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-        subject = message.get("subject", "")
+        raw_subject = _decode_mime_header(message.get("subject", ""))
+        normalised_subject = _norm(raw_subject)
         from_address = message.get("from", "")
         recipients = message.get_all("to", [])
         body = self._extract_body(message)
-        rfq_id = self._extract_rfq_id(f"{subject} {body}")
+        normalised_body = _norm(body)
+        rfq_id = self._extract_rfq_id(
+            f"{normalised_subject} {normalised_body}",
+            raw_subject=raw_subject,
+            normalised_subject=normalised_subject,
+        )
         attachments = self._extract_attachments(message)
         return {
-            "subject": subject,
+            "subject": raw_subject,
             "from": from_address,
             "body": body,
             "rfq_id": rfq_id,
@@ -1946,12 +1983,68 @@ class SESEmailWatcher:
             )
         return attachments
 
-    def _extract_rfq_id(self, text: str) -> Optional[str]:
-        pattern = getattr(self.supplier_agent, "RFQ_PATTERN", SupplierInteractionAgent.RFQ_PATTERN)
-        if not pattern:
+    def _extract_rfq_id(
+        self,
+        text: str,
+        *,
+        raw_subject: Optional[str] = None,
+        normalised_subject: Optional[str] = None,
+    ) -> Optional[str]:
+        if not text:
+            if raw_subject is not None:
+                logger.debug(
+                    "RFQ match debug | subj_raw='%s' | subj_norm='%s' | ids=%s",
+                    raw_subject[:200],
+                    (normalised_subject or _norm(raw_subject))[:200],
+                    [],
+                )
             return None
-        match = pattern.search(text)
-        return match.group(0) if match else None
+
+        pattern = getattr(self.supplier_agent, "RFQ_PATTERN", None)
+        if not pattern:
+            pattern = RFQ_ID_RE
+
+        if not hasattr(pattern, "findall"):
+            try:
+                pattern = re.compile(str(pattern))
+            except re.error:
+                logger.debug("Invalid RFQ pattern provided; skipping match")
+                return None
+
+        normalised_text = _norm(text)
+
+        try:
+            raw_matches = pattern.findall(normalised_text)
+        except Exception:
+            match = pattern.search(normalised_text)
+            raw_matches = [match.group(0)] if match else []
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        for raw_match in raw_matches:
+            if isinstance(raw_match, tuple):
+                candidate = next((part for part in raw_match if part), "")
+            else:
+                candidate = raw_match
+            if not candidate:
+                continue
+            canonical = _canon_id(candidate)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            candidates.append(candidate)
+
+        if raw_subject is not None:
+            subject_for_log = normalised_subject or _norm(raw_subject)
+            logger.debug(
+                "RFQ match debug | subj_raw='%s' | subj_norm='%s' | ids=%s",
+                raw_subject[:200],
+                subject_for_log[:200] if subject_for_log else "",
+                candidates,
+            )
+
+        return candidates[0] if candidates else None
 
     def _ensure_s3_mapping(self, s3_key: Optional[str], rfq_id: Optional[object]) -> Optional[str]:
         if not self.bucket or not s3_key or rfq_id is None:
