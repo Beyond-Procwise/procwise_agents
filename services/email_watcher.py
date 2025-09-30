@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.header import decode_header, make_header
+from email.utils import parseaddr
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 import boto3
@@ -1153,6 +1154,30 @@ class SESEmailWatcher:
         return lowered or None
 
     @staticmethod
+    def _normalise_email(value: object) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        if not text:
+            return None
+        try:
+            _, address = parseaddr(text)
+        except Exception:
+            address = None
+        if address:
+            address = address.strip()
+        else:
+            # Fallback for strings like "Name <email>" when parseaddr fails
+            match = re.search(r"<\s*([^>]+)\s*>", text)
+            address = match.group(1).strip() if match else None
+        if not address and "@" in text:
+            address = text
+        return address.lower() if address else None
+
+    @staticmethod
     def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
         if not filters:
             return False
@@ -1161,7 +1186,34 @@ class SESEmailWatcher:
         payload_supplier = SESEmailWatcher._normalise_filter_value(payload.get("supplier_id"))
         payload_subject = SESEmailWatcher._normalise_filter_value(payload.get("subject")) or ""
         payload_sender = SESEmailWatcher._normalise_filter_value(payload.get("from_address"))
+        payload_sender_email = SESEmailWatcher._normalise_email(payload.get("from_address"))
         payload_message = SESEmailWatcher._normalise_filter_value(payload.get("message_id")) or SESEmailWatcher._normalise_filter_value(payload.get("id"))
+
+        def _like(actual: Optional[str], expected_like: object) -> bool:
+            needle = SESEmailWatcher._normalise_filter_value(expected_like)
+            if not needle:
+                return True
+            if actual is None:
+                return False
+
+            pattern = re.escape(needle)
+            # Support SQL-style and glob-style wildcards for convenience.
+            pattern = (
+                pattern.replace("%", ".*")
+                .replace(r"\%", ".*")
+                .replace("_", ".")
+                .replace(r"\_", ".")
+                .replace(r"\*", ".*")
+            )
+            regex = re.compile(f"^{pattern}$")
+            if regex.fullmatch(actual):
+                return True
+
+            # Allow bare substrings (without wildcards) to behave like ``LIKE %needle%``
+            if needle and "%" not in needle and "_" not in needle and "*" not in needle:
+                return needle in actual
+
+            return False
 
         for key, expected in filters.items():
             if expected in (None, ""):
@@ -1169,18 +1221,45 @@ class SESEmailWatcher:
             if key == "rfq_id":
                 if payload_rfq != SESEmailWatcher._normalise_filter_value(expected):
                     return False
+            elif key == "rfq_id_like":
+                if not _like(payload_rfq, expected):
+                    return False
             elif key == "supplier_id":
                 if payload_supplier != SESEmailWatcher._normalise_filter_value(expected):
                     return False
+            elif key == "supplier_id_like":
+                if not _like(payload_supplier, expected):
+                    return False
             elif key == "from_address":
-                if payload_sender != SESEmailWatcher._normalise_filter_value(expected):
+                expected_normalised = SESEmailWatcher._normalise_filter_value(expected)
+                expected_email = SESEmailWatcher._normalise_email(expected)
+                candidates = [payload_sender, payload_sender_email]
+                expectations = [expected_normalised, expected_email]
+                if not any(
+                    actual and expected_val and actual == expected_val
+                    for actual in candidates
+                    for expected_val in expectations
+                ):
+                    return False
+            elif key == "from_address_like":
+                if not any(
+                    _like(candidate, expected)
+                    for candidate in (payload_sender, payload_sender_email)
+                    if candidate
+                ):
                     return False
             elif key == "subject_contains":
                 needle = SESEmailWatcher._normalise_filter_value(expected)
                 if needle and needle not in payload_subject:
                     return False
+            elif key == "subject_like":
+                if not _like(payload_subject, expected):
+                    return False
             elif key == "message_id":
                 if payload_message != SESEmailWatcher._normalise_filter_value(expected):
+                    return False
+            elif key == "message_id_like":
+                if not _like(payload_message, expected):
                     return False
         return True
 

@@ -212,6 +212,65 @@ def test_poll_once_retries_until_target_found(monkeypatch):
     assert calls["count"] == 2
 
 
+def test_poll_once_supports_like_filters():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-like",
+            "subject": "Re: RFQ-20240101-abcd1234 Follow up",
+            "body": "Quoted 1200",
+            "from": "Muthu Subramanian <muthu.subramanian@dhsit.co.uk>",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+            "supplier_id": "SUP-12345",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={
+            "rfq_id_like": "rfq-20240101-abcd%",
+            "from_address_like": "%@dhsit.co.uk>",
+            "subject_like": "%follow up",
+            "supplier_id_like": "sup-123",
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["supplier_id"] == "SUP-12345"
+    assert "msg-like" in state
+
+
+def test_poll_once_matches_display_name_sender_with_plain_filter():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-display",
+            "subject": "Re: RFQ-20240101-abcd1234 clarification",
+            "body": "Quoted 1200",
+            "from": "Muthu Subramanian <muthu.subramanian@dhsit.co.uk>",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "from_address": "muthu.subramanian@dhsit.co.uk",
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["from_address"].startswith("Muthu Subramanian")
+    assert "msg-display" in state
+
+
 def test_poll_once_stops_future_polls_after_match():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
