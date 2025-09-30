@@ -8,13 +8,15 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
-
 from utils.gpu import configure_gpu
 
 from .email_service import EmailService
+from .email_thread_store import (
+    DEFAULT_THREAD_TABLE,
+    ensure_thread_table,
+    record_thread_mapping,
+    sanitise_thread_table_name,
+)
 
 configure_gpu()
 
@@ -23,8 +25,7 @@ logger = logging.getLogger(__name__)
 _RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 
 
-_DEFAULT_THREAD_TABLE = "procwise_outbound_emails"
-_BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
+_DEFAULT_THREAD_TABLE = DEFAULT_THREAD_TABLE
 
 
 class EmailDispatchService:
@@ -35,12 +36,11 @@ class EmailDispatchService:
         self.email_service = EmailService(agent_nick)
         self.settings = agent_nick.settings
         self.logger = logging.getLogger(__name__)
-        self._thread_table_name = (
-            getattr(self.settings, "email_thread_table", None)
-            or _DEFAULT_THREAD_TABLE
+        self._thread_table_name = sanitise_thread_table_name(
+            getattr(self.settings, "email_thread_table", None),
+            logger=self.logger,
         )
-        self._thread_table = None
-        self._ddb_resource = None
+        self._thread_table_ready = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -149,11 +149,13 @@ class EmailDispatchService:
                 dispatch_payload["message_id"] = message_id
                 try:
                     self._record_thread_mapping(
+                        conn,
                         message_id,
                         rfq_id,
                         draft.get("supplier_id"),
                         recipient_list,
                     )
+                    conn.commit()
                 except Exception:  # pragma: no cover - defensive
                     self.logger.exception(
                         "Failed to persist thread mapping for RFQ %s", rfq_id
@@ -345,57 +347,33 @@ class EmailDispatchService:
     # ------------------------------------------------------------------
     def _record_thread_mapping(
         self,
+        conn,
         message_id: Optional[str],
         rfq_id: str,
         supplier_id: Optional[str],
         recipients: Sequence[str],
     ) -> None:
-        if not message_id:
+        if not message_id or conn is None or not self._thread_table_name:
             return
 
-        table = self._get_thread_table()
-        if table is None:
+        self._ensure_thread_table(conn)
+
+        record_thread_mapping(
+            conn,
+            self._thread_table_name,
+            message_id=str(message_id),
+            rfq_id=str(rfq_id),
+            supplier_id=str(supplier_id) if supplier_id else None,
+            recipients=recipients,
+            logger=self.logger,
+        )
+
+    def _ensure_thread_table(self, conn) -> None:
+        if self._thread_table_ready:
             return
 
-        item: Dict[str, Any] = {
-            "message_id": str(message_id),
-            "rfq_id": str(rfq_id),
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        if supplier_id:
-            item["supplier_id"] = str(supplier_id)
-        if recipients:
-            item["recipients"] = list(recipients)
-
-        try:
-            table.put_item(
-                Item=item,
-                ConditionExpression="attribute_not_exists(message_id)",
-            )
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code") if isinstance(exc.response, dict) else None
-            if error_code == "ConditionalCheckFailedException":
-                self.logger.debug(
-                    "Thread mapping for message %s already exists", message_id
-                )
-                return
-            raise
-
-    def _get_thread_table(self):
-        if not self._thread_table_name:
-            return None
-
-        if self._thread_table is None:
-            region = getattr(self.settings, "ses_region", None)
-            resource_kwargs = {"config": _BOTO_CONFIG}
-            if region:
-                resource_kwargs["region_name"] = region
-            self._ddb_resource = self._ddb_resource or boto3.resource(
-                "dynamodb",
-                **resource_kwargs,
-            )
-            self._thread_table = self._ddb_resource.Table(self._thread_table_name)
-        return self._thread_table
+        ensure_thread_table(conn, self._thread_table_name, logger=self.logger)
+        self._thread_table_ready = True
 
     @staticmethod
     def _extract_action_id(payload: Dict[str, Any]) -> Optional[str]:

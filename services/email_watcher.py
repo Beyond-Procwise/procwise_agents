@@ -193,7 +193,22 @@ class SESEmailWatcher:
             poll_interval = int(poll_interval)
         except Exception:
             poll_interval = 60
+
+        self._poll_window_minutes = self._coerce_int(
+            getattr(self.settings, "email_watch_window_minutes", 10),
+            default=10,
+            minimum=1,
+        )
+        sleep_default = self._coerce_int(
+            getattr(self.settings, "email_match_poll_sleep_seconds", 60),
+            default=60,
+            minimum=1,
+        )
+        self._match_poll_sleep_seconds = max(1, sleep_default)
+
         self.poll_interval_seconds = max(1, poll_interval)
+        if self.poll_interval_seconds < self._match_poll_sleep_seconds:
+            self.poll_interval_seconds = self._match_poll_sleep_seconds
 
         self.mailbox_address = (
             getattr(self.settings, "supplier_mailbox", None)
@@ -284,9 +299,17 @@ class SESEmailWatcher:
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
-            getattr(self.settings, "email_match_poll_attempts", 0),
-            default=0,
+            getattr(self.settings, "email_match_poll_attempts", 3),
+            default=3,
             minimum=0,
+        )
+        self._match_poll_timeout_seconds = max(
+            0,
+            self._coerce_int(
+                getattr(self.settings, "email_match_poll_timeout_seconds", 300),
+                default=300,
+                minimum=0,
+            ),
         )
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
@@ -350,12 +373,16 @@ class SESEmailWatcher:
             self._respect_post_dispatch_wait()
 
             attempts = 0
+            poll_deadline: Optional[float] = None
             if target_rfq_normalised:
                 unlimited_attempts = self._match_poll_attempts <= 0
                 max_attempts = self._match_poll_attempts if self._match_poll_attempts > 0 else 0
+                if self._match_poll_timeout_seconds > 0:
+                    poll_deadline = time.time() + self._match_poll_timeout_seconds
             else:
                 unlimited_attempts = False
                 max_attempts = 1
+                poll_deadline = None
             total_candidates = 0
             total_processed = 0
 
@@ -468,6 +495,15 @@ class SESEmailWatcher:
                     )
                     break
 
+                if poll_deadline is not None and time.time() >= poll_deadline:
+                    logger.debug(
+                        "RFQ %s not found in mailbox %s within %.1fs; reached polling deadline",
+                        target_rfq_normalised,
+                        self.mailbox_address,
+                        self._match_poll_timeout_seconds,
+                    )
+                    break
+
                 logger.debug(
                     "RFQ %s not found in mailbox %s on attempt %d/%s; waiting %.1fs before retrying",
                     target_rfq_normalised,
@@ -476,8 +512,17 @@ class SESEmailWatcher:
                     max_attempts if max_attempts > 0 else "inf",
                     self.poll_interval_seconds,
                 )
-                if self.poll_interval_seconds > 0:
-                    time.sleep(max(0.5, min(self.poll_interval_seconds, 5)))
+                if self.poll_interval_seconds >= 0:
+                    sleep_for = self.poll_interval_seconds
+                else:
+                    sleep_for = self._match_poll_sleep_seconds
+                if poll_deadline is not None:
+                    remaining = poll_deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    sleep_for = min(sleep_for, max(0.0, remaining))
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
             if target_rfq_normalised and match_found:
                 self._completed_targets.add(target_rfq_normalised)
@@ -572,6 +617,11 @@ class SESEmailWatcher:
                 processed.get("from_address"),
             )
             was_processed = True
+
+            canonical_key = self._ensure_s3_mapping(s3_key, processed_payload.get("rfq_id"))
+            if canonical_key:
+                processed_payload["canonical_s3_key"] = canonical_key
+                processed["canonical_s3_key"] = canonical_key
 
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
@@ -1276,6 +1326,9 @@ class SESEmailWatcher:
         watermark_key: str,
     ) -> List[Tuple[str, str, Optional[datetime], Optional[str]]]:
         object_refs: List[Tuple[str, str, Optional[datetime], Optional[str]]] = []
+        newest_seen: Optional[datetime] = None
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=self._poll_window_minutes)
         paginator = client.get_paginator("list_objects_v2")
 
         for prefix in prefixes:
@@ -1290,13 +1343,26 @@ class SESEmailWatcher:
                         continue
                     if key.endswith("/") or "AMAZON_SES_SETUP_NOTIFICATION" in key:
                         continue
+                    if "/ingest/" in key:
+                        continue
 
                     last_modified_raw = obj.get("LastModified")
-                    last_modified = (
-                        last_modified_raw
-                        if isinstance(last_modified_raw, datetime)
-                        else None
-                    )
+                    if isinstance(last_modified_raw, datetime):
+                        if last_modified_raw.tzinfo is None:
+                            last_modified = last_modified_raw.replace(tzinfo=timezone.utc)
+                        else:
+                            last_modified = last_modified_raw.astimezone(timezone.utc)
+                    else:
+                        last_modified = None
+
+                    if last_modified is not None:
+                        if newest_seen is None or last_modified > newest_seen:
+                            newest_seen = last_modified
+                        if last_modified < window_start:
+                            continue
+                    else:
+                        # Unable to determine age; skip to avoid processing stale data.
+                        continue
 
                     if not self._is_newer_than_watermark(
                         last_modified, key, watermark_ts, watermark_key
@@ -1307,6 +1373,19 @@ class SESEmailWatcher:
                     object_refs.append((prefix, key, last_modified, etag_value))
 
         if not object_refs:
+            if newest_seen is None or newest_seen < window_start:
+                newest_text = newest_seen.isoformat() if newest_seen else "<none>"
+                sleep_hint = (
+                    self.poll_interval_seconds
+                    if self.poll_interval_seconds >= 0
+                    else self._match_poll_sleep_seconds
+                )
+                logger.info(
+                    "Newest key older than %dm window (newest=%s). Sleeping %ss.",
+                    self._poll_window_minutes,
+                    newest_text,
+                    sleep_hint,
+                )
             return []
 
         tz_aware_min = datetime.min.replace(tzinfo=timezone.utc)
@@ -1782,6 +1861,70 @@ class SESEmailWatcher:
             return None
         match = pattern.search(text)
         return match.group(0) if match else None
+
+    def _ensure_s3_mapping(self, s3_key: Optional[str], rfq_id: Optional[object]) -> Optional[str]:
+        if not self.bucket or not s3_key or rfq_id is None:
+            return None
+
+        rfq_text = str(rfq_id).strip()
+        if not rfq_text:
+            return None
+
+        try:
+            client = self._get_s3_client()
+        except Exception:
+            logger.debug("Unable to obtain S3 client for canonical mapping", exc_info=True)
+            return None
+
+        if client is None:
+            return None
+
+        self._tag_s3_object(client, self.bucket, s3_key, rfq_text)
+        return self._copy_to_canonical(client, self.bucket, s3_key, rfq_text)
+
+    def _tag_s3_object(self, client, bucket: str, key: str, rfq_id: str) -> None:
+        try:
+            client.put_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                Tagging={"TagSet": [{"Key": "rfq-id", "Value": rfq_id}]},
+            )
+        except ClientError as exc:
+            logger.debug("Tagging failed for %s: %s", key, exc)
+        except Exception:
+            logger.debug("Tagging failed for %s due to unexpected error", key, exc_info=True)
+
+    def _copy_to_canonical(self, client, bucket: str, key: str, rfq_id: str) -> Optional[str]:
+        if not key:
+            return None
+
+        base_name = key.split("/")[-1]
+        prefix_root = self._prefixes[0] if self._prefixes else "emails/"
+        normalised_root = prefix_root.rstrip("/")
+        if normalised_root:
+            canonical_key = f"{normalised_root}/{rfq_id}/ingest/{base_name}"
+        else:
+            canonical_key = f"{rfq_id}/ingest/{base_name}"
+
+        if canonical_key == key:
+            return canonical_key
+
+        try:
+            client.copy_object(
+                Bucket=bucket,
+                CopySource={"Bucket": bucket, "Key": key},
+                Key=canonical_key,
+                TaggingDirective="REPLACE",
+                Tagging=f"rfq-id={rfq_id}",
+            )
+        except ClientError as exc:
+            logger.debug("Copy to canonical failed for %s: %s", key, exc)
+            return None
+        except Exception:
+            logger.debug("Copy to canonical failed for %s due to unexpected error", key, exc_info=True)
+            return None
+
+        return canonical_key
 
     def _get_s3_client(self):
         if self._s3_client is not None:
