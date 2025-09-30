@@ -438,7 +438,7 @@ class SESEmailWatcher:
                             )
                             if was_processed:
                                 total_processed += 1
-                            if matched or (rfq_matched and not filters):
+                            if matched or rfq_matched:
                                 match_found = True
                             if should_stop:
                                 if not match_found:
@@ -630,12 +630,16 @@ class SESEmailWatcher:
 
         if processed:
             processed_payload = self._record_processed_payload(message_id, processed)
+            original_rfq = processed_payload.get("rfq_id") if processed_payload else None
+            rfq_extracted = (
+                self._normalise_filter_value(original_rfq) if original_rfq else None
+            )
+            if target_rfq_normalised:
+                rfq_match = rfq_extracted == target_rfq_normalised
+            else:
+                rfq_match = bool(rfq_extracted)
+
             if match_filters:
-                original_rfq = processed_payload.get("rfq_id") if processed_payload else None
-                rfq_match = bool(
-                    target_rfq_normalised
-                    and self._normalise_filter_value(original_rfq) == target_rfq_normalised
-                )
                 self._apply_filter_defaults(processed_payload, match_filters)
                 message_match = self._matches_filters(processed_payload, match_filters)
                 # Treat RFQ match as authoritative even if other filters fail
