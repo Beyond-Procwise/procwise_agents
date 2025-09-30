@@ -13,7 +13,11 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
-from services.email_watcher import InMemoryEmailWatcherState, SESEmailWatcher
+from services.email_watcher import (
+    InMemoryEmailWatcherState,
+    SESEmailWatcher,
+    S3ObjectWatcher,
+)
 
 
 class StubSupplierInteractionAgent:
@@ -212,6 +216,65 @@ def test_poll_once_retries_until_target_found(monkeypatch):
     assert calls["count"] == 2
 
 
+def test_poll_once_supports_like_filters():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-like",
+            "subject": "Re: RFQ-20240101-abcd1234 Follow up",
+            "body": "Quoted 1200",
+            "from": "Muthu Subramanian <muthu.subramanian@dhsit.co.uk>",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+            "supplier_id": "SUP-12345",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={
+            "rfq_id_like": "rfq-20240101-abcd%",
+            "from_address_like": "%@dhsit.co.uk>",
+            "subject_like": "%follow up",
+            "supplier_id_like": "sup-123",
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["supplier_id"] == "SUP-12345"
+    assert "msg-like" in state
+
+
+def test_poll_once_matches_display_name_sender_with_plain_filter():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-display",
+            "subject": "Re: RFQ-20240101-abcd1234 clarification",
+            "body": "Quoted 1200",
+            "from": "Muthu Subramanian <muthu.subramanian@dhsit.co.uk>",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(
+        match_filters={
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "from_address": "muthu.subramanian@dhsit.co.uk",
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["from_address"].startswith("Muthu Subramanian")
+    assert "msg-display" in state
+
+
 def test_poll_once_stops_future_polls_after_match():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
@@ -391,3 +454,54 @@ def test_s3_poll_prioritises_newest_objects(monkeypatch):
     assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
     assert watcher._last_watermark_key == "emails/newest.eml"
     assert watcher._last_watermark_ts is not None
+
+
+def test_scan_recent_objects_includes_backlog_without_watermark():
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    prefix = watcher._prefixes[0]
+    old_time = datetime.now(timezone.utc) - timedelta(minutes=120)
+    contents = [
+        {"Key": f"{prefix}msg-old", "LastModified": old_time, "ETag": '"etag-old"'},
+    ]
+
+    class DummyPaginator:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def paginate(self, **kwargs):
+            yield {"Contents": list(self._payload)}
+
+    class FakeClient:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return DummyPaginator(self._payload)
+
+    fake_client = FakeClient(contents)
+    watcher._s3_prefix_watchers[prefix] = S3ObjectWatcher(limit=8)
+
+    refs_without_window = watcher._scan_recent_s3_objects(
+        fake_client,
+        [prefix],
+        watermark_ts=None,
+        watermark_key="",
+        enforce_window=False,
+    )
+
+    assert refs_without_window == [
+        (prefix, f"{prefix}msg-old", old_time, '"etag-old"')
+    ]
+
+    refs_with_window = watcher._scan_recent_s3_objects(
+        fake_client,
+        [prefix],
+        watermark_ts=old_time,
+        watermark_key="",
+        enforce_window=True,
+    )
+
+    assert refs_with_window == []

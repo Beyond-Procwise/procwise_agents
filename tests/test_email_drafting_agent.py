@@ -1,351 +1,181 @@
+import json
 import os
 import sys
-from types import SimpleNamespace
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
-os.environ.setdefault("OMP_NUM_THREADS", "8")
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.email_drafting_agent import EmailDraftingAgent
+from agents import email_drafting_agent as module
 from agents.base_agent import AgentContext, AgentStatus
+from agents.email_drafting_agent import DecisionContext, EmailDraftingAgent, ThreadHeaders
 
 
-class DummyNick:
-    def __init__(self):
-        self.settings = SimpleNamespace(
-            ses_default_sender="sender@example.com",
-            qdrant_collection_name="dummy",
-            extraction_model="gpt-oss",
-            script_user="tester",
-            email_response_poll_seconds=60,
+@pytest.fixture(autouse=True)
+def restore_env(monkeypatch):
+    monkeypatch.delenv("EMAIL_POLISH_ENABLED", raising=False)
+    yield
+
+
+def test_from_decision_formats_payload(monkeypatch):
+    calls = []
+
+    def fake_chat(model, system, user, **kwargs):
+        calls.append({"model": model, "system": system, "payload": json.loads(user.split("Context (JSON):\n", 1)[1].split("\n\nWrite", 1)[0])})
+        return (
+            "Subject: Re: RFQ RFQ-001\n"
+            "Hello Acme team,\n"
+            "RFQ RFQ-001 relates to your current offer of 47.5 GBP.\n"
+            "- Please confirm if 44.8 GBP is workable.\n"
+            "- Advise if you can deliver within 3 weeks.\n"
+            "Regards,\n"
         )
-        self.process_routing_service = SimpleNamespace(
-            log_process=lambda **_: None,
-            log_action=lambda **_: None,
-        )
+
+    monkeypatch.setattr(module, "_chat", fake_chat)
+
+    agent = EmailDraftingAgent()
+    decision = {
+        "rfq_id": "RFQ-001",
+        "supplier_id": "S-1",
+        "supplier_name": "Acme",
+        "to": "sales@acme.test",
+        "cc": ["buyer@test"],
+        "current_offer": 47.50,
+        "currency": "GBP",
+        "lead_time_weeks": 4,
+        "counter_price": 44.80,
+        "asks": ["Confirm revised pricing", "Update on lead time"],
+        "thread": {"message_id": "<msg1>", "references": ["<msg0>"]},
+    }
+
+    result = agent.from_decision(decision)
+
+    assert result["subject"] == "Re: RFQ RFQ-001"
+    assert "Please confirm if 44.8 GBP is workable." in result["text"]
+    assert "<ul>" in result["html"] and "<li>Please confirm if 44.8 GBP is workable.</li>" in result["html"]
+    assert result["headers"]["In-Reply-To"] == "<msg1>"
+    assert result["headers"]["References"] == "<msg0>"
+    assert result["metadata"]["supplier_id"] == "S-1"
+    assert calls[0]["payload"]["rfq_id"] == "RFQ-001"
 
 
-def test_email_drafting_agent(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
+def test_from_decision_subject_fallback(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    agent = EmailDraftingAgent()
+    result = agent.from_decision({"rfq_id": "ABC"})
+    assert result["subject"] == "ABC – Counter Offer & Next Steps"
+    assert result["text"] == "Body without explicit subject"
 
-    captured = {}
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: captured.setdefault("drafts", []).append(draft))
 
-    ranking = [
-        {
-            "supplier_id": "S1",
-            "supplier_name": "Acme",
-            "justification": "Ranked 1 following spend analysis.",
-        }
-    ]
-    context = AgentContext(
-        workflow_id="wf1",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={
-            "ranking": ranking,
-            "submission_deadline": "01/01/2025",
-            "category_manager_name": "Cat",
-            "category_manager_title": "Mgr",
-            "category_manager_email": "cat@example.com",
-            "your_name": "Buyer",
-            "your_title": "Procurement",
-            "your_company": "Your Company",
-        },
+def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
+    agent = EmailDraftingAgent()
+    rfq_id = "RFQ-20250930-84d44c85"
+    result = agent.from_decision({"rfq_id": rfq_id})
+    assert result["subject"] == f"{rfq_id} – Counter Offer & Next Steps"
+
+
+def test_prompt_mode_with_polish(monkeypatch):
+    responses = iter([
+        "Subject: RFQ XYZ follow-up\nInitial draft",  # compose
+        "Subject: RFQ XYZ follow-up\nPolished draft referencing RFQ XYZ",  # polish
+    ])
+
+    def fake_chat(*_, **__):
+        return next(responses)
+
+    monkeypatch.setattr(module, "_chat", fake_chat)
+
+    agent = EmailDraftingAgent()
+    agent.polish_model = "gemma3"
+
+    result = agent.from_prompt("Please follow up on RFQ XYZ")
+
+    assert result["subject"] == "RFQ XYZ follow-up"
+    assert result["text"] == "Polished draft referencing RFQ XYZ"
+    assert result["rfq_id"].lower().startswith("rfq xyz".replace(" ", ""))
+
+
+def test_decision_context_to_public_json():
+    ctx = DecisionContext(
+        rfq_id="R1",
+        supplier_id="S",
+        supplier_name="Name",
+        current_offer=12.3,
+        currency="GBP",
+        lead_time_weeks=2.0,
+        target_price=11.5,
+        round=2,
+        strategy="midpoint",
+        counter_price=11.8,
+        asks=["item"],
+        lead_time_request="3 weeks",
+        rationale="alignment",
+        thread=ThreadHeaders(message_id="m"),
     )
-
-    output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
-    assert output.data["drafts"]
-    draft = output.data["drafts"][0]
-    assert draft["supplier_id"] == "S1"
-    assert draft["supplier_name"] == "Acme"
-    assert draft["rfq_id"].startswith("RFQ-")
-    assert f"<!-- RFQ-ID: {draft['rfq_id']} -->" in draft["body"]
-    assert "<p>Dear Acme,</p>" in draft["body"]
-    assert "initiating a sourcing request" in draft["body"]
-    assert "return your quotation using the table below by 01/01/2025" in draft["body"]
-    assert "Kindly retain the RFQ ID in the email subject" in draft["body"]
-    assert "We appreciate your timely response and support" in draft["body"]
-    assert "<table" in draft["body"]
-    assert draft["subject"].count("RFQ") == 1
-    body_lower = draft["body"].lower()
-    assert "rank" not in body_lower
-    assert "analysis" not in body_lower
-    assert draft["sent_status"] is False
-    assert draft["sender"] == "sender@example.com"
-    assert draft["contact_level"] == 0
-    assert draft["recipients"] == []
-    assert draft.get("receiver") is None
-    assert draft["thread_index"] == 1
-    assert "action_id" in draft
-    assert draft["action_id"] is None
-    assert captured["drafts"][0] == draft
+    data = ctx.to_public_json()
+    assert data["rfq_id"] == "R1"
+    assert data["asks"] == ["item"]
 
 
-def test_email_drafting_applies_instruction_settings(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-
-    stored = []
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: stored.append(draft))
-
-    ranking = [
-        {
-            "supplier_id": "S1",
-            "supplier_name": "Alpha Co",
-            "contact_email": "alpha@example.com",
-        }
-    ]
-
-    prompts = [
-        {
-            "promptId": 1,
-            "prompts_desc": (
-                "body_template: \"<p>Dear {supplier_contact_name_html}, we kindly request a quotation.</p>\"\n"
-                "include_rfq_table: false\n"
-                "additional_paragraph: \"Please confirm receipt of this request.\""
-            ),
-        }
-    ]
-
-    policies = [
-        {
-            "policyId": 2,
-            "policy_desc": (
-                "subject_template: \"RFQ {rfq_id} for {supplier_company}\"\n"
-                "compliance_notice: \"All quotations are confidential.\""
-            ),
-        }
-    ]
-
-    context = AgentContext(
-        workflow_id="wf-instruction",
+def _make_context(payload: dict) -> AgentContext:
+    return AgentContext(
+        workflow_id="wf-1",
         agent_id="email_drafting",
         user_id="tester",
-        input_data={
-            "ranking": ranking,
-            "prompts": prompts,
-            "policies": policies,
-            "submission_deadline": "2025-01-15",
-        },
+        input_data=payload,
     )
 
-    output = agent.run(context)
-    draft = output.data["drafts"][0]
 
-    assert draft["subject"].startswith("RFQ")
-    assert "Alpha Co" in draft["subject"]
-    body = draft["body"]
-    assert "we kindly request a quotation" in body
-    assert "Please confirm receipt of this request." in body
-    assert "All quotations are confidential" in body
-    assert "Compliance" in body
-    assert "<table" not in body
-    assert draft["recipients"] == []
+def test_execute_uses_decision_payload(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Update\nBody line")
 
-
-def test_email_drafting_follow_up_interaction(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
-
-    ranking = [
+    agent = EmailDraftingAgent()
+    context = _make_context(
         {
-            "supplier_id": "S9",
-            "supplier_name": "Delta Supplies",
+            "decision": {
+                "rfq_id": "RFQ-900",
+                "supplier_id": "S-900",
+                "to": "buyer@example.com",
+                "counter_price": 42.5,
+            }
         }
-    ]
-
-    prompts = [
-        {
-            "prompts_desc": "interaction_type: follow_up\n",
-        }
-    ]
-
-    context = AgentContext(
-        workflow_id="wf-follow",
-        agent_id="email_drafting",
-        user_id="tester",
-        input_data={
-            "ranking": ranking,
-            "prompts": prompts,
-            "submission_deadline": "2025-03-01",
-            "previous_sent_on": "2025-02-20",
-        },
     )
 
-    output = agent.run(context)
-    body = output.data["drafts"][0]["body"]
+    result = agent.execute(context)
 
-    assert "following up on our earlier quotation request" in body
-    assert "update on your quotation" in body
-    assert "Kindly retain the RFQ ID in the email subject" in body
-
-
-def test_email_drafting_includes_negotiation_message(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
-
-    ranking = [{"supplier_id": "S1", "supplier_name": "Acme"}]
-    context = AgentContext(
-        workflow_id="wf-neg",
-        agent_id="email_drafting",
-        user_id="tester",
-        input_data={
-            "ranking": ranking,
-            "message": "Please consider revising your quotation to align with our target.",
-            "target_price": 750,
-        },
-    )
-
-    output = agent.run(context)
-    draft = output.data["drafts"][0]
-
-    assert "Please consider revising your quotation" in draft["body"]
-    assert draft["sent_status"] is False
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"]
+    draft = result.data["drafts"][0]
+    assert draft["subject"] == "Update"
+    assert draft["metadata"]["counter_price"] == 42.5
 
 
-def test_email_drafting_uses_template_from_previous_agent(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+def test_execute_falls_back_to_prompt(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Follow-up\nBody")
 
-    ranking = [{"supplier_id": "S1", "supplier_name": "Bob"}]
-    context = AgentContext(
-        workflow_id="wf3",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={
-            "ranking": ranking,
-            "body": "Hello {{ supplier_contact_name }}",
-        },
-    )
+    agent = EmailDraftingAgent()
+    context = _make_context({"prompt": "Please follow up", "rfq_id": "RFQ-XYZ"})
 
-    output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
-    assert "<p>Hello Bob</p>" in output.data["drafts"][0]["body"]
+    result = agent.execute(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"][0]["subject"] == "Follow-up"
 
 
-def test_email_drafting_handles_missing_ranking(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
+def test_execute_infers_recipients_and_counter_price(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody")
 
-    context = AgentContext(
-        workflow_id="wf2",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={"body": "hi"},
-    )
+    agent = EmailDraftingAgent()
+    payload = {
+        "rfq_id": "RFQ-321",
+        "recipients": ["primary@example.com", "cc1@example.com"],
+        "counter_proposals": [{"price": 11.75}],
+        "decision_log": "Request revision",
+    }
+    result = agent.execute(_make_context(payload))
 
-    output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
-    assert output.data["drafts"] == []
-
-
-def test_email_drafting_includes_action_ids(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
-
-    ranking = [
-        {"supplier_id": "S1", "supplier_name": "Acme", "action_id": "rank-1"},
-        {"supplier_id": "S2", "supplier_name": "Beta"},
-    ]
-    context = AgentContext(
-        workflow_id="wf4",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={
-            "ranking": ranking,
-            "action_id": "email-action",
-        },
-    )
-
-    output = agent.run(context)
-    assert output.status == AgentStatus.SUCCESS
-    drafts = output.data["drafts"]
-    assert output.data.get("action_id") is None
-    assert drafts[0].get("action_id") is None
-    assert drafts[0]["supplier_name"] == "Acme"
-    assert drafts[1].get("action_id") is None
-    assert drafts[1]["supplier_name"] == "Beta"
-
-    assert "action_id" not in output.pass_fields
-
-
-def test_email_drafting_reuses_valid_email_action_id(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: None)
-    monkeypatch.setattr(agent, "_action_belongs_to_email_agent", lambda _: True)
-
-    ranking = [
-        {"supplier_id": "S1", "supplier_name": "Acme"},
-        {"supplier_id": "S2", "supplier_name": "Beta"},
-    ]
-
-    context = AgentContext(
-        workflow_id="wf4",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={
-            "ranking": ranking,
-            "action_id": "email-action",
-        },
-    )
-
-    output = agent.run(context)
-    drafts = output.data["drafts"]
-    assert output.data["action_id"] == "email-action"
-    assert drafts[0]["action_id"] == "email-action"
-    assert drafts[1]["action_id"] == "email-action"
-    assert output.pass_fields["action_id"] == "email-action"
-
-
-def test_email_drafting_creates_manual_draft_without_sending(monkeypatch):
-    nick = DummyNick()
-    agent = EmailDraftingAgent(nick)
-
-    stored = []
-    monkeypatch.setattr(agent, "_store_draft", lambda draft: stored.append(draft))
-
-    context = AgentContext(
-        workflow_id="wf5",
-        agent_id="email_drafting",
-        user_id="u1",
-        input_data={
-            "subject": "Manual Subject",
-            "recipients": ["user@example.com", "team@example.com", "user@example.com"],
-            "body": "<!-- RFQ-ID: RFQ-MANUAL --><p>Hello supplier</p>",
-            "action_id": "manual-action",
-        },
-    )
-
-    output = agent.run(context)
-
-    assert output.status == AgentStatus.SUCCESS
-    assert "sent" not in output.data
-
-    drafts = output.data["drafts"]
-    assert len(drafts) == 1
-    draft = drafts[0]
-    assert draft["rfq_id"] == "RFQ-MANUAL"
-    assert draft["sent_status"] is True
-    assert draft.get("action_id") is None
-    assert draft["recipients"] == ["user@example.com", "team@example.com"]
-    assert draft["receiver"] == "user@example.com"
-    assert draft["contact_level"] == 1
-    assert draft["thread_index"] == 1
-    assert stored[0] == draft
-    assert output.data["recipients"] == ["user@example.com", "team@example.com"]
-    assert output.data.get("action_id") is None
-    assert output.pass_fields["body"].startswith("<!-- RFQ-ID: RFQ-MANUAL -->")
-
+    draft = result.data["drafts"][0]
+    assert draft["to"] == "primary@example.com"
+    assert draft["cc"] == ["cc1@example.com"]
+    assert draft["metadata"]["counter_price"] == 11.75
