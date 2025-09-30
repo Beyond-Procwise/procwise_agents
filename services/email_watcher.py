@@ -322,6 +322,8 @@ class SESEmailWatcher:
         )
         self._processed_cache: OrderedDict[str, Dict[str, object]] = OrderedDict()
         self._completed_targets: Set[str] = set()
+        self._rfq_run_counts: Dict[str, int] = {}
+        self._rfq_index_hits: Dict[str, str] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
@@ -399,6 +401,56 @@ class SESEmailWatcher:
                     self.mailbox_address,
                 )
                 return results
+
+        run_count = 0
+        if target_rfq_normalised:
+            run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
+            self._rfq_run_counts[target_rfq_normalised] = run_count
+            if run_count > 1 and target_rfq_normalised in self._completed_targets:
+                logger.info(
+                    "RFQ %s requested again for mailbox %s (run %s); resetting completion state",
+                    target_rfq_normalised,
+                    self.mailbox_address,
+                    run_count,
+                )
+                self._completed_targets.discard(target_rfq_normalised)
+        if target_rfq_normalised:
+            hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
+            if hit:
+                cached_key = self._rfq_index_hits.get(target_rfq_normalised)
+                if cached_key and cached_key == hit["key"]:
+                    logger.info(
+                        "RFQ %s index entry %s already surfaced on a prior run (run %s); continuing with S3 scan",
+                        target_rfq_normalised,
+                        cached_key,
+                        run_count or 1,
+                    )
+                else:
+                    self._rfq_index_hits[target_rfq_normalised] = hit["key"]
+                    results.append(
+                        {
+                            "rfq_id": hit["rfq_id"],
+                            "supplier_id": None,
+                            "message_id": None,
+                            "subject": None,
+                            "from_address": None,
+                            "message_body": None,
+                            "target_price": None,
+                            "negotiation_triggered": False,
+                            "supplier_status": None,
+                            "negotiation_status": None,
+                            "supplier_output": None,
+                            "negotiation_output": None,
+                            "canonical_s3_key": hit["key"],
+                        }
+                    )
+                    logger.info(
+                        "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
+                        target_rfq_normalised,
+                        hit["processed_at"],
+                        self.mailbox_address,
+                    )
+                    return results
 
         logger.info(
             "Scanning %s for new supplier responses (limit=%s)",
@@ -684,6 +736,8 @@ class SESEmailWatcher:
             if canonical_key:
                 processed_payload["canonical_s3_key"] = canonical_key
                 processed["canonical_s3_key"] = canonical_key
+                if target_rfq_normalised:
+                    self._rfq_index_hits[target_rfq_normalised] = canonical_key
 
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
