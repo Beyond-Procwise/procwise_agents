@@ -91,7 +91,7 @@ class EmailDispatchService:
             else:
                 subject_candidate = draft.get("subject")
             subject_str = str(subject_candidate).strip() if subject_candidate else ""
-            subject = subject_str or f"RFQ {rfq_id} – Request for Quotation"
+            subject = subject_str or f"{rfq_id} – Request for Quotation"
 
             body_source = body_override if body_override is not None else draft.get("body")
             body_text = str(body_source).strip() if body_source else ""
