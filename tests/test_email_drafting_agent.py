@@ -1,11 +1,8 @@
 import json
 import os
 import sys
-
 import pytest
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from agents import email_drafting_agent as module
 from agents.base_agent import AgentContext, AgentStatus
 from agents.email_drafting_agent import DecisionContext, EmailDraftingAgent, ThreadHeaders
@@ -73,7 +70,6 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     rfq_id = "RFQ-20250930-84d44c85"
     result = agent.from_decision({"rfq_id": rfq_id})
     assert result["subject"] == f"{rfq_id} – Counter Offer & Next Steps"
-
 
 def test_prompt_mode_with_polish(monkeypatch):
     responses = iter([
