@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from types import SimpleNamespace
 import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -223,3 +224,40 @@ def test_execute_infers_recipients_and_counter_price(monkeypatch):
     assert draft["to"] == "primary@example.com"
     assert draft["cc"] == ["cc1@example.com"]
     assert draft["metadata"]["counter_price"] == 11.75
+
+
+def test_execute_logs_process_action_when_service_available(monkeypatch):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody")
+
+    class Recorder:
+        def __init__(self):
+            self.logged = {}
+
+        def log_process(self, **kwargs):
+            self.logged["log_process"] = kwargs
+            return 101
+
+        def log_run_detail(self, **kwargs):
+            self.logged["log_run_detail"] = kwargs
+            return "run-101"
+
+        def log_action(self, **kwargs):
+            self.logged["log_action"] = kwargs
+            return "action-101"
+
+    recorder = Recorder()
+    agent_nick = SimpleNamespace(
+        process_routing_service=recorder,
+        settings=SimpleNamespace(script_user="script-user"),
+    )
+    agent = EmailDraftingAgent(agent_nick=agent_nick)
+    context = _make_context({"prompt": "Follow up", "rfq_id": "RFQ-XYZ"})
+
+    result = agent.execute(context)
+
+    assert result.action_id == "action-101"
+    assert result.data["action_id"] == "action-101"
+    assert result.data["drafts"][0]["action_id"] == "action-101"
+    assert recorder.logged["log_process"]["user_id"] == "tester"
+    assert recorder.logged["log_action"]["status"] == "completed"
+    assert recorder.logged["log_action"]["process_output"]["drafts"]
