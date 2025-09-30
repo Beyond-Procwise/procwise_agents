@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import string
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import requests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
@@ -16,6 +19,30 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL_COMPOSE = os.getenv("EMAIL_DRAFT_MODEL", "llama3.2")
 MODEL_POLISH = os.getenv("EMAIL_POLISH_MODEL", "gemma3")  # optional
 ENABLE_POLISH = os.getenv("EMAIL_POLISH_ENABLED", "false").strip().lower() == "true"
+
+_RFQ_ID_PATTERN = re.compile(r"RFQ-\d{8}-[A-Z0-9]{8}")
+
+
+def _current_rfq_date() -> str:
+    return datetime.utcnow().strftime("%Y%m%d")
+
+
+def _generate_rfq_token(length: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+
+
+def _generate_rfq_id() -> str:
+    return f"RFQ-{_current_rfq_date()}-{_generate_rfq_token()}"
+
+
+def _ensure_rfq_id(value: Any) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().upper()
+        match = _RFQ_ID_PATTERN.search(candidate)
+        if match:
+            return match.group(0)
+    return _generate_rfq_id()
 
 
 def _post_ollama(path: str, payload: dict, timeout: int = 120) -> dict:
@@ -307,6 +334,8 @@ class EmailDraftingAgent:
             match = re.search(r"(RFQ[-\s:_]*[A-Za-z0-9\-]+)", body, flags=re.I)
             rfq_id = match.group(1).replace(" ", "") if match else "RFQ"
 
+        rfq_id = _ensure_rfq_id(rfq_id)
+
         subject = _first_line_subject_fallback(
             body, _trim_subject_prefixes(f"{rfq_id} – Follow-up")
         )
@@ -366,7 +395,7 @@ class EmailDraftingAgent:
         asks = payload.get("asks") or []
 
         return DecisionContext(
-            rfq_id=str(payload.get("rfq_id")),
+            rfq_id=_ensure_rfq_id(payload.get("rfq_id")),
             supplier_id=payload.get("supplier_id"),
             supplier_name=payload.get("supplier_name"),
             to=payload.get("to"),
@@ -396,8 +425,6 @@ class EmailDraftingAgent:
         def _append(candidate: Optional[Dict[str, Any]]) -> None:
             if not isinstance(candidate, dict):
                 return
-            if not candidate.get("rfq_id"):
-                return
             decisions.append(self._normalise_decision_payload(candidate))
 
         _append(payload.get("decision"))
@@ -415,7 +442,7 @@ class EmailDraftingAgent:
 
         # Fallback: treat the full payload as a decision when it resembles the
         # negotiation agent's pass-through structure.
-        if not decisions and payload.get("rfq_id"):
+        if not decisions and isinstance(payload, dict):
             _append(payload)
 
         return decisions
@@ -444,7 +471,7 @@ class EmailDraftingAgent:
     def _normalise_decision_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Extract recognised decision fields with sensible fallbacks."""
 
-        decision: Dict[str, Any] = {"rfq_id": str(payload.get("rfq_id"))}
+        decision: Dict[str, Any] = {"rfq_id": _ensure_rfq_id(payload.get("rfq_id"))}
 
         def _first_non_empty(keys: Iterable[str]) -> Optional[Any]:
             for key in keys:
