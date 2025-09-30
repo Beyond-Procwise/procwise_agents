@@ -10,6 +10,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.email_dispatch_service import EmailDispatchService
+from services.email_service import EmailSendResult
 
 
 class InMemoryDraftStore:
@@ -177,8 +178,19 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     service = EmailDispatchService(nick)
 
     sent_args = {}
+    recorded_thread = {}
 
-    def fake_send(subject, body, recipients, sender, attachments=None):
+    def fake_record_thread(message_id, rfq_id, supplier_id, recipients):
+        recorded_thread.update(
+            {
+                "message_id": message_id,
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "recipients": list(recipients),
+            }
+        )
+
+    def fake_send(subject, body, recipients, sender, attachments=None, **kwargs):
         sent_args.update(
             {
                 "subject": subject,
@@ -186,11 +198,13 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
                 "recipients": recipients,
                 "sender": sender,
                 "attachments": attachments,
+                "headers": kwargs.get("headers"),
             }
         )
-        return True
+        return EmailSendResult(True, "<message-id-1>")
 
     monkeypatch.setattr(service.email_service, "send_email", fake_send)
+    monkeypatch.setattr(service, "_record_thread_mapping", fake_record_thread)
 
     result = service.send_draft("RFQ-UNIT")
 
@@ -198,6 +212,14 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["recipients"] == ["buyer@example.com"]
     assert result["subject"].startswith("RFQ RFQ-UNIT")
     assert result["draft"]["sent_status"] is True
+    assert result["message_id"] == "<message-id-1>"
+    assert sent_args["headers"]["X-Procwise-RFQ-ID"] == "RFQ-UNIT"
+    assert recorded_thread == {
+        "message_id": "<message-id-1>",
+        "rfq_id": "RFQ-UNIT",
+        "supplier_id": "S1",
+        "recipients": ["buyer@example.com"],
+    }
     assert result["body"].startswith("<!-- RFQ-ID: RFQ-UNIT -->")
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"

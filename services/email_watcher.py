@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
+from email.header import decode_header, make_header
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 import boto3
+from botocore.exceptions import ClientError
 
 try:  # pragma: no cover - optional dependency during tests
     from psycopg2 import errors as psycopg2_errors
@@ -33,6 +35,23 @@ logger = logging.getLogger(__name__)
 # Ensure GPU related environment flags are consistently applied even when the
 # watcher is used standalone (e.g. in a scheduled job).
 configure_gpu()
+
+
+def _decode_mime_header(value: object) -> str:
+    """Decode MIME encoded headers into a display-friendly string."""
+
+    if value in (None, ""):
+        return ""
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+
+    try:
+        header = make_header(decode_header(text))
+        return str(header).strip()
+    except Exception:
+        return text.strip()
 
 
 class EmailLoader(Protocol):
@@ -265,9 +284,9 @@ class SESEmailWatcher:
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._match_poll_attempts = self._coerce_int(
-            getattr(self.settings, "email_match_poll_attempts", 3),
-            default=3,
-            minimum=1,
+            getattr(self.settings, "email_match_poll_attempts", 0),
+            default=0,
+            minimum=0,
         )
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
@@ -330,13 +349,18 @@ class SESEmailWatcher:
 
             self._respect_post_dispatch_wait()
 
-            max_attempts = self._match_poll_attempts if target_rfq_normalised else 1
             attempts = 0
+            if target_rfq_normalised:
+                unlimited_attempts = self._match_poll_attempts <= 0
+                max_attempts = self._match_poll_attempts if self._match_poll_attempts > 0 else 0
+            else:
+                unlimited_attempts = False
+                max_attempts = 1
             total_candidates = 0
             total_processed = 0
 
 
-            while attempts < max_attempts and not match_found:
+            while True:
                 attempts += 1
                 try:
                     if self._custom_loader is not None:
@@ -364,7 +388,8 @@ class SESEmailWatcher:
                             if matched or (rfq_matched and not filters):
                                 match_found = True
                             if should_stop:
-
+                                if not match_found:
+                                    match_found = True
                                 break
                     else:
                         processed_batch: List[Dict[str, object]] = []
@@ -430,19 +455,29 @@ class SESEmailWatcher:
                 if match_found:
                     break
 
-                if target_rfq_normalised:
-                    if attempts >= max_attempts:
-                        break
+                if not target_rfq_normalised:
+                    break
+
+                if not unlimited_attempts and max_attempts > 0 and attempts >= max_attempts:
                     logger.debug(
-                        "RFQ %s not found in mailbox %s on attempt %d/%d; waiting %.1fs before retrying",
+                        "RFQ %s not found in mailbox %s on attempt %d/%s; reached polling limit",
                         target_rfq_normalised,
                         self.mailbox_address,
                         attempts,
                         max_attempts,
-                        self.poll_interval_seconds,
                     )
-                    if self.poll_interval_seconds > 0:
-                        time.sleep(max(0.5, min(self.poll_interval_seconds, 5)))
+                    break
+
+                logger.debug(
+                    "RFQ %s not found in mailbox %s on attempt %d/%s; waiting %.1fs before retrying",
+                    target_rfq_normalised,
+                    self.mailbox_address,
+                    attempts,
+                    max_attempts if max_attempts > 0 else "inf",
+                    self.poll_interval_seconds,
+                )
+                if self.poll_interval_seconds > 0:
+                    time.sleep(max(0.5, min(self.poll_interval_seconds, 5)))
 
             if target_rfq_normalised and match_found:
                 self._completed_targets.add(target_rfq_normalised)
@@ -1232,6 +1267,119 @@ class SESEmailWatcher:
 
         self._last_dispatch_wait_acknowledged = candidate_time
 
+    def _scan_recent_s3_objects(
+        self,
+        client,
+        prefixes: Sequence[str],
+        *,
+        watermark_ts: Optional[datetime],
+        watermark_key: str,
+    ) -> List[Tuple[str, str, Optional[datetime], Optional[str]]]:
+        object_refs: List[Tuple[str, str, Optional[datetime], Optional[str]]] = []
+        paginator = client.get_paginator("list_objects_v2")
+
+        for prefix in prefixes:
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                contents = page.get("Contents", [])
+                if not contents:
+                    continue
+
+                for obj in contents:
+                    key = obj.get("Key")
+                    if not key:
+                        continue
+                    if key.endswith("/") or "AMAZON_SES_SETUP_NOTIFICATION" in key:
+                        continue
+
+                    last_modified_raw = obj.get("LastModified")
+                    last_modified = (
+                        last_modified_raw
+                        if isinstance(last_modified_raw, datetime)
+                        else None
+                    )
+
+                    if not self._is_newer_than_watermark(
+                        last_modified, key, watermark_ts, watermark_key
+                    ):
+                        continue
+
+                    etag_value = obj.get("ETag") if isinstance(obj.get("ETag"), str) else None
+                    object_refs.append((prefix, key, last_modified, etag_value))
+
+        if not object_refs:
+            return []
+
+        tz_aware_min = datetime.min.replace(tzinfo=timezone.utc)
+        object_refs.sort(
+            key=lambda item: ((item[2] or tz_aware_min), item[1]),
+            reverse=True,
+        )
+
+        self._log_s3_preview(client, object_refs[: min(3, len(object_refs))])
+        return object_refs
+
+    def _log_s3_preview(
+        self,
+        client,
+        preview_refs: Sequence[Tuple[str, str, Optional[datetime], Optional[str]]],
+    ) -> None:
+        if not preview_refs:
+            return
+
+        bucket_name = self.bucket
+        if not bucket_name:
+            return
+
+        for _, key, _, _ in preview_refs:
+            try:
+                response = client.get_object(
+                    Bucket=bucket_name,
+                    Key=key,
+                    Range="bytes=0-4095",
+                )
+            except ClientError as exc:
+                error_code = exc.response.get("Error", {}).get("Code") if hasattr(exc, "response") else None
+                if error_code in ("InvalidRange", "NotImplemented"):
+                    response = client.get_object(Bucket=bucket_name, Key=key)
+                else:
+                    logger.debug("Preview fetch failed for %s: %s", key, exc)
+                    continue
+            except Exception:
+                logger.exception("Preview fetch failed for %s", key)
+                continue
+
+            try:
+                blob = response["Body"].read()
+            except Exception:
+                logger.debug("Unable to read preview body for %s", key)
+                continue
+
+            headers = self._parse_email_headers(blob)
+            subject = headers.get("subject") or ""
+            recipient = headers.get("to") or ""
+            logger.debug(
+                "%s | Subject: %s | To: %s",
+                key,
+                subject or "<unknown>",
+                recipient or "<unknown>",
+            )
+
+    @staticmethod
+    def _parse_email_headers(raw_bytes: bytes) -> Dict[str, str]:
+        if not raw_bytes:
+            return {}
+
+        try:
+            parser = BytesParser(policy=policy.default)
+            message = parser.parsebytes(raw_bytes, headersonly=True)
+        except Exception:
+            return {}
+
+        return {
+            "subject": _decode_mime_header(message.get("Subject")),
+            "to": _decode_mime_header(message.get("To")),
+        }
+
     def _load_from_s3(
         self,
         limit: Optional[int] = None,
@@ -1251,8 +1399,6 @@ class SESEmailWatcher:
             self._format_bucket_prefixes(prefixes),
             self.mailbox_address,
         )
-        paginator = client.get_paginator("list_objects_v2")
-
         collected: List[Tuple[Optional[datetime], Dict[str, object]]] = []
         seen_keys: Set[str] = set()
 
@@ -1261,57 +1407,24 @@ class SESEmailWatcher:
 
         bypass_known_filters = bool(self._require_new_s3_objects)
 
-        object_refs: List[Tuple[str, str, Optional[datetime], Optional[str]]] = []
         watermark_ts = self._last_watermark_ts
         watermark_key = self._last_watermark_key
 
         for prefix in active_prefixes:
-            watcher = self._s3_prefix_watchers.get(prefix)
-            if watcher is None:
-                watcher = S3ObjectWatcher(limit=self._s3_watch_history_limit)
-                self._s3_prefix_watchers[prefix] = watcher
+            if prefix not in self._s3_prefix_watchers:
+                self._s3_prefix_watchers[prefix] = S3ObjectWatcher(
+                    limit=self._s3_watch_history_limit
+                )
 
-            iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            for page in iterator:
-                contents = page.get("Contents", [])
-                if not contents:
-                    continue
-
-                for obj in contents:
-                    key = obj.get("Key")
-                    if not key:
-                        continue
-                    if key.endswith("/") or "AMAZON_SES_SETUP_NOTIFICATION" in key:
-                        continue
-                    last_modified_raw = obj.get("LastModified")
-                    last_modified = (
-                        last_modified_raw
-                        if isinstance(last_modified_raw, datetime)
-                        else None
-                    )
-                    if not self._is_newer_than_watermark(last_modified, key, watermark_ts, watermark_key):
-                        continue
-                    etag_value = obj.get("ETag") if isinstance(obj.get("ETag"), str) else None
-                    object_refs.append((prefix, key, last_modified, etag_value))
+        object_refs = self._scan_recent_s3_objects(
+            client,
+            active_prefixes,
+            watermark_ts=watermark_ts,
+            watermark_key=watermark_key,
+        )
 
         if not object_refs:
             return []
-
-        object_refs.sort(
-            key=lambda item: ((item[2] or datetime.min), item[1]),
-            reverse=True,
-        )
-
-        if logger.isEnabledFor(logging.DEBUG):
-            preview = ", ".join(
-                f"{key} (prefix={prefix})" for prefix, key, _ in object_refs[:5]
-            )
-            logger.debug(
-                "Discovered %d S3 object(s) for mailbox %s: %s",
-                len(object_refs),
-                self.mailbox_address,
-                preview or "<none>",
-            )
 
         processed_prefixes: Dict[str, bool] = {prefix: False for prefix in active_prefixes}
 
