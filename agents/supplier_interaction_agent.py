@@ -22,13 +22,12 @@ class SupplierInteractionAgent(BaseAgent):
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         self._email_watcher = None
 
-    # Suppliers may respond with upper-case hexadecimal identifiers (e.g.
-    # ``RFQ-20240101-ABCD1234``).  The previous lower-case only pattern meant
-    # the email watcher failed to recognise these RFQ references which in turn
-    # left the ``wait_for_response`` loop polling indefinitely.  The compiled
-    # regular expression is now case-insensitive ensuring both database stored
-    # values and supplier emails align regardless of casing.
-    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}", re.IGNORECASE)
+    # Suppliers occasionally include upper-case letters or non-hex characters
+    # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
+    # tolerates the broader ``[A-Za-z0-9]{8}`` space while remaining
+    # case-insensitive so mailbox matching and downstream database checks stay
+    # aligned regardless of the original casing.
+    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[A-Za-z0-9]{8}", re.IGNORECASE)
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Process a single supplier email or poll the mailbox."""
