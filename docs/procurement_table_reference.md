@@ -386,6 +386,18 @@ rfq_id text NOT NULL,
     CONSTRAINT negotiation_sessions_pk PRIMARY KEY (rfq_id, supplier_id, round)
 ```
 
+### `proc.email_thread_map`
+```
+message_id text PRIMARY KEY,
+    rfq_id text NOT NULL,
+    supplier_id text,
+    recipients jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+```
+Stores the outbound message to RFQ mapping so inbound replies can be
+associated without DynamoDB.
+
 ### `proc.supplier_replies`
 ```
 rfq_id text NOT NULL,

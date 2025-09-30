@@ -84,17 +84,6 @@ def _prepare_s3_stub(email_bytes, bucket, key, *, rfq="RFQ-20240101-ABC12345", u
     return client, stub
 
 
-class _FakeTable:
-    def __init__(self, mapping):
-        self.mapping = mapping
-
-    def get_item(self, Key):
-        message_id = Key.get("message_id")
-        if message_id in self.mapping:
-            return {"Item": {"rfq_id": self.mapping[message_id]}}
-        return {}
-
-
 @pytest.fixture(autouse=True)
 def stub_upsert(monkeypatch):
     calls = []
@@ -107,13 +96,59 @@ def stub_upsert(monkeypatch):
     calls.clear()
 
 
+class _NullCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, *args, **kwargs):
+        return None
+
+    def fetchone(self):
+        return None
+
+
+class _NullConnection:
+    def cursor(self):
+        return _NullCursor()
+
+
+@pytest.fixture(autouse=True)
+def stub_thread_mapping(monkeypatch):
+    mapping = {}
+    connection = _NullConnection()
+
+    def fake_get_db_connection():
+        return connection
+
+    def fake_lookup(conn, table_name, keys, logger=None):
+        for key in keys:
+            if key in mapping:
+                return mapping[key]
+        return None
+
+    def fake_ensure_table(conn, table_name, logger=None):
+        return None
+
+    monkeypatch.setattr(ingest, "_get_db_connection", fake_get_db_connection)
+    monkeypatch.setattr(ingest, "lookup_rfq_from_threads", fake_lookup)
+    monkeypatch.setattr(ingest, "ensure_thread_table", fake_ensure_table)
+    ingest._THREAD_TABLE_READY = True
+
+    yield mapping
+
+    mapping.clear()
+    ingest._THREAD_TABLE_READY = False
+
+
 def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
     bucket = "procwisemvp"
     key = "emails/random-object"
     email_bytes = _build_email(subject="Re: RFQ-20240101-abc12345", body="Price 1200")
 
     _prepare_s3_stub(email_bytes, bucket, key)
-    ingest._DDB_TABLE = _FakeTable({})
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
@@ -125,13 +160,13 @@ def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
     assert stub_upsert and stub_upsert[0][0] == "RFQ-20240101-ABC12345"
 
 
-def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert):
+def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert, stub_thread_mapping):
     bucket = "procwisemvp"
     key = "emails/random-object-2"
     email_bytes = _build_email(subject="Re: Quote", body="No RFQ", **{"In-Reply-To": "<thread-123>"})
 
     _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240202-THREAD12")
-    ingest._DDB_TABLE = _FakeTable({"<thread-123>": "RFQ-20240202-THREAD12"})
+    stub_thread_mapping["<thread-123>"] = "RFQ-20240202-THREAD12"
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
@@ -148,7 +183,6 @@ def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
     email_bytes = _build_email(subject="Quote", body="No identifier present")
 
     _prepare_s3_stub(email_bytes, bucket, key, unmatched=True)
-    ingest._DDB_TABLE = _FakeTable({})
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
@@ -165,7 +199,6 @@ def test_lambda_handler_processes_sqs_envelope(monkeypatch, stub_upsert):
     email_bytes = _build_email(subject="Re: RFQ-20240102-beefcafe", body="Confirming order")
 
     _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240102-BEEFCAFE")
-    ingest._DDB_TABLE = _FakeTable({})
 
     s3_record = {
         "eventSource": "aws:s3",
@@ -200,7 +233,6 @@ def test_process_record_persists_metadata(monkeypatch, stub_upsert):
     )
 
     _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240103-DEADBEEF")
-    ingest._DDB_TABLE = _FakeTable({})
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
@@ -249,7 +281,7 @@ def test_process_record_skips_known_objects(monkeypatch):
 def reset_clients():
     yield
     ingest._S3_CLIENT = None
-    ingest._DDB_TABLE = None
+    ingest._THREAD_TABLE_READY = False
     ingest._DB_CONNECTION = None
     ingest._SUPPLIER_TABLE_INITIALISED = False
     ingest._SUPPLIER_OBJECT_TABLE_INITIALISED = False

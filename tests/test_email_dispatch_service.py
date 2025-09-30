@@ -180,7 +180,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     sent_args = {}
     recorded_thread = {}
 
-    def fake_record_thread(message_id, rfq_id, supplier_id, recipients):
+    def fake_record_thread(conn, message_id, rfq_id, supplier_id, recipients):
         recorded_thread.update(
             {
                 "message_id": message_id,

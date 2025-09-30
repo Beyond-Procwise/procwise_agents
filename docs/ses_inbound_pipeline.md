@@ -21,13 +21,14 @@ troubleshooting delayed replies.
 ## 2. Validate watcher configuration
 - The Lambda is configured via environment variables (`EMAIL_INGEST_BUCKET`,
   `EMAIL_INGEST_PREFIX`, `EMAIL_THREAD_TABLE`). Defaults point to
-  `procwisemvp`, `emails/`, and `procwise_outbound_emails` respectively.
+  `procwisemvp`, `emails/`, and the Postgres table `proc.email_thread_map`
+  respectively.
 - The function copies every processed object into
   `emails/<RFQ-ID>/ingest/<original-name>` and applies the tag `rfq-id=<RFQ-ID>`.
   Downstream processors should read from the normalised prefix or filter by tag.
-- Each processed message is upserted into Postgres (`proc.supplier_replies`) so
-  the orchestrator can reconcile supplier replies without re-downloading from
-  S3.
+- Each processed message is upserted into Postgres (`proc.supplier_replies`),
+  and outbound thread mappings are recorded in `proc.email_thread_map` so the
+  orchestrator can reconcile supplier replies without re-downloading from S3.
 - Replies that cannot be matched to an RFQ are copied into
   `emails/_unmatched/` with the tag `needs-review=true` for manual triage.
 
