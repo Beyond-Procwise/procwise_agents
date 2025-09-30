@@ -71,6 +71,7 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     result = agent.from_decision({"rfq_id": rfq_id})
     assert result["subject"] == f"{rfq_id} – Counter Offer & Next Steps"
 
+
 def test_prompt_mode_with_polish(monkeypatch):
     responses = iter([
         "Subject: RFQ XYZ follow-up\nInitial draft",  # compose
