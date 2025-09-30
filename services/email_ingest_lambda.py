@@ -32,8 +32,14 @@ from urllib.parse import unquote_plus
 import boto3
 import psycopg2
 from botocore.config import Config
-from botocore.exceptions import ClientError
 from psycopg2 import extras
+
+from services.email_thread_store import (
+    DEFAULT_THREAD_TABLE,
+    ensure_thread_table,
+    lookup_rfq_from_threads,
+    sanitise_thread_table_name,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +47,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = os.getenv("EMAIL_INGEST_BUCKET", os.getenv("S3_BUCKET", "procwisemvp"))
 DEFAULT_PREFIX = os.getenv("EMAIL_INGEST_PREFIX", "emails/")
-THREAD_TABLE = os.getenv("EMAIL_THREAD_TABLE", os.getenv("DDB_TABLE", "procwise_outbound_emails"))
+THREAD_TABLE = sanitise_thread_table_name(
+    os.getenv("EMAIL_THREAD_TABLE", os.getenv("DDB_TABLE", DEFAULT_THREAD_TABLE)),
+    logger=logger,
+)
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
@@ -53,7 +62,7 @@ _RAW_SUPPLIER_OBJECT_TABLE = os.getenv(
 )
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
 _S3_CLIENT = None
-_DDB_TABLE = None
+_THREAD_TABLE_READY = False
 _DB_CONNECTION = None
 _SUPPLIER_TABLE_INITIALISED = False
 _SUPPLIER_OBJECT_TABLE_INITIALISED = False
@@ -85,16 +94,6 @@ def _get_s3_client():
     if _S3_CLIENT is None:
         _S3_CLIENT = boto3.client("s3", config=_BOTO_CONFIG)
     return _S3_CLIENT
-
-
-def _get_thread_table():
-    global _DDB_TABLE
-    if _DDB_TABLE is None:
-        resource = boto3.resource("dynamodb", config=_BOTO_CONFIG)
-        _DDB_TABLE = resource.Table(THREAD_TABLE)
-    return _DDB_TABLE
-
-
 def _get_db_connection():
     global _DB_CONNECTION
     if _DB_CONNECTION is not None:
@@ -225,6 +224,19 @@ def _collect_headers(message) -> Dict[str, List[str]]:
         headers.setdefault(key, []).append(decoded)
     return headers
 
+def _ensure_thread_table(conn) -> bool:
+    global _THREAD_TABLE_READY
+    if conn is None or _THREAD_TABLE_READY:
+        return conn is not None and _THREAD_TABLE_READY
+
+    try:
+        ensure_thread_table(conn, THREAD_TABLE, logger=logger)
+        _THREAD_TABLE_READY = True
+        return True
+    except Exception:  # pragma: no cover - logging only
+        logger.exception("Failed to ensure email thread mapping table %s", THREAD_TABLE)
+        return False
+
 
 def _decode_header(value: Optional[str]) -> str:
     if not value:
@@ -260,19 +272,20 @@ def _lookup_rfq_from_thread(in_reply_to: Optional[str], references: Optional[str
     if not candidates:
         return None
 
-    table = _get_thread_table()
-    for candidate in candidates:
-        key = candidate.strip()
-        if not key:
-            continue
-        try:
-            result = table.get_item(Key={"message_id": key})
-        except ClientError:  # pragma: no cover - propagation would retry via SQS
-            logger.exception("Failed to query thread map for message %s", key)
-            continue
-        item = result.get("Item") if isinstance(result, dict) else None
-        if item and item.get("rfq_id"):
-            return str(item["rfq_id"]).upper()
+    conn = _get_db_connection()
+    if conn is None:
+        return None
+
+    if not _ensure_thread_table(conn):
+        return None
+
+    keys = [candidate.strip() for candidate in candidates if candidate.strip()]
+    if not keys:
+        return None
+
+    rfq_id = lookup_rfq_from_threads(conn, THREAD_TABLE, keys, logger=logger)
+    if rfq_id:
+        return rfq_id
     return None
 
 
