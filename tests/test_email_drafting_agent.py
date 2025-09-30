@@ -192,6 +192,22 @@ def test_execute_falls_back_to_prompt(monkeypatch):
     assert result.data["drafts"][0]["subject"] == "Follow-up"
 
 
+def test_execute_prompt_payload_skips_decision_fallback(monkeypatch):
+    def fake_chat(model, system, user, **kwargs):
+        assert system != module.SYSTEM_COMPOSE, "prompt payload should not use decision pathway"
+        return "Subject: Follow-up\nBody"
+
+    monkeypatch.setattr(module, "_chat", fake_chat)
+
+    agent = EmailDraftingAgent()
+    context = _make_context({"prompt": "Prompt only flow", "rfq_id": "RFQ-XYZ"})
+
+    result = agent.execute(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.data["drafts"][0]["subject"] == "Follow-up"
+
+
 def test_execute_infers_recipients_and_counter_price(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody")
 

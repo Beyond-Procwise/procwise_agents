@@ -514,9 +514,46 @@ class EmailDraftingAgent:
                     _append(entry.get("decision"))
 
         # Fallback: treat the full payload as a decision when it resembles the
-        # negotiation agent's pass-through structure.
+        # negotiation agent's pass-through structure.  Avoid hijacking prompt
+        # payloads that rely on :meth:`from_prompt` by requiring a decision
+        # signal and no prompt-style keys.
         if not decisions and isinstance(payload, dict):
-            _append(payload)
+            prompt_like_keys = ("prompt", "prompts", "email_prompt")
+            has_prompt_signal = any(
+                key in payload and payload.get(key)
+                for key in prompt_like_keys
+            )
+
+            decision_hint_keys = {
+                "to",
+                "cc",
+                "recipients",
+                "supplier_id",
+                "supplier_name",
+                "strategy",
+                "current_offer",
+                "counter_price",
+                "counter_proposals",
+                "lead_time_weeks",
+                "lead_time_request",
+                "target_price",
+                "asks",
+                "rationale",
+                "decision_log",
+                "notes",
+                "thread",
+                "round",
+                "currency",
+                "recipient",
+                "recipient_email",
+                "supplier_email",
+            }
+            has_decision_signal = bool(payload.get("rfq_id")) or any(
+                key in payload for key in decision_hint_keys
+            )
+
+            if has_decision_signal and not has_prompt_signal:
+                _append(payload)
 
         return decisions
 
