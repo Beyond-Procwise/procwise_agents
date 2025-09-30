@@ -3,11 +3,13 @@ import logging
 import smtplib
 import ssl
 import time
-from typing import Iterable, List, Optional, Tuple, Union
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
+from dataclasses import dataclass
 from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import boto3
 from botocore.exceptions import ClientError
@@ -18,6 +20,15 @@ from .email_credentials_manager import (
     CredentialsRotationError,
     SESSMTPAccessManager,
 )
+
+
+@dataclass
+class EmailSendResult:
+    """Outcome of an SES SMTP send attempt."""
+
+    success: bool
+    message_id: Optional[str] = None
+
 
 configure_gpu()
 
@@ -48,11 +59,16 @@ class EmailService:
         recipients: Union[str, Iterable[str]],
         sender: str,
         attachments: Optional[List[Tuple[bytes, str]]] = None,
-    ) -> bool:
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        message_id: Optional[str] = None,
+    ) -> EmailSendResult:
         """Send an email using SMTP credentials configured in settings.
 
         Attachments should be provided as a list of ``(content, filename)`` tuples.
-        Returns True on success, False otherwise.
+        ``headers`` allows callers to inject additional RFC-2822 headers such as
+        ``X-Procwise-RFQ-ID`` while ``message_id`` can be provided to guarantee a
+        stable value across retries.
         """
 
         msg = MIMEMultipart()
@@ -64,6 +80,15 @@ class EmailService:
             recipient_list = list(recipients)
         msg["To"] = ", ".join(recipient_list)
         msg.attach(MIMEText(body, "html"))
+
+        generated_message_id = message_id or make_msgid(domain=self._infer_domain(sender))
+        msg["Message-ID"] = generated_message_id
+        msg["Date"] = formatdate(localtime=True)
+
+        if headers:
+            for key, value in headers.items():
+                if key and value is not None:
+                    msg[str(key)] = str(value)
 
         if attachments:
             for content, filename in attachments:
@@ -80,7 +105,7 @@ class EmailService:
             smtp_username, smtp_password = self._fetch_smtp_credentials()
         except Exception as exc:
             self.logger.error("Unable to retrieve SMTP credentials: %s", exc)
-            return False
+            return EmailSendResult(False, generated_message_id)
 
         message_payload = msg.as_string()
 
@@ -89,7 +114,7 @@ class EmailService:
                 message_payload, sender, recipient_list, smtp_username, smtp_password
             )
 
-            return True
+            return EmailSendResult(True, generated_message_id)
         except smtplib.SMTPAuthenticationError as auth_exc:
             self.logger.warning(
                 "SMTP authentication failed with current credentials; attempting fallback",
@@ -103,11 +128,12 @@ class EmailService:
                 self.logger.error(
                     "Unable to retrieve fallback SMTP credentials: %s", fallback_exc
                 )
-                return self._attempt_rotation_and_resend(
+                success = self._attempt_rotation_and_resend(
                     message_payload,
                     sender,
                     recipient_list,
                 )
+                return EmailSendResult(success, generated_message_id)
 
             try:
                 self._deliver_via_smtp(
@@ -117,23 +143,24 @@ class EmailService:
                     fallback_username,
                     fallback_password,
                 )
-                return True
+                return EmailSendResult(True, generated_message_id)
             except smtplib.SMTPAuthenticationError as fallback_auth_exc:
                 self.logger.error(
                     "Fallback SES SMTP credentials failed authentication: %s",
                     fallback_auth_exc,
                 )
-                return self._attempt_rotation_and_resend(
+                success = self._attempt_rotation_and_resend(
                     message_payload,
                     sender,
                     recipient_list,
                 )
+                return EmailSendResult(success, generated_message_id)
             except Exception as fallback_exc:  # pragma: no cover - defensive
                 self.logger.error("Email send failed: %s", fallback_exc)
-                return False
+                return EmailSendResult(False, generated_message_id)
         except Exception as exc:  # pragma: no cover - network/runtime
             self.logger.error("Email send failed: %s", exc)
-            return False
+            return EmailSendResult(False, generated_message_id)
 
     def _attempt_rotation_and_resend(
         self,
@@ -323,6 +350,17 @@ class EmailService:
             return default
 
         return coerced if coerced >= minimum else minimum
+
+    @staticmethod
+    def _infer_domain(sender: str) -> Optional[str]:
+        """Best-effort extraction of the sender's domain for Message-ID generation."""
+
+        if not sender:
+            return None
+        if "@" not in sender:
+            return None
+        domain = sender.split("@", 1)[-1].strip()
+        return domain or None
 
     def _secrets_manager_client(self, region: str):
         """Create a Secrets Manager client, assuming a role when configured."""

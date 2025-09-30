@@ -18,7 +18,6 @@ from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
 from services.email_dispatch_service import EmailDispatchService
-from services.email_watcher import SESEmailWatcher
 
 # Ensure GPU-related environment variables are set
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -28,40 +27,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Dependency helpers
-# ---------------------------------------------------------------------------
-
-def ensure_email_watcher(agent_nick):
-    """Initialise the SES email watcher lazily after dispatch starts."""
-
-    watcher = getattr(agent_nick, "email_watcher", None)
-    if watcher is not None:
-        return watcher
-
-    if not hasattr(agent_nick, "agents") or not hasattr(agent_nick, "settings"):
-        logger.debug(
-            "AgentNick lacks full context for email watcher initialisation; skipping."
-        )
-        return None
-
-    registry = getattr(agent_nick, "agents", {}) or {}
-    get_agent = getattr(registry, "get", lambda key, default=None: default)
-    supplier_agent = get_agent("supplier_interaction") or get_agent(
-        "SupplierInteractionAgent"
-    )
-    negotiation_agent = get_agent("negotiation") or get_agent("NegotiationAgent")
-
-    watcher = SESEmailWatcher(
-        agent_nick,
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-    )
-    setattr(agent_nick, "email_watcher", watcher)
-    return watcher
-
 def get_orchestrator(request: Request) -> Orchestrator:
     orchestrator = getattr(request.app.state, "orchestrator", None)
     if not orchestrator:
@@ -481,11 +446,6 @@ async def send_email(
         dispatch_timestamp = time.time()
         setattr(agent_nick, "dispatch_service_started", True)
         setattr(agent_nick, "email_dispatch_last_sent_at", dispatch_timestamp)
-        watcher = ensure_email_watcher(agent_nick)
-        if watcher is not None:
-            record_dispatch = getattr(watcher, "record_dispatch_timestamp", None)
-            if callable(record_dispatch):
-                record_dispatch(dispatch_timestamp)
 
         prs.log_action(
             process_id=process_id,

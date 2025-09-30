@@ -213,6 +213,38 @@ def test_process_record_persists_metadata(monkeypatch, stub_upsert):
     assert metadata["received_at"].isoformat().startswith("2025-02-03T10:00:00")
 
 
+def test_process_record_skips_known_objects(monkeypatch):
+    bucket = "procwisemvp"
+    key = "emails/duplicate-object"
+
+    class _FailingClient:
+        def get_object(self, *args, **kwargs):  # pragma: no cover - should not run
+            raise AssertionError("get_object should not be invoked for duplicates")
+
+    ingest._S3_CLIENT = _FailingClient()
+
+    def fake_lookup(connection, bucket_name, object_key, etag):
+        assert bucket_name == bucket
+        assert object_key == key
+        assert etag == "abc123"
+        return {"rfq_id": "RFQ-20240101-ABC12345", "message_id": "<id@example>"}
+
+    monkeypatch.setattr(ingest, "_lookup_processed_object", fake_lookup)
+
+    record = {
+        "s3": {
+            "bucket": {"name": bucket},
+            "object": {"key": key, "eTag": "\"abc123\""},
+        }
+    }
+
+    result = ingest.process_record(record)
+
+    assert result["status"] == "duplicate"
+    assert result["rfq_id"] == "RFQ-20240101-ABC12345"
+    assert result["metadata"]["message_id"] == "<id@example>"
+
+
 @pytest.fixture(autouse=True)
 def reset_clients():
     yield
@@ -220,6 +252,7 @@ def reset_clients():
     ingest._DDB_TABLE = None
     ingest._DB_CONNECTION = None
     ingest._SUPPLIER_TABLE_INITIALISED = False
+    ingest._SUPPLIER_OBJECT_TABLE_INITIALISED = False
     while _ACTIVE_STUBBERS:
         stub = _ACTIVE_STUBBERS.pop()
         stub.deactivate()

@@ -48,11 +48,15 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT", "5432")
 _RAW_SUPPLIER_REPLY_TABLE = os.getenv("SUPPLIER_REPLY_TABLE", "proc.supplier_replies")
+_RAW_SUPPLIER_OBJECT_TABLE = os.getenv(
+    "SUPPLIER_REPLY_OBJECT_TABLE", "proc.supplier_reply_objects"
+)
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
 _S3_CLIENT = None
 _DDB_TABLE = None
 _DB_CONNECTION = None
 _SUPPLIER_TABLE_INITIALISED = False
+_SUPPLIER_OBJECT_TABLE_INITIALISED = False
 
 RFQ_SUBJECT_RE = re.compile(r"\bRFQ[-_](\d{8})[-_]?([A-Za-z0-9\-]+)", re.IGNORECASE)
 RFQ_HTML_COMMENT_RE = re.compile(r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->", re.IGNORECASE)
@@ -73,6 +77,7 @@ def _sanitise_table_name(name: Optional[str]) -> str:
 
 
 SUPPLIER_REPLY_TABLE = _sanitise_table_name(_RAW_SUPPLIER_REPLY_TABLE)
+SUPPLIER_REPLY_OBJECT_TABLE = _sanitise_table_name(_RAW_SUPPLIER_OBJECT_TABLE)
 
 
 def _get_s3_client():
@@ -154,6 +159,39 @@ def _ensure_supplier_reply_table(connection) -> None:
         _SUPPLIER_TABLE_INITIALISED = True
     except Exception:
         logger.exception("Failed to ensure supplier reply table %s", SUPPLIER_REPLY_TABLE)
+
+
+def _ensure_supplier_reply_object_table(connection) -> None:
+    global _SUPPLIER_OBJECT_TABLE_INITIALISED
+    if _SUPPLIER_OBJECT_TABLE_INITIALISED or connection is None:
+        return
+
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS {SUPPLIER_REPLY_OBJECT_TABLE} (
+            bucket TEXT NOT NULL,
+            object_key TEXT NOT NULL,
+            etag TEXT NOT NULL,
+            rfq_id TEXT,
+            message_id TEXT,
+            processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (bucket, object_key, etag)
+        )
+    """
+    index_sql = (
+        f"CREATE INDEX IF NOT EXISTS {SUPPLIER_REPLY_OBJECT_TABLE.replace('.', '_')}_key_idx "
+        f"ON {SUPPLIER_REPLY_OBJECT_TABLE} (object_key)"
+    )
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(ddl)
+            cursor.execute(index_sql)
+        _SUPPLIER_OBJECT_TABLE_INITIALISED = True
+    except Exception:
+        logger.exception(
+            "Failed to ensure supplier reply object table %s",
+            SUPPLIER_REPLY_OBJECT_TABLE,
+        )
 
 
 def _parse_received_at(date_header: Optional[str]) -> Optional[datetime]:
@@ -371,6 +409,67 @@ def _upsert_supplier_reply(rfq_id: str, metadata: Dict[str, object]) -> None:
         logger.exception("Failed to upsert supplier reply for RFQ %s", rfq_id)
 
 
+def _register_processed_object(
+    connection,
+    bucket: str,
+    key: str,
+    etag: Optional[str],
+    *,
+    rfq_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+) -> None:
+    if connection is None or not (bucket and key and etag):
+        return
+
+    _ensure_supplier_reply_object_table(connection)
+
+    sql = f"""
+        INSERT INTO {SUPPLIER_REPLY_OBJECT_TABLE} (
+            bucket, object_key, etag, rfq_id, message_id
+        )
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (bucket, key, etag, rfq_id, message_id))
+    except Exception:
+        logger.exception(
+            "Failed to register processed object %s/%s (etag=%s)", bucket, key, etag
+        )
+
+
+def _lookup_processed_object(connection, bucket: str, key: str, etag: Optional[str]) -> Optional[Dict[str, object]]:
+    if connection is None or not (bucket and key and etag):
+        return None
+
+    _ensure_supplier_reply_object_table(connection)
+
+    sql = f"""
+        SELECT rfq_id, message_id
+        FROM {SUPPLIER_REPLY_OBJECT_TABLE}
+        WHERE bucket = %s AND object_key = %s AND etag = %s
+        LIMIT 1
+    """
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (bucket, key, etag))
+            row = cursor.fetchone()
+    except Exception:
+        logger.exception(
+            "Failed to check processed state for %s/%s (etag=%s)", bucket, key, etag
+        )
+        return None
+
+    if not row:
+        return None
+
+    rfq_id, message_id = row
+    return {"rfq_id": rfq_id, "message_id": message_id}
+
+
 def _tag_object(s3_client, bucket: str, key: str, rfq_id: str) -> None:
     s3_client.put_object_tagging(
         Bucket=bucket,
@@ -413,9 +512,30 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
         raise ValueError("Invalid S3 event record: missing bucket or key")
 
     decoded_key = unquote_plus(str(key))
+    raw_etag = record.get("s3", {}).get("object", {}).get("eTag")
+    if not raw_etag:
+        raw_etag = record.get("s3", {}).get("object", {}).get("etag")
+    etag = str(raw_etag).strip('"') if raw_etag else None
+
+    connection = _get_db_connection()
+    existing = _lookup_processed_object(connection, bucket, decoded_key, etag)
+    if existing:
+        logger.info(
+            "Skipping already processed object %s/%s (etag=%s)", bucket, decoded_key, etag
+        )
+        return {
+            "rfq_id": existing.get("rfq_id"),
+            "s3_key": decoded_key,
+            "status": "duplicate",
+            "metadata": {"message_id": existing.get("message_id")},
+        }
+
     response = s3_client.get_object(Bucket=bucket, Key=decoded_key)
     body = response["Body"].read()
     message = message_from_bytes(body)
+    if not etag:
+        response_etag = response.get("ETag")
+        etag = str(response_etag).strip('"') if response_etag else None
 
     metadata = _build_reply_metadata(message, bucket, decoded_key)
     subject = metadata.get("subject") or ""
@@ -433,6 +553,14 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
         metadata["s3_key"] = dest_key
         logger.info("Tagged S3 object %s/%s with RFQ %s", bucket, decoded_key, rfq_id)
         _upsert_supplier_reply(rfq_id, metadata)
+        _register_processed_object(
+            connection,
+            bucket,
+            decoded_key,
+            etag,
+            rfq_id=rfq_id,
+            message_id=metadata.get("message_id"),
+        )
         return {
             "rfq_id": rfq_id,
             "s3_key": dest_key,
@@ -450,6 +578,14 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
 
     dest_key = _move_to_unmatched(s3_client, bucket, decoded_key)
     logger.warning("Unable to resolve RFQ for %s/%s; moved to %s", bucket, decoded_key, dest_key)
+    _register_processed_object(
+        connection,
+        bucket,
+        decoded_key,
+        etag,
+        rfq_id=None,
+        message_id=metadata.get("message_id"),
+    )
     return {
         "rfq_id": None,
         "s3_key": dest_key,
