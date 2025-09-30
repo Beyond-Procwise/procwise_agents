@@ -1,6 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any, Dict
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
@@ -28,65 +29,76 @@ class DummyNick:
         self.ollama_options = lambda: {}
         self.qdrant_client = SimpleNamespace()
         self.embedding_model = SimpleNamespace(encode=lambda x: [0.0])
+
         def get_db_connection():
             class DummyConn:
-                def __enter__(self): return self
-                def __exit__(self, *args): pass
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
                 def cursor(self):
                     class DummyCursor:
-                        def __enter__(self): return self
-                        def __exit__(self, *args): pass
-                        def execute(self, *args, **kwargs): pass
-                        def fetchone(self): return None
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *args):
+                            pass
+
+                        def execute(self, *args, **kwargs):
+                            pass
+
+                        def fetchone(self):
+                            return None
+
+                        def fetchall(self):
+                            return []
+
                     return DummyCursor()
+
+                def commit(self):
+                    pass
+
             return DummyConn()
+
         self.get_db_connection = get_db_connection
 
 
-
-def test_negotiation_agent_handles_missing_fields():
+def test_negotiation_agent_handles_missing_fields(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
+
+    monkeypatch.setattr(
+        agent,
+        "call_ollama",
+        lambda **_: {"message": {"content": "Please share the quote details."}},
+    )
+
     context = AgentContext(
         workflow_id="wf1",
         agent_id="negotiation",
         user_id="u1",
         input_data={},
     )
+
     output = agent.run(context)
+
     assert output.status == AgentStatus.SUCCESS
     assert output.data["counter_proposals"] == []
+    assert output.data["decision"]["strategy"] == "clarify"
+    assert "quote details" in output.data["message"].lower()
 
 
-def test_negotiation_agent_builds_contextual_prompt(monkeypatch):
+def test_negotiation_agent_composes_counter(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    supplier_context = {
-        "profile": {
-            "supplier_name": "Acme Parts",
-            "default_currency": "GBP",
-            "risk_score": "Low",
-            "delivery_lead_time_days": "5",
-            "is_preferred_supplier": True,
-        },
-        "spend": {"total_amount": 120000.0, "po_count": 12},
-        "contracts": [
-            {
-                "contract_id": "CO0001",
-                "contract_end_date": None,
-                "total_contract_value": 250000.0,
-            }
-        ],
-    }
-
-    monkeypatch.setattr(agent, "_load_supplier_context", lambda *args, **kwargs: supplier_context)
-
-    def fake_call(**kwargs):
-        captured["prompt"] = kwargs.get("prompt")
-        return {"response": "Revised counter proposal."}
+    def fake_call(model=None, messages=None, **kwargs):
+        captured.setdefault("calls", []).append({"model": model, "messages": messages})
+        return {"message": {"content": "Email body"}}
 
     monkeypatch.setattr(agent, "call_ollama", fake_call)
 
@@ -96,36 +108,39 @@ def test_negotiation_agent_builds_contextual_prompt(monkeypatch):
         user_id="tester",
         input_data={
             "supplier": "S1",
-            "current_offer": 1500.0,
+            "current_offer": 1300.0,
             "target_price": 1200.0,
             "rfq_id": "RFQ-123",
             "round": 1,
-            "item_id": "ITEM-1",
-            "benchmark_price": 1150.0,
+            "currency": "USD",
+            "lead_time_weeks": 4,
+            "supplier_snippets": ["We can ship in four weeks."],
         },
     )
 
     output = agent.run(context)
-    prompt = captured.get("prompt", "")
 
-    assert "Acme Parts" in prompt
-    assert "Historic purchase orders total" in prompt
-    assert "risk rating" in prompt.lower()
-    assert output.data["message"] == "Revised counter proposal."
+    assert output.data["decision"]["strategy"] == "midpoint"
+    assert output.data["decision"]["counter_price"] == 1250.0
+    assert output.data["message"] == "Email body"
+
+    first_call = captured["calls"][0]
+    assert first_call["model"] == "llama3.2"
+    user_prompt = first_call["messages"][1]["content"]
+    assert "RFQ-123" in user_prompt
+    assert "decision" in user_prompt
+    assert "We can ship in four weeks." in user_prompt
 
 
-def test_negotiation_agent_generates_fallback_message(monkeypatch):
+def test_negotiation_agent_uses_fallback_email(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
 
-    supplier_context = {
-        "profile": {"supplier_name": "Omega", "default_currency": "USD"},
-        "spend": {"total_amount": 54000.0},
-        "contracts": [],
-    }
-
-    monkeypatch.setattr(agent, "_load_supplier_context", lambda *args, **kwargs: supplier_context)
-    monkeypatch.setattr(agent, "call_ollama", lambda **_: {"response": ""})
+    monkeypatch.setattr(
+        agent,
+        "call_ollama",
+        lambda **_: {"message": {"content": ""}},
+    )
 
     context = AgentContext(
         workflow_id="wf3",
@@ -133,17 +148,15 @@ def test_negotiation_agent_generates_fallback_message(monkeypatch):
         user_id="tester",
         input_data={
             "supplier": "S2",
-            "current_offer": 1800.0,
+            "current_offer": 2000.0,
             "target_price": 1500.0,
             "rfq_id": "RFQ-789",
-            "round": 2,
-            "item_id": "COMP-5",
+            "currency": "GBP",
         },
     )
 
     output = agent.run(context)
     message = output.data["message"]
 
-    assert "pricing closer" in message
-    assert "Historic collaboration" in message
-    assert output.data["decision_log"].startswith("Targeting 1500.0 against current offer")
+    assert "align on pricing" in message.lower()
+    assert "rfq RFQ-789".lower() in message.lower()
