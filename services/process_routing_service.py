@@ -881,7 +881,7 @@ class ProcessRoutingService:
             )
             return
 
-        agents = details.get("agents", [])
+        agents = [a for a in details.get("agents", []) if isinstance(a, dict)]
         order = [a.get("agent") for a in agents]
         if agent_name not in order:
             logger.warning(
@@ -889,13 +889,39 @@ class ProcessRoutingService:
             )
             return
         idx = order.index(agent_name)
-        for prev in agents[:idx]:
-            # Allow downstream agents to start once predecessors have at least
-            # begun execution. Only agents still in the ``saved`` state are
-            # considered incomplete for ordering purposes.
-            if prev.get("status") == "saved":
+
+        dependency_keys = ("onSuccess", "onFailure", "onCompletion")
+        agent_lookup = {a.get("agent"): a for a in agents if a.get("agent")}
+
+        target = agent_lookup.get(agent_name, {})
+        target_deps = target.get("dependencies") or {}
+
+        blocking_agents: set[str] = set()
+        for key in dependency_keys:
+            for dep_name in target_deps.get(key, []) or []:
+                if dep_name:
+                    blocking_agents.add(dep_name)
+
+        if not blocking_agents:
+            # If the workflow does not define any dependency metadata, retain
+            # the previous sequential guard as a conservative fallback.
+            has_dependency_metadata = any(
+                (agent.get("dependencies") or {}).get(key)
+                for agent in agents
+                for key in dependency_keys
+            )
+            if not has_dependency_metadata:
+                blocking_agents.update(
+                    a.get("agent")
+                    for a in agents[:idx]
+                    if a.get("agent") and a.get("agent") != agent_name
+                )
+
+        for dep_name in blocking_agents:
+            dependent = agent_lookup.get(dep_name)
+            if dependent and dependent.get("status") == "saved":
                 raise ValueError(
-                    f"Cannot update {agent_name} before {prev.get('agent')} starts"
+                    f"Cannot update {agent_name} before {dep_name} starts"
                 )
         agents[idx]["status"] = status
 

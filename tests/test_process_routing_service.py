@@ -576,7 +576,7 @@ def test_update_agent_status_enforces_sequence():
         "status": "saved",
         "agents": [
             {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "1"},
-            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+            {"agent": "A2", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
         ],
     }
     conn = DummyConn()
@@ -595,7 +595,7 @@ def test_update_agent_status_allows_when_previous_started():
         "status": "saved",
         "agents": [
             {"agent": "A1", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "validated", "agent_ref_id": "1"},
-            {"agent": "A2", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
+            {"agent": "A2", "dependencies": {"onSuccess": ["A1"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "2"},
         ],
     }
     conn = DummyConn()
@@ -608,6 +608,30 @@ def test_update_agent_status_allows_when_previous_started():
     prs.update_agent_status(1, "A2", "validated")
     updated = json.loads(conn.cursor_obj.params[0])
     assert updated["agents"][1]["status"] == "validated"
+
+
+def test_update_agent_status_ignores_unrelated_predecessors():
+    initial = {
+        "status": "running",
+        "agents": [
+            {"agent": "Root", "dependencies": {"onSuccess": [], "onFailure": [], "onCompletion": []}, "status": "failed", "agent_ref_id": "root"},
+            {"agent": "SuccessBranch", "dependencies": {"onSuccess": ["Root"], "onFailure": [], "onCompletion": []}, "status": "saved", "agent_ref_id": "success"},
+            {"agent": "FailureBranch", "dependencies": {"onSuccess": [], "onFailure": ["Root"], "onCompletion": []}, "status": "saved", "agent_ref_id": "failure"},
+        ],
+    }
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    prs.get_process_details = lambda pid, **kwargs: initial
+
+    prs.update_agent_status(1, "FailureBranch", "validated")
+    params = conn.cursor_obj.params
+    assert params[0] == -1
+    updated = json.loads(params[1])
+    assert updated["agents"][2]["status"] == "validated"
 
 
 def test_update_process_status_updates_process_details():
