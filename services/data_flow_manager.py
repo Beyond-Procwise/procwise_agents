@@ -270,6 +270,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
         "tables": {
             "proc.rfq_targets",
             "proc.negotiation_sessions",
+            "proc.negotiation_session_state",
             "proc.purchase_order_agent",
             "proc.quote_agent",
         },
@@ -283,6 +284,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
         "tables": {
             "proc.rfq_targets",
             "proc.negotiation_sessions",
+            "proc.negotiation_session_state",
             "proc.purchase_order_agent",
             "proc.invoice_agent",
         },

@@ -386,6 +386,22 @@ rfq_id text NOT NULL,
     CONSTRAINT negotiation_sessions_pk PRIMARY KEY (rfq_id, supplier_id, round)
 ```
 
+### `proc.negotiation_session_state`
+```
+rfq_id text NOT NULL,
+    supplier_id text NOT NULL,
+    supplier_reply_count integer NOT NULL DEFAULT 0,
+    current_round integer NOT NULL DEFAULT 1,
+    status text NOT NULL DEFAULT 'ACTIVE',
+    awaiting_response boolean NOT NULL DEFAULT false,
+    last_supplier_msg_id text,
+    last_agent_msg_id text,
+    last_email_sent_at timestamp with time zone,
+    updated_on timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT negotiation_session_state_pk PRIMARY KEY (rfq_id, supplier_id)
+```
+Tracks supplier reply counts and awaiting-response status for each negotiation session.
+
 ### `proc.email_thread_map`
 ```
 message_id text PRIMARY KEY,
