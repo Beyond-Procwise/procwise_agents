@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 from datetime import datetime
@@ -669,7 +670,7 @@ def test_missing_workflow_blocks_detection(monkeypatch):
         workflow_id="wf-missing",
         agent_id="opportunity_miner",
         user_id="tester",
-        input_data={"conditions": {}},
+        input_data={"conditions": {"actual_price": 1.0}},
     )
 
     output = agent.run(context)
@@ -1336,3 +1337,67 @@ def test_registry_matches_numeric_policy_identifiers_without_catalog():
     assert second_entry["policy_id"] == "oppfinderpolicy_003_volume_consolidation"
     assert second_entry["policy_slug"] == "volume_consolidation_check"
     assert len(provided) == 2
+
+def test_opportunity_miner_resolves_supplier_from_db(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    draft_calls = {"count": 0}
+
+    def fake_lookup(rfq_id):
+        draft_calls["count"] += 1
+        return "SUP-DB"
+
+    monkeypatch.setattr(agent, "_lookup_supplier_from_drafts", fake_lookup)
+    monkeypatch.setattr(agent, "_lookup_supplier_from_processed", lambda rfq: None)
+
+    def boom_ingest():
+        raise RuntimeError("ingest stop")
+
+    monkeypatch.setattr(agent, "_ingest_data", boom_ingest)
+
+    context = AgentContext(
+        workflow_id="wf1",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={"rfq_id": "RFQ-20240101-XYZ", "conditions": {}},
+    )
+
+    output = agent.run(context)
+
+    assert draft_calls["count"] == 1
+    assert context.input_data["supplier_id"] == "SUP-DB"
+    assert output.status == AgentStatus.FAILED
+    assert "skipped" not in output.data
+    assert output.error == "ingest stop"
+
+
+def test_opportunity_miner_skips_without_supplier(monkeypatch, caplog):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    monkeypatch.setattr(agent, "_lookup_supplier_from_drafts", lambda rfq: None)
+    monkeypatch.setattr(agent, "_lookup_supplier_from_processed", lambda rfq: None)
+
+    ingest_called = {"value": False}
+
+    def mark_ingest():
+        ingest_called["value"] = True
+        return {}
+
+    monkeypatch.setattr(agent, "_ingest_data", mark_ingest)
+
+    context = AgentContext(
+        workflow_id="wf-skip",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={"rfq_id": "RFQ-20240101-MISS"},
+    )
+
+    with caplog.at_level(logging.INFO):
+        output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data == {"skipped": True, "reason": "missing_supplier_id"}
+    assert ingest_called["value"] is False
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)

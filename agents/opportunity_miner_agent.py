@@ -1146,6 +1146,35 @@ class OpportunityMinerAgent(BaseAgent):
     def process(self, context: AgentContext) -> AgentOutput:
         try:
             input_data = context.input_data or {}
+            conditions = input_data.get("conditions")
+            if not isinstance(conditions, dict):
+                conditions = {}
+                input_data["conditions"] = conditions
+
+            resolved_supplier = self._resolve_supplier_id(
+                input_data.get("supplier_id"), event=input_data
+            )
+            if resolved_supplier:
+                input_data["supplier_id"] = resolved_supplier
+                self._assign_condition(
+                    conditions, "supplier_id", resolved_supplier, override=True
+                )
+            else:
+                has_condition_values = any(
+                    self._is_condition_value(value)
+                    for key, value in conditions.items()
+                    if key not in {"rfq_id"}
+                )
+                policies = input_data.get("policies")
+                has_policies = isinstance(policies, (list, tuple)) and any(policies)
+                if not has_condition_values and not has_policies:
+                    logger.info(
+                        "OpportunityMinerAgent skipping run due to missing supplier identifier"
+                    )
+                    return AgentOutput(
+                        status=AgentStatus.SUCCESS,
+                        data={"skipped": True, "reason": "missing_supplier_id"},
+                    )
             input_keys = sorted(input_data.keys()) if isinstance(input_data, dict) else []
             preview = ", ".join(input_keys[:5]) if input_keys else "none"
             if len(input_keys) > 5:
@@ -2909,7 +2938,13 @@ class OpportunityMinerAgent(BaseAgent):
 
         return default
 
-    def _resolve_supplier_id(self, supplier_id: Optional[Any]) -> Optional[str]:
+    def _resolve_supplier_id(
+        self, supplier_id: Optional[Any], *, event: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        if event is not None:
+            resolved_from_event = self._resolve_supplier_from_event(event, supplier_id)
+            if resolved_from_event:
+                return resolved_from_event
         if supplier_id is None:
             return None
         raw_text = str(supplier_id).strip()
@@ -2971,6 +3006,186 @@ class OpportunityMinerAgent(BaseAgent):
                 return resolved
 
         logger.debug("Supplier %s not found in master data; skipping", supplier)
+        return None
+
+    def _resolve_supplier_from_event(
+        self, payload: Dict[str, Any], supplier_value: Optional[Any] = None
+    ) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        conditions = payload.get("conditions")
+        if not isinstance(conditions, dict):
+            conditions = {}
+            payload["conditions"] = conditions
+
+        def _commit(resolved: Optional[str]) -> Optional[str]:
+            if not resolved:
+                return None
+            self._assign_condition(conditions, "supplier_id", resolved, override=True)
+            payload["supplier_id"] = resolved
+            return resolved
+
+        if self._is_condition_value(supplier_value):
+            direct = self._resolve_supplier_id(supplier_value)
+            if direct:
+                return _commit(direct)
+
+        candidate = self._resolve_condition_value(conditions, "supplier_id")
+        if self._is_condition_value(candidate):
+            resolved = self._resolve_supplier_id(candidate)
+            if resolved:
+                return _commit(resolved)
+
+        candidate = self._resolve_condition_value(payload, "supplier_id")
+        if self._is_condition_value(candidate):
+            resolved = self._resolve_supplier_id(candidate)
+            if resolved:
+                return _commit(resolved)
+
+        rfq_candidate = self._resolve_condition_value(conditions, "rfq_id") or payload.get(
+            "rfq_id"
+        )
+        rfq_id = self._normalise_identifier(rfq_candidate)
+        if rfq_id:
+            resolved = self._lookup_supplier_from_drafts(rfq_id)
+            if resolved:
+                return _commit(resolved)
+            resolved = self._lookup_supplier_from_processed(rfq_id)
+            if resolved:
+                return _commit(resolved)
+
+        for key in ("from_address", "supplier_email", "email", "contact_email"):
+            candidate = self._resolve_condition_value(conditions, key)
+            if not self._is_condition_value(candidate):
+                candidate = payload.get(key)
+            if self._is_condition_value(candidate):
+                resolved = self._resolve_supplier_id(candidate)
+                if resolved:
+                    return _commit(resolved)
+
+        policies = payload.get("policies")
+        if isinstance(policies, (list, tuple)):
+            for policy in policies:
+                if not isinstance(policy, dict):
+                    continue
+                candidate = self._resolve_condition_value(policy, "supplier_id")
+                if not self._is_condition_value(candidate):
+                    candidate = self._resolve_condition_value(
+                        policy.get("conditions"), "supplier_id"
+                    )
+                if self._is_condition_value(candidate):
+                    resolved = self._resolve_supplier_id(candidate)
+                    if resolved:
+                        return _commit(resolved)
+
+        return None
+
+    def _lookup_supplier_from_drafts(self, rfq_id: str) -> Optional[str]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT supplier_id
+                        FROM proc.draft_rfq_emails
+                        WHERE rfq_id = %s
+                        ORDER BY created_on DESC
+                        LIMIT 1
+                        """,
+                        (rfq_id,),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        resolved = self._resolve_supplier_id(row[0])
+                        if resolved:
+                            return resolved
+        except Exception:
+            logger.debug(
+                "Supplier draft lookup failed for RFQ %s", rfq_id, exc_info=True
+            )
+        return None
+
+    def _lookup_supplier_from_processed(self, rfq_id: str) -> Optional[str]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT key
+                        FROM proc.processed_emails
+                        WHERE rfq_id = %s
+                        ORDER BY processed_at DESC
+                        LIMIT 1
+                        """,
+                        (rfq_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    key = row[0]
+
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(
+                            """
+                            SELECT supplier_id
+                            FROM proc.email_thread_map
+                            WHERE rfq_id = %s
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (rfq_id,),
+                        )
+                        thread_row = cur.fetchone()
+                    except Exception:
+                        conn.rollback()
+                        thread_row = None
+
+                    if thread_row and thread_row[0]:
+                        resolved = self._resolve_supplier_id(thread_row[0])
+                        if resolved:
+                            return resolved
+
+                    try:
+                        cur.execute(
+                            """
+                            SELECT supplier_id, from_address
+                            FROM proc.supplier_replies
+                            WHERE rfq_id = %s AND (%s IS NULL OR s3_key = %s)
+                            ORDER BY COALESCE(received_at, updated_at) DESC
+                            LIMIT 1
+                            """,
+                            (rfq_id, key, key),
+                        )
+                        reply_row = cur.fetchone()
+                    except Exception:
+                        conn.rollback()
+                        reply_row = None
+
+                if reply_row:
+                    supplier_candidate, from_address = reply_row
+                    resolved = self._resolve_supplier_id(supplier_candidate)
+                    if resolved:
+                        return resolved
+                    if from_address:
+                        resolved = self._resolve_supplier_id(from_address)
+                        if resolved:
+                            return resolved
+        except Exception:
+            logger.debug(
+                "Supplier lookup via processed emails failed for RFQ %s",
+                rfq_id,
+                exc_info=True,
+            )
         return None
 
     def _select_top_supplier(

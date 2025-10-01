@@ -8,7 +8,7 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.supplier_ranking_agent import SupplierRankingAgent
+from agents.supplier_ranking_agent import SupplierRankingAgent, ensure_payment_terms_score
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from engines.policy_engine import PolicyEngine
 from orchestration.orchestrator import Orchestrator
@@ -558,3 +558,15 @@ def test_supplier_ranking_instruction_overrides(monkeypatch):
     assert weights["price"] == pytest.approx(1.0)
     assert context.input_data["intent"].get("parameters", {}).get("criteria") == ["price"]
 
+
+def test_ensure_payment_terms_score_from_terms_text():
+    df = pd.DataFrame({"payment_terms": ["Net 30"]})
+    result = ensure_payment_terms_score(df.copy())
+    assert pytest.approx(66.67, abs=0.01) == result.loc[0, "payment_terms_score"]
+
+def test_ensure_payment_terms_score_imputes_unknown(caplog):
+    df = pd.DataFrame({"supplier": ["S1"], "payment_terms": ["Deferred"]})
+    with caplog.at_level("INFO"):
+        result = ensure_payment_terms_score(df.copy())
+    assert result.loc[0, "payment_terms_score"] == 50.0
+    assert any("payment_terms_score" in record.getMessage() for record in caplog.records)

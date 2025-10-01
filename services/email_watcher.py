@@ -153,7 +153,7 @@ def _strip_html(value: str) -> str:
     # downstream RFQ pattern matching still works even when the supplier
     # replies without keeping the identifier in the visible text.
     comment_matches = re.findall(
-        r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->",
+        r"<!--\s*(?:RFQ-ID\s*:\s*|PROCWISE:RFQ_ID=)([A-Za-z0-9_-]+)\s*-->",
         value,
         flags=re.IGNORECASE,
     )
@@ -290,6 +290,8 @@ class SESEmailWatcher:
         # to run repeatedly thanks to ``IF NOT EXISTS`` guards.
         self._ensure_negotiation_tables()
         self._ensure_processed_registry_table()
+        self._ensure_draft_rfq_email_constraints()
+        self._ensure_email_watcher_watermarks_table()
 
         self._validate_inbound_configuration(prefix_value)
 
@@ -326,6 +328,7 @@ class SESEmailWatcher:
         self._rfq_index_hits: Dict[str, str] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
+        self._load_watermark()
         self._match_poll_attempts = self._coerce_int(
             getattr(self.settings, "email_match_poll_attempts", 3),
             default=3,
@@ -374,34 +377,6 @@ class SESEmailWatcher:
         target_rfq_normalised: Optional[str] = None
         if filters:
             target_rfq_normalised = self._normalise_filter_value(filters.get("rfq_id"))
-        if target_rfq_normalised:
-            hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
-            if hit:
-                results.append(
-                    {
-                        "rfq_id": hit["rfq_id"],
-                        "supplier_id": None,
-                        "message_id": None,
-                        "subject": None,
-                        "from_address": None,
-                        "message_body": None,
-                        "target_price": None,
-                        "negotiation_triggered": False,
-                        "supplier_status": None,
-                        "negotiation_status": None,
-                        "supplier_output": None,
-                        "negotiation_output": None,
-                        "canonical_s3_key": hit["key"],
-                    }
-                )
-                logger.info(
-                    "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
-                    target_rfq_normalised,
-                    hit["processed_at"],
-                    self.mailbox_address,
-                )
-                return results
-
         run_count = 0
         if target_rfq_normalised:
             run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
@@ -414,7 +389,6 @@ class SESEmailWatcher:
                     run_count,
                 )
                 self._completed_targets.discard(target_rfq_normalised)
-        if target_rfq_normalised:
             hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
             if hit:
                 cached_key = self._rfq_index_hits.get(target_rfq_normalised)
@@ -442,106 +416,7 @@ class SESEmailWatcher:
                             "supplier_output": None,
                             "negotiation_output": None,
                             "canonical_s3_key": hit["key"],
-                        }
-                    )
-                    logger.info(
-                        "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
-                        target_rfq_normalised,
-                        hit["processed_at"],
-                        self.mailbox_address,
-                    )
-                    return results
-
-        run_count = 0
-        if target_rfq_normalised:
-            run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
-            self._rfq_run_counts[target_rfq_normalised] = run_count
-            if run_count > 1 and target_rfq_normalised in self._completed_targets:
-                logger.info(
-                    "RFQ %s requested again for mailbox %s (run %s); resetting completion state",
-                    target_rfq_normalised,
-                    self.mailbox_address,
-                    run_count,
-                )
-                self._completed_targets.discard(target_rfq_normalised)
-        if target_rfq_normalised:
-            hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
-            if hit:
-                cached_key = self._rfq_index_hits.get(target_rfq_normalised)
-                if cached_key and cached_key == hit["key"]:
-                    logger.info(
-                        "RFQ %s index entry %s already surfaced on a prior run (run %s); continuing with S3 scan",
-                        target_rfq_normalised,
-                        cached_key,
-                        run_count or 1,
-                    )
-                else:
-                    self._rfq_index_hits[target_rfq_normalised] = hit["key"]
-                    results.append(
-                        {
-                            "rfq_id": hit["rfq_id"],
-                            "supplier_id": None,
-                            "message_id": None,
-                            "subject": None,
-                            "from_address": None,
-                            "message_body": None,
-                            "target_price": None,
-                            "negotiation_triggered": False,
-                            "supplier_status": None,
-                            "negotiation_status": None,
-                            "supplier_output": None,
-                            "negotiation_output": None,
-                            "canonical_s3_key": hit["key"],
-                        }
-                    )
-                    logger.info(
-                        "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
-                        target_rfq_normalised,
-                        hit["processed_at"],
-                        self.mailbox_address,
-                    )
-                    return results
-
-        run_count = 0
-        if target_rfq_normalised:
-            run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
-            self._rfq_run_counts[target_rfq_normalised] = run_count
-            if run_count > 1 and target_rfq_normalised in self._completed_targets:
-                logger.info(
-                    "RFQ %s requested again for mailbox %s (run %s); resetting completion state",
-                    target_rfq_normalised,
-                    self.mailbox_address,
-                    run_count,
-                )
-                self._completed_targets.discard(target_rfq_normalised)
-        if target_rfq_normalised:
-            hit = self._lookup_rfq_hit_pg(target_rfq_normalised)
-            if hit:
-                cached_key = self._rfq_index_hits.get(target_rfq_normalised)
-                if cached_key and cached_key == hit["key"]:
-                    logger.info(
-                        "RFQ %s index entry %s already surfaced on a prior run (run %s); continuing with S3 scan",
-                        target_rfq_normalised,
-                        cached_key,
-                        run_count or 1,
-                    )
-                else:
-                    self._rfq_index_hits[target_rfq_normalised] = hit["key"]
-                    results.append(
-                        {
-                            "rfq_id": hit["rfq_id"],
-                            "supplier_id": None,
-                            "message_id": None,
-                            "subject": None,
-                            "from_address": None,
-                            "message_body": None,
-                            "target_price": None,
-                            "negotiation_triggered": False,
-                            "supplier_status": None,
-                            "negotiation_status": None,
-                            "supplier_output": None,
-                            "negotiation_output": None,
-                            "canonical_s3_key": hit["key"],
+                            "matched_via": "index",
                         }
                     )
                     logger.info(
@@ -559,6 +434,7 @@ class SESEmailWatcher:
         )
 
         previous_new_flag = self._require_new_s3_objects
+        previous_watermark = (self._last_watermark_ts, self._last_watermark_key)
         self._require_new_s3_objects = bool(filters)
 
         try:
@@ -762,6 +638,11 @@ class SESEmailWatcher:
 
             return results
         finally:
+            if (
+                self._last_watermark_ts,
+                self._last_watermark_key,
+            ) != previous_watermark:
+                self._store_watermark()
             self._require_new_s3_objects = previous_new_flag
 
     def _process_candidate_message(
@@ -777,6 +658,20 @@ class SESEmailWatcher:
         bucket = getattr(self, "bucket", None)
         s3_key = message.get("id") if isinstance(message.get("id"), str) else message.get("s3_key")
         etag = message.get("_s3_etag") or message.get("s3_etag")
+        size_hint = (
+            message.get("_content_length")
+            or message.get("size_bytes")
+            or message.get("content_length")
+        )
+        size_bytes: Optional[int]
+        size_bytes = None
+        if isinstance(size_hint, (int, float)):
+            size_bytes = int(size_hint)
+        elif isinstance(size_hint, str):
+            try:
+                size_bytes = int(float(size_hint))
+            except (TypeError, ValueError):
+                size_bytes = None
 
         if self.state_store and message_id in self.state_store:
             logger.debug(
@@ -824,12 +719,6 @@ class SESEmailWatcher:
                 # Treat RFQ match as authoritative even if other filters fail
                 if target_rfq_normalised and rfq_match:
                     message_match = True
-            logger.info(
-                "Processed message %s for RFQ %s from %s",
-                message_id,
-                processed.get("rfq_id"),
-                processed.get("from_address"),
-            )
             was_processed = True
 
             canonical_key = self._ensure_s3_mapping(s3_key, processed_payload.get("rfq_id"))
@@ -838,6 +727,63 @@ class SESEmailWatcher:
                 processed["canonical_s3_key"] = canonical_key
                 if target_rfq_normalised:
                     self._rfq_index_hits[target_rfq_normalised] = canonical_key
+
+            log_s3_key = canonical_key or s3_key
+            if log_s3_key and not processed_payload.get("s3_key"):
+                processed_payload["s3_key"] = log_s3_key
+            if etag and not processed_payload.get("etag"):
+                processed_payload["etag"] = etag
+            if size_bytes is not None and not processed_payload.get("size_bytes"):
+                processed_payload["size_bytes"] = size_bytes
+
+            canonical_rfq = self._normalise_filter_value(processed_payload.get("rfq_id"))
+            header_candidate = message.get("rfq_id_header")
+            match_source = "unknown"
+            if (
+                canonical_rfq
+                and isinstance(header_candidate, str)
+                and self._normalise_filter_value(header_candidate) == canonical_rfq
+            ):
+                match_source = "header"
+            else:
+                subject_candidate = (
+                    processed_payload.get("subject") or message.get("subject")
+                )
+                body_candidate = (
+                    processed_payload.get("message_body") or message.get("body")
+                )
+                if (
+                    match_source == "unknown"
+                    and canonical_rfq
+                    and subject_candidate
+                    and canonical_rfq in _norm(str(subject_candidate)).upper()
+                ):
+                    match_source = "subject"
+                if (
+                    match_source == "unknown"
+                    and canonical_rfq
+                    and body_candidate
+                    and canonical_rfq in _norm(str(body_candidate)).upper()
+                ):
+                    match_source = "body"
+            if match_source == "unknown" and canonical_rfq:
+                match_source = "body"
+
+            processed_payload["matched_via"] = match_source
+            processed_payload.setdefault("mailbox", self.mailbox_address)
+
+            logger.info(
+                "rfq_email_processed mailbox=%s rfq_id=%s supplier_id=%s s3_key=%s etag=%s size_bytes=%s price=%s lead_time=%s matched_via=%s",
+                self.mailbox_address,
+                processed_payload.get("rfq_id"),
+                processed_payload.get("supplier_id"),
+                log_s3_key,
+                etag or "",
+                size_bytes if size_bytes is not None else "unknown",
+                processed_payload.get("price"),
+                processed_payload.get("lead_time"),
+                match_source,
+            )
 
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
@@ -1083,6 +1029,68 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("Failed to ensure processed email registry table exists")
 
+    def _ensure_draft_rfq_email_constraints(self) -> None:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        try:
+            with get_conn() as conn:
+                success = True
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(
+                            """
+                            ALTER TABLE proc.draft_rfq_emails
+                                ADD CONSTRAINT draft_rfq_emails_rfq_id_uk UNIQUE (rfq_id)
+                            """
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive
+                        success = False
+                        if psycopg2_errors and isinstance(
+                            exc, getattr(psycopg2_errors, "DuplicateObject", ())
+                        ):
+                            conn.rollback()
+                        elif psycopg2_errors and isinstance(
+                            exc, getattr(psycopg2_errors, "UniqueViolation", ())
+                        ):
+                            logger.warning(
+                                "Duplicate RFQ identifiers detected while enforcing uniqueness"
+                            )
+                            conn.rollback()
+                        else:
+                            conn.rollback()
+                            raise
+                if success:
+                    conn.commit()
+        except Exception:
+            logger.exception(
+                "Failed to ensure unique constraint on proc.draft_rfq_emails"
+            )
+
+    def _ensure_email_watcher_watermarks_table(self) -> None:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.email_watcher_watermarks (
+                            mailbox TEXT NOT NULL,
+                            prefix  TEXT NOT NULL,
+                            ts      TIMESTAMPTZ NOT NULL,
+                            key     TEXT NOT NULL,
+                            PRIMARY KEY (mailbox, prefix)
+                        )
+                        """
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to ensure email watcher watermark table exists")
+
     def _is_processed_in_registry(
         self,
         bucket: Optional[str],
@@ -1142,6 +1150,71 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("RFQ index lookup failed for %s", rfq_id_norm)
             return None
+
+    def _load_watermark(self) -> None:
+        if not self._prefixes:
+            return
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        prefix = self._prefixes[0]
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT ts, key
+                        FROM proc.email_watcher_watermarks
+                        WHERE mailbox = %s AND prefix = %s
+                        """,
+                        (self.mailbox_address, prefix),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return
+                    ts_value, key_value = row
+                    self._last_watermark_ts = ts_value
+                    self._last_watermark_key = str(key_value or "")
+        except Exception:
+            logger.exception(
+                "Failed to load email watcher watermark for mailbox %s",
+                self.mailbox_address,
+            )
+
+    def _store_watermark(self) -> None:
+        if self._last_watermark_ts is None or not self._prefixes:
+            return
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return
+
+        prefix = self._prefixes[0]
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proc.email_watcher_watermarks (mailbox, prefix, ts, key)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (mailbox, prefix)
+                        DO UPDATE SET ts = EXCLUDED.ts, key = EXCLUDED.key
+                        """,
+                        (
+                            self.mailbox_address,
+                            prefix,
+                            self._last_watermark_ts,
+                            self._last_watermark_key,
+                        ),
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception(
+                "Failed to persist email watcher watermark for mailbox %s",
+                self.mailbox_address,
+            )
 
     def _record_processed_in_registry(
         self,
@@ -1870,15 +1943,18 @@ class SESEmailWatcher:
                 if not watcher.is_new(key):
                     continue
 
-            raw = self._download_object(client, key, bucket=self.bucket)
-            if raw is None:
+            download = self._download_object(client, key, bucket=self.bucket)
+            if download is None:
                 continue
+            raw, size_bytes = download
 
             parsed = self._invoke_parser(parser_fn, raw, key)
             parsed["id"] = key
             parsed["s3_key"] = key
             parsed["_s3_etag"] = etag
             parsed["_last_modified"] = last_modified
+            if size_bytes is not None:
+                parsed["_content_length"] = size_bytes
             collected.append((last_modified, parsed))
             seen_keys.add(key)
             watcher.mark_known(key, last_modified)
@@ -1984,7 +2060,7 @@ class SESEmailWatcher:
 
     def _download_object(
         self, client, key: str, *, bucket: Optional[str] = None
-    ) -> Optional[bytes]:
+    ) -> Optional[Tuple[bytes, Optional[int]]]:
         bucket_name = bucket or self.bucket
         if not bucket_name:
             logger.warning(
@@ -1997,6 +2073,11 @@ class SESEmailWatcher:
             response = client.get_object(Bucket=bucket_name, Key=key)
 
             body = response["Body"].read()
+            size_value = response.get("ContentLength")
+            try:
+                size_bytes: Optional[int] = int(size_value) if size_value is not None else None
+            except (TypeError, ValueError):
+                size_bytes = None
             encoding = str(response.get("ContentEncoding", "") or "").lower()
             key_lower = key.lower()
             if encoding == "gzip" or key_lower.endswith(".gz"):
@@ -2007,7 +2088,7 @@ class SESEmailWatcher:
                         "Failed to decompress gzip payload for %s; using raw bytes",
                         key,
                     )
-            return body
+            return body, size_bytes
         except Exception:  # pragma: no cover - network/runtime
             logger.exception(
                 "Failed to download SES message %s from bucket %s",
@@ -2056,7 +2137,9 @@ class SESEmailWatcher:
         recipients = message.get_all("to", [])
         body = self._extract_body(message)
         normalised_body = _norm(body)
-        rfq_id = self._extract_rfq_id(
+        header_rfq = message.get("X-Procwise-RFQ-ID") or message.get("X-Procwise-RFQ-Id")
+        header_rfq = str(header_rfq).strip() if header_rfq else ""
+        rfq_id = header_rfq or self._extract_rfq_id(
             f"{normalised_subject} {normalised_body}",
             raw_subject=raw_subject,
             normalised_subject=normalised_subject,
@@ -2067,6 +2150,7 @@ class SESEmailWatcher:
             "from": from_address,
             "body": body,
             "rfq_id": rfq_id,
+            "rfq_id_header": header_rfq or None,
             "received_at": message.get("date"),
             "message_id": message.get("message-id"),
             "recipients": recipients,

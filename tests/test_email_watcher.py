@@ -1,5 +1,6 @@
 
 import io
+import logging
 import re
 import sys
 import time
@@ -302,6 +303,143 @@ def test_poll_once_stops_future_polls_after_match():
     second = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
     assert second == []
     assert calls["count"] > 1
+
+
+def test_poll_once_without_filters_marks_match(caplog):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    message = {
+        "id": "match-1",
+        "subject": "Re: RFQ-20240101-abcd1234",
+        "body": "Quoted price 1500",
+        "from": "supplier@example.com",
+        "rfq_id": "RFQ-20240101-abcd1234",
+    }
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [message], state_store=state)
+
+    with caplog.at_level(logging.INFO):
+        results = watcher.poll_once()
+
+    assert len(results) == 1
+    assert any(
+        "matched=True" in record.getMessage()
+        and "Completed scan" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_poll_once_short_circuits_with_index(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    hit = {
+        "rfq_id": "RFQ-20240101-ABC12345",
+        "key": "emails/RFQ-20240101-ABC12345/ingest/msg-1",
+        "processed_at": "2024-01-01T00:00:00Z",
+    }
+
+    monkeypatch.setattr(watcher, "_lookup_rfq_hit_pg", lambda rfq: dict(hit))
+
+    called = {"load": False}
+
+    def fail_load(*args, **kwargs):
+        called["load"] = True
+        raise AssertionError("Should not load messages when index hit is present")
+
+    monkeypatch.setattr(watcher, "_load_messages", fail_load)
+
+    results = watcher.poll_once(match_filters={"rfq_id": hit["rfq_id"]})
+
+    assert len(results) == 1
+    assert results[0]["canonical_s3_key"] == hit["key"]
+    assert results[0]["matched_via"] == "index"
+    assert called["load"] is False
+
+
+def test_watermark_persistence_across_runs():
+    storage: Dict[tuple, tuple] = {}
+
+    class WatermarkCursor:
+        def __init__(self, connection):
+            self.connection = connection
+            self._result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.strip().lower().split())
+            self.connection.owner.ddl_statements.append(statement.strip())
+            if "select ts, key from proc.email_watcher_watermarks" in normalized:
+                key = (params[0], params[1])
+                self._result = self.connection.storage.get(key)
+            elif "insert into proc.email_watcher_watermarks" in normalized:
+                mailbox, prefix, ts_value, key_value = params
+                self.connection.storage[(mailbox, prefix)] = (ts_value, key_value)
+                self._result = None
+            else:
+                self._result = None
+
+        def fetchone(self):
+            return self._result
+
+    class WatermarkConnection:
+        def __init__(self, owner, storage):
+            self.owner = owner
+            self.storage = storage
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return WatermarkCursor(self)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    class WatermarkNick(DummyNick):
+        def __init__(self, backing):
+            super().__init__()
+            self._storage = backing
+
+        def get_db_connection(self):
+            return WatermarkConnection(self, self._storage)
+
+    message_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    message = {
+        "id": "wm-1",
+        "subject": "Re: RFQ-20240101-ABCD1234",
+        "body": "Quoted price 1500",
+        "from": "supplier@example.com",
+        "rfq_id": "RFQ-20240101-ABCD1234",
+        "_last_modified": message_ts,
+    }
+
+    nick = WatermarkNick(storage)
+    watcher = _make_watcher(nick, loader=lambda limit=None: [message])
+    watcher.poll_once()
+
+    key = (watcher.mailbox_address, watcher._prefixes[0])
+    assert key in storage
+    stored_ts, stored_key = storage[key]
+    assert stored_ts == message_ts
+    assert stored_key == "wm-1"
+
+    nick_reload = WatermarkNick(storage)
+    watcher_reload = _make_watcher(nick_reload, loader=lambda limit=None: [])
+    assert watcher_reload._last_watermark_ts == message_ts
+    assert watcher_reload._last_watermark_key == "wm-1"
 
 
 def test_poll_once_repeats_scan_when_index_hit_reused(monkeypatch):

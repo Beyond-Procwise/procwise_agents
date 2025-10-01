@@ -220,7 +220,8 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "supplier_id": "S1",
         "recipients": ["buyer@example.com"],
     }
-    assert result["body"].startswith("<!-- RFQ-ID: RFQ-UNIT -->")
+    assert result["body"].startswith("<!-- PROCWISE:RFQ_ID=RFQ-UNIT -->")
+    assert "<!-- RFQ-ID: RFQ-UNIT -->" in result["body"]
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
@@ -229,4 +230,5 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert updated_action["sent_status"] == "True"
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
-    assert sent_args["body"].startswith("<!-- RFQ-ID: RFQ-UNIT -->")
+    assert sent_args["body"].startswith("<!-- PROCWISE:RFQ_ID=RFQ-UNIT -->")
+    assert "<!-- RFQ-ID: RFQ-UNIT -->" in sent_args["body"]

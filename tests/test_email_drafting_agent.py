@@ -32,7 +32,7 @@ def test_from_decision_formats_payload(monkeypatch):
 
     monkeypatch.setattr(module, "_chat", fake_chat)
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "RFQ00001")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00001")
 
     agent = EmailDraftingAgent()
     decision = {
@@ -63,7 +63,7 @@ def test_from_decision_formats_payload(monkeypatch):
 def test_from_decision_subject_fallback(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "RFQ00001")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00001")
     agent = EmailDraftingAgent()
     result = agent.from_decision({"rfq_id": "ABC"})
     assert result["subject"] == "RFQ-20250930-RFQ00001 – Counter Offer & Next Steps"
@@ -81,7 +81,7 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
 def test_from_decision_generates_unique_rfq_id(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "UN1QUEID")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-UN1QUEID")
 
     agent = EmailDraftingAgent()
     decision = {"rfq_id": None, "supplier_id": "S-42"}
@@ -113,7 +113,7 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     monkeypatch.setattr(module, "_chat", fake_chat)
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_token", lambda length=8: "96F5YFY9")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-96F5YFY9")
 
     agent = EmailDraftingAgent()
     agent.polish_model = "gemma3"
