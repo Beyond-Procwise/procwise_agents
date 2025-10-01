@@ -4,14 +4,13 @@ import json
 import logging
 import os
 import re
-import secrets
-import string
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from types import SimpleNamespace
 import requests
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from utils.rfq import generate_rfq_id
 
 
 logger = logging.getLogger(__name__)
@@ -35,13 +34,8 @@ def _current_rfq_date() -> str:
     return datetime.utcnow().strftime("%Y%m%d")
 
 
-def _generate_rfq_token(length: int = 8) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
-
-
 def _generate_rfq_id() -> str:
-    return f"RFQ-{_current_rfq_date()}-{_generate_rfq_token()}"
+    return generate_rfq_id()
 
 
 def _ensure_rfq_id(value: Any) -> str:

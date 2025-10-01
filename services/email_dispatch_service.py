@@ -400,11 +400,24 @@ class EmailDispatchService:
         return values
 
     def _ensure_rfq_annotation(self, body: str, rfq_id: str) -> str:
-        if not body:
-            return f"<!-- RFQ-ID: {rfq_id} -->"
-        if _RFQ_ID_PATTERN.search(body):
-            return body
-        return f"<!-- RFQ-ID: {rfq_id} -->\n{body.strip()}"
+        if body is None:
+            body = ""
+
+        annotations: List[str] = []
+        procwise_comment = f"<!-- PROCWISE:RFQ_ID={rfq_id} -->"
+        legacy_comment = f"<!-- RFQ-ID: {rfq_id} -->"
+
+        if not re.search(r"PROCWISE:RFQ_ID\s*=\s*" + re.escape(rfq_id), body, re.IGNORECASE):
+            annotations.append(procwise_comment)
+        if not re.search(r"RFQ-ID\s*[:=]\s*" + re.escape(rfq_id), body, re.IGNORECASE):
+            annotations.append(legacy_comment)
+
+        if not body.strip():
+            return "\n".join(annotations) if annotations else legacy_comment
+
+        if annotations:
+            return "\n".join(annotations + [body.strip()])
+        return body
 
     @staticmethod
     def _load_json_field(value: Any) -> Optional[Any]:
