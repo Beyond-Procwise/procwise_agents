@@ -56,6 +56,28 @@ def _canon_id(value: str) -> str:
     return _norm(value).upper()
 
 
+def _rfq_match_key(value: object) -> Optional[str]:
+    """Return the normalised tail used for RFQ comparisons."""
+
+    if value in (None, ""):
+        return None
+
+    try:
+        canonical = _canon_id(str(value))
+    except Exception:
+        return None
+
+    if not canonical:
+        return None
+
+    tail_source = re.sub(r"[^A-Z0-9]", "", canonical)
+    if not tail_source:
+        return None
+
+    tail = tail_source[-8:]
+    return tail.lower() if tail else None
+
+
 RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
 
 # Ensure GPU related environment flags are consistently applied even when the
@@ -326,6 +348,7 @@ class SESEmailWatcher:
         self._completed_targets: Set[str] = set()
         self._rfq_run_counts: Dict[str, int] = {}
         self._rfq_index_hits: Dict[str, str] = {}
+        self._rfq_tail_cache: Dict[str, List[Dict[str, object]]] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._load_watermark()
@@ -376,7 +399,7 @@ class SESEmailWatcher:
         results: List[Dict[str, object]] = []
         target_rfq_normalised: Optional[str] = None
         if filters:
-            target_rfq_normalised = self._normalise_filter_value(filters.get("rfq_id"))
+            target_rfq_normalised = self._normalise_rfq_value(filters.get("rfq_id"))
         run_count = 0
         if target_rfq_normalised:
             run_count = self._rfq_run_counts.get(target_rfq_normalised, 0) + 1
@@ -706,7 +729,7 @@ class SESEmailWatcher:
             processed_payload = self._record_processed_payload(message_id, processed)
             original_rfq = processed_payload.get("rfq_id") if processed_payload else None
             rfq_extracted = (
-                self._normalise_filter_value(original_rfq) if original_rfq else None
+                self._normalise_rfq_value(original_rfq) if original_rfq else None
             )
             if target_rfq_normalised:
                 rfq_match = rfq_extracted == target_rfq_normalised
@@ -736,14 +759,20 @@ class SESEmailWatcher:
             if size_bytes is not None and not processed_payload.get("size_bytes"):
                 processed_payload["size_bytes"] = size_bytes
 
-            canonical_rfq = self._normalise_filter_value(processed_payload.get("rfq_id"))
+            canonical_rfq_full = None
+            try:
+                if processed_payload.get("rfq_id"):
+                    canonical_rfq_full = _canon_id(str(processed_payload.get("rfq_id")))
+            except Exception:
+                canonical_rfq_full = None
             header_candidate = message.get("rfq_id_header")
             match_source = "unknown"
-            if (
-                canonical_rfq
-                and isinstance(header_candidate, str)
-                and self._normalise_filter_value(header_candidate) == canonical_rfq
-            ):
+            header_tail = (
+                self._normalise_rfq_value(header_candidate)
+                if isinstance(header_candidate, str)
+                else None
+            )
+            if canonical_rfq_full and header_tail and header_tail == rfq_extracted:
                 match_source = "header"
             else:
                 subject_candidate = (
@@ -754,19 +783,19 @@ class SESEmailWatcher:
                 )
                 if (
                     match_source == "unknown"
-                    and canonical_rfq
+                    and canonical_rfq_full
                     and subject_candidate
-                    and canonical_rfq in _norm(str(subject_candidate)).upper()
+                    and canonical_rfq_full in _norm(str(subject_candidate)).upper()
                 ):
                     match_source = "subject"
                 if (
                     match_source == "unknown"
-                    and canonical_rfq
+                    and canonical_rfq_full
                     and body_candidate
-                    and canonical_rfq in _norm(str(body_candidate)).upper()
+                    and canonical_rfq_full in _norm(str(body_candidate)).upper()
                 ):
                     match_source = "body"
-            if match_source == "unknown" and canonical_rfq:
+            if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
             processed_payload["matched_via"] = match_source
@@ -1123,6 +1152,9 @@ class SESEmailWatcher:
         return False
 
     def _lookup_rfq_hit_pg(self, rfq_id_norm: str) -> Optional[Dict[str, str]]:
+        tail = self._normalise_rfq_value(rfq_id_norm)
+        if not tail:
+            return None
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         if not callable(get_conn):
             return None
@@ -1133,11 +1165,11 @@ class SESEmailWatcher:
                         """
                         SELECT rfq_id, key, processed_at
                         FROM proc.processed_emails
-                        WHERE rfq_id = %s
+                        WHERE RIGHT(REGEXP_REPLACE(UPPER(rfq_id), '[^A-Z0-9]', '', 'g'), 8) = %s
                         ORDER BY processed_at DESC
                         LIMIT 1
                         """,
-                        (_canon_id(rfq_id_norm),),
+                        (tail.upper(),),
                     )
                     row = cur.fetchone()
                     if not row:
@@ -1264,6 +1296,9 @@ class SESEmailWatcher:
             return None, "missing_rfq_id"
 
         metadata = self._load_metadata(rfq_id)
+        canonical_rfq_id = metadata.get("canonical_rfq_id")
+        if canonical_rfq_id:
+            rfq_id = str(canonical_rfq_id)
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
         target_price = metadata.get("target_price") or message.get("target_price")
         negotiation_round = metadata.get("round") or message.get("round") or 1
@@ -1367,6 +1402,7 @@ class SESEmailWatcher:
             "supplier_output": interaction_output.data,
             "negotiation_output": negotiation_output.data if negotiation_output else None,
         }
+        self._remember_rfq_tail(rfq_id, supplier_id)
         return result, None
 
     def _load_metadata(self, rfq_id: str) -> Dict[str, object]:
@@ -1378,22 +1414,35 @@ class SESEmailWatcher:
                 logger.exception("metadata provider failed for %s", rfq_id)
 
         details: Dict[str, object] = {}
+        resolved_record = self._resolve_rfq_record(rfq_id)
+        canonical_rfq_id: Optional[str] = None
+        if resolved_record:
+            canonical_rfq_id = resolved_record.get("rfq_id")
+            if resolved_record.get("supplier_id"):
+                details["supplier_id"] = resolved_record["supplier_id"]
+
+        lookup_rfq_id = canonical_rfq_id or rfq_id
+        if canonical_rfq_id:
+            details["canonical_rfq_id"] = canonical_rfq_id
+
+        self._remember_rfq_tail(lookup_rfq_id, details.get("supplier_id"))
         try:
             with self.agent_nick.get_db_connection() as conn:  # pragma: no cover - network
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT supplier_id FROM proc.draft_rfq_emails WHERE rfq_id = %s ORDER BY created_on DESC LIMIT 1",
-                        (rfq_id,),
-                    )
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        details["supplier_id"] = row[0]
+                    if "supplier_id" not in details:
+                        cur.execute(
+                            "SELECT supplier_id FROM proc.draft_rfq_emails WHERE rfq_id = %s ORDER BY created_on DESC LIMIT 1",
+                            (lookup_rfq_id,),
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            details["supplier_id"] = row[0]
 
                     # Attempt to retrieve negotiation targets when the table exists.
                     try:
                         cur.execute(
                             "SELECT target_price, negotiation_round FROM proc.rfq_targets WHERE rfq_id = %s ORDER BY updated_on DESC LIMIT 1",
-                            (rfq_id,),
+                            (lookup_rfq_id,),
                         )
                         row = cur.fetchone()
                         if row:
@@ -1422,7 +1471,7 @@ class SESEmailWatcher:
                         with conn.cursor() as fallback_cur:
                             fallback_cur.execute(
                                 "SELECT COALESCE(MAX(round), 0) + 1 FROM proc.negotiation_sessions WHERE rfq_id = %s",
-                                (rfq_id,),
+                                (lookup_rfq_id,),
                             )
                             row = fallback_cur.fetchone()
                             if row and row[0]:
@@ -1431,6 +1480,95 @@ class SESEmailWatcher:
             logger.exception("Failed to load RFQ metadata for %s", rfq_id)
 
         return details
+
+    def _get_rfq_candidates_for_tail(self, tail: str) -> List[Dict[str, object]]:
+        tail_key = (tail or "").strip().lower()
+        if not tail_key:
+            return []
+
+        if tail_key in self._rfq_tail_cache:
+            return list(self._rfq_tail_cache.get(tail_key, []))
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            self._rfq_tail_cache[tail_key] = []
+            return []
+
+        rows: List[Tuple] = []
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT rfq_id, supplier_id
+                        FROM proc.draft_rfq_emails
+                        WHERE RIGHT(REGEXP_REPLACE(LOWER(rfq_id), '[^a-z0-9]', '', 'g'), 8) = %s
+                        ORDER BY updated_on DESC, created_on DESC
+                        """,
+                        (tail_key,),
+                    )
+                    fetch_all = getattr(cur, "fetchall", None)
+                    if callable(fetch_all):
+                        rows = fetch_all()
+                    else:  # pragma: no cover - defensive
+                        row = cur.fetchone()
+                        rows = [row] if row else []
+        except Exception:
+            logger.exception("Failed to load RFQ records for tail %s", tail_key)
+            rows = []
+
+        entries: List[Dict[str, object]] = []
+        for row in rows:
+            if not row:
+                continue
+            rfq_value = row[0]
+            supplier_value = row[1] if len(row) > 1 else None
+            entries.append({"rfq_id": rfq_value, "supplier_id": supplier_value})
+
+        self._rfq_tail_cache[tail_key] = list(entries)
+        return entries
+
+    def _resolve_rfq_record(self, rfq_id: str) -> Optional[Dict[str, object]]:
+        tail = self._normalise_rfq_value(rfq_id)
+        if not tail:
+            return None
+
+        candidates = self._get_rfq_candidates_for_tail(tail)
+        if not candidates:
+            return None
+
+        canonical = _canon_id(rfq_id)
+        for entry in candidates:
+            stored_id = entry.get("rfq_id")
+            if stored_id and _canon_id(str(stored_id)) == canonical:
+                return entry
+
+        return candidates[0]
+
+    def _remember_rfq_tail(self, rfq_id: Optional[str], supplier_id: Optional[str]) -> None:
+        if not rfq_id:
+            return
+
+        tail = self._normalise_rfq_value(rfq_id)
+        if not tail:
+            return
+
+        entry = {"rfq_id": rfq_id, "supplier_id": supplier_id}
+        cached = self._rfq_tail_cache.get(tail)
+        if not cached:
+            self._rfq_tail_cache[tail] = [entry]
+            return
+
+        canonical = _canon_id(rfq_id)
+        for idx, existing in enumerate(list(cached)):
+            stored_id = existing.get("rfq_id")
+            if stored_id and _canon_id(str(stored_id)) == canonical:
+                cached[idx] = entry
+                break
+        else:
+            cached.insert(0, entry)
+            if len(cached) > 10:
+                del cached[10:]
 
     def _load_messages(
         self,
@@ -1484,6 +1622,10 @@ class SESEmailWatcher:
         return lowered or None
 
     @staticmethod
+    def _normalise_rfq_value(value: object) -> Optional[str]:
+        return _rfq_match_key(value)
+
+    @staticmethod
     def _normalise_email(value: object) -> Optional[str]:
         if value in (None, ""):
             return None
@@ -1512,7 +1654,8 @@ class SESEmailWatcher:
         if not filters:
             return False
 
-        payload_rfq = SESEmailWatcher._normalise_filter_value(payload.get("rfq_id"))
+        payload_rfq_tail = SESEmailWatcher._normalise_rfq_value(payload.get("rfq_id"))
+        payload_rfq_full = SESEmailWatcher._normalise_filter_value(payload.get("rfq_id"))
         payload_supplier = SESEmailWatcher._normalise_filter_value(payload.get("supplier_id"))
         payload_subject = SESEmailWatcher._normalise_filter_value(payload.get("subject")) or ""
         payload_sender = SESEmailWatcher._normalise_filter_value(payload.get("from_address"))
@@ -1549,10 +1692,10 @@ class SESEmailWatcher:
             if expected in (None, ""):
                 continue
             if key == "rfq_id":
-                if payload_rfq != SESEmailWatcher._normalise_filter_value(expected):
+                if payload_rfq_tail != SESEmailWatcher._normalise_rfq_value(expected):
                     return False
             elif key == "rfq_id_like":
-                if not _like(payload_rfq, expected):
+                if not _like(payload_rfq_full, expected):
                     return False
             elif key == "supplier_id":
                 if payload_supplier != SESEmailWatcher._normalise_filter_value(expected):
