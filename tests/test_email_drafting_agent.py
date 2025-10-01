@@ -52,11 +52,17 @@ def test_from_decision_formats_payload(monkeypatch):
     result = agent.from_decision(decision)
 
     assert result["subject"] == "Re: RFQ RFQ-001"
+    assert result["body"] == result["text"]
     assert "Please confirm if 44.8 GBP is workable." in result["text"]
     assert "<ul>" in result["html"] and "<li>Please confirm if 44.8 GBP is workable.</li>" in result["html"]
     assert result["headers"]["In-Reply-To"] == "<msg1>"
     assert result["headers"]["References"] == "<msg0>"
     assert result["metadata"]["supplier_id"] == "S-1"
+    assert result["receiver"] == "sales@acme.test"
+    assert result["recipients"] == ["sales@acme.test", "buyer@test"]
+    assert result["contact_level"] == 1
+    assert result["sender"]
+    assert result["sent_status"] is False
     assert calls[0]["payload"]["rfq_id"] == "RFQ-20250930-RFQ00001"
 
 

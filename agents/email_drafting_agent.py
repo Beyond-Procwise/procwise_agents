@@ -15,9 +15,6 @@ from utils.rfq import generate_rfq_id
 
 logger = logging.getLogger(__name__)
 
-
-logger = logging.getLogger(__name__)
-
 # -----------------------
 # Config & small utilities
 # -----------------------
@@ -26,6 +23,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL_COMPOSE = os.getenv("EMAIL_DRAFT_MODEL", "llama3.2")
 MODEL_POLISH = os.getenv("EMAIL_POLISH_MODEL", "gemma3")  # optional
 ENABLE_POLISH = os.getenv("EMAIL_POLISH_ENABLED", "false").strip().lower() == "true"
+DEFAULT_SENDER = (
+    os.getenv("SES_DEFAULT_SENDER") or "supplierconnect@procwise.co.uk"
+).strip()
 
 _RFQ_ID_PATTERN = re.compile(r"RFQ-\d{8}-[A-Z0-9]{8}")
 
@@ -172,6 +172,30 @@ class DecisionContext:
 # -----------------------
 
 
+def _normalise_recipients(primary: Optional[str], extras: Optional[Sequence[str]]) -> List[str]:
+    addresses: List[str] = []
+    seen = set()
+
+    def _add(value: Optional[str]) -> None:
+        if not value:
+            return
+        candidate = str(value).strip()
+        if not candidate:
+            return
+        key = candidate.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        addresses.append(candidate)
+
+    _add(primary)
+    if extras:
+        for item in extras:
+            _add(item)
+
+    return addresses
+
+
 def _build_output(decision: DecisionContext, subject: str, body_text: str) -> dict:
     body_text = body_text.strip()
     subject = subject.strip()
@@ -181,20 +205,32 @@ def _build_output(decision: DecisionContext, subject: str, body_text: str) -> di
     if decision.thread and decision.thread.references:
         headers["References"] = " ".join(decision.thread.references)
 
+    recipients = _normalise_recipients(decision.to, decision.cc or [])
+
     return {
         "rfq_id": decision.rfq_id,
+        "supplier_id": decision.supplier_id,
+        "supplier_name": decision.supplier_name,
         "to": decision.to,
+        "receiver": decision.to,
         "cc": decision.cc or [],
+        "recipients": recipients,
+        "contact_level": 1 if recipients else 0,
         "subject": subject,
         "text": body_text,
+        "body": body_text,
         "html": _to_html(body_text),
         "headers": headers,
+        "sender": DEFAULT_SENDER,
+        "sent_status": False,
+        "thread_index": 1,
         "metadata": {
             "supplier_id": decision.supplier_id,
             "round": decision.round,
             "strategy": decision.strategy,
             "counter_price": decision.counter_price,
         },
+        "supplier_profile": {},
     }
 
 
