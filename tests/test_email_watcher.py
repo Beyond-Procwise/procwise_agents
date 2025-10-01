@@ -66,6 +66,9 @@ class DummyNick:
         def fetchone(self):
             return None
 
+        def fetchall(self):
+            return []
+
     class _DummyConn:
         def __init__(self, owner):
             self._owner = owner
@@ -185,6 +188,33 @@ def test_poll_once_continues_until_all_filters_match():
     # RFQ match is authoritative, so the first candidate ends the poll
     assert [result["supplier_id"] for result in results] == ["SUP-1"]
     assert len(watcher.supplier_agent.contexts) == 1
+
+
+def test_poll_once_matches_on_rfq_tail():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-tail",
+            "subject": "Re: RFQ-20240101-00001234",
+            "body": "Quoted price 1200",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-00001234",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20249999-00001234"})
+
+    assert len(results) == 1
+    assert results[0]["rfq_id"] == "RFQ-20240101-00001234"
+    assert "msg-tail" in state
+
+
+def test_normalise_rfq_value_uses_last_eight_digits():
+    assert SESEmailWatcher._normalise_rfq_value("RFQ-20240101-ABCD1234") == "abcd1234"
+    assert SESEmailWatcher._normalise_rfq_value("RFQ-20240101-00001234") == "00001234"
 
 
 def test_poll_once_retries_until_target_found(monkeypatch):
