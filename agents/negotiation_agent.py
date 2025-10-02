@@ -94,7 +94,6 @@ class NegotiationAgent(BaseAgent):
         self._state_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._email_agent: Optional[EmailDraftingAgent] = None
 
-
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
 
@@ -242,9 +241,13 @@ class NegotiationAgent(BaseAgent):
         counter_price = decision.get("counter_price")
         if counter_price is not None:
             counter_options.append({"price": counter_price, "terms": None, "bundle": None})
-
         if rfq_id and supplier:
             self._store_session(rfq_id, supplier, round_no, counter_price)
+
+        try:
+            supplier_reply_count = int(state.get("supplier_reply_count", 0))
+        except Exception:
+            supplier_reply_count = 0
 
         draft_payload = {
             "intent": "NEGOTIATION_COUNTER",
@@ -260,7 +263,7 @@ class NegotiationAgent(BaseAgent):
             "lead_time_request": decision.get("lead_time_request"),
             "rationale": decision.get("rationale"),
             "round": round_no,
-            "supplier_reply_count": state.get("supplier_reply_count", 0),
+            "supplier_reply_count": supplier_reply_count,
             "supplier_message": supplier_message,
             "supplier_snippets": supplier_snippets,
             "from_address": context.input_data.get("from_address"),
@@ -272,7 +275,7 @@ class NegotiationAgent(BaseAgent):
             "target_price": target_price,
             "current_offer": price,
             "round": round_no,
-            "supplier_reply_count": state.get("supplier_reply_count", 0),
+            "supplier_reply_count": supplier_reply_count,
             "strategy": decision.get("strategy"),
             "asks": decision.get("asks", []),
             "lead_time_request": decision.get("lead_time_request"),
@@ -311,9 +314,10 @@ class NegotiationAgent(BaseAgent):
         )
 
         email_output: Optional[AgentOutput] = None
+        fallback_payload: Optional[Dict[str, Any]] = None
         if email_payload and supplier and rfq_id:
             email_output = self._invoke_email_drafting_agent(context, email_payload)
-
+            fallback_payload = dict(email_payload)
         if email_output and email_output.status == AgentStatus.SUCCESS:
             email_data = email_output.data or {}
             email_action_id = email_output.action_id or email_data.get("action_id")
@@ -333,6 +337,15 @@ class NegotiationAgent(BaseAgent):
         else:
             draft_records.append(dict(draft_stub))
             next_agents = ["EmailDraftingAgent"]
+            if fallback_payload is None:
+                # Reconstruct a payload compatible with EmailDraftingAgent expectations.
+                fallback_payload = self._build_email_agent_payload(
+                    context,
+                    draft_payload,
+                    decision,
+                    state,
+                    negotiation_message,
+                )
 
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
@@ -341,7 +354,7 @@ class NegotiationAgent(BaseAgent):
         if email_action_id:
             state["last_agent_msg_id"] = email_action_id
         self._save_session_state(rfq_id, supplier, state)
-
+        public_state = self._public_state(state)
         data = {
             "supplier": supplier,
             "rfq_id": rfq_id,
@@ -359,7 +372,7 @@ class NegotiationAgent(BaseAgent):
             "intent": "NEGOTIATION_COUNTER",
             "draft_payload": draft_payload,
             "drafts": draft_records,
-            "session_state": self._public_state(state),
+            "session_state": public_state,
             "currency": currency,
             "current_offer": price,
             "target_price": target_price,
@@ -373,7 +386,68 @@ class NegotiationAgent(BaseAgent):
             data["email_body"] = email_body
         if email_action_id:
             data["email_action_id"] = email_action_id
+        pass_fields: Dict[str, Any] = data
 
+        if next_agents:
+            merge_payload = dict(fallback_payload or {})
+            merge_payload.setdefault("intent", "NEGOTIATION_COUNTER")
+            merge_payload.setdefault("decision", decision)
+            merge_payload.setdefault("session_state", public_state)
+            if rfq_id is not None:
+                merge_payload.setdefault("rfq_id", rfq_id)
+            if supplier is not None:
+                merge_payload.setdefault("supplier_id", supplier)
+            supplier_name = context.input_data.get("supplier_name")
+            if supplier_name:
+                merge_payload.setdefault("supplier_name", supplier_name)
+            merge_payload.setdefault("round", round_no)
+            merge_payload.setdefault("counter_price", counter_price)
+            merge_payload.setdefault("target_price", target_price)
+            merge_payload.setdefault("current_offer", price)
+            merge_payload.setdefault("current_offer_numeric", price)
+            if currency:
+                merge_payload.setdefault("currency", currency)
+            merge_payload.setdefault("asks", decision.get("asks", []))
+            merge_payload.setdefault("lead_time_request", decision.get("lead_time_request"))
+            merge_payload.setdefault("rationale", decision.get("rationale"))
+            merge_payload.setdefault("negotiation_message", negotiation_message)
+            if supplier_message:
+                merge_payload.setdefault("supplier_message", supplier_message)
+            merge_payload.setdefault("supplier_reply_count", supplier_reply_count)
+            contact = context.input_data.get("from_address")
+            if contact and not merge_payload.get("recipients"):
+                merge_payload["recipients"] = [contact]
+            sender = context.input_data.get("sender")
+            if sender and not merge_payload.get("sender"):
+                merge_payload["sender"] = sender
+
+            sync_keys = {
+                "supplier_id",
+                "supplier_name",
+                "rfq_id",
+                "counter_price",
+                "target_price",
+                "current_offer",
+                "current_offer_numeric",
+                "currency",
+                "asks",
+                "lead_time_request",
+                "rationale",
+                "negotiation_message",
+                "supplier_message",
+                "supplier_reply_count",
+                "session_state",
+                "intent",
+                "round",
+                "recipients",
+                "sender",
+            }
+            for key in sync_keys:
+                if key in merge_payload:
+                    data[key] = merge_payload[key]
+
+            pass_fields = dict(data)
+            pass_fields.update(merge_payload)
         logger.info(
             "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
         )
@@ -381,7 +455,7 @@ class NegotiationAgent(BaseAgent):
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=data,
-            pass_fields=data,
+            pass_fields=pass_fields,
             next_agents=next_agents,
         )
 
@@ -406,6 +480,7 @@ class NegotiationAgent(BaseAgent):
             "status": state.get("status", "ACTIVE"),
             "awaiting_response": bool(state.get("awaiting_response", False)),
         }
+
 
     def _load_session_state(
         self, rfq_id: Optional[str], supplier: Optional[str]

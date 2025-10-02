@@ -121,7 +121,6 @@ def test_negotiation_agent_composes_counter(monkeypatch):
         lambda ctx, payload: stub_email_output,
     )
 
-
     context = AgentContext(
         workflow_id="wf2",
         agent_id="negotiation",
@@ -159,8 +158,6 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert output.data.get("email_subject") == "Re: RFQ-123 – Updated commercial terms"
     assert output.data.get("email_body") == "Email body"
     assert output.next_agents == []
-
-
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
