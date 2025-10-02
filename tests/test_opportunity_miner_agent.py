@@ -252,6 +252,7 @@ def test_policy_category_limits_caps_suppliers_to_two():
     assert category_map["Duplicate Supplier"]["all"] == aggregated
 
 
+
 def test_build_finding_normalises_decimal_inputs():
     nick = DummyNick()
     nick.query_engine = None

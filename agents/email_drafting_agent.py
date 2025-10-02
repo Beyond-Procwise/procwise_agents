@@ -176,7 +176,7 @@ NEGOTIATION_COUNTER_USER_PROMPT = (
     "hyperbole."
 )
 
-DEFAULT_NEGOTIATION_MODEL = "llama3.1:70b"
+DEFAULT_NEGOTIATION_MODEL = "mistral"
 
 
 class EmailDraftingAgent(BaseAgent):

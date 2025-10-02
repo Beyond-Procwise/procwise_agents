@@ -796,6 +796,7 @@ class OpportunityMinerAgent(BaseAgent):
 
             if not top_findings and unique_sorted:
                 top_findings = unique_sorted[:1]
+
             policy_categories: Dict[str, List[Finding]] = {"all": top_findings}
 
             for finding in unique_sorted:
