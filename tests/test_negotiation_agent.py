@@ -117,6 +117,14 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert draft_payload["counter_price"] == 1250.0
     assert draft_payload["negotiation_message"].startswith("Round 1 plan")
     assert output.data["session_state"]["current_round"] == 2
+    assert output.data["session_state"]["supplier_reply_count"] == 0
+    drafts = output.data["drafts"]
+    assert isinstance(drafts, list) and len(drafts) == 1
+    stub = drafts[0]
+    assert stub["rfq_id"] == "RFQ-123"
+    assert stub["sent_status"] is False
+    assert stub["metadata"]["counter_price"] == 1250.0
+    assert stub["payload"]["counter_price"] == 1250.0
 
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
@@ -143,7 +151,11 @@ def test_negotiation_agent_detects_final_offer(monkeypatch):
     assert output.next_agents == []
     assert "final offer" in output.data["message"].lower()
     assert output.data["session_state"]["status"].upper() == "COMPLETED"
+    assert output.data["drafts"] == []
 
+def test_negotiation_agent_detects_final_offer(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
 
 def test_negotiation_agent_caps_supplier_replies(monkeypatch):
     nick = DummyNick()
@@ -186,3 +198,99 @@ def test_negotiation_agent_caps_supplier_replies(monkeypatch):
     assert output.data["negotiation_allowed"] is False
     assert output.data["session_state"]["status"].upper() == "EXHAUSTED"
     assert saved.get("status") == "EXHAUSTED"
+
+
+def test_negotiation_agent_counts_replies_only_after_counter(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {
+        "supplier_reply_count": 1,
+        "current_round": 3,
+        "status": "ACTIVE",
+        "awaiting_response": True,
+        "last_supplier_msg_id": "msg-prev",
+    }
+
+    saved: Dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), True),
+    )
+
+    def fake_save(rfq, supplier, new_state):
+        saved.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    context = AgentContext(
+        workflow_id="wf5",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S4",
+            "current_offer": 2100.0,
+            "target_price": 1800.0,
+            "rfq_id": "RFQ-567",
+            "message_id": "msg-new",
+            "round": 3,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.data["session_state"]["supplier_reply_count"] == 2
+    assert saved.get("supplier_reply_count") == 2
+    assert saved.get("awaiting_response") is True
+
+
+def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {
+        "supplier_reply_count": 1,
+        "current_round": 2,
+        "status": "ACTIVE",
+        "awaiting_response": True,
+        "last_supplier_msg_id": "msg-1",
+    }
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), True),
+    )
+
+    saved: Dict[str, Any] = {}
+
+    def fake_save(rfq, supplier, new_state):
+        saved.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    context = AgentContext(
+        workflow_id="wf6",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S5",
+            "current_offer": 2100.0,
+            "target_price": 1800.0,
+            "rfq_id": "RFQ-890",
+            "message_id": "msg-1",
+            "round": 2,
+
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.data["negotiation_allowed"] is True
+    assert output.data["session_state"]["status"].upper() == "ACTIVE"
+    assert output.data["session_state"]["awaiting_response"] is True
+    assert output.data["drafts"] == []
+    assert saved.get("awaiting_response") is True
+

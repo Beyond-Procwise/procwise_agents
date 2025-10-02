@@ -400,7 +400,9 @@ rfq_id text NOT NULL,
     updated_on timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT negotiation_session_state_pk PRIMARY KEY (rfq_id, supplier_id)
 ```
-Tracks supplier reply counts and awaiting-response status for each negotiation session.
+Tracks supplier reply counts and awaiting-response status for each negotiation session. The
+reply counter advances only after an outbound counter email when the agent is awaiting a
+response, ensuring each supplier response is monitored until the negotiation finalises.
 
 ### `proc.email_thread_map`
 ```

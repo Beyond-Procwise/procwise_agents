@@ -150,7 +150,11 @@ class NegotiationAgent(BaseAgent):
         message_id = context.input_data.get("message_id")
         supplier_reply_registered = False
         if message_id and state.get("last_supplier_msg_id") != message_id:
-            state["supplier_reply_count"] = int(state.get("supplier_reply_count", 0)) + 1
+            previously_awaiting = bool(state.get("awaiting_response", False))
+            if previously_awaiting:
+                state["supplier_reply_count"] = int(state.get("supplier_reply_count", 0)) + 1
+            else:
+                state["supplier_reply_count"] = int(state.get("supplier_reply_count", 0))
             state["last_supplier_msg_id"] = message_id
             state["awaiting_response"] = False
             supplier_reply_registered = True
@@ -174,12 +178,19 @@ class NegotiationAgent(BaseAgent):
 
         decision_log = self._build_decision_log(supplier, rfq_id, price, target_price, decision)
 
+        draft_records: List[Dict[str, Any]] = []
+
         if not should_continue:
             state["status"] = new_status
-            state["awaiting_response"] = False
+            awaiting_before = bool(state.get("awaiting_response", False))
+            if awaiting_before and halt_reason == "Awaiting supplier response.":
+                state["awaiting_response"] = True
+            else:
+                state["awaiting_response"] = False
             stop_message = self._build_stop_message(new_status, halt_reason, round_no)
             decision.setdefault("status_reason", halt_reason)
             self._save_session_state(rfq_id, supplier, state)
+            negotiation_open = new_status not in {"COMPLETED", "EXHAUSTED"}
             data = {
                 "supplier": supplier,
                 "rfq_id": rfq_id,
@@ -192,13 +203,16 @@ class NegotiationAgent(BaseAgent):
                 "email_subject": None,
                 "email_body": None,
                 "supplier_snippets": supplier_snippets,
-                "negotiation_allowed": False,
+                "negotiation_allowed": negotiation_open,
                 "interaction_type": "negotiation",
                 "session_state": self._public_state(state),
                 "currency": currency,
                 "current_offer": price,
                 "target_price": target_price,
                 "supplier_message": supplier_message,
+                "drafts": draft_records,
+                "sent_status": False,
+
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
@@ -251,6 +265,36 @@ class NegotiationAgent(BaseAgent):
             "negotiation_message": negotiation_message,
         }
 
+        draft_metadata = {
+            "counter_price": counter_price,
+            "target_price": target_price,
+            "current_offer": price,
+            "round": round_no,
+            "supplier_reply_count": state.get("supplier_reply_count", 0),
+            "strategy": decision.get("strategy"),
+            "asks": decision.get("asks", []),
+            "lead_time_request": decision.get("lead_time_request"),
+            "rationale": decision.get("rationale"),
+            "intent": "NEGOTIATION_COUNTER",
+        }
+
+        draft_stub = {
+            "rfq_id": rfq_id,
+            "supplier_id": supplier,
+            "intent": "NEGOTIATION_COUNTER",
+            "metadata": draft_metadata,
+            "negotiation_message": negotiation_message,
+            "counter_proposals": counter_options,
+            "sent_status": False,
+            "thread_index": round_no,
+        }
+        if currency:
+            draft_stub["currency"] = currency
+        if supplier_snippets:
+            draft_stub["supplier_snippets"] = supplier_snippets
+        draft_stub["payload"] = draft_payload
+        draft_records.append(draft_stub)
+
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
         state["current_round"] = round_no + 1
@@ -273,11 +317,13 @@ class NegotiationAgent(BaseAgent):
             "interaction_type": "negotiation",
             "intent": "NEGOTIATION_COUNTER",
             "draft_payload": draft_payload,
+            "drafts": draft_records,
             "session_state": self._public_state(state),
             "currency": currency,
             "current_offer": price,
             "target_price": target_price,
             "supplier_message": supplier_message,
+            "sent_status": False,
         }
 
         logger.info(
