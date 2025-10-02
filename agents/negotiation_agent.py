@@ -94,6 +94,7 @@ class NegotiationAgent(BaseAgent):
         self._state_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._email_agent: Optional[EmailDraftingAgent] = None
 
+
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
 
@@ -745,3 +746,4 @@ class NegotiationAgent(BaseAgent):
         except Exception:
             logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
             return None
+
