@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import imaplib
@@ -208,7 +209,13 @@ class SupplierInteractionAgent(BaseAgent):
                 "response_text": precomputed.get("response_text") or body,
             }
             if isinstance(precomputed, dict)
-            else self._parse_response(body)
+            else self._parse_response(
+                body,
+                subject=subject,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+                drafts=drafts,
+            )
         )
 
         target = self._coerce_float(input_data.get("target_price"))
@@ -269,7 +276,17 @@ class SupplierInteractionAgent(BaseAgent):
                     text = body.decode(errors='ignore')
                     rfq_id = self._extract_rfq_id(subject + " " + text)
                     if rfq_id:
-                        self._store_response(rfq_id, None, text, self._parse_response(text))
+                        self._store_response(
+                            rfq_id,
+                            None,
+                            text,
+                            self._parse_response(
+                                text,
+                                subject=subject,
+                                rfq_id=rfq_id,
+                                supplier_id=None,
+                            ),
+                        )
                         processed += 1
         except Exception:  # pragma: no cover - best effort
             logger.exception("mailbox polling failed")
@@ -637,12 +654,143 @@ class SupplierInteractionAgent(BaseAgent):
         match = self.RFQ_PATTERN.search(text)
         return match.group(0) if match else None
 
-    def _parse_response(self, text: str) -> Dict:
+    def _analyze_response_with_llm(
+        self,
+        *,
+        subject: Optional[str],
+        body: str,
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+        drafts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        prompt_payload = {
+            "subject": subject or "",
+            "rfq_id": rfq_id or "",
+            "supplier_id": supplier_id or "",
+            "message": body,
+            "drafts": [
+                {
+                    "rfq_id": draft.get("rfq_id"),
+                    "supplier_id": draft.get("supplier_id"),
+                    "subject": draft.get("subject") or draft.get("title"),
+                }
+                for draft in (drafts or [])
+                if isinstance(draft, dict)
+            ],
+        }
+
+        try:
+            model_name = getattr(
+                self.settings,
+                "supplier_interaction_model",
+                getattr(self.settings, "extraction_model", None),
+            )
+            response = self.call_ollama(
+                model=model_name,
+                format="json",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You analyse supplier RFQ responses."
+                            " Return strict JSON with keys:"
+                            " price (number or null), lead_time_days"
+                            " (number or null), summary (string)."
+                            " Capture the supplier's intent and any"
+                            " contextual signals in summary."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt_payload, ensure_ascii=False),
+                    },
+                ],
+                options={"temperature": 0.2},
+            )
+        except Exception:
+            logger.debug("LLM response extraction failed", exc_info=True)
+            return None
+
+        content: Optional[str] = None
+        if isinstance(response, dict):
+            if isinstance(response.get("response"), str):
+                content = response.get("response")
+            elif isinstance(response.get("message"), dict):
+                message_payload = response.get("message")
+                if isinstance(message_payload, dict):
+                    maybe_content = message_payload.get("content")
+                    if isinstance(maybe_content, str):
+                        content = maybe_content
+
+        if not content:
+            return None
+
+        parsed: Optional[Dict[str, Any]]
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            logger.debug("LLM response was not valid JSON: %s", content)
+            return None
+
+        return parsed if isinstance(parsed, dict) else None
+
+    def _parse_response(
+        self,
+        text: str,
+        *,
+        subject: Optional[str] = None,
+        rfq_id: Optional[str] = None,
+        supplier_id: Optional[str] = None,
+        drafts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict:
         price_match = re.search(r"(\d+[.,]?\d*)", text)
         lead_match = re.search(r"(\d+)\s*days", text, re.IGNORECASE)
         price = float(price_match.group(1).replace(',', '')) if price_match else None
         lead_time = lead_match.group(1) if lead_match else None
-        return {"price": price, "lead_time": lead_time, "response_text": text}
+
+        llm_payload = self._analyze_response_with_llm(
+            subject=subject,
+            body=text,
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            drafts=drafts,
+        )
+
+        if isinstance(llm_payload, dict):
+            llm_price = self._coerce_float(llm_payload.get("price"))
+            if llm_price is None:
+                llm_price = self._coerce_float(llm_payload.get("price_gbp"))
+            if llm_price is not None:
+                price = llm_price
+
+            lead_candidate = llm_payload.get("lead_time_days") or llm_payload.get(
+                "lead_time"
+            )
+            if lead_candidate is not None:
+                if isinstance(lead_candidate, (int, float)):
+                    lead_time = str(int(lead_candidate))
+                else:
+                    lead_text = str(lead_candidate)
+                    lead_digits = re.search(r"(\d+)", lead_text)
+                    if lead_digits:
+                        lead_time = lead_digits.group(1)
+
+            summary_text = llm_payload.get("summary") or llm_payload.get("context")
+            if isinstance(summary_text, str) and summary_text.strip():
+                summary = summary_text.strip()
+            else:
+                summary = None
+        else:
+            summary = None
+
+        payload = {
+            "price": price,
+            "lead_time": lead_time,
+            "response_text": text,
+        }
+        if summary:
+            payload["context_summary"] = summary
+        return payload
 
     def _store_response(self, rfq_id: Optional[str], supplier_id: Optional[str], text: str, parsed: Dict) -> None:
         if not rfq_id:

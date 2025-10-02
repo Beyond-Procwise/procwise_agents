@@ -652,6 +652,98 @@ class OpportunityMinerAgent(BaseAgent):
                 if policies:
                     context.input_data["policies"] = policies
 
+    def _finding_uniqueness_key(
+        self, finding: Finding, policy_display: str
+    ) -> Tuple[str, str]:
+        """Return a stable key used to de-duplicate supplier opportunities."""
+
+        def _candidate_key(*values: Any) -> Optional[str]:
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    joined = "|".join(str(part).strip() for part in value if part is not None)
+                    normalised = self._normalise_identifier(joined)
+                else:
+                    normalised = self._normalise_identifier(value)
+                if normalised:
+                    return normalised
+            return None
+
+        opportunity_key = _candidate_key(
+            finding.opportunity_ref_id,
+            finding.opportunity_id,
+            (finding.detector_type, finding.policy_id, finding.item_id),
+            (policy_display, finding.item_reference or finding.category_id),
+        )
+        if not opportunity_key:
+            opportunity_key = self._normalise_identifier(policy_display) or "UNKNOWN"
+
+        supplier_key = self._normalise_identifier(finding.supplier_id) or "_"
+        return opportunity_key, supplier_key
+
+    def _merge_duplicate_finding_metadata(
+        self, primary: Finding, duplicate: Finding
+    ) -> None:
+        """Preserve contextual metadata when collapsing duplicate findings."""
+
+        if duplicate.policy_id and not primary.policy_id:
+            primary.policy_id = duplicate.policy_id
+
+        primary_details: Dict[str, Any] = (
+            dict(primary.calculation_details)
+            if isinstance(primary.calculation_details, dict)
+            else {}
+        )
+        duplicate_details: Dict[str, Any] = (
+            dict(duplicate.calculation_details)
+            if isinstance(duplicate.calculation_details, dict)
+            else {}
+        )
+
+        related_policies: List[str] = []
+        if primary.policy_id:
+            related_policies.append(str(primary.policy_id))
+        if duplicate.policy_id:
+            related_policies.append(str(duplicate.policy_id))
+        for payload in (primary_details.get("related_policies"), duplicate_details.get("related_policies")):
+            if isinstance(payload, list):
+                related_policies.extend(str(entry) for entry in payload if entry)
+        if related_policies:
+            primary_details["related_policies"] = sorted({p for p in related_policies if p})
+
+        for key, value in duplicate_details.items():
+            if key not in primary_details or primary_details[key] in (None, ""):
+                primary_details[key] = value
+
+        def _merge_list(field: str) -> None:
+            primary_list = getattr(primary, field, None)
+            duplicate_list = getattr(duplicate, field, None)
+            if not isinstance(primary_list, list) or not isinstance(duplicate_list, list):
+                return
+            merged: List[Any] = []
+            seen: set[str] = set()
+
+            def _serialise(value: Any) -> str:
+                try:
+                    return json.dumps(value, sort_keys=True, default=str)
+                except TypeError:
+                    return str(value)
+
+            for candidate in primary_list + duplicate_list:
+                marker = _serialise(candidate)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                merged.append(candidate)
+            setattr(primary, field, merged)
+
+        _merge_list("source_records")
+        _merge_list("candidate_suppliers")
+        _merge_list("context_documents")
+
+        primary.calculation_details = primary_details
+
     def _apply_policy_category_limits(
         self, per_policy: Dict[str, List[Finding]]
     ) -> Tuple[List[Finding], Dict[str, Dict[str, List[Finding]]]]:
@@ -659,7 +751,7 @@ class OpportunityMinerAgent(BaseAgent):
         """Retain the top findings per policy while keeping category insights."""
 
         aggregated: List[Finding] = []
-        seen_ids: set[str] = set()
+        seen_map: Dict[Tuple[str, str], int] = {}
         category_map: Dict[str, Dict[str, List[Finding]]] = {}
 
         for display, items in per_policy.items():
@@ -682,10 +774,19 @@ class OpportunityMinerAgent(BaseAgent):
                 reverse=True,
             )
 
-            top_findings = sorted_items[:2]
+            unique_sorted: List[Finding] = []
+            seen_policy: set[Tuple[str, str]] = set()
+            for finding in sorted_items:
+                key = self._finding_uniqueness_key(finding, display)
+                if key in seen_policy:
+                    continue
+                seen_policy.add(key)
+                unique_sorted.append(finding)
+
+            top_findings = unique_sorted[:2]
             policy_categories: Dict[str, List[Finding]] = {"all": top_findings}
 
-            for finding in sorted_items:
+            for finding in unique_sorted:
                 cat_raw = finding.category_id
                 category = str(cat_raw).strip() if cat_raw else "uncategorized"
                 policy_categories.setdefault(category, []).append(finding)
@@ -694,14 +795,19 @@ class OpportunityMinerAgent(BaseAgent):
             category_map[display] = policy_categories
 
             for finding in top_findings:
-                key = (
-                    finding.opportunity_ref_id
-                    or finding.opportunity_id
-                    or f"{display}:{id(finding)}"
-                )
-                if key in seen_ids:
+                key = self._finding_uniqueness_key(finding, display)
+                if key in seen_map:
+                    existing_index = seen_map[key]
+                    existing_finding = aggregated[existing_index]
+                    preferred = existing_finding
+                    comparison = finding
+                    if finding.financial_impact_gbp > existing_finding.financial_impact_gbp:
+                        aggregated[existing_index] = finding
+                        preferred = finding
+                        comparison = existing_finding
+                    self._merge_duplicate_finding_metadata(preferred, comparison)
                     continue
-                seen_ids.add(key)
+                seen_map[key] = len(aggregated)
                 aggregated.append(finding)
 
         return aggregated, category_map

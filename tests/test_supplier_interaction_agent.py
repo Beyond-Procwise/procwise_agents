@@ -1,6 +1,9 @@
+import json
 import os
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -226,3 +229,31 @@ def test_supplier_interaction_waits_using_drafts():
     assert output.data["price"] == 900.0
     assert output.data["target_price"] == 1000.0
     assert output.next_agents == ["QuoteEvaluationAgent"]
+
+
+def test_parse_response_uses_llm_when_available(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    llm_payload = {
+        "response": json.dumps(
+            {
+                "price": 775.5,
+                "lead_time_days": 7,
+                "summary": "Supplier will expedite the delivery schedule.",
+            }
+        )
+    }
+
+    monkeypatch.setattr(agent, "call_ollama", lambda **kwargs: llm_payload)
+
+    parsed = agent._parse_response(
+        "Offering revised pricing",
+        subject="Re: RFQ-20240101-ABCD1234",
+        rfq_id="RFQ-20240101-ABCD1234",
+        supplier_id="SUP-1",
+    )
+
+    assert parsed["price"] == pytest.approx(775.5)
+    assert parsed["lead_time"] == "7"
+    assert parsed["context_summary"].startswith("Supplier will expedite")
