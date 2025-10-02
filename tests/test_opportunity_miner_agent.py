@@ -213,6 +213,46 @@ def test_policy_category_limits_deduplicate_same_supplier():
     assert category_map["Supplier Consolidation"]["all"] == [finding_high]
 
 
+def test_policy_category_limits_caps_suppliers_to_two():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    observed = datetime.now(timezone.utc)
+    findings = [
+        Finding(
+            opportunity_id=f"OPP-{index}",
+            opportunity_ref_id=f"OPP-REF-{index}",
+            detector_type="Duplicate Supplier",
+            supplier_id=supplier,
+            category_id="CAT-1",
+            item_id=f"ITEM-{index}",
+            financial_impact_gbp=impact,
+            calculation_details={"source": f"policy_{index}"},
+            source_records=[f"rec-{index}"],
+            detected_on=observed,
+            policy_id=f"POL-{index}",
+        )
+        for index, (supplier, impact) in enumerate(
+            [
+                ("SUP-PRIMARY", 400.0),
+                ("SUP-PRIMARY", 325.0),
+                ("SUP-ALT-1", 210.0),
+                ("SUP-ALT-2", 150.0),
+            ],
+            start=1,
+        )
+    ]
+
+    per_policy = {"Duplicate Supplier": findings}
+
+    aggregated, category_map = agent._apply_policy_category_limits(per_policy)
+
+    assert len(aggregated) == 2
+    assert {f.supplier_id for f in aggregated} == {"SUP-PRIMARY", "SUP-ALT-1"}
+    assert category_map["Duplicate Supplier"]["all"] == aggregated
+
+
+
 def test_build_finding_normalises_decimal_inputs():
     nick = DummyNick()
     nick.query_engine = None

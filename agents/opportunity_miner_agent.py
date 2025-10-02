@@ -783,7 +783,20 @@ class OpportunityMinerAgent(BaseAgent):
                 seen_policy.add(key)
                 unique_sorted.append(finding)
 
-            top_findings = unique_sorted[:2]
+            top_findings: List[Finding] = []
+            seen_suppliers: set[str] = set()
+            for finding in unique_sorted:
+                supplier_key = self._normalise_identifier(finding.supplier_id) or "_"
+                if supplier_key in seen_suppliers:
+                    continue
+                seen_suppliers.add(supplier_key)
+                top_findings.append(finding)
+                if len(top_findings) >= 2:
+                    break
+
+            if not top_findings and unique_sorted:
+                top_findings = unique_sorted[:1]
+
             policy_categories: Dict[str, List[Finding]] = {"all": top_findings}
 
             for finding in unique_sorted:
