@@ -159,7 +159,6 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert output.data.get("email_body") == "Email body"
     assert output.next_agents == []
 
-
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
@@ -385,6 +384,7 @@ def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
             "target_price": 900.0,
             "rfq_id": "RFQ-234",
             "round": 1,
+
         },
     )
 

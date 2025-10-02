@@ -241,7 +241,6 @@ class NegotiationAgent(BaseAgent):
         counter_price = decision.get("counter_price")
         if counter_price is not None:
             counter_options.append({"price": counter_price, "terms": None, "bundle": None})
-
         if rfq_id and supplier:
             self._store_session(rfq_id, supplier, round_no, counter_price)
 
@@ -319,7 +318,6 @@ class NegotiationAgent(BaseAgent):
         if email_payload and supplier and rfq_id:
             email_output = self._invoke_email_drafting_agent(context, email_payload)
             fallback_payload = dict(email_payload)
-
         if email_output and email_output.status == AgentStatus.SUCCESS:
             email_data = email_output.data or {}
             email_action_id = email_output.action_id or email_data.get("action_id")
@@ -356,9 +354,7 @@ class NegotiationAgent(BaseAgent):
         if email_action_id:
             state["last_agent_msg_id"] = email_action_id
         self._save_session_state(rfq_id, supplier, state)
-
         public_state = self._public_state(state)
-
         data = {
             "supplier": supplier,
             "rfq_id": rfq_id,
@@ -390,7 +386,6 @@ class NegotiationAgent(BaseAgent):
             data["email_body"] = email_body
         if email_action_id:
             data["email_action_id"] = email_action_id
-
         pass_fields: Dict[str, Any] = data
 
         if next_agents:
@@ -453,7 +448,6 @@ class NegotiationAgent(BaseAgent):
 
             pass_fields = dict(data)
             pass_fields.update(merge_payload)
-
         logger.info(
             "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
         )
@@ -486,6 +480,7 @@ class NegotiationAgent(BaseAgent):
             "status": state.get("status", "ACTIVE"),
             "awaiting_response": bool(state.get("awaiting_response", False)),
         }
+
 
     def _load_session_state(
         self, rfq_id: Optional[str], supplier: Optional[str]
@@ -826,3 +821,4 @@ class NegotiationAgent(BaseAgent):
         except Exception:
             logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
             return None
+
