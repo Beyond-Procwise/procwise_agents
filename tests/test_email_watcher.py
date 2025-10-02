@@ -22,7 +22,7 @@ from services.email_watcher import (
 
 
 class StubSupplierInteractionAgent:
-    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[a-f0-9]{8}", re.IGNORECASE)
+    RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[A-Za-z0-9]{8}", re.IGNORECASE)
 
     def __init__(self):
         self.contexts: List[AgentContext] = []
@@ -214,6 +214,93 @@ def test_poll_once_matches_on_rfq_tail():
     assert "msg-tail" in state
 
 
+def test_email_watcher_maps_multiple_rfq_ids():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-multi",
+            "subject": "RFQ-20240101-abcd1234 & RFQ-20240101-efgh5678",
+            "body": (
+                "Pricing updates: RFQ-20240101-ABCD1234 is 900 GBP and RFQ-20240101-EFGH5678 is 850 GBP."
+            ),
+            "from": "supplier@example.com",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once()
+    assert len(results) == 1
+    payload = results[0]
+
+    assert payload["workflow_id"]
+    assert payload["related_rfq_ids"]
+    assert any(r.lower() == "rfq-20240101-efgh5678" for r in payload["related_rfq_ids"])
+
+    workflow_key = watcher._normalise_filter_value(payload["workflow_id"])
+    canonical_primary = watcher._canonical_rfq(payload["rfq_id"])
+    canonical_related = {
+        watcher._canonical_rfq(rfq) for rfq in payload["related_rfq_ids"] if rfq
+    }
+
+    assert canonical_primary in watcher._workflow_rfq_index.get(workflow_key, set())
+    assert canonical_related.issubset(watcher._workflow_rfq_index.get(workflow_key, set()))
+
+    assert watcher._matches_filters(payload, {"workflow_id": payload["workflow_id"]})
+
+    secondary_payload = dict(payload)
+    secondary_payload["rfq_id"] = payload["related_rfq_ids"][0]
+    assert watcher._matches_filters(secondary_payload, {"workflow_id": payload["workflow_id"]})
+
+
+def test_email_watcher_matches_mixed_case_workflow_filters(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-workflow",
+            "subject": "RFQ-20240101-abcd1234",
+            "body": "Offer for RFQ-20240101-ABCD1234 is 975",
+            "from": "supplier@example.com",
+        }
+    ]
+
+    monkeypatch.setattr("services.email_watcher.uuid.uuid4", lambda: "WF-Alpha-01")
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    results = watcher.poll_once(match_filters={"workflow_id": "wf-alpha-01"})
+
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["workflow_id"] == "WF-Alpha-01"
+
+    workflow_key = watcher._normalise_filter_value(payload["workflow_id"])
+    canonical_rfq = watcher._canonical_rfq(payload["rfq_id"])
+    assert canonical_rfq in watcher._workflow_rfq_index.get(workflow_key, set())
+
+
+def test_email_watcher_filter_matches_legacy_payload_without_workflow():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "rfq_id": "RFQ-20240101-ABCD1234",
+        "subject": "Re: RFQ-20240101-ABCD1234",
+        "from_address": "supplier@example.com",
+        "related_rfq_ids": ["RFQ-20240101-EFGH5678"],
+    }
+
+    filters = {"workflow_id": "WF-Legacy-01"}
+    watcher._apply_filter_defaults(payload, filters)
+
+    assert payload["workflow_id"] == "WF-Legacy-01"
+    assert watcher._matches_filters(payload, filters)
+
+
 def test_normalise_rfq_value_uses_last_eight_digits():
     assert SESEmailWatcher._normalise_rfq_value("RFQ-20240101-ABCD1234") == "abcd1234"
     assert SESEmailWatcher._normalise_rfq_value("RFQ-20240101-00001234") == "00001234"
@@ -360,6 +447,41 @@ def test_poll_once_without_filters_marks_match(caplog):
         and "Completed scan" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_email_watcher_resolves_tail_without_prefix(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-tail-fallback",
+            "subject": "Quote update 20240101-ABCD1234",
+            "body": "Thanks for the request 20240101-ABCD1234.",
+            "from": "supplier@example.com",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    monkeypatch.setattr(watcher, "_load_metadata", lambda rfq: {})
+    monkeypatch.setattr(watcher, "_ensure_s3_mapping", lambda *args, **kwargs: None)
+
+    def fake_tail_lookup(tail: str):
+        if tail == "abcd1234":
+            return [{"rfq_id": "RFQ-20240101-ABCD1234", "supplier_id": "SUP-TAIL"}]
+        return []
+
+    monkeypatch.setattr(watcher, "_get_rfq_candidates_for_tail", fake_tail_lookup)
+
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["rfq_id"] == "RFQ-20240101-ABCD1234"
+    assert payload["supplier_id"] == "SUP-TAIL"
+    assert payload["matched_via"]
+    assert "msg-tail-fallback" in state
 
 
 def test_poll_once_short_circuits_with_index(monkeypatch):

@@ -215,7 +215,7 @@ def test_execute_prompt_payload_skips_decision_fallback(monkeypatch):
 
 
 def test_execute_infers_recipients_and_counter_price(monkeypatch):
-    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody")
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "Subject: Hello\nBody", raising=False)
 
     agent = EmailDraftingAgent()
     payload = {
@@ -267,3 +267,131 @@ def test_execute_logs_process_action_when_service_available(monkeypatch):
     assert recorder.logged["log_process"]["user_id"] == "tester"
     assert recorder.logged["log_action"]["status"] == "completed"
     assert recorder.logged["log_action"]["process_output"]["drafts"]
+
+
+def test_email_drafting_personalises_supplier_content(monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "_chat",
+        lambda *_, **__: "Subject: Hello\nBody",
+        raising=False,
+    )
+
+    def fake_prompt_engine(agent_nick, prompt_rows=None):
+        return SimpleNamespace(get_prompt=lambda *_, **__: None)
+
+    monkeypatch.setattr(module, "PromptEngine", fake_prompt_engine, raising=False)
+    monkeypatch.setattr("agents.base_agent.PromptEngine", fake_prompt_engine)
+    monkeypatch.setattr("agents.base_agent.configure_gpu", lambda *_, **__: "cpu")
+
+    class DummyCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return DummyCursor()
+
+        def commit(self):
+            pass
+
+    class DummyRouting:
+        def log_process(self, **kwargs):
+            return None
+
+        def log_run_detail(self, **kwargs):
+            return None
+
+        def log_action(self, **kwargs):
+            return None
+
+    agent_nick = SimpleNamespace(
+        settings=SimpleNamespace(
+            script_user="tester",
+            ses_default_sender="buyer@example.com",
+            ses_inbound_bucket=None,
+            ses_inbound_prefix=None,
+            ses_inbound_s3_uri=None,
+            s3_bucket_name=None,
+            email_response_poll_seconds=1,
+            email_inbound_initial_wait_seconds=0,
+        ),
+        process_routing_service=DummyRouting(),
+        agents={},
+        prompt_engine=fake_prompt_engine(None),
+    )
+
+    agent_nick.get_db_connection = lambda: DummyConn()
+
+    agent = EmailDraftingAgent(agent_nick=agent_nick)
+    agent._store_draft = lambda draft: None
+
+    ranking = [
+        {
+            "supplier_id": "SUP-1",
+            "supplier_name": "Vendor A",
+            "avg_unit_price": 1250.0,
+            "total_spend": 250000.0,
+            "po_count": 12,
+            "invoice_count": 18,
+            "lead_time_days": 14,
+            "relationship_summary": "Long-term frame agreement",
+        },
+        {
+            "supplier_id": "SUP-2",
+            "supplier_name": "Vendor B",
+            "avg_unit_price": 1310.0,
+            "total_spend": 80000.0,
+            "po_count": 3,
+            "relationship_statements": ["New vendor onboarding in progress"],
+            "flow_coverage": 0.6,
+        },
+    ]
+
+    profiles = {
+        "SUP-1": {"items": ["High-spec laptop"], "categories": {"IT": ["Hardware"]}},
+        "SUP-2": {"items": ["Monitor"], "categories": {"IT": ["Displays"]}},
+    }
+
+    context = _make_context(
+        {
+            "ranking": ranking,
+            "supplier_profiles": profiles,
+            "currency": "GBP",
+            "tone": "friendly",
+        }
+    )
+
+    result = agent.run(context)
+    assert result.status == AgentStatus.SUCCESS
+    drafts = result.data["drafts"]
+    assert len(drafts) == 2
+
+    first_body = drafts[0]["body"]
+    second_body = drafts[1]["body"]
+
+    assert "£250,000.00" in first_body
+    assert "14 days" in first_body
+    assert "Long-term frame agreement" in first_body
+
+    assert "£80,000.00" in second_body
+    assert "New vendor onboarding" in second_body
+    assert first_body != second_body
