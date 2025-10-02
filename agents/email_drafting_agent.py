@@ -12,9 +12,10 @@ import logging
 import re
 import threading
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from jinja2 import Template
 
@@ -25,6 +26,60 @@ from utils.instructions import parse_instruction_sources
 logger = logging.getLogger(__name__)
 
 configure_gpu()
+
+
+@dataclass
+class ThreadHeaders:
+    message_id: Optional[str] = None
+    references: Optional[List[str]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if self.message_id:
+            payload["message_id"] = self.message_id
+        if self.references:
+            payload["references"] = list(self.references)
+        return payload
+
+
+@dataclass
+class DecisionContext:
+    rfq_id: Optional[str] = None
+    supplier_id: Optional[str] = None
+    supplier_name: Optional[str] = None
+    current_offer: Optional[float] = None
+    currency: Optional[str] = None
+    lead_time_weeks: Optional[float] = None
+    target_price: Optional[float] = None
+    round: Optional[int] = None
+    strategy: Optional[str] = None
+    counter_price: Optional[float] = None
+    asks: List[str] = field(default_factory=list)
+    lead_time_request: Optional[str] = None
+    rationale: Optional[str] = None
+    thread: ThreadHeaders = field(default_factory=ThreadHeaders)
+
+    def to_public_json(self) -> Dict[str, Any]:
+        payload = {
+            "rfq_id": self.rfq_id,
+            "supplier_id": self.supplier_id,
+            "supplier_name": self.supplier_name,
+            "current_offer": self.current_offer,
+            "currency": self.currency,
+            "lead_time_weeks": self.lead_time_weeks,
+            "target_price": self.target_price,
+            "round": self.round,
+            "strategy": self.strategy,
+            "counter_price": self.counter_price,
+            "asks": list(self.asks),
+            "lead_time_request": self.lead_time_request,
+            "rationale": self.rationale,
+        }
+        if isinstance(self.thread, ThreadHeaders):
+            headers = self.thread.to_dict()
+            if headers:
+                payload["thread"] = headers
+        return payload
 
 DEFAULT_PROMPT_TEMPLATE = (
     "[Subject]\n\n"
@@ -720,6 +775,27 @@ class EmailDraftingAgent(BaseAgent):
         if highlights_html:
             sections.append(highlights_html)
 
+        supplier_context_html = self._build_supplier_personalisation(
+            supplier,
+            profile,
+            template_args,
+            context,
+            instructions,
+            interaction_type,
+        )
+        if supplier_context_html:
+            sections.append(supplier_context_html)
+
+        negotiation_context = self._build_negotiation_summary(
+            interaction_type,
+            supplier,
+            template_args,
+            context,
+            instructions,
+        )
+        if negotiation_context:
+            sections.append(negotiation_context)
+
         cta = self._build_dynamic_call_to_action(
             interaction_type,
             template_args,
@@ -807,6 +883,180 @@ class EmailDraftingAgent(BaseAgent):
             return None
         items = "".join(f"<li>{escape(point)}</li>" for point in highlights[:5])
         return f"<ul>{items}</ul>"
+
+    def _build_supplier_personalisation(
+        self,
+        supplier: Dict[str, Any],
+        profile: Dict[str, Any],
+        template_args: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+        interaction_type: str,
+    ) -> Optional[str]:
+        statements: List[str] = []
+
+        currency = (
+            context.get("currency")
+            or instructions.get("currency")
+            or template_args.get("currency")
+        )
+
+        def _append(text: Optional[str]) -> None:
+            if text:
+                cleaned = str(text).strip()
+                if cleaned:
+                    statements.append(cleaned)
+
+        avg_price = self._as_float(
+            supplier.get("avg_unit_price")
+            or supplier.get("current_price")
+            or supplier.get("price")
+        )
+        if avg_price is not None:
+            price_text = self._format_currency_value(avg_price, currency)
+            _append(f"Recent average submitted pricing on record is {price_text}.")
+
+        spend_value = self._as_float(supplier.get("total_spend"))
+        if spend_value and spend_value > 0:
+            spend_text = self._format_currency_value(spend_value, currency)
+            _append(f"Year-to-date spend with your organisation totals {spend_text}.")
+
+        po_count = self._as_float(supplier.get("po_count"))
+        invoice_count = self._as_float(supplier.get("invoice_count"))
+        if po_count and po_count > 0:
+            volume_note = f"{int(po_count)} purchase orders"
+            if invoice_count and invoice_count > 0:
+                volume_note += f" across {int(invoice_count)} invoices"
+            _append(f"Our records show {volume_note} in scope for this category.")
+
+        lead_time = self._as_float(
+            supplier.get("lead_time_days")
+            or supplier.get("avg_lead_time_days")
+            or profile.get("lead_time_days")
+        )
+        if lead_time and lead_time > 0:
+            _append(f"Typical delivery performance has averaged {self._format_lead_time(lead_time)}.")
+
+        relationship_summary = supplier.get("relationship_summary")
+        if isinstance(relationship_summary, str) and relationship_summary.strip():
+            _append(relationship_summary.strip())
+
+        rel_statements = supplier.get("relationship_statements")
+        if isinstance(rel_statements, list):
+            for statement in rel_statements[:2]:
+                if isinstance(statement, str) and statement.strip():
+                    _append(statement.strip())
+
+        flow_coverage = self._as_float(supplier.get("flow_coverage"))
+        if flow_coverage is not None and flow_coverage > 0:
+            _append(
+                f"Workflow coverage against current processes is {self._format_percentage(flow_coverage)}."
+            )
+
+        relationship_cov = self._as_float(supplier.get("relationship_coverage"))
+        if relationship_cov is not None and relationship_cov > 0:
+            _append(
+                f"Relationship coverage signals {self._format_percentage(relationship_cov)} engagement across our teams."
+            )
+
+        if interaction_type != "negotiation":
+            price_score = self._as_float(supplier.get("price_score"))
+            delivery_score = self._as_float(supplier.get("delivery_score"))
+            risk_score = self._as_float(supplier.get("risk_score"))
+            final_score = self._as_float(supplier.get("final_score"))
+            score_notes: List[str] = []
+            if final_score is not None:
+                score_notes.append(f"composite score {final_score:.2f}")
+            if price_score is not None:
+                score_notes.append(f"price {price_score:.2f}")
+            if delivery_score is not None:
+                score_notes.append(f"delivery {delivery_score:.2f}")
+            if risk_score is not None:
+                score_notes.append(f"risk {risk_score:.2f}")
+            if score_notes:
+                _append("Performance scores on the latest evaluation: " + ", ".join(score_notes) + ".")
+
+        if not statements:
+            return None
+
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for sentence in statements:
+            key = sentence.lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(sentence)
+
+        if not unique:
+            return None
+
+        if len(unique) == 1:
+            return self._wrap_paragraph(unique[0])
+
+        items = "".join(f"<li>{escape(text)}</li>" for text in unique[:5])
+        return f"<p><strong>Supplier context</strong></p><ul>{items}</ul>"
+
+    def _build_negotiation_summary(
+        self,
+        interaction_type: str,
+        supplier: Dict[str, Any],
+        template_args: Dict[str, Any],
+        context: Dict[str, Any],
+        instructions: Dict[str, Any],
+    ) -> Optional[str]:
+        if interaction_type != "negotiation":
+            return None
+
+        currency = (
+            context.get("currency")
+            or instructions.get("currency")
+            or template_args.get("currency")
+        )
+        lines: List[str] = []
+
+        current_offer = (
+            context.get("current_offer")
+            or supplier.get("current_offer")
+            or supplier.get("avg_unit_price")
+        )
+        if current_offer is not None:
+            lines.append(
+                f"Your latest submitted position stands at {self._format_currency_value(current_offer, currency)}."
+            )
+
+        target_price = (
+            instructions.get("negotiation_target")
+            or context.get("target_price")
+            or supplier.get("target_price")
+        )
+        if target_price is not None:
+            lines.append(
+                f"Our target for this round is {self._format_currency_value(target_price, currency)}."
+            )
+
+        counter = context.get("counter_price") or supplier.get("counter_price")
+        if counter is not None and counter != target_price:
+            lines.append(
+                f"We are positioned to proceed at {self._format_currency_value(counter, currency)} subject to alignment on scope."
+            )
+
+        lead_time_request = (
+            context.get("lead_time_request")
+            or supplier.get("lead_time")
+            or supplier.get("lead_time_days")
+        )
+        if lead_time_request:
+            if isinstance(lead_time_request, (int, float)):
+                lead_note = self._format_lead_time(float(lead_time_request))
+            else:
+                lead_note = str(lead_time_request)
+            lines.append(f"Requested delivery commitment: {lead_note}.")
+
+        if not lines:
+            return None
+
+        combined = " ".join(lines)
+        return self._wrap_paragraph(combined)
 
     def _collect_highlights(
         self,
@@ -938,6 +1188,32 @@ class EmailDraftingAgent(BaseAgent):
             text = "Your prompt attention to this matter is greatly appreciated."
 
         return self._wrap_paragraph(text)
+
+    @staticmethod
+    def _format_percentage(value: Any) -> str:
+        try:
+            number = float(value)
+        except Exception:
+            return "0%"
+        if number < 0:
+            number = 0.0
+        if number <= 1:
+            number *= 100
+        return f"{number:.0f}%"
+
+    @staticmethod
+    def _format_lead_time(days: float) -> str:
+        try:
+            day_value = float(days)
+        except Exception:
+            return str(days)
+        rounded_days = int(round(day_value))
+        if rounded_days <= 1:
+            return "1 day"
+        weeks = day_value / 7.0
+        if weeks >= 1.5:
+            return f"{rounded_days} days (~{weeks:.1f} weeks)"
+        return f"{rounded_days} days"
 
     def _build_signature_block(self, template_args: Dict[str, Any]) -> str:
         name = template_args.get("your_name_html") or template_args.get("your_name")

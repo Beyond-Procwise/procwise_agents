@@ -8,7 +8,7 @@ import time
 import unicodedata
 import uuid
 from urllib.parse import unquote_plus, urlparse
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -349,6 +349,8 @@ class SESEmailWatcher:
         self._rfq_run_counts: Dict[str, int] = {}
         self._rfq_index_hits: Dict[str, str] = {}
         self._rfq_tail_cache: Dict[str, List[Dict[str, object]]] = {}
+        self._workflow_rfq_index: Dict[str, Set[str]] = defaultdict(set)
+        self._rfq_workflow_index: Dict[str, Set[str]] = defaultdict(set)
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._load_watermark()
@@ -817,6 +819,8 @@ class SESEmailWatcher:
             metadata = {
                 "rfq_id": processed_payload.get("rfq_id") if processed_payload else None,
                 "supplier_id": processed_payload.get("supplier_id") if processed_payload else None,
+                "workflow_id": processed_payload.get("workflow_id") if processed_payload else None,
+                "related_rfq_ids": processed_payload.get("related_rfq_ids") if processed_payload else None,
                 "processed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "processed",
                 "payload": processed_payload,
@@ -1307,22 +1311,87 @@ class SESEmailWatcher:
         subject_normalised = _norm(subject)
         body_normalised = _norm(body)
         from_address = str(message.get("from", ""))
-        rfq_id = message.get("rfq_id")
-        if not isinstance(rfq_id, str) or not rfq_id:
-            rfq_id = self._extract_rfq_id(
-                f"{subject_normalised} {body_normalised}",
-                raw_subject=subject,
-                normalised_subject=subject_normalised,
+        rfq_candidates: List[str] = []
+        tail_supplier_map: Dict[str, Optional[str]] = {}
+        raw_rfq = message.get("rfq_id")
+        if isinstance(raw_rfq, str) and raw_rfq.strip():
+            rfq_candidates.append(raw_rfq)
+        elif isinstance(raw_rfq, (list, tuple, set)):
+            for entry in raw_rfq:
+                if isinstance(entry, str) and entry.strip():
+                    rfq_candidates.append(entry)
+
+        extracted_candidates = self._extract_rfq_ids(
+            f"{subject_normalised} {body_normalised}",
+            raw_subject=subject,
+            normalised_subject=subject_normalised,
+        )
+        rfq_candidates.extend(extracted_candidates)
+
+        metadata_candidates = self._rfq_candidates_from_metadata(message)
+        for candidate, supplier_hint in metadata_candidates:
+            if candidate not in rfq_candidates:
+                rfq_candidates.append(candidate)
+            canonical_hint = self._canonical_rfq(candidate)
+            if canonical_hint and supplier_hint and canonical_hint not in tail_supplier_map:
+                tail_supplier_map[canonical_hint] = supplier_hint
+
+        canonical_map: Dict[str, str] = {}
+        ordered_canonicals: List[str] = []
+        for candidate in rfq_candidates:
+            canonical = self._canonical_rfq(candidate)
+            if not canonical or canonical in canonical_map:
+                continue
+            canonical_map[canonical] = str(candidate)
+            ordered_canonicals.append(canonical)
+
+        if not ordered_canonicals:
+            search_text = " ".join(
+                value
+                for value in (subject_normalised, body_normalised)
+                if isinstance(value, str)
             )
-        if not rfq_id:
+            for canonical, resolved_value, supplier_hint in self._resolve_rfq_from_tail_tokens(
+                search_text, message
+            ):
+                if canonical in canonical_map:
+                    continue
+                canonical_map[canonical] = resolved_value
+                ordered_canonicals.append(canonical)
+                if supplier_hint and canonical not in tail_supplier_map:
+                    tail_supplier_map[canonical] = supplier_hint
+
+        if not ordered_canonicals:
             logger.debug("Skipping email without RFQ identifier: %s", subject)
             return None, "missing_rfq_id"
+
+        primary_canonical = ordered_canonicals[0]
+        rfq_id = canonical_map[primary_canonical]
+        additional_canonicals = ordered_canonicals[1:]
+        additional_rfqs = [canonical_map[c] for c in additional_canonicals]
+
+        if not additional_rfqs and len(rfq_candidates) > 1:
+            fallback_values: List[str] = []
+            fallback_canonicals: List[str] = []
+            for candidate in rfq_candidates:
+                canonical = self._canonical_rfq(candidate)
+                if not canonical or canonical == primary_canonical:
+                    continue
+                if canonical in fallback_canonicals:
+                    continue
+                fallback_canonicals.append(canonical)
+                fallback_values.append(canonical_map.get(canonical, str(candidate)))
+            if fallback_values:
+                additional_rfqs = fallback_values
+                additional_canonicals = fallback_canonicals
 
         metadata = self._load_metadata(rfq_id)
         canonical_rfq_id = metadata.get("canonical_rfq_id")
         if canonical_rfq_id:
             rfq_id = str(canonical_rfq_id)
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
+        if not supplier_id:
+            supplier_id = tail_supplier_map.get(primary_canonical)
         target_price = metadata.get("target_price") or message.get("target_price")
         negotiation_round = metadata.get("round") or message.get("round") or 1
 
@@ -1349,6 +1418,10 @@ class SESEmailWatcher:
             },
         )
 
+        self._register_workflow_mapping(
+            context.workflow_id, [primary_canonical, *additional_canonicals]
+        )
+
         interaction_output = self.supplier_agent.execute(context)
         if interaction_output.status != AgentStatus.SUCCESS:
             error_detail = interaction_output.error
@@ -1368,6 +1441,8 @@ class SESEmailWatcher:
                     "from_address": from_address,
                     "message_body": body,
                     "target_price": target_price,
+                    "workflow_id": context.workflow_id,
+                    "related_rfq_ids": additional_rfqs,
                     "negotiation_triggered": False,
                     "supplier_status": interaction_output.status.value,
                     "negotiation_status": None,
@@ -1430,9 +1505,13 @@ class SESEmailWatcher:
                 "negotiation_status": negotiation_output.status.value if negotiation_output else None,
                 "supplier_output": interaction_output.data,
                 "negotiation_output": negotiation_output.data if negotiation_output else None,
+                "workflow_id": context.workflow_id,
+                "related_rfq_ids": additional_rfqs,
             }
         )
         self._remember_rfq_tail(rfq_id, supplier_id)
+        for extra in additional_rfqs:
+            self._remember_rfq_tail(extra, supplier_id)
         return processed, None
 
     def _load_metadata(self, rfq_id: str) -> Dict[str, object]:
@@ -1656,6 +1735,34 @@ class SESEmailWatcher:
         return _rfq_match_key(value)
 
     @staticmethod
+    def _canonical_rfq(value: object) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            canonical = _canon_id(str(value))
+        except Exception:
+            return None
+        return canonical or None
+
+    def _register_workflow_mapping(
+        self, workflow_id: Optional[str], rfq_canonicals: Iterable[str]
+    ) -> None:
+        if not rfq_canonicals:
+            return
+
+        workflow_key = None
+        if workflow_id:
+            workflow_key = self._normalise_filter_value(workflow_id)
+        for canonical in rfq_canonicals:
+            if not canonical:
+                continue
+            self._rfq_workflow_index.setdefault(canonical, set())
+            if workflow_key:
+                mapping = self._workflow_rfq_index.setdefault(workflow_key, set())
+                mapping.add(canonical)
+                self._rfq_workflow_index[canonical].add(workflow_key)
+
+    @staticmethod
     def _normalise_email(value: object) -> Optional[str]:
         if value in (None, ""):
             return None
@@ -1679,21 +1786,32 @@ class SESEmailWatcher:
             address = text
         return address.lower() if address else None
 
-    @staticmethod
-    def _matches_filters(payload: Dict[str, object], filters: Dict[str, object]) -> bool:
+    def _matches_filters(self, payload: Dict[str, object], filters: Dict[str, object]) -> bool:
         if not filters:
             return False
 
-        payload_rfq_tail = SESEmailWatcher._normalise_rfq_value(payload.get("rfq_id"))
-        payload_rfq_full = SESEmailWatcher._normalise_filter_value(payload.get("rfq_id"))
-        payload_supplier = SESEmailWatcher._normalise_filter_value(payload.get("supplier_id"))
-        payload_subject = SESEmailWatcher._normalise_filter_value(payload.get("subject")) or ""
-        payload_sender = SESEmailWatcher._normalise_filter_value(payload.get("from_address"))
-        payload_sender_email = SESEmailWatcher._normalise_email(payload.get("from_address"))
-        payload_message = SESEmailWatcher._normalise_filter_value(payload.get("message_id")) or SESEmailWatcher._normalise_filter_value(payload.get("id"))
+        payload_rfq_tail = self._normalise_rfq_value(payload.get("rfq_id"))
+        payload_rfq_full = self._normalise_filter_value(payload.get("rfq_id"))
+        payload_supplier = self._normalise_filter_value(payload.get("supplier_id"))
+        payload_subject = self._normalise_filter_value(payload.get("subject")) or ""
+        payload_sender = self._normalise_filter_value(payload.get("from_address"))
+        payload_sender_email = self._normalise_email(payload.get("from_address"))
+        payload_message = self._normalise_filter_value(payload.get("message_id")) or self._normalise_filter_value(payload.get("id"))
+        payload_workflow = self._normalise_filter_value(payload.get("workflow_id"))
+
+        payload_rfq_canonicals: Set[str] = set()
+        primary_canonical = self._canonical_rfq(payload.get("rfq_id"))
+        if primary_canonical:
+            payload_rfq_canonicals.add(primary_canonical)
+        related = payload.get("related_rfq_ids")
+        if isinstance(related, list):
+            for entry in related:
+                canonical = self._canonical_rfq(entry)
+                if canonical:
+                    payload_rfq_canonicals.add(canonical)
 
         def _like(actual: Optional[str], expected_like: object) -> bool:
-            needle = SESEmailWatcher._normalise_filter_value(expected_like)
+            needle = self._normalise_filter_value(expected_like)
             if not needle:
                 return True
             if actual is None:
@@ -1722,20 +1840,20 @@ class SESEmailWatcher:
             if expected in (None, ""):
                 continue
             if key == "rfq_id":
-                if payload_rfq_tail != SESEmailWatcher._normalise_rfq_value(expected):
+                if payload_rfq_tail != self._normalise_rfq_value(expected):
                     return False
             elif key == "rfq_id_like":
                 if not _like(payload_rfq_full, expected):
                     return False
             elif key == "supplier_id":
-                if payload_supplier != SESEmailWatcher._normalise_filter_value(expected):
+                if payload_supplier != self._normalise_filter_value(expected):
                     return False
             elif key == "supplier_id_like":
                 if not _like(payload_supplier, expected):
                     return False
             elif key == "from_address":
-                expected_normalised = SESEmailWatcher._normalise_filter_value(expected)
-                expected_email = SESEmailWatcher._normalise_email(expected)
+                expected_normalised = self._normalise_filter_value(expected)
+                expected_email = self._normalise_email(expected)
                 candidates = [payload_sender, payload_sender_email]
                 expectations = [expected_normalised, expected_email]
                 if not any(
@@ -1744,6 +1862,23 @@ class SESEmailWatcher:
                     for expected_val in expectations
                 ):
                     return False
+            elif key == "workflow_id":
+                expected_workflow = self._normalise_filter_value(expected)
+                if not expected_workflow:
+                    continue
+                if payload_workflow == expected_workflow:
+                    continue
+                workflow_map = self._workflow_rfq_index.get(expected_workflow, set())
+                if payload_rfq_canonicals and workflow_map:
+                    if any(candidate in workflow_map for candidate in payload_rfq_canonicals):
+                        continue
+                if payload_rfq_canonicals:
+                    if any(
+                        expected_workflow in self._rfq_workflow_index.get(candidate, set())
+                        for candidate in payload_rfq_canonicals
+                    ):
+                        continue
+                return False
             elif key == "from_address_like":
                 if not any(
                     _like(candidate, expected)
@@ -1752,14 +1887,14 @@ class SESEmailWatcher:
                 ):
                     return False
             elif key == "subject_contains":
-                needle = SESEmailWatcher._normalise_filter_value(expected)
+                needle = self._normalise_filter_value(expected)
                 if needle and needle not in payload_subject:
                     return False
             elif key == "subject_like":
                 if not _like(payload_subject, expected):
                     return False
             elif key == "message_id":
-                if payload_message != SESEmailWatcher._normalise_filter_value(expected):
+                if payload_message != self._normalise_filter_value(expected):
                     return False
             elif key == "message_id_like":
                 if not _like(payload_message, expected):
@@ -1782,7 +1917,7 @@ class SESEmailWatcher:
             except Exception:
                 return False
 
-        for field in ("rfq_id", "supplier_id", "from_address"):
+        for field in ("rfq_id", "supplier_id", "from_address", "workflow_id"):
             if field in filters and _should_fill(field):
                 candidate = filters.get(field)
                 if candidate not in (None, ""):
@@ -2466,13 +2601,13 @@ class SESEmailWatcher:
             )
         return attachments
 
-    def _extract_rfq_id(
+    def _extract_rfq_ids(
         self,
         text: str,
         *,
         raw_subject: Optional[str] = None,
         normalised_subject: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> List[str]:
         if not text:
             if raw_subject is not None:
                 logger.debug(
@@ -2481,7 +2616,7 @@ class SESEmailWatcher:
                     (normalised_subject or _norm(raw_subject))[:200],
                     [],
                 )
-            return None
+            return []
 
         pattern = getattr(self.supplier_agent, "RFQ_PATTERN", None)
         if not pattern:
@@ -2518,6 +2653,27 @@ class SESEmailWatcher:
             seen.add(canonical)
             candidates.append(candidate)
 
+        if not candidates:
+            loose_matches = re.findall(
+                r"RFQ(?:ID)?[:#\s-]*([0-9]{4,8})[-_\s]*([A-Za-z0-9]{4,})",
+                normalised_text,
+                flags=re.IGNORECASE,
+            )
+            for date_part, suffix in loose_matches:
+                cleaned_suffix = re.sub(r"[^A-Za-z0-9]", "", suffix)
+                if not cleaned_suffix:
+                    continue
+                trimmed_suffix = cleaned_suffix[:8]
+                trimmed_date = re.sub(r"[^0-9]", "", date_part)[-8:]
+                if len(trimmed_date) != 8 or len(trimmed_suffix) < 4:
+                    continue
+                candidate = f"RFQ-{trimmed_date}-{trimmed_suffix.upper()}"
+                canonical = _canon_id(candidate)
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                candidates.append(candidate)
+
         if raw_subject is not None:
             subject_for_log = normalised_subject or _norm(raw_subject)
             logger.debug(
@@ -2527,7 +2683,88 @@ class SESEmailWatcher:
                 candidates,
             )
 
-        return candidates[0] if candidates else None
+        return candidates
+
+    def _extract_rfq_id(
+        self,
+        text: str,
+        *,
+        raw_subject: Optional[str] = None,
+        normalised_subject: Optional[str] = None,
+    ) -> Optional[str]:
+        matches = self._extract_rfq_ids(
+            text,
+            raw_subject=raw_subject,
+            normalised_subject=normalised_subject,
+        )
+        return matches[0] if matches else None
+
+    def _rfq_candidates_from_metadata(
+        self, message: Dict[str, object]
+    ) -> List[Tuple[str, Optional[str]]]:
+        candidates: List[Tuple[str, Optional[str]]] = []
+        supplier_hint = message.get("supplier_id")
+        keys = (
+            "s3_key",
+            "id",
+            "message_id",
+            "object_key",
+            "receipt_handle",
+        )
+        for key in keys:
+            value = message.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            for match in RFQ_ID_RE.findall(value):
+                if isinstance(match, tuple):
+                    rfq_value = next((part for part in match if part), "")
+                else:
+                    rfq_value = match
+                if not rfq_value:
+                    continue
+                candidates.append((rfq_value, supplier_hint if supplier_hint else None))
+        return candidates
+
+    def _resolve_rfq_from_tail_tokens(
+        self, text: str, message: Dict[str, object]
+    ) -> List[Tuple[str, str, Optional[str]]]:
+        segments: List[str] = []
+        if isinstance(text, str) and text.strip():
+            segments.append(text)
+        for key in ("s3_key", "id", "message_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                segments.append(value)
+        combined = " ".join(segments)
+        if not combined:
+            return []
+
+        tails = re.findall(r"\b([A-Za-z0-9]{8})\b", combined)
+        if not tails:
+            return []
+
+        resolved: List[Tuple[str, str, Optional[str]]] = []
+        seen_tails: Set[str] = set()
+        for tail in tails:
+            tail_key = tail.lower()
+            if tail_key in seen_tails:
+                continue
+            seen_tails.add(tail_key)
+            lookup_records = self._get_rfq_candidates_for_tail(tail_key)
+            if not lookup_records:
+                continue
+            for record in lookup_records:
+                rfq_value = record.get("rfq_id")
+                if not rfq_value:
+                    continue
+                canonical = self._canonical_rfq(rfq_value)
+                if not canonical:
+                    continue
+                if any(existing[0] == canonical for existing in resolved):
+                    continue
+                supplier_hint = record.get("supplier_id") if isinstance(record, dict) else None
+                resolved.append((canonical, str(rfq_value), supplier_hint))
+        return resolved
 
     def _ensure_s3_mapping(self, s3_key: Optional[str], rfq_id: Optional[object]) -> Optional[str]:
         if not self.bucket or not s3_key or rfq_id is None:

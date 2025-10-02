@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -162,6 +162,94 @@ def test_build_finding_includes_policy_identifier():
     assert finding_b.opportunity_id == "2"
     assert "policy_9" in finding_a.opportunity_ref_id
     assert "policy_10" in finding_b.opportunity_ref_id
+
+
+def test_policy_category_limits_deduplicate_same_supplier():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    observed = datetime.now(timezone.utc)
+    finding_low = Finding(
+        opportunity_id="OPP-001",
+        opportunity_ref_id="OPP-REF-001",
+        detector_type="Volume Discount",
+        supplier_id="SUP-1",
+        category_id="CAT-1",
+        item_id="ITEM-1",
+        financial_impact_gbp=100.0,
+        calculation_details={"source": "policy_a"},
+        source_records=["rec-1"],
+        detected_on=observed,
+        policy_id="POL-A",
+    )
+    finding_high = Finding(
+        opportunity_id="OPP-001",
+        opportunity_ref_id="OPP-REF-001",
+        detector_type="Supplier Consolidation",
+        supplier_id="SUP-1",
+        category_id="CAT-1",
+        item_id="ITEM-1",
+        financial_impact_gbp=250.0,
+        calculation_details={"source": "policy_b"},
+        source_records=["rec-2"],
+        detected_on=observed,
+        policy_id="POL-B",
+    )
+
+    per_policy = {
+        "Volume Discount": [finding_low],
+        "Supplier Consolidation": [finding_high],
+    }
+
+    aggregated, category_map = agent._apply_policy_category_limits(per_policy)
+
+    assert len(aggregated) == 1
+    chosen = aggregated[0]
+    assert chosen.financial_impact_gbp == pytest.approx(250.0)
+    assert sorted(chosen.source_records) == ["rec-1", "rec-2"]
+    assert chosen.calculation_details.get("related_policies") == ["POL-A", "POL-B"]
+
+    assert category_map["Volume Discount"]["all"] == [finding_low]
+    assert category_map["Supplier Consolidation"]["all"] == [finding_high]
+
+
+def test_policy_category_limits_caps_suppliers_to_two():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    observed = datetime.now(timezone.utc)
+    findings = [
+        Finding(
+            opportunity_id=f"OPP-{index}",
+            opportunity_ref_id=f"OPP-REF-{index}",
+            detector_type="Duplicate Supplier",
+            supplier_id=supplier,
+            category_id="CAT-1",
+            item_id=f"ITEM-{index}",
+            financial_impact_gbp=impact,
+            calculation_details={"source": f"policy_{index}"},
+            source_records=[f"rec-{index}"],
+            detected_on=observed,
+            policy_id=f"POL-{index}",
+        )
+        for index, (supplier, impact) in enumerate(
+            [
+                ("SUP-PRIMARY", 400.0),
+                ("SUP-PRIMARY", 325.0),
+                ("SUP-ALT-1", 210.0),
+                ("SUP-ALT-2", 150.0),
+            ],
+            start=1,
+        )
+    ]
+
+    per_policy = {"Duplicate Supplier": findings}
+
+    aggregated, category_map = agent._apply_policy_category_limits(per_policy)
+
+    assert len(aggregated) == 2
+    assert {f.supplier_id for f in aggregated} == {"SUP-PRIMARY", "SUP-ALT-1"}
+    assert category_map["Duplicate Supplier"]["all"] == aggregated
 
 
 def test_build_finding_normalises_decimal_inputs():
