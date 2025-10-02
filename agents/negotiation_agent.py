@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from agents.email_drafting_agent import EmailDraftingAgent
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,8 @@ class NegotiationAgent(BaseAgent):
         super().__init__(agent_nick)
         self.device = configure_gpu()
         self._state_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._email_agent: Optional[EmailDraftingAgent] = None
+
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -212,7 +215,6 @@ class NegotiationAgent(BaseAgent):
                 "supplier_message": supplier_message,
                 "drafts": draft_records,
                 "sent_status": False,
-
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
@@ -278,6 +280,12 @@ class NegotiationAgent(BaseAgent):
             "intent": "NEGOTIATION_COUNTER",
         }
 
+        email_action_id: Optional[str] = None
+        email_subject: Optional[str] = None
+        email_body: Optional[str] = None
+        draft_records: List[Dict[str, Any]] = []
+        next_agents: List[str] = []
+
         draft_stub = {
             "rfq_id": rfq_id,
             "supplier_id": supplier,
@@ -293,12 +301,45 @@ class NegotiationAgent(BaseAgent):
         if supplier_snippets:
             draft_stub["supplier_snippets"] = supplier_snippets
         draft_stub["payload"] = draft_payload
-        draft_records.append(draft_stub)
+
+        email_payload = self._build_email_agent_payload(
+            context,
+            draft_payload,
+            decision,
+            state,
+            negotiation_message,
+        )
+
+        email_output: Optional[AgentOutput] = None
+        if email_payload and supplier and rfq_id:
+            email_output = self._invoke_email_drafting_agent(context, email_payload)
+
+        if email_output and email_output.status == AgentStatus.SUCCESS:
+            email_data = email_output.data or {}
+            email_action_id = email_output.action_id or email_data.get("action_id")
+            email_subject = email_data.get("subject")
+            email_body = email_data.get("body")
+            drafts_payload = email_data.get("drafts")
+            if isinstance(drafts_payload, list) and drafts_payload:
+                for draft in drafts_payload:
+                    if not isinstance(draft, dict):
+                        continue
+                    draft_copy = dict(draft)
+                    if email_action_id:
+                        draft_copy.setdefault("email_action_id", email_action_id)
+                    draft_records.append(draft_copy)
+            else:
+                draft_records.append(dict(draft_stub))
+        else:
+            draft_records.append(dict(draft_stub))
+            next_agents = ["EmailDraftingAgent"]
 
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
         state["current_round"] = round_no + 1
         state["last_email_sent_at"] = datetime.now(timezone.utc)
+        if email_action_id:
+            state["last_agent_msg_id"] = email_action_id
         self._save_session_state(rfq_id, supplier, state)
 
         data = {
@@ -326,6 +367,13 @@ class NegotiationAgent(BaseAgent):
             "sent_status": False,
         }
 
+        if email_subject:
+            data["email_subject"] = email_subject
+        if email_body:
+            data["email_body"] = email_body
+        if email_action_id:
+            data["email_action_id"] = email_action_id
+
         logger.info(
             "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
         )
@@ -334,7 +382,7 @@ class NegotiationAgent(BaseAgent):
             status=AgentStatus.SUCCESS,
             data=data,
             pass_fields=data,
-            next_agents=["EmailDraftingAgent"],
+            next_agents=next_agents,
         )
 
     # ------------------------------------------------------------------
@@ -653,3 +701,49 @@ class NegotiationAgent(BaseAgent):
         if isinstance(value, list):
             return value
         return [value]
+
+    def _build_email_agent_payload(
+        self,
+        context: AgentContext,
+        draft_payload: Dict[str, Any],
+        decision: Dict[str, Any],
+        state: Dict[str, Any],
+        negotiation_message: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(draft_payload, dict):
+            return None
+        payload = dict(draft_payload)
+        payload.setdefault("decision", decision)
+        payload.setdefault("session_state", self._public_state(state))
+        payload.setdefault("negotiation_message", negotiation_message)
+        payload.setdefault("supplier_reply_count", state.get("supplier_reply_count", 0))
+        supplier_name = context.input_data.get("supplier_name")
+        if supplier_name:
+            payload.setdefault("supplier_name", supplier_name)
+        contact = context.input_data.get("from_address")
+        if contact:
+            payload.setdefault("recipients", [contact])
+        payload.setdefault("intent", "NEGOTIATION_COUNTER")
+        return payload
+
+    def _invoke_email_drafting_agent(
+        self,
+        parent_context: AgentContext,
+        payload: Dict[str, Any],
+    ) -> Optional[AgentOutput]:
+        try:
+            if self._email_agent is None:
+                self._email_agent = EmailDraftingAgent(self.agent_nick)
+            email_context = AgentContext(
+                workflow_id=parent_context.workflow_id,
+                agent_id="EmailDraftingAgent",
+                user_id=parent_context.user_id,
+                input_data=payload,
+                parent_agent=parent_context.agent_id,
+                routing_history=list(parent_context.routing_history),
+            )
+            return self._email_agent.execute(email_context)
+        except Exception:
+            logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
+            return None
+
