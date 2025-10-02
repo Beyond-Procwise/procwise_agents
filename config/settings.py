@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     knowledge_graph_collection_name: str = Field(
         default="procwise_knowledge_graph", env="KNOWLEDGE_GRAPH_COLLECTION_NAME"
     )
+    learning_collection_name: str = Field(
+        default="learning", env="LEARNING_COLLECTION_NAME"
+    )
 
     # Email settings
     ses_smtp_secret_name: str = Field(
@@ -75,7 +78,7 @@ class Settings(BaseSettings):
     document_extraction_model: str = Field(
         default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
     )
-    rag_model: str = Field(default="gpt-oss:20b", env="RAG_LLM_MODEL")
+    rag_model: str = Field(default="gemma3:1b-it-qat", env="RAG_LLM_MODEL")
     # ``nomic-embed-text`` offers competitive retrieval quality with a compact
     # footprint (768 dimensions) and is optimised for procurement-style
     # documents, making it a better default for document extraction pipelines.

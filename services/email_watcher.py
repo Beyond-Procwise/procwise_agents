@@ -1038,6 +1038,46 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("Failed to ensure negotiation support tables exist")
 
+    def _load_negotiation_state(
+        self, rfq_id: Optional[str], supplier_id: Optional[str]
+    ) -> tuple[bool, Optional[str]]:
+        if not rfq_id or not supplier_id:
+            return False, None
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return False, None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT awaiting_response, last_supplier_msg_id
+                          FROM proc.negotiation_session_state
+                         WHERE rfq_id = %s AND supplier_id = %s
+                        """,
+                        (rfq_id, supplier_id),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return False, None
+                    awaiting = bool(row[0])
+                    last_msg = row[1] if len(row) > 1 else None
+                    if isinstance(last_msg, memoryview):
+                        last_msg = last_msg.tobytes()
+                    if isinstance(last_msg, (bytes, bytearray)):
+                        try:
+                            last_msg = last_msg.decode("utf-8", errors="ignore")
+                        except Exception:
+                            last_msg = str(last_msg)
+                    return awaiting, last_msg
+        except Exception:
+            logger.exception(
+                "Failed to load negotiation state for rfq %s supplier %s",
+                rfq_id,
+                supplier_id,
+            )
+        return False, None
+
     def _ensure_processed_registry_table(self) -> None:
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         if not callable(get_conn):
@@ -1462,33 +1502,43 @@ class SESEmailWatcher:
             and "NegotiationAgent" in (interaction_output.next_agents or [])
             and self.negotiation_agent is not None
         ):
-            current_offer = interaction_output.data.get("price")
-            negotiation_context = AgentContext(
-                workflow_id=context.workflow_id,
-                agent_id="NegotiationAgent",
-                user_id=context.user_id,
-                input_data={
-                    "supplier": supplier_id,
-                    "current_offer": current_offer,
-                    "target_price": target_price,
-                    "rfq_id": rfq_id,
-                    "round": negotiation_round,
-                    "message_id": processed.get("message_id"),
-                    "from_address": from_address,
-                    "supplier_message": interaction_output.data.get("response_text"),
-                },
-                parent_agent=context.agent_id,
-                routing_history=list(context.routing_history),
-            )
-            negotiation_output = self.negotiation_agent.execute(negotiation_context)
-            triggered = negotiation_output.status == AgentStatus.SUCCESS
-            logger.info(
-                "Negotiation triggered for RFQ %s (round %s) via mailbox %s; status=%s",
-                rfq_id,
-                negotiation_round,
-                self.mailbox_address,
-                negotiation_output.status.value,
-            )
+            awaiting_state, last_supplier_msg = self._load_negotiation_state(rfq_id, supplier_id)
+            message_token = processed.get("message_id")
+            message_key = str(message_token) if message_token else None
+            last_key = str(last_supplier_msg) if last_supplier_msg else None
+            if awaiting_state and (message_key is None or message_key == last_key):
+                logger.info(
+                    "Negotiation paused for RFQ %s – awaiting supplier response before counter.",
+                    rfq_id,
+                )
+            else:
+                current_offer = interaction_output.data.get("price")
+                negotiation_context = AgentContext(
+                    workflow_id=context.workflow_id,
+                    agent_id="NegotiationAgent",
+                    user_id=context.user_id,
+                    input_data={
+                        "supplier": supplier_id,
+                        "current_offer": current_offer,
+                        "target_price": target_price,
+                        "rfq_id": rfq_id,
+                        "round": negotiation_round,
+                        "message_id": message_token,
+                        "from_address": from_address,
+                        "supplier_message": interaction_output.data.get("response_text"),
+                    },
+                    parent_agent=context.agent_id,
+                    routing_history=list(context.routing_history),
+                )
+                negotiation_output = self.negotiation_agent.execute(negotiation_context)
+                triggered = negotiation_output.status == AgentStatus.SUCCESS
+                logger.info(
+                    "Negotiation triggered for RFQ %s (round %s) via mailbox %s; status=%s",
+                    rfq_id,
+                    negotiation_round,
+                    self.mailbox_address,
+                    negotiation_output.status.value,
+                )
 
         processed.update(
             {
