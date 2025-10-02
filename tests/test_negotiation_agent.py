@@ -153,6 +153,9 @@ def test_negotiation_agent_detects_final_offer(monkeypatch):
     assert output.data["session_state"]["status"].upper() == "COMPLETED"
     assert output.data["drafts"] == []
 
+def test_negotiation_agent_detects_final_offer(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
 
 def test_negotiation_agent_caps_supplier_replies(monkeypatch):
     nick = DummyNick()
@@ -279,6 +282,7 @@ def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
             "rfq_id": "RFQ-890",
             "message_id": "msg-1",
             "round": 2,
+
         },
     )
 
@@ -289,3 +293,4 @@ def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
     assert output.data["session_state"]["awaiting_response"] is True
     assert output.data["drafts"] == []
     assert saved.get("awaiting_response") is True
+

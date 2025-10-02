@@ -212,6 +212,7 @@ class NegotiationAgent(BaseAgent):
                 "supplier_message": supplier_message,
                 "drafts": draft_records,
                 "sent_status": False,
+
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
