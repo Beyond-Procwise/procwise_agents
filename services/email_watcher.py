@@ -1007,6 +1007,29 @@ class SESEmailWatcher:
                             ON proc.negotiation_sessions (rfq_id, supplier_id)
                         """
                     )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.negotiation_session_state (
+                            rfq_id TEXT NOT NULL,
+                            supplier_id TEXT NOT NULL,
+                            supplier_reply_count INTEGER NOT NULL DEFAULT 0,
+                            current_round INTEGER NOT NULL DEFAULT 1,
+                            status TEXT NOT NULL DEFAULT 'ACTIVE',
+                            awaiting_response BOOLEAN NOT NULL DEFAULT FALSE,
+                            last_supplier_msg_id TEXT,
+                            last_agent_msg_id TEXT,
+                            last_email_sent_at TIMESTAMPTZ,
+                            updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            CONSTRAINT negotiation_session_state_pk PRIMARY KEY (rfq_id, supplier_id)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx
+                            ON proc.negotiation_session_state (status)
+                        """
+                    )
                 conn.commit()
         except Exception:
             logger.exception("Failed to ensure negotiation support tables exist")
@@ -1310,6 +1333,8 @@ class SESEmailWatcher:
                 logger.warning("Invalid target price '%s' for RFQ %s", target_price, rfq_id)
                 target_price = None
 
+        processed: Dict[str, object] = {"message_id": message.get("id")}
+
         context = AgentContext(
             workflow_id=str(uuid.uuid4()),
             agent_id="supplier_interaction",
@@ -1335,22 +1360,23 @@ class SESEmailWatcher:
                 self.mailbox_address,
                 error_detail or "unknown_error",
             )
-            result = {
-                "rfq_id": rfq_id,
-                "supplier_id": supplier_id,
-                "message_id": message.get("id"),
-                "subject": subject,
-                "from_address": from_address,
-                "message_body": body,
-                "target_price": target_price,
-                "negotiation_triggered": False,
-                "supplier_status": interaction_output.status.value,
-                "negotiation_status": None,
-                "supplier_output": interaction_output.data,
-                "negotiation_output": None,
-                "error": error_detail,
-            }
-            return result, "supplier_interaction_failed"
+            processed.update(
+                {
+                    "rfq_id": rfq_id,
+                    "supplier_id": supplier_id,
+                    "subject": subject,
+                    "from_address": from_address,
+                    "message_body": body,
+                    "target_price": target_price,
+                    "negotiation_triggered": False,
+                    "supplier_status": interaction_output.status.value,
+                    "negotiation_status": None,
+                    "supplier_output": interaction_output.data,
+                    "negotiation_output": None,
+                    "error": error_detail,
+                }
+            )
+            return processed, "supplier_interaction_failed"
         negotiation_output: Optional[AgentOutput] = None
         triggered = False
 
@@ -1372,6 +1398,9 @@ class SESEmailWatcher:
                     "target_price": target_price,
                     "rfq_id": rfq_id,
                     "round": negotiation_round,
+                    "message_id": processed.get("message_id"),
+                    "from_address": from_address,
+                    "supplier_message": interaction_output.data.get("response_text"),
                 },
                 parent_agent=context.agent_id,
                 routing_history=list(context.routing_history),
@@ -1386,24 +1415,25 @@ class SESEmailWatcher:
                 negotiation_output.status.value,
             )
 
-        result = {
-            "rfq_id": rfq_id,
-            "supplier_id": supplier_id,
-            "message_id": message.get("id"),
-            "subject": subject,
-            "from_address": from_address,
-            "message_body": body,
-            "price": interaction_output.data.get("price"),
-            "lead_time": interaction_output.data.get("lead_time"),
-            "target_price": target_price,
-            "negotiation_triggered": triggered,
-            "supplier_status": interaction_output.status.value,
-            "negotiation_status": negotiation_output.status.value if negotiation_output else None,
-            "supplier_output": interaction_output.data,
-            "negotiation_output": negotiation_output.data if negotiation_output else None,
-        }
+        processed.update(
+            {
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "subject": subject,
+                "from_address": from_address,
+                "message_body": body,
+                "price": interaction_output.data.get("price"),
+                "lead_time": interaction_output.data.get("lead_time"),
+                "target_price": target_price,
+                "negotiation_triggered": triggered,
+                "supplier_status": interaction_output.status.value,
+                "negotiation_status": negotiation_output.status.value if negotiation_output else None,
+                "supplier_output": interaction_output.data,
+                "negotiation_output": negotiation_output.data if negotiation_output else None,
+            }
+        )
         self._remember_rfq_tail(rfq_id, supplier_id)
-        return result, None
+        return processed, None
 
     def _load_metadata(self, rfq_id: str) -> Dict[str, object]:
         if self.metadata_provider is not None:

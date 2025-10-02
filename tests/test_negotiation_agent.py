@@ -11,7 +11,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents.negotiation_agent import NegotiationAgent
-from agents.base_agent import AgentContext, AgentStatus
+from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
 class DummyNick:
@@ -23,8 +23,9 @@ class DummyNick:
             ses_default_sender="noreply@example.com",
         )
         self.process_routing_service = SimpleNamespace(
-            log_process=lambda **_: None,
-            log_action=lambda **_: None,
+            log_process=lambda **_: 1,
+            log_run_detail=lambda **_: "run-1",
+            log_action=lambda **_: "action-1",
         )
         self.ollama_options = lambda: {}
         self.qdrant_client = SimpleNamespace()
@@ -69,12 +70,6 @@ def test_negotiation_agent_handles_missing_fields(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
 
-    monkeypatch.setattr(
-        agent,
-        "call_ollama",
-        lambda **_: {"message": {"content": "Please share the quote details."}},
-    )
-
     context = AgentContext(
         workflow_id="wf1",
         agent_id="negotiation",
@@ -87,20 +82,44 @@ def test_negotiation_agent_handles_missing_fields(monkeypatch):
     assert output.status == AgentStatus.SUCCESS
     assert output.data["counter_proposals"] == []
     assert output.data["decision"]["strategy"] == "clarify"
-    assert "quote details" in output.data["message"].lower()
+    assert output.data["negotiation_allowed"] is True
+    assert output.data["intent"] == "NEGOTIATION_COUNTER"
+    assert output.data["message"].lower().startswith("round 1 plan")
 
 
 def test_negotiation_agent_composes_counter(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
 
-    captured: Dict[str, Any] = {}
+    stub_email_output = AgentOutput(
+        status=AgentStatus.SUCCESS,
+        data={
+            "drafts": [
+                {
+                    "supplier_id": "S1",
+                    "rfq_id": "RFQ-123",
+                    "subject": "Re: RFQ-123 – Updated commercial terms",
+                    "body": "Email body",
+                    "sent_status": False,
+                    "metadata": {
+                        "counter_price": 1250.0,
+                        "target_price": 1200.0,
+                        "current_offer": 1300.0,
+                        "round": 1,
+                    },
+                }
+            ],
+            "subject": "Re: RFQ-123 – Updated commercial terms",
+            "body": "Email body",
+        },
+    )
+    stub_email_output.action_id = "email-action-1"
 
-    def fake_call(model=None, messages=None, **kwargs):
-        captured.setdefault("calls", []).append({"model": model, "messages": messages})
-        return {"message": {"content": "Email body"}}
-
-    monkeypatch.setattr(agent, "call_ollama", fake_call)
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: stub_email_output,
+    )
 
     context = AgentContext(
         workflow_id="wf2",
@@ -122,25 +141,28 @@ def test_negotiation_agent_composes_counter(monkeypatch):
 
     assert output.data["decision"]["strategy"] == "midpoint"
     assert output.data["decision"]["counter_price"] == 1250.0
-    assert output.data["message"] == "Email body"
+    assert output.data["negotiation_allowed"] is True
+    assert output.data["intent"] == "NEGOTIATION_COUNTER"
+    assert "$" in output.data["message"] or "1250" in output.data["message"]
+    draft_payload = output.data["draft_payload"]
+    assert draft_payload["counter_price"] == 1250.0
+    assert draft_payload["negotiation_message"].startswith("Round 1 plan")
+    assert output.data["session_state"]["current_round"] == 2
+    assert output.data["session_state"]["supplier_reply_count"] == 0
+    drafts = output.data["drafts"]
+    assert isinstance(drafts, list) and len(drafts) == 1
+    stub = drafts[0]
+    assert stub["rfq_id"] == "RFQ-123"
+    assert stub["sent_status"] is False
+    assert stub.get("email_action_id") == "email-action-1"
+    assert output.data.get("email_subject") == "Re: RFQ-123 – Updated commercial terms"
+    assert output.data.get("email_body") == "Email body"
+    assert output.next_agents == []
 
-    first_call = captured["calls"][0]
-    assert first_call["model"] == "llama3.2"
-    user_prompt = first_call["messages"][1]["content"]
-    assert "RFQ-123" in user_prompt
-    assert "decision" in user_prompt
-    assert "We can ship in four weeks." in user_prompt
 
-
-def test_negotiation_agent_uses_fallback_email(monkeypatch):
+def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
-
-    monkeypatch.setattr(
-        agent,
-        "call_ollama",
-        lambda **_: {"message": {"content": ""}},
-    )
 
     context = AgentContext(
         workflow_id="wf3",
@@ -148,15 +170,226 @@ def test_negotiation_agent_uses_fallback_email(monkeypatch):
         user_id="tester",
         input_data={
             "supplier": "S2",
-            "current_offer": 2000.0,
+            "current_offer": 1750.0,
             "target_price": 1500.0,
             "rfq_id": "RFQ-789",
-            "currency": "GBP",
+            "supplier_message": "This is our final offer with no further reductions.",
+            "message_id": "msg-1",
         },
     )
 
     output = agent.run(context)
-    message = output.data["message"]
 
-    assert "align on pricing" in message.lower()
-    assert "rfq RFQ-789".lower() in message.lower()
+    assert output.data["negotiation_allowed"] is False
+    assert output.next_agents == []
+    assert "final offer" in output.data["message"].lower()
+    assert output.data["session_state"]["status"].upper() == "COMPLETED"
+    assert output.data["drafts"] == []
+
+
+def test_negotiation_agent_caps_supplier_replies(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {
+        "supplier_reply_count": 3,
+        "current_round": 4,
+        "status": "ACTIVE",
+        "awaiting_response": False,
+    }
+    saved: Dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), True),
+    )
+
+    def fake_save(rfq, supplier, new_state):
+        saved.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    context = AgentContext(
+        workflow_id="wf4",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S3",
+            "current_offer": 2200.0,
+            "target_price": 1800.0,
+            "rfq_id": "RFQ-456",
+            "message_id": "msg-final",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.data["negotiation_allowed"] is False
+    assert output.data["session_state"]["status"].upper() == "EXHAUSTED"
+    assert saved.get("status") == "EXHAUSTED"
+
+
+def test_negotiation_agent_counts_replies_only_after_counter(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {
+        "supplier_reply_count": 1,
+        "current_round": 3,
+        "status": "ACTIVE",
+        "awaiting_response": True,
+        "last_supplier_msg_id": "msg-prev",
+    }
+
+    saved: Dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), True),
+    )
+
+    def fake_save(rfq, supplier, new_state):
+        saved.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    stub_email_output = AgentOutput(
+        status=AgentStatus.SUCCESS,
+        data={
+            "drafts": [
+                {
+                    "supplier_id": "S4",
+                    "rfq_id": "RFQ-567",
+                    "subject": "Re: RFQ-567 – Updated commercial terms",
+                    "body": "Email body",
+                    "sent_status": False,
+                }
+            ],
+            "subject": "Re: RFQ-567 – Updated commercial terms",
+            "body": "Email body",
+        },
+    )
+    stub_email_output.action_id = "email-action-2"
+
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: stub_email_output,
+    )
+
+    context = AgentContext(
+        workflow_id="wf5",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S4",
+            "current_offer": 2100.0,
+            "target_price": 1800.0,
+            "rfq_id": "RFQ-567",
+            "message_id": "msg-new",
+            "round": 3,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.data["session_state"]["supplier_reply_count"] == 2
+    assert saved.get("supplier_reply_count") == 2
+    assert saved.get("awaiting_response") is True
+    assert output.data.get("email_action_id") == "email-action-2"
+    assert output.next_agents == []
+
+
+def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {
+        "supplier_reply_count": 1,
+        "current_round": 2,
+        "status": "ACTIVE",
+        "awaiting_response": True,
+        "last_supplier_msg_id": "msg-1",
+    }
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), True),
+    )
+
+    saved: Dict[str, Any] = {}
+
+    def fake_save(rfq, supplier, new_state):
+        saved.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    context = AgentContext(
+        workflow_id="wf6",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S5",
+            "current_offer": 2100.0,
+            "target_price": 1800.0,
+            "rfq_id": "RFQ-890",
+            "message_id": "msg-1",
+            "round": 2,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.data["negotiation_allowed"] is True
+    assert output.data["session_state"]["status"].upper() == "ACTIVE"
+    assert output.data["session_state"]["awaiting_response"] is True
+    assert output.data["drafts"] == []
+    assert saved.get("awaiting_response") is True
+
+
+def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state = {"supplier_reply_count": 0, "current_round": 1, "status": "ACTIVE"}
+
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda rfq, supplier: (dict(state), False),
+    )
+
+    recorded_state: Dict[str, Any] = {}
+
+    def fake_save(rfq, supplier, new_state):
+        recorded_state.update(new_state)
+
+    monkeypatch.setattr(agent, "_save_session_state", fake_save)
+
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: None,
+    )
+
+    context = AgentContext(
+        workflow_id="wf7",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S6",
+            "current_offer": 1000.0,
+            "target_price": 900.0,
+            "rfq_id": "RFQ-234",
+            "round": 1,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.next_agents == ["EmailDraftingAgent"]
+    assert output.data.get("email_action_id") is None
+    assert recorded_state.get("awaiting_response") is True

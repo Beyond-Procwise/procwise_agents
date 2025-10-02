@@ -125,8 +125,10 @@ def test_email_watcher_bootstraps_negotiation_tables():
     ddl = "".join(nick.ddl_statements)
     assert "CREATE TABLE IF NOT EXISTS proc.rfq_targets" in ddl
     assert "CREATE TABLE IF NOT EXISTS proc.negotiation_sessions" in ddl
+    assert "CREATE TABLE IF NOT EXISTS proc.negotiation_session_state" in ddl
     assert "CREATE TABLE IF NOT EXISTS proc.processed_emails" in ddl
     assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
+    assert "CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx" in ddl
 
 
 
