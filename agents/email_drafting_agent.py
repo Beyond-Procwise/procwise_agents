@@ -105,6 +105,25 @@ def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
 RFQ_TABLE_HEADER = _build_rfq_table_html([])
 
 
+NEGOTIATION_COUNTER_SYSTEM_PROMPT = (
+    "You are an elite procurement negotiator crafting decisive, relationship-aware "
+    "emails. Blend firmness with partnership, ground every request in the data "
+    "provided, and never invent figures. Keep replies under 160 words, use clear "
+    "paragraphs or short bullet points, and always reference the RFQ ID."
+)
+
+NEGOTIATION_COUNTER_USER_PROMPT = (
+    "Context (JSON):\n{payload}\n\n"
+    "Draft a high-impact counter email that: (1) anchors the counter price or asks, "
+    "(2) justifies the request with business rationale, (3) offers alternate value "
+    "creation paths (tiered pricing, lead time flex, added terms), and (4) requests "
+    "confirmation within 2–3 business days. Maintain professional warmth and avoid "
+    "hyperbole."
+)
+
+DEFAULT_NEGOTIATION_MODEL = "llama3.1:70b"
+
+
 class EmailDraftingAgent(BaseAgent):
     """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
@@ -225,6 +244,239 @@ class EmailDraftingAgent(BaseAgent):
 
         if not self.prompt_template:
             self.prompt_template = DEFAULT_PROMPT_TEMPLATE
+
+    def _handle_negotiation_counter(self, context: AgentContext, data: Dict[str, Any]) -> AgentOutput:
+        supplier_id = data.get("supplier_id")
+        supplier_name = data.get("supplier_name") or supplier_id or "Supplier"
+        rfq_id_raw = data.get("rfq_id")
+        rfq_id = str(rfq_id_raw).strip().upper() if rfq_id_raw else "RFQ"
+        decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
+        counter_price = data.get("counter_price")
+        if counter_price is None:
+            counter_price = decision.get("counter_price")
+        target_price = data.get("target_price")
+        if target_price is None:
+            target_price = decision.get("target_price")
+        current_offer = data.get("current_offer_numeric")
+        if current_offer is None:
+            current_offer = data.get("current_offer")
+        currency = data.get("currency") or decision.get("currency")
+        asks = data.get("asks") if isinstance(data.get("asks"), list) else decision.get("asks", [])
+        if not isinstance(asks, list):
+            asks = [asks] if asks else []
+        lead_time_request = data.get("lead_time_request") or decision.get("lead_time_request")
+        rationale = data.get("rationale") or decision.get("rationale")
+        negotiation_message = (
+            data.get("negotiation_message")
+            or decision.get("negotiation_message")
+            or data.get("message")
+        )
+        supplier_message = data.get("supplier_message")
+        round_value = data.get("round") or decision.get("round") or 1
+        try:
+            round_no = int(round_value)
+        except Exception:
+            round_no = 1
+        session_state = data.get("session_state") if isinstance(data.get("session_state"), dict) else {}
+        reply_count_value = data.get("supplier_reply_count")
+        if reply_count_value is None and session_state:
+            reply_count_value = session_state.get("supplier_reply_count")
+        try:
+            supplier_reply_count = int(reply_count_value) if reply_count_value is not None else 0
+        except Exception:
+            supplier_reply_count = 0
+        strategy = decision.get("strategy")
+
+        payload = {
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "round": round_no,
+            "current_offer": current_offer,
+            "target_price": target_price,
+            "counter_price": counter_price,
+            "currency": currency,
+            "asks": asks,
+            "lead_time_request": lead_time_request,
+            "rationale": rationale,
+            "negotiation_message": negotiation_message,
+            "supplier_message": supplier_message,
+            "supplier_reply_count": supplier_reply_count,
+            "strategy": strategy,
+        }
+
+        payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+        model_name = getattr(self.agent_nick.settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL)
+        messages = [
+            {"role": "system", "content": NEGOTIATION_COUNTER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": NEGOTIATION_COUNTER_USER_PROMPT.format(payload=payload_json),
+            },
+        ]
+
+        email_text = ""
+        try:
+            response = self.call_ollama(
+                model=model_name,
+                messages=messages,
+                options={"temperature": 0.35, "top_p": 0.9, "num_ctx": 4096},
+            )
+            email_text = self._extract_ollama_message(response)
+        except Exception:  # pragma: no cover - defensive composition
+            logger.exception(
+                "Failed to compose negotiation counter email via model %s", model_name
+            )
+
+        if not email_text:
+            email_text = self._build_negotiation_fallback(
+                rfq_id,
+                counter_price,
+                target_price,
+                current_offer,
+                currency,
+                asks,
+                lead_time_request,
+                negotiation_message,
+            )
+
+        body_content = self._sanitise_generated_body(email_text)
+        comment = f"<!-- RFQ-ID: {rfq_id} -->"
+        body = comment if not body_content else f"{comment}\n{body_content}"
+
+        subject_base = data.get("subject") or f"Re: {rfq_id} – Updated commercial terms"
+        subject = self._normalise_subject_line(subject_base, rfq_id) or subject_base
+        if not subject:
+            subject = f"Re: {rfq_id} – Negotiation update"
+
+        sender_email = data.get("sender") or self.agent_nick.settings.ses_default_sender
+        recipients = self._normalise_recipients(data.get("recipients") or data.get("to"))
+        receiver = recipients[0] if recipients else None
+        contact_level = 1 if recipients else 0
+
+        metadata = {
+            "counter_price": counter_price,
+            "target_price": target_price,
+            "current_offer": current_offer,
+            "round": round_no,
+            "supplier_reply_count": supplier_reply_count,
+            "strategy": strategy,
+            "asks": asks,
+            "lead_time_request": lead_time_request,
+            "rationale": rationale,
+            "intent": "NEGOTIATION_COUNTER",
+        }
+
+        draft = {
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "rfq_id": rfq_id,
+            "subject": subject,
+            "body": body,
+            "sent_status": False,
+            "sender": sender_email,
+            "recipients": recipients,
+            "receiver": receiver,
+            "contact_level": contact_level,
+            "metadata": metadata,
+        }
+
+        negotiation_extra = {
+            "negotiation_message": negotiation_message,
+            "supplier_message": supplier_message,
+        }
+        draft.update({k: v for k, v in negotiation_extra.items() if v})
+
+        action_id = data.get("action_id") or context.input_data.get("action_id")
+        if action_id:
+            draft["action_id"] = action_id
+        thread_index = data.get("thread_index")
+        try:
+            thread_index_int = int(thread_index) if thread_index is not None else 1
+        except Exception:
+            thread_index_int = 1
+        draft.setdefault("thread_index", max(1, thread_index_int))
+
+        self._store_draft(draft)
+
+        output_data: Dict[str, Any] = {
+            "drafts": [draft],
+            "subject": subject,
+            "body": body,
+            "sender": sender_email,
+            "intent": "NEGOTIATION_COUNTER",
+        }
+        if recipients:
+            output_data["recipients"] = recipients
+        if action_id:
+            output_data["action_id"] = action_id
+
+        pass_fields: Dict[str, Any] = {"drafts": [draft]}
+        if action_id:
+            pass_fields["action_id"] = action_id
+
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data=output_data,
+            pass_fields=pass_fields,
+        )
+
+    def _build_negotiation_fallback(
+        self,
+        rfq_id: str,
+        counter_price: Optional[Any],
+        target_price: Optional[Any],
+        current_offer: Optional[Any],
+        currency: Optional[str],
+        asks: List[Any],
+        lead_time_request: Optional[str],
+        negotiation_message: Optional[str],
+    ) -> str:
+        counter_text = self._format_currency_value(counter_price, currency)
+        target_text = self._format_currency_value(target_price, currency)
+        offer_text = self._format_currency_value(current_offer, currency)
+        lines = [f"Thank you for the latest update on RFQ {rfq_id}."]
+        if counter_text:
+            clause = f"To secure approvals we need to align at {counter_text}"
+            if target_text and target_text != counter_text:
+                clause += f" against our target of {target_text}"
+            if offer_text:
+                clause += f" versus your current {offer_text}."
+            else:
+                clause += "."
+            lines.append(clause)
+        elif target_text:
+            clause = f"Our pricing target remains {target_text}"
+            if offer_text:
+                clause += f" compared with your {offer_text}."
+            else:
+                clause += "."
+            lines.append(clause)
+        else:
+            lines.append("Could you share a structured unit price breakdown so we can complete approval?")
+        if lead_time_request:
+            lines.append(f"Lead time request: {lead_time_request}.")
+        asks_list = [str(item).strip() for item in asks if str(item).strip()]
+        if asks_list:
+            lines.append("Key considerations:")
+            lines.extend(f"- {item}" for item in asks_list)
+        if negotiation_message:
+            lines.append(negotiation_message)
+        lines.append("Please confirm within 2 business days so we can lock in next steps.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_ollama_message(response: Dict[str, Any]) -> str:
+        if not isinstance(response, dict):
+            return ""
+        message = response.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+        content = response.get("response")
+        if isinstance(content, str):
+            return content.strip()
+        return ""
 
     def _instruction_sources_from_policy(self, policy: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -809,6 +1061,10 @@ class EmailDraftingAgent(BaseAgent):
                 prev = {}
         if isinstance(prev, dict):
             data = {**prev, **data}
+
+        intent_value = data.get("intent")
+        if isinstance(intent_value, str) and intent_value.upper() == "NEGOTIATION_COUNTER":
+            return self._handle_negotiation_counter(context, data)
 
         ranking = data.get("ranking", [])
         findings = data.get("findings", [])
