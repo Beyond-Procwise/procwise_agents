@@ -771,13 +771,17 @@ def test_price_variance_blocks_when_supplier_missing(monkeypatch):
     output = agent.run(context)
 
     assert output.status == AgentStatus.SUCCESS
-    assert not output.data["findings"]
+    findings = [
+        f
+        for f in output.data["findings"]
+        if f["detector_type"] == "Price Benchmark Variance"
+    ]
+    assert findings, "Expected auto-detected findings even without explicit supplier"
+    assert findings[0]["calculation_details"].get("auto_detect") is True
     events = output.data.get("policy_events") or []
     assert events
     blocked = [evt for evt in events if evt["status"] == "blocked"]
-    assert blocked
-    message = blocked[0]["message"]
-    assert "supplier" in message.lower()
+    assert not blocked, "Auto-detection should avoid blocking when supplier is missing"
 
 
 def test_price_variance_auto_detects_supplier_from_po_history(monkeypatch):
@@ -897,6 +901,164 @@ def test_supplier_performance_auto_records_from_invoice_history():
     assert finding.calculation_details.get("avg_days_late") >= 1.0
     assert notifications == {"Negotiation", "Approvals", "CategoryManager"}
     assert any(event["supplier_id"] == "SI0001" for event in agent._event_log)
+
+
+def test_run_price_variance_without_supplier_still_auto_detects(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    supplier_master = pd.DataFrame(
+        {"supplier_id": ["SI0001", "SI0002"], "supplier_name": ["Alpha", "Beta"]}
+    )
+    purchase_orders = pd.DataFrame(
+        {"po_id": ["PO-1", "PO-2"], "supplier_id": ["SI0001", "SI0002"]}
+    )
+    purchase_order_lines = pd.DataFrame(
+        {
+            "po_id": ["PO-1", "PO-2"],
+            "item_id": ["ITEM-1", "ITEM-1"],
+            "unit_price": [95.0, 132.0],
+            "quantity": [10, 10],
+            "line_total": [950.0, 1320.0],
+        }
+    )
+    invoices = pd.DataFrame(
+        {
+            "invoice_id": ["INV-1", "INV-2"],
+            "po_id": ["PO-1", "PO-2"],
+            "supplier_name": ["Alpha", "Beta"],
+            "due_date": ["2024-01-10", "2024-01-12"],
+            "invoice_paid_date": ["2024-01-10", "2024-01-20"],
+            "invoice_total_incl_tax": [950.0, 1320.0],
+        }
+    )
+
+    tables = {
+        "supplier_master": supplier_master,
+        "purchase_orders": purchase_orders,
+        "purchase_order_lines": purchase_order_lines,
+        "invoices": invoices,
+    }
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    monkeypatch.setattr(
+        agent,
+        "_ingest_data",
+        lambda: {name: df.copy() for name, df in tables.items()},
+    )
+
+    policy_payload = {
+        "policyId": "oppfinderpolicy_001_price_benchmark_variance_detection",
+        "policyName": "Price Benchmark Variance",
+        "policy_desc": "oppfinderpolicy_001_price_benchmark_variance_detection",
+        "conditions": {"varianceThresholdPct": 0.05},
+    }
+
+    context = AgentContext(
+        workflow_id="wf-auto-price",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "price_variance_check",
+            "conditions": {},
+            "policies": [policy_payload],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = output.data["findings"]
+    assert findings, "Expected auto-detected price variance opportunities"
+    suppliers = {f.get("supplier_id") for f in findings}
+    assert "SI0002" in suppliers
+    blocked = [
+        event
+        for event in agent._event_log
+        if event.get("status") == "blocked"
+        and "supplier" in event.get("message", "").lower()
+    ]
+    assert not blocked, "Supplier auto-detection should prevent blocking events"
+
+
+def test_run_supplier_performance_without_records_auto_detects(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick, min_financial_impact=0)
+
+    supplier_master = pd.DataFrame(
+        {"supplier_id": ["SI0001", "SI0002"], "supplier_name": ["Alpha", "Beta"]}
+    )
+    purchase_orders = pd.DataFrame(
+        {"po_id": ["PO-1", "PO-2"], "supplier_id": ["SI0001", "SI0002"]}
+    )
+    invoices = pd.DataFrame(
+        {
+            "invoice_id": ["INV-1", "INV-2", "INV-3", "INV-4"],
+            "po_id": ["PO-1", "PO-1", "PO-2", "PO-2"],
+            "supplier_name": ["Alpha", "Alpha", "Beta", "Beta"],
+            "due_date": [
+                pd.Timestamp("2024-02-10"),
+                pd.Timestamp("2024-03-15"),
+                pd.Timestamp("2024-02-05"),
+                pd.Timestamp("2024-02-20"),
+            ],
+            "invoice_paid_date": [
+                pd.Timestamp("2024-02-18"),
+                pd.Timestamp("2024-03-25"),
+                pd.Timestamp("2024-02-05"),
+                pd.Timestamp("2024-02-20"),
+            ],
+            "invoice_total_incl_tax": [5000.0, 4500.0, 3000.0, 2800.0],
+        }
+    )
+
+    tables = {
+        "supplier_master": supplier_master,
+        "purchase_orders": purchase_orders,
+        "invoices": invoices,
+    }
+
+    monkeypatch.setattr(agent, "_output_excel", lambda findings: None)
+    monkeypatch.setattr(agent, "_output_feed", lambda findings: None)
+    monkeypatch.setattr(
+        agent,
+        "_ingest_data",
+        lambda: {name: df.copy() for name, df in tables.items()},
+    )
+
+    policy_payload = {
+        "policyId": "oppfinderpolicy_011_supplier_performance_deviation",
+        "policyName": "Supplier Performance Deviation",
+        "policy_desc": "oppfinderpolicy_011_supplier_performance_deviation",
+        "conditions": {},
+    }
+
+    context = AgentContext(
+        workflow_id="wf-auto-performance",
+        agent_id="opportunity_miner",
+        user_id="tester",
+        input_data={
+            "workflow": "supplier_performance_check",
+            "conditions": {},
+            "policies": [policy_payload],
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    findings = output.data["findings"]
+    assert findings, "Expected auto-detected supplier performance deviations"
+    suppliers = {f.get("supplier_id") for f in findings}
+    assert "SI0001" in suppliers
+    blocked = [
+        event
+        for event in agent._event_log
+        if event.get("status") == "blocked"
+        and "performance records" in event.get("message", "").lower()
+    ]
+    assert not blocked, "Auto-detected performance records should avoid blocking"
 
 
 def test_price_variance_infers_supplier_from_contract(monkeypatch):

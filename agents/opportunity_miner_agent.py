@@ -1434,10 +1434,10 @@ class OpportunityMinerAgent(BaseAgent):
                 )
 
 
-                requires_supplier = "supplier_id" in (
-                    policy_cfg.get("required_fields") or []
-                )
-                if requires_supplier:
+                required_fields = policy_cfg.get("required_fields") or []
+                supplier_autodetect = bool(policy_cfg.get("supplier_autodetect"))
+                needs_supplier = "supplier_id" in required_fields
+                if needs_supplier:
                     conditions = policy_input.get("conditions", {})
                     supplier_metadata: Optional[Dict[str, Any]] = None
                     supplier_token = (
@@ -1453,7 +1453,7 @@ class OpportunityMinerAgent(BaseAgent):
                             supplier_metadata = None
                             supplier_token = resolved_supplier
 
-                    if not self._is_condition_value(supplier_token):
+                    if not self._is_condition_value(supplier_token) and not supplier_autodetect:
                         policy_id = policy_cfg.get("policy_id", "unknown")
                         message = (
                             supplier_metadata.get("message")
@@ -2886,7 +2886,28 @@ class OpportunityMinerAgent(BaseAgent):
                 or policy.get("description")
             )
             matched_entry: Optional[Dict[str, Any]] = None
+            candidate_slug = slug_hint
+            if candidate_slug:
+                candidate_slug = candidate_slug.strip().lower()
+            if candidate_slug:
+                for key, cfg in registry.items():
+                    base_probe = self._decorate_policy_entry(
+                        key, cfg, slug_hint=slug_hint
+                    )
+                    entry_slug = str(base_probe.get("policy_slug") or "").strip().lower()
+                    alias_tokens = {
+                        alias
+                        for alias in (base_probe.get("aliases") or set())
+                        if alias
+                    }
+                    if entry_slug == candidate_slug or candidate_slug in alias_tokens:
+                        matched_entry = self._decorate_policy_entry(
+                            key, cfg, provided_policy=policy, slug_hint=slug_hint
+                        )
+                        break
             for key, cfg in registry.items():
+                if matched_entry:
+                    break
                 probe = self._decorate_policy_entry(key, cfg, slug_hint=slug_hint)
                 aliases = probe.get("aliases", set())
                 alias_tokens = {alias for alias in aliases if alias}
@@ -3009,6 +3030,9 @@ class OpportunityMinerAgent(BaseAgent):
                 ),
                 "policy_name": str(name) if name else slug,
                 "handler": handler,
+                "supplier_autodetect": bool(
+                    getattr(handler, "supports_supplier_autodetect", False)
+                ),
                 "parameters": dict(parameters),
                 "required_fields": list(parameters.keys()),
                 "default_conditions": {},
@@ -3635,11 +3659,17 @@ class OpportunityMinerAgent(BaseAgent):
             handler,
             required: Iterable[str],
             default_conditions: Optional[Dict[str, Any]] = None,
+            *,
+            supplier_autodetect: bool = False,
         ) -> Dict[str, Any]:
             aliases = {
                 self._normalise_policy_slug(slug),
                 self._normalise_policy_slug(detector),
             }
+            autodetect_enabled = bool(
+                supplier_autodetect
+                or getattr(handler, "supports_supplier_autodetect", False)
+            )
             return {
                 "policy_slug": slug,
                 "policy_id": slug,
@@ -3648,6 +3678,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "required_fields": list(required),
                 "handler": handler,
                 "default_conditions": dict(default_conditions or {}),
+                "supplier_autodetect": autodetect_enabled,
                 "aliases": {alias for alias in aliases if alias},
             }
 
@@ -3657,6 +3688,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "Price Benchmark Variance",
                 self._policy_price_benchmark_variance,
                 ["supplier_id", "item_id", "actual_price", "benchmark_price"],
+                supplier_autodetect=True,
             ),
             "volume_consolidation_check": entry(
                 "volume_consolidation_check",
@@ -3712,6 +3744,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "Supplier Performance Deviation",
                 self._policy_supplier_performance,
                 ["performance_records"],
+                supplier_autodetect=True,
             ),
             "esg_opportunity_check": entry(
                 "esg_opportunity_check",
@@ -6828,4 +6861,8 @@ class OpportunityMinerAgent(BaseAgent):
         with open(path, "w", encoding="utf-8") as f:
             json.dump([f.as_dict() for f in findings], f, ensure_ascii=False, indent=2)
         logger.info("Wrote %d findings to %s", len(findings), path)
+
+
+OpportunityMinerAgent._policy_price_benchmark_variance.supports_supplier_autodetect = True
+OpportunityMinerAgent._policy_supplier_performance.supports_supplier_autodetect = True
 
