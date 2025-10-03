@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import threading
+from typing import Optional
 from types import SimpleNamespace
 
 import pytest
@@ -229,6 +231,77 @@ def test_supplier_interaction_waits_using_drafts():
     assert output.data["price"] == 900.0
     assert output.data["target_price"] == 1000.0
     assert output.next_agents == ["QuoteEvaluationAgent"]
+
+
+def test_wait_for_multiple_responses_starts_parallel_watchers(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    created_watchers = []
+
+    class DummyWatcher:
+        def __init__(self, *args, **kwargs):
+            created_watchers.append(kwargs)
+
+    monkeypatch.setattr(
+        "services.email_watcher.SESEmailWatcher",
+        DummyWatcher,
+    )
+
+    calls = []
+
+    def fake_wait_for_response(
+        self,
+        *,
+        watcher=None,
+        timeout: int,
+        poll_interval: Optional[int] = None,
+        limit: int = 1,
+        rfq_id: Optional[str] = None,
+        supplier_id: Optional[str] = None,
+        **kwargs,
+    ):
+        assert watcher is not None
+        calls.append((threading.current_thread().name, rfq_id, supplier_id))
+        return {"rfq_id": rfq_id, "supplier_id": supplier_id}
+
+    monkeypatch.setattr(
+        SupplierInteractionAgent,
+        "wait_for_response",
+        fake_wait_for_response,
+        raising=False,
+    )
+
+    drafts = [
+        {
+            "rfq_id": "RFQ-20240101-AAA11111",
+            "supplier_id": "SUP-1",
+            "recipients": ["one@example.com"],
+            "subject": "Re: RFQ-20240101-AAA11111",
+        },
+        {
+            "rfq_id": "RFQ-20240101-BBB22222",
+            "supplier_id": "SUP-2",
+            "receiver": "two@example.com",
+            "subject": "Re: RFQ-20240101-BBB22222",
+        },
+    ]
+
+    results = agent.wait_for_multiple_responses(
+        drafts,
+        timeout=5,
+        poll_interval=1,
+        limit=1,
+    )
+
+    assert len(results) == len(drafts)
+    assert created_watchers and len(created_watchers) == len(drafts)
+    thread_names = {name for name, _rfq, _sup in calls}
+    assert thread_names == {f"supplier-watch-{idx}" for idx in range(len(drafts))}
+    assert all(
+        result and result["rfq_id"] == draft["rfq_id"]
+        for result, draft in zip(results, drafts)
+    )
 
 
 def test_parse_response_uses_llm_when_available(monkeypatch):

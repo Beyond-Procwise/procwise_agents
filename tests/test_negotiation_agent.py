@@ -157,7 +157,10 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert stub.get("email_action_id") == "email-action-1"
     assert output.data.get("email_subject") == "Re: RFQ-123 – Updated commercial terms"
     assert output.data.get("email_body") == "Email body"
-    assert output.next_agents == []
+    assert output.next_agents == ["SupplierInteractionAgent"]
+    assert output.pass_fields["await_response"] is True
+    assert output.pass_fields["message"] == ""
+    assert output.pass_fields["drafts"][0]["rfq_id"] == "RFQ-123"
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
@@ -298,7 +301,8 @@ def test_negotiation_agent_counts_replies_only_after_counter(monkeypatch):
     assert saved.get("supplier_reply_count") == 2
     assert saved.get("awaiting_response") is True
     assert output.data.get("email_action_id") == "email-action-2"
-    assert output.next_agents == []
+    assert output.next_agents == ["SupplierInteractionAgent"]
+    assert output.pass_fields.get("await_response") is True
 
 
 def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
@@ -342,11 +346,14 @@ def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.data["negotiation_allowed"] is True
-    assert output.data["session_state"]["status"].upper() == "ACTIVE"
+    assert output.data["negotiation_allowed"] is False
+    assert output.data["session_state"]["status"] == "AWAITING_SUPPLIER"
     assert output.data["session_state"]["awaiting_response"] is True
     assert output.data["drafts"] == []
     assert saved.get("awaiting_response") is True
+    assert saved.get("status") == "AWAITING_SUPPLIER"
+    assert output.next_agents == ["SupplierInteractionAgent"]
+    assert output.pass_fields["drafts"][0]["rfq_id"] == "RFQ-890"
 
 
 def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
@@ -390,6 +397,6 @@ def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.next_agents == ["EmailDraftingAgent"]
+    assert output.next_agents == ["EmailDraftingAgent", "SupplierInteractionAgent"]
     assert output.data.get("email_action_id") is None
     assert recorded_state.get("awaiting_response") is True

@@ -184,8 +184,7 @@ class NegotiationAgent(BaseAgent):
 
         if not should_continue:
             state["status"] = new_status
-            awaiting_before = bool(state.get("awaiting_response", False))
-            if awaiting_before and halt_reason == "Awaiting supplier response.":
+            if halt_reason == "Awaiting supplier response.":
                 state["awaiting_response"] = True
             else:
                 state["awaiting_response"] = False
@@ -201,7 +200,10 @@ class NegotiationAgent(BaseAgent):
                 bool(state.get("awaiting_response", False)),
                 supplier_reply_registered,
             )
-            negotiation_open = new_status not in {"COMPLETED", "EXHAUSTED"}
+            awaiting_now = bool(state.get("awaiting_response", False))
+            negotiation_open = (
+                new_status not in {"COMPLETED", "EXHAUSTED"} and not awaiting_now
+            )
             data = {
                 "supplier": supplier,
                 "rfq_id": rfq_id,
@@ -230,11 +232,24 @@ class NegotiationAgent(BaseAgent):
                 rfq_id,
                 halt_reason,
             )
+            pass_fields = dict(data)
+            next_agents: List[str] = []
+            if awaiting_now:
+                watch_fields = self._build_supplier_watch_fields(
+                    context=context,
+                    rfq_id=rfq_id,
+                    supplier=supplier,
+                    drafts=draft_records,
+                    state=state,
+                )
+                if watch_fields:
+                    pass_fields.update(watch_fields)
+                    next_agents.append("SupplierInteractionAgent")
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data=data,
-                pass_fields=data,
-                next_agents=[],
+                pass_fields=pass_fields,
+                next_agents=next_agents,
             )
 
         negotiation_message = self._build_summary(
@@ -372,7 +387,11 @@ class NegotiationAgent(BaseAgent):
             True,
             supplier_reply_registered,
         )
-        public_state = self._public_state(state)
+        cache_key: Optional[Tuple[str, str]] = None
+        if rfq_id and supplier:
+            cache_key = (str(rfq_id), str(supplier))
+        cached_state = self._state_cache.get(cache_key) if cache_key else None
+        public_state = self._public_state(cached_state or state)
         data = {
             "supplier": supplier,
             "rfq_id": rfq_id,
@@ -404,13 +423,25 @@ class NegotiationAgent(BaseAgent):
             data["email_body"] = email_body
         if email_action_id:
             data["email_action_id"] = email_action_id
-        pass_fields: Dict[str, Any] = data
+        pass_fields: Dict[str, Any] = dict(data)
+
+        supplier_watch_fields = self._build_supplier_watch_fields(
+            context=context,
+            rfq_id=rfq_id,
+            supplier=supplier,
+            drafts=draft_records,
+            state=state,
+        )
+        if supplier_watch_fields:
+            pass_fields.update(supplier_watch_fields)
+            if "SupplierInteractionAgent" not in next_agents:
+                next_agents.append("SupplierInteractionAgent")
 
         if next_agents:
             merge_payload = dict(fallback_payload or {})
             merge_payload.setdefault("intent", "NEGOTIATION_COUNTER")
             merge_payload.setdefault("decision", decision)
-            merge_payload.setdefault("session_state", public_state)
+            merge_payload["session_state"] = public_state
             if rfq_id is not None:
                 merge_payload.setdefault("rfq_id", rfq_id)
             if supplier is not None:
@@ -464,7 +495,6 @@ class NegotiationAgent(BaseAgent):
                 if key in merge_payload:
                     data[key] = merge_payload[key]
 
-            pass_fields = dict(data)
             pass_fields.update(merge_payload)
         logger.info(
             "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
@@ -621,7 +651,7 @@ class NegotiationAgent(BaseAgent):
         if replies >= MAX_SUPPLIER_REPLIES:
             return False, "EXHAUSTED", "Supplier reply cap reached."
         if state.get("awaiting_response") and not supplier_reply_registered:
-            return False, status or "ACTIVE", "Awaiting supplier response."
+            return False, "AWAITING_SUPPLIER", "Awaiting supplier response."
         return True, "ACTIVE", ""
 
     def _build_summary(
@@ -656,6 +686,71 @@ class NegotiationAgent(BaseAgent):
         if asks:
             parts.append("Key asks: " + "; ".join(asks))
         return ". ".join(parts)
+
+    def _build_supplier_watch_fields(
+        self,
+        *,
+        context: AgentContext,
+        rfq_id: Optional[str],
+        supplier: Optional[str],
+        drafts: List[Dict[str, Any]],
+        state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not rfq_id or not supplier:
+            return None
+
+        candidate_drafts: List[Dict[str, Any]] = []
+        for source in (drafts, context.input_data.get("drafts")):
+            if not source:
+                continue
+            if isinstance(source, dict):
+                source = [source]
+            if not isinstance(source, list):
+                continue
+            for entry in source:
+                if isinstance(entry, dict):
+                    candidate_drafts.append(dict(entry))
+
+        if not candidate_drafts:
+            candidate_drafts.append({"rfq_id": rfq_id, "supplier_id": supplier})
+
+        poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
+
+        watch_payload: Dict[str, Any] = {
+            "await_response": True,
+            "message": "",
+            "body": "",
+            "drafts": candidate_drafts,
+            "rfq_id": rfq_id,
+            "supplier_id": supplier,
+            "response_poll_interval": poll_interval,
+        }
+
+        timeout_setting = getattr(self.agent_nick.settings, "email_response_timeout_seconds", None)
+        if timeout_setting:
+            try:
+                timeout_value = int(timeout_setting)
+                if timeout_value > 0:
+                    watch_payload["response_timeout"] = timeout_value
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Invalid email_response_timeout_seconds=%s", timeout_setting)
+
+        if len(watch_payload["drafts"]) > 1:
+            watch_payload["await_all_responses"] = True
+
+        reply_count = state.get("supplier_reply_count")
+        if reply_count is not None:
+            watch_payload["supplier_reply_count"] = reply_count
+
+        contact = context.input_data.get("from_address")
+        if contact:
+            watch_payload.setdefault("from_address", contact)
+
+        sender = context.input_data.get("sender")
+        if sender:
+            watch_payload.setdefault("sender", sender)
+
+        return watch_payload
 
     def _build_stop_message(self, status: str, reason: str, round_no: int) -> str:
         status_text = status.capitalize()

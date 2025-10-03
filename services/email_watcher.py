@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import imaplib
 import logging
 import mimetypes
 import re
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.header import decode_header, make_header
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 import boto3
@@ -1737,7 +1738,6 @@ class SESEmailWatcher:
         prefixes: Optional[Sequence[str]] = None,
         on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
-        del mark_seen  # unused in S3-only polling
 
         if limit is not None:
             try:
@@ -1749,15 +1749,173 @@ class SESEmailWatcher:
         else:
             effective_limit = None
 
-        if not self.bucket:
-            logger.warning("S3 bucket not configured; unable to load inbound messages")
+        messages: List[Dict[str, object]] = []
+
+        if self.bucket:
+            messages = self._load_from_s3(
+                effective_limit,
+                prefixes=prefixes,
+                on_message=on_message,
+            )
+        else:
+            logger.warning("S3 bucket not configured; skipping direct poll for mailbox %s", self.mailbox_address)
+
+        if messages:
+            return messages
+
+        if self._imap_configured():
+            imap_messages = self._load_from_imap(
+                effective_limit,
+                mark_seen=bool(mark_seen),
+                on_message=on_message,
+            )
+            if imap_messages:
+                return imap_messages
+
+        return messages
+
+    def _imap_configured(self) -> bool:
+        host, user, password, _, _ = self._imap_settings()
+        return bool(host and user and password)
+
+    def _imap_settings(self) -> Tuple[
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        str,
+        str,
+    ]:
+        host = getattr(self.settings, "imap_host", None)
+        user = getattr(self.settings, "imap_user", None)
+        password = getattr(self.settings, "imap_password", None)
+        mailbox = getattr(self.settings, "imap_mailbox", "INBOX") or "INBOX"
+        search_criteria = getattr(self.settings, "imap_search_criteria", "ALL") or "ALL"
+        return host, user, password, mailbox, search_criteria
+
+    def _load_from_imap(
+        self,
+        limit: Optional[int],
+        *,
+        mark_seen: bool,
+        on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
+    ) -> List[Dict[str, object]]:
+        host, user, password, mailbox, search_criteria = self._imap_settings()
+        if not host or not user or not password:
             return []
 
-        return self._load_from_s3(
-            effective_limit,
-            prefixes=prefixes,
-            on_message=on_message,
+        collected: List[Tuple[Optional[datetime], Dict[str, object]]] = []
+        seen_ids: Set[str] = set()
+
+        try:
+            with imaplib.IMAP4_SSL(host) as client:
+                client.login(user, password)
+                status, _ = client.select(mailbox)
+                if status != "OK":
+                    logger.warning(
+                        "IMAP fallback could not select mailbox %s for %s", mailbox, self.mailbox_address
+                    )
+                    client.logout()
+                    return []
+
+                status, data = client.search(None, search_criteria)
+                if status != "OK" or not data:
+                    client.logout()
+                    return []
+
+                raw_ids = data[0].split()
+                if not raw_ids:
+                    client.logout()
+                    return []
+
+                if limit is not None and limit > 0:
+                    raw_ids = raw_ids[-limit:]
+
+                fetch_command = "(RFC822)" if mark_seen else "(BODY.PEEK[])"
+
+                for raw_id in reversed(raw_ids):
+                    message_id_str = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+                    if message_id_str in seen_ids:
+                        continue
+
+                    status, payload = client.fetch(raw_id, fetch_command)
+                    if status != "OK" or not payload:
+                        continue
+
+                    raw_bytes: Optional[bytes] = None
+                    for part in payload:
+                        if isinstance(part, tuple) and len(part) >= 2:
+                            raw_bytes = part[1]
+                            break
+                    if raw_bytes is None:
+                        continue
+
+                    parsed = self._parse_inbound_object(
+                        raw_bytes, key=f"imap/{message_id_str}"
+                    )
+                    parsed.setdefault("id", f"imap/{message_id_str}")
+                    parsed.setdefault("s3_key", f"imap/{message_id_str}")
+                    if not parsed.get("message_id"):
+                        parsed["message_id"] = parsed.get("id")
+                    parsed.setdefault("_source", "imap")
+                    timestamp = self._coerce_imap_timestamp(parsed.get("received_at"))
+                    if timestamp is None:
+                        timestamp = datetime.now(timezone.utc)
+                    collected.append((timestamp, parsed))
+                    seen_ids.add(message_id_str)
+
+                    if mark_seen:
+                        try:
+                            client.store(raw_id, "+FLAGS", "(\\Seen)")
+                        except Exception:
+                            logger.debug(
+                                "Failed to set IMAP seen flag for %s", message_id_str, exc_info=True
+                            )
+
+                    should_stop = False
+                    if on_message is not None:
+                        try:
+                            should_stop = bool(on_message(parsed, timestamp))
+                        except Exception:
+                            logger.exception(
+                                "on_message callback failed for IMAP message %s", message_id_str
+                            )
+
+                    if limit is not None and len(collected) >= limit:
+                        break
+                    if should_stop:
+                        break
+
+                client.logout()
+        except Exception:
+            logger.exception(
+                "IMAP fallback polling failed for mailbox %s", self.mailbox_address
+            )
+            return []
+
+        if not collected:
+            return []
+
+        collected.sort(
+            key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
         )
+        return [payload for _, payload in collected]
+
+    @staticmethod
+    def _coerce_imap_timestamp(value: object) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = parsedate_to_datetime(value)
+            except Exception:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        return None
 
     @staticmethod
     def _coerce_limit(value: Optional[int]) -> Optional[int]:

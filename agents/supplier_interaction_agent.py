@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import imaplib
+import threading
 import time
 import os
 from datetime import datetime, timedelta
@@ -576,6 +577,120 @@ class SupplierInteractionAgent(BaseAgent):
                 )
 
         return result
+
+    def wait_for_multiple_responses(
+        self,
+        drafts: List[Dict[str, Any]],
+        *,
+        timeout: int = 300,
+        poll_interval: Optional[int] = None,
+        limit: int = 1,
+    ) -> List[Optional[Dict]]:
+        """Spawn concurrent watchers for each draft and wait for supplier replies.
+
+        Args:
+            drafts: A list of draft payloads from ``EmailDraftingAgent``. Each
+                payload should include at least an ``rfq_id`` and ``supplier_id``.
+            timeout: Maximum seconds each watcher should wait for a reply.
+            poll_interval: Optional override for the polling cadence in seconds.
+            limit: Maximum number of messages to fetch per poll iteration.
+
+        Returns:
+            A list of supplier response payloads in the same order as ``drafts``.
+            Entries are ``None`` when the response was not observed before the
+            timeout or if the draft payload was missing required identifiers.
+        """
+
+        if not drafts:
+            return []
+
+        safe_interval = poll_interval
+        if safe_interval is not None:
+            try:
+                safe_interval = max(1, int(safe_interval))
+            except Exception:
+                safe_interval = None
+
+        results: List[Optional[Dict]] = [None] * len(drafts)
+        errors: List[Optional[BaseException]] = [None] * len(drafts)
+        lock = threading.Lock()
+        threads: List[threading.Thread] = []
+
+        try:
+            from services.email_watcher import SESEmailWatcher
+        except Exception:  # pragma: no cover - optional dependency
+            logger.exception("Unable to initialise email watcher for parallel polling")
+            return results
+
+        def _watch_single(index: int, draft: Dict[str, Any]) -> None:
+            rfq_id = draft.get("rfq_id")
+            supplier_id = draft.get("supplier_id")
+            if not rfq_id or not supplier_id:
+                logger.warning(
+                    "Skipping parallel watch for draft missing identifiers (index=%s)", index
+                )
+                return
+
+            recipient_hint = draft.get("receiver") or draft.get("recipient_email")
+            if recipient_hint is None:
+                recipients_field = draft.get("recipients")
+                if isinstance(recipients_field, (list, tuple)) and recipients_field:
+                    recipient_hint = recipients_field[0]
+                elif isinstance(recipients_field, str):
+                    recipient_hint = recipients_field
+            subject_hint = draft.get("subject")
+
+            watcher_instance = SESEmailWatcher(
+                self.agent_nick,
+                supplier_agent=self,
+                negotiation_agent=None,
+                enable_negotiation=False,
+                response_poll_seconds=safe_interval
+                if safe_interval is not None
+                else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60),
+            )
+
+            try:
+                result = self.wait_for_response(
+                    watcher=watcher_instance,
+                    timeout=timeout,
+                    poll_interval=safe_interval,
+                    limit=limit,
+                    rfq_id=rfq_id,
+                    supplier_id=supplier_id,
+                    subject_hint=subject_hint,
+                    from_address=recipient_hint,
+                )
+                with lock:
+                    results[index] = result
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception(
+                    "Parallel email watch failed for rfq_id=%s supplier=%s", rfq_id, supplier_id
+                )
+                with lock:
+                    errors[index] = exc
+
+        for idx, draft in enumerate(drafts):
+            if not isinstance(draft, dict):
+                logger.debug("Ignoring non-dict draft payload at index %s", idx)
+                continue
+            thread = threading.Thread(
+                target=_watch_single,
+                name=f"supplier-watch-{idx}",
+                args=(idx, draft),
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=timeout + 1)
+
+        for error in errors:
+            if error is not None:
+                raise error
+
+        return results
 
     @staticmethod
     def _coerce_int(value: Any, *, default: int) -> int:
