@@ -341,18 +341,30 @@ class EmailDraftingAgent(BaseAgent):
                 script_user="AgentNick",
             )
             setattr(agent_nick, "settings", settings)
+        def _safe_assign(target, name, value):
+            try:
+                setattr(target, name, value)
+                return True
+            except (AttributeError, ValueError):
+                return False
+
         if not getattr(settings, "ses_default_sender", None):
-            settings.ses_default_sender = "procurement@example.com"
+            _safe_assign(settings, "ses_default_sender", "procurement@example.com")
         if not getattr(settings, "script_user", None):
-            settings.script_user = "AgentNick"
+            _safe_assign(settings, "script_user", "AgentNick")
+
         if not getattr(settings, "negotiation_email_model", None):
-            settings.negotiation_email_model = DEFAULT_NEGOTIATION_MODEL
+            _safe_assign(settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL)
+
         if not getattr(settings, "email_compose_model", None):
-            settings.email_compose_model = getattr(
-                settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL
+            _safe_assign(
+                settings,
+                "email_compose_model",
+                getattr(settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL),
             )
+
         if not hasattr(settings, "email_polish_model"):
-            settings.email_polish_model = None
+            _safe_assign(settings, "email_polish_model", None)
 
         if not hasattr(agent_nick, "process_routing_service"):
             setattr(
