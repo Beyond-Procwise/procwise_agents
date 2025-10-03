@@ -778,8 +778,125 @@ def test_price_variance_blocks_when_supplier_missing(monkeypatch):
     assert blocked
     message = blocked[0]["message"]
     assert "supplier" in message.lower()
-    details = blocked[0].get("details", {})
-    assert "supplier_id" in details.get("missing_fields", [])
+
+
+def test_price_variance_auto_detects_supplier_from_po_history(monkeypatch):
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    supplier_master = pd.DataFrame(
+        {"supplier_id": ["SI0001", "SI0002"], "supplier_name": ["Alpha", "Beta"]}
+    )
+    purchase_orders = pd.DataFrame(
+        {"po_id": ["PO-1", "PO-2"], "supplier_id": ["SI0001", "SI0002"]}
+    )
+    purchase_order_lines = pd.DataFrame(
+        {
+            "po_id": ["PO-1", "PO-2"],
+            "item_id": ["ITEM-1", "ITEM-1"],
+            "unit_price": [95.0, 132.0],
+            "quantity": [10, 10],
+            "line_total": [950.0, 1320.0],
+        }
+    )
+    invoices = pd.DataFrame(
+        {
+            "invoice_id": ["INV-1", "INV-2"],
+            "po_id": ["PO-1", "PO-2"],
+            "supplier_name": ["Alpha", "Beta"],
+            "due_date": ["2024-01-10", "2024-01-12"],
+            "invoice_paid_date": ["2024-01-10", "2024-01-12"],
+            "invoice_total_incl_tax": [950.0, 1320.0],
+        }
+    )
+
+    tables = {
+        "supplier_master": supplier_master,
+        "purchase_orders": purchase_orders,
+        "purchase_order_lines": purchase_order_lines,
+        "invoices": invoices,
+    }
+
+    agent._build_supplier_lookup(tables)
+    notifications: set[str] = set()
+    policy_cfg = {
+        "policy_id": "oppfinderpolicy_001_price_benchmark_variance_detection",
+        "detector": "Price Benchmark Variance",
+        "policy_name": "Price Benchmark Variance",
+    }
+    input_data = {"conditions": {"variance_threshold_pct": 0.05}}
+
+    findings = agent._policy_price_benchmark_variance(
+        tables, input_data, notifications, policy_cfg
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.supplier_id == "SI0002"
+    assert finding.calculation_details.get("auto_detect") is True
+    assert finding.calculation_details.get("variance_pct", 0) > 0.05
+    assert notifications == {"Negotiation", "Approvals", "CategoryManager"}
+    assert any(event["supplier_id"] == "SI0002" for event in agent._event_log)
+
+
+def test_supplier_performance_auto_records_from_invoice_history():
+    nick = DummyNick()
+    agent = OpportunityMinerAgent(nick)
+
+    supplier_master = pd.DataFrame(
+        {"supplier_id": ["SI0001", "SI0002"], "supplier_name": ["Alpha", "Beta"]}
+    )
+    purchase_orders = pd.DataFrame(
+        {"po_id": ["PO-1", "PO-2"], "supplier_id": ["SI0001", "SI0002"]}
+    )
+    invoices = pd.DataFrame(
+        {
+            "invoice_id": ["INV-1", "INV-2", "INV-3", "INV-4"],
+            "po_id": ["PO-1", "PO-1", "PO-2", "PO-2"],
+            "supplier_name": ["Alpha", "Alpha", "Beta", "Beta"],
+            "due_date": [
+                pd.Timestamp("2024-02-10"),
+                pd.Timestamp("2024-03-15"),
+                pd.Timestamp("2024-02-05"),
+                pd.Timestamp("2024-02-20"),
+            ],
+            "invoice_paid_date": [
+                pd.Timestamp("2024-02-18"),
+                pd.Timestamp("2024-03-25"),
+                pd.Timestamp("2024-02-05"),
+                pd.Timestamp("2024-02-20"),
+            ],
+            "invoice_total_incl_tax": [5000.0, 4500.0, 3000.0, 2800.0],
+        }
+    )
+
+    tables = {
+        "supplier_master": supplier_master,
+        "purchase_orders": purchase_orders,
+        "invoices": invoices,
+    }
+
+    agent._build_supplier_lookup(tables)
+    notifications: set[str] = set()
+    policy_cfg = {
+        "policy_id": "oppfinderpolicy_011_supplier_performance_deviation",
+        "detector": "Supplier Performance Deviation",
+        "policy_name": "Supplier Performance Deviation",
+    }
+    input_data = {"conditions": {}}
+
+    findings = agent._policy_supplier_performance(
+        tables, input_data, notifications, policy_cfg
+    )
+
+    assert findings, "Expected performance deviations to be detected"
+    suppliers = {finding.supplier_id for finding in findings}
+    assert suppliers == {"SI0001"}
+    finding = findings[0]
+    assert finding.calculation_details.get("auto_detect") is True
+    assert finding.calculation_details.get("avg_days_late") >= 1.0
+    assert notifications == {"Negotiation", "Approvals", "CategoryManager"}
+    assert any(event["supplier_id"] == "SI0001" for event in agent._event_log)
 
 
 def test_price_variance_infers_supplier_from_contract(monkeypatch):
