@@ -1434,10 +1434,10 @@ class OpportunityMinerAgent(BaseAgent):
                 )
 
 
-                requires_supplier = "supplier_id" in (
-                    policy_cfg.get("required_fields") or []
-                )
-                if requires_supplier:
+                required_fields = policy_cfg.get("required_fields") or []
+                supplier_autodetect = bool(policy_cfg.get("supplier_autodetect"))
+                needs_supplier = "supplier_id" in required_fields
+                if needs_supplier:
                     conditions = policy_input.get("conditions", {})
                     supplier_metadata: Optional[Dict[str, Any]] = None
                     supplier_token = (
@@ -1453,7 +1453,7 @@ class OpportunityMinerAgent(BaseAgent):
                             supplier_metadata = None
                             supplier_token = resolved_supplier
 
-                    if not self._is_condition_value(supplier_token):
+                    if not self._is_condition_value(supplier_token) and not supplier_autodetect:
                         policy_id = policy_cfg.get("policy_id", "unknown")
                         message = (
                             supplier_metadata.get("message")
@@ -2886,7 +2886,28 @@ class OpportunityMinerAgent(BaseAgent):
                 or policy.get("description")
             )
             matched_entry: Optional[Dict[str, Any]] = None
+            candidate_slug = slug_hint
+            if candidate_slug:
+                candidate_slug = candidate_slug.strip().lower()
+            if candidate_slug:
+                for key, cfg in registry.items():
+                    base_probe = self._decorate_policy_entry(
+                        key, cfg, slug_hint=slug_hint
+                    )
+                    entry_slug = str(base_probe.get("policy_slug") or "").strip().lower()
+                    alias_tokens = {
+                        alias
+                        for alias in (base_probe.get("aliases") or set())
+                        if alias
+                    }
+                    if entry_slug == candidate_slug or candidate_slug in alias_tokens:
+                        matched_entry = self._decorate_policy_entry(
+                            key, cfg, provided_policy=policy, slug_hint=slug_hint
+                        )
+                        break
             for key, cfg in registry.items():
+                if matched_entry:
+                    break
                 probe = self._decorate_policy_entry(key, cfg, slug_hint=slug_hint)
                 aliases = probe.get("aliases", set())
                 alias_tokens = {alias for alias in aliases if alias}
@@ -3009,6 +3030,9 @@ class OpportunityMinerAgent(BaseAgent):
                 ),
                 "policy_name": str(name) if name else slug,
                 "handler": handler,
+                "supplier_autodetect": bool(
+                    getattr(handler, "supports_supplier_autodetect", False)
+                ),
                 "parameters": dict(parameters),
                 "required_fields": list(parameters.keys()),
                 "default_conditions": {},
@@ -3635,11 +3659,17 @@ class OpportunityMinerAgent(BaseAgent):
             handler,
             required: Iterable[str],
             default_conditions: Optional[Dict[str, Any]] = None,
+            *,
+            supplier_autodetect: bool = False,
         ) -> Dict[str, Any]:
             aliases = {
                 self._normalise_policy_slug(slug),
                 self._normalise_policy_slug(detector),
             }
+            autodetect_enabled = bool(
+                supplier_autodetect
+                or getattr(handler, "supports_supplier_autodetect", False)
+            )
             return {
                 "policy_slug": slug,
                 "policy_id": slug,
@@ -3648,6 +3678,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "required_fields": list(required),
                 "handler": handler,
                 "default_conditions": dict(default_conditions or {}),
+                "supplier_autodetect": autodetect_enabled,
                 "aliases": {alias for alias in aliases if alias},
             }
 
@@ -3657,6 +3688,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "Price Benchmark Variance",
                 self._policy_price_benchmark_variance,
                 ["supplier_id", "item_id", "actual_price", "benchmark_price"],
+                supplier_autodetect=True,
             ),
             "volume_consolidation_check": entry(
                 "volume_consolidation_check",
@@ -3712,6 +3744,7 @@ class OpportunityMinerAgent(BaseAgent):
                 "Supplier Performance Deviation",
                 self._policy_supplier_performance,
                 ["performance_records"],
+                supplier_autodetect=True,
             ),
             "esg_opportunity_check": entry(
                 "esg_opportunity_check",
@@ -4796,6 +4829,201 @@ class OpportunityMinerAgent(BaseAgent):
 
         return findings
 
+    def _auto_detect_price_variance(
+        self,
+        tables: Dict[str, pd.DataFrame],
+        policy_cfg: Dict[str, Any],
+        threshold_pct: float,
+        *,
+        supplier_filter: Optional[str] = None,
+        item_filter: Optional[Any] = None,
+        quantity_override: Optional[float] = None,
+    ) -> List[Finding]:
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        if (
+            po_lines.empty
+            or "po_id" not in po_lines.columns
+            or "item_id" not in po_lines.columns
+        ):
+            return []
+
+        df = po_lines.dropna(subset=["po_id", "item_id"]).copy()
+        if df.empty:
+            return []
+
+        df["po_id"] = df["po_id"].map(self._normalise_identifier)
+        df["item_id"] = df["item_id"].astype(str).str.strip()
+        df = df.dropna(subset=["po_id"])
+        df = df[df["item_id"].astype(str).str.strip() != ""]
+        df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
+        df["supplier_id"] = df["supplier_id"].map(self._resolve_supplier_id)
+        df = df.dropna(subset=["supplier_id"])
+        if df.empty:
+            return []
+
+        if supplier_filter:
+            df = df[df["supplier_id"] == supplier_filter]
+        if item_filter:
+            norm_item = str(item_filter).strip()
+            df = df[df["item_id"].str.casefold() == norm_item.casefold()]
+        if df.empty:
+            return []
+
+        value_col = self._choose_first_column(df, _PURCHASE_LINE_VALUE_COLUMNS)
+        price_col = self._choose_first_column(df, ["unit_price_gbp", "unit_price"])
+        qty_col = "quantity" if "quantity" in df.columns else None
+
+        if price_col:
+            df["unit_price_calc"] = pd.to_numeric(
+                df[price_col], errors="coerce"
+            )
+        else:
+            df["unit_price_calc"] = pd.Series(
+                [float("nan")] * len(df), index=df.index, dtype="float64"
+            )
+        if value_col:
+            df["line_value_calc"] = pd.to_numeric(
+                df[value_col], errors="coerce"
+            )
+        else:
+            df["line_value_calc"] = pd.Series(
+                [float("nan")] * len(df), index=df.index, dtype="float64"
+            )
+        if qty_col:
+            df["quantity_calc"] = pd.to_numeric(df[qty_col], errors="coerce")
+        else:
+            df["quantity_calc"] = pd.Series(
+                [float("nan")] * len(df), index=df.index, dtype="float64"
+            )
+
+        with_value = df["line_value_calc"].notna()
+        with_quantity = df["quantity_calc"].notna()
+        with_price = df["unit_price_calc"].notna()
+
+        # derive missing quantities from value and price when possible
+        fill_quantity = with_value & with_price & ~with_quantity
+        if fill_quantity.any():
+            denom = df.loc[fill_quantity, "unit_price_calc"].replace(0, pd.NA)
+            df.loc[fill_quantity, "quantity_calc"] = (
+                df.loc[fill_quantity, "line_value_calc"] / denom
+            )
+
+        # derive missing unit price from value and quantity
+        with_value = df["line_value_calc"].notna()
+        with_quantity = df["quantity_calc"].notna()
+        fill_price = with_value & with_quantity & ~with_price
+        if fill_price.any():
+            denom = df.loc[fill_price, "quantity_calc"].replace(0, pd.NA)
+            df.loc[fill_price, "unit_price_calc"] = (
+                df.loc[fill_price, "line_value_calc"] / denom
+            )
+
+        # default quantity to 1 when still missing
+        df.loc[df["quantity_calc"].isna(), "quantity_calc"] = 1.0
+
+        df.loc[df["unit_price_calc"].isna(), "unit_price_calc"] = df.loc[
+            df["unit_price_calc"].isna(), "line_value_calc"
+        ]
+        df.loc[df["line_value_calc"].isna(), "line_value_calc"] = (
+            df.loc[df["line_value_calc"].isna(), "unit_price_calc"]
+            * df.loc[df["line_value_calc"].isna(), "quantity_calc"]
+        )
+
+        df = df.replace([pd.NA, float("inf"), float("-inf")], float("nan"))
+        df = df.dropna(subset=["unit_price_calc", "quantity_calc", "line_value_calc"])
+        if df.empty:
+            return []
+
+        df = df[(df["unit_price_calc"] > 0) & (df["quantity_calc"] > 0)]
+        if df.empty:
+            return []
+
+        grouped = (
+            df.groupby(["item_id", "supplier_id"], as_index=False)
+            .agg(
+                total_qty=("quantity_calc", "sum"),
+                avg_price=("unit_price_calc", "mean"),
+                total_value=("line_value_calc", "sum"),
+            )
+            .dropna()
+        )
+        if grouped.empty:
+            return []
+
+        supplier_counts = (
+            grouped.groupby("item_id")["supplier_id"].nunique().to_dict()
+        )
+        if not any(count >= 2 for count in supplier_counts.values()):
+            return []
+
+        benchmark_map = grouped.groupby("item_id")["avg_price"].min().to_dict()
+        po_sources = (
+            df.groupby(["item_id", "supplier_id"])["po_id"]
+            .apply(
+                lambda series: [
+                    value
+                    for value in dict.fromkeys(
+                        [str(po).strip() for po in series if pd.notna(po)]
+                    )
+                    if value
+                ]
+            )
+            .to_dict()
+        )
+
+        detector = policy_cfg.get("detector", "Price Benchmark Variance")
+        policy_id = policy_cfg.get("policy_id")
+        policy_name = policy_cfg.get("policy_name")
+
+        findings: List[Finding] = []
+        for row in grouped.itertuples(index=False):
+            item_id = getattr(row, "item_id")
+            supplier_id = getattr(row, "supplier_id")
+            if supplier_counts.get(item_id, 0) < 2:
+                continue
+            benchmark_price = benchmark_map.get(item_id)
+            if benchmark_price in (None, 0, 0.0):
+                continue
+            actual_price = float(getattr(row, "avg_price", 0.0) or 0.0)
+            if actual_price <= benchmark_price:
+                continue
+            variance_pct = (actual_price - benchmark_price) / benchmark_price
+            if variance_pct <= threshold_pct:
+                continue
+            total_qty = float(getattr(row, "total_qty", 0.0) or 0.0)
+            if quantity_override and quantity_override > 0:
+                total_qty = max(total_qty, float(quantity_override))
+            if total_qty <= 0:
+                total_qty = 1.0
+            impact = (actual_price - benchmark_price) * total_qty
+            po_ids = po_sources.get((item_id, supplier_id), [])
+            invoice_ids = self._invoice_ids_for_po(tables, po_ids)
+            sources = po_ids[:5] + invoice_ids[:5]
+            if not sources and item_id is not None:
+                sources = [str(item_id)]
+            category_id = self._category_for_po(po_ids[0]) if po_ids else None
+            details = {
+                "actual_price": actual_price,
+                "benchmark_price": benchmark_price,
+                "variance_pct": variance_pct,
+                "quantity": total_qty,
+                "auto_detect": True,
+            }
+            finding = self._build_finding(
+                detector,
+                supplier_id,
+                category_id,
+                item_id,
+                impact,
+                details,
+                sources,
+                policy_id=policy_id,
+                policy_name=policy_name,
+            )
+            findings.append(finding)
+
+        return findings
+
     def _policy_price_benchmark_variance(
         self,
         tables: Dict[str, pd.DataFrame],
@@ -4807,26 +5035,95 @@ class OpportunityMinerAgent(BaseAgent):
         policy_id = policy_cfg["policy_id"]
         detector = policy_cfg["detector"]
 
-        supplier_id, supplier_meta = self._resolve_policy_supplier(input_data)
-        if not supplier_id:
-            message = supplier_meta.get("message") if supplier_meta else None
-            if not message:
-                message = "Supplier identifier missing from policy conditions"
-            self._log_policy_event(
-                policy_id,
-                None,
-                "blocked",
-                message,
-                supplier_meta if supplier_meta else {},
-            )
-            return findings
-
-        item_id = self._get_condition(input_data, "item_id")
-        actual_price = self._to_float(self._get_condition(input_data, "actual_price"))
-        benchmark_price = self._to_float(self._get_condition(input_data, "benchmark_price"))
-        quantity = max(self._to_float(self._get_condition(input_data, "quantity", 1.0), 1.0), 1.0)
         threshold_pct = self._to_float(
             self._get_condition(input_data, "variance_threshold_pct", 0.0)
+        )
+        quantity_override = self._to_float(self._get_condition(input_data, "quantity"))
+
+        supplier_filter = self._resolve_supplier_id(
+            self._get_condition(input_data, "supplier_id")
+        )
+        item_filter = self._get_condition(input_data, "item_id")
+
+        actual_price = self._to_float(self._get_condition(input_data, "actual_price"))
+        benchmark_price = self._to_float(
+            self._get_condition(input_data, "benchmark_price")
+        )
+
+        auto_mode = (
+            supplier_filter is None
+            or actual_price is None
+            or benchmark_price is None
+            or actual_price <= 0
+            or benchmark_price <= 0
+        )
+
+        if auto_mode:
+            auto_findings = self._auto_detect_price_variance(
+                tables,
+                policy_cfg,
+                threshold_pct,
+                supplier_filter=supplier_filter,
+                item_filter=item_filter,
+                quantity_override=quantity_override,
+            )
+            if auto_findings:
+                for finding in auto_findings:
+                    details = (
+                        finding.calculation_details
+                        if isinstance(finding.calculation_details, dict)
+                        else {}
+                    )
+                    self._record_escalation(
+                        policy_id,
+                        finding.supplier_id,
+                        "Price variance threshold breached",
+                        details,
+                    )
+                self._default_notifications(notifications)
+                return auto_findings
+
+            message = "No suppliers exceeded the benchmark variance threshold"
+            context: Dict[str, Any] = {
+                "threshold_pct": threshold_pct,
+                "auto_detect": True,
+            }
+            if supplier_filter:
+                context["supplier_id"] = supplier_filter
+            if item_filter:
+                context["item_id"] = item_filter
+            self._log_policy_event(policy_id, None, "no_action", message, context)
+            return findings
+
+        supplier_id = supplier_filter
+        supplier_meta: Optional[Dict[str, Any]] = None
+        if not supplier_id:
+            supplier_id, supplier_meta = self._resolve_policy_supplier(input_data)
+            if not supplier_id:
+                message = supplier_meta.get("message") if supplier_meta else None
+                if not message:
+                    message = "Supplier identifier missing from policy conditions"
+                self._log_policy_event(
+                    policy_id,
+                    None,
+                    "blocked",
+                    message,
+                    supplier_meta if supplier_meta else {},
+                )
+                return findings
+
+        item_id = item_filter or self._get_condition(input_data, "item_id")
+        actual_price = actual_price or self._to_float(
+            self._get_condition(input_data, "actual_price")
+        )
+        benchmark_price = benchmark_price or self._to_float(
+            self._get_condition(input_data, "benchmark_price")
+        )
+        quantity = max(
+            self._to_float(
+                quantity_override if quantity_override is not None else 1.0, 1.0
+            ),
+            1.0,
         )
 
         if benchmark_price <= 0:
@@ -6026,6 +6323,139 @@ class OpportunityMinerAgent(BaseAgent):
             )
         return findings
 
+    def _auto_supplier_performance_records(
+        self,
+        tables: Dict[str, pd.DataFrame],
+        *,
+        threshold: float,
+        supplier_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        invoices = tables.get("invoices", pd.DataFrame())
+        if invoices.empty or "invoice_id" not in invoices.columns:
+            return []
+
+        df = invoices.dropna(subset=["invoice_id"]).copy()
+        if df.empty:
+            return []
+
+        df["invoice_id"] = df["invoice_id"].map(self._normalise_identifier)
+        df = df.dropna(subset=["invoice_id"])
+        if df.empty:
+            return []
+
+        supplier_id_col = self._find_column_for_key(df, "supplier_id")
+        if supplier_id_col and supplier_id_col in df.columns:
+            df[supplier_id_col] = df[supplier_id_col].map(self._resolve_supplier_id)
+        supplier_name_col = self._find_column_for_key(df, "supplier_name")
+        if supplier_name_col and supplier_name_col in df.columns:
+            resolved_names = df[supplier_name_col].map(self._resolve_supplier_id)
+            if supplier_id_col and supplier_id_col in df.columns:
+                mask = df[supplier_id_col].isna()
+                df.loc[mask, supplier_id_col] = resolved_names[mask]
+            else:
+                df["__supplier_name_resolved"] = resolved_names
+
+        df["supplier_id_resolved"] = df.get(supplier_id_col) if supplier_id_col else None
+        if "supplier_id_resolved" not in df.columns or df["supplier_id_resolved"].isna().all():
+            df["supplier_id_resolved"] = df["invoice_id"].map(self._invoice_supplier_map)
+        if df["supplier_id_resolved"].isna().any() and "po_id" in df.columns:
+            po_norm = df["po_id"].map(self._normalise_identifier)
+            fallback = po_norm.map(self._po_supplier_map)
+            df.loc[df["supplier_id_resolved"].isna(), "supplier_id_resolved"] = fallback[
+                df["supplier_id_resolved"].isna()
+            ]
+        if "__supplier_name_resolved" in df.columns:
+            mask = df["supplier_id_resolved"].isna()
+            df.loc[mask, "supplier_id_resolved"] = df.loc[
+                mask, "__supplier_name_resolved"
+            ]
+        df["supplier_id_resolved"] = df["supplier_id_resolved"].map(
+            self._resolve_supplier_id
+        )
+        df = df.dropna(subset=["supplier_id_resolved"])
+        if df.empty:
+            return []
+
+        if supplier_filter:
+            df = df[df["supplier_id_resolved"] == supplier_filter]
+        if df.empty:
+            return []
+
+        due_candidates = ["due_date", "invoice_due_date"]
+        paid_candidates = ["invoice_paid_date", "payment_date", "paid_date"]
+        due_col = next((col for col in due_candidates if col in df.columns), None)
+        paid_col = next((col for col in paid_candidates if col in df.columns), None)
+        if not due_col:
+            return []
+        df["due_ts"] = pd.to_datetime(df[due_col], errors="coerce")
+        if paid_col:
+            df["paid_ts"] = pd.to_datetime(df[paid_col], errors="coerce")
+        else:
+            df["paid_ts"] = pd.to_datetime(df.get("invoice_paid_date"), errors="coerce")
+        invoice_date_col = "invoice_date" if "invoice_date" in df.columns else None
+        if invoice_date_col:
+            invoice_ts = pd.to_datetime(df[invoice_date_col], errors="coerce")
+            df.loc[df["paid_ts"].isna(), "paid_ts"] = invoice_ts[df["paid_ts"].isna()]
+
+        df = df.dropna(subset=["due_ts"])
+        if df.empty:
+            return []
+
+        df["days_late"] = (
+            df["paid_ts"] - df["due_ts"]
+        ).dt.days.replace({pd.NA: 0}).fillna(0).astype(float)
+        df["days_late"] = df["days_late"].apply(lambda value: max(0.0, value))
+        df["is_late"] = df["days_late"] > 0
+
+        value_candidates = [
+            "invoice_total_incl_tax",
+            "invoice_amount",
+            "total_amount",
+            "converted_amount_usd",
+        ]
+        value_col = next((col for col in value_candidates if col in df.columns), None)
+        if value_col:
+            df["invoice_value"] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
+        else:
+            df["invoice_value"] = 0.0
+
+        records: List[Dict[str, Any]] = []
+        grouped = df.groupby("supplier_id_resolved")
+        for supplier_id, group in grouped:
+            total_invoices = int(group.shape[0])
+            if total_invoices == 0:
+                continue
+            late_count = int(group["is_late"].sum())
+            late_ratio = late_count / total_invoices if total_invoices else 0.0
+            score = 1.0 - late_ratio
+            if late_count == 0 or score >= threshold:
+                continue
+            late_days = group.loc[group["is_late"], "days_late"]
+            avg_late_days = float(late_days.mean()) if not late_days.empty else 0.0
+            total_value = float(group["invoice_value"].sum())
+            late_value = float(group.loc[group["is_late"], "invoice_value"].sum())
+            impact = late_value if late_value > 0 else total_value * late_ratio
+            evidence = (
+                group.sort_values("days_late", ascending=False)["invoice_id"]
+                .astype(str)
+                .head(5)
+                .tolist()
+            )
+            record = {
+                "supplier_id": supplier_id,
+                "metric": "on_time_payment",
+                "score": round(score, 4),
+                "threshold": threshold,
+                "impact_gbp": round(max(impact, 0.0), 2),
+                "evidence_ids": evidence,
+                "auto_detect": True,
+                "avg_days_late": round(avg_late_days, 2),
+                "late_ratio": round(late_ratio, 4),
+            }
+            records.append(record)
+
+        return records
+
     def _policy_supplier_performance(
         self,
         tables: Dict[str, pd.DataFrame],
@@ -6037,15 +6467,36 @@ class OpportunityMinerAgent(BaseAgent):
         policy_id = policy_cfg["policy_id"]
         detector = policy_cfg["detector"]
         records = self._get_condition(input_data, "performance_records", [])
+        supplier_filter = self._resolve_supplier_id(
+            self._get_condition(input_data, "supplier_id")
+        )
+        threshold_raw = self._to_float(
+            self._get_condition(input_data, "performance_threshold", 0.9)
+        )
+        threshold = threshold_raw if threshold_raw is not None else 0.9
+        if threshold <= 0 or threshold >= 1:
+            threshold = 0.9
+
         if not isinstance(records, list) or not records:
-            self._log_policy_event(
-                policy_id,
-                None,
-                "blocked",
-                "Performance records must be provided as a list",
-                {},
+            auto_records = self._auto_supplier_performance_records(
+                tables,
+                threshold=threshold,
+                supplier_filter=supplier_filter,
             )
-            return findings
+            if auto_records:
+                records = auto_records
+            else:
+                details = {"auto_detect": True, "threshold": threshold}
+                if supplier_filter:
+                    details["supplier_id"] = supplier_filter
+                self._log_policy_event(
+                    policy_id,
+                    None,
+                    "blocked",
+                    "Performance records must be provided as a list",
+                    details,
+                )
+                return findings
 
         for record in records:
             if not isinstance(record, dict):
@@ -6071,6 +6522,12 @@ class OpportunityMinerAgent(BaseAgent):
                 "score": score,
                 "threshold": threshold,
             }
+            if record.get("auto_detect"):
+                details["auto_detect"] = True
+            if record.get("avg_days_late") is not None:
+                details.setdefault("avg_days_late", record.get("avg_days_late"))
+            if record.get("late_ratio") is not None:
+                details.setdefault("late_ratio", record.get("late_ratio"))
             sources = record.get("evidence_ids") or []
             if isinstance(sources, str):
                 sources = [sources]
@@ -6404,4 +6861,8 @@ class OpportunityMinerAgent(BaseAgent):
         with open(path, "w", encoding="utf-8") as f:
             json.dump([f.as_dict() for f in findings], f, ensure_ascii=False, indent=2)
         logger.info("Wrote %d findings to %s", len(findings), path)
+
+
+OpportunityMinerAgent._policy_price_benchmark_variance.supports_supplier_autodetect = True
+OpportunityMinerAgent._policy_supplier_performance.supports_supplier_autodetect = True
 

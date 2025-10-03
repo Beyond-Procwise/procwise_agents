@@ -7,14 +7,19 @@ identical structure.  The prompt template lives in
 exposes this prompt in its output for downstream LLM usage.
 """
 
+from __future__ import annotations
+
 import json
 import logging
+import os
 import re
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from jinja2 import Template
@@ -26,6 +31,99 @@ from utils.instructions import parse_instruction_sources
 logger = logging.getLogger(__name__)
 
 configure_gpu()
+
+
+SYSTEM_COMPOSE = (
+    "You are a senior procurement specialist negotiating with suppliers."
+    " Craft concise, relationship-positive responses grounded in the data "
+    "provided. Never mention internal scoring, evaluation logic, or how the "
+    "supplier was analysed."
+)
+
+SYSTEM_PROMPT_COMPOSE = (
+    "You are a procurement email assistant drafting professional RFQ "
+    "messages. Use the supplied context, keep the tone courteous and direct, "
+    "and avoid disclosing internal evaluation or scoring logic."
+)
+
+SYSTEM_POLISH = (
+    "You refine procurement emails for clarity and executive polish without "
+    "changing intent. Remove any wording that hints at internal scoring or "
+    "analysis and return the improved email with an explicit Subject line."
+)
+
+
+def _current_rfq_date() -> str:
+    return datetime.utcnow().strftime("%Y%m%d")
+
+
+def _generate_rfq_id() -> str:
+    return f"RFQ-{_current_rfq_date()}-{uuid.uuid4().hex[:8].upper()}"
+
+
+def _chat(model: str, system: str, user: str, **kwargs) -> str:
+    agent = kwargs.pop("agent", None)
+    if agent is None:
+        raise RuntimeError("_chat requires an agent instance")
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    response = agent.call_ollama(model=model, messages=messages, **kwargs)
+    return agent._extract_ollama_message(response)
+
+
+class _InMemoryCursor:
+    def __init__(self) -> None:
+        self.description = None
+
+    def __enter__(self) -> "_InMemoryCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - trivial
+        return False
+
+    def execute(self, *args, **kwargs) -> None:  # pragma: no cover - noop
+        self.description = []
+        return None
+
+    def fetchone(self):  # pragma: no cover - noop
+        return None
+
+    def fetchall(self):  # pragma: no cover - noop
+        return []
+
+
+class _InMemoryConnection:
+    def __enter__(self) -> "_InMemoryConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - trivial
+        return False
+
+    def cursor(self) -> _InMemoryCursor:
+        return _InMemoryCursor()
+
+    def commit(self) -> None:  # pragma: no cover - noop
+        return None
+
+
+class _NullS3Client:
+    def get_object(self, *args, **kwargs):  # pragma: no cover - noop
+        raise FileNotFoundError
+
+    def put_object(self, *args, **kwargs):  # pragma: no cover - noop
+        return {}
+
+
+@contextmanager
+def _null_db_connection():
+    yield _InMemoryConnection()
+
+
+@contextmanager
+def _null_s3_connection():
+    yield _NullS3Client()
 
 
 @dataclass
@@ -164,7 +262,9 @@ NEGOTIATION_COUNTER_SYSTEM_PROMPT = (
     "You are an elite procurement negotiator crafting decisive, relationship-aware "
     "emails. Blend firmness with partnership, ground every request in the data "
     "provided, and never invent figures. Keep replies under 160 words, use clear "
-    "paragraphs or short bullet points, and always reference the RFQ ID."
+    "paragraphs or short bullet points, and always reference the RFQ ID. Do not "
+    "discuss internal scorecards, evaluation formulas, or any analysis logic used to "
+    "assess suppliers."
 )
 
 NEGOTIATION_COUNTER_USER_PROMPT = (
@@ -194,11 +294,385 @@ class EmailDraftingAgent(BaseAgent):
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
 
-    def __init__(self, agent_nick):
+    def __init__(self, agent_nick=None):
+        agent_nick = self._prepare_agent_nick(agent_nick)
         super().__init__(agent_nick)
         self._draft_table_checked = False
         self._draft_table_lock = threading.Lock()
         self.prompt_template = DEFAULT_PROMPT_TEMPLATE
+        settings = self.agent_nick.settings
+        self.compose_model = getattr(
+            settings,
+            "email_compose_model",
+            getattr(settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL),
+        )
+        self.polish_model = getattr(settings, "email_polish_model", None)
+
+    @staticmethod
+    def _prepare_agent_nick(agent_nick):
+        if agent_nick is None:
+            settings = SimpleNamespace(
+                ses_default_sender="procurement@example.com",
+                script_user="AgentNick",
+                negotiation_email_model=DEFAULT_NEGOTIATION_MODEL,
+                email_compose_model=DEFAULT_NEGOTIATION_MODEL,
+                email_polish_model=None,
+            )
+            process_routing = SimpleNamespace(
+                log_process=lambda **kwargs: None,
+                log_run_detail=lambda **kwargs: None,
+                log_action=lambda **kwargs: None,
+            )
+            agent_nick = SimpleNamespace(
+                settings=settings,
+                process_routing_service=process_routing,
+                prompt_engine=None,
+                learning_repository=None,
+                ollama_options=lambda: {},
+                get_db_connection=lambda: _null_db_connection(),
+                reserve_s3_connection=lambda: _null_s3_connection(),
+            )
+            return agent_nick
+
+        settings = getattr(agent_nick, "settings", None)
+        if settings is None:
+            settings = SimpleNamespace(
+                ses_default_sender="procurement@example.com",
+                script_user="AgentNick",
+            )
+            setattr(agent_nick, "settings", settings)
+        def _safe_assign(target, name, value):
+            try:
+                setattr(target, name, value)
+                return True
+            except (AttributeError, ValueError):
+                return False
+
+        if not getattr(settings, "ses_default_sender", None):
+            _safe_assign(settings, "ses_default_sender", "procurement@example.com")
+        if not getattr(settings, "script_user", None):
+            _safe_assign(settings, "script_user", "AgentNick")
+
+        if not getattr(settings, "negotiation_email_model", None):
+            _safe_assign(settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL)
+
+        if not getattr(settings, "email_compose_model", None):
+            _safe_assign(
+                settings,
+                "email_compose_model",
+                getattr(settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL),
+            )
+
+        if not hasattr(settings, "email_polish_model"):
+            _safe_assign(settings, "email_polish_model", None)
+
+        if not hasattr(agent_nick, "process_routing_service"):
+            setattr(
+                agent_nick,
+                "process_routing_service",
+                SimpleNamespace(
+                    log_process=lambda **kwargs: None,
+                    log_run_detail=lambda **kwargs: None,
+                    log_action=lambda **kwargs: None,
+                ),
+            )
+        else:
+            routing = agent_nick.process_routing_service
+            if not hasattr(routing, "log_process"):
+                routing.log_process = lambda **kwargs: None
+            if not hasattr(routing, "log_run_detail"):
+                routing.log_run_detail = lambda **kwargs: None
+            if not hasattr(routing, "log_action"):
+                routing.log_action = lambda **kwargs: None
+
+        if not hasattr(agent_nick, "ollama_options"):
+            agent_nick.ollama_options = lambda: {}
+        if not hasattr(agent_nick, "get_db_connection"):
+            agent_nick.get_db_connection = lambda: _null_db_connection()
+        if not hasattr(agent_nick, "reserve_s3_connection"):
+            agent_nick.reserve_s3_connection = lambda: _null_s3_connection()
+        if not hasattr(agent_nick, "learning_repository"):
+            agent_nick.learning_repository = None
+
+        return agent_nick
+
+    def from_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        decision_data = dict(decision or {})
+        supplier_id = decision_data.get("supplier_id")
+        supplier_name = decision_data.get("supplier_name") or supplier_id
+        to_list = self._normalise_recipients(
+            decision_data.get("to") or decision_data.get("recipients")
+        )
+        cc_list = self._normalise_recipients(decision_data.get("cc"))
+        recipients = self._merge_recipients(to_list, cc_list)
+        receiver = to_list[0] if to_list else None
+        sender = decision_data.get("sender") or self.agent_nick.settings.ses_default_sender
+
+        supplied_rfq = self._normalise_rfq_identifier(decision_data.get("rfq_id"))
+        payload_rfq = _generate_rfq_id()
+        rfq_id_output = supplied_rfq or payload_rfq
+
+        asks_raw = decision_data.get("asks") or decision_data.get("counter_points") or []
+        if isinstance(asks_raw, str):
+            asks = [asks_raw]
+        elif isinstance(asks_raw, Iterable):
+            asks = [
+                str(item).strip()
+                for item in asks_raw
+                if isinstance(item, (str, int, float)) and str(item).strip()
+            ]
+        else:
+            asks = []
+
+        lead_time_request = (
+            decision_data.get("lead_time_request")
+            or decision_data.get("lead_time")
+            or decision_data.get("lead_time_days")
+        )
+        negotiation_message = decision_data.get("negotiation_message") or decision_data.get(
+            "message"
+        )
+
+        payload = {
+            "rfq_id": payload_rfq,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "current_offer": decision_data.get("current_offer"),
+            "counter_price": decision_data.get("counter_price"),
+            "target_price": decision_data.get("target_price"),
+            "currency": decision_data.get("currency"),
+            "lead_time_weeks": decision_data.get("lead_time_weeks"),
+            "lead_time_request": lead_time_request,
+            "asks": asks,
+            "strategy": decision_data.get("strategy"),
+            "negotiation_message": negotiation_message,
+        }
+        user_prompt = (
+            f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+            "Write a professional negotiation counter email with an explicit Subject line. "
+            "Reference the RFQ ID provided, summarise the commercial position, list the key asks "
+            "as bullet points, and close with a clear call to action."
+        )
+
+        model_name = getattr(
+            self.agent_nick.settings,
+            "negotiation_email_model",
+            DEFAULT_NEGOTIATION_MODEL,
+        )
+        try:
+            response_text = _chat(
+                model_name,
+                SYSTEM_COMPOSE,
+                user_prompt,
+                agent=self,
+                options={"temperature": 0.35, "top_p": 0.9},
+            )
+        except Exception:  # pragma: no cover - defensive fallback
+            logger.exception("Failed to compose negotiation counter email")
+            response_text = ""
+
+        subject_line, body_text = self._split_subject_and_body(response_text)
+        fallback_text = self._build_negotiation_fallback(
+            rfq_id_output,
+            decision_data.get("counter_price"),
+            decision_data.get("target_price"),
+            decision_data.get("current_offer"),
+            decision_data.get("currency"),
+            asks,
+            lead_time_request,
+            negotiation_message,
+        )
+        if not body_text:
+            body_text = fallback_text
+
+        html_body = self._render_html_from_text(body_text)
+        sanitised_html = self._sanitise_generated_body(html_body)
+        if not sanitised_html:
+            sanitised_html = self._sanitise_generated_body(
+                self._render_html_from_text(fallback_text)
+            )
+        plain_text = self._html_to_plain_text(sanitised_html) if sanitised_html else fallback_text
+        if not sanitised_html and plain_text:
+            sanitised_html = self._render_html_from_text(plain_text)
+
+        if subject_line:
+            subject = subject_line.strip() or f"{rfq_id_output} – Counter Offer & Next Steps"
+        else:
+            fallback_subject = f"{rfq_id_output} – Counter Offer & Next Steps"
+            subject = (
+                self._normalise_subject_line(fallback_subject, supplied_rfq or rfq_id_output)
+                or fallback_subject
+            )
+
+        thread_headers = decision_data.get("thread")
+        headers: Dict[str, Any] = {"X-Procwise-RFQ-ID": rfq_id_output}
+        if isinstance(thread_headers, dict):
+            message_id = thread_headers.get("message_id")
+            if message_id:
+                headers["In-Reply-To"] = message_id
+            references = thread_headers.get("references")
+            if isinstance(references, list) and references:
+                headers["References"] = " ".join(str(ref) for ref in references if ref)
+
+        metadata = {
+            "rfq_id": rfq_id_output,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "counter_price": decision_data.get("counter_price"),
+            "target_price": decision_data.get("target_price"),
+            "current_offer": decision_data.get("current_offer"),
+            "currency": decision_data.get("currency"),
+            "lead_time_weeks": decision_data.get("lead_time_weeks"),
+            "lead_time_request": lead_time_request,
+            "strategy": decision_data.get("strategy"),
+            "intent": "NEGOTIATION_COUNTER",
+        }
+        metadata = {k: v for k, v in metadata.items() if v is not None}
+
+        draft = {
+            "rfq_id": rfq_id_output,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "subject": subject,
+            "body": plain_text,
+            "text": plain_text,
+            "html": sanitised_html,
+            "sender": sender,
+            "recipients": recipients,
+            "receiver": receiver,
+            "to": receiver,
+            "cc": cc_list,
+            "contact_level": 1 if receiver else 0,
+            "sent_status": False,
+            "metadata": metadata,
+            "headers": headers,
+        }
+
+        thread_index = decision_data.get("thread_index")
+        if thread_index is not None:
+            draft["thread_index"] = thread_index
+
+        return draft
+
+    def from_prompt(
+        self, prompt: str, *, context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        context = dict(context or {})
+        prompt_text = str(prompt or "").strip()
+        recipients_input = context.get("recipients")
+        to_source = context.get("to")
+        to_list = self._normalise_recipients(to_source or recipients_input)
+        cc_list = self._normalise_recipients(context.get("cc"))
+        if not to_source and isinstance(recipients_input, Iterable):
+            derived_cc = to_list[1:]
+            if derived_cc:
+                cc_list = self._merge_recipients(derived_cc, cc_list)
+                to_list = to_list[:1]
+        recipients = self._merge_recipients(to_list, cc_list)
+        receiver = to_list[0] if to_list else None
+        sender = context.get("sender") or self.agent_nick.settings.ses_default_sender
+
+        supplied_rfq = self._normalise_rfq_identifier(context.get("rfq_id"))
+        rfq_id_value = supplied_rfq or _generate_rfq_id()
+
+        payload = {"rfq_id": rfq_id_value, "prompt": prompt_text}
+        user_prompt = (
+            f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+            "Compose a professional procurement email with a clear Subject line and structured body. "
+            "Keep the tone courteous and do not expose internal scoring or analysis logic."
+        )
+
+        model_name = getattr(self.agent_nick.settings, "email_compose_model", self.compose_model)
+        try:
+            response_text = _chat(model_name, SYSTEM_PROMPT_COMPOSE, user_prompt, agent=self)
+        except Exception:  # pragma: no cover - defensive fallback
+            logger.exception("Failed to compose email from prompt")
+            response_text = ""
+
+        subject_line, body_text = self._split_subject_and_body(response_text)
+        if not body_text:
+            body_text = prompt_text
+
+        html_body = self._render_html_from_text(body_text)
+        sanitised_html = self._sanitise_generated_body(html_body)
+        plain_text = self._html_to_plain_text(sanitised_html) if sanitised_html else body_text
+
+        polish_enabled = os.getenv("EMAIL_POLISH_ENABLED", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if polish_enabled and self.polish_model:
+            polish_payload = {
+                "rfq_id": rfq_id_value,
+                "subject": subject_line or context.get("subject") or rfq_id_value,
+                "body": plain_text,
+            }
+            polish_prompt = (
+                f"Context (JSON):\n{json.dumps(polish_payload, ensure_ascii=False, default=str)}\n\n"
+                "Polish this procurement email for clarity and executive tone. Return the refined email "
+                "starting with a Subject line."
+            )
+            try:
+                polished_text = _chat(
+                    self.polish_model, SYSTEM_POLISH, polish_prompt, agent=self
+                )
+            except Exception:  # pragma: no cover - defensive fallback
+                logger.exception("Failed to polish composed email")
+                polished_text = ""
+            polish_subject, polish_body = self._split_subject_and_body(polished_text)
+            if polish_subject:
+                subject_line = polish_subject
+            if polish_body:
+                html_body = self._render_html_from_text(polish_body)
+                sanitised_html = self._sanitise_generated_body(html_body)
+                plain_text = self._html_to_plain_text(sanitised_html) if sanitised_html else polish_body
+        if not sanitised_html and plain_text:
+            sanitised_html = self._render_html_from_text(plain_text)
+
+        subject_candidate = (
+            subject_line
+            or context.get("subject")
+            or f"{rfq_id_value} – Follow Up"
+        )
+        subject = self._normalise_subject_line(subject_candidate, rfq_id_value)
+        if not subject:
+            subject = f"{rfq_id_value} – Follow Up"
+
+        counter_price = context.get("counter_price")
+        if counter_price is None:
+            proposals = context.get("counter_proposals")
+            if isinstance(proposals, Iterable):
+                for proposal in proposals:
+                    if isinstance(proposal, dict) and proposal.get("price") is not None:
+                        counter_price = proposal.get("price")
+                        break
+
+        metadata = {
+            "intent": context.get("intent") or "PROMPT_COMPOSE",
+            "rfq_id": rfq_id_value,
+        }
+        if counter_price is not None:
+            metadata["counter_price"] = counter_price
+
+        draft = {
+            "rfq_id": rfq_id_value,
+            "subject": subject,
+            "body": plain_text,
+            "text": plain_text,
+            "html": sanitised_html,
+            "sender": sender,
+            "recipients": recipients,
+            "receiver": receiver,
+            "to": receiver,
+            "cc": cc_list,
+            "contact_level": 1 if receiver else 0,
+            "sent_status": False,
+            "metadata": metadata,
+            "headers": {"X-Procwise-RFQ-ID": rfq_id_value},
+        }
+
+        return draft
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -452,6 +926,7 @@ class EmailDraftingAgent(BaseAgent):
         draft.setdefault("thread_index", max(1, thread_index_int))
 
         self._store_draft(draft)
+        self._record_learning_events(context, [draft], data)
 
         output_data: Dict[str, Any] = {
             "drafts": [draft],
@@ -1261,6 +1736,95 @@ class EmailDraftingAgent(BaseAgent):
         return f"{formatted} {code}"
 
     @staticmethod
+    def _normalise_rfq_identifier(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        candidate = re.sub(r"[^A-Za-z0-9_-]+", "", text).upper()
+        if not candidate:
+            return None
+        if not candidate.startswith("RFQ"):
+            return None
+        return candidate
+
+    @staticmethod
+    def _split_subject_and_body(text: str) -> tuple[Optional[str], str]:
+        if not isinstance(text, str):
+            return None, ""
+        subject: Optional[str] = None
+        body_lines: List[str] = []
+        for line in text.splitlines():
+            if subject is None and line.lower().startswith("subject:"):
+                subject = line.split(":", 1)[1].strip()
+                continue
+            body_lines.append(line)
+        body = "\n".join(body_lines).strip()
+        return subject, body
+
+    @staticmethod
+    def _merge_recipients(to_list: List[str], cc_list: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen: Set[str] = set()
+        for addr in list(to_list) + list(cc_list):
+            candidate = addr.strip()
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+        return merged
+
+    def _render_html_from_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        lines = text.splitlines()
+        html_parts: List[str] = []
+        bullets: List[str] = []
+
+        def flush() -> None:
+            if bullets:
+                items = "".join(f"<li>{escape(item)}</li>" for item in bullets)
+                html_parts.append(f"<ul>{items}</ul>")
+                bullets.clear()
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                flush()
+                continue
+            if re.match(r"^[-*•]\s+", stripped):
+                bullets.append(stripped[1:].strip())
+                continue
+            flush()
+            html_parts.append(f"<p>{escape(stripped)}</p>")
+        flush()
+        if not html_parts:
+            return ""
+        return "".join(html_parts)
+
+    @staticmethod
+    def _html_to_plain_text(html: str) -> str:
+        if not html:
+            return ""
+        text = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+        text = re.sub(
+            r"<li>(.*?)</li>",
+            lambda m: "- " + re.sub(r"<[^>]+>", "", m.group(1)).strip(),
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\r\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
     def _normalise_subject_line(subject: str, rfq_id: Optional[str]) -> str:
         """Remove duplicated RFQ tokens that often arise from templates."""
 
@@ -1337,6 +1901,56 @@ class EmailDraftingAgent(BaseAgent):
                 prev = {}
         if isinstance(prev, dict):
             data = {**prev, **data}
+
+        decision_payload = data.get("decision")
+        if isinstance(decision_payload, dict) and decision_payload:
+            draft = self.from_decision(decision_payload)
+            self._store_draft(draft)
+            source_snapshot = {**decision_payload, "intent": "NEGOTIATION_COUNTER"}
+            self._record_learning_events(context, [draft], source_snapshot)
+            output_data: Dict[str, Any] = {
+                "drafts": [draft],
+                "subject": draft.get("subject"),
+                "body": draft.get("body"),
+                "sender": draft.get("sender"),
+                "intent": draft.get("metadata", {}).get("intent", "NEGOTIATION_COUNTER"),
+            }
+            recipients = draft.get("recipients")
+            if recipients:
+                output_data["recipients"] = recipients
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=output_data,
+                pass_fields={"drafts": [draft]},
+            )
+
+        prompt_text: Optional[str] = None
+        prompt_candidate = data.get("prompt")
+        if isinstance(prompt_candidate, str) and prompt_candidate.strip():
+            prompt_text = prompt_candidate
+        else:
+            decision_log = data.get("decision_log")
+            if isinstance(decision_log, str) and decision_log.strip():
+                prompt_text = decision_log
+        if prompt_text:
+            draft = self.from_prompt(prompt_text, context=data)
+            self._store_draft(draft)
+            self._record_learning_events(context, [draft], data)
+            output_data = {
+                "drafts": [draft],
+                "subject": draft.get("subject"),
+                "body": draft.get("body"),
+                "sender": draft.get("sender"),
+                "intent": draft.get("metadata", {}).get("intent"),
+            }
+            recipients = draft.get("recipients")
+            if recipients:
+                output_data["recipients"] = recipients
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=output_data,
+                pass_fields={"drafts": [draft]},
+            )
 
         intent_value = data.get("intent")
         if isinstance(intent_value, str) and intent_value.upper() == "NEGOTIATION_COUNTER":
@@ -1665,6 +2279,8 @@ class EmailDraftingAgent(BaseAgent):
         if manual_recipients:
             pass_fields["recipients"] = manual_recipients
 
+        self._record_learning_events(context, drafts, data)
+
         return AgentOutput(
             status=AgentStatus.SUCCESS,
             data=output_data,
@@ -1673,7 +2289,7 @@ class EmailDraftingAgent(BaseAgent):
 
 
     def _generate_rfq_id(self) -> str:
-        return f"RFQ-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+        return _generate_rfq_id()
 
     def _derive_sender_identity(
         self, sender_email: str, override_title: Optional[str] = None
@@ -1810,6 +2426,9 @@ class EmailDraftingAgent(BaseAgent):
             "evaluation",
             "assess",
             "assessment",
+            "scorecard",
+            "calculation",
+            "internal analysis",
         )
         if any(keyword in lowered for keyword in banned):
             return None
@@ -1902,7 +2521,7 @@ class EmailDraftingAgent(BaseAgent):
         )
         text = suggestion_pattern.sub("", text)
         restricted_pattern = re.compile(
-            r"<p[^>]*>[^<]*(rank|ranking|analysis|score|scoring|evaluation|assess|assessment)[^<]*</p>",
+            r"<p[^>]*>[^<]*(rank|ranking|analysis|score|scoring|scorecard|evaluation|assess|assessment|calculation|internal\\s+analysis)[^<]*</p>",
             re.IGNORECASE,
         )
         text = restricted_pattern.sub("", text)
@@ -2005,6 +2624,37 @@ class EmailDraftingAgent(BaseAgent):
                     draft["draft_record_id"] = record_id
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store RFQ draft")
+
+    def _record_learning_events(
+        self,
+        context: AgentContext,
+        drafts: Iterable[Dict[str, Any]],
+        source_data: Dict[str, Any],
+    ) -> None:
+        repository = getattr(self, "learning_repository", None)
+        if repository is None:
+            return
+        workflow_id = getattr(context, "workflow_id", None)
+        context_snapshot = {
+            "intent": source_data.get("intent"),
+            "document_origin": source_data.get("document_origin")
+            or source_data.get("document_type"),
+            "target_price": source_data.get("target_price"),
+            "current_offer": source_data.get("current_offer"),
+        }
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            try:
+                repository.record_email_learning(
+                    workflow_id=workflow_id,
+                    draft=draft,
+                    context=context_snapshot,
+                )
+            except Exception:
+                logger.debug(
+                    "Learning capture failed for draft %s", draft.get("rfq_id"), exc_info=True
+                )
 
     def _synchronise_draft_records(self, result: AgentOutput) -> None:
         drafts = (result.data or {}).get("drafts") if isinstance(result, AgentOutput) else None

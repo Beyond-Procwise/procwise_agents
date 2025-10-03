@@ -85,6 +85,12 @@ class RAGAgent(BaseAgent):
                     search_hits.append(h)
                     seen_ids.add(h.id)
 
+        learning_hits = self._search_learning_context(query_variants, top_k)
+        for hit in learning_hits:
+            if hit.id not in seen_ids:
+                search_hits.append(hit)
+                seen_ids.add(hit.id)
+
         kg_collection = getattr(self.settings, "knowledge_graph_collection_name", None)
         if kg_collection:
             for q in query_variants:
@@ -399,6 +405,56 @@ class RAGAgent(BaseAgent):
             else:
                 documents.append(hit)
         return documents, knowledge
+
+    def _search_learning_context(
+        self, queries: Sequence[str], top_k: int
+    ) -> List[Any]:
+        collection_name = getattr(self.settings, "learning_collection_name", None)
+        if not collection_name:
+            return []
+        client = getattr(self.agent_nick, "qdrant_client", None)
+        embedder = getattr(self.agent_nick, "embedding_model", None)
+        if client is None or embedder is None or not hasattr(client, "search"):
+            return []
+
+        filter_learning = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_type", match=models.MatchValue(value="learning")
+                )
+            ]
+        )
+        collected: Dict[Any, Any] = {}
+        for query in queries:
+            if not query:
+                continue
+            try:
+                vector = embedder.encode(query, normalize_embeddings=True)
+            except Exception:
+                logger.exception("Failed to encode learning context query")
+                continue
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+            search_params = models.SearchParams(hnsw_ef=128, exact=False)
+            try:
+                hits = client.search(
+                    collection_name=collection_name,
+                    query_vector=vector,
+                    query_filter=filter_learning,
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False,
+                    search_params=search_params,
+                )
+            except Exception:
+                logger.exception("Learning search failed for query '%s'", query)
+                continue
+            for hit in hits or []:
+                hit_id = getattr(hit, "id", None)
+                if hit_id is None or hit_id in collected:
+                    continue
+                collected[hit_id] = hit
+        return list(collected.values())[:top_k]
 
     def _search_knowledge_graph(
         self, query: str, top_k: int = 5, filters: Optional[models.Filter] = None

@@ -32,6 +32,7 @@ class ModelTrainingService:
         self._event_bus = get_event_bus()
         self._subscription_registered = False
         self._supplier_trainer = SupplierRankingTrainer()
+        self._learning_repo = getattr(agent_nick, "learning_repository", None)
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -281,6 +282,7 @@ class ModelTrainingService:
 
         training_jobs = self.dispatch_due_jobs(force=force, limit=limit)
         relationship_jobs: List[Dict[str, Any]] = []
+        workflow_context: List[Dict[str, Any]] = []
         scheduler = self._get_relationship_scheduler()
         if scheduler is not None:
             try:
@@ -291,9 +293,15 @@ class ModelTrainingService:
                         relationship_jobs = [summary]
             except Exception:
                 logger.exception("Supplier relationship refresh during dispatch failed")
+        if self._learning_repo is not None:
+            try:
+                workflow_context = self._learning_repo.get_recent_learnings(limit=25)
+            except Exception:
+                logger.exception("Failed to gather workflow learning context during dispatch")
         return {
             "training_jobs": training_jobs,
             "relationship_jobs": relationship_jobs,
+            "workflow_context": workflow_context,
         }
 
     def record_workflow_outcome(
@@ -301,6 +309,18 @@ class ModelTrainingService:
     ) -> None:
         if not isinstance(result, dict):
             return
+
+        if self._learning_repo is not None:
+            try:
+                self._learning_repo.record_workflow_learning(
+                    workflow_id=workflow_id,
+                    workflow_name=workflow_name,
+                    result=result,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to capture workflow learning context for %s", workflow_id
+                )
 
         if workflow_name == "supplier_ranking":
             snapshot = result.get("training_snapshot")
@@ -400,6 +420,18 @@ class ModelTrainingService:
     def _run_training_job(self, job: Dict[str, Any]) -> None:
         agent_slug = job.get("agent_slug")
         payload = job.get("payload") or {}
+        if self._learning_repo is not None:
+            try:
+                context_snapshot = self._learning_repo.build_context_snapshot(
+                    workflow_id=job.get("workflow_id")
+                )
+            except Exception:
+                logger.exception("Failed to build learning context snapshot for job %s", job.get("job_id"))
+                context_snapshot = None
+            if context_snapshot:
+                payload = dict(payload)
+                payload["learning_context"] = context_snapshot
+                job["payload"] = payload
         policy_id = job.get("policy_id")
         logger.info(
             "Running model training job %s for %s (policy %s)",
