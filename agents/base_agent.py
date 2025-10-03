@@ -26,6 +26,7 @@ from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
+from services.learning_repository import LearningRepository
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ class BaseAgent:
                 prompt_engine = PromptEngine(agent_nick=None, prompt_rows=[])
             setattr(agent_nick, "prompt_engine", prompt_engine)
         self.prompt_engine = prompt_engine
+        self.learning_repository = getattr(agent_nick, "learning_repository", None)
 
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")
@@ -311,6 +313,7 @@ class AgentNick:
         self._db_engine = None
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
+        self.learning_repository = LearningRepository(self)
         s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
         self._s3_pool_size = s3_pool
         self.s3_client = boto3.client(

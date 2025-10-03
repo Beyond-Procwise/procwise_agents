@@ -192,6 +192,15 @@ class NegotiationAgent(BaseAgent):
             stop_message = self._build_stop_message(new_status, halt_reason, round_no)
             decision.setdefault("status_reason", halt_reason)
             self._save_session_state(rfq_id, supplier, state)
+            self._record_learning_snapshot(
+                context,
+                rfq_id,
+                supplier,
+                decision,
+                state,
+                bool(state.get("awaiting_response", False)),
+                supplier_reply_registered,
+            )
             negotiation_open = new_status not in {"COMPLETED", "EXHAUSTED"}
             data = {
                 "supplier": supplier,
@@ -354,6 +363,15 @@ class NegotiationAgent(BaseAgent):
         if email_action_id:
             state["last_agent_msg_id"] = email_action_id
         self._save_session_state(rfq_id, supplier, state)
+        self._record_learning_snapshot(
+            context,
+            rfq_id,
+            supplier,
+            decision,
+            state,
+            True,
+            supplier_reply_registered,
+        )
         public_state = self._public_state(state)
         data = {
             "supplier": supplier,
@@ -662,6 +680,35 @@ class NegotiationAgent(BaseAgent):
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store negotiation session")
+
+    def _record_learning_snapshot(
+        self,
+        context: AgentContext,
+        rfq_id: Optional[str],
+        supplier: Optional[str],
+        decision: Dict[str, Any],
+        state: Dict[str, Any],
+        awaiting_response: bool,
+        supplier_reply_registered: bool,
+    ) -> None:
+        repository = getattr(self, "learning_repository", None)
+        if repository is None:
+            return
+        try:
+            repository.record_negotiation_learning(
+                workflow_id=getattr(context, "workflow_id", None),
+                rfq_id=rfq_id,
+                supplier_id=supplier,
+                decision=decision,
+                state=state,
+                awaiting_response=awaiting_response,
+                supplier_reply_registered=supplier_reply_registered,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to capture negotiation learning for %s/%s", rfq_id, supplier,
+                exc_info=True,
+            )
 
     def _collect_supplier_snippets(self, payload: Dict[str, Any]) -> List[str]:
         snippets: List[str] = []
