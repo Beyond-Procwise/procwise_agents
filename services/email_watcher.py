@@ -239,38 +239,6 @@ class SESEmailWatcher:
             or getattr(self.settings, "imap_user", None)
             or "supplierconnect@procwise.co.uk"
         )
-
-        if self._custom_loader is None:
-            queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
-            if queue_url:
-                try:
-                    from services.email_sqs_loader import sqs_email_loader
-
-                    max_batch = self._coerce_int(
-                        getattr(self.settings, "ses_inbound_queue_max_messages", 10),
-                        default=10,
-                        minimum=1,
-                    )
-                    wait_seconds = self._coerce_int(
-                        getattr(self.settings, "ses_inbound_queue_wait_seconds", 2),
-                        default=2,
-                        minimum=0,
-                    )
-                    self._custom_loader = sqs_email_loader(
-                        queue_url=queue_url,
-                        max_batch=max_batch,
-                        wait_seconds=wait_seconds,
-                    )
-                    logger.info(
-                        "Using SQS loader for mailbox %s via queue %s",
-                        self.mailbox_address,
-                        queue_url,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to initialise SQS loader for mailbox %s",
-                        self.mailbox_address,
-                    )
         poll_interval = response_poll_seconds
         if poll_interval is None:
             poll_interval = getattr(
@@ -400,6 +368,12 @@ class SESEmailWatcher:
                 minimum=0,
             ),
         )
+        self._imap_fallback_attempts = self._coerce_int(
+            getattr(self.settings, "email_s3_imap_fallback_attempts", 3),
+            default=3,
+            minimum=1,
+        )
+        self._consecutive_empty_s3_batches = 0
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
             0,
@@ -1518,7 +1492,12 @@ class SESEmailWatcher:
                 logger.warning("Invalid target price '%s' for RFQ %s", target_price, rfq_id)
                 target_price = None
 
-        processed: Dict[str, object] = {"message_id": message.get("id")}
+        message_identifier = message.get("message_id") or message.get("id")
+        processed: Dict[str, object] = {"message_id": message_identifier}
+        if message.get("s3_key"):
+            processed["s3_key"] = message.get("s3_key")
+        if message.get("_bucket"):
+            processed["_bucket"] = message.get("_bucket")
 
         context = AgentContext(
             workflow_id=str(uuid.uuid4()),
@@ -1531,6 +1510,8 @@ class SESEmailWatcher:
                 "rfq_id": rfq_id,
                 "from_address": from_address,
                 "target_price": target_price,
+                "message_id": message_identifier,
+                "s3_key": message.get("s3_key"),
             },
         )
 
@@ -1825,8 +1806,10 @@ class SESEmailWatcher:
             effective_limit = None
 
         messages: List[Dict[str, object]] = []
+        attempted_s3 = False
 
         if self.bucket:
+            attempted_s3 = True
             messages = self._load_from_s3(
                 effective_limit,
                 prefixes=prefixes,
@@ -1836,15 +1819,33 @@ class SESEmailWatcher:
             logger.warning("S3 bucket not configured; skipping direct poll for mailbox %s", self.mailbox_address)
 
         if messages:
+            self._consecutive_empty_s3_batches = 0
             return messages
 
-        if self._imap_configured():
+        if attempted_s3:
+            self._consecutive_empty_s3_batches += 1
+        else:
+            self._consecutive_empty_s3_batches = 0
+
+        should_fallback_to_imap = not attempted_s3 or (
+            self._imap_fallback_attempts > 0
+            and self._consecutive_empty_s3_batches >= self._imap_fallback_attempts
+        )
+
+        if should_fallback_to_imap and self._imap_configured():
+            if attempted_s3 and self._consecutive_empty_s3_batches == self._imap_fallback_attempts:
+                logger.info(
+                    "No new S3 messages after %d poll(s); falling back to IMAP for mailbox %s",
+                    self._imap_fallback_attempts,
+                    self.mailbox_address,
+                )
             imap_messages = self._load_from_imap(
                 effective_limit,
                 mark_seen=bool(mark_seen),
                 on_message=on_message,
             )
             if imap_messages:
+                self._consecutive_empty_s3_batches = 0
                 return imap_messages
 
         return messages
@@ -1929,6 +1930,9 @@ class SESEmailWatcher:
                     )
                     parsed.setdefault("id", f"imap/{message_id_str}")
                     parsed.setdefault("s3_key", f"imap/{message_id_str}")
+                    parsed.setdefault(
+                        "_bucket", f"imap::{self.mailbox_address or 'unknown'}"
+                    )
                     if not parsed.get("message_id"):
                         parsed["message_id"] = parsed.get("id")
                     parsed.setdefault("_source", "imap")

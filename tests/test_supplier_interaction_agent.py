@@ -1,7 +1,9 @@
 import json
+import logging
 import os
 import sys
 import threading
+from collections import deque
 from typing import Dict, List, Optional
 from types import SimpleNamespace
 
@@ -437,13 +439,14 @@ def test_await_all_responses_processes_parallel_results(monkeypatch):
 
     stored: List[Dict[str, Any]] = []
 
-    def fake_store(rfq_id, supplier_id, message, parsed):
+    def fake_store(rfq_id, supplier_id, message, parsed, **kwargs):
         stored.append(
             {
                 "rfq_id": rfq_id,
                 "supplier_id": supplier_id,
                 "message": message,
                 "parsed": parsed,
+                "meta": kwargs,
             }
         )
 
@@ -502,3 +505,160 @@ def test_parse_response_uses_llm_when_available(monkeypatch):
     assert parsed["price"] == pytest.approx(775.5)
     assert parsed["lead_time"] == "7"
     assert parsed["context_summary"].startswith("Supplier will expedite")
+
+
+def test_store_response_resolves_supplier_from_db(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    results = deque([None, None, ("SUP-DB",)])
+    statements: List[str] = []
+    inserts: List[tuple] = []
+    connections: List[object] = []
+
+    class CursorStub:
+        def __init__(self, owner):
+            self.owner = owner
+            self._result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.strip().split())
+            statements.append(normalized)
+            if "INSERT INTO proc.supplier_responses" in normalized:
+                inserts.append(params)
+                self._result = None
+                return
+            try:
+                self._result = results.popleft()
+            except IndexError:
+                self._result = None
+
+        def fetchone(self):
+            return self._result
+
+        def fetchall(self):
+            return []
+
+    class ConnectionStub:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return CursorStub(self)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    def connection_factory():
+        conn = ConnectionStub()
+        connections.append(conn)
+        return conn
+
+    agent.agent_nick.get_db_connection = connection_factory  # type: ignore[assignment]
+
+    agent._store_response(
+        "RFQ-20240101-ABCD1234",
+        None,
+        "Thank you",
+        {"price": 1200.0, "lead_time": "5"},
+        message_id="message-1",
+        from_address="supplier@example.com",
+    )
+
+    assert inserts, "expected supplier response insert"
+    assert inserts[0][1] == "SUP-DB"
+    assert any("proc.negotiation_sessions" in stmt for stmt in statements)
+    assert connections and connections[-1].commits == 1
+
+
+def test_store_response_skips_when_supplier_unresolved(monkeypatch, caplog):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    results = deque([None, None, None, None, None, None])
+    statements: List[str] = []
+    inserts: List[tuple] = []
+
+    class CursorStub:
+        def __init__(self, owner):
+            self.owner = owner
+            self._result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.strip().split())
+            statements.append(normalized)
+            if "INSERT INTO proc.supplier_responses" in normalized:
+                inserts.append(params)
+                self._result = None
+                return
+            try:
+                self._result = results.popleft()
+            except IndexError:
+                self._result = None
+
+        def fetchone(self):
+            return self._result
+
+        def fetchall(self):
+            return []
+
+    class ConnectionStub:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return CursorStub(self)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    def connection_factory():
+        return ConnectionStub()
+
+    agent.agent_nick.get_db_connection = connection_factory  # type: ignore[assignment]
+
+    with caplog.at_level(logging.ERROR):
+        agent._store_response(
+            "RFQ-20240101-ABCD1234",
+            None,
+            "No supplier id",
+            {"price": None, "lead_time": None},
+            message_id="message-2",
+            from_address="unknown@example.com",
+        )
+
+    assert not inserts
+    assert "could not be resolved" in caplog.text
+    assert any("proc.draft_rfq_emails" in stmt for stmt in statements)

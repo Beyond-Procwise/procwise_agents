@@ -7,7 +7,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
@@ -69,6 +69,8 @@ class SupplierInteractionAgent(BaseAgent):
         input_data = dict(context.input_data)
         subject = str(input_data.get("subject") or "")
         message_text = input_data.get("message")
+        from_address = input_data.get("from_address")
+        message_id = input_data.get("message_id")
         body = message_text if isinstance(message_text, str) else ""
         drafts: List[Dict[str, Any]] = [
             draft for draft in input_data.get("drafts", []) if isinstance(draft, dict)
@@ -212,6 +214,7 @@ class SupplierInteractionAgent(BaseAgent):
             subject = str(wait_result.get("subject") or subject)
             supplier_id = wait_result.get("supplier_id") or supplier_id
             rfq_id = wait_result.get("rfq_id") or rfq_id
+            message_id = wait_result.get("message_id") or message_id
 
             supplier_payload = wait_result.get("supplier_output")
             if isinstance(supplier_payload, dict):
@@ -273,7 +276,14 @@ class SupplierInteractionAgent(BaseAgent):
             context_hits = self.vector_search(parsed.get("response_text") or body, top_k=3)
             related_docs = [h.payload for h in context_hits]
 
-        self._store_response(rfq_id, supplier_id, parsed.get("response_text") or body, parsed)
+        self._store_response(
+            rfq_id,
+            supplier_id,
+            parsed.get("response_text") or body,
+            parsed,
+            message_id=message_id,
+            from_address=from_address,
+        )
 
         price = parsed.get("price")
         if price is not None and target is not None and price > target:
@@ -321,16 +331,19 @@ class SupplierInteractionAgent(BaseAgent):
                     text = body.decode(errors='ignore')
                     rfq_id = self._extract_rfq_id(subject + " " + text)
                     if rfq_id:
+                        parsed_payload = self._parse_response(
+                            text,
+                            subject=subject,
+                            rfq_id=rfq_id,
+                            supplier_id=None,
+                        )
                         self._store_response(
                             rfq_id,
                             None,
                             text,
-                            self._parse_response(
-                                text,
-                                subject=subject,
-                                rfq_id=rfq_id,
-                                supplier_id=None,
-                            ),
+                            parsed_payload,
+                            message_id=msg.get('message-id'),
+                            from_address=msg.get('from'),
                         )
                         processed += 1
         except Exception:  # pragma: no cover - best effort
@@ -825,7 +838,7 @@ class SupplierInteractionAgent(BaseAgent):
     def _persist_parallel_result(self, result: Dict[str, Any]) -> None:
         rfq_id = result.get("rfq_id")
         supplier_id = result.get("supplier_id")
-        if not rfq_id or not supplier_id:
+        if not rfq_id:
             return
 
         subject = result.get("subject")
@@ -854,7 +867,161 @@ class SupplierInteractionAgent(BaseAgent):
                 supplier_id=supplier_id,
             )
 
-        self._store_response(rfq_id, supplier_id, message_body, parsed)
+        self._store_response(
+            rfq_id,
+            supplier_id,
+            message_body,
+            parsed,
+            message_id=result.get("message_id"),
+            from_address=result.get("from_address"),
+        )
+
+    def _resolve_supplier_id(
+        self,
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+        *,
+        message_id: Optional[str] = None,
+        from_address: Optional[str] = None,
+    ) -> Optional[str]:
+        if supplier_id:
+            try:
+                candidate = str(supplier_id).strip()
+            except Exception:
+                candidate = None
+            if candidate:
+                return candidate
+        if not rfq_id:
+            return None
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        lookup_queries: List[Tuple[str, str, Tuple]] = []
+        if message_id:
+            lookup_queries.append(
+                (
+                    "email_thread_map",
+                    """
+                    SELECT supplier_id
+                    FROM proc.email_thread_map
+                    WHERE message_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (message_id,),
+                )
+            )
+
+        lookup_queries.extend(
+            [
+                (
+                    "negotiation_session_state",
+                    """
+                    SELECT supplier_id
+                    FROM proc.negotiation_session_state
+                    WHERE rfq_id = %s
+                    ORDER BY updated_on DESC
+                    LIMIT 1
+                    """,
+                    (rfq_id,),
+                ),
+                (
+                    "negotiation_sessions",
+                    """
+                    SELECT supplier_id
+                    FROM proc.negotiation_sessions
+                    WHERE rfq_id = %s
+                    ORDER BY round DESC, created_on DESC
+                    LIMIT 1
+                    """,
+                    (rfq_id,),
+                ),
+            ]
+        )
+
+        if from_address:
+            lookup_queries.append(
+                (
+                    "draft_rfq_emails_recipient",
+                    """
+                    SELECT supplier_id
+                    FROM proc.draft_rfq_emails
+                    WHERE rfq_id = %s
+                      AND (
+                          recipient_email = %s
+                          OR LOWER(recipient_email) = LOWER(%s)
+                      )
+                    ORDER BY updated_on DESC, created_on DESC
+                    LIMIT 1
+                    """,
+                    (rfq_id, from_address, from_address),
+                )
+            )
+
+        lookup_queries.extend(
+            [
+                (
+                    "draft_rfq_emails",
+                    """
+                    SELECT supplier_id
+                    FROM proc.draft_rfq_emails
+                    WHERE rfq_id = %s
+                    ORDER BY updated_on DESC, created_on DESC
+                    LIMIT 1
+                    """,
+                    (rfq_id,),
+                ),
+                (
+                    "rfq_targets",
+                    """
+                    SELECT supplier_id
+                    FROM proc.rfq_targets
+                    WHERE rfq_id = %s
+                    ORDER BY updated_on DESC
+                    LIMIT 1
+                    """,
+                    (rfq_id,),
+                ),
+            ]
+        )
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for label, statement, params in lookup_queries:
+                        try:
+                            cur.execute(statement, params)
+                        except Exception:
+                            if hasattr(conn, "rollback"):
+                                try:
+                                    conn.rollback()
+                                except Exception:  # pragma: no cover - defensive
+                                    pass
+                            logger.debug(
+                                "Supplier lookup %s failed for rfq_id=%s", label, rfq_id, exc_info=True
+                            )
+                            continue
+                        row = cur.fetchone()
+                        if not row:
+                            continue
+                        value = row[0]
+                        if value in (None, ""):
+                            continue
+                        resolved = str(value).strip()
+                        if not resolved:
+                            continue
+                        logger.debug(
+                            "Resolved supplier_id=%s for rfq_id=%s via %s lookup",
+                            resolved,
+                            rfq_id,
+                            label,
+                        )
+                        return resolved
+        except Exception:
+            logger.exception("Failed to resolve supplier_id for rfq_id=%s", rfq_id)
+        return None
 
     @staticmethod
     def _coerce_int(value: Any, *, default: int) -> int:
@@ -1071,9 +1238,33 @@ class SupplierInteractionAgent(BaseAgent):
             payload["context_summary"] = summary
         return payload
 
-    def _store_response(self, rfq_id: Optional[str], supplier_id: Optional[str], text: str, parsed: Dict) -> None:
+    def _store_response(
+        self,
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+        text: str,
+        parsed: Dict,
+        *,
+        message_id: Optional[str] = None,
+        from_address: Optional[str] = None,
+    ) -> None:
         if not rfq_id:
             return
+
+        resolved_supplier = self._resolve_supplier_id(
+            rfq_id,
+            supplier_id,
+            message_id=message_id,
+            from_address=from_address,
+        )
+        if not resolved_supplier:
+            logger.error(
+                "failed to store supplier response because supplier_id could not be resolved (rfq_id=%s, message_id=%s)",
+                rfq_id,
+                message_id,
+            )
+            return
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
@@ -1090,7 +1281,7 @@ class SupplierInteractionAgent(BaseAgent):
                         """,
                         (
                             rfq_id,
-                            supplier_id,
+                            resolved_supplier,
                             text,
                             parsed.get("price"),
                             parsed.get("lead_time"),
