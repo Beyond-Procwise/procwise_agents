@@ -152,6 +152,9 @@ def test_data_flow_manager_builds_graph_and_persists():
     first_flow = flows[0]
     assert first_flow.get("supplier_id")
     assert "coverage_ratio" in first_flow
+    assert "categories" in first_flow
+    if first_flow.get("categories"):
+        assert first_flow.get("primary_category")
 
     manager.persist_knowledge_graph(relations, graph)
 
@@ -182,6 +185,8 @@ def test_data_flow_manager_builds_graph_and_persists():
         mapping_summary = point.payload.get("mapping_summary")
         assert isinstance(mapping_summary, list) and mapping_summary
         assert all("proc." not in statement for statement in mapping_summary)
+        if point.payload.get("categories"):
+            assert point.payload.get("primary_category")
 
 
 def test_persist_knowledge_graph_skips_when_learning_disabled():

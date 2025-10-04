@@ -200,6 +200,43 @@ _NUMERIC_CONDITION_KEYS: set[str] = {
 }
 
 
+_INSTRUCTION_TABLE_KEYWORDS: Dict[str, tuple[str, ...]] = {
+    "purchase_orders": (
+        "purchase order",
+        "po header",
+        "po header table",
+        "purchase_order_agent",
+        "po summary",
+    ),
+    "purchase_order_lines": (
+        "po line",
+        "line item",
+        "po_line_items_agent",
+        "purchase order line",
+    ),
+    "invoices": (
+        "invoice header",
+        "invoice summary",
+        "invoice table",
+        "invoice_agent",
+    ),
+    "invoice_lines": (
+        "invoice line",
+        "invoice item",
+        "invoice_line_items_agent",
+        "invoice detail",
+    ),
+}
+
+
+_MANDATORY_POLICY_TABLES: set[str] = {
+    "purchase_orders",
+    "purchase_order_lines",
+    "invoices",
+    "invoice_lines",
+}
+
+
 _INTEGER_CONDITION_KEYS: set[str] = {
     "lookback_period_days",
     "negotiation_window_days",
@@ -361,6 +398,10 @@ class OpportunityMinerAgent(BaseAgent):
         self._supplier_flow_index: Dict[str, Dict[str, Any]] = {}
         self._supplier_flow_name_index: Dict[str, Dict[str, Any]] = {}
         self._priority_model = OpportunityPriorityModel()
+        self._policy_instruction_tables: Dict[str, set[str]] = {}
+        self._global_instruction_tables: set[str] = set()
+        self._catalog_category_lookup: Dict[str, Dict[str, Any]] = {}
+        self._supplier_category_profile: Dict[str, Dict[str, Any]] = {}
 
         # GPU configuration
         self.device = configure_gpu()
@@ -412,6 +453,52 @@ class OpportunityMinerAgent(BaseAgent):
             if value:
                 sources.append(value)
         return sources
+
+    def _extract_instruction_texts(self, sources: Iterable[Any]) -> List[str]:
+        texts: List[str] = []
+
+        def _walk(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    texts.append(stripped)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _walk(item)
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    _walk(item)
+
+        for entry in sources:
+            _walk(entry)
+        return texts
+
+    def _detect_instruction_tables(self, sources: Iterable[Any]) -> set[str]:
+        tables: set[str] = set()
+        texts = self._extract_instruction_texts(sources)
+        if not texts:
+            return tables
+        for text in texts:
+            lowered = text.lower()
+            for alias, keywords in _INSTRUCTION_TABLE_KEYWORDS.items():
+                for keyword in keywords:
+                    if keyword in lowered:
+                        tables.add(alias)
+                        break
+        return tables
+
+    def _record_policy_tables(self, slug: str, tables: Iterable[str]) -> None:
+        if not slug:
+            return
+        existing = self._policy_instruction_tables.setdefault(slug, set())
+        for alias in tables:
+            if alias:
+                existing.add(alias)
+        existing.update(_MANDATORY_POLICY_TABLES)
 
     def _resolve_canonical_condition_key(self, key: Any) -> Optional[str]:
         normalised = normalize_instruction_key(key)
@@ -591,6 +678,9 @@ class OpportunityMinerAgent(BaseAgent):
         for policy in policies:
             sources.extend(self._instruction_sources_from_policy(policy))
         instructions = parse_instruction_sources(sources)
+        detected_tables = self._detect_instruction_tables(sources)
+        if detected_tables:
+            self._global_instruction_tables.update(detected_tables)
         self._apply_instruction_overrides(context, instructions)
 
         conditions = context.input_data.get("conditions")
@@ -913,6 +1003,205 @@ class OpportunityMinerAgent(BaseAgent):
             manager.persist_knowledge_graph(relations, graph)
         except Exception:  # pragma: no cover - persistence best effort
             logger.exception("Failed to persist knowledge graph")
+
+    def _build_catalog_category_lookup(
+        self, tables: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Dict[str, Any]]:
+        catalog = tables.get("product_mapping", pd.DataFrame())
+        if catalog is None or catalog.empty:
+            return {}
+        if "product" not in catalog.columns:
+            return {}
+        lookup: Dict[str, Dict[str, Any]] = {}
+        for row in catalog.itertuples(index=False):
+            product = getattr(row, "product", None)
+            if not product:
+                continue
+            key = str(product).strip().lower()
+            if not key:
+                continue
+            details: Dict[str, Any] = {"product": str(product).strip()}
+            for level in range(1, 6):
+                field = f"category_level_{level}"
+                if hasattr(row, field):
+                    value = getattr(row, field)
+                    if value:
+                        details[field] = str(value).strip()
+            lookup[key] = details
+        return lookup
+
+    def _lookup_catalog_category(self, description: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not description:
+            return None
+        key = str(description).strip().lower()
+        if not key:
+            return None
+        if key in self._catalog_category_lookup:
+            return self._catalog_category_lookup[key]
+        # Attempt relaxed match by collapsing whitespace
+        compact = re.sub(r"\s+", " ", key)
+        return self._catalog_category_lookup.get(compact)
+
+    def _build_supplier_category_profile(
+        self, tables: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Dict[str, Any]]:
+        category_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+        product_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+        source_tracker: Dict[str, set[str]] = defaultdict(set)
+
+        def _record(
+            supplier_id: Optional[str],
+            category: Optional[str],
+            product: Optional[str],
+            source: str,
+        ) -> None:
+            if not supplier_id:
+                return
+            sid = str(supplier_id).strip()
+            if not sid:
+                return
+            source_tracker[sid].add(source)
+            if category:
+                category_counts[sid][str(category).strip()] += 1
+            if product:
+                product_counts[sid][str(product).strip()] += 1
+
+        purchase_orders = tables.get("purchase_orders", pd.DataFrame())
+        if isinstance(purchase_orders, pd.DataFrame) and not purchase_orders.empty:
+            supplier_col = self._find_column_for_key(purchase_orders, "supplier_id")
+            categories_cols = [
+                col
+                for col in ("category_id", "spend_category")
+                if col in purchase_orders.columns
+            ]
+            if supplier_col and categories_cols:
+                for row in purchase_orders.itertuples(index=False):
+                    supplier_id = getattr(row, supplier_col, None)
+                    supplier_id = self._resolve_supplier_id(supplier_id)
+                    for field in categories_cols:
+                        category = getattr(row, field, None)
+                        if category:
+                            _record(supplier_id, category, None, "purchase_orders")
+
+        def _derive_from_lines(df: pd.DataFrame, table_name: str) -> None:
+            if df.empty:
+                return
+            supplier_series = df.get("supplier_id")
+            if supplier_series is None or supplier_series.isna().all():
+                return
+            category_fields = [
+                col
+                for col in (
+                    "category_id",
+                    "spend_category",
+                    "category",
+                    "category_level_1",
+                    "category_level_2",
+                    "category_level_3",
+                    "category_level_4",
+                    "category_level_5",
+                )
+                if col in df.columns
+            ]
+            for row in df.itertuples(index=False):
+                supplier_id = getattr(row, "supplier_id", None)
+                supplier_id = self._resolve_supplier_id(supplier_id)
+                category_value: Optional[str] = None
+                for field in category_fields:
+                    value = getattr(row, field, None)
+                    if value:
+                        category_value = str(value).strip()
+                        if category_value:
+                            break
+                product_value = getattr(row, "item_description", None)
+                if not category_value and product_value:
+                    catalog_entry = self._lookup_catalog_category(product_value)
+                    if catalog_entry:
+                        for level in (
+                            "category_level_2",
+                            "category_level_1",
+                            "category_level_3",
+                            "category_level_4",
+                            "category_level_5",
+                        ):
+                            value = catalog_entry.get(level)
+                            if value:
+                                category_value = str(value)
+                                break
+                        product_value = catalog_entry.get("product") or product_value
+                _record(supplier_id, category_value, product_value, table_name)
+
+        po_lines = tables.get("purchase_order_lines", pd.DataFrame())
+        if isinstance(po_lines, pd.DataFrame) and not po_lines.empty:
+            df = po_lines.copy()
+            df["po_id"] = df["po_id"].map(self._normalise_identifier)
+            df["supplier_id"] = df["po_id"].map(self._po_supplier_map)
+            fallback = df.get("supplier_id")
+            if fallback is not None and fallback.isna().any():
+                candidate_col = self._find_column_for_key(po_lines, "supplier_id")
+                if candidate_col and candidate_col in po_lines.columns:
+                    df.loc[fallback.isna(), "supplier_id"] = po_lines.loc[
+                        fallback.isna(), candidate_col
+                    ]
+            _derive_from_lines(df, "purchase_order_lines")
+
+        invoice_lines = tables.get("invoice_lines", pd.DataFrame())
+        if isinstance(invoice_lines, pd.DataFrame) and not invoice_lines.empty:
+            df = invoice_lines.copy()
+            df["invoice_id"] = df["invoice_id"].map(self._normalise_identifier)
+            df["supplier_id"] = df["invoice_id"].map(self._invoice_supplier_map)
+            if "po_id" in df.columns:
+                df.loc[df["supplier_id"].isna(), "supplier_id"] = df.loc[
+                    df["supplier_id"].isna(), "po_id"
+                ].map(self._po_supplier_map)
+            _derive_from_lines(df, "invoice_lines")
+
+        profiles: Dict[str, Dict[str, Any]] = {}
+        for supplier_id, counts in category_counts.items():
+            primary_category: Optional[str] = None
+            breakdown = []
+            for category, count in counts.most_common():
+                if primary_category is None:
+                    primary_category = category
+                breakdown.append({"category": category, "occurrences": int(count)})
+            products = product_counts.get(supplier_id, Counter())
+            product_list = [name for name, _ in products.most_common(10)]
+            profiles[supplier_id] = {
+                "supplier_id": supplier_id,
+                "primary_category": primary_category,
+                "category_breakdown": breakdown,
+                "products": product_list,
+                "sources": sorted(source_tracker.get(supplier_id, set())),
+            }
+        for supplier_id, products in product_counts.items():
+            if supplier_id not in profiles:
+                profiles[supplier_id] = {
+                    "supplier_id": supplier_id,
+                    "primary_category": None,
+                    "category_breakdown": [],
+                    "products": [name for name, _ in products.most_common(10)],
+                    "sources": sorted(source_tracker.get(supplier_id, set())),
+                }
+            else:
+                entry = profiles[supplier_id]
+                if not entry.get("products"):
+                    entry["products"] = [name for name, _ in products.most_common(10)]
+        return profiles
+
+    def _build_policy_data_coverage(
+        self, tables: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Dict[str, bool]]:
+        coverage: Dict[str, Dict[str, bool]] = {}
+        for slug, aliases in self._policy_instruction_tables.items():
+            entry: Dict[str, bool] = {}
+            for alias in sorted(aliases):
+                df = tables.get(alias, pd.DataFrame())
+                entry[alias] = bool(isinstance(df, pd.DataFrame) and not df.empty)
+                canonical = self.TABLE_MAP.get(alias)
+                if canonical:
+                    entry[canonical] = entry[alias]
+            coverage[str(slug)] = entry
+        return coverage
 
     def _summarise_top_opportunities(
         self,
@@ -1307,9 +1596,15 @@ class OpportunityMinerAgent(BaseAgent):
             qe = getattr(self.agent_nick, "query_engine", None)
             workflow_completed = False
             self._data_profile = {}
+            self._policy_instruction_tables = {}
+            self._global_instruction_tables = set()
+            self._catalog_category_lookup = {}
+            self._supplier_category_profile = {}
             tables = self._ingest_data()
             tables = self._validate_data(tables)
             self._build_supplier_lookup(tables)
+            self._catalog_category_lookup = self._build_catalog_category_lookup(tables)
+            self._supplier_category_profile = self._build_supplier_category_profile(tables)
             tables = self._normalise_currency(tables)
             tables = self._apply_index_adjustment(tables)
             self._data_profile = self._build_data_profile(tables)
@@ -1802,6 +2097,24 @@ class OpportunityMinerAgent(BaseAgent):
                 if reason:
                     policy_supplier_gaps[display] = reason
 
+            policy_supplier_categories: Dict[str, Dict[str, List[str]]] = {}
+            for display, suppliers in policy_suppliers.items():
+                category_map: Dict[str, set[str]] = {}
+                for supplier in suppliers:
+                    profile = self._supplier_category_profile.get(supplier, {})
+                    category = None
+                    if isinstance(profile, dict):
+                        category = profile.get("primary_category")
+                    category_key = str(category).strip() if category else "uncategorized"
+                    if category_key:
+                        category_map.setdefault(category_key, set()).add(supplier)
+                policy_supplier_categories[display] = {
+                    category: sorted(values)
+                    for category, values in category_map.items()
+                }
+
+            policy_table_coverage = self._build_policy_data_coverage(tables)
+
             # compute weightage with risk and data coverage awareness
             weight_factors: List[float] = []
             for f in filtered:
@@ -1846,6 +2159,12 @@ class OpportunityMinerAgent(BaseAgent):
                 "policy_category_opportunities": policy_category_opportunities,
                 "policy_suppliers": policy_suppliers,
                 "policy_supplier_gaps": policy_supplier_gaps,
+                "policy_supplier_categories": policy_supplier_categories,
+                "policy_table_coverage": policy_table_coverage,
+                "supplier_category_profiles": self._supplier_category_profile,
+                "instruction_table_hits": sorted(
+                    self._global_instruction_tables.union(_MANDATORY_POLICY_TABLES)
+                ),
             }
             # pass candidate supplier IDs to downstream agents
             supplier_candidates = {
@@ -2946,6 +3265,14 @@ class OpportunityMinerAgent(BaseAgent):
                     break
             if not matched_entry:
                 continue
+            slug = matched_entry.get("policy_slug") or key
+            policy_sources = self._instruction_sources_from_policy(policy)
+            detected_tables = self._detect_instruction_tables(policy_sources)
+            if slug:
+                self._record_policy_tables(str(slug), detected_tables)
+                tables_list = sorted(self._policy_instruction_tables.get(str(slug), set()))
+                if tables_list:
+                    matched_entry["data_requirements"] = tables_list
             rules = self._coerce_policy_rules(policy)
             if rules:
                 matched_entry["rules"] = rules
@@ -2996,6 +3323,20 @@ class OpportunityMinerAgent(BaseAgent):
             registry = self._filter_registry_by_policies(
                 self._get_policy_registry(), []
             )
+        for key, cfg in registry.items():
+            if not isinstance(cfg, dict):
+                continue
+            slug = cfg.get("policy_slug") or key
+            if not slug:
+                continue
+            if slug not in self._policy_instruction_tables:
+                sources: List[Any] = []
+                sources.extend(self._instruction_sources_from_policy(cfg))
+                detected = self._detect_instruction_tables(sources)
+                self._record_policy_tables(str(slug), detected)
+            tables = sorted(self._policy_instruction_tables.get(str(slug), set()))
+            if tables:
+                cfg.setdefault("data_requirements", tables)
         return registry, provided_policies
 
     def _build_dynamic_policy_registry(
@@ -3055,6 +3396,13 @@ class OpportunityMinerAgent(BaseAgent):
             decorated = self._decorate_policy_entry(
                 slug, entry, provided_policy=policy, slug_hint=slug
             )
+            policy_tables = self._detect_instruction_tables(
+                self._instruction_sources_from_policy(policy)
+            )
+            self._record_policy_tables(decorated["policy_slug"], policy_tables)
+            tables = sorted(self._policy_instruction_tables.get(decorated["policy_slug"], set()))
+            if tables:
+                decorated.setdefault("data_requirements", tables)
             registry[decorated["policy_slug"]] = decorated
 
         return registry
@@ -4628,6 +4976,16 @@ class OpportunityMinerAgent(BaseAgent):
                     )
             if f.supplier_id and supplier_lookup:
                 f.supplier_name = supplier_lookup.get(f.supplier_id)
+            if not f.category_id and f.supplier_id:
+                profile = self._supplier_category_profile.get(str(f.supplier_id))
+                if isinstance(profile, dict):
+                    primary_category = profile.get("primary_category")
+                    if primary_category:
+                        f.category_id = str(primary_category)
+                        if isinstance(f.calculation_details, dict):
+                            f.calculation_details.setdefault(
+                                "supplier_primary_category", primary_category
+                            )
         return findings
 
     def _map_item_descriptions(
@@ -4740,44 +5098,27 @@ class OpportunityMinerAgent(BaseAgent):
             return most_common[0][0] if most_common else None
 
         description_matches: Dict[str, Dict[str, Any]] = {}
-        catalog = tables.get("product_mapping", pd.DataFrame())
-        if isinstance(catalog, pd.DataFrame) and not catalog.empty:
-            if "product" in catalog.columns:
-                catalog_df = catalog.dropna(subset=["product"]).copy()
-                if not catalog_df.empty:
-                    catalog_df["product"] = catalog_df["product"].astype(str).str.strip()
-                    catalog_df = catalog_df[catalog_df["product"] != ""]
-                    catalog_rows = []
-                    for row in catalog_df.itertuples(index=False):
-                        product_name = getattr(row, "product", None)
-                        if not product_name:
-                            continue
-                        entry: Dict[str, Any] = {"product": str(product_name).strip()}
-                        for level in range(1, 6):
-                            field = f"category_level_{level}"
-                            if hasattr(row, field):
-                                entry[field] = getattr(row, field)
-                        catalog_rows.append(entry)
-                    if catalog_rows:
-                        catalog_index = [
-                            (entry["product"].lower(), entry)
-                            for entry in catalog_rows
-                        ]
-                        unique_descriptions = {desc for counter in supplier_desc.values() for desc in counter}
-                        for description in unique_descriptions:
-                            key = description.lower()
-                            best_score = 0.0
-                            best_entry: Optional[Dict[str, Any]] = None
-                            for product_key, entry in catalog_index:
-                                score = SequenceMatcher(None, key, product_key).ratio()
-                                if score > best_score:
-                                    best_score = score
-                                    best_entry = entry
-                            if best_entry and best_score >= _CATALOG_MATCH_THRESHOLD:
-                                description_matches[description] = {
-                                    **best_entry,
-                                    "match_score": best_score,
-                                }
+        if not self._catalog_category_lookup:
+            self._catalog_category_lookup = self._build_catalog_category_lookup(tables)
+        if self._catalog_category_lookup:
+            catalog_index = list(self._catalog_category_lookup.items())
+            unique_descriptions = {
+                desc for counter in supplier_desc.values() for desc in counter
+            }
+            for description in unique_descriptions:
+                key = description.lower()
+                best_score = 0.0
+                best_entry: Optional[Dict[str, Any]] = None
+                for product_key, entry in catalog_index:
+                    score = SequenceMatcher(None, key, product_key).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_entry = entry
+                if best_entry and best_score >= _CATALOG_MATCH_THRESHOLD:
+                    description_matches[description] = {
+                        **best_entry,
+                        "match_score": best_score,
+                    }
 
         for finding in findings:
             supplier_id = finding.supplier_id
@@ -4835,10 +5176,26 @@ class OpportunityMinerAgent(BaseAgent):
                             finding.calculation_details.setdefault(
                                 "catalog_categories", category_details
                             )
+                            profile = self._supplier_category_profile.get(supplier_id)
+                            if isinstance(profile, dict):
+                                profile.setdefault("derived_from", []).append(
+                                    "catalog_match"
+                                )
                 else:
                     finding.item_id = description
             else:
                 finding.item_id = description
+
+            if not finding.category_id:
+                profile = self._supplier_category_profile.get(supplier_id)
+                if isinstance(profile, dict):
+                    candidate_category = profile.get("primary_category")
+                    if candidate_category:
+                        finding.category_id = str(candidate_category)
+                        if isinstance(finding.calculation_details, dict):
+                            finding.calculation_details.setdefault(
+                                "supplier_primary_category", candidate_category
+                            )
 
         return findings
 

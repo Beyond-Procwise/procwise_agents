@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 from jinja2 import Template
 
@@ -524,6 +524,8 @@ class EmailDraftingAgent(BaseAgent):
             asks,
             lead_time_request,
             negotiation_message,
+            decision_data.get("round"),
+            decision_data.get("line_items") or decision_data.get("pricing_table"),
         )
         if not body_text:
             body_text = fallback_text
@@ -909,6 +911,8 @@ class EmailDraftingAgent(BaseAgent):
                 asks,
                 lead_time_request,
                 negotiation_message,
+                round_no,
+                decision.get("line_items") or data.get("line_items"),
             )
 
         body_content = self._sanitise_generated_body(email_text)
@@ -990,6 +994,74 @@ class EmailDraftingAgent(BaseAgent):
             pass_fields=pass_fields,
         )
 
+    def _render_negotiation_table(self, line_items: Optional[Any]) -> List[str]:
+        if not line_items:
+            return []
+        if isinstance(line_items, str):
+            try:
+                line_items = json.loads(line_items)
+            except Exception:
+                return []
+        if isinstance(line_items, Mapping):
+            for key in ("rows", "items", "line_items"):
+                candidate = line_items.get(key)
+                if isinstance(candidate, Sequence):
+                    line_items = candidate
+                    break
+        if not isinstance(line_items, Sequence):
+            return []
+
+        structured_rows = [item for item in line_items if isinstance(item, Mapping)]
+        if not structured_rows:
+            return []
+
+        preferred_columns = [
+            "item",
+            "description",
+            "current_price",
+            "counter_price",
+            "quantity",
+            "total",
+        ]
+        available_columns: List[str] = []
+        for column in preferred_columns:
+            if any(column in row for row in structured_rows):
+                available_columns.append(column)
+        if not available_columns:
+            sample = structured_rows[0]
+            available_columns = [str(key) for key in sample.keys() if key]
+
+        headers = [column.replace("_", " ").title() for column in available_columns]
+        rows: List[List[str]] = []
+        for row in structured_rows:
+            formatted: List[str] = []
+            for column in available_columns:
+                value = row.get(column)
+                if isinstance(value, (int, float)) and column.lower().endswith("price"):
+                    formatted.append(f"{value:,.2f}")
+                elif isinstance(value, (int, float)) and column.lower() in {"total", "quantity"}:
+                    formatted.append(f"{value:,.2f}")
+                else:
+                    formatted.append(str(value) if value is not None else "-")
+            rows.append(formatted)
+        if not rows:
+            return []
+
+        widths = [
+            max(len(headers[idx]), max(len(row[idx]) for row in rows))
+            for idx in range(len(headers))
+        ]
+        header_line = " | ".join(
+            headers[idx].ljust(widths[idx]) for idx in range(len(headers))
+        )
+        separator = "-+-".join("-" * widths[idx] for idx in range(len(headers)))
+        table_lines = [header_line, separator]
+        for row in rows:
+            table_lines.append(
+                " | ".join(row[idx].ljust(widths[idx]) for idx in range(len(headers)))
+            )
+        return table_lines
+
     def _build_negotiation_fallback(
         self,
         rfq_id: str,
@@ -1000,38 +1072,85 @@ class EmailDraftingAgent(BaseAgent):
         asks: List[Any],
         lead_time_request: Optional[str],
         negotiation_message: Optional[str],
+        round_no: Optional[int] = None,
+        line_items: Optional[Any] = None,
     ) -> str:
         counter_text = self._format_currency_value(counter_price, currency)
         target_text = self._format_currency_value(target_price, currency)
         offer_text = self._format_currency_value(current_offer, currency)
-        lines = ["Thank you for the latest update on the quotation request."]
-        if counter_text:
-            clause = f"To secure approvals we need to align at {counter_text}"
-            if target_text and target_text != counter_text:
-                clause += f" against our target of {target_text}"
-            if offer_text:
-                clause += f" versus your current {offer_text}."
-            else:
+        lines = ["Dear Procwise,"]
+
+        if round_no is None:
+            try:
+                round_no = int(self.agent_nick.settings.negotiation_round)
+            except Exception:
+                round_no = 1
+        if round_no <= 1:
+            intro = (
+                "Thank you for the RFQ update and for the competitive pricing you have shared "
+                "with us previously."
+            )
+            lines.extend(["", intro])
+            if counter_text:
+                clause = f"If we can finalise this week, I am authorised to move to {counter_text}"
+                if offer_text:
+                    clause += f" against your current {offer_text}"
+                if target_text and target_text != counter_text:
+                    clause += f" (target {target_text})"
                 clause += "."
-            lines.append(clause)
-        elif target_text:
-            clause = f"Our pricing target remains {target_text}"
-            if offer_text:
-                clause += f" compared with your {offer_text}."
-            else:
-                clause += "."
-            lines.append(clause)
+                lines.append(clause)
+        elif round_no == 2:
+            lines.extend(
+                [
+                    "",
+                    "Our last position reflected the scope as we understood it."
+                    " To explore any further movement we would need to adjust a deal lever.",
+                ]
+            )
+            lever_options = [
+                "a longer commitment term",
+                "a higher consolidated volume",
+                "accelerated payment terms",
+            ]
+            lever = lever_options[0]
+            if asks:
+                lever = str(asks[0]).strip() or lever
+            lines.append(f"If we can secure {lever}, I can revisit the pricing immediately.")
         else:
-            lines.append("Could you share a structured unit price breakdown so we can complete approval?")
+            lines.extend(
+                [
+                    "",
+                    "We have now exhausted our internal flexibility and the figures below represent the final position we can hold.",
+                ]
+            )
+
+        if counter_text and round_no != 3:
+            lines.append(f"Our counter position stands at {counter_text}.")
+        elif target_text and not counter_text:
+            lines.append(f"Our pricing objective remains {target_text}.")
         if lead_time_request:
             lines.append(f"Lead time request: {lead_time_request}.")
+
         asks_list = [str(item).strip() for item in asks if str(item).strip()]
         if asks_list:
+            lines.append("")
             lines.append("Key considerations:")
             lines.extend(f"- {item}" for item in asks_list)
+
+        table_lines = self._render_negotiation_table(line_items)
+        if table_lines:
+            lines.extend(["", *table_lines])
+
         if negotiation_message:
-            lines.append(negotiation_message)
-        lines.append("Please confirm within 2 business days so we can lock in next steps.")
+            lines.extend(["", negotiation_message])
+
+        lines.append("")
+        lines.append(
+            "Could you confirm we can proceed this week so that we can lock in the pricing and availability?"
+        )
+        lines.append("")
+        lines.append("Thank you,")
+        lines.append("Procwise Sourcing Team")
         return "\n".join(lines)
 
     @staticmethod
