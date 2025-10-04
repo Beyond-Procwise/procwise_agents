@@ -234,6 +234,12 @@ class SESEmailWatcher:
         self.metadata_provider = metadata_provider
         self.state_store = state_store or InMemoryEmailWatcherState()
         self._custom_loader = message_loader
+        self.mailbox_address = (
+            getattr(self.settings, "supplier_mailbox", None)
+            or getattr(self.settings, "imap_user", None)
+            or "supplierconnect@procwise.co.uk"
+        )
+
         if self._custom_loader is None:
             queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
             if queue_url:
@@ -290,12 +296,6 @@ class SESEmailWatcher:
         self.poll_interval_seconds = max(1, poll_interval)
         if self.poll_interval_seconds < self._match_poll_sleep_seconds:
             self.poll_interval_seconds = self._match_poll_sleep_seconds
-
-        self.mailbox_address = (
-            getattr(self.settings, "supplier_mailbox", None)
-            or getattr(self.settings, "imap_user", None)
-            or "supplierconnect@procwise.co.uk"
-        )
 
         endpoint = getattr(self.settings, "ses_smtp_endpoint", "")
         self.region = getattr(self.settings, "ses_region", None) or self._parse_region(endpoint)
