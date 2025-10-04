@@ -32,6 +32,11 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
+from services.email_thread_store import (
+    ensure_thread_table,
+    lookup_rfq_from_threads,
+    sanitise_thread_table_name,
+)
 from utils.gpu import configure_gpu
 
 
@@ -318,6 +323,12 @@ class SESEmailWatcher:
         self._ensure_email_watcher_watermarks_table()
 
         self._validate_inbound_configuration(prefix_value)
+
+        self._thread_table_name = sanitise_thread_table_name(
+            getattr(self.settings, "email_thread_table", None),
+            logger=logger,
+        )
+        self._thread_table_ready = False
 
         # Prefer reusing the orchestrator's S3 client so we respect any
         # endpoint overrides or credential sources initialised during startup.
@@ -1435,6 +1446,17 @@ class SESEmailWatcher:
             if canonical_hint and supplier_hint and canonical_hint not in tail_supplier_map:
                 tail_supplier_map[canonical_hint] = supplier_hint
 
+        if not rfq_candidates:
+            thread_match = self._resolve_rfq_from_thread_headers(message)
+            if thread_match:
+                rfq_value, supplier_hint = thread_match
+                if rfq_value not in rfq_candidates:
+                    rfq_candidates.append(rfq_value)
+                if supplier_hint:
+                    canonical_hint = self._canonical_rfq(rfq_value)
+                    if canonical_hint and canonical_hint not in tail_supplier_map:
+                        tail_supplier_map[canonical_hint] = supplier_hint
+
         canonical_map: Dict[str, str] = {}
         ordered_canonicals: List[str] = []
         for candidate in rfq_candidates:
@@ -1459,6 +1481,17 @@ class SESEmailWatcher:
                 ordered_canonicals.append(canonical)
                 if supplier_hint and canonical not in tail_supplier_map:
                     tail_supplier_map[canonical] = supplier_hint
+
+        if not ordered_canonicals:
+            thread_match = self._resolve_rfq_from_thread_headers(message)
+            if thread_match:
+                rfq_value, supplier_hint = thread_match
+                canonical = self._canonical_rfq(rfq_value)
+                if canonical and canonical not in canonical_map:
+                    canonical_map[canonical] = rfq_value
+                    ordered_canonicals.append(canonical)
+                    if supplier_hint and canonical not in tail_supplier_map:
+                        tail_supplier_map[canonical] = supplier_hint
 
         if not ordered_canonicals:
             logger.debug("Skipping email without RFQ identifier: %s", subject)
@@ -3090,6 +3123,116 @@ class SESEmailWatcher:
                 supplier_hint = record.get("supplier_id") if isinstance(record, dict) else None
                 resolved.append((canonical, str(rfq_value), supplier_hint))
         return resolved
+
+    def _resolve_rfq_from_thread_headers(
+        self, message: Dict[str, object]
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        identifiers = self._collect_thread_identifiers(message)
+        if not identifiers:
+            return None
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn) or not self._thread_table_name:
+            return None
+
+        try:
+            with get_conn() as conn:
+                if not self._ensure_thread_table_ready(conn):
+                    return None
+                rfq_id = lookup_rfq_from_threads(
+                    conn,
+                    self._thread_table_name,
+                    identifiers,
+                    logger=logger,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to resolve RFQ from thread headers for mailbox %s", self.mailbox_address
+            )
+            return None
+
+        if not rfq_id:
+            return None
+
+        return str(rfq_id), None
+
+    def _collect_thread_identifiers(self, message: Dict[str, object]) -> List[str]:
+        raw_values: List[str] = []
+
+        def _collect(value: object) -> None:
+            if value in (None, ""):
+                return
+            if isinstance(value, (list, tuple, set)):
+                for entry in value:
+                    _collect(entry)
+                return
+            try:
+                text = str(value)
+            except Exception:
+                return
+            trimmed = text.strip()
+            if trimmed:
+                raw_values.append(trimmed)
+
+        _collect(message.get("in_reply_to"))
+        _collect(message.get("references"))
+
+        headers = message.get("headers")
+        if isinstance(headers, dict):
+            _collect(headers.get("In-Reply-To") or headers.get("in-reply-to"))
+            reference_values = headers.get("References") or headers.get("references")
+            _collect(reference_values)
+
+        if not raw_values:
+            return []
+
+        message_ids: List[str] = []
+        seen: Set[str] = set()
+        pattern = re.compile(r"<([^>]+)>")
+        for value in raw_values:
+            matches = pattern.findall(value)
+            if matches:
+                for candidate in matches:
+                    trimmed = candidate.strip()
+                    if not trimmed:
+                        continue
+                    lowered = trimmed.lower()
+                    if lowered in seen:
+                        continue
+                    seen.add(lowered)
+                    message_ids.append(trimmed)
+                continue
+
+            trimmed = value.strip()
+            if trimmed.startswith("<") and trimmed.endswith(">"):
+                trimmed = trimmed[1:-1].strip()
+            if not trimmed:
+                continue
+            lowered = trimmed.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            message_ids.append(trimmed)
+
+        return message_ids
+
+    def _ensure_thread_table_ready(self, conn) -> bool:
+        if self._thread_table_ready:
+            return True
+
+        try:
+            ensure_thread_table(conn, self._thread_table_name, logger=logger)
+            self._thread_table_ready = True
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to ensure email thread table %s", self._thread_table_name
+            )
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Rollback failed after ensuring thread table")
+            return False
 
     def _ensure_s3_mapping(self, s3_key: Optional[str], rfq_id: Optional[object]) -> Optional[str]:
         if not self.bucket or not s3_key or rfq_id is None:

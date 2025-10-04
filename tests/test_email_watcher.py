@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from email.message import EmailMessage
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pytest
 
@@ -158,6 +158,43 @@ def test_poll_once_triggers_supplier_agent_on_match():
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
     assert watcher.supplier_agent.contexts
     assert "msg-1" in state
+
+
+def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
+    nick = DummyNick()
+
+    message = {
+        "id": "msg-thread-1",
+        "subject": "Supplier response",
+        "body": "Here is our quote 1200",
+        "from": "supplier@example.com",
+        "in_reply_to": "<dispatch-001@example.com>",
+        "rfq_id": None,
+    }
+
+    lookup_calls: List[Tuple[str, List[str]]] = []
+    ensure_calls: List[str] = []
+
+    def fake_lookup(conn, table_name, identifiers, logger=None):
+        lookup_calls.append((table_name, list(identifiers)))
+        return "RFQ-20240101-THREAD42"
+
+    def fake_ensure(conn, table_name, logger=None):
+        ensure_calls.append(table_name)
+
+    monkeypatch.setattr("services.email_watcher.lookup_rfq_from_threads", fake_lookup)
+    monkeypatch.setattr("services.email_watcher.ensure_thread_table", fake_ensure)
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [dict(message)])
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    processed = results[0]
+    assert processed["rfq_id"] == "RFQ-20240101-THREAD42"
+    assert lookup_calls
+    assert lookup_calls[0][0] == "proc.email_thread_map"
+    assert lookup_calls[0][1] == ["dispatch-001@example.com"]
+    assert ensure_calls == ["proc.email_thread_map"]
 
 
 def test_poll_once_continues_until_all_filters_match():
