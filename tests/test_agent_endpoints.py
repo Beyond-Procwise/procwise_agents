@@ -129,9 +129,13 @@ def test_email_workflow_returns_action_id(monkeypatch):
                 "recipients": recipients or ["r1", "r2"],
                 "sender": sender or "sender@example.com",
                 "subject": subject_override or "s",
-                "body": body_override or "<!-- RFQ-ID: RFQ-123 --><p>generated</p>",
+                "body": body_override or "<p>generated</p>",
                 "thread_index": 1,
-                "draft": {"rfq_id": rfq_id, "sent_status": True},
+                "draft": {
+                    "rfq_id": rfq_id,
+                    "sent_status": True,
+                    "dispatch_metadata": {"rfq_id": rfq_id},
+                },
             }
 
     monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
@@ -143,7 +147,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
             "subject": "s",
             "recipients": "r1,r2",
             "action_id": "a1",
-            "body": "<!-- RFQ-ID: RFQ-123 --><p>generated</p>",
+            "body": "<p>generated</p>",
         },
     )
     assert resp.status_code == 200
