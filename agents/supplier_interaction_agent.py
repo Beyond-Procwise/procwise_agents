@@ -733,6 +733,7 @@ class SupplierInteractionAgent(BaseAgent):
                     subject_hint=subject_hint,
                     from_address=recipient_hint,
                     enable_negotiation=enable_negotiation,
+
                 )
                 with lock:
                     results[index] = result

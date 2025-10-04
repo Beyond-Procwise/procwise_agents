@@ -169,6 +169,7 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert "await_response" not in output.pass_fields
     assert output.pass_fields["supplier_responses"][0]["message_id"] == "reply-1"
 
+
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
