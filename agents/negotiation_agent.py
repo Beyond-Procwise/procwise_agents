@@ -1,10 +1,11 @@
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
-from agents.email_drafting_agent import EmailDraftingAgent
+from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -97,6 +98,7 @@ class NegotiationAgent(BaseAgent):
         self._state_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._email_agent: Optional[EmailDraftingAgent] = None
         self._supplier_agent: Optional["SupplierInteractionAgent"] = None
+        self._state_schema_checked = False
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -144,6 +146,11 @@ class NegotiationAgent(BaseAgent):
             or context.input_data.get("response_text")
             or context.input_data.get("message")
         )
+
+        incoming_subject = self._coerce_text(context.input_data.get("subject"))
+        base_candidate = self._normalise_base_subject(incoming_subject)
+        if base_candidate and not state.get("base_subject"):
+            state["base_subject"] = base_candidate
 
         decision = decide_strategy(price, target_price, lead_weeks=lead_weeks, constraints=constraints)
         decision.setdefault("strategy", "clarify")
@@ -299,6 +306,8 @@ class NegotiationAgent(BaseAgent):
             "negotiation_message": negotiation_message,
         }
 
+        draft_payload.setdefault("subject", self._format_negotiation_subject(state))
+
         recipients = self._collect_recipient_candidates(context)
         if recipients:
             draft_payload.setdefault("recipients", recipients)
@@ -322,6 +331,10 @@ class NegotiationAgent(BaseAgent):
         draft_records: List[Dict[str, Any]] = []
         next_agents: List[str] = []
 
+        subject_seed = self._coerce_text(draft_payload.get("subject"))
+        if not subject_seed:
+            subject_seed = self._format_negotiation_subject(state)
+
         draft_stub = {
             "rfq_id": rfq_id,
             "supplier_id": supplier,
@@ -331,6 +344,7 @@ class NegotiationAgent(BaseAgent):
             "counter_proposals": counter_options,
             "sent_status": False,
             "thread_index": round_no,
+            "subject": subject_seed,
         }
         if currency:
             draft_stub["currency"] = currency
@@ -339,6 +353,8 @@ class NegotiationAgent(BaseAgent):
         draft_stub["payload"] = draft_payload
         if recipients:
             draft_stub["recipients"] = recipients
+        if negotiation_message:
+            draft_stub.setdefault("body", negotiation_message)
 
         email_payload = self._build_email_agent_payload(
             context,
@@ -381,6 +397,25 @@ class NegotiationAgent(BaseAgent):
                     state,
                     negotiation_message,
                 )
+
+        if email_subject:
+            base_from_email = self._normalise_base_subject(email_subject)
+            if base_from_email and not state.get("base_subject"):
+                state["base_subject"] = base_from_email
+        elif subject_seed and not state.get("base_subject"):
+            fallback_base = self._normalise_base_subject(subject_seed)
+            if fallback_base:
+                state["base_subject"] = fallback_base
+
+        if email_body and not state.get("initial_body"):
+            state["initial_body"] = email_body
+        elif not state.get("initial_body") and negotiation_message:
+            state["initial_body"] = negotiation_message
+
+        if not email_subject:
+            email_subject = subject_seed
+        if not email_body and negotiation_message:
+            email_body = negotiation_message
 
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
@@ -631,6 +666,8 @@ class NegotiationAgent(BaseAgent):
             "last_supplier_msg_id": None,
             "last_agent_msg_id": None,
             "last_email_sent_at": None,
+            "base_subject": None,
+            "initial_body": None,
         }
 
     def _public_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -641,12 +678,60 @@ class NegotiationAgent(BaseAgent):
             "awaiting_response": bool(state.get("awaiting_response", False)),
         }
 
+    def _ensure_state_schema(self) -> None:
+        if getattr(self, "_state_schema_checked", False):
+            return
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            self._state_schema_checked = True
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS base_subject TEXT"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS initial_body TEXT"
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("failed to ensure negotiation state schema", exc_info=True)
+        finally:
+            self._state_schema_checked = True
+
+    @staticmethod
+    def _normalise_base_subject(subject: Optional[str]) -> Optional[str]:
+        if subject is None:
+            return None
+        if not isinstance(subject, str):
+            try:
+                subject = str(subject)
+            except Exception:
+                return None
+        trimmed = subject.strip()
+        if not trimmed:
+            return None
+        trimmed = re.sub(r"(?i)^(re|fw|fwd):\s*", "", trimmed)
+        cleaned = EmailDraftingAgent._strip_rfq_identifier_tokens(trimmed)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip("-–: ")
+        return cleaned or None
+
+    def _format_negotiation_subject(self, state: Dict[str, Any]) -> str:
+        base = self._coerce_text(state.get("base_subject"))
+        if base:
+            if re.match(r"(?i)^(re|fw|fwd):", base.strip()):
+                return base.strip()
+            return f"Re: {base}".strip()
+        return DEFAULT_NEGOTIATION_SUBJECT
+
 
     def _load_session_state(
         self, rfq_id: Optional[str], supplier: Optional[str]
     ) -> Tuple[Dict[str, Any], bool]:
         if not rfq_id or not supplier:
             return self._default_state(), False
+        self._ensure_state_schema()
         key = (str(rfq_id), str(supplier))
         if key in self._state_cache:
             return dict(self._state_cache[key]), True
@@ -659,7 +744,8 @@ class NegotiationAgent(BaseAgent):
                     cur.execute(
                         """
                         SELECT supplier_reply_count, current_round, status, awaiting_response,
-                               last_supplier_msg_id, last_agent_msg_id, last_email_sent_at
+                               last_supplier_msg_id, last_agent_msg_id, last_email_sent_at,
+                               base_subject, initial_body
                           FROM proc.negotiation_session_state
                          WHERE rfq_id = %s AND supplier_id = %s
                         """,
@@ -675,7 +761,21 @@ class NegotiationAgent(BaseAgent):
                             state["last_supplier_msg_id"],
                             state["last_agent_msg_id"],
                             state["last_email_sent_at"],
+                            base_subject,
+                            initial_body,
                         ) = row
+                        if isinstance(base_subject, (bytes, bytearray, memoryview)):
+                            try:
+                                base_subject = base_subject.decode("utf-8", errors="ignore")
+                            except Exception:
+                                base_subject = str(base_subject)
+                        if isinstance(initial_body, (bytes, bytearray, memoryview)):
+                            try:
+                                initial_body = initial_body.decode("utf-8", errors="ignore")
+                            except Exception:
+                                initial_body = str(initial_body)
+                        state["base_subject"] = base_subject
+                        state["initial_body"] = initial_body
                         exists = True
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load negotiation session state")
@@ -687,6 +787,7 @@ class NegotiationAgent(BaseAgent):
             return
         key = (str(rfq_id), str(supplier))
         self._state_cache[key] = dict(state)
+        self._ensure_state_schema()
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
@@ -702,9 +803,11 @@ class NegotiationAgent(BaseAgent):
                             last_supplier_msg_id,
                             last_agent_msg_id,
                             last_email_sent_at,
+                            base_subject,
+                            initial_body,
                             updated_on
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (rfq_id, supplier_id) DO UPDATE SET
                             supplier_reply_count = EXCLUDED.supplier_reply_count,
                             current_round = EXCLUDED.current_round,
@@ -713,6 +816,8 @@ class NegotiationAgent(BaseAgent):
                             last_supplier_msg_id = EXCLUDED.last_supplier_msg_id,
                             last_agent_msg_id = EXCLUDED.last_agent_msg_id,
                             last_email_sent_at = EXCLUDED.last_email_sent_at,
+                            base_subject = EXCLUDED.base_subject,
+                            initial_body = EXCLUDED.initial_body,
                             updated_on = NOW()
                         """,
                         (
@@ -725,6 +830,8 @@ class NegotiationAgent(BaseAgent):
                             state.get("last_supplier_msg_id"),
                             state.get("last_agent_msg_id"),
                             state.get("last_email_sent_at"),
+                            state.get("base_subject"),
+                            state.get("initial_body"),
                         ),
                     )
                 conn.commit()

@@ -397,12 +397,38 @@ rfq_id text NOT NULL,
     last_supplier_msg_id text,
     last_agent_msg_id text,
     last_email_sent_at timestamp with time zone,
+    base_subject text,
+    initial_body text,
     updated_on timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT negotiation_session_state_pk PRIMARY KEY (rfq_id, supplier_id)
 ```
 Tracks supplier reply counts and awaiting-response status for each negotiation session. The
 reply counter advances only after an outbound counter email when the agent is awaiting a
 response, ensuring each supplier response is monitored until the negotiation finalises.
+
+### `proc.email_dispatch_chains`
+```
+id serial PRIMARY KEY,
+    rfq_id text NOT NULL,
+    message_id text NOT NULL UNIQUE,
+    thread_index integer NOT NULL DEFAULT 1,
+    supplier_id text,
+    workflow_ref text,
+    recipients jsonb,
+    subject text NOT NULL,
+    body text NOT NULL,
+    dispatch_metadata jsonb,
+    awaiting_response boolean NOT NULL DEFAULT true,
+    responded_at timestamptz,
+    response_message_id text,
+    response_metadata jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+```
+Records each dispatched email along with its message identifier so replies can be
+matched to the originating workflow. When an inbound message references one of the
+stored message IDs the row is updated with the response metadata, allowing workflows
+to confirm that every dispatched email has received a reply before closing.
 
 ### `proc.email_thread_map`
 ```

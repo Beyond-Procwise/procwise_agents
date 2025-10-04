@@ -34,6 +34,7 @@ import psycopg2
 from botocore.config import Config
 from psycopg2 import extras
 
+from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
 from services.email_thread_store import (
     DEFAULT_THREAD_TABLE,
     ensure_thread_table,
@@ -345,6 +346,10 @@ def _build_reply_metadata(message, bucket: str, key: str) -> Dict[str, object]:
     raw_message_id = message.get("Message-ID") or message.get("Message-Id")
     message_id = raw_message_id.strip() if isinstance(raw_message_id, str) else None
 
+    in_reply_to = _decode_header(message.get("In-Reply-To"))
+    reference_headers = message.get_all("References", [])
+    references = [_decode_header(value) for value in reference_headers]
+
     metadata = {
         "subject": subject,
         "from_address": from_address,
@@ -358,6 +363,8 @@ def _build_reply_metadata(message, bucket: str, key: str) -> Dict[str, object]:
         "s3_bucket": bucket,
         "s3_key": key,
         "original_s3_key": key,
+        "in_reply_to": in_reply_to,
+        "references": references,
     }
     return metadata
 
@@ -566,6 +573,22 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
         metadata["s3_key"] = dest_key
         logger.info("Tagged S3 object %s/%s with RFQ %s", bucket, decoded_key, rfq_id)
         _upsert_supplier_reply(rfq_id, metadata)
+        try:
+            mark_dispatch_response(
+                connection,
+                rfq_id=rfq_id,
+                in_reply_to=metadata.get("in_reply_to"),
+                references=metadata.get("references"),
+                response_message_id=metadata.get("message_id"),
+                response_metadata={
+                    "subject": metadata.get("subject"),
+                    "from_address": metadata.get("from_address"),
+                },
+            )
+        except Exception:  # pragma: no cover - best effort logging
+            logger.exception(
+                "Failed to mark dispatch chain response for RFQ %s", rfq_id
+            )
         _register_processed_object(
             connection,
             bucket,

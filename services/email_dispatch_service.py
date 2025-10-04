@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from utils.gpu import configure_gpu
 
+from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
 from .email_service import EmailService
 from .email_thread_store import (
     DEFAULT_THREAD_TABLE,
@@ -95,7 +96,7 @@ class EmailDispatchService:
 
             body_source = body_override if body_override is not None else draft.get("body")
             body_text = str(body_source).strip() if body_source else ""
-            body = self._ensure_rfq_annotation(body_text, rfq_id)
+            body, backend_metadata = self._ensure_rfq_annotation(body_text, rfq_id)
 
             dispatch_payload = dict(draft)
             dispatch_payload.update(
@@ -106,6 +107,7 @@ class EmailDispatchService:
                     "receiver": recipient_list[0] if recipient_list else draft.get("receiver"),
                     "contact_level": 1 if recipient_list else 0,
                     "sender": sender_email,
+                    "dispatch_metadata": backend_metadata,
                 }
             )
 
@@ -159,6 +161,23 @@ class EmailDispatchService:
                 except Exception:  # pragma: no cover - defensive
                     self.logger.exception(
                         "Failed to persist thread mapping for RFQ %s", rfq_id
+                    )
+                try:
+                    register_dispatch_chain(
+                        conn,
+                        rfq_id=rfq_id,
+                        message_id=message_id,
+                        subject=subject,
+                        body=body,
+                        thread_index=draft.get("thread_index"),
+                        supplier_id=draft.get("supplier_id"),
+                        workflow_ref=draft.get("action_id"),
+                        recipients=recipient_list,
+                        metadata=backend_metadata,
+                    )
+                except Exception:  # pragma: no cover - best effort logging
+                    self.logger.exception(
+                        "Failed to register dispatch chain for RFQ %s", rfq_id
                     )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
@@ -399,25 +418,13 @@ class EmailDispatchService:
                 values.append(candidate)
         return values
 
-    def _ensure_rfq_annotation(self, body: str, rfq_id: str) -> str:
-        if body is None:
-            body = ""
-
-        annotations: List[str] = []
-        procwise_comment = f"<!-- PROCWISE:RFQ_ID={rfq_id} -->"
-        legacy_comment = f"<!-- RFQ-ID: {rfq_id} -->"
-
-        if not re.search(r"PROCWISE:RFQ_ID\s*=\s*" + re.escape(rfq_id), body, re.IGNORECASE):
-            annotations.append(procwise_comment)
-        if not re.search(r"RFQ-ID\s*[:=]\s*" + re.escape(rfq_id), body, re.IGNORECASE):
-            annotations.append(legacy_comment)
-
-        if not body.strip():
-            return "\n".join(annotations) if annotations else legacy_comment
-
-        if annotations:
-            return "\n".join(annotations + [body.strip()])
-        return body
+    def _ensure_rfq_annotation(self, body: str, rfq_id: str) -> tuple[str, Dict[str, Any]]:
+        text = body or ""
+        metadata: Dict[str, Any] = {"rfq_id": rfq_id}
+        if text and rfq_id:
+            text = re.sub(r"(?i)\bRFQ[-\s:]*[A-Z0-9]{2,}[^\s]*", "", text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip(), metadata
 
     @staticmethod
     def _load_json_field(value: Any) -> Optional[Any]:

@@ -9,6 +9,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
 
@@ -141,7 +142,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     store = InMemoryDraftStore()
     draft_payload = {
         "rfq_id": "RFQ-UNIT",
-        "subject": "RFQ RFQ-UNIT – Request for Quotation",
+        "subject": DEFAULT_RFQ_SUBJECT,
         "body": "<p>Hello</p>",
         "receiver": "buyer@example.com",
         "recipients": ["buyer@example.com"],
@@ -210,18 +211,18 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
 
     assert result["sent"] is True
     assert result["recipients"] == ["buyer@example.com"]
-    assert result["subject"].startswith("RFQ RFQ-UNIT")
+    assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
     assert sent_args["headers"]["X-Procwise-RFQ-ID"] == "RFQ-UNIT"
+    assert result["draft"]["dispatch_metadata"]["rfq_id"] == "RFQ-UNIT"
     assert recorded_thread == {
         "message_id": "<message-id-1>",
         "rfq_id": "RFQ-UNIT",
         "supplier_id": "S1",
         "recipients": ["buyer@example.com"],
     }
-    assert result["body"].startswith("<!-- PROCWISE:RFQ_ID=RFQ-UNIT -->")
-    assert "<!-- RFQ-ID: RFQ-UNIT -->" in result["body"]
+    assert "RFQ-UNIT" not in result["body"]
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
@@ -230,5 +231,4 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert updated_action["sent_status"] == "True"
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
-    assert sent_args["body"].startswith("<!-- PROCWISE:RFQ_ID=RFQ-UNIT -->")
-    assert "<!-- RFQ-ID: RFQ-UNIT -->" in sent_args["body"]
+    assert "RFQ-UNIT" not in sent_args["body"]

@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - psycopg2 may be unavailable in tests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
+from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
 from utils.gpu import configure_gpu
 
 
@@ -1073,10 +1074,18 @@ class SESEmailWatcher:
                             last_supplier_msg_id TEXT,
                             last_agent_msg_id TEXT,
                             last_email_sent_at TIMESTAMPTZ,
+                            base_subject TEXT,
+                            initial_body TEXT,
                             updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             CONSTRAINT negotiation_session_state_pk PRIMARY KEY (rfq_id, supplier_id)
                         )
                         """
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS base_subject TEXT"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS initial_body TEXT"
                     )
                     cur.execute(
                         """
@@ -1498,6 +1507,35 @@ class SESEmailWatcher:
             processed["s3_key"] = message.get("s3_key")
         if message.get("_bucket"):
             processed["_bucket"] = message.get("_bucket")
+
+        try:
+            get_conn = getattr(self.agent_nick, "get_db_connection", None)
+            if callable(get_conn) and rfq_id:
+                with get_conn() as conn:
+                    headers = message.get("headers") if isinstance(message.get("headers"), dict) else {}
+                    in_reply_to_candidate = None
+                    references_candidate: Optional[Iterable[str] | str] = None
+                    if headers:
+                        in_reply_to_candidate = headers.get("In-Reply-To") or headers.get("in-reply-to")
+                        references_candidate = headers.get("References") or headers.get("references")
+                    in_reply_to_value = message.get("in_reply_to") or in_reply_to_candidate
+                    references_value = message.get("references") or references_candidate
+                    mark_dispatch_response(
+                        conn,
+                        rfq_id=rfq_id,
+                        in_reply_to=in_reply_to_value,
+                        references=references_value,
+                        response_message_id=message_identifier,
+                        response_metadata={
+                            "subject": subject,
+                            "from_address": from_address,
+                        },
+                    )
+                    conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.debug(
+                "Failed to reconcile dispatch chain for message %s", message_identifier, exc_info=True
+            )
 
         context = AgentContext(
             workflow_id=str(uuid.uuid4()),

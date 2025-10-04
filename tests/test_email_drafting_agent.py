@@ -51,7 +51,7 @@ def test_from_decision_formats_payload(monkeypatch):
 
     result = agent.from_decision(decision)
 
-    assert result["subject"] == "Re: RFQ RFQ-001"
+    assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
     assert result["body"] == result["text"]
     assert "Please confirm if 44.8 GBP is workable." in result["text"]
     assert "<ul>" in result["html"] and "<li>Please confirm if 44.8 GBP is workable.</li>" in result["html"]
@@ -72,7 +72,7 @@ def test_from_decision_subject_fallback(monkeypatch):
     monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00001")
     agent = EmailDraftingAgent()
     result = agent.from_decision({"rfq_id": "ABC"})
-    assert result["subject"] == "RFQ-20250930-RFQ00001 – Counter Offer & Next Steps"
+    assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
     assert result["text"] == "Body without explicit subject"
 
 
@@ -81,7 +81,7 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     agent = EmailDraftingAgent()
     rfq_id = "RFQ-20250930-84d44c85"
     result = agent.from_decision({"rfq_id": rfq_id})
-    assert result["subject"] == "RFQ-20250930-84D44C85 – Counter Offer & Next Steps"
+    assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
 def test_from_decision_generates_unique_rfq_id(monkeypatch):
@@ -96,7 +96,7 @@ def test_from_decision_generates_unique_rfq_id(monkeypatch):
 
     assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
     assert result["headers"]["X-Procwise-RFQ-ID"] == "RFQ-20250930-UN1QUEID"
-    assert result["subject"] == "RFQ-20250930-UN1QUEID – Counter Offer & Next Steps"
+    assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
 def test_from_decision_normalises_lowercase_rfq_id(monkeypatch):

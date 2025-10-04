@@ -224,6 +224,11 @@ _RFQ_HEADER_CELL_STYLE = (
 )
 _RFQ_BODY_CELL_STYLE = "border: 1px solid #d0d0d0; padding: 6px; text-align: left;"
 _RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", flags=re.IGNORECASE)
+_VISIBLE_RFQ_ID_PATTERN = re.compile(r"(?i)RFQ[\w\s:-]*\d[\w-]*")
+
+DEFAULT_RFQ_SUBJECT = "Request for Quotation – Procurement Opportunity"
+DEFAULT_NEGOTIATION_SUBJECT = "Re: Procurement Negotiation Update"
+DEFAULT_FOLLOW_UP_SUBJECT = "Procurement Follow Up"
 
 
 def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
@@ -293,6 +298,44 @@ class EmailDraftingAgent(BaseAgent):
         "<p>We appreciate your timely response.</p>"
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
     )
+
+    @staticmethod
+    def _strip_rfq_identifier_tokens(text: Optional[str]) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = _VISIBLE_RFQ_ID_PATTERN.sub("", text)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned.strip()
+
+    @classmethod
+    def _clean_subject_text(cls, subject: Optional[str], fallback: str) -> str:
+        prefix = ""
+        candidate = subject.strip() if isinstance(subject, str) else ""
+        if candidate:
+            prefix_match = re.match(r"(?i)^(re|fw|fwd):\s*", candidate)
+            if prefix_match:
+                prefix = prefix_match.group(0)
+                candidate = candidate[prefix_match.end():]
+            candidate = cls._strip_rfq_identifier_tokens(candidate)
+            candidate = candidate.strip("-–: ")
+            if candidate:
+                return f"{prefix}{candidate}".strip()
+
+        fallback_clean = cls._strip_rfq_identifier_tokens(fallback or "").strip("-–: ")
+        if prefix and fallback_clean:
+            fallback_without_prefix = re.sub(r"(?i)^(re|fw|fwd):\s*", "", fallback_clean)
+            combined = f"{prefix}{fallback_without_prefix}".strip()
+            return combined or prefix.strip()
+        result = fallback_clean or prefix.strip()
+        return result if result else "Procurement Update"
+
+    @staticmethod
+    def _clean_body_text(body: Optional[str]) -> str:
+        if not isinstance(body, str):
+            return ""
+        cleaned = _VISIBLE_RFQ_ID_PATTERN.sub("", body)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def __init__(self, agent_nick=None):
         agent_nick = self._prepare_agent_nick(agent_nick)
@@ -495,14 +538,15 @@ class EmailDraftingAgent(BaseAgent):
         if not sanitised_html and plain_text:
             sanitised_html = self._render_html_from_text(plain_text)
 
+        if sanitised_html:
+            sanitised_html = self._clean_body_text(sanitised_html)
+        if plain_text:
+            plain_text = self._clean_body_text(plain_text)
+
         if subject_line:
-            subject = subject_line.strip() or f"{rfq_id_output} – Counter Offer & Next Steps"
+            subject = self._clean_subject_text(subject_line.strip(), DEFAULT_NEGOTIATION_SUBJECT)
         else:
-            fallback_subject = f"{rfq_id_output} – Counter Offer & Next Steps"
-            subject = (
-                self._normalise_subject_line(fallback_subject, supplied_rfq or rfq_id_output)
-                or fallback_subject
-            )
+            subject = self._clean_subject_text(None, DEFAULT_NEGOTIATION_SUBJECT)
 
         thread_headers = decision_data.get("thread")
         headers: Dict[str, Any] = {"X-Procwise-RFQ-ID": rfq_id_output}
@@ -597,6 +641,9 @@ class EmailDraftingAgent(BaseAgent):
         sanitised_html = self._sanitise_generated_body(html_body)
         plain_text = self._html_to_plain_text(sanitised_html) if sanitised_html else body_text
 
+        subject_candidate = subject_line or context.get("subject")
+        subject = self._clean_subject_text(subject_candidate, DEFAULT_FOLLOW_UP_SUBJECT)
+
         polish_enabled = os.getenv("EMAIL_POLISH_ENABLED", "1").strip().lower() not in {
             "0",
             "false",
@@ -605,7 +652,7 @@ class EmailDraftingAgent(BaseAgent):
         if polish_enabled and self.polish_model:
             polish_payload = {
                 "rfq_id": rfq_id_value,
-                "subject": subject_line or context.get("subject") or rfq_id_value,
+                "subject": subject,
                 "body": plain_text,
             }
             polish_prompt = (
@@ -622,7 +669,7 @@ class EmailDraftingAgent(BaseAgent):
                 polished_text = ""
             polish_subject, polish_body = self._split_subject_and_body(polished_text)
             if polish_subject:
-                subject_line = polish_subject
+                subject = self._clean_subject_text(polish_subject, subject)
             if polish_body:
                 html_body = self._render_html_from_text(polish_body)
                 sanitised_html = self._sanitise_generated_body(html_body)
@@ -630,14 +677,10 @@ class EmailDraftingAgent(BaseAgent):
         if not sanitised_html and plain_text:
             sanitised_html = self._render_html_from_text(plain_text)
 
-        subject_candidate = (
-            subject_line
-            or context.get("subject")
-            or f"{rfq_id_value} – Follow Up"
-        )
-        subject = self._normalise_subject_line(subject_candidate, rfq_id_value)
-        if not subject:
-            subject = f"{rfq_id_value} – Follow Up"
+        if sanitised_html:
+            sanitised_html = self._clean_body_text(sanitised_html)
+        if plain_text:
+            plain_text = self._clean_body_text(plain_text)
 
         counter_price = context.get("counter_price")
         if counter_price is None:
@@ -869,13 +912,10 @@ class EmailDraftingAgent(BaseAgent):
             )
 
         body_content = self._sanitise_generated_body(email_text)
-        comment = f"<!-- RFQ-ID: {rfq_id} -->"
-        body = comment if not body_content else f"{comment}\n{body_content}"
+        body = self._clean_body_text(body_content)
 
-        subject_base = data.get("subject") or f"Re: {rfq_id} – Updated commercial terms"
-        subject = self._normalise_subject_line(subject_base, rfq_id) or subject_base
-        if not subject:
-            subject = f"Re: {rfq_id} – Negotiation update"
+        subject_base = data.get("subject") or DEFAULT_NEGOTIATION_SUBJECT
+        subject = self._clean_subject_text(subject_base, DEFAULT_NEGOTIATION_SUBJECT)
 
         sender_email = data.get("sender") or self.agent_nick.settings.ses_default_sender
         recipients = self._normalise_recipients(data.get("recipients") or data.get("to"))
@@ -964,7 +1004,7 @@ class EmailDraftingAgent(BaseAgent):
         counter_text = self._format_currency_value(counter_price, currency)
         target_text = self._format_currency_value(target_price, currency)
         offer_text = self._format_currency_value(current_offer, currency)
-        lines = [f"Thank you for the latest update on RFQ {rfq_id}."]
+        lines = ["Thank you for the latest update on the quotation request."]
         if counter_text:
             clause = f"To secure approvals we need to align at {counter_text}"
             if target_text and target_text != counter_text:
@@ -1831,7 +1871,7 @@ class EmailDraftingAgent(BaseAgent):
 
     @staticmethod
     def _normalise_subject_line(subject: str, rfq_id: Optional[str]) -> str:
-        """Remove duplicated RFQ tokens that often arise from templates."""
+        """Remove visible RFQ identifiers from subject lines."""
 
         if not isinstance(subject, str):
             return ""
@@ -1843,14 +1883,10 @@ class EmailDraftingAgent(BaseAgent):
         if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {'"', "'"}:
             trimmed = trimmed[1:-1].strip()
 
-        if rfq_id:
-            identifier = str(rfq_id).strip()
-            if identifier:
-                pattern = re.compile(
-                    rf"(?i)\bRFQ[\s:-]+{re.escape(identifier)}"
-                )
-                trimmed = pattern.sub(identifier, trimmed, count=1)
-
+        cleaned = EmailDraftingAgent._strip_rfq_identifier_tokens(trimmed)
+        cleaned = cleaned.strip("-–: ")
+        if cleaned:
+            return cleaned
         return trimmed
 
     @staticmethod
@@ -2172,18 +2208,19 @@ class EmailDraftingAgent(BaseAgent):
             content = self._sanitise_generated_body(message_content)
             if negotiation_section_html and negotiation_section_html not in content:
                 content = f"{content}{negotiation_section_html}"
-            comment = comment if comment else f"<!-- RFQ-ID: {rfq_id} -->"
-            body = comment if not content else f"{comment}\n{content}"
+            body = self._clean_body_text(content)
             if subject_template_source:
                 subject_args = dict(template_args)
                 subject_args.setdefault("rfq_id", rfq_id)
-                subject = self._render_template_string(
+                rendered_subject = self._render_template_string(
                     subject_template_source, subject_args
                 )
-                subject = self._normalise_subject_line(subject, rfq_id)
-                subject = subject or f"{rfq_id} – Request for Quotation"
+                subject = self._clean_subject_text(
+                    self._normalise_subject_line(rendered_subject, rfq_id),
+                    DEFAULT_RFQ_SUBJECT,
+                )
             else:
-                subject = f"{rfq_id} – Request for Quotation"
+                subject = self._clean_subject_text(None, DEFAULT_RFQ_SUBJECT)
 
             draft_action_id = _resolve_action_id(supplier) or default_action_id
 
@@ -2243,14 +2280,10 @@ class EmailDraftingAgent(BaseAgent):
                 else self._sanitise_generated_body(manual_body_input)
             )
             manual_rfq_id = self._extract_rfq_id(manual_comment) or self._generate_rfq_id()
-            manual_comment = manual_comment or f"<!-- RFQ-ID: {manual_rfq_id} -->"
-            manual_body_rendered = (
-                manual_comment
-                if not manual_body_content
-                else f"{manual_comment}\n{manual_body_content}"
-            )
-            manual_subject_rendered = manual_subject_input or (
-                f"{manual_rfq_id} – Request for Quotation"
+            manual_body_rendered = self._clean_body_text(manual_body_content)
+            manual_subject_rendered = self._clean_subject_text(
+                manual_subject_input,
+                DEFAULT_RFQ_SUBJECT,
             )
 
             manual_draft = {
