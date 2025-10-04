@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 from dataclasses import dataclass
@@ -1473,6 +1474,48 @@ class DataFlowManager:
 
         flows: Dict[str, Dict[str, Any]] = {}
         name_map: Dict[str, str] = {}
+        category_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+        product_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+
+        catalog_lookup: Dict[str, Dict[str, Any]] = {}
+        catalog_alias = alias_index.resolve_alias("proc.cat_product_mapping", tables)
+        catalog_df = tables.get(catalog_alias, pd.DataFrame()) if catalog_alias else pd.DataFrame()
+        if (
+            isinstance(catalog_df, pd.DataFrame)
+            and not catalog_df.empty
+            and "product" in catalog_df.columns
+        ):
+            for row in catalog_df.dropna(subset=["product"]).itertuples(index=False):
+                product = getattr(row, "product", None)
+                if not product:
+                    continue
+                key = str(product).strip().lower()
+                if not key:
+                    continue
+                entry: Dict[str, Any] = {"product": str(product).strip()}
+                for level in range(1, 6):
+                    field = f"category_level_{level}"
+                    if hasattr(row, field):
+                        value = getattr(row, field)
+                        if value:
+                            entry[field] = str(value).strip()
+                catalog_lookup[key] = entry
+
+        def _register_category(
+            supplier_id: Optional[str],
+            category: Optional[str],
+            product: Optional[str],
+        ) -> None:
+            if not supplier_id:
+                return
+            sid = str(supplier_id).strip()
+            if not sid:
+                return
+            if category:
+                category_counters[sid][str(category).strip()] += 1
+            if product:
+                product_counters[sid][str(product).strip()] += 1
+
         for idx, supplier_id in base_df["__supplier_id"].items():
             if supplier_id is None:
                 continue
@@ -1565,6 +1608,16 @@ class DataFlowManager:
                     }
                     if latest_order:
                         po_summary[supplier_id]["latest_order_date"] = latest_order
+                    for field in ("category_id", "spend_category"):
+                        if field in group.columns:
+                            values = (
+                                group[field]
+                                .dropna()
+                                .astype(str)
+                                .str.strip()
+                            )
+                            for category in values[values != ""]:
+                                _register_category(supplier_id, category, None)
                     entry["purchase_orders"] = po_summary[supplier_id]
 
         # Purchase order line items (product coverage)
@@ -1607,6 +1660,51 @@ class DataFlowManager:
                             ],
                             "unique_items": len(descriptions),
                         }
+                    category_fields = [
+                        col
+                        for col in (
+                            "category_id",
+                            "category",
+                            "category_level_1",
+                            "category_level_2",
+                            "category_level_3",
+                            "category_level_4",
+                            "category_level_5",
+                        )
+                        if col in group.columns
+                    ]
+                    for row in group.itertuples(index=False):
+                        category_value: Optional[str] = None
+                        for field in category_fields:
+                            value = getattr(row, field, None)
+                            if value:
+                                category_value = str(value).strip()
+                                if category_value:
+                                    break
+                        product_value = None
+                        if item_desc_col and hasattr(row, item_desc_col):
+                            product_value = getattr(row, item_desc_col, None)
+                        if not product_value and item_id_col and hasattr(row, item_id_col):
+                            product_value = getattr(row, item_id_col, None)
+                        lookup_key = str(product_value).strip().lower() if product_value else None
+                        if (not category_value or not category_value.strip()) and lookup_key:
+                            catalog_entry = catalog_lookup.get(lookup_key)
+                            if catalog_entry:
+                                for level in (
+                                    "category_level_2",
+                                    "category_level_1",
+                                    "category_level_3",
+                                    "category_level_4",
+                                    "category_level_5",
+                                ):
+                                    value = catalog_entry.get(level)
+                                    if value:
+                                        category_value = str(value).strip()
+                                        if category_value:
+                                            break
+                                product_value = catalog_entry.get("product") or product_value
+                        product_clean = str(product_value).strip() if product_value else None
+                        _register_category(supplier_id, category_value, product_clean)
 
         # Invoices
         invoice_alias = alias_index.resolve_alias("proc.invoice_agent", tables)
@@ -1636,6 +1734,86 @@ class DataFlowManager:
                     }
                     if latest_invoice:
                         entry["invoices"]["latest_invoice_date"] = latest_invoice
+
+        invoice_lines_alias = alias_index.resolve_alias("proc.invoice_line_items_agent", tables)
+        invoice_lines = tables.get(invoice_lines_alias, pd.DataFrame()) if invoice_lines_alias else pd.DataFrame()
+        if invoice_supplier_series is not None and not invoice_lines.empty and not invoices.empty:
+            inv_id_col = self._resolve_column(invoices, "invoice_id", _INVOICE_ID_ALIASES) or "invoice_id"
+            line_invoice_col = self._resolve_column(invoice_lines, "invoice_id", _INVOICE_ID_ALIASES) or "invoice_id"
+            inv_lookup = invoices[[inv_id_col]].copy()
+            inv_lookup["__supplier_id"] = invoice_supplier_series
+            join_df = invoice_lines.merge(
+                inv_lookup,
+                left_on=line_invoice_col,
+                right_on=inv_id_col,
+                how="left",
+            )
+            if "po_id" in join_df.columns and po_supplier_series is not None:
+                po_map = purchase_orders[[po_id_col]].copy()
+                po_map["__supplier_id_po"] = po_supplier_series
+                join_df = join_df.merge(
+                    po_map,
+                    left_on="po_id",
+                    right_on=po_id_col,
+                    how="left",
+                    suffixes=("", "_po"),
+                )
+                join_df.loc[
+                    join_df["__supplier_id"].isna(), "__supplier_id"
+                ] = join_df.loc[
+                    join_df["__supplier_id"].isna(), "__supplier_id_po"
+                ]
+                join_df = join_df.drop(columns=["__supplier_id_po"], errors="ignore")
+            join_df = join_df.dropna(subset=["__supplier_id"])
+            if not join_df.empty:
+                category_fields = [
+                    col
+                    for col in (
+                        "category_id",
+                        "category",
+                        "category_level_1",
+                        "category_level_2",
+                        "category_level_3",
+                        "category_level_4",
+                        "category_level_5",
+                    )
+                    if col in join_df.columns
+                ]
+                item_desc_col = self._resolve_column(join_df, "item_description", _ITEM_DESC_ALIASES)
+                item_id_col = self._resolve_column(join_df, "item_id", _ITEM_ID_ALIASES)
+                for supplier_id, group in join_df.groupby("__supplier_id"):
+                    for row in group.itertuples(index=False):
+                        category_value: Optional[str] = None
+                        for field in category_fields:
+                            value = getattr(row, field, None)
+                            if value:
+                                category_value = str(value).strip()
+                                if category_value:
+                                    break
+                        product_value = None
+                        if item_desc_col and hasattr(row, item_desc_col):
+                            product_value = getattr(row, item_desc_col, None)
+                        if not product_value and item_id_col and hasattr(row, item_id_col):
+                            product_value = getattr(row, item_id_col, None)
+                        lookup_key = str(product_value).strip().lower() if product_value else None
+                        if (not category_value or not category_value.strip()) and lookup_key:
+                            catalog_entry = catalog_lookup.get(lookup_key)
+                            if catalog_entry:
+                                for level in (
+                                    "category_level_2",
+                                    "category_level_1",
+                                    "category_level_3",
+                                    "category_level_4",
+                                    "category_level_5",
+                                ):
+                                    value = catalog_entry.get(level)
+                                    if value:
+                                        category_value = str(value).strip()
+                                        if category_value:
+                                            break
+                                product_value = catalog_entry.get("product") or product_value
+                        product_clean = str(product_value).strip() if product_value else None
+                        _register_category(supplier_id, category_value, product_clean)
 
         # Quotes
         quote_alias = alias_index.resolve_alias("proc.quote_agent", tables)
@@ -1670,6 +1848,23 @@ class DataFlowManager:
                         coverage_hits += 1
             coverage_ratio = (coverage_hits / coverage_components) if coverage_components else 0.0
             entry["coverage_ratio"] = round(coverage_ratio, 3)
+            categories_counter = category_counters.get(supplier_id)
+            if categories_counter:
+                breakdown = [
+                    {"category": category, "occurrences": int(count)}
+                    for category, count in categories_counter.most_common()
+                ]
+                if breakdown:
+                    entry["categories"] = breakdown
+                    entry.setdefault("primary_category", breakdown[0]["category"])
+            products_counter = product_counters.get(supplier_id)
+            if products_counter:
+                catalog_products = [name for name, _ in products_counter.most_common(10)]
+                if catalog_products:
+                    if isinstance(entry.get("products"), dict):
+                        entry["products"].setdefault("catalog_products", catalog_products)
+                    else:
+                        entry.setdefault("catalog_products", catalog_products)
             flows_list.append(entry)
 
         flows_list.sort(key=lambda item: (item.get("supplier_name") or "", item["supplier_id"]))
@@ -1763,6 +1958,31 @@ class DataFlowManager:
             unique = products.get("unique_items")
             if isinstance(unique, (int, float)) and unique:
                 parts.append(f"Product catalogue covers {int(unique)} unique items.")
+            catalog_products = products.get("catalog_products")
+            if isinstance(catalog_products, list) and catalog_products:
+                parts.append(
+                    "Catalog references include "
+                    + ", ".join(catalog_products[: _SUPPLIER_FLOW_ITEM_LIMIT])
+                    + "."
+                )
+
+        categories = flow.get("categories") if isinstance(flow.get("categories"), list) else []
+        if categories:
+            category_labels = [
+                str(item.get("category")).strip()
+                for item in categories
+                if isinstance(item, Mapping) and item.get("category")
+            ]
+            category_labels = [label for label in category_labels if label]
+            if category_labels:
+                limited = ", ".join(category_labels[:3])
+                parts.append(
+                    f"Category coverage spans {limited}"
+                    + ("." if len(category_labels) <= 3 else ", ...")
+                )
+        primary_category = flow.get("primary_category")
+        if primary_category:
+            parts.append(f"Primary category focus: {primary_category}.")
 
         mapping_summary = self._supplier_flow_mapping_statements(
             flow, label, supplier_id

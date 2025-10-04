@@ -531,6 +531,55 @@ class SupplierRankingAgent(BaseAgent):
         df = self._merge_supplier_metrics(df, tables)
         profiles = self._build_supplier_profiles(tables, df["supplier_id"].astype(str))
 
+        external_profiles = context.input_data.get("supplier_category_profiles")
+        if isinstance(external_profiles, str):
+            try:
+                external_profiles = json.loads(external_profiles)
+            except Exception:  # pragma: no cover - defensive parsing
+                external_profiles = {}
+        if isinstance(external_profiles, dict):
+            for supplier_id, extra in external_profiles.items():
+                if not isinstance(extra, dict):
+                    continue
+                sid = str(supplier_id).strip()
+                if not sid:
+                    continue
+                profile = profiles.setdefault(
+                    sid,
+                    {
+                        "supplier_id": sid,
+                        "po_ids": [],
+                        "invoice_ids": [],
+                        "items": [],
+                        "categories": [],
+                    },
+                )
+                primary_category = extra.get("primary_category")
+                if primary_category and not profile.get("primary_category"):
+                    profile["primary_category"] = primary_category
+                categories_payload = extra.get("category_breakdown") or extra.get("categories")
+                if isinstance(categories_payload, list):
+                    profile["categories"] = categories_payload
+                elif isinstance(categories_payload, dict):
+                    profile["categories"] = [
+                        {"category": key, "occurrences": value}
+                        for key, value in categories_payload.items()
+                    ]
+                products = extra.get("products")
+                if isinstance(products, list) and products:
+                    profile["products"] = products
+                sources = extra.get("sources")
+                if isinstance(sources, list) and sources:
+                    profile["sources"] = sources
+
+        if profiles and "supplier_id" in df.columns:
+            primary_category_map = {
+                sid: profile.get("primary_category")
+                for sid, profile in profiles.items()
+                if isinstance(profile, dict)
+            }
+            df["primary_category"] = df["supplier_id"].map(primary_category_map)
+
         contexts_by_id, contexts_by_name = self._fetch_relationship_context(df)
         if contexts_by_id or contexts_by_name:
             df = self._merge_relationship_context(df, contexts_by_id, contexts_by_name)

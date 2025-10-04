@@ -796,6 +796,21 @@ def test_price_variance_detection_generates_finding(monkeypatch):
     assert "data_flow_snapshot" not in output.data
 
     assert any(evt["status"] == "escalated" for evt in output.data["policy_events"])
+    coverage = output.data.get("policy_table_coverage")
+    assert isinstance(coverage, dict) and coverage
+    coverage_sample = next(iter(coverage.values()))
+    for alias in ("purchase_orders", "purchase_order_lines", "invoices", "invoice_lines"):
+        assert coverage_sample.get(alias) is True
+    profiles = output.data.get("supplier_category_profiles")
+    assert isinstance(profiles, dict) and profiles
+    for profile in profiles.values():
+        assert "category_breakdown" in profile
+    supplier_categories = output.data.get("policy_supplier_categories")
+    assert isinstance(supplier_categories, dict) and supplier_categories
+    hits = output.data.get("instruction_table_hits")
+    assert isinstance(hits, list)
+    for alias in ("purchase_orders", "purchase_order_lines", "invoices", "invoice_lines"):
+        assert alias in hits
 
 
 def test_price_variance_blocks_when_supplier_missing(monkeypatch):
