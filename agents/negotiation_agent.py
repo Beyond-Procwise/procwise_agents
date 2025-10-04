@@ -1,10 +1,13 @@
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from agents.supplier_interaction_agent import SupplierInteractionAgent
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -93,6 +96,7 @@ class NegotiationAgent(BaseAgent):
         self.device = configure_gpu()
         self._state_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._email_agent: Optional[EmailDraftingAgent] = None
+        self._supplier_agent: Optional["SupplierInteractionAgent"] = None
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -225,6 +229,7 @@ class NegotiationAgent(BaseAgent):
                 "supplier_message": supplier_message,
                 "drafts": draft_records,
                 "sent_status": False,
+                "awaiting_response": awaiting_now,
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
@@ -294,6 +299,10 @@ class NegotiationAgent(BaseAgent):
             "negotiation_message": negotiation_message,
         }
 
+        recipients = self._collect_recipient_candidates(context)
+        if recipients:
+            draft_payload.setdefault("recipients", recipients)
+
         draft_metadata = {
             "counter_price": counter_price,
             "target_price": target_price,
@@ -328,6 +337,8 @@ class NegotiationAgent(BaseAgent):
         if supplier_snippets:
             draft_stub["supplier_snippets"] = supplier_snippets
         draft_stub["payload"] = draft_payload
+        if recipients:
+            draft_stub["recipients"] = recipients
 
         email_payload = self._build_email_agent_payload(
             context,
@@ -415,6 +426,7 @@ class NegotiationAgent(BaseAgent):
             "target_price": target_price,
             "supplier_message": supplier_message,
             "sent_status": False,
+            "awaiting_response": True,
         }
 
         if email_subject:
@@ -432,10 +444,111 @@ class NegotiationAgent(BaseAgent):
             drafts=draft_records,
             state=state,
         )
+        supplier_responses: List[Dict[str, Any]] = []
         if supplier_watch_fields:
             pass_fields.update(supplier_watch_fields)
-            if "SupplierInteractionAgent" not in next_agents:
-                next_agents.append("SupplierInteractionAgent")
+            await_response = bool(supplier_watch_fields.get("await_response"))
+            if await_response and not next_agents:
+                wait_results = self._await_supplier_responses(
+                    context=context,
+                    watch_payload=supplier_watch_fields,
+                    state=state,
+                )
+                if wait_results is None:
+                    logger.error(
+                        "Supplier responses not received before timeout for rfq_id=%s supplier=%s",
+                        rfq_id,
+                        supplier,
+                    )
+                    error_payload = {
+                        "supplier": supplier,
+                        "rfq_id": rfq_id,
+                        "round": round_no,
+                        "decision": decision,
+                        "message": "Supplier response not received before timeout.",
+                    }
+                    return AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data=error_payload,
+                        error="supplier response timeout",
+                    )
+                supplier_responses = [res for res in wait_results if isinstance(res, dict)]
+                if not supplier_responses:
+                    logger.error(
+                        "No supplier responses received while waiting for rfq_id=%s supplier=%s",
+                        rfq_id,
+                        supplier,
+                    )
+                    error_payload = {
+                        "supplier": supplier,
+                        "rfq_id": rfq_id,
+                        "round": round_no,
+                        "decision": decision,
+                        "message": "Missing supplier responses after wait.",
+                    }
+                    return AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data=error_payload,
+                        error="supplier response missing",
+                    )
+                known_ids: Set[str] = set()
+                current_message = self._coerce_text(context.input_data.get("message_id"))
+                if current_message:
+                    known_ids.add(current_message.lower())
+                previous_recorded = self._coerce_text(state.get("last_supplier_msg_id"))
+                if previous_recorded:
+                    known_ids.add(previous_recorded.lower())
+
+                new_responses: List[Dict[str, Any]] = []
+                for response in supplier_responses:
+                    message_token = self._coerce_text(
+                        response.get("message_id") or response.get("id")
+                    )
+                    if message_token and message_token.lower() in known_ids:
+                        continue
+                    if message_token:
+                        known_ids.add(message_token.lower())
+                    new_responses.append(response)
+
+                increment_count = len(new_responses)
+                if increment_count:
+                    state["supplier_reply_count"] = int(
+                        state.get("supplier_reply_count", 0)
+                    ) + increment_count
+                    last_reply = new_responses[-1]
+                    last_message_id = last_reply.get("message_id") or last_reply.get("id")
+                    if last_message_id:
+                        state["last_supplier_msg_id"] = last_message_id
+                elif not supplier_reply_registered:
+                    # Ensure at least the last observed response is recorded.
+                    last_reply = supplier_responses[-1]
+                    last_message_id = last_reply.get("message_id") or last_reply.get("id")
+                    if last_message_id:
+                        state["last_supplier_msg_id"] = last_message_id
+                supplier_responses = new_responses or supplier_responses
+                state["awaiting_response"] = False
+                self._save_session_state(rfq_id, supplier, state)
+                public_state = self._public_state(state)
+                data["session_state"] = public_state
+                data["awaiting_response"] = False
+                pass_fields["session_state"] = public_state
+                pass_fields.pop("await_response", None)
+                pass_fields.pop("await_all_responses", None)
+                self._record_learning_snapshot(
+                    context,
+                    rfq_id,
+                    supplier,
+                    decision,
+                    state,
+                    False,
+                    bool(new_responses) or supplier_reply_registered,
+                )
+            else:
+                if "SupplierInteractionAgent" not in next_agents:
+                    next_agents.append("SupplierInteractionAgent")
+        if supplier_responses:
+            data["supplier_responses"] = supplier_responses
+            pass_fields["supplier_responses"] = supplier_responses
 
         if next_agents:
             merge_payload = dict(fallback_payload or {})
@@ -463,9 +576,8 @@ class NegotiationAgent(BaseAgent):
             if supplier_message:
                 merge_payload.setdefault("supplier_message", supplier_message)
             merge_payload.setdefault("supplier_reply_count", supplier_reply_count)
-            contact = context.input_data.get("from_address")
-            if contact and not merge_payload.get("recipients"):
-                merge_payload["recipients"] = [contact]
+            if recipients:
+                merge_payload.setdefault("recipients", recipients)
             sender = context.input_data.get("sender")
             if sender and not merge_payload.get("sender"):
                 merge_payload["sender"] = sender
@@ -726,6 +838,15 @@ class NegotiationAgent(BaseAgent):
             "response_poll_interval": poll_interval,
         }
 
+        batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
+        if batch_limit:
+            try:
+                batch_value = int(batch_limit)
+                if batch_value > 0:
+                    watch_payload["response_batch_limit"] = batch_value
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Invalid email_response_batch_limit=%s", batch_limit)
+
         timeout_setting = getattr(self.agent_nick.settings, "email_response_timeout_seconds", None)
         if timeout_setting:
             try:
@@ -751,6 +872,101 @@ class NegotiationAgent(BaseAgent):
             watch_payload.setdefault("sender", sender)
 
         return watch_payload
+
+    def _await_supplier_responses(
+        self,
+        *,
+        context: AgentContext,
+        watch_payload: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Optional[List[Optional[Dict[str, Any]]]]:
+        if not watch_payload.get("await_response"):
+            return []
+
+        try:
+            supplier_agent = self._get_supplier_agent()
+        except Exception:  # pragma: no cover - defensive fallback
+            logger.exception("Unable to initialise supplier interaction agent for wait")
+            return None
+
+        timeout_default = getattr(
+            self.agent_nick.settings, "email_response_timeout_seconds", 900
+        )
+        poll_default = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
+        batch_default = getattr(self.agent_nick.settings, "email_response_batch_limit", 5)
+
+        timeout_raw = watch_payload.get("response_timeout") or timeout_default
+        poll_raw = watch_payload.get("response_poll_interval") or poll_default
+        batch_raw = watch_payload.get("response_batch_limit") or batch_default
+
+        timeout = self._positive_int(timeout_raw, fallback=timeout_default)
+        poll_interval = self._positive_int(poll_raw, fallback=poll_default)
+        batch_limit = self._positive_int(batch_raw, fallback=batch_default)
+
+        draft_entries: List[Dict[str, Any]] = []
+        for draft in watch_payload.get("drafts", []):
+            if isinstance(draft, dict):
+                draft_entries.append(dict(draft))
+
+        if not draft_entries:
+            fallback_entry = {
+                "rfq_id": watch_payload.get("rfq_id"),
+                "supplier_id": watch_payload.get("supplier_id"),
+            }
+            if fallback_entry.get("rfq_id") or fallback_entry.get("supplier_id"):
+                draft_entries.append(fallback_entry)
+
+        if not draft_entries:
+            logger.warning("No draft context available while awaiting supplier response")
+            return None
+
+        await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
+
+        try:
+            if await_all:
+                return supplier_agent.wait_for_multiple_responses(
+                    draft_entries,
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                    limit=batch_limit,
+                    enable_negotiation=False,
+                )
+
+            target = draft_entries[0]
+            recipient_hint = target.get("receiver") or target.get("recipient_email")
+            if not recipient_hint:
+                recipients_field = target.get("recipients")
+                if isinstance(recipients_field, list) and recipients_field:
+                    recipient_hint = recipients_field[0]
+                elif isinstance(recipients_field, str):
+                    recipient_hint = recipients_field
+
+            return [
+                supplier_agent.wait_for_response(
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                    limit=batch_limit,
+                    rfq_id=target.get("rfq_id"),
+                    supplier_id=target.get("supplier_id"),
+                    subject_hint=target.get("subject"),
+                    from_address=recipient_hint,
+                    enable_negotiation=False,
+                )
+            ]
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Failed while waiting for supplier responses (rfq_id=%s, supplier=%s)",
+                watch_payload.get("rfq_id"),
+                watch_payload.get("supplier_id"),
+            )
+            return None
+
+    def _get_supplier_agent(self) -> "SupplierInteractionAgent":
+        if self._supplier_agent is None:
+            from agents.supplier_interaction_agent import SupplierInteractionAgent
+
+            self._supplier_agent = SupplierInteractionAgent(self.agent_nick)
+        return self._supplier_agent
 
     def _build_stop_message(self, status: str, reason: str, round_no: int) -> str:
         status_text = status.capitalize()
@@ -804,6 +1020,61 @@ class NegotiationAgent(BaseAgent):
                 "Failed to capture negotiation learning for %s/%s", rfq_id, supplier,
                 exc_info=True,
             )
+
+    def _collect_recipient_candidates(self, context: AgentContext) -> List[str]:
+        seen: Set[str] = set()
+        recipients: List[str] = []
+        payload = context.input_data
+
+        def _append(candidate: Any) -> None:
+            email = self._coerce_text(candidate)
+            if not email:
+                return
+            key = email.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            recipients.append(email)
+
+        for key in (
+            "recipients",
+            "recipient_email",
+            "recipient",
+            "supplier_contact_email",
+            "supplier_email",
+            "email",
+            "contact_email",
+            "contact_email_1",
+            "contact_email_2",
+        ):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _append(item)
+            else:
+                _append(value)
+
+        contacts = payload.get("supplier_contacts")
+        if isinstance(contacts, list):
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    continue
+                _append(contact.get("email"))
+                _append(contact.get("contact_email"))
+
+        drafts = payload.get("drafts")
+        if isinstance(drafts, list):
+            for draft in drafts:
+                if not isinstance(draft, dict):
+                    continue
+                _append(draft.get("recipient_email"))
+                _append(draft.get("receiver"))
+                draft_recipients = draft.get("recipients")
+                if isinstance(draft_recipients, list):
+                    for item in draft_recipients:
+                        _append(item)
+
+        return recipients
 
     def _collect_supplier_snippets(self, payload: Dict[str, Any]) -> List[str]:
         snippets: List[str] = []
@@ -904,6 +1175,13 @@ class NegotiationAgent(BaseAgent):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _positive_int(self, value: Any, *, fallback: int) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            return fallback
+        return parsed if parsed > 0 else fallback
 
     def _coerce_text(self, value: Any) -> Optional[str]:
         if isinstance(value, str):

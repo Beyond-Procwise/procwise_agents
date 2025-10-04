@@ -7,10 +7,13 @@ import time
 import os
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.gpu import configure_gpu
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from agents.negotiation_agent import NegotiationAgent
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,7 @@ class SupplierInteractionAgent(BaseAgent):
         self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         self._email_watcher = None
+        self._negotiation_agent = None
 
     # Suppliers occasionally include upper-case letters or non-hex characters
     # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
@@ -126,17 +130,57 @@ class SupplierInteractionAgent(BaseAgent):
                     or draft_match.get("contact_email")
                 )
 
-            wait_result = self.wait_for_response(
-                timeout=timeout,
-                poll_interval=poll_interval,
-                limit=batch_limit,
-                rfq_id=rfq_id,
-                supplier_id=supplier_id,
-                subject_hint=subject,
-                from_address=expected_sender,
-            )
+            watch_candidates = [
+                draft
+                for draft in drafts
+                if isinstance(draft, dict) and draft.get("rfq_id") and draft.get("supplier_id")
+            ]
+
+            await_all = bool(input_data.get("await_all_responses") and len(watch_candidates) > 1)
+            parallel_results: List[Optional[Dict[str, Any]]] = []
+            wait_result: Optional[Dict[str, Any]] = None
+
+            if await_all:
+                parallel_results = self.wait_for_multiple_responses(
+                    watch_candidates,
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                    limit=batch_limit,
+                )
+                wait_result = self._select_parallel_response(
+                    parallel_results,
+                    rfq_id=rfq_id,
+                    supplier_id=supplier_id,
+                )
+                for candidate in parallel_results:
+                    if not candidate or candidate is wait_result:
+                        continue
+                    try:
+                        self._persist_parallel_result(candidate)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception(
+                            "Failed to persist parallel supplier response for rfq_id=%s supplier=%s",
+                            candidate.get("rfq_id"),
+                            candidate.get("supplier_id"),
+                        )
+            else:
+                wait_result = self.wait_for_response(
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                    limit=batch_limit,
+                    rfq_id=rfq_id,
+                    supplier_id=supplier_id,
+                    subject_hint=subject,
+                    from_address=expected_sender,
+                )
 
             if not wait_result:
+                if await_all and parallel_results and any(result is None for result in parallel_results):
+                    logger.error(
+                        "Supplier responses missing for one or more RFQs while awaiting all responses; rfq_id=%s supplier=%s",
+                        rfq_id,
+                        supplier_id,
+                    )
                 logger.error(
                     "Supplier response not received for RFQ %s (supplier=%s) before timeout=%ss",
                     rfq_id,
@@ -367,8 +411,16 @@ class SupplierInteractionAgent(BaseAgent):
         subject_hint: Optional[str] = None,
         from_address: Optional[str] = None,
         max_attempts: Optional[int] = None,
+        enable_negotiation: bool = True,
     ) -> Optional[Dict]:
-        """Wait for an inbound supplier email and return the processed result."""
+        """Wait for an inbound supplier email and return the processed result.
+
+        When ``enable_negotiation`` is ``True`` the underlying SES watcher is
+        initialised with a negotiation agent reference so counter rounds can be
+        triggered automatically as part of the polling loop.  NegotiationAgent
+        itself disables the flag while awaiting responses to avoid recursive
+        execution.
+        """
 
         deadline = time.time() + max(timeout, 0)
 
@@ -416,30 +468,41 @@ class SupplierInteractionAgent(BaseAgent):
         if active_watcher is None:
             try:
                 from services.email_watcher import SESEmailWatcher
-                from agents.negotiation_agent import NegotiationAgent
             except Exception:  # pragma: no cover - optional import
                 SESEmailWatcher = None
-                NegotiationAgent = None  # type: ignore
 
             if SESEmailWatcher is None:
                 return None
 
+            watcher_needs_refresh = False
             if self._email_watcher is None:
-                registry = getattr(self.agent_nick, "agents", {})
+                watcher_needs_refresh = True
+            else:
+                current_flag = getattr(self._email_watcher, "enable_negotiation", True)
+                if bool(current_flag) != bool(enable_negotiation):
+                    watcher_needs_refresh = True
+
+            if watcher_needs_refresh:
                 negotiation_agent = None
-                if isinstance(registry, dict):
-                    negotiation_agent = registry.get("negotiation") or registry.get(
-                        "NegotiationAgent"
+                if enable_negotiation:
+                    negotiation_agent = self._get_negotiation_agent()
+
+                poll_setting = getattr(
+                    self.agent_nick.settings, "email_response_poll_seconds", 60
+                )
+                if poll_interval is not None:
+                    response_poll_seconds = self._coerce_int(
+                        poll_interval, default=poll_setting
                     )
+                else:
+                    response_poll_seconds = poll_setting
 
                 self._email_watcher = SESEmailWatcher(
                     self.agent_nick,
                     supplier_agent=self,
                     negotiation_agent=negotiation_agent,
-                    enable_negotiation=False,
-                    response_poll_seconds=getattr(
-                        self.agent_nick.settings, "email_response_poll_seconds", 60
-                    ),
+                    enable_negotiation=enable_negotiation,
+                    response_poll_seconds=response_poll_seconds,
                 )
             active_watcher = self._email_watcher
 
@@ -585,6 +648,7 @@ class SupplierInteractionAgent(BaseAgent):
         timeout: int = 300,
         poll_interval: Optional[int] = None,
         limit: int = 1,
+        enable_negotiation: bool = True,
     ) -> List[Optional[Dict]]:
         """Spawn concurrent watchers for each draft and wait for supplier replies.
 
@@ -622,6 +686,8 @@ class SupplierInteractionAgent(BaseAgent):
             logger.exception("Unable to initialise email watcher for parallel polling")
             return results
 
+        negotiation_agent = self._get_negotiation_agent() if enable_negotiation else None
+
         def _watch_single(index: int, draft: Dict[str, Any]) -> None:
             rfq_id = draft.get("rfq_id")
             supplier_id = draft.get("supplier_id")
@@ -640,14 +706,20 @@ class SupplierInteractionAgent(BaseAgent):
                     recipient_hint = recipients_field
             subject_hint = draft.get("subject")
 
+            poll_setting = getattr(
+                self.agent_nick.settings, "email_response_poll_seconds", 60
+            )
+            if safe_interval is not None:
+                response_interval = self._coerce_int(safe_interval, default=poll_setting)
+            else:
+                response_interval = poll_setting
+
             watcher_instance = SESEmailWatcher(
                 self.agent_nick,
                 supplier_agent=self,
-                negotiation_agent=None,
-                enable_negotiation=False,
-                response_poll_seconds=safe_interval
-                if safe_interval is not None
-                else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60),
+                negotiation_agent=negotiation_agent,
+                enable_negotiation=enable_negotiation,
+                response_poll_seconds=response_interval,
             )
 
             try:
@@ -660,6 +732,8 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_id=supplier_id,
                     subject_hint=subject_hint,
                     from_address=recipient_hint,
+                    enable_negotiation=enable_negotiation,
+
                 )
                 with lock:
                     results[index] = result
@@ -691,6 +765,96 @@ class SupplierInteractionAgent(BaseAgent):
                 raise error
 
         return results
+
+    def _get_negotiation_agent(self) -> Optional["NegotiationAgent"]:
+        if self._negotiation_agent is not None:
+            return self._negotiation_agent
+
+        registry = getattr(self.agent_nick, "agents", None)
+        candidate = None
+        if isinstance(registry, dict):
+            candidate = registry.get("negotiation") or registry.get("NegotiationAgent")
+
+        if candidate is None:
+            try:
+                from agents.negotiation_agent import NegotiationAgent
+
+                candidate = NegotiationAgent(self.agent_nick)
+            except Exception:  # pragma: no cover - defensive fallback
+                logger.debug("Negotiation agent initialisation failed for email watcher")
+                candidate = None
+
+        self._negotiation_agent = candidate
+        return self._negotiation_agent
+
+    def _select_parallel_response(
+        self,
+        results: List[Optional[Dict[str, Any]]],
+        *,
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        def _matches(target: Optional[str], candidate: Optional[str]) -> bool:
+            return bool(
+                target
+                and candidate
+                and self._normalise_identifier(target) == self._normalise_identifier(candidate)
+            )
+
+        for result in results:
+            if not result:
+                continue
+            if supplier_id and _matches(supplier_id, result.get("supplier_id")):
+                if not rfq_id or _matches(rfq_id, result.get("rfq_id")):
+                    return result
+        for result in results:
+            if not result:
+                continue
+            if rfq_id and _matches(rfq_id, result.get("rfq_id")):
+                return result
+        for result in results:
+            if not result:
+                continue
+            if supplier_id and _matches(supplier_id, result.get("supplier_id")):
+                return result
+        for result in results:
+            if result:
+                return result
+        return None
+
+    def _persist_parallel_result(self, result: Dict[str, Any]) -> None:
+        rfq_id = result.get("rfq_id")
+        supplier_id = result.get("supplier_id")
+        if not rfq_id or not supplier_id:
+            return
+
+        subject = result.get("subject")
+        response_text = (
+            result.get("supplier_message")
+            or result.get("message")
+            or result.get("body")
+            or ""
+        )
+        response_text = str(response_text)
+
+        supplier_payload = result.get("supplier_output")
+        if isinstance(supplier_payload, dict):
+            parsed = {
+                "price": supplier_payload.get("price"),
+                "lead_time": supplier_payload.get("lead_time"),
+                "response_text": supplier_payload.get("response_text") or response_text,
+            }
+            message_body = parsed.get("response_text") or response_text
+        else:
+            message_body = response_text
+            parsed = self._parse_response(
+                message_body,
+                subject=subject,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+            )
+
+        self._store_response(rfq_id, supplier_id, message_body, parsed)
 
     @staticmethod
     def _coerce_int(value: Any, *, default: int) -> int:

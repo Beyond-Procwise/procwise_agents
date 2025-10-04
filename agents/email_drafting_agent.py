@@ -2183,7 +2183,7 @@ class EmailDraftingAgent(BaseAgent):
 
             receiver = self._resolve_receiver(supplier, profile)
             recipients: List[str] = []
-            if receiver and not instructions_present:
+            if receiver:
                 recipients = self._normalise_recipients([receiver])
             if recipients:
                 receiver = recipients[0]

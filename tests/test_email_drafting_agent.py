@@ -153,6 +153,30 @@ def test_decision_context_to_public_json():
     assert data["asks"] == ["item"]
 
 
+def test_run_sets_recipient_when_instructions_present():
+    agent = EmailDraftingAgent()
+    context = _make_context(
+        {
+            "ranking": [
+                {
+                    "supplier_id": "SUP-1",
+                    "supplier_name": "Acme",
+                    "contact_email": "quotes@acme.test",
+                }
+            ],
+            "supplier_profiles": {"SUP-1": {}},
+            "policies": [{"policy_details": "Tone: formal"}],
+        }
+    )
+
+    result = agent.run(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    draft = result.data["drafts"][0]
+    assert draft["recipients"] == ["quotes@acme.test"]
+    assert draft["receiver"] == "quotes@acme.test"
+
+
 def _make_context(payload: dict) -> AgentContext:
     return AgentContext(
         workflow_id="wf-1",
