@@ -239,6 +239,7 @@ class SESEmailWatcher:
             or getattr(self.settings, "imap_user", None)
             or "supplierconnect@procwise.co.uk"
         )
+
         if self._custom_loader is None:
             queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
             if queue_url:
