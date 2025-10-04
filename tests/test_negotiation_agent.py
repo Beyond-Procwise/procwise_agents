@@ -120,6 +120,11 @@ def test_negotiation_agent_composes_counter(monkeypatch):
         "_invoke_email_drafting_agent",
         lambda ctx, payload: stub_email_output,
     )
+    monkeypatch.setattr(
+        agent,
+        "_await_supplier_responses",
+        lambda **_: [{"message_id": "reply-1", "supplier_id": "S1", "rfq_id": "RFQ-123"}],
+    )
 
     context = AgentContext(
         workflow_id="wf2",
@@ -134,6 +139,7 @@ def test_negotiation_agent_composes_counter(monkeypatch):
             "currency": "USD",
             "lead_time_weeks": 4,
             "supplier_snippets": ["We can ship in four weeks."],
+            "supplier_email": ["quotes@supplier.test"],
         },
     )
 
@@ -147,8 +153,9 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     draft_payload = output.data["draft_payload"]
     assert draft_payload["counter_price"] == 1250.0
     assert draft_payload["negotiation_message"].startswith("Round 1 plan")
+    assert draft_payload["recipients"] == ["quotes@supplier.test"]
     assert output.data["session_state"]["current_round"] == 2
-    assert output.data["session_state"]["supplier_reply_count"] == 0
+    assert output.data["session_state"]["supplier_reply_count"] == 1
     drafts = output.data["drafts"]
     assert isinstance(drafts, list) and len(drafts) == 1
     stub = drafts[0]
@@ -157,7 +164,10 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert stub.get("email_action_id") == "email-action-1"
     assert output.data.get("email_subject") == "Re: RFQ-123 – Updated commercial terms"
     assert output.data.get("email_body") == "Email body"
+    assert output.data["awaiting_response"] is False
     assert output.next_agents == []
+    assert "await_response" not in output.pass_fields
+    assert output.pass_fields["supplier_responses"][0]["message_id"] == "reply-1"
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
@@ -183,6 +193,7 @@ def test_negotiation_agent_detects_final_offer(monkeypatch):
     assert output.next_agents == []
     assert "final offer" in output.data["message"].lower()
     assert output.data["session_state"]["status"].upper() == "COMPLETED"
+    assert output.data["awaiting_response"] is False
     assert output.data["drafts"] == []
 
 
@@ -277,6 +288,13 @@ def test_negotiation_agent_counts_replies_only_after_counter(monkeypatch):
         "_invoke_email_drafting_agent",
         lambda ctx, payload: stub_email_output,
     )
+    monkeypatch.setattr(
+        agent,
+        "_await_supplier_responses",
+        lambda **_: [
+            {"message_id": "msg-new", "supplier_id": "S4", "rfq_id": "RFQ-567"}
+        ],
+    )
 
     context = AgentContext(
         workflow_id="wf5",
@@ -296,9 +314,56 @@ def test_negotiation_agent_counts_replies_only_after_counter(monkeypatch):
 
     assert output.data["session_state"]["supplier_reply_count"] == 2
     assert saved.get("supplier_reply_count") == 2
-    assert saved.get("awaiting_response") is True
+    assert saved.get("awaiting_response") is False
     assert output.data.get("email_action_id") == "email-action-2"
     assert output.next_agents == []
+    assert "await_response" not in output.pass_fields
+
+
+def test_negotiation_agent_waits_for_supplier_timeout(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    stub_email_output = AgentOutput(
+        status=AgentStatus.SUCCESS,
+        data={
+            "drafts": [
+                {
+                    "supplier_id": "S8",
+                    "rfq_id": "RFQ-321",
+                    "subject": "Re: RFQ-321",
+                    "body": "Email body",
+                }
+            ],
+            "subject": "Re: RFQ-321",
+            "body": "Email body",
+        },
+    )
+
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: stub_email_output,
+    )
+    monkeypatch.setattr(agent, "_await_supplier_responses", lambda **_: None)
+
+    context = AgentContext(
+        workflow_id="wf-timeout",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S8",
+            "current_offer": 1500.0,
+            "target_price": 1300.0,
+            "rfq_id": "RFQ-321",
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.FAILED
+    assert output.error == "supplier response timeout"
+    assert output.data["rfq_id"] == "RFQ-321"
 
 
 def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
@@ -342,11 +407,14 @@ def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.data["negotiation_allowed"] is True
-    assert output.data["session_state"]["status"].upper() == "ACTIVE"
+    assert output.data["negotiation_allowed"] is False
+    assert output.data["session_state"]["status"] == "AWAITING_SUPPLIER"
     assert output.data["session_state"]["awaiting_response"] is True
     assert output.data["drafts"] == []
     assert saved.get("awaiting_response") is True
+    assert saved.get("status") == "AWAITING_SUPPLIER"
+    assert output.next_agents == ["SupplierInteractionAgent"]
+    assert output.pass_fields["drafts"][0]["rfq_id"] == "RFQ-890"
 
 
 def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
@@ -390,6 +458,6 @@ def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.next_agents == ["EmailDraftingAgent"]
+    assert output.next_agents == ["EmailDraftingAgent", "SupplierInteractionAgent"]
     assert output.data.get("email_action_id") is None
     assert recorded_state.get("awaiting_response") is True

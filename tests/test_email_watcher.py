@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from email.message import EmailMessage
 from typing import Dict, List
 
 import pytest
@@ -212,6 +213,64 @@ def test_poll_once_matches_on_rfq_tail():
     assert len(results) == 1
     assert results[0]["rfq_id"] == "RFQ-20240101-00001234"
     assert "msg-tail" in state
+
+
+def test_email_watcher_falls_back_to_imap(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = None
+
+    class StubIMAP:
+        def __init__(self, host):
+            self.host = host
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.logout()
+            return False
+
+        def login(self, user, password):
+            self.user = user
+            self.password = password
+
+        def select(self, mailbox):
+            self.mailbox = mailbox
+            return "OK", [b""]
+
+        def search(self, charset, criteria):
+            return "OK", [b"1"]
+
+        def fetch(self, msg_id, command):
+            message = EmailMessage()
+            message["Subject"] = "Re: RFQ-20240101-abcd1234"
+            message["From"] = "supplier@example.com"
+            message["Message-ID"] = "<imap-msg-1>"
+            message["Date"] = "Mon, 01 Jan 2024 10:00:00 +0000"
+            message.set_content("Quoted price 1200")
+            return "OK", [(b"1", message.as_bytes())]
+
+        def store(self, msg_id, flags, values):
+            self.stored = (msg_id, flags, values)
+
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr("services.email_watcher.imaplib.IMAP4_SSL", StubIMAP)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", lambda self, *args, **kwargs: [])
+
+    results = watcher.poll_once(limit=1)
+
+    assert results
+    payload = results[0]
+    assert payload["message_id"] in {"<imap-msg-1>", "imap/1"}
+    assert payload["subject"] == "Re: RFQ-20240101-abcd1234"
 
 
 def test_email_watcher_maps_multiple_rfq_ids():
