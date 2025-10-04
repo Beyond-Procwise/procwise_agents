@@ -1492,7 +1492,12 @@ class SESEmailWatcher:
                 logger.warning("Invalid target price '%s' for RFQ %s", target_price, rfq_id)
                 target_price = None
 
-        processed: Dict[str, object] = {"message_id": message.get("id")}
+        message_identifier = message.get("message_id") or message.get("id")
+        processed: Dict[str, object] = {"message_id": message_identifier}
+        if message.get("s3_key"):
+            processed["s3_key"] = message.get("s3_key")
+        if message.get("_bucket"):
+            processed["_bucket"] = message.get("_bucket")
 
         context = AgentContext(
             workflow_id=str(uuid.uuid4()),
@@ -1505,6 +1510,8 @@ class SESEmailWatcher:
                 "rfq_id": rfq_id,
                 "from_address": from_address,
                 "target_price": target_price,
+                "message_id": message_identifier,
+                "s3_key": message.get("s3_key"),
             },
         )
 

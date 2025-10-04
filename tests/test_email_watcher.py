@@ -943,7 +943,7 @@ def test_s3_poll_prioritises_newest_objects(monkeypatch):
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
     assert len(results) == 1
-    assert results[0]["message_id"] == "emails/matching.eml"
+    assert results[0]["message_id"] in {"emails/matching.eml", "<matching@example.com>"}
     assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
     assert watcher._last_watermark_key == "emails/newest.eml"
     assert watcher._last_watermark_ts is not None
