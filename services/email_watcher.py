@@ -20,6 +20,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 try:  # pragma: no cover - optional dependency during tests
@@ -233,6 +234,37 @@ class SESEmailWatcher:
         self.metadata_provider = metadata_provider
         self.state_store = state_store or InMemoryEmailWatcherState()
         self._custom_loader = message_loader
+        if self._custom_loader is None:
+            queue_url = getattr(self.settings, "ses_inbound_queue_url", None)
+            if queue_url:
+                try:
+                    from services.email_sqs_loader import sqs_email_loader
+
+                    max_batch = self._coerce_int(
+                        getattr(self.settings, "ses_inbound_queue_max_messages", 10),
+                        default=10,
+                        minimum=1,
+                    )
+                    wait_seconds = self._coerce_int(
+                        getattr(self.settings, "ses_inbound_queue_wait_seconds", 2),
+                        default=2,
+                        minimum=0,
+                    )
+                    self._custom_loader = sqs_email_loader(
+                        queue_url=queue_url,
+                        max_batch=max_batch,
+                        wait_seconds=wait_seconds,
+                    )
+                    logger.info(
+                        "Using SQS loader for mailbox %s via queue %s",
+                        self.mailbox_address,
+                        queue_url,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to initialise SQS loader for mailbox %s",
+                        self.mailbox_address,
+                    )
         poll_interval = response_poll_seconds
         if poll_interval is None:
             poll_interval = getattr(
@@ -497,6 +529,7 @@ class SESEmailWatcher:
             while True:
                 attempts += 1
                 try:
+                    loader_empty = False
                     if self._custom_loader is not None:
                         messages = self._custom_loader(limit)
                         candidate_batch = list(messages)
@@ -505,6 +538,7 @@ class SESEmailWatcher:
                             len(candidate_batch),
                             self.mailbox_address,
                         )
+                        loader_empty = len(candidate_batch) == 0
                         for message in candidate_batch:
                             last_modified_hint = message.get("_last_modified")
                             if isinstance(last_modified_hint, datetime):
@@ -525,7 +559,8 @@ class SESEmailWatcher:
                                 if not match_found:
                                     match_found = True
                                 break
-                    else:
+
+                    if self._custom_loader is None or loader_empty:
                         processed_batch: List[Dict[str, object]] = []
 
                         def _on_message(
@@ -680,8 +715,48 @@ class SESEmailWatcher:
         results: List[Dict[str, object]],
         effective_limit: Optional[int],
     ) -> Tuple[bool, bool, bool, bool]:
+        if not isinstance(message, dict):
+            return False, False, False, False
+
+        bucket_hint = message.get("_bucket") or message.get("bucket")
+        if bucket_hint:
+            message["_bucket"] = bucket_hint
+
+        s3_key = message.get("id") if isinstance(message.get("id"), str) else message.get("s3_key")
+        if (not message.get("body") or not message.get("subject")) and s3_key:
+            bucket_for_fetch = bucket_hint or getattr(self, "bucket", None)
+            if bucket_for_fetch:
+                try:
+                    client = self._get_s3_client()
+                    download = self._download_object(client, s3_key, bucket=bucket_for_fetch)
+                except Exception:
+                    logger.exception(
+                        "Failed to hydrate SES message %s from bucket %s",
+                        s3_key,
+                        bucket_for_fetch,
+                    )
+                    download = None
+                if download is not None:
+                    raw_bytes, size_bytes = download
+                    parsed_payload = self._invoke_parser(
+                        self._parse_inbound_object, raw_bytes, s3_key
+                    )
+                    parsed_payload.setdefault("id", s3_key)
+                    parsed_payload.setdefault("s3_key", s3_key)
+                    parsed_payload.setdefault("_bucket", bucket_for_fetch)
+                    if size_bytes is not None:
+                        parsed_payload["_content_length"] = size_bytes
+                    for key, value in parsed_payload.items():
+                        if key not in message or not message.get(key):
+                            message[key] = value
+                    if size_bytes is not None and not message.get("_content_length"):
+                        message["_content_length"] = size_bytes
+                    if not bucket_hint:
+                        bucket_hint = bucket_for_fetch
+                        message["_bucket"] = bucket_hint
+
         message_id = str(message.get("id") or uuid.uuid4())
-        bucket = getattr(self, "bucket", None)
+        bucket = bucket_hint or getattr(self, "bucket", None)
         s3_key = message.get("id") if isinstance(message.get("id"), str) else message.get("s3_key")
         etag = message.get("_s3_etag") or message.get("s3_etag")
         size_hint = (
@@ -2423,8 +2498,8 @@ class SESEmailWatcher:
                     limit=self._s3_watch_history_limit
                 )
 
-        enforce_recent_window = watermark_ts is not None
-        if not enforce_recent_window:
+        enforce_recent_window = False
+        if watermark_ts is None:
             enforce_recent_window = all(
                 self._s3_prefix_watchers[prefix].primed
                 or bool(self._s3_prefix_watchers[prefix].known)
@@ -3050,6 +3125,18 @@ class SESEmailWatcher:
         client_kwargs = {}
         if self.region:
             client_kwargs["region_name"] = self.region
+
+        max_pool = self._coerce_int(
+            getattr(self.settings, "s3_max_pool_connections", 50),
+            default=50,
+            minimum=1,
+        )
+        client_kwargs["config"] = Config(
+            max_pool_connections=max_pool,
+            retries={"max_attempts": 10, "mode": "adaptive"},
+            read_timeout=20,
+            connect_timeout=5,
+        )
 
         if self._s3_role_arn:
             try:

@@ -1258,8 +1258,13 @@ class EmailDraftingAgent(BaseAgent):
             instructions,
             interaction_type,
         )
-        if supplier_context_html:
-            sections.append(supplier_context_html)
+        if supplier_context_html and isinstance(meta, dict):
+            internal_context = meta.setdefault("internal_context", {})
+            if isinstance(internal_context, dict):
+                internal_context["supplier_context_html"] = supplier_context_html
+                internal_context["supplier_context_text"] = self._html_to_plain_text(
+                    supplier_context_html
+                )
 
         negotiation_context = self._build_negotiation_summary(
             interaction_type,
@@ -2137,6 +2142,7 @@ class EmailDraftingAgent(BaseAgent):
             if negotiation_message:
                 dynamic_meta["negotiation_message"] = negotiation_message
 
+            rendered = None
             if self._should_auto_compose(
                 body_template, instruction_settings, data
             ):
@@ -2189,6 +2195,14 @@ class EmailDraftingAgent(BaseAgent):
                 receiver = recipients[0]
             contact_level = 1 if recipients else 0
 
+            internal_context = {}
+            if isinstance(dynamic_meta.get("internal_context"), dict):
+                internal_context = {
+                    key: value
+                    for key, value in dynamic_meta["internal_context"].items()
+                    if value
+                }
+
             draft = {
                 "supplier_id": supplier_id,
                 "supplier_name": supplier_name,
@@ -2206,6 +2220,17 @@ class EmailDraftingAgent(BaseAgent):
             if draft_action_id:
                 draft["action_id"] = draft_action_id
             draft.setdefault("thread_index", 1)
+            metadata: Dict[str, Any] = {
+                "rfq_id": rfq_id,
+                "interaction_type": interaction_type,
+            }
+            if supplier_id is not None:
+                metadata["supplier_id"] = supplier_id
+            if supplier_name:
+                metadata["supplier_name"] = supplier_name
+            if internal_context:
+                metadata["internal_context"] = internal_context
+            draft["metadata"] = metadata
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
@@ -2353,23 +2378,17 @@ class EmailDraftingAgent(BaseAgent):
         return " ".join(sentences)
 
     def _relationship_sentence(self, supplier: Dict) -> str:
-        supplier_name = (
-            supplier.get("supplier_name")
-            or supplier.get("supplier_id")
-            or "your team"
-        )
         spend = self._as_float(supplier.get("total_spend")) or 0.0
         po_count = self._as_float(supplier.get("po_count")) or 0.0
         if po_count > 0:
             return (
-                f"We appreciate the recent collaboration with {supplier_name} and "
-                "look forward to your updated quotation"
+                "We appreciate the recent collaboration and look forward to your updated quotation"
             )
         if spend > 0:
             return (
-                f"We value our ongoing work with {supplier_name} and would welcome your refreshed proposal"
+                "We value our ongoing work together and would welcome your refreshed proposal"
             )
-        return f"We would welcome {supplier_name}'s response for this sourcing need"
+        return "We would welcome your response for this sourcing need"
 
     def _scope_sentences(
         self, supplier: Dict, profile: Dict, context: Dict

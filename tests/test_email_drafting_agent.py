@@ -177,6 +177,47 @@ def test_run_sets_recipient_when_instructions_present():
     assert draft["receiver"] == "quotes@acme.test"
 
 
+def test_supplier_context_is_not_injected_into_email_body():
+    agent = EmailDraftingAgent()
+    context = _make_context(
+        {
+            "ranking": [
+                {
+                    "supplier_id": "SUP-CTX",
+                    "supplier_name": "Context Corp",
+                    "contact_name": "Alex",
+                    "contact_email": "rfq@context.test",
+                    "avg_unit_price": 42.78,
+                    "currency": "GBP",
+                    "po_count": 2,
+                    "invoice_count": 2,
+                    "relationship_summary": (
+                        "Year-to-date spend with your organisation totals £28,487.89."
+                    ),
+                }
+            ],
+            "supplier_profiles": {"SUP-CTX": {}},
+        }
+    )
+
+    result = agent.run(context)
+
+    assert result.status == AgentStatus.SUCCESS
+    draft = result.data["drafts"][0]
+    body = draft["body"]
+    assert "Supplier context" not in body
+    assert "£28,487.89" not in body
+
+    metadata = draft.get("metadata") or {}
+    internal = metadata.get("internal_context") or {}
+    html_context = internal.get("supplier_context_html")
+    text_context = internal.get("supplier_context_text")
+
+    assert html_context and "Supplier context" in html_context
+    assert "£28,487.89" in html_context
+    assert text_context and "£28,487.89" in text_context
+
+
 def _make_context(payload: dict) -> AgentContext:
     return AgentContext(
         workflow_id="wf-1",
@@ -409,13 +450,21 @@ def test_email_drafting_personalises_supplier_content(monkeypatch):
     drafts = result.data["drafts"]
     assert len(drafts) == 2
 
-    first_body = drafts[0]["body"]
-    second_body = drafts[1]["body"]
+    first = drafts[0]
+    second = drafts[1]
 
-    assert "£250,000.00" in first_body
-    assert "14 days" in first_body
-    assert "Long-term frame agreement" in first_body
+    assert "£250,000.00" not in first["body"]
+    assert "Long-term frame agreement" not in first["body"]
+    assert "£80,000.00" not in second["body"]
+    assert "New vendor onboarding" not in second["body"]
 
-    assert "£80,000.00" in second_body
-    assert "New vendor onboarding" in second_body
-    assert first_body != second_body
+    first_internal = (first.get("metadata") or {}).get("internal_context") or {}
+    second_internal = (second.get("metadata") or {}).get("internal_context") or {}
+
+    assert "£250,000.00" in first_internal.get("supplier_context_html", "")
+    assert "Long-term frame agreement" in first_internal.get("supplier_context_text", "")
+
+    assert "£80,000.00" in second_internal.get("supplier_context_html", "")
+    assert "New vendor onboarding" in second_internal.get("supplier_context_text", "")
+
+    assert first_internal != second_internal
