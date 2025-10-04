@@ -1,5 +1,6 @@
 
 import io
+import json
 import logging
 import re
 import sys
@@ -15,6 +16,7 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+from services.email_sqs_loader import sqs_email_loader
 from services.email_watcher import (
     InMemoryEmailWatcherState,
     SESEmailWatcher,
@@ -387,6 +389,7 @@ def test_poll_once_retries_until_target_found(monkeypatch):
 
     watcher = _make_watcher(nick, loader=loader)
     watcher.poll_interval_seconds = 0
+    watcher.bucket = None
 
     result = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
@@ -720,6 +723,7 @@ def test_poll_once_returns_empty_after_attempts(monkeypatch):
 
     watcher.poll_interval_seconds = 0
     watcher._match_poll_attempts = 2
+    watcher.bucket = None
 
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-missing"})
 
@@ -750,6 +754,7 @@ def test_poll_once_respects_dispatch_wait(monkeypatch):
     )
 
     watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.bucket = None
     watcher.record_dispatch_timestamp()
 
     watcher.poll_interval_seconds = 1
@@ -883,3 +888,102 @@ def test_scan_recent_objects_includes_backlog_without_watermark():
     )
 
     assert refs_with_window == []
+
+
+def test_loader_metadata_is_hydrated_from_s3(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    bucket_name = nick.settings.ses_inbound_bucket or "procwisemvp"
+    key_name = "emails/metadata-only.eml"
+
+    raw_email = (
+        b"Subject: RFQ-20240101-ABCD1234\n"
+        b"From: supplier@example.com\n\n"
+        b"Quoted price 1200 for RFQ-20240101-ABCD1234"
+    )
+
+    def loader(limit=None):
+        return [{"id": key_name, "s3_key": key_name, "_bucket": bucket_name}]
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    watcher._get_s3_client = lambda: object()
+    watcher._download_object = lambda client, key, bucket=None: (raw_email, len(raw_email))
+
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-ABCD1234"})
+
+    assert results
+    payload = results[0]
+    assert payload["rfq_id"].lower() == "rfq-20240101-abcd1234"
+    assert state.items()
+
+
+def test_watermark_disables_recent_window(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    watcher._last_watermark_ts = datetime.now(timezone.utc) - timedelta(hours=1)
+    watcher._last_watermark_key = "emails/previous.eml"
+
+    captured = {}
+
+    def fake_scan(client, prefixes, *, watermark_ts, watermark_key, enforce_window):
+        captured["enforce_window"] = enforce_window
+        return []
+
+    watcher._scan_recent_s3_objects = fake_scan  # type: ignore[assignment]
+    watcher._get_s3_client = lambda: None
+
+    watcher._load_from_s3(limit=None)
+
+    assert captured.get("enforce_window") is False
+
+
+def test_sqs_email_loader_extracts_records():
+    class StubSQSClient:
+        def __init__(self):
+            self.deleted: List[str] = []
+            self._messages = [
+                {
+                    "Body": json.dumps(
+                        {
+                            "Records": [
+                                {
+                                    "s3": {
+                                        "bucket": {"name": "procwisemvp"},
+                                        "object": {"key": "emails/test%20file.eml"},
+                                    },
+                                    "eventTime": "2025-10-04T06:05:58Z",
+                                }
+                            ]
+                        }
+                    ),
+                    "ReceiptHandle": "r1",
+                }
+            ]
+
+        def receive_message(self, **kwargs):
+            return {"Messages": list(self._messages)}
+
+        def delete_message(self, **kwargs):
+            self.deleted.append(kwargs.get("ReceiptHandle"))
+            self._messages.clear()
+
+    stub = StubSQSClient()
+    loader = sqs_email_loader(
+        queue_url="https://sqs.example.com/queue",
+        max_batch=5,
+        wait_seconds=0,
+        visibility_timeout=30,
+        sqs_client=stub,
+    )
+
+    batch = loader()
+
+    assert batch
+    record = batch[0]
+    assert record["s3_key"] == "emails/test file.eml"
+    assert record["_bucket"] == "procwisemvp"
+    assert isinstance(record.get("_last_modified"), datetime)
+    assert stub.deleted == ["r1"]
