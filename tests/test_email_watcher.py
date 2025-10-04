@@ -275,6 +275,116 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
     assert payload["subject"] == "Re: RFQ-20240101-abcd1234"
 
 
+def test_imap_fallback_triggers_after_three_empty_s3_batches(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = "procwise-bucket"
+
+    counters = {"s3": 0, "imap": 0}
+
+    def _stub_s3(self, limit, *, prefixes=None, on_message=None):
+        counters["s3"] += 1
+        return []
+
+    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+        counters["imap"] += 1
+        return [
+            {
+                "id": f"imap-msg-{counters['imap']}",
+                "message_id": f"imap-msg-{counters['imap']}",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Quoted price 1250",
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "from": "supplier@example.com",
+                "from_address": "supplier@example.com",
+            }
+        ]
+
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
+
+    assert watcher.poll_once(limit=1) == []
+    assert watcher.poll_once(limit=1) == []
+    third_batch = watcher.poll_once(limit=1)
+
+    assert counters["s3"] >= 3
+    assert counters["imap"] == 1
+    assert third_batch
+    assert third_batch[0]["message_id"].startswith("imap-msg-")
+
+
+def test_imap_loader_records_processed_email(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = None
+
+    class StubIMAP:
+        def __init__(self, host):
+            self.host = host
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.logout()
+            return False
+
+        def login(self, user, password):
+            self.user = user
+            self.password = password
+
+        def select(self, mailbox):
+            self.mailbox = mailbox
+            return "OK", [b""]
+
+        def search(self, charset, criteria):
+            return "OK", [b"1"]
+
+        def fetch(self, msg_id, command):
+            message = EmailMessage()
+            message["Subject"] = "Re: RFQ-20240101-abcd1234"
+            message["From"] = "supplier@example.com"
+            message["Message-ID"] = "<imap-msg-42>"
+            message["Date"] = "Mon, 01 Jan 2024 10:00:00 +0000"
+            message.set_content("Quoted price 1150 for RFQ-20240101-ABCD1234")
+            return "OK", [(b"1", message.as_bytes())]
+
+        def store(self, msg_id, flags, values):
+            self.stored = (msg_id, flags, values)
+
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr("services.email_watcher.imaplib.IMAP4_SSL", StubIMAP)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", lambda self, *args, **kwargs: [])
+
+    recorded: List[tuple] = []
+
+    def _capture_registry(self, bucket, key, etag, rfq_id):
+        recorded.append((bucket, key, etag, rfq_id))
+
+    monkeypatch.setattr(SESEmailWatcher, "_record_processed_in_registry", _capture_registry, raising=False)
+
+    results = watcher.poll_once(limit=1)
+
+    assert results
+    assert recorded
+    bucket, key, _, rfq_id = recorded[0]
+    assert bucket.startswith("imap::")
+    assert key.startswith("imap/")
+    assert rfq_id
+
+
 def test_email_watcher_maps_multiple_rfq_ids():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
