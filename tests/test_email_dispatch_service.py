@@ -84,7 +84,19 @@ class DummyCursor:
             row = self.store.get_latest(rfq_id)
             self._result = [row] if row else []
         elif normalized.startswith("UPDATE proc.draft_rfq_emails SET"):
-            sent_flag, subject, body, recipient, contact_level, payload_json, sent_bool, draft_id = params
+            (
+                sent_flag,
+                subject,
+                body,
+                recipient,
+                contact_level,
+                supplier_id,
+                supplier_name,
+                rfq_value,
+                payload_json,
+                sent_bool,
+                draft_id,
+            ) = params
             updates = {
                 "sent": bool(sent_flag),
                 "subject": subject,
@@ -93,6 +105,9 @@ class DummyCursor:
                 "contact_level": contact_level,
                 "payload": payload_json,
             }
+            updates["supplier_id"] = supplier_id
+            updates["supplier_name"] = supplier_name
+            updates["rfq_id"] = rfq_value
             if sent_bool:
                 updates["sent_on"] = "now"
             self.store.update(draft_id, **updates)

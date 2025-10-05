@@ -197,6 +197,123 @@ def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
     assert ensure_calls == ["proc.email_thread_map"]
 
 
+def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
+    nick = DummyNick()
+
+    dispatch_row = {
+        "rfq_id": "RFQ-20240201-XYZ12345",
+        "supplier_id": "supplier-42",
+        "supplier_name": "Acme Supplies",
+        "sent_on": datetime.now(timezone.utc) - timedelta(minutes=5),
+        "created_on": datetime.now(timezone.utc) - timedelta(minutes=10),
+        "updated_on": datetime.now(timezone.utc) - timedelta(minutes=2),
+    }
+
+    class DispatchCursor:
+        def __init__(self, owner):
+            self._owner = owner
+            self._result: List[Tuple] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            if normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
+                    )
+                ]
+            elif normalized.startswith(
+                "select supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["rfq_id"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
+                    )
+                ]
+            elif normalized.startswith("select target_price"):
+                self._result = []
+            else:
+                self._owner.ddl_statements.append(statement.strip())
+                self._result = []
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+    class DispatchConn:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return DispatchCursor(self._owner)
+
+        def commit(self):
+            pass
+
+    nick.get_db_connection = lambda: DispatchConn(nick)
+
+    captured_mark = {}
+
+    def fake_mark_response(connection, **kwargs):
+        captured_mark.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "services.email_watcher.mark_dispatch_response",
+        fake_mark_response,
+    )
+
+    message = {
+        "id": "msg-dispatch-1",
+        "subject": "Re: Pricing",
+        "body": "Here is our latest quote",
+        "from": "Acme Rep <buyer@acme.test>",
+        "rfq_id": None,
+    }
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [dict(message)])
+
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    processed = results[0]
+    assert processed["rfq_id"] == dispatch_row["rfq_id"]
+    assert processed["supplier_id"] == dispatch_row["supplier_id"]
+    assert processed["matched_via"] == "dispatch"
+    assert watcher.supplier_agent.contexts
+    context = watcher.supplier_agent.contexts[0]
+    assert context.input_data["rfq_id"] == dispatch_row["rfq_id"]
+    assert context.input_data["supplier_id"] == dispatch_row["supplier_id"]
+    assert captured_mark["rfq_id"] == dispatch_row["rfq_id"]
+
 def test_poll_once_continues_until_all_filters_match():
     nick = DummyNick()
     messages = [

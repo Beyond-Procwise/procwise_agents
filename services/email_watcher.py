@@ -859,6 +859,8 @@ class SESEmailWatcher:
                     and canonical_rfq_full in _norm(str(body_candidate)).upper()
                 ):
                     match_source = "body"
+            if match_source == "unknown" and message.get("_dispatch_record"):
+                match_source = "dispatch"
             if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
@@ -1494,6 +1496,20 @@ class SESEmailWatcher:
                         tail_supplier_map[canonical] = supplier_hint
 
         if not ordered_canonicals:
+            dispatch_resolution = self._resolve_rfq_from_recent_dispatch(message)
+            if dispatch_resolution:
+                dispatch_rfq, dispatch_supplier, dispatch_record = dispatch_resolution
+                canonical = self._canonical_rfq(dispatch_rfq)
+                if canonical:
+                    if canonical not in canonical_map:
+                        canonical_map[canonical] = dispatch_rfq
+                        ordered_canonicals.append(canonical)
+                    if dispatch_supplier and canonical not in tail_supplier_map:
+                        tail_supplier_map[canonical] = dispatch_supplier
+                    if dispatch_record:
+                        message["_dispatch_record"] = dispatch_record
+
+        if not ordered_canonicals:
             logger.debug("Skipping email without RFQ identifier: %s", subject)
             return None, "missing_rfq_id"
 
@@ -1521,7 +1537,14 @@ class SESEmailWatcher:
         canonical_rfq_id = metadata.get("canonical_rfq_id")
         if canonical_rfq_id:
             rfq_id = str(canonical_rfq_id)
+        dispatch_record = metadata.get("dispatch_record")
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
+        if dispatch_record:
+            message["_dispatch_record"] = dispatch_record
+            record_supplier = dispatch_record.get("supplier_id")
+            if record_supplier:
+                supplier_id = record_supplier
+                tail_supplier_map.setdefault(primary_canonical, record_supplier)
         if not supplier_id:
             supplier_id = tail_supplier_map.get(primary_canonical)
         target_price = metadata.get("target_price") or message.get("target_price")
@@ -1716,14 +1739,50 @@ class SESEmailWatcher:
         try:
             with self.agent_nick.get_db_connection() as conn:  # pragma: no cover - network
                 with conn.cursor() as cur:
-                    if "supplier_id" not in details:
-                        cur.execute(
-                            "SELECT supplier_id FROM proc.draft_rfq_emails WHERE rfq_id = %s ORDER BY created_on DESC LIMIT 1",
-                            (lookup_rfq_id,),
-                        )
-                        row = cur.fetchone()
-                        if row and row[0]:
-                            details["supplier_id"] = row[0]
+                    cur.execute(
+                        """
+                        SELECT supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on
+                        FROM proc.draft_rfq_emails
+                        WHERE rfq_id = %s
+                        ORDER BY updated_on DESC, created_on DESC
+                        LIMIT 1
+                        """,
+                        (lookup_rfq_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        (
+                            draft_supplier_id,
+                            draft_supplier_name,
+                            draft_rfq_id,
+                            draft_sent_on,
+                            draft_sent_flag,
+                            draft_created_on,
+                            draft_updated_on,
+                        ) = row
+                        dispatch_record = {
+                            "supplier_id": draft_supplier_id,
+                            "supplier_name": draft_supplier_name,
+                            "rfq_id": draft_rfq_id,
+                            "sent_on": draft_sent_on,
+                            "sent": bool(draft_sent_flag),
+                            "created_on": draft_created_on,
+                            "updated_on": draft_updated_on,
+                        }
+                        details["dispatch_record"] = dispatch_record
+                        if draft_supplier_name and not details.get("supplier_name"):
+                            details["supplier_name"] = draft_supplier_name
+                        if draft_supplier_id:
+                            if details.get("supplier_id") not in (draft_supplier_id, None):
+                                logger.debug(
+                                    "Overriding supplier %s with dispatch supplier %s for RFQ %s",
+                                    details.get("supplier_id"),
+                                    draft_supplier_id,
+                                    lookup_rfq_id,
+                                )
+                            details["supplier_id"] = draft_supplier_id
+                        elif "supplier_id" not in details:
+                            details["supplier_id"] = None
 
                     # Attempt to retrieve negotiation targets when the table exists.
                     try:
@@ -1856,6 +1915,93 @@ class SESEmailWatcher:
             cached.insert(0, entry)
             if len(cached) > 10:
                 del cached[10:]
+
+    def _resolve_rfq_from_recent_dispatch(
+        self, message: Dict[str, object]
+    ) -> Optional[Tuple[str, Optional[str], Optional[Dict[str, object]]]]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        supplier_candidates: List[str] = []
+        supplier_hint = self._normalise_filter_value(message.get("supplier_id"))
+        if supplier_hint:
+            supplier_candidates.append(supplier_hint)
+
+        email_candidates: List[str] = []
+        for key in ("from", "reply_to", "supplier_email"):
+            candidate = self._normalise_email(message.get(key))
+            if candidate and candidate not in email_candidates:
+                email_candidates.append(candidate)
+
+        headers = message.get("headers")
+        if isinstance(headers, dict):
+            for header_key in ("From", "from", "Reply-To", "reply-to", "Return-Path", "return-path"):
+                candidate = self._normalise_email(headers.get(header_key))
+                if candidate and candidate not in email_candidates:
+                    email_candidates.append(candidate)
+
+        if not supplier_candidates and not email_candidates:
+            return None
+
+        where_clauses: List[str] = []
+        params: List[object] = []
+
+        if supplier_candidates:
+            where_clauses.append("supplier_id = ANY(%s)")
+            params.append(supplier_candidates)
+
+        if email_candidates:
+            where_clauses.append("LOWER(COALESCE(recipient_email, '')) = ANY(%s)")
+            params.append(email_candidates)
+
+        if not where_clauses:
+            return None
+
+        query = """
+            SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on
+            FROM proc.draft_rfq_emails
+            WHERE sent = TRUE AND ({})
+            ORDER BY updated_on DESC, created_on DESC
+            LIMIT 1
+        """.format(" OR ".join(where_clauses))
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, tuple(params))
+                    row = cur.fetchone()
+        except Exception:
+            logger.debug("Failed to resolve RFQ from dispatch history", exc_info=True)
+            return None
+
+        if not row:
+            return None
+
+        (
+            rfq_value,
+            supplier_value,
+            supplier_name,
+            sent_on,
+            sent_flag,
+            created_on,
+            updated_on,
+        ) = row
+
+        if not rfq_value:
+            return None
+
+        dispatch_record = {
+            "rfq_id": rfq_value,
+            "supplier_id": supplier_value,
+            "supplier_name": supplier_name,
+            "sent_on": sent_on,
+            "sent": bool(sent_flag),
+            "created_on": created_on,
+            "updated_on": updated_on,
+        }
+
+        return str(rfq_value), supplier_value, dispatch_record
 
     def _load_messages(
         self,
