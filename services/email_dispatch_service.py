@@ -285,6 +285,10 @@ class EmailDispatchService:
         payload["sent_status"] = bool(sent)
         payload_json = json.dumps(payload, default=str)
 
+        supplier_id = payload.get("supplier_id") or row[2]
+        supplier_name = payload.get("supplier_name") or row[3]
+        rfq_value = payload.get("rfq_id") or row[1]
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -294,6 +298,9 @@ class EmailDispatchService:
                     body = %s,
                     recipient_email = %s,
                     contact_level = %s,
+                    supplier_id = %s,
+                    supplier_name = %s,
+                    rfq_id = %s,
                     payload = %s,
                     sent_on = CASE WHEN %s THEN NOW() ELSE sent_on END,
                     updated_on = NOW()
@@ -305,6 +312,9 @@ class EmailDispatchService:
                     payload.get("body"),
                     recipient,
                     contact_level,
+                    supplier_id,
+                    supplier_name,
+                    rfq_value,
                     payload_json,
                     bool(sent),
                     draft_id,

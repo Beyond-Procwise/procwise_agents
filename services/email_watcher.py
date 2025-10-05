@@ -859,6 +859,8 @@ class SESEmailWatcher:
                     and canonical_rfq_full in _norm(str(body_candidate)).upper()
                 ):
                     match_source = "body"
+            if match_source == "unknown" and message.get("_dispatch_record"):
+                match_source = "dispatch"
             if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
@@ -1521,7 +1523,14 @@ class SESEmailWatcher:
         canonical_rfq_id = metadata.get("canonical_rfq_id")
         if canonical_rfq_id:
             rfq_id = str(canonical_rfq_id)
+        dispatch_record = metadata.get("dispatch_record")
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
+        if dispatch_record:
+            message["_dispatch_record"] = dispatch_record
+            record_supplier = dispatch_record.get("supplier_id")
+            if record_supplier:
+                supplier_id = record_supplier
+                tail_supplier_map.setdefault(primary_canonical, record_supplier)
         if not supplier_id:
             supplier_id = tail_supplier_map.get(primary_canonical)
         target_price = metadata.get("target_price") or message.get("target_price")
@@ -1716,14 +1725,50 @@ class SESEmailWatcher:
         try:
             with self.agent_nick.get_db_connection() as conn:  # pragma: no cover - network
                 with conn.cursor() as cur:
-                    if "supplier_id" not in details:
-                        cur.execute(
-                            "SELECT supplier_id FROM proc.draft_rfq_emails WHERE rfq_id = %s ORDER BY created_on DESC LIMIT 1",
-                            (lookup_rfq_id,),
-                        )
-                        row = cur.fetchone()
-                        if row and row[0]:
-                            details["supplier_id"] = row[0]
+                    cur.execute(
+                        """
+                        SELECT supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on
+                        FROM proc.draft_rfq_emails
+                        WHERE rfq_id = %s
+                        ORDER BY updated_on DESC, created_on DESC
+                        LIMIT 1
+                        """,
+                        (lookup_rfq_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        (
+                            draft_supplier_id,
+                            draft_supplier_name,
+                            draft_rfq_id,
+                            draft_sent_on,
+                            draft_sent_flag,
+                            draft_created_on,
+                            draft_updated_on,
+                        ) = row
+                        dispatch_record = {
+                            "supplier_id": draft_supplier_id,
+                            "supplier_name": draft_supplier_name,
+                            "rfq_id": draft_rfq_id,
+                            "sent_on": draft_sent_on,
+                            "sent": bool(draft_sent_flag),
+                            "created_on": draft_created_on,
+                            "updated_on": draft_updated_on,
+                        }
+                        details["dispatch_record"] = dispatch_record
+                        if draft_supplier_name and not details.get("supplier_name"):
+                            details["supplier_name"] = draft_supplier_name
+                        if draft_supplier_id:
+                            if details.get("supplier_id") not in (draft_supplier_id, None):
+                                logger.debug(
+                                    "Overriding supplier %s with dispatch supplier %s for RFQ %s",
+                                    details.get("supplier_id"),
+                                    draft_supplier_id,
+                                    lookup_rfq_id,
+                                )
+                            details["supplier_id"] = draft_supplier_id
+                        elif "supplier_id" not in details:
+                            details["supplier_id"] = None
 
                     # Attempt to retrieve negotiation targets when the table exists.
                     try:
