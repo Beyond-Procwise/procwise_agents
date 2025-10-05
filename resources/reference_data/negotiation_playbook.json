@@ -1,0 +1,280 @@
+{
+  "Transactional": {
+    "descriptor": "Automate RFQs, push standard T&Cs, lowest price focus",
+    "styles": {
+      "Competitive": {
+        "Commercial": [
+          "Run e-auction with ≥3 bidders to push price down",
+          "Anchor low and require justification for any premium"
+        ],
+        "Operational": [
+          "Demand standard 2–3 day delivery; no customizations"
+        ],
+        "Risk": [
+          "Insist on minimum legal warranty only",
+          "Require supplier-funded returns within 14 days"
+        ]
+      },
+      "Collaborative": {
+        "Commercial": [
+          "Offer early payment (net-15) for 2–3% discount"
+        ],
+        "Operational": [
+          "Align deliveries to monthly batching to reduce handling costs"
+        ],
+        "Risk": [
+          "Streamline returns/refunds via portal for repetitive items"
+        ]
+      },
+      "Principled": {
+        "Commercial": [
+          "Benchmark pricing against market/commodity indices"
+        ],
+        "Risk": [
+          "Ensure warranty coverage matches industry norms"
+        ]
+      },
+      "Accommodating": {
+        "Commercial": [
+          "Accept modest discount in exchange for reliable fulfillment"
+        ],
+        "Operational": [
+          "Allow extended lead times if continuity is guaranteed"
+        ],
+        "Relational": [
+          "Offer repeat-business recognition"
+        ]
+      },
+      "Compromising": {
+        "Commercial": [
+          "Split the difference between target and offer price"
+        ],
+        "Risk": [
+          "Accept supplier return conditions with minor concession"
+        ]
+      }
+    },
+    "examples": [
+      "Supplier quoting £100/unit → run e-auction to target £85/unit with 48h delivery.",
+      "Propose net-15 for 3% discount; align deliveries monthly to reduce admin cost.",
+      "If price won’t move, request free shipping on bulk orders and strict 14-day returns at supplier cost."
+    ]
+  },
+  "Leverage": {
+    "descriptor": "Run competitive events, bundle spend, use volume to extract discounts",
+    "styles": {
+      "Competitive": {
+        "Commercial": [
+          "Demand tiered volume discounts (10% at 100 units, 20% at 500 units)",
+          "Leverage competitor quotes to pressure pricing"
+        ],
+        "Operational": [
+          "Require priority fulfillment; SLA penalties if delivery > 7 days"
+        ],
+        "Risk": [
+          "Bundle 2-year warranty at no cost",
+          "Full refund/credit for non-compliant goods"
+        ]
+      },
+      "Collaborative": {
+        "Commercial": [
+          "Consolidate spend across divisions/geographies for 12–18% savings"
+        ],
+        "Operational": [
+          "Share forecasts to guarantee 7-day fulfillment; reserve capacity windows"
+        ],
+        "Risk": [
+          "Create pooled warranty coverage across categories",
+          "Use service credits instead of refunds for minor issues"
+        ],
+        "Strategic": [
+          "Co-develop savings roadmap; share efficiency gains"
+        ],
+        "Relational": [
+          "Offer preferred supplier status with quarterly business reviews"
+        ]
+      },
+      "Principled": {
+        "Commercial": [
+          "Use transparent cost benchmarks to justify price targets"
+        ],
+        "Operational": [
+          "Align OTIF (on-time in-full) SLAs to industry standards"
+        ],
+        "Risk": [
+          "Match warranty terms to peer set; cap restocking fees"
+        ]
+      },
+      "Accommodating": {
+        "Commercial": [
+          "Accept smaller discount in return for extended payment terms (e.g., net-60)"
+        ],
+        "Operational": [
+          "Allow longer lead times during peak season with prior notice"
+        ],
+        "Risk": [
+          "Negotiate extended warranty coverage in lieu of deeper discount"
+        ],
+        "Relational": [
+          "Recognition on preferred vendor list"
+        ]
+      },
+      "Compromising": {
+        "Commercial": [
+          "Agree mid-point discount; trade for 12-month warranty extension"
+        ],
+        "Risk": [
+          "Limited returns/refund flexibility with clear thresholds"
+        ]
+      }
+    },
+    "examples": [
+      "Negotiate 20% off at 500 units; enforce 7-day lead time with penalties; 2-year warranty included.",
+      "Bundle adjacent categories for 15% off, add pooled warranty and service credits for minor failures.",
+      "If discount stalls, offer 3-year term for stable pricing and net-60 terms."
+    ]
+  },
+  "Strategic": {
+    "descriptor": "Long-term partnership, co-innovation roadmap, risk-sharing, governance councils",
+    "styles": {
+      "Competitive": {
+        "Commercial": [
+          "Rebates tied to growth KPIs (e.g., 2% rebate if annual spend > £10m)"
+        ],
+        "Operational": [
+          "Guarantee next-day delivery with premium priority lanes"
+        ],
+        "Risk": [
+          "Free 5-year extended warranty",
+          "Aggressive service-credit regime for SLA breaches"
+        ]
+      },
+      "Collaborative": {
+        "Commercial": [
+          "Joint efficiency projects with shared savings (e.g., automation)"
+        ],
+        "Operational": [
+          "Integrated demand planning to reduce lead times by ~15%"
+        ],
+        "Risk": [
+          "Co-develop predictive maintenance warranty models",
+          "Governance council arbitrates credits vs refunds"
+        ],
+        "Strategic": [
+          "Co-create innovation roadmap with shared IP parameters",
+          "ESG initiatives tied to contract extension"
+        ],
+        "Relational": [
+          "Seat on governance council; quarterly executive reviews"
+        ]
+      },
+      "Principled": {
+        "Commercial": [
+          "Benchmark prices and terms against industry leaders"
+        ],
+        "Operational": [
+          "Define escalation ladder and response SLAs via governance"
+        ],
+        "Risk": [
+          "Set liability caps using objective criteria (e.g., % of annual fees)"
+        ]
+      },
+      "Accommodating": {
+        "Commercial": [
+          "Accept higher pricing to secure continuity and strategic alignment"
+        ],
+        "Operational": [
+          "Allow longer lead times in exchange for co-innovation benefits"
+        ],
+        "Risk": [
+          "Lock in extended warranty coverage on critical items"
+        ],
+        "Strategic": [
+          "Offer limited exclusivity in defined scope/regions"
+        ]
+      },
+      "Compromising": {
+        "Commercial": [
+          "Split discounts; add SLA-linked bonuses for performance"
+        ],
+        "Risk": [
+          "Moderate warranty extension with partial refund mechanisms"
+        ],
+        "Strategic": [
+          "Joint marketing in lieu of deeper discounts"
+        ]
+      }
+    },
+    "examples": [
+      "Guarantee next-day delivery and 5-year warranty in exchange for a 10-year contract.",
+      "Co-create predictive warranty; integrated planning shortens lead times by 15%.",
+      "Agree shared-savings automation program with quarterly governance reviews."
+    ]
+  },
+  "Bottleneck": {
+    "descriptor": "Secure continuity, dual-source where possible, service guarantees",
+    "styles": {
+      "Competitive": {
+        "Commercial": [
+          "Signal dual-sourcing to pressure price alignment"
+        ],
+        "Operational": [
+          "SLA penalties of 5% of order value per delayed week"
+        ],
+        "Risk": [
+          "Extended warranty to mitigate continuity risk",
+          "Compensation for downtime due to stockouts"
+        ]
+      },
+      "Collaborative": {
+        "Commercial": [
+          "Co-fund capacity expansion to unlock supply"
+        ],
+        "Operational": [
+          "Joint supply planning; reserve production slots"
+        ],
+        "Risk": [
+          "Co-funded warranty pool; streamlined replacements"
+        ],
+        "Strategic": [
+          "Priority allocation agreements during peaks"
+        ]
+      },
+      "Principled": {
+        "Commercial": [
+          "Transparent cost-plus pricing model"
+        ],
+        "Operational": [
+          "Contractual lead-time baselines aligned with peers"
+        ],
+        "Risk": [
+          "Warranty coverage at least equal to industry norms"
+        ]
+      },
+      "Accommodating": {
+        "Commercial": [
+          "Accept higher cost if robust continuity clauses are secured"
+        ],
+        "Operational": [
+          "Allow slower lead times where supply is guaranteed"
+        ],
+        "Strategic": [
+          "Offer long-term contracts to maintain goodwill"
+        ]
+      },
+      "Compromising": {
+        "Commercial": [
+          "Pay slightly above market for guaranteed capacity"
+        ],
+        "Risk": [
+          "Limited warranty but partial refunds for failures"
+        ]
+      }
+    },
+    "examples": [
+      "Accept higher price but demand 3-year warranty and penalties for delays > 7 days.",
+      "Fund 10% of supplier expansion; secure 24h delivery priority and 3-year warranty.",
+      "Negotiate buffer stock and reserved capacity during peak seasons."
+    ]
+  }
+}

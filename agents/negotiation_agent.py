@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import re
@@ -10,6 +11,8 @@ from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
 from utils.gpu import configure_gpu
+
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,24 @@ FINAL_OFFER_PATTERNS = (
     "take it or leave it",
     "ultimatum",
 )
+
+LEVER_CATEGORIES = {
+    "COMMERCIAL",
+    "OPERATIONAL",
+    "RISK",
+    "STRATEGIC",
+    "RELATIONAL",
+}
+
+TRADE_OFF_HINTS = {
+    "Commercial": "May require volume commitments, stepped pricing, or altered cash flow.",
+    "Operational": "May reduce supplier flexibility or need shared planning resources.",
+    "Risk": "Could introduce legal negotiation overhead or stricter enforcement costs.",
+    "Strategic": "Requires executive sponsorship and potential co-investment or exclusivity.",
+    "Relational": "Demands governance time and tighter alignment of internal stakeholders.",
+}
+
+PLAYBOOK_PATH = Path(__file__).resolve().parent.parent / "resources" / "reference_data" / "negotiation_playbook.json"
 
 
 def decide_strategy(
@@ -99,6 +120,7 @@ class NegotiationAgent(BaseAgent):
         self._email_agent: Optional[EmailDraftingAgent] = None
         self._supplier_agent: Optional["SupplierInteractionAgent"] = None
         self._state_schema_checked = False
+        self._playbook_cache: Optional[Dict[str, Any]] = None
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -158,6 +180,25 @@ class NegotiationAgent(BaseAgent):
         decision.setdefault("asks", [])
         decision.setdefault("lead_time_request", None)
         decision.setdefault("rationale", "")
+
+        playbook_context = self._resolve_playbook_context(context, decision)
+        play_recommendations = playbook_context.get("plays", [])
+        if play_recommendations:
+            decision["play_recommendations"] = play_recommendations
+            descriptor = playbook_context.get("descriptor")
+            if descriptor:
+                decision["playbook_descriptor"] = descriptor
+            style_used = playbook_context.get("style")
+            if style_used:
+                decision["playbook_style"] = style_used
+            lever_focus = playbook_context.get("lever_priorities")
+            if lever_focus:
+                decision.setdefault("lever_priorities", lever_focus)
+            examples = playbook_context.get("examples")
+            if examples:
+                decision["playbook_examples"] = examples
+        else:
+            decision.setdefault("play_recommendations", [])
 
         state, _ = self._load_session_state(rfq_id, supplier)
         message_id = context.input_data.get("message_id")
@@ -237,6 +278,9 @@ class NegotiationAgent(BaseAgent):
                 "drafts": draft_records,
                 "sent_status": False,
                 "awaiting_response": awaiting_now,
+                "play_recommendations": play_recommendations,
+                "playbook_descriptor": playbook_context.get("descriptor"),
+                "playbook_examples": playbook_context.get("examples"),
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
@@ -273,6 +317,13 @@ class NegotiationAgent(BaseAgent):
             round_no,
         )
 
+        if play_recommendations:
+            negotiation_message = self._append_playbook_recommendations(
+                negotiation_message,
+                play_recommendations,
+                playbook_context,
+            )
+
         counter_options: List[Dict[str, Any]] = []
         counter_price = decision.get("counter_price")
         if counter_price is not None:
@@ -304,6 +355,9 @@ class NegotiationAgent(BaseAgent):
             "supplier_snippets": supplier_snippets,
             "from_address": context.input_data.get("from_address"),
             "negotiation_message": negotiation_message,
+            "play_recommendations": play_recommendations,
+            "playbook_descriptor": playbook_context.get("descriptor"),
+            "playbook_examples": playbook_context.get("examples"),
         }
 
         draft_payload.setdefault("subject", self._format_negotiation_subject(state))
@@ -323,6 +377,7 @@ class NegotiationAgent(BaseAgent):
             "lead_time_request": decision.get("lead_time_request"),
             "rationale": decision.get("rationale"),
             "intent": "NEGOTIATION_COUNTER",
+            "play_recommendations": play_recommendations,
         }
 
         email_action_id: Optional[str] = None
@@ -350,6 +405,11 @@ class NegotiationAgent(BaseAgent):
             draft_stub["currency"] = currency
         if supplier_snippets:
             draft_stub["supplier_snippets"] = supplier_snippets
+        if play_recommendations:
+            draft_stub["play_recommendations"] = play_recommendations
+        descriptor = playbook_context.get("descriptor")
+        if descriptor:
+            draft_stub["playbook_descriptor"] = descriptor
         draft_stub["payload"] = draft_payload
         if recipients:
             draft_stub["recipients"] = recipients
@@ -462,6 +522,9 @@ class NegotiationAgent(BaseAgent):
             "supplier_message": supplier_message,
             "sent_status": False,
             "awaiting_response": True,
+            "play_recommendations": play_recommendations,
+            "playbook_descriptor": playbook_context.get("descriptor"),
+            "playbook_examples": playbook_context.get("examples"),
         }
 
         if email_subject:
@@ -616,6 +679,11 @@ class NegotiationAgent(BaseAgent):
             sender = context.input_data.get("sender")
             if sender and not merge_payload.get("sender"):
                 merge_payload["sender"] = sender
+            if play_recommendations:
+                merge_payload.setdefault("play_recommendations", play_recommendations)
+            descriptor = playbook_context.get("descriptor")
+            if descriptor:
+                merge_payload.setdefault("playbook_descriptor", descriptor)
 
             sync_keys = {
                 "supplier_id",
@@ -837,6 +905,442 @@ class NegotiationAgent(BaseAgent):
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to persist negotiation session state")
+
+    # ------------------------------------------------------------------
+    # Negotiation playbook helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_playbook_context(
+        self, context: AgentContext, decision: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        playbook = self._load_playbook()
+        if not playbook:
+            return {"plays": [], "lever_priorities": []}
+
+        supplier_type = self._normalise_supplier_type(
+            context.input_data.get("supplier_type")
+            or context.input_data.get("supplier_segment")
+            or decision.get("supplier_type")
+        )
+        negotiation_style = self._normalise_negotiation_style(
+            context.input_data.get("negotiation_style")
+            or context.input_data.get("style")
+            or decision.get("negotiation_style")
+        )
+
+        if not supplier_type or supplier_type not in playbook:
+            return {"plays": [], "lever_priorities": []}
+
+        supplier_entry = playbook.get(supplier_type, {})
+        styles = supplier_entry.get("styles", {})
+        if not negotiation_style or negotiation_style not in styles:
+            return {
+                "plays": [],
+                "descriptor": supplier_entry.get("descriptor"),
+                "examples": supplier_entry.get("examples", []),
+                "lever_priorities": [],
+                "style": negotiation_style,
+                "supplier_type": supplier_type,
+            }
+
+        lever_priorities = self._resolve_lever_priorities(
+            context,
+            styles[negotiation_style],
+        )
+
+        if not lever_priorities:
+            lever_priorities = list(styles[negotiation_style].keys())
+
+        policy_guidance = self._extract_policy_guidance(context)
+        supplier_performance = context.input_data.get("supplier_performance")
+        if not isinstance(supplier_performance, dict):
+            supplier_performance = {}
+        market_context = context.input_data.get("market_context")
+        if not isinstance(market_context, dict):
+            market_context = {}
+
+        plays: List[Dict[str, Any]] = []
+        style_plays = styles[negotiation_style]
+        for lever in lever_priorities:
+            lever_plays = style_plays.get(lever)
+            if not isinstance(lever_plays, list):
+                continue
+            for idx, play_text in enumerate(lever_plays):
+                if not isinstance(play_text, str) or not play_text.strip():
+                    continue
+                base_score = 1.0 + (idx * 0.01)
+                policy_score, policy_notes = self._score_policy_alignment(lever, policy_guidance)
+                performance_score, performance_notes = self._score_supplier_performance(
+                    lever, supplier_performance
+                )
+                market_score, market_notes = self._score_market_context(lever, market_context)
+                total_score = base_score + policy_score + performance_score + market_score
+                rationale = self._compose_play_rationale(
+                    supplier_entry.get("descriptor"),
+                    negotiation_style,
+                    lever,
+                    policy_notes,
+                    performance_notes,
+                    market_notes,
+                )
+                plays.append(
+                    {
+                        "supplier_type": supplier_type,
+                        "style": negotiation_style,
+                        "lever": lever,
+                        "play": play_text.strip(),
+                        "score": round(total_score, 4),
+                        "policy_alignment": policy_notes,
+                        "performance_signals": performance_notes,
+                        "market_signals": market_notes,
+                        "rationale": rationale,
+                        "trade_offs": TRADE_OFF_HINTS.get(
+                            lever, "Monitor implementation impact across stakeholders."
+                        ),
+                    }
+                )
+
+        plays.sort(key=lambda item: (-item["score"], item.get("lever", ""), item.get("play", "")))
+        top_plays = plays[:10]
+
+        return {
+            "plays": top_plays,
+            "descriptor": supplier_entry.get("descriptor"),
+            "examples": supplier_entry.get("examples", []),
+            "style": negotiation_style,
+            "supplier_type": supplier_type,
+            "lever_priorities": lever_priorities,
+        }
+
+    def _resolve_lever_priorities(self, context: AgentContext, style_plays: Dict[str, Any]) -> List[str]:
+        raw_candidates = (
+            context.input_data.get("lever_priorities")
+            or context.input_data.get("lever_focus")
+            or context.input_data.get("lever_preferences")
+            or context.input_data.get("preferred_levers")
+        )
+        priorities: List[str] = []
+        for candidate in self._ensure_list(raw_candidates):
+            lever = self._normalise_lever_category(candidate)
+            if lever and lever in style_plays and lever not in priorities:
+                priorities.append(lever)
+        if priorities:
+            return priorities
+        # Fall back to context-provided comma separated string
+        if isinstance(raw_candidates, str):
+            for chunk in raw_candidates.split(","):
+                lever = self._normalise_lever_category(chunk)
+                if lever and lever in style_plays and lever not in priorities:
+                    priorities.append(lever)
+        return priorities
+
+    def _append_playbook_recommendations(
+        self,
+        summary: str,
+        plays: List[Dict[str, Any]],
+        playbook_context: Dict[str, Any],
+    ) -> str:
+        lines: List[str] = [summary.strip()]
+        descriptor = playbook_context.get("descriptor")
+        if descriptor:
+            lines.append("")
+            lines.append(f"Playbook focus: {descriptor}")
+        if plays:
+            lines.append("")
+            lines.append("Recommended plays from negotiation playbook:")
+            for idx, play in enumerate(plays[:3], 1):
+                if not isinstance(play, dict):
+                    continue
+                lever = play.get("lever")
+                description = play.get("play")
+                rationale = play.get("rationale")
+                trade_offs = play.get("trade_offs")
+                entry = f"{idx}. "
+                if lever:
+                    entry += f"[{lever}] "
+                if description:
+                    entry += str(description)
+                if rationale:
+                    entry += f" — Rationale: {rationale}"
+                if trade_offs:
+                    entry += f" Trade-off: {trade_offs}"
+                lines.append(entry)
+        examples = playbook_context.get("examples") or []
+        if examples:
+            lines.append("")
+            lines.append("Examples:")
+            for example in examples[:2]:
+                lines.append(f"- {example}")
+        return "\n".join(line for line in lines if line is not None)
+
+    def _load_playbook(self) -> Dict[str, Any]:
+        if self._playbook_cache is not None:
+            return self._playbook_cache
+        try:
+            with PLAYBOOK_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            # Normalise lever keys to expected casing for faster lookups.
+            for supplier_type, entry in data.items():
+                styles = entry.get("styles")
+                if not isinstance(styles, dict):
+                    continue
+                for style_key, style_entry in list(styles.items()):
+                    if not isinstance(style_entry, dict):
+                        continue
+                    normalised_style_entry: Dict[str, Any] = {}
+                    for lever_key, plays in style_entry.items():
+                        lever_name = self._normalise_lever_category(lever_key)
+                        if not lever_name:
+                            continue
+                        normalised_style_entry[lever_name] = plays
+                    styles[style_key] = normalised_style_entry
+            self._playbook_cache = data
+            return data
+        except FileNotFoundError:
+            logger.warning("Negotiation playbook file missing at %s", PLAYBOOK_PATH)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to load negotiation playbook from %s", PLAYBOOK_PATH)
+        self._playbook_cache = {}
+        return {}
+
+    def _normalise_supplier_type(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        mapping = {
+            "transactional": "Transactional",
+            "leverage": "Leverage",
+            "strategic": "Strategic",
+            "bottleneck": "Bottleneck",
+        }
+        for key, canonical in mapping.items():
+            if key in lowered:
+                return canonical
+        return None
+
+    def _normalise_negotiation_style(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        mapping = {
+            "competitive": "Competitive",
+            "collaborative": "Collaborative",
+            "principled": "Principled",
+            "accommodating": "Accommodating",
+            "compromising": "Compromising",
+        }
+        for key, canonical in mapping.items():
+            if key in lowered:
+                return canonical
+        return None
+
+    def _normalise_lever_category(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        cleaned = re.sub(r"[^a-zA-Z]+", " ", text).strip().upper()
+        if not cleaned:
+            return None
+        for category in LEVER_CATEGORIES:
+            if cleaned == category or category in cleaned.split():
+                return category.title()
+        return None
+
+    def _extract_policy_guidance(self, context: AgentContext) -> Dict[str, Set[str]]:
+        guidance: Dict[str, Set[str]] = {
+            "preferred": set(),
+            "required": set(),
+            "restricted": set(),
+            "discouraged": set(),
+        }
+
+        def ingest(bucket: str, values: Any) -> None:
+            if not values:
+                return
+            for item in self._ensure_list(values):
+                lever = self._normalise_lever_category(item)
+                if lever:
+                    guidance[bucket].add(lever)
+
+        def parse_blob(blob: Any) -> None:
+            if blob is None:
+                return
+            if isinstance(blob, dict):
+                for key, value in blob.items():
+                    if isinstance(value, (dict, list)):
+                        parse_blob(value)
+                        continue
+                    lowered = str(key).lower()
+                    if lowered in {"preferred", "preferred_levers", "allowed_levers", "focus_levers", "priority_levers"}:
+                        ingest("preferred", value)
+                    elif lowered in {"required", "required_levers", "mandated_levers", "must_have"}:
+                        ingest("required", value)
+                    elif lowered in {"restricted", "restricted_levers", "blocked_levers", "prohibited_levers"}:
+                        ingest("restricted", value)
+                    elif lowered in {"discouraged", "discouraged_levers", "avoid_levers"}:
+                        ingest("discouraged", value)
+                    else:
+                        lever = self._normalise_lever_category(value)
+                        if lever:
+                            guidance["preferred"].add(lever)
+            elif isinstance(blob, list):
+                for item in blob:
+                    parse_blob(item)
+            elif isinstance(blob, str):
+                tokens = re.split(r"[,;/]", blob)
+                for token in tokens:
+                    lever = self._normalise_lever_category(token)
+                    if lever:
+                        guidance["preferred"].add(lever)
+
+        parse_blob(context.input_data.get("policy_guidance"))
+        parse_blob(context.input_data.get("policy_constraints"))
+        parse_blob(context.input_data.get("policy_preferences"))
+        for policy in self._ensure_list(context.input_data.get("policies")):
+            parse_blob(policy)
+        return guidance
+
+    def _score_policy_alignment(
+        self, lever: str, guidance: Dict[str, Set[str]]
+    ) -> Tuple[float, List[str]]:
+        notes: List[str] = []
+        score = 0.0
+        if lever in guidance.get("required", set()):
+            score += 0.6
+            notes.append("Required by policy")
+        if lever in guidance.get("preferred", set()):
+            score += 0.3
+            notes.append("Policy prefers this lever")
+        if lever in guidance.get("discouraged", set()):
+            score -= 0.3
+            notes.append("Policy discourages this lever")
+        if lever in guidance.get("restricted", set()):
+            score -= 0.7
+            notes.append("Policy restricts this lever")
+        return score, notes
+
+    def _score_supplier_performance(
+        self, lever: str, performance: Dict[str, Any]
+    ) -> Tuple[float, List[str]]:
+        score = 0.0
+        notes: List[str] = []
+        if not performance:
+            return score, notes
+
+        def _coerce_float_metric(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = performance.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        on_time = _coerce_float_metric("on_time_delivery", "on_time", "delivery_score", "otif")
+        if on_time is not None:
+            if on_time < 0.9 and lever in {"Operational", "Risk"}:
+                score += 0.4 if lever == "Operational" else 0.2
+                notes.append("On-time delivery below 90%")
+            elif on_time > 0.97 and lever == "Operational":
+                score -= 0.1
+                notes.append("Delivery reliability already strong")
+
+        defect_rate = _coerce_float_metric("quality_incidents", "defect_rate", "return_rate")
+        if defect_rate is not None and defect_rate > 0:
+            if lever == "Risk":
+                score += 0.3
+            notes.append("Quality issues detected")
+
+        esg_score = _coerce_float_metric("esg_score", "sustainability_score")
+        if esg_score is not None and esg_score < 0.6 and lever == "Strategic":
+            score += 0.2
+            notes.append("ESG performance lagging")
+
+        collaboration_score = _coerce_float_metric("relationship_score", "collaboration_index")
+        if collaboration_score is not None and collaboration_score < 0.6 and lever == "Relational":
+            score += 0.3
+            notes.append("Relationship maturity low")
+
+        innovation_score = _coerce_float_metric("innovation_score", "co_innovation_index")
+        if innovation_score is not None and innovation_score < 0.5 and lever == "Strategic":
+            score += 0.25
+            notes.append("Innovation potential needs reinforcement")
+
+        return score, notes
+
+    def _score_market_context(
+        self, lever: str, market: Dict[str, Any]
+    ) -> Tuple[float, List[str]]:
+        score = 0.0
+        notes: List[str] = []
+        if not market:
+            return score, notes
+
+        supply_risk = market.get("supply_risk") or market.get("supply_risk_level")
+        if isinstance(supply_risk, str) and supply_risk.strip().lower() in {"high", "elevated", "tight"}:
+            if lever == "Risk":
+                score += 0.3
+            notes.append("Market supply risk elevated")
+
+        demand_trend = market.get("demand_trend") or market.get("demand")
+        if isinstance(demand_trend, str) and demand_trend.strip().lower() in {"rising", "high"}:
+            if lever == "Commercial":
+                score += 0.2
+            notes.append("Demand is rising")
+
+        inflation = market.get("inflation") or market.get("price_trend")
+        if isinstance(inflation, str) and inflation.strip().lower() in {"inflationary", "increasing"}:
+            if lever == "Commercial":
+                score += 0.25
+            notes.append("Prices trending upward")
+
+        capacity = market.get("capacity") or market.get("capacity_constraints")
+        if isinstance(capacity, str) and capacity.strip().lower() in {"limited", "constrained"}:
+            if lever in {"Operational", "Strategic"}:
+                score += 0.2
+            notes.append("Capacity constraints present")
+
+        esg_pressure = market.get("esg_pressure") or market.get("regulatory_focus")
+        if isinstance(esg_pressure, str) and esg_pressure.strip().lower() in {"high", "tightening"}:
+            if lever == "Strategic":
+                score += 0.2
+            notes.append("ESG expectations increasing")
+
+        return score, notes
+
+    def _compose_play_rationale(
+        self,
+        descriptor: Optional[str],
+        style: Optional[str],
+        lever: str,
+        policy_notes: List[str],
+        performance_notes: List[str],
+        market_notes: List[str],
+    ) -> str:
+        segments: List[str] = []
+        if descriptor:
+            segments.append(str(descriptor))
+        if style:
+            segments.append(f"Supports {style.lower()} posture on the {lever.lower()} lever.")
+        else:
+            segments.append(f"Targets the {lever.lower()} lever.")
+        if policy_notes:
+            segments.append("Policy: " + "; ".join(policy_notes))
+        if performance_notes:
+            segments.append("Performance: " + "; ".join(performance_notes))
+        if market_notes:
+            segments.append("Market: " + "; ".join(market_notes))
+        return " ".join(segments)
 
     # ------------------------------------------------------------------
     # Decision support helpers
@@ -1213,6 +1717,22 @@ class NegotiationAgent(BaseAgent):
             f"Strategy={decision.get('strategy')} counter={decision.get('counter_price')}"
             f" target={target_price} current={price} supplier={supplier} rfq={rfq_id}."
         )
+        plays = decision.get("play_recommendations") or []
+        if plays:
+            top_snippets: List[str] = []
+            for play in plays[:3]:
+                if not isinstance(play, dict):
+                    continue
+                lever = play.get("lever") or play.get("category")
+                description = play.get("play") or play.get("description")
+                if not description:
+                    continue
+                if lever:
+                    top_snippets.append(f"{lever}: {description}")
+                else:
+                    top_snippets.append(str(description))
+            if top_snippets:
+                base = f"{base} Plays={' | '.join(top_snippets)}."
         rationale = decision.get("rationale")
         if rationale:
             return f"{base} {rationale}"
