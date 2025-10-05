@@ -140,6 +140,17 @@ def test_negotiation_agent_composes_counter(monkeypatch):
             "lead_time_weeks": 4,
             "supplier_snippets": ["We can ship in four weeks."],
             "supplier_email": ["quotes@supplier.test"],
+            "supplier_type": "Leverage",
+            "negotiation_style": "Collaborative",
+            "lever_priorities": ["Operational", "Commercial"],
+            "policies": [
+                {
+                    "preferred_levers": ["Operational"],
+                    "restricted_levers": ["Commercial"],
+                }
+            ],
+            "supplier_performance": {"on_time_delivery": 0.82},
+            "market_context": {"supply_risk": "high"},
         },
     )
 
@@ -154,6 +165,11 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert draft_payload["counter_price"] == 1250.0
     assert draft_payload["negotiation_message"].startswith("Round 1 plan")
     assert draft_payload["recipients"] == ["quotes@supplier.test"]
+    assert "Recommended plays" in draft_payload["negotiation_message"]
+    plays = draft_payload["play_recommendations"]
+    assert isinstance(plays, list) and plays
+    assert plays[0]["lever"] == "Operational"
+    assert "Trade-off" in draft_payload["negotiation_message"]
     assert output.data["session_state"]["current_round"] == 2
     assert output.data["session_state"]["supplier_reply_count"] == 1
     drafts = output.data["drafts"]
@@ -164,10 +180,12 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert stub.get("email_action_id") == "email-action-1"
     assert output.data.get("email_subject") == "Re: RFQ-123 – Updated commercial terms"
     assert output.data.get("email_body") == "Email body"
+    assert output.data["play_recommendations"] == plays
     assert output.data["awaiting_response"] is False
     assert output.next_agents == []
     assert "await_response" not in output.pass_fields
     assert output.pass_fields["supplier_responses"][0]["message_id"] == "reply-1"
+    assert output.pass_fields["play_recommendations"] == plays
 
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
@@ -198,6 +216,77 @@ def test_negotiation_agent_detects_final_offer(monkeypatch):
     assert output.data["drafts"] == []
 
 
+def test_negotiation_playbook_policy_ranking(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    stub_email_output = AgentOutput(
+        status=AgentStatus.SUCCESS,
+        data={
+            "drafts": [],
+            "subject": "Re: RFQ-222 – Negotiation update",
+            "body": "Email body",
+        },
+    )
+    stub_email_output.action_id = "email-action-2"
+
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: stub_email_output,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_await_supplier_responses",
+        lambda **_: [{"message_id": "reply-risk", "supplier_id": "S3", "rfq_id": "RFQ-222"}],
+    )
+
+    context = AgentContext(
+        workflow_id="wf4",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": "S3",
+            "current_offer": 150.0,
+            "target_price": 120.0,
+            "rfq_id": "RFQ-222",
+            "currency": "GBP",
+            "supplier_type": "Leverage",
+            "negotiation_style": "Competitive",
+            "lever_priorities": ["Commercial", "Risk", "Operational"],
+            "policies": [
+                {
+                    "preferred_levers": ["Risk"],
+                    "restricted_levers": ["Commercial"],
+                }
+            ],
+            "supplier_performance": {
+                "on_time_delivery": 0.82,
+                "quality_incidents": 3,
+            },
+            "market_context": {
+                "supply_risk": "high",
+                "inflation": "increasing",
+            },
+        },
+    )
+
+    output = agent.run(context)
+
+    plays = output.data["play_recommendations"]
+    assert plays, "Expected play recommendations to be returned"
+    assert plays[0]["lever"] == "Risk"
+    assert plays[0]["score"] >= plays[-1]["score"]
+    policy_notes = plays[0]["policy_alignment"]
+    assert "Policy:" in plays[0]["rationale"]
+    assert any("policy" in note.lower() for note in policy_notes)
+    # Ensure restricted lever appears but with lower score
+    commercial_entries = [p for p in plays if p["lever"] == "Commercial"]
+    if commercial_entries:
+        for entry in commercial_entries:
+            assert entry["score"] < plays[0]["score"]
+    assert output.data["decision"]["play_recommendations"] == plays
+    assert "Recommended plays" in output.data["message"]
 def test_negotiation_agent_caps_supplier_replies(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
