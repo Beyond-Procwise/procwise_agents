@@ -358,9 +358,11 @@ class DocumentExtractor:
         text, detected_tables = self._extract_text_and_tables(path)
         detected_type = document_type or self._detect_document_type(text)
         if detected_type not in RAW_TABLE_MAPPING:
-            raise ValueError(
-                f"Unsupported or undetected document type '{detected_type}'"
+            logger.warning(
+                "Document type '%s' not recognised; defaulting to Contract",
+                detected_type,
             )
+            detected_type = "Contract"
 
         header = self._extract_header_fields(text, detected_type)
         line_items, derived_tables = self._extract_line_items_from_text(text)

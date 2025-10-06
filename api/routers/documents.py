@@ -43,11 +43,10 @@ class S3DocumentExtractionRequest(BaseModel):
         ...,
         description="S3 folder or object path containing procurement documents",
     )
-    document_type: Optional[str] = Field(
-        default=None,
-        description="Optional explicit document type override",
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional metadata applied to every ingested document",
     )
-    metadata: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("s3_path", mode="before")
     @classmethod
@@ -211,7 +210,6 @@ def extract_document_from_s3(
 
                     result = extractor.extract(
                         tmp_path,
-                        document_type=req.document_type,
                         metadata=metadata,
                         source_label=object_key,
                     )

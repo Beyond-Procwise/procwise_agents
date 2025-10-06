@@ -243,3 +243,28 @@ def test_local_model_payload_enrichment(tmp_path):
     assert result.tables and result.tables[0]["rows"][0]["item_description"] == "Support Plan"
     assert llm.calls and llm.calls[0]["schema_hint"]["document_table"]["name"] == "proc.invoice_agent"
 
+
+def test_unclassified_document_defaults_to_contract(tmp_path, extractor):
+    doc = tmp_path / "unclassified_note.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Summary Record",
+                "Reference Id: REF-3301",
+                "Supplier: Evergreen Holdings",
+                "Total Amount: 8750.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, db_path = extractor
+    result = extractor_service.extract(doc)
+
+    assert result.document_type == "Contract"
+    assert result.header["reference_id"] == "REF-3301"
+
+    row = _read_table(db_path, "proc.raw_contracts")
+    payload = json.loads(row["header_json"])
+    assert payload["reference_id"] == "REF-3301"
+
