@@ -7,11 +7,9 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
-
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
-
 from services.document_extractor import DocumentExtractor
 
 # Ensure GPU-related environment variables align with the rest of the API.
