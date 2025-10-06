@@ -321,6 +321,7 @@ class DocumentExtractor:
         *,
         document_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        source_label: Optional[str] = None,
     ) -> ExtractionResult:
         """Extract a document from ``source`` and persist it.
 
@@ -341,6 +342,8 @@ class DocumentExtractor:
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(f"Document not found at {path}")
+
+        source_name = source_label or path.name
 
         text, detected_tables = self._extract_text_and_tables(path)
         detected_type = document_type or self._detect_document_type(text)
@@ -375,15 +378,17 @@ class DocumentExtractor:
 
         schema_reference = self._schema_reference.schema_for_document(detected_type)
 
+        metadata_payload = dict(metadata or {})
+
         result = ExtractionResult(
             document_id=self._generate_document_id(path, header),
             document_type=detected_type,
-            source_file=path.name,
+            source_file=source_name,
             header=header,
             line_items=line_items,
             tables=tables,
             raw_text=text,
-            metadata=metadata or {},
+            metadata=metadata_payload,
             schema_reference=schema_reference,
         )
 
