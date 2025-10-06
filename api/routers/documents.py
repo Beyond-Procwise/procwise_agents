@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
+
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
+
 from services.document_extractor import DocumentExtractor
 
 # Ensure GPU-related environment variables align with the rest of the API.
@@ -24,6 +26,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
+DEFAULT_S3_BUCKET_NAME = "procwisemvp"
+
+
 def get_agent_nick(request: Request):
     agent_nick = getattr(request.app.state, "agent_nick", None)
     if not agent_nick:
@@ -34,13 +39,9 @@ def get_agent_nick(request: Request):
 class S3DocumentExtractionRequest(BaseModel):
     """Input payload for S3-backed document extraction."""
 
-    object_key: Optional[str] = Field(
-        default=None,
-        description="Optional S3 object key for extracting a single document",
-    )
-    s3_path: Optional[str] = Field(
-        default=None,
-        description="S3 path/prefix pointing at a folder of procurement documents",
+    s3_path: str = Field(
+        ...,
+        description="S3 folder or object path containing procurement documents",
     )
     document_type: Optional[str] = Field(
         default=None,
@@ -48,33 +49,17 @@ class S3DocumentExtractionRequest(BaseModel):
     )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("object_key", mode="before")
-    @classmethod
-    def _strip_object_key(cls, value: Any) -> str:
-        if value is None:
-            return value  # handled by overall validation
-        if not isinstance(value, str):
-            value = str(value)
-        key = value.strip()
-        return key or None
-
     @field_validator("s3_path", mode="before")
     @classmethod
-    def _strip_s3_path(cls, value: Any) -> Optional[str]:
+    def _strip_s3_path(cls, value: Any) -> str:
         if value is None:
-            return None
+            raise ValueError("s3_path is required")
         if not isinstance(value, str):
             value = str(value)
         path = value.strip()
-        return path or None
-
-    @model_validator(mode="after")
-    def _ensure_location(cls, values: "S3DocumentExtractionRequest") -> "S3DocumentExtractionRequest":
-        if not values.object_key and not values.s3_path:
-            raise ValueError("Either object_key or s3_path must be provided")
-        if values.object_key and values.s3_path:
-            raise ValueError("Provide either object_key or s3_path, not both")
-        return values
+        if not path:
+            raise ValueError("s3_path must not be empty")
+        return path
 
 
 def _resolve_s3_path(s3_path: str, default_bucket: str) -> Tuple[str, str]:
@@ -151,16 +136,15 @@ def extract_document_from_s3(
 
     bucket = getattr(agent_nick.settings, "s3_bucket_name", None)
     if not bucket:
+        bucket = os.getenv("S3_BUCKET_NAME", DEFAULT_S3_BUCKET_NAME)
+
+    if not bucket:
         raise HTTPException(status_code=503, detail="S3 bucket is not configured")
 
-    effective_bucket = bucket
-    prefix: Optional[str] = None
-
-    if req.s3_path:
-        try:
-            effective_bucket, prefix = _resolve_s3_path(req.s3_path, bucket)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        effective_bucket, prefix = _resolve_s3_path(req.s3_path, bucket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     connection_factory = lambda: agent_nick.get_db_connection()
     chat_options = {}
@@ -183,23 +167,18 @@ def extract_document_from_s3(
 
     try:
         with agent_nick.reserve_s3_connection() as s3_client:
-            object_keys: List[str]
-            if prefix is not None:
-                try:
-                    object_keys = _list_s3_keys(s3_client, effective_bucket, prefix)
-                except ClientError as exc:  # pragma: no cover - network failures in prod
-                    error = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
-                    detail = error.get("Message") or f"Unable to list objects for {prefix}"
-                    raise HTTPException(status_code=500, detail=detail) from exc
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.exception("Failed to list S3 objects for %s", prefix)
-                    raise HTTPException(status_code=500, detail="Failed to list S3 objects") from exc
+            try:
+                object_keys = _list_s3_keys(s3_client, effective_bucket, prefix)
+            except ClientError as exc:  # pragma: no cover - network failures in prod
+                error = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+                detail = error.get("Message") or f"Unable to list objects for {prefix}"
+                raise HTTPException(status_code=500, detail=detail) from exc
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("Failed to list S3 objects for %s", prefix)
+                raise HTTPException(status_code=500, detail="Failed to list S3 objects") from exc
 
-                if not object_keys:
-                    raise HTTPException(status_code=404, detail="No documents found for provided s3_path")
-            else:
-                assert req.object_key is not None  # validated during model creation
-                object_keys = [req.object_key]
+            if not object_keys:
+                raise HTTPException(status_code=404, detail="No documents found for provided s3_path")
 
             for object_key in object_keys:
                 if not object_key:

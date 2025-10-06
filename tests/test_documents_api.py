@@ -39,7 +39,7 @@ class _DummyS3Client:
 
 
 class _Settings:
-    s3_bucket_name = "unit-test-bucket"
+    s3_bucket_name = "procwisemvp"
 
 
 class _DummyAgentNick:
@@ -126,5 +126,5 @@ def test_extract_document_from_s3_endpoint(api_app):
         assert invoice_ids == {"INV-3001", "INV-3002"}
         for row in rows:
             metadata = json.loads(row["metadata_json"])
-            assert metadata["s3_bucket"] == "unit-test-bucket"
+            assert metadata["s3_bucket"] == "procwisemvp"
             assert metadata["s3_object_key"] in objects
