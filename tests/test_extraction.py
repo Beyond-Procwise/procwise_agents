@@ -60,8 +60,10 @@ def test_digital_invoice_extraction(tmp_path, extractor):
     assert result.header["supplier_name"].lower() == "acme components"
     assert len(result.line_items) == 2
     assert result.tables  # ensure at least one table captured
-    assert (
-        result.schema_reference["document_table"]["name"] == "proc.invoice_agent"
+    assert result.schema_reference["document_type"] == "Invoice"
+    assert "invoice_id" in result.schema_reference["header_fields"]
+    assert {"item_description", "qty", "unit_price", "line_total"}.issubset(
+        set(result.schema_reference["line_item_fields"])
     )
 
     row = _read_table(db_path, "proc.raw_invoice")
@@ -97,10 +99,8 @@ def test_digital_purchase_order_extraction(tmp_path, extractor):
     assert result.header["po_id"] == "PO-9001"
     assert result.header["supplier_name"].lower() == "northwind traders"
     assert len(result.line_items) == 2
-    assert (
-        result.schema_reference["document_table"]["name"]
-        == "proc.purchase_order_agent"
-    )
+    assert result.schema_reference["document_type"] == "Purchase_Order"
+    assert "po_id" in result.schema_reference["header_fields"]
 
     row = _read_table(db_path, "proc.raw_purchase_order")
     payload = json.loads(row["header_json"])
@@ -134,9 +134,8 @@ def test_scanned_contract_extraction(tmp_path, extractor):
     assert result.header["contract_id"] == "C-2024-001"
     assert result.header["contract_title"].startswith("Managed Services")
     assert result.metadata["ingestion_mode"] == "scanned"
-    assert (
-        result.schema_reference["document_table"]["name"] == "proc.contracts"
-    )
+    assert result.schema_reference["document_type"] == "Contract"
+    assert "contract_id" in result.schema_reference["header_fields"]
 
     row = _read_table(db_path, "proc.raw_contracts")
     header = json.loads(row["header_json"])
@@ -169,7 +168,8 @@ def test_scanned_quote_with_table(tmp_path, extractor):
     assert result.document_type == "Quote"
     assert result.tables and len(result.tables[0]["rows"]) == 2
     assert result.line_items[0]["item_description"].lower() == "ergonomic chair"
-    assert result.schema_reference["document_table"]["name"] == "proc.quote_agent"
+    assert result.schema_reference["document_type"] == "Quote"
+    assert "quote_id" in result.schema_reference["header_fields"]
 
     row = _read_table(db_path, "proc.raw_quotes")
     tables = json.loads(row["tables_json"])
@@ -184,9 +184,9 @@ def test_local_model_payload_enrichment(tmp_path):
         def __init__(self) -> None:
             self.calls = []
 
-        def extract(self, text, document_type, *, schema_hint=None):
+        def extract(self, text, document_type, *, field_hints=None):
             self.calls.append(
-                {"text": text, "document_type": document_type, "schema_hint": schema_hint}
+                {"text": text, "document_type": document_type, "field_hints": field_hints}
             )
             return {
                 "document_type": "Invoice",
@@ -241,7 +241,8 @@ def test_local_model_payload_enrichment(tmp_path):
     assert result.header["currency"] == "USD"
     assert result.line_items and result.line_items[0]["line_total"] == "1000"
     assert result.tables and result.tables[0]["rows"][0]["item_description"] == "Support Plan"
-    assert llm.calls and llm.calls[0]["schema_hint"]["document_table"]["name"] == "proc.invoice_agent"
+    assert llm.calls
+    assert "invoice_id" in llm.calls[0]["field_hints"]["header_fields"]
 
 
 def test_unclassified_document_defaults_to_contract(tmp_path, extractor):

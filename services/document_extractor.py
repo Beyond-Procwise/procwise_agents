@@ -42,101 +42,6 @@ RAW_TABLE_MAPPING = {
 }
 
 
-class ProcurementSchemaReference:
-    """Lightweight parser for ``docs/procurement_table_reference.md``."""
-
-    _DOCUMENT_TABLE_MAP = {
-        "Invoice": (
-            "proc.invoice_agent",
-            "proc.invoice_line_items_agent",
-        ),
-        "Purchase_Order": (
-            "proc.purchase_order_agent",
-            "proc.po_line_items_agent",
-        ),
-        "Contract": ("proc.contracts", None),
-        "Quote": (
-            "proc.quote_agent",
-            "proc.quote_line_items_agent",
-        ),
-    }
-
-    def __init__(self, reference_path: Optional[Path]) -> None:
-        default_path = (
-            reference_path
-            if reference_path is not None
-            else Path(__file__).resolve().parents[1]
-            / "docs"
-            / "procurement_table_reference.md"
-        )
-        self._path = default_path
-        self._table_columns: Dict[str, List[str]] = {}
-        if self._path.exists():
-            try:
-                content = self._path.read_text(encoding="utf-8")
-            except Exception:  # pragma: no cover - defensive guard
-                logger.warning("Unable to read procurement schema reference", exc_info=True)
-            else:
-                self._table_columns = self._parse_reference(content)
-
-    @staticmethod
-    def _parse_reference(content: str) -> Dict[str, List[str]]:
-        table_columns: Dict[str, List[str]] = {}
-        current_table: Optional[str] = None
-        inside_code_block = False
-
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if line.startswith("### `") and line.endswith("`"):
-                current_table = line.split("`")[1]
-                table_columns.setdefault(current_table, [])
-                continue
-
-            if line.startswith("```"):
-                inside_code_block = not inside_code_block
-                continue
-
-            if not inside_code_block or not current_table:
-                continue
-
-            if not line or line.startswith("--"):
-                continue
-            if line.upper().startswith("PRIMARY ") or line.upper().startswith("CONSTRAINT"):
-                continue
-
-            column_name = line.split()[0].strip("\",")
-            if not column_name:
-                continue
-
-            if column_name not in table_columns[current_table]:
-                table_columns[current_table].append(column_name)
-
-        return table_columns
-
-    def columns_for(self, table_name: Optional[str]) -> List[str]:
-        if not table_name:
-            return []
-        return list(self._table_columns.get(table_name, []))
-
-    def schema_for_document(self, document_type: str) -> Dict[str, Any]:
-        header_table, line_table = self._DOCUMENT_TABLE_MAP.get(document_type, (None, None))
-        schema: Dict[str, Any] = {}
-        if header_table:
-            schema["document_table"] = {
-                "name": header_table,
-                "columns": self.columns_for(header_table),
-            }
-        if line_table:
-            schema["line_table"] = {
-                "name": line_table,
-                "columns": self.columns_for(line_table),
-            }
-        raw_table = RAW_TABLE_MAPPING.get(document_type)
-        if raw_table:
-            schema["raw_table"] = {"name": raw_table, "columns": []}
-        return schema
-
-
 class _LocalModelExtractor:
     """Thin wrapper around a local Ollama model for structured extraction."""
 
@@ -183,25 +88,33 @@ class _LocalModelExtractor:
         text: str,
         document_type: str,
         *,
-        schema_hint: Optional[Dict[str, Any]] = None,
+        field_hints: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.available():
             return None
         if not text.strip():
             return None
 
-        header_columns = []
-        line_columns = []
-        if schema_hint:
-            header_columns = schema_hint.get("document_table", {}).get("columns", [])
-            line_columns = schema_hint.get("line_table", {}).get("columns", [])
+        header_columns: List[str] = []
+        line_columns: List[str] = []
+        table_headers: List[List[str]] = []
+        if field_hints:
+            header_columns = sorted({str(col) for col in field_hints.get("header_fields", [])})
+            line_columns = sorted({str(col) for col in field_hints.get("line_item_fields", [])})
+            table_headers = [
+                [str(value) for value in headers]
+                for headers in field_hints.get("table_headers", [])
+            ]
 
         prompt = textwrap.dedent(
             f"""
             You are a specialised procurement data extractor.
             Determine the precise header fields and line items for a {document_type} document.
-            Use the provided procurement schemas when naming fields. Header columns: {header_columns}.
-            Line item columns: {line_columns}. If a column is absent from the text, omit it.
+            Use the observed fields to remain consistent with the document formatting.
+            Header columns already detected: {header_columns}.
+            Line item columns already detected: {line_columns}.
+            Table headers observed: {table_headers}.
+            If a column is absent from the text, omit it.
             Represent amounts and dates exactly as they appear.
 
             Return a JSON object with keys:
@@ -276,7 +189,7 @@ class ExtractionResult:
     tables: List[Dict[str, Any]]
     raw_text: str
     metadata: Dict[str, Any]
-    schema_reference: Dict[str, str]
+    schema_reference: Dict[str, Any]
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -306,7 +219,6 @@ class DocumentExtractor:
     ) -> None:
         self._connection_factory = connection_factory
         self._ensured_tables: set[str] = set()
-        self._schema_reference = ProcurementSchemaReference(reference_path)
         self._llm = llm_client or _LocalModelExtractor(
             preferred_models=preferred_models,
             chat_options=chat_options,
@@ -366,16 +278,20 @@ class DocumentExtractor:
 
         header = self._extract_header_fields(text, detected_type)
         line_items, derived_tables = self._extract_line_items_from_text(text)
-        schema_hint = self._schema_reference.schema_for_document(detected_type)
+        field_hints = self._build_field_hints(
+            header,
+            line_items,
+            detected_tables,
+            derived_tables,
+        )
 
-        llm_payload = self._invoke_local_model(text, detected_type, schema_hint)
+        llm_payload = self._invoke_local_model(text, detected_type, field_hints)
         if llm_payload:
             llm_type = self._normalise_document_type(
                 llm_payload.get("document_type") if isinstance(llm_payload, dict) else None
             )
             if llm_type and llm_type in RAW_TABLE_MAPPING:
                 detected_type = llm_type
-                schema_hint = self._schema_reference.schema_for_document(detected_type)
 
             header = self._merge_header_fields(
                 header, llm_payload.get("header"), detected_type
@@ -388,7 +304,12 @@ class DocumentExtractor:
         if not line_items and tables:
             line_items = [dict(row) for row in tables[0]["rows"]]
 
-        schema_reference = self._schema_reference.schema_for_document(detected_type)
+        schema_reference = self._build_structure_summary(
+            detected_type,
+            header,
+            line_items,
+            tables,
+        )
 
         metadata_payload = dict(metadata or {})
 
@@ -465,7 +386,7 @@ class DocumentExtractor:
         self,
         text: str,
         document_type: str,
-        schema_hint: Optional[Dict[str, Any]],
+        field_hints: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         if not getattr(self, "_llm", None):
             return None
@@ -473,10 +394,69 @@ class DocumentExtractor:
         if not callable(extract_fn):
             return None
         try:
-            return extract_fn(text, document_type, schema_hint=schema_hint)
+            return extract_fn(text, document_type, field_hints=field_hints)
         except Exception:
             logger.warning("Local model invocation encountered an error", exc_info=True)
             return None
+
+    def _build_field_hints(
+        self,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        raw_tables: List[List[List[str]]],
+        derived_tables: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        header_fields = [key for key, value in header.items() if self._clean_cell(value)]
+        line_item_fields: set[str] = set()
+        for item in line_items:
+            line_item_fields.update(item.keys())
+
+        table_headers: List[List[str]] = []
+        for table in derived_tables:
+            headers = list(table.get("headers", []))
+            if headers:
+                table_headers.append(headers)
+                line_item_fields.update(headers)
+
+        for table in raw_tables:
+            if not table or not table[0]:
+                continue
+            headers = [self._normalise_column_name(self._clean_cell(cell)) for cell in table[0]]
+            normalised_headers = [header for header in headers if header]
+            if normalised_headers:
+                table_headers.append(normalised_headers)
+                line_item_fields.update(normalised_headers)
+
+        return {
+            "header_fields": sorted(dict.fromkeys(header_fields)),
+            "line_item_fields": sorted(line_item_fields),
+            "table_headers": table_headers,
+        }
+
+    def _build_structure_summary(
+        self,
+        document_type: str,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        tables: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        header_fields = sorted(header.keys())
+        line_fields: set[str] = set()
+        for item in line_items:
+            line_fields.update(item.keys())
+        table_summaries = [
+            {
+                "headers": list(table.get("headers", [])),
+                "row_count": len(table.get("rows", [])),
+            }
+            for table in tables
+        ]
+        return {
+            "document_type": document_type,
+            "header_fields": header_fields,
+            "line_item_fields": sorted(line_fields),
+            "table_summaries": table_summaries,
+        }
 
     def _normalise_tables(
         self,
