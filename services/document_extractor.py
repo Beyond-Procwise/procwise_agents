@@ -311,6 +311,16 @@ class DocumentExtractor:
             preferred_models=preferred_models,
             chat_options=chat_options,
         )
+        self._db_dialect = "generic"
+        try:
+            with closing(self._connection_factory()) as conn:
+                module_name = getattr(type(conn), "__module__", "").lower()
+                if "sqlite" in module_name:
+                    self._db_dialect = "sqlite"
+                elif "psycopg" in module_name or "postgres" in module_name:
+                    self._db_dialect = "postgres"
+        except Exception:
+            logger.debug("Unable to infer database dialect for identifier quoting", exc_info=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -918,9 +928,17 @@ class DocumentExtractor:
             return "%s"
         return "?"
 
-    @staticmethod
-    def _quote_identifier(identifier: str) -> str:
-        return f'"{identifier}"'
+    def _quote_identifier(self, identifier: str) -> str:
+        if self._db_dialect == "sqlite":
+            escaped = identifier.replace('"', '""')
+            return f'"{escaped}"'
+
+        parts = identifier.split(".")
+        quoted_parts = []
+        for part in parts:
+            clean = part.strip('"').replace('"', '""')
+            quoted_parts.append(f'"{clean}"')
+        return ".".join(quoted_parts)
 
 
 __all__ = ["DocumentExtractor", "ExtractionResult"]
