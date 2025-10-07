@@ -1508,6 +1508,202 @@ def test_negotiation_executes_after_expected_responses(monkeypatch):
 
     assert second_payload["negotiation_triggered"] is False
 
+
+def test_negotiation_counters_reset_between_rounds(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-round1-s1",
+            "subject": "Re: RFQ-20240102-R1A",
+            "body": "Price 1600",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240102-R1A",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-round1-s2",
+            "subject": "Re: RFQ-20240102-R1B",
+            "body": "Price 900",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240102-R1B",
+            "supplier_id": "SUP-2",
+        },
+        {
+            "id": "msg-round2-s1",
+            "subject": "Re: RFQ-20240102-R2A",
+            "body": "Price 1700",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240102-R2A",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-round2-s2",
+            "subject": "Re: RFQ-20240102-R2B",
+            "body": "Price 950",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240102-R2B",
+            "supplier_id": "SUP-2",
+        },
+    ]
+
+    batches = [[messages[0]], [messages[1]], [messages[2]], [messages[3]], []]
+
+    def loader(limit=None):
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    metadata_map = {
+        "RFQ-20240102-R1A": {
+            "supplier_id": "SUP-1",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-MULTI-RESET",
+            "expected_supplier_count": 2,
+        },
+        "RFQ-20240102-R1B": {
+            "supplier_id": "SUP-2",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-MULTI-RESET",
+            "expected_supplier_count": 2,
+        },
+        "RFQ-20240102-R2A": {
+            "supplier_id": "SUP-1",
+            "target_price": 1000,
+            "round": 2,
+            "workflow_id": "WF-MULTI-RESET",
+            "expected_supplier_count": 2,
+        },
+        "RFQ-20240102-R2B": {
+            "supplier_id": "SUP-2",
+            "target_price": 1000,
+            "round": 2,
+            "workflow_id": "WF-MULTI-RESET",
+            "expected_supplier_count": 2,
+        },
+    }
+
+    def fake_metadata(rfq_id):
+        return dict(metadata_map[rfq_id])
+
+    monkeypatch.setattr(watcher, "_load_metadata", fake_metadata, raising=False)
+
+    first_round_first = watcher.poll_once(limit=1)
+    assert first_round_first and len(first_round_first) == 1
+    assert watcher.negotiation_agent.contexts == []
+
+    first_round_second = watcher.poll_once(limit=1)
+    assert first_round_second and len(first_round_second) == 1
+    assert len(watcher.negotiation_agent.contexts) == 1
+
+    workflow_key = watcher._normalise_workflow_key("WF-MULTI-RESET")
+    assert workflow_key not in watcher._workflow_processed_counts
+    assert workflow_key not in watcher._workflow_expected_counts
+
+    second_round_first = watcher.poll_once(limit=1)
+    assert second_round_first and len(second_round_first) == 1
+    assert len(watcher.negotiation_agent.contexts) == 1
+    assert watcher._workflow_processed_counts.get(workflow_key) == 1
+    assert watcher._workflow_expected_counts.get(workflow_key) == 2
+
+    second_round_second = watcher.poll_once(limit=1)
+    assert second_round_second and len(second_round_second) == 1
+    assert len(watcher.negotiation_agent.contexts) == 2
+    assert workflow_key not in watcher._workflow_processed_counts
+    assert workflow_key not in watcher._workflow_expected_counts
+
+
+
+def test_negotiation_flushes_when_expected_count_reduces(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-reduce-s1",
+            "subject": "Re: RFQ-20240103-A1",
+            "body": "Price 1600",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240103-A1",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-reduce-s2",
+            "subject": "Re: RFQ-20240103-B2",
+            "body": "Price 950",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240103-B2",
+            "supplier_id": "SUP-2",
+        },
+        {
+            "id": "msg-reduce-update",
+            "subject": "Re: RFQ-20240103-A1",
+            "body": "Follow up",
+            "from": "buyer@example.com",
+            "rfq_id": "RFQ-20240103-A1",
+            "supplier_id": "SUP-1",
+        },
+    ]
+
+    batches = [[messages[0]], [messages[1]], [messages[2]], []]
+
+    def loader(limit=None):
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    metadata_map = {
+        "RFQ-20240103-A1": {
+            "supplier_id": "SUP-1",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-REDUCE",
+            "expected_supplier_count": 5,
+        },
+        "RFQ-20240103-B2": {
+            "supplier_id": "SUP-2",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-REDUCE",
+            "expected_supplier_count": 5,
+        },
+    }
+
+    def fake_metadata(rfq_id):
+        return dict(metadata_map.get(rfq_id, {}))
+
+    monkeypatch.setattr(watcher, "_load_metadata", fake_metadata, raising=False)
+
+    first_result = watcher.poll_once(limit=1)
+    assert first_result and len(first_result) == 1
+
+    second_result = watcher.poll_once(limit=1)
+    assert second_result and len(second_result) == 1
+
+    workflow_key = watcher._normalise_workflow_key("WF-REDUCE")
+    assert watcher._workflow_processed_counts.get(workflow_key) == 2
+    assert watcher._workflow_expected_counts.get(workflow_key) == 5
+    assert watcher.negotiation_agent.contexts == []
+
+    metadata_map["RFQ-20240103-A1"]["expected_supplier_count"] = 2
+
+    # Third message updates expectations to two suppliers; negotiation should flush immediately
+    third_result = watcher.poll_once(limit=1)
+    assert third_result and len(third_result) == 1
+
+    assert len(watcher.negotiation_agent.contexts) == 1
+    cached_first = watcher._processed_cache.get("msg-reduce-s1")
+    assert cached_first
+    assert cached_first["negotiation_triggered"] is True
+
+    assert workflow_key not in watcher._workflow_processed_counts
+    assert workflow_key not in watcher._workflow_expected_counts
+    assert not watcher._workflow_negotiation_jobs.get(workflow_key)
+
+
 def test_sqs_email_loader_extracts_records():
     class StubSQSClient:
         def __init__(self):

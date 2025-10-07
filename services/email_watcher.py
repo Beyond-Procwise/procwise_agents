@@ -2163,9 +2163,6 @@ class SESEmailWatcher:
         workflow_key = self._normalise_workflow_key(workflow_id)
         if not workflow_key:
             return None
-        if workflow_key in self._workflow_expected_counts:
-            return self._workflow_expected_counts[workflow_key]
-
         action_payload = metadata.get("action_payload")
         if not action_payload:
             action_id = metadata.get("action_id")
@@ -2182,10 +2179,24 @@ class SESEmailWatcher:
                     if workflow_hint and not metadata.get("workflow_id"):
                         metadata["workflow_id"] = workflow_hint
 
+        existing_expected = self._workflow_expected_counts.get(workflow_key)
+        existing_processed = self._workflow_processed_counts.get(workflow_key)
         expected = self._derive_expected_supplier_count(metadata, action_payload)
         if expected is not None:
-            self._workflow_expected_counts[workflow_key] = expected
-        return expected
+            if existing_expected != expected:
+                self._workflow_expected_counts[workflow_key] = expected
+                if expected <= 0:
+                    self._workflow_processed_counts.pop(workflow_key, None)
+                elif existing_processed is not None:
+                    self._workflow_processed_counts[workflow_key] = min(
+                        existing_processed,
+                        expected,
+                    )
+                else:
+                    self._workflow_processed_counts.pop(workflow_key, None)
+            return expected
+
+        return existing_expected
 
     def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
         return self._normalise_filter_value(workflow_id) if workflow_id else None
@@ -2194,6 +2205,8 @@ class SESEmailWatcher:
         self, workflow_key: str, current_processed: Dict[str, object]
     ) -> Tuple[bool, Optional[AgentOutput]]:
         jobs = self._workflow_negotiation_jobs.pop(workflow_key, [])
+        self._workflow_processed_counts.pop(workflow_key, None)
+        self._workflow_expected_counts.pop(workflow_key, None)
         result: Tuple[bool, Optional[AgentOutput]] = (
             current_processed.get("negotiation_triggered", False),
             None,
@@ -2598,9 +2611,6 @@ class SESEmailWatcher:
         payload_doc = self._safe_parse_json(payload_json)
         if payload_doc:
             dispatch_record["payload"] = payload_doc
-
-        if best_domains:
-            dispatch_record["matched_domains"] = best_domains
 
         return str(rfq_value), supplier_value, dispatch_record
 
