@@ -122,6 +122,23 @@ def _make_watcher(nick, *, loader=None, state_store=None):
     )
 
 
+@pytest.fixture
+def similarity_dispatch_row():
+    now = datetime.now(timezone.utc)
+    return {
+        "rfq_id": "RFQ-20240215-SIM12345",
+        "supplier_id": "supplier-9001",
+        "supplier_name": "Industrial Bolts Ltd",
+        "subject": "RFQ request: Immediate quote for flange bolts",
+        "body": "Please provide your immediate quote for flange bolts and lead times.",
+        "recipient_email": "sales@acme-industrial.com",
+        "sender": "buyer@procwise.test",
+        "sent_on": now - timedelta(minutes=30),
+        "created_on": now - timedelta(hours=1),
+        "updated_on": now - timedelta(minutes=5),
+    }
+
+
 def test_email_watcher_bootstraps_negotiation_tables():
     nick = DummyNick()
     _make_watcher(nick, loader=lambda limit=None: [])
@@ -315,6 +332,127 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
     assert context.input_data["rfq_id"] == dispatch_row["rfq_id"]
     assert context.input_data["supplier_id"] == dispatch_row["supplier_id"]
     assert captured_mark["rfq_id"] == dispatch_row["rfq_id"]
+
+
+def test_email_watcher_resolves_rfq_via_dispatch_similarity(
+    monkeypatch, similarity_dispatch_row
+):
+    nick = DummyNick()
+
+    row = similarity_dispatch_row
+
+    class SimilarityCursor:
+        def __init__(self, owner):
+            self._owner = owner
+            self._result: List[Tuple] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            if normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = []
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, subject, body, recipient_email, sender from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        row["rfq_id"],
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                        row["subject"],
+                        row["body"],
+                        row["recipient_email"],
+                        row["sender"],
+                    )
+                ]
+            elif normalized.startswith(
+                "select supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["rfq_id"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                    )
+                ]
+            elif normalized.startswith("select target_price"):
+                self._result = []
+            else:
+                self._owner.ddl_statements.append(statement.strip())
+                self._result = []
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+    class SimilarityConn:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return SimilarityCursor(self._owner)
+
+        def commit(self):
+            pass
+
+    nick.get_db_connection = lambda: SimilarityConn(nick)
+
+    captured_mark = {}
+
+    def fake_mark_response(connection, **kwargs):
+        captured_mark.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "services.email_watcher.mark_dispatch_response",
+        fake_mark_response,
+    )
+
+    message = {
+        "id": "msg-similarity-1",
+        "subject": "Re: Immediate quote for flange bolts",
+        "body": "Hello, our quote for flange bolts is 1250.",
+        "from": "Quotes <sales@acme-industrial.com>",
+        "rfq_id": None,
+    }
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [dict(message)])
+
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    processed = results[0]
+    assert processed["rfq_id"] == row["rfq_id"]
+    assert processed["supplier_id"] == row["supplier_id"]
+    assert processed["matched_via"] == "dispatch_similarity"
+    assert watcher.supplier_agent.contexts
+    context = watcher.supplier_agent.contexts[0]
+    assert context.input_data["rfq_id"] == row["rfq_id"]
+    assert context.input_data["supplier_id"] == row["supplier_id"]
+    assert captured_mark["rfq_id"] == row["rfq_id"]
 
 def test_poll_once_continues_until_all_filters_match():
     nick = DummyNick()
@@ -1033,6 +1171,103 @@ def test_poll_once_respects_dispatch_wait(monkeypatch):
     watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
     assert sleep_calls == [pytest.approx(1.0), pytest.approx(1.0)]
 
+
+def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
+    import services.email_watcher as email_watcher_module
+
+    class DispatchCursor(DummyNick._DummyCursor):
+        def __init__(self, owner):
+            super().__init__(owner)
+            self._result: List[Tuple] = []
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            if normalized.startswith("select action_id, process_output from proc.action where action_id ="):
+                self._result = [(self._owner.action_id, self._owner.process_output)]
+            elif normalized.startswith(
+                "select count(*) from proc.draft_rfq_emails where sent = true and id = any"
+            ):
+                index = min(self._owner.sent_count_index, len(self._owner.sent_count_sequence) - 1)
+                count = self._owner.sent_count_sequence[index]
+                self._owner.sent_count_index = min(
+                    self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
+                )
+                self._owner.sent_count_calls += 1
+                self._result = [(count,)]
+            elif normalized.startswith(
+                "select count(*) from proc.draft_rfq_emails where sent = true and payload::jsonb ->> 'action_id'"
+            ):
+                index = min(self._owner.sent_count_index, len(self._owner.sent_count_sequence) - 1)
+                count = self._owner.sent_count_sequence[index]
+                self._owner.sent_count_index = min(
+                    self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
+                )
+                self._owner.sent_count_calls += 1
+                self._result = [(count,)]
+            else:
+                super().execute(statement, params)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+    class DispatchConnection(DummyNick._DummyConn):
+        def cursor(self):
+            return DispatchCursor(self._owner)
+
+    class DispatchNick(DummyNick):
+        def __init__(self):
+            super().__init__()
+            self.settings.email_inbound_initial_wait_seconds = 5
+            self.action_id = "action-test-001"
+            self.process_output = json.dumps(
+                {
+                    "drafts": [
+                        {"draft_record_id": 101, "supplier_id": "S1"},
+                        {"draft_record_id": 102, "supplier_id": "S2"},
+                    ]
+                }
+            )
+            self.sent_count_sequence = [1, 2]
+            self.sent_count_index = 0
+            self.sent_count_calls = 0
+
+        def get_db_connection(self):
+            return DispatchConnection(self)
+
+    fake_clock = {"now": 0.0, "sleeps": []}
+
+    def fake_time() -> float:
+        return fake_clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        fake_clock["sleeps"].append(seconds)
+        fake_clock["now"] += seconds
+
+    monkeypatch.setattr(
+        email_watcher_module,
+        "time",
+        SimpleNamespace(time=fake_time, sleep=fake_sleep),
+    )
+
+    nick = DispatchNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.bucket = None
+
+    watcher.record_dispatch_timestamp()
+
+    results = watcher.poll_once(match_filters={"action_id": nick.action_id})
+    assert results == []
+    assert fake_clock["sleeps"][0] == pytest.approx(5.0)
+    assert nick.sent_count_calls >= 2
+
+    fake_clock["sleeps"].clear()
+    previous_calls = nick.sent_count_calls
+    watcher.poll_once(match_filters={"action_id": nick.action_id})
+    assert fake_clock["sleeps"] == []
+    assert nick.sent_count_calls == previous_calls
 
 def test_s3_poll_prioritises_newest_objects(monkeypatch):
     nick = DummyNick()

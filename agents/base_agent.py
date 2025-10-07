@@ -31,6 +31,8 @@ from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
+_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = ("qwen3:30b", "mixtral:8x7b", "gemma3")
+
 
 class AgentStatus(str, Enum):
     """Execution status for an agent."""
@@ -232,6 +234,13 @@ class BaseAgent:
             deduped_candidates.append((name, is_quantized))
         requested_candidates = deduped_candidates
 
+        fallback_candidates: List[Tuple[str, bool]] = []
+        for fallback_name in _OLLAMA_FALLBACK_MODELS:
+            if fallback_name in seen_names:
+                continue
+            seen_names.add(fallback_name)
+            fallback_candidates.append((fallback_name, False))
+
         available_models = self._get_available_ollama_models()
         available_set = set(available_models)
 
@@ -240,15 +249,17 @@ class BaseAgent:
             for name, is_quantized in requested_candidates:
                 if name in available_set:
                     candidate_models.append((name, is_quantized))
-            if not candidate_models:
-                fallback_model = next((m for m in available_models if m), None)
-                if fallback_model:
-                    logger.warning(
-                        "Requested Ollama models %s not available; falling back to '%s'.",
-                        [name for name, _ in requested_candidates],
-                        fallback_model,
-                    )
-                    candidate_models.append((fallback_model, False))
+        if not candidate_models:
+            candidate_models.extend(fallback_candidates)
+        if not candidate_models and available_models:
+            fallback_model = next((m for m in available_models if m), None)
+            if fallback_model:
+                logger.warning(
+                    "Requested Ollama models %s not available; falling back to '%s'.",
+                    [name for name, _ in requested_candidates],
+                    fallback_model,
+                )
+                candidate_models.append((fallback_model, False))
 
         if not candidate_models:
             error_msg = "No available Ollama models detected from 'ollama list'."
@@ -328,24 +339,26 @@ class BaseAgent:
 
         cached: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
         if force_refresh or cached is None:
+            names: List[str] = []
             try:
                 response = ollama.list()
                 models = response.get("models", []) if isinstance(response, dict) else []
-                names: List[str] = []
                 for entry in models:
                     if not isinstance(entry, dict):
                         continue
                     name = entry.get("name") or entry.get("model")
                     if name:
                         names.append(name)
-                cached = names
-                setattr(self.agent_nick, "_available_ollama_models", cached)
             except Exception as exc:  # pragma: no cover - external dependency failure
                 logger.warning("Failed to retrieve available Ollama models: %s", exc)
-                if cached is None:
-                    setattr(self.agent_nick, "_available_ollama_models", [])
-                    return []
-        return list(cached or [])
+            if not names:
+                names = list(_OLLAMA_FALLBACK_MODELS)
+            cached = names
+            setattr(self.agent_nick, "_available_ollama_models", cached)
+        if not cached:
+            cached = list(_OLLAMA_FALLBACK_MODELS)
+            setattr(self.agent_nick, "_available_ollama_models", cached)
+        return list(cached)
 
     def _remove_cached_ollama_model(self, model_name: str) -> None:
         """Remove a model from the cached ``ollama list`` response."""
