@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from typing import Dict, List, Optional
 from types import SimpleNamespace
 
@@ -315,6 +315,95 @@ def test_wait_for_multiple_responses_starts_parallel_watchers(monkeypatch):
         result and result["rfq_id"] == draft["rfq_id"]
         for result, draft in zip(results, drafts)
     )
+
+
+def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    pending_map = {
+        "RFQ-20240101-AAA11111": 1,
+        "RFQ-20240101-BBB22222": 1,
+    }
+    call_counts = defaultdict(int)
+
+    class DummyWatcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "services.email_watcher.SESEmailWatcher",
+        DummyWatcher,
+    )
+
+    def fake_pending(self, rfq_id):
+        return pending_map.get(rfq_id, 0)
+
+    def fake_wait_for_response(
+        self,
+        *,
+        watcher=None,
+        timeout: int,
+        poll_interval: Optional[int] = None,
+        limit: int = 1,
+        rfq_id: Optional[str] = None,
+        supplier_id: Optional[str] = None,
+        **_kwargs,
+    ):
+        key = (rfq_id, supplier_id)
+        attempt = call_counts[key]
+        call_counts[key] += 1
+        if attempt == 0:
+            return None
+        if rfq_id:
+            pending_map[rfq_id] = 0
+        return {
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "supplier_output": {"attempt": attempt},
+        }
+
+    monkeypatch.setattr(
+        SupplierInteractionAgent,
+        "_pending_dispatch_count",
+        fake_pending,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        SupplierInteractionAgent,
+        "wait_for_response",
+        fake_wait_for_response,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.time.sleep",
+        lambda *_args, **_kwargs: None,
+    )
+
+    drafts = [
+        {
+            "rfq_id": "RFQ-20240101-AAA11111",
+            "supplier_id": "SUP-1",
+            "recipients": ["one@example.com"],
+        },
+        {
+            "rfq_id": "RFQ-20240101-BBB22222",
+            "supplier_id": "SUP-2",
+            "recipients": ["two@example.com"],
+        },
+    ]
+
+    results = agent.wait_for_multiple_responses(
+        drafts,
+        timeout=3,
+        poll_interval=1,
+        limit=1,
+    )
+
+    assert all(result and result.get("supplier_output", {}).get("attempt") == 1 for result in results)
+    for draft in drafts:
+        key = (draft["rfq_id"], draft["supplier_id"])
+        assert call_counts[key] >= 2
 
 
 def test_wait_for_response_initialises_watcher_with_negotiation_toggle(monkeypatch):

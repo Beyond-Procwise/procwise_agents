@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from utils.email_markers import attach_hidden_marker, extract_marker_token, split_hidden_marker
 from utils.gpu import configure_gpu
 
 from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
@@ -96,7 +97,15 @@ class EmailDispatchService:
 
             body_source = body_override if body_override is not None else draft.get("body")
             body_text = str(body_source).strip() if body_source else ""
-            body, backend_metadata = self._ensure_rfq_annotation(body_text, rfq_id)
+            draft_metadata = (
+                draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+            )
+            body, backend_metadata = self._ensure_rfq_annotation(
+                body_text,
+                rfq_id,
+                supplier_id=draft.get("supplier_id"),
+                dispatch_token=draft_metadata.get("dispatch_token"),
+            )
 
             dispatch_payload = dict(draft)
             dispatch_payload.update(
@@ -428,13 +437,33 @@ class EmailDispatchService:
                 values.append(candidate)
         return values
 
-    def _ensure_rfq_annotation(self, body: str, rfq_id: str) -> tuple[str, Dict[str, Any]]:
+    def _ensure_rfq_annotation(
+        self,
+        body: str,
+        rfq_id: str,
+        *,
+        supplier_id: Optional[str] = None,
+        dispatch_token: Optional[str] = None,
+    ) -> tuple[str, Dict[str, Any]]:
         text = body or ""
+        comment, remainder = split_hidden_marker(text)
+        cleaned = remainder or ""
+        if cleaned and rfq_id:
+            cleaned = re.sub(r"(?i)\bRFQ[-\s:]*[A-Z0-9]{2,}[^\s]*", "", cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+        marker_token = dispatch_token or extract_marker_token(comment)
+        annotated_body, marker_token = attach_hidden_marker(
+            cleaned.strip(),
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            token=marker_token,
+        )
+
         metadata: Dict[str, Any] = {"rfq_id": rfq_id}
-        if text and rfq_id:
-            text = re.sub(r"(?i)\bRFQ[-\s:]*[A-Z0-9]{2,}[^\s]*", "", text)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip(), metadata
+        if marker_token:
+            metadata["dispatch_token"] = marker_token
+        return annotated_body, metadata
 
     @staticmethod
     def _load_json_field(value: Any) -> Optional[Any]:

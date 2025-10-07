@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 from jinja2 import Template
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from utils.email_markers import attach_hidden_marker, extract_rfq_id, split_hidden_marker
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 
@@ -223,7 +224,6 @@ _RFQ_HEADER_CELL_STYLE = (
     "border: 1px solid #d0d0d0; padding: 6px; text-align: left; background-color: #f5f5f5;"
 )
 _RFQ_BODY_CELL_STYLE = "border: 1px solid #d0d0d0; padding: 6px; text-align: left;"
-_RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", flags=re.IGNORECASE)
 _VISIBLE_RFQ_ID_PATTERN = re.compile(r"(?i)RFQ[\w\s:-]*\d[\w-]*")
 
 DEFAULT_RFQ_SUBJECT = "Request for Quotation – Procurement Opportunity"
@@ -545,6 +545,12 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
+        annotated_body, marker_token = attach_hidden_marker(
+            plain_text or "",
+            rfq_id=rfq_id_output,
+            supplier_id=supplier_id,
+        )
+
         if subject_line:
             subject = self._clean_subject_text(subject_line.strip(), DEFAULT_NEGOTIATION_SUBJECT)
         else:
@@ -573,6 +579,8 @@ class EmailDraftingAgent(BaseAgent):
             "strategy": decision_data.get("strategy"),
             "intent": "NEGOTIATION_COUNTER",
         }
+        if marker_token:
+            metadata["dispatch_token"] = marker_token
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
         draft = {
@@ -580,7 +588,7 @@ class EmailDraftingAgent(BaseAgent):
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
             "subject": subject,
-            "body": plain_text,
+            "body": annotated_body,
             "text": plain_text,
             "html": sanitised_html,
             "sender": sender,
@@ -684,6 +692,13 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
+        supplier_id = context.get("supplier_id")
+        annotated_body, marker_token = attach_hidden_marker(
+            plain_text or "",
+            rfq_id=rfq_id_value,
+            supplier_id=supplier_id,
+        )
+
         counter_price = context.get("counter_price")
         if counter_price is None:
             proposals = context.get("counter_proposals")
@@ -699,11 +714,13 @@ class EmailDraftingAgent(BaseAgent):
         }
         if counter_price is not None:
             metadata["counter_price"] = counter_price
+        if marker_token:
+            metadata["dispatch_token"] = marker_token
 
         draft = {
             "rfq_id": rfq_id_value,
             "subject": subject,
-            "body": plain_text,
+            "body": annotated_body,
             "text": plain_text,
             "html": sanitised_html,
             "sender": sender,
@@ -917,6 +934,11 @@ class EmailDraftingAgent(BaseAgent):
 
         body_content = self._sanitise_generated_body(email_text)
         body = self._clean_body_text(body_content)
+        body, marker_token = attach_hidden_marker(
+            body,
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+        )
 
         subject_base = data.get("subject") or DEFAULT_NEGOTIATION_SUBJECT
         subject = self._clean_subject_text(subject_base, DEFAULT_NEGOTIATION_SUBJECT)
@@ -938,6 +960,9 @@ class EmailDraftingAgent(BaseAgent):
             "rationale": rationale,
             "intent": "NEGOTIATION_COUNTER",
         }
+
+        if marker_token:
+            metadata["dispatch_token"] = marker_token
 
         draft = {
             "supplier_id": supplier_id,
@@ -2328,6 +2353,11 @@ class EmailDraftingAgent(BaseAgent):
             if negotiation_section_html and negotiation_section_html not in content:
                 content = f"{content}{negotiation_section_html}"
             body = self._clean_body_text(content)
+            body, marker_token = attach_hidden_marker(
+                body,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+            )
             if subject_template_source:
                 subject_args = dict(template_args)
                 subject_args.setdefault("rfq_id", rfq_id)
@@ -2386,6 +2416,8 @@ class EmailDraftingAgent(BaseAgent):
                 metadata["supplier_name"] = supplier_name
             if internal_context:
                 metadata["internal_context"] = internal_context
+            if marker_token:
+                metadata["dispatch_token"] = marker_token
             draft["metadata"] = metadata
             drafts.append(draft)
             self._store_draft(draft)
@@ -2400,10 +2432,19 @@ class EmailDraftingAgent(BaseAgent):
             )
             manual_rfq_id = self._extract_rfq_id(manual_comment) or self._generate_rfq_id()
             manual_body_rendered = self._clean_body_text(manual_body_content)
+            manual_body_rendered, manual_marker_token = attach_hidden_marker(
+                manual_body_rendered,
+                rfq_id=manual_rfq_id,
+                supplier_id=None,
+            )
             manual_subject_rendered = self._clean_subject_text(
                 manual_subject_input,
                 DEFAULT_RFQ_SUBJECT,
             )
+
+            manual_metadata: Dict[str, Any] = {"rfq_id": manual_rfq_id}
+            if manual_marker_token:
+                manual_metadata["dispatch_token"] = manual_marker_token
 
             manual_draft = {
                 "supplier_id": None,
@@ -2418,6 +2459,7 @@ class EmailDraftingAgent(BaseAgent):
                 "recipients": manual_recipients,
                 "receiver": manual_recipients[0] if manual_recipients else None,
                 "contact_level": 1 if manual_recipients else 0,
+                "metadata": manual_metadata,
             }
             if default_action_id:
                 manual_draft["action_id"] = default_action_id
@@ -2655,22 +2697,10 @@ class EmailDraftingAgent(BaseAgent):
         return escape(text).replace("\n", "<br>")
 
     def _split_existing_comment(self, body: str) -> tuple[Optional[str], str]:
-        if not isinstance(body, str):
-            return None, ""
-        match = re.match(r"\s*(<!--.*?-->)", body, flags=re.DOTALL)
-        if match and "RFQ-ID" in match.group(1):
-            comment = match.group(1).strip()
-            remainder = body[match.end():].lstrip("\n")
-            return comment, remainder
-        return None, body
+        return split_hidden_marker(body)
 
     def _extract_rfq_id(self, comment: Optional[str]) -> Optional[str]:
-        if not comment:
-            return None
-        match = _RFQ_ID_PATTERN.search(comment)
-        if match:
-            return match.group(1).strip()
-        return None
+        return extract_rfq_id(comment)
 
     def _sanitise_generated_body(self, body: str) -> str:
         if not body:
