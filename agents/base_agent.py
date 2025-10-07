@@ -31,7 +31,7 @@ from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = ("qwen3", "mistral", "gemma3")
+_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = ("qwen3:30b", "mixtral:8x7b", "gemma3")
 
 
 class AgentStatus(str, Enum):
