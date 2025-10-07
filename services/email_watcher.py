@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import imaplib
+import json
 import logging
 import mimetypes
 import re
@@ -416,6 +417,10 @@ class SESEmailWatcher:
         self._rfq_tail_cache: Dict[str, List[Dict[str, object]]] = {}
         self._workflow_rfq_index: Dict[str, Set[str]] = defaultdict(set)
         self._rfq_workflow_index: Dict[str, Set[str]] = defaultdict(set)
+        self._workflow_expected_counts: Dict[str, int] = {}
+        self._workflow_processed_counts: Dict[str, int] = {}
+        self._workflow_negotiation_jobs: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        self._action_payload_cache: Dict[str, Dict[str, object]] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
         self._load_watermark()
@@ -1634,6 +1639,28 @@ class SESEmailWatcher:
         target_price = metadata.get("target_price") or message.get("target_price")
         negotiation_round = metadata.get("round") or message.get("round") or 1
 
+        workflow_id = metadata.get("workflow_id")
+        dispatch_payload = metadata.get("dispatch_payload")
+        action_payload = metadata.get("action_payload")
+        if not workflow_id and dispatch_payload:
+            workflow_id = self._extract_workflow_id_from_payload(dispatch_payload)
+        if not workflow_id:
+            if action_payload is None:
+                action_id = metadata.get("action_id")
+                if not action_id and dispatch_payload:
+                    action_id = self._extract_action_id_from_payload(dispatch_payload)
+                    if action_id:
+                        metadata["action_id"] = action_id
+                if action_id:
+                    action_payload = self._load_action_output(action_id)
+                    if action_payload:
+                        metadata["action_payload"] = action_payload
+            if action_payload:
+                workflow_id = self._extract_workflow_id_from_payload(action_payload)
+        if not workflow_id:
+            workflow_id = str(uuid.uuid4())
+        metadata.setdefault("workflow_id", workflow_id)
+
         if target_price is not None:
             try:
                 target_price = float(target_price)
@@ -1678,7 +1705,7 @@ class SESEmailWatcher:
             )
 
         context = AgentContext(
-            workflow_id=str(uuid.uuid4()),
+            workflow_id=workflow_id,
             agent_id="supplier_interaction",
             user_id=self.settings.script_user,
             input_data={
@@ -1729,6 +1756,7 @@ class SESEmailWatcher:
             return processed, "supplier_interaction_failed"
         negotiation_output: Optional[AgentOutput] = None
         triggered = False
+        negotiation_job: Optional[Dict[str, object]] = None
 
         if (
             self.enable_negotiation
@@ -1765,15 +1793,12 @@ class SESEmailWatcher:
                     parent_agent=context.agent_id,
                     routing_history=list(context.routing_history),
                 )
-                negotiation_output = self.negotiation_agent.execute(negotiation_context)
-                triggered = negotiation_output.status == AgentStatus.SUCCESS
-                logger.info(
-                    "Negotiation triggered for RFQ %s (round %s) via mailbox %s; status=%s",
-                    rfq_id,
-                    negotiation_round,
-                    self.mailbox_address,
-                    negotiation_output.status.value,
-                )
+                negotiation_job = {
+                    "context": negotiation_context,
+                    "rfq_id": rfq_id,
+                    "round": negotiation_round,
+                    "supplier_id": supplier_id,
+                }
 
         processed.update(
             {
@@ -1794,6 +1819,22 @@ class SESEmailWatcher:
                 "related_rfq_ids": additional_rfqs,
             }
         )
+        processed.setdefault("negotiation_triggered", False)
+        processed.setdefault("negotiation_status", None)
+        processed.setdefault("negotiation_output", None)
+
+        triggered, negotiation_output = self._register_processed_response(
+            context.workflow_id,
+            metadata,
+            processed,
+            negotiation_job,
+        )
+        if negotiation_output is not None:
+            processed["negotiation_status"] = negotiation_output.status.value
+            processed["negotiation_output"] = negotiation_output.data
+        if triggered:
+            processed["negotiation_triggered"] = True
+
         self._remember_rfq_tail(rfq_id, supplier_id)
         for extra in additional_rfqs:
             self._remember_rfq_tail(extra, supplier_id)
@@ -1825,7 +1866,7 @@ class SESEmailWatcher:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on
+                        SELECT supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on, payload
                         FROM proc.draft_rfq_emails
                         WHERE rfq_id = %s
                         ORDER BY updated_on DESC, created_on DESC
@@ -1843,6 +1884,7 @@ class SESEmailWatcher:
                             draft_sent_flag,
                             draft_created_on,
                             draft_updated_on,
+                            draft_payload,
                         ) = row
                         dispatch_record = {
                             "supplier_id": draft_supplier_id,
@@ -1853,6 +1895,25 @@ class SESEmailWatcher:
                             "created_on": draft_created_on,
                             "updated_on": draft_updated_on,
                         }
+                        dispatch_payload = self._safe_parse_json(draft_payload)
+                        if dispatch_payload:
+                            dispatch_record["payload"] = dispatch_payload
+                            details["dispatch_payload"] = dispatch_payload
+                            action_identifier = self._extract_action_id_from_payload(
+                                dispatch_payload
+                            )
+                            if action_identifier and not details.get("action_id"):
+                                details["action_id"] = action_identifier
+                            workflow_hint = self._extract_workflow_id_from_payload(
+                                dispatch_payload
+                            )
+                            if workflow_hint and not details.get("workflow_id"):
+                                details["workflow_id"] = workflow_hint
+                            expected_hint = self._coerce_int_value(
+                                dispatch_payload.get("expected_supplier_count")
+                            )
+                            if expected_hint is not None:
+                                details.setdefault("expected_supplier_count", expected_hint)
                         details["dispatch_record"] = dispatch_record
                         if draft_supplier_name and not details.get("supplier_name"):
                             details["supplier_name"] = draft_supplier_name
@@ -1910,6 +1971,310 @@ class SESEmailWatcher:
             logger.exception("Failed to load RFQ metadata for %s", rfq_id)
 
         return details
+
+    @staticmethod
+    def _safe_parse_json(value: object) -> Optional[Dict[str, object]]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                logger.debug("Failed to parse JSON payload", exc_info=True)
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    @staticmethod
+    def _coerce_int_value(value: object) -> Optional[int]:
+        if isinstance(value, bool):
+            return int(value) if value else None
+        if isinstance(value, (int, float)):
+            candidate = int(value)
+            return candidate if candidate >= 0 else None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                parsed = float(text)
+            except Exception:
+                return None
+            candidate = int(parsed)
+            return candidate if candidate >= 0 else None
+        return None
+
+    @staticmethod
+    def _extract_action_id_from_payload(
+        payload: Optional[Dict[str, object]]
+    ) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("action_id", "draft_action_id", "email_action_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("action_id", "draft_action_id", "email_action_id"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    @staticmethod
+    def _extract_workflow_id_from_payload(
+        payload: Optional[Dict[str, object]]
+    ) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        def _collect_candidates(container: Dict[str, object]) -> List[Optional[str]]:
+            candidates: List[Optional[str]] = []
+            keys = ("workflow_id", "workflowId", "workflow")
+            for key in keys:
+                candidates.append(container.get(key))
+            return candidates
+
+        candidates = _collect_candidates(payload)
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.extend(_collect_candidates(metadata))
+
+        for field in ("input", "input_data", "context", "source_data", "process_details"):
+            section = payload.get(field)
+            if isinstance(section, dict):
+                candidates.extend(_collect_candidates(section))
+
+        drafts = payload.get("drafts")
+        if isinstance(drafts, list):
+            for draft in drafts:
+                if not isinstance(draft, dict):
+                    continue
+                candidates.extend(_collect_candidates(draft))
+                draft_meta = draft.get("metadata")
+                if isinstance(draft_meta, dict):
+                    candidates.extend(_collect_candidates(draft_meta))
+
+        dispatch_record = payload.get("dispatch_record")
+        if isinstance(dispatch_record, dict):
+            candidates.extend(_collect_candidates(dispatch_record))
+
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if text:
+                    return text
+        return None
+
+    def _load_action_output(self, action_id: Optional[str]) -> Dict[str, object]:
+        if not action_id:
+            return {}
+        cached = self._action_payload_cache.get(action_id)
+        if cached is not None:
+            return cached
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return {}
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT process_output FROM proc.action WHERE action_id = %s",
+                        (action_id,),
+                    )
+                    row = cur.fetchone()
+        except Exception:
+            logger.debug(
+                "Failed to load action payload for %s", action_id, exc_info=True
+            )
+            payload = {}
+        else:
+            payload = self._safe_parse_json(row[0]) if row and row[0] else {}
+            if payload is None:
+                payload = {}
+
+        self._action_payload_cache[action_id] = payload
+        return payload
+
+    def _derive_expected_supplier_count(
+        self,
+        metadata: Optional[Dict[str, object]],
+        action_payload: Optional[Dict[str, object]] = None,
+    ) -> Optional[int]:
+        sources: List[Dict[str, object]] = []
+        if isinstance(metadata, dict):
+            sources.append(metadata)
+            dispatch_payload = metadata.get("dispatch_payload")
+            if isinstance(dispatch_payload, dict):
+                sources.append(dispatch_payload)
+                meta_payload = dispatch_payload.get("metadata")
+                if isinstance(meta_payload, dict):
+                    sources.append(meta_payload)
+            dispatch_record = metadata.get("dispatch_record")
+            if isinstance(dispatch_record, dict):
+                record_payload = dispatch_record.get("payload")
+                if isinstance(record_payload, dict):
+                    sources.append(record_payload)
+        if isinstance(action_payload, dict):
+            sources.append(action_payload)
+            action_meta = action_payload.get("metadata")
+            if isinstance(action_meta, dict):
+                sources.append(action_meta)
+
+        for source in sources:
+            for key in (
+                "expected_supplier_count",
+                "expected_suppliers",
+                "total_suppliers",
+                "supplier_total",
+                "supplier_count",
+            ):
+                candidate = self._coerce_int_value(source.get(key))
+                if candidate is not None and candidate > 0:
+                    return candidate
+
+        for source in sources:
+            drafts = source.get("drafts")
+            if isinstance(drafts, list) and drafts:
+                suppliers: Set[str] = set()
+                for draft in drafts:
+                    if not isinstance(draft, dict):
+                        continue
+                    supplier_id = draft.get("supplier_id")
+                    if supplier_id:
+                        suppliers.add(str(supplier_id))
+                if suppliers:
+                    return len(suppliers)
+                valid_drafts = [draft for draft in drafts if isinstance(draft, dict)]
+                if valid_drafts:
+                    return len(valid_drafts)
+
+        return None
+
+    def _ensure_workflow_expectations(
+        self, workflow_id: Optional[str], metadata: Dict[str, object]
+    ) -> Optional[int]:
+        workflow_key = self._normalise_workflow_key(workflow_id)
+        if not workflow_key:
+            return None
+        if workflow_key in self._workflow_expected_counts:
+            return self._workflow_expected_counts[workflow_key]
+
+        action_payload = metadata.get("action_payload")
+        if not action_payload:
+            action_id = metadata.get("action_id")
+            if not action_id:
+                dispatch_payload = metadata.get("dispatch_payload")
+                action_id = self._extract_action_id_from_payload(dispatch_payload)
+                if action_id:
+                    metadata["action_id"] = action_id
+            if action_id:
+                action_payload = self._load_action_output(action_id)
+                if action_payload:
+                    metadata["action_payload"] = action_payload
+                    workflow_hint = self._extract_workflow_id_from_payload(action_payload)
+                    if workflow_hint and not metadata.get("workflow_id"):
+                        metadata["workflow_id"] = workflow_hint
+
+        expected = self._derive_expected_supplier_count(metadata, action_payload)
+        if expected is not None:
+            self._workflow_expected_counts[workflow_key] = expected
+        return expected
+
+    def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
+        return self._normalise_filter_value(workflow_id) if workflow_id else None
+
+    def _flush_negotiation_jobs(
+        self, workflow_key: str, current_processed: Dict[str, object]
+    ) -> Tuple[bool, Optional[AgentOutput]]:
+        jobs = self._workflow_negotiation_jobs.pop(workflow_key, [])
+        result: Tuple[bool, Optional[AgentOutput]] = (
+            current_processed.get("negotiation_triggered", False),
+            None,
+        )
+        for entry in jobs:
+            job = entry.get("job") if isinstance(entry, dict) else None
+            processed = entry.get("processed") if isinstance(entry, dict) else None
+            if not job or not isinstance(processed, dict):
+                continue
+            triggered, output = self._execute_negotiation_job(job)
+            processed["negotiation_triggered"] = triggered
+            processed["negotiation_status"] = (
+                output.status.value if output else None
+            )
+            processed["negotiation_output"] = output.data if output else None
+            self._update_processed_snapshot(processed)
+            if processed is current_processed:
+                result = (triggered, output)
+        return result
+
+    def _execute_negotiation_job(
+        self, job: Dict[str, object]
+    ) -> Tuple[bool, Optional[AgentOutput]]:
+        negotiation_agent = self.negotiation_agent
+        context = job.get("context")
+        if negotiation_agent is None or not isinstance(context, AgentContext):
+            return False, None
+
+        negotiation_output = negotiation_agent.execute(context)
+        triggered = negotiation_output.status == AgentStatus.SUCCESS
+        logger.info(
+            "Negotiation triggered for RFQ %s (round %s) via mailbox %s; status=%s",
+            job.get("rfq_id"),
+            job.get("round"),
+            self.mailbox_address,
+            negotiation_output.status.value,
+        )
+        return triggered, negotiation_output
+
+    def _register_processed_response(
+        self,
+        workflow_id: Optional[str],
+        metadata: Dict[str, object],
+        processed: Dict[str, object],
+        negotiation_job: Optional[Dict[str, object]],
+    ) -> Tuple[bool, Optional[AgentOutput]]:
+        workflow_key = self._normalise_workflow_key(workflow_id)
+        default_result: Tuple[bool, Optional[AgentOutput]] = (
+            processed.get("negotiation_triggered", False),
+            None,
+        )
+
+        if workflow_key:
+            expected = self._ensure_workflow_expectations(workflow_id, metadata)
+            if negotiation_job:
+                queue = self._workflow_negotiation_jobs.setdefault(workflow_key, [])
+                queue.append({"job": negotiation_job, "processed": processed})
+            count = self._workflow_processed_counts.get(workflow_key, 0) + 1
+            self._workflow_processed_counts[workflow_key] = count
+            if expected is None or count >= expected:
+                return self._flush_negotiation_jobs(workflow_key, processed)
+            return default_result
+
+        if negotiation_job:
+            triggered, output = self._execute_negotiation_job(negotiation_job)
+            processed["negotiation_triggered"] = triggered
+            processed["negotiation_status"] = (
+                output.status.value if output else None
+            )
+            processed["negotiation_output"] = output.data if output else None
+            self._update_processed_snapshot(processed)
+            return triggered, output
+
+        return default_result
+
+    def _update_processed_snapshot(self, processed: Dict[str, object]) -> None:
+        message_id = processed.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            return
+        if message_id in self._processed_cache:
+            self._processed_cache[message_id] = deepcopy(processed)
 
     def _get_rfq_candidates_for_tail(self, tail: str) -> List[Dict[str, object]]:
         tail_key = (tail or "").strip().lower()
@@ -2119,8 +2484,7 @@ class SESEmailWatcher:
                     inbound_domains.append(domain)
 
         query = """
-            SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on,
-                   subject, body, recipient_email, sender
+            SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload
             FROM proc.draft_rfq_emails
             WHERE sent = TRUE
               AND updated_on >= NOW() - INTERVAL '7 days'
@@ -2214,8 +2578,8 @@ class SESEmailWatcher:
             sent_flag,
             created_on,
             updated_on,
-            *_
-        ) = best_row
+            payload_json,
+        ) = row
 
         if not rfq_value:
             return None
@@ -2231,6 +2595,9 @@ class SESEmailWatcher:
             "match_source": "dispatch_similarity",
             "matched_tokens": sorted(best_overlap),
         }
+        payload_doc = self._safe_parse_json(payload_json)
+        if payload_doc:
+            dispatch_record["payload"] = payload_doc
 
         if best_domains:
             dispatch_record["matched_domains"] = best_domains

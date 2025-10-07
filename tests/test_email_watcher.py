@@ -240,7 +240,7 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
         def execute(self, statement, params=None):
             normalized = " ".join(statement.split()).lower()
             if normalized.startswith(
-                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
             ):
                 self._result = [
                     (
@@ -251,10 +251,11 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
                         True,
                         dispatch_row["created_on"],
                         dispatch_row["updated_on"],
+                        json.dumps({}),
                     )
                 ]
             elif normalized.startswith(
-                "select supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+                "select supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
             ):
                 self._result = [
                     (
@@ -265,6 +266,7 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
                         True,
                         dispatch_row["created_on"],
                         dispatch_row["updated_on"],
+                        json.dumps({}),
                     )
                 ]
             elif normalized.startswith("select target_price"):
@@ -1438,6 +1440,73 @@ def test_watermark_disables_recent_window(monkeypatch):
 
     assert captured.get("enforce_window") is False
 
+
+
+
+def test_negotiation_executes_after_expected_responses(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-queued-1",
+            "subject": "Re: RFQ-20240101-AAAA1111",
+            "body": "Price 1500",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240101-AAAA1111",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-queued-2",
+            "subject": "Re: RFQ-20240101-BBBB2222",
+            "body": "Price 900",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240101-BBBB2222",
+            "supplier_id": "SUP-2",
+        },
+    ]
+
+    batches = [messages[:1], messages[1:], []]
+
+    def loader(limit=None):
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    def fake_metadata(rfq_id):
+        supplier = "SUP-1" if rfq_id.endswith("1111") else "SUP-2"
+        return {
+            "supplier_id": supplier,
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-MULTI-01",
+            "expected_supplier_count": 2,
+        }
+
+    monkeypatch.setattr(watcher, "_load_metadata", fake_metadata, raising=False)
+
+    first_results = watcher.poll_once(limit=1)
+    assert first_results and len(first_results) == 1
+    first_payload = first_results[0]
+    assert first_payload["negotiation_triggered"] is False
+    assert watcher.negotiation_agent.contexts == []
+
+    second_results = watcher.poll_once(limit=1)
+    assert second_results and len(second_results) == 1
+    second_payload = second_results[0]
+
+    assert len(watcher.negotiation_agent.contexts) == 1
+    negotiation_context = watcher.negotiation_agent.contexts[0]
+    assert negotiation_context.input_data["current_offer"] == 1500
+    assert negotiation_context.input_data["rfq_id"] == "RFQ-20240101-AAAA1111"
+
+    cached_first = watcher._processed_cache.get("msg-queued-1")
+    assert cached_first
+    assert cached_first["negotiation_triggered"] is True
+    assert cached_first["negotiation_status"] == AgentStatus.SUCCESS.value
+    assert cached_first["negotiation_output"] == {"counter": 1000}
+
+    assert second_payload["negotiation_triggered"] is False
 
 def test_sqs_email_loader_extracts_records():
     class StubSQSClient:
