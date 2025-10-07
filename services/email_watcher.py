@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import imaplib
 import json
 import logging
@@ -88,6 +89,57 @@ def _rfq_match_key(value: object) -> Optional[str]:
 
 
 RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
+_SIMILARITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+
+
+def _extract_similarity_tokens(*values: object, limit: int = 64) -> Set[str]:
+    """Return a set of normalised tokens for fuzzy comparisons."""
+
+    tokens: Set[str] = set()
+    if limit <= 0:
+        limit = 0
+
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            text = _norm(str(value))
+        except Exception:
+            continue
+        if not text:
+            continue
+        lowered = text.lower()
+        for match in _SIMILARITY_TOKEN_RE.findall(lowered):
+            if not match:
+                continue
+            if limit and len(tokens) >= limit:
+                break
+            tokens.add(match)
+        if limit and len(tokens) >= limit:
+            break
+    return tokens
+
+
+def _extract_email_domain(value: object) -> Optional[str]:
+    """Extract a lowercase domain from an email-like value."""
+
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        _, address = parseaddr(text)
+    except Exception:
+        address = None
+    candidate = address.strip() if address else text
+    if "@" not in candidate:
+        return None
+    domain = candidate.split("@")[-1].strip().lower()
+    return domain or None
 
 # Ensure GPU related environment flags are consistently applied even when the
 # watcher is used standalone (e.g. in a scheduled job).
@@ -402,6 +454,9 @@ class SESEmailWatcher:
         )
         self._last_dispatch_notified_at: Optional[float] = None
         self._last_dispatch_wait_acknowledged: Optional[float] = None
+        self._dispatch_expectations: Dict[str, "_DispatchExpectation"] = {}
+        self._completed_dispatch_actions: Set[str] = set()
+        self._workflow_dispatch_actions: Dict[str, str] = {}
 
         logger.info(
             "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
@@ -500,7 +555,7 @@ class SESEmailWatcher:
                 )
                 return []
 
-            self._respect_post_dispatch_wait()
+            self._respect_post_dispatch_wait(filters)
 
             attempts = 0
             poll_deadline: Optional[float] = None
@@ -796,6 +851,22 @@ class SESEmailWatcher:
 
         if processed:
             processed_payload = self._record_processed_payload(message_id, processed)
+            dispatch_record = (
+                message.get("_dispatch_record")
+                if isinstance(message.get("_dispatch_record"), dict)
+                else None
+            )
+            if dispatch_record:
+                record_rfq = dispatch_record.get("rfq_id")
+                record_supplier = dispatch_record.get("supplier_id")
+                if record_rfq and processed_payload.get("rfq_id") is None:
+                    processed_payload["rfq_id"] = record_rfq
+                    if isinstance(processed, dict) and processed.get("rfq_id") is None:
+                        processed["rfq_id"] = record_rfq
+                if record_supplier and processed_payload.get("supplier_id") is None:
+                    processed_payload["supplier_id"] = record_supplier
+                    if isinstance(processed, dict) and processed.get("supplier_id") is None:
+                        processed["supplier_id"] = record_supplier
             original_rfq = processed_payload.get("rfq_id") if processed_payload else None
             rfq_extracted = (
                 self._normalise_rfq_value(original_rfq) if original_rfq else None
@@ -864,8 +935,12 @@ class SESEmailWatcher:
                     and canonical_rfq_full in _norm(str(body_candidate)).upper()
                 ):
                     match_source = "body"
-            if match_source == "unknown" and message.get("_dispatch_record"):
-                match_source = "dispatch"
+            if match_source == "unknown" and dispatch_record:
+                record_source = dispatch_record.get("match_source")
+                if isinstance(record_source, str) and record_source:
+                    match_source = record_source
+                else:
+                    match_source = "dispatch"
             if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
@@ -1539,10 +1614,19 @@ class SESEmailWatcher:
                 additional_canonicals = fallback_canonicals
 
         metadata = self._load_metadata(rfq_id)
+        existing_dispatch_record = (
+            message.get("_dispatch_record")
+            if isinstance(message.get("_dispatch_record"), dict)
+            else None
+        )
         canonical_rfq_id = metadata.get("canonical_rfq_id")
         if canonical_rfq_id:
             rfq_id = str(canonical_rfq_id)
         dispatch_record = metadata.get("dispatch_record")
+        if isinstance(dispatch_record, dict) and existing_dispatch_record:
+            for key in ("match_source", "matched_tokens", "matched_domains"):
+                if key in existing_dispatch_record and key not in dispatch_record:
+                    dispatch_record[key] = existing_dispatch_record[key]
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
         if dispatch_record:
             message["_dispatch_record"] = dispatch_record
@@ -2305,13 +2389,17 @@ class SESEmailWatcher:
 
         headers = message.get("headers")
         if isinstance(headers, dict):
-            for header_key in ("From", "from", "Reply-To", "reply-to", "Return-Path", "return-path"):
+            for header_key in (
+                "From",
+                "from",
+                "Reply-To",
+                "reply-to",
+                "Return-Path",
+                "return-path",
+            ):
                 candidate = self._normalise_email(headers.get(header_key))
                 if candidate and candidate not in email_candidates:
                     email_candidates.append(candidate)
-
-        if not supplier_candidates and not email_candidates:
-            return None
 
         where_clauses: List[str] = []
         params: List[object] = []
@@ -2324,27 +2412,166 @@ class SESEmailWatcher:
             where_clauses.append("LOWER(COALESCE(recipient_email, '')) = ANY(%s)")
             params.append(email_candidates)
 
-        if not where_clauses:
+        if where_clauses:
+            query = """
+                SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on
+                FROM proc.draft_rfq_emails
+                WHERE sent = TRUE AND ({})
+                ORDER BY updated_on DESC, created_on DESC
+                LIMIT 1
+            """.format(" OR ".join(where_clauses))
+
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(query, tuple(params))
+                        row = cur.fetchone()
+            except Exception:
+                logger.debug("Failed to resolve RFQ from dispatch history", exc_info=True)
+                row = None
+
+            if row:
+                (
+                    rfq_value,
+                    supplier_value,
+                    supplier_name,
+                    sent_on,
+                    sent_flag,
+                    created_on,
+                    updated_on,
+                ) = row
+
+                if rfq_value:
+                    dispatch_record = {
+                        "rfq_id": rfq_value,
+                        "supplier_id": supplier_value,
+                        "supplier_name": supplier_name,
+                        "sent_on": sent_on,
+                        "sent": bool(sent_flag),
+                        "created_on": created_on,
+                        "updated_on": updated_on,
+                        "match_source": "dispatch",
+                    }
+                    return str(rfq_value), supplier_value, dispatch_record
+
+        return self._resolve_recent_dispatch_by_similarity(message, get_conn)
+
+    def _resolve_recent_dispatch_by_similarity(
+        self,
+        message: Dict[str, object],
+        get_conn: Callable[[], object],
+    ) -> Optional[Tuple[str, Optional[str], Optional[Dict[str, object]]]]:
+        subject = message.get("subject")
+        body = message.get("body")
+
+        body_segment: Optional[str]
+        if isinstance(body, str):
+            body_segment = body[:2000]
+        else:
+            body_segment = None
+
+        inbound_tokens = _extract_similarity_tokens(subject, body_segment)
+        if not inbound_tokens:
             return None
+
+        inbound_domains: List[str] = []
+        for key in ("from", "reply_to", "supplier_email"):
+            domain = _extract_email_domain(message.get(key))
+            if domain and domain not in inbound_domains:
+                inbound_domains.append(domain)
+
+        headers = message.get("headers")
+        if isinstance(headers, dict):
+            for header_key in ("From", "from", "Reply-To", "reply-to"):
+                domain = _extract_email_domain(headers.get(header_key))
+                if domain and domain not in inbound_domains:
+                    inbound_domains.append(domain)
 
         query = """
             SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload
             FROM proc.draft_rfq_emails
-            WHERE sent = TRUE AND ({})
+            WHERE sent = TRUE
+              AND updated_on >= NOW() - INTERVAL '7 days'
             ORDER BY updated_on DESC, created_on DESC
-            LIMIT 1
-        """.format(" OR ".join(where_clauses))
+            LIMIT %s
+        """
 
+        rows: List[Tuple] = []
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(query, tuple(params))
-                    row = cur.fetchone()
+                    cur.execute(query, (25,))
+                    fetched = cur.fetchall()
+                    if fetched:
+                        rows = list(fetched)
         except Exception:
-            logger.debug("Failed to resolve RFQ from dispatch history", exc_info=True)
+            logger.debug("Failed to load recent RFQ dispatches for similarity", exc_info=True)
             return None
 
-        if not row:
+        if not rows:
+            return None
+
+        best_row: Optional[Tuple] = None
+        best_score = -1.0
+        best_overlap: Set[str] = set()
+        best_domains: List[str] = []
+
+        min_overlap = 1 if len(inbound_tokens) <= 4 else 2
+
+        for row in rows:
+            if not row or not row[0]:
+                continue
+
+            candidate_subject = row[7] if len(row) > 7 else None
+            candidate_body = row[8] if len(row) > 8 else None
+            if isinstance(candidate_body, str):
+                candidate_body = candidate_body[:2000]
+
+            candidate_tokens = _extract_similarity_tokens(
+                candidate_subject, candidate_body
+            )
+            if not candidate_tokens:
+                continue
+
+            overlap = inbound_tokens & candidate_tokens
+
+            recipient_domain = _extract_email_domain(row[9] if len(row) > 9 else None)
+            sender_domain = _extract_email_domain(row[10] if len(row) > 10 else None)
+            candidate_domains = [d for d in (recipient_domain, sender_domain) if d]
+            domain_match = False
+            if inbound_domains and candidate_domains:
+                domain_match = any(domain in inbound_domains for domain in candidate_domains)
+
+            if len(overlap) < min_overlap and not domain_match:
+                continue
+
+            token_score = len(overlap) / max(len(inbound_tokens), 1)
+            domain_bonus = 0.3 if domain_match else 0.0
+            score = token_score + domain_bonus
+
+            if score < 0.2:
+                continue
+
+            updated_on = row[6] if len(row) > 6 else None
+
+            if score > best_score:
+                best_row = row
+                best_score = score
+                best_overlap = set(overlap)
+                best_domains = list(candidate_domains)
+            elif score == best_score and best_row is not None:
+                current_updated = best_row[6] if len(best_row) > 6 else None
+                if isinstance(updated_on, datetime) and isinstance(current_updated, datetime):
+                    if updated_on > current_updated:
+                        best_row = row
+                        best_overlap = set(overlap)
+                        best_domains = list(candidate_domains)
+                elif updated_on and not current_updated:
+                    best_row = row
+                    best_overlap = set(overlap)
+                    best_domains = list(candidate_domains)
+
+        if not best_row:
             return None
 
         (
@@ -2369,6 +2596,8 @@ class SESEmailWatcher:
             "sent": bool(sent_flag),
             "created_on": created_on,
             "updated_on": updated_on,
+            "match_source": "dispatch_similarity",
+            "matched_tokens": sorted(best_overlap),
         }
         payload_doc = self._safe_parse_json(payload_json)
         if payload_doc:
@@ -2877,7 +3106,270 @@ class SESEmailWatcher:
         except Exception:  # pragma: no cover - defensive
             logger.debug("Unable to persist dispatch timestamp on agent context")
 
-    def _respect_post_dispatch_wait(self) -> None:
+    @dataclass
+    class _DispatchExpectation:
+        action_id: Optional[str]
+        workflow_id: Optional[str]
+        draft_ids: Tuple[int, ...]
+        draft_count: int
+        supplier_count: int
+
+    @staticmethod
+    def _coerce_identifier(value: object) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    @staticmethod
+    def _coerce_process_output(value: object) -> Optional[Dict[str, object]]:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                logger.debug("Unable to decode process_output JSON", exc_info=True)
+                return None
+        return None
+
+    def _build_dispatch_expectation(
+        self,
+        action_id: Optional[str],
+        workflow_id: Optional[str],
+        drafts: Iterable[object],
+    ) -> Optional["_DispatchExpectation"]:
+        draft_ids: List[int] = []
+        supplier_keys: Set[str] = set()
+        draft_count = 0
+
+        for entry in drafts:
+            if not isinstance(entry, dict):
+                continue
+            draft_count += 1
+            candidate_id = entry.get("draft_record_id") or entry.get("id")
+            try:
+                if candidate_id is not None:
+                    draft_ids.append(int(candidate_id))
+            except Exception:
+                logger.debug("Ignoring non-numeric draft identifier: %r", candidate_id)
+            supplier = entry.get("supplier_id")
+            supplier_key = self._coerce_identifier(supplier)
+            if supplier_key:
+                supplier_keys.add(supplier_key.lower())
+
+        if draft_count == 0:
+            return None
+
+        return self._DispatchExpectation(
+            action_id=action_id,
+            workflow_id=workflow_id,
+            draft_ids=tuple(sorted(set(draft_ids))),
+            draft_count=draft_count,
+            supplier_count=len(supplier_keys),
+        )
+
+    def _load_dispatch_expectation(
+        self,
+        action_id: Optional[str],
+        workflow_id: Optional[str],
+    ) -> Optional["_DispatchExpectation"]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        rows: List[Tuple[object, object]] = []
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if action_id:
+                        cur.execute(
+                            """
+                            SELECT action_id, process_output
+                            FROM proc.action
+                            WHERE action_id = %s
+                            """,
+                            (action_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            rows.append(row)
+                    else:
+                        cur.execute(
+                            """
+                            SELECT action_id, process_output
+                            FROM proc.action
+                            WHERE agent_type = %s
+                            ORDER BY action_date DESC
+                            LIMIT 20
+                            """,
+                            ("EmailDraftingAgent",),
+                        )
+                        rows.extend(cur.fetchall() or [])
+        except Exception:
+            logger.exception(
+                "Failed to load dispatch expectation for action=%s workflow=%s",
+                action_id,
+                workflow_id,
+            )
+            return None
+
+        workflow_key = self._normalise_filter_value(workflow_id)
+        for row_action_id, payload in rows:
+            output = self._coerce_process_output(payload)
+            if not isinstance(output, dict):
+                continue
+            candidate_workflow = self._coerce_identifier(output.get("workflow_id"))
+            if workflow_key and candidate_workflow:
+                if self._normalise_filter_value(candidate_workflow) != workflow_key:
+                    continue
+            elif workflow_key and not action_id:
+                # Without an explicit action identifier prefer matching workflow metadata
+                continue
+
+            drafts = output.get("drafts") if isinstance(output.get("drafts"), list) else []
+            expectation = self._build_dispatch_expectation(
+                self._coerce_identifier(row_action_id),
+                candidate_workflow or workflow_id,
+                drafts,
+            )
+            if expectation is not None:
+                return expectation
+
+        return None
+
+    def _resolve_dispatch_expectation(
+        self, filters: Optional[Dict[str, object]]
+    ) -> Optional["_DispatchExpectation"]:
+        if not filters:
+            return None
+
+        workflow_candidate = self._coerce_identifier(filters.get("workflow_id"))
+        workflow_key = self._normalise_filter_value(workflow_candidate) if workflow_candidate else None
+        action_candidate: Optional[str] = None
+        for key in ("action_id", "draft_action_id", "email_action_id"):
+            candidate = self._coerce_identifier(filters.get(key)) if filters else None
+            if candidate:
+                action_candidate = candidate
+                break
+
+        if workflow_key and action_candidate:
+            self._workflow_dispatch_actions[workflow_key] = action_candidate
+        elif workflow_key and workflow_key in self._workflow_dispatch_actions:
+            action_candidate = self._workflow_dispatch_actions[workflow_key]
+
+        if not action_candidate and not workflow_candidate:
+            return None
+
+        if action_candidate and action_candidate in self._completed_dispatch_actions:
+            return None
+
+        if action_candidate and action_candidate in self._dispatch_expectations:
+            return self._dispatch_expectations[action_candidate]
+
+        expectation = self._load_dispatch_expectation(action_candidate, workflow_candidate)
+        if expectation and expectation.action_id:
+            self._dispatch_expectations[expectation.action_id] = expectation
+            if expectation.workflow_id:
+                mapped_key = self._normalise_filter_value(expectation.workflow_id)
+                if mapped_key:
+                    self._workflow_dispatch_actions[mapped_key] = expectation.action_id
+        return expectation
+
+    def _count_sent_drafts(self, expectation: "_DispatchExpectation") -> Optional[int]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if expectation.draft_ids:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM proc.draft_rfq_emails
+                            WHERE sent = TRUE AND id = ANY(%s)
+                            """,
+                            (list(expectation.draft_ids),),
+                        )
+                    elif expectation.action_id:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM proc.draft_rfq_emails
+                            WHERE sent = TRUE AND payload::jsonb ->> 'action_id' = %s
+                            """,
+                            (expectation.action_id,),
+                        )
+                    else:
+                        return None
+                    row = cur.fetchone()
+                    if not row:
+                        return 0
+                    return int(row[0])
+        except Exception:
+            logger.exception(
+                "Failed to count sent drafts for action=%s",
+                expectation.action_id,
+            )
+            return None
+
+    def _wait_for_dispatch_completion(
+        self, expectation: "_DispatchExpectation"
+    ) -> bool:
+        if expectation.draft_count <= 0:
+            return True
+
+        timeout = max(self._dispatch_wait_seconds, expectation.draft_count * 60)
+        poll_interval = self._dispatch_wait_seconds if self._dispatch_wait_seconds > 0 else 5.0
+        poll_interval = max(1.0, min(10.0, float(poll_interval)))
+        deadline = time.time() + timeout
+
+        while True:
+            sent_count = self._count_sent_drafts(expectation)
+            if sent_count is None:
+                return False
+            if sent_count >= expectation.draft_count:
+                logger.info(
+                    "Detected %d/%d dispatched RFQ emails for action=%s (workflow=%s); proceeding with inbound poll",
+                    sent_count,
+                    expectation.draft_count,
+                    expectation.action_id,
+                    expectation.workflow_id,
+                )
+                return True
+
+            now = time.time()
+            if now >= deadline:
+                logger.warning(
+                    "Timed out waiting for %d dispatched RFQ emails (current=%d) for action=%s",
+                    expectation.draft_count,
+                    sent_count,
+                    expectation.action_id,
+                )
+                return False
+
+            sleep_for = min(poll_interval, max(0.5, deadline - now))
+            logger.debug(
+                "Waiting %.1fs for dispatched RFQ emails (current=%d/%d, action=%s)",
+                sleep_for,
+                sent_count,
+                expectation.draft_count,
+                expectation.action_id,
+            )
+            time.sleep(sleep_for)
+
+    def _respect_post_dispatch_wait(self, filters: Optional[Dict[str, object]] = None) -> None:
         if self._dispatch_wait_seconds <= 0:
             return
 
@@ -2894,6 +3386,20 @@ class SESEmailWatcher:
             self._last_dispatch_wait_acknowledged is not None
             and candidate_time <= self._last_dispatch_wait_acknowledged
         ):
+            return
+
+        expectation = self._resolve_dispatch_expectation(filters)
+        if expectation is not None and expectation.draft_count > 0:
+            completed = self._wait_for_dispatch_completion(expectation)
+            if expectation.action_id:
+                self._dispatch_expectations.pop(expectation.action_id, None)
+                self._completed_dispatch_actions.add(expectation.action_id)
+                if not completed:
+                    logger.debug(
+                        "Dispatch count check for action=%s ended without reaching target", 
+                        expectation.action_id,
+                    )
+            self._last_dispatch_wait_acknowledged = candidate_time
             return
 
         now = time.time()
