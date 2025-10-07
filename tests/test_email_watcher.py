@@ -314,6 +314,229 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
     assert context.input_data["supplier_id"] == dispatch_row["supplier_id"]
     assert captured_mark["rfq_id"] == dispatch_row["rfq_id"]
 
+
+def test_email_watcher_processes_all_dispatch_replies_before_completion(monkeypatch):
+    rfq_id = "RFQ-20240101-MULTI"
+    base_time = datetime.now(timezone.utc)
+
+    dispatch_rows = [
+        {
+            "rfq_id": rfq_id,
+            "supplier_id": None,
+            "supplier_name": "Alpha Supplies",
+            "recipient_email": "alpha@example.com",
+            "sent_on": base_time - timedelta(minutes=12),
+            "created_on": base_time - timedelta(minutes=20),
+            "updated_on": base_time - timedelta(minutes=11),
+            "sent": True,
+        },
+        {
+            "rfq_id": rfq_id,
+            "supplier_id": None,
+            "supplier_name": "Bravo Industrial",
+            "recipient_email": "bravo@example.com",
+            "sent_on": base_time - timedelta(minutes=10),
+            "created_on": base_time - timedelta(minutes=18),
+            "updated_on": base_time - timedelta(minutes=9),
+            "sent": True,
+        },
+    ]
+
+    class DispatchAwareCursor:
+        def __init__(self, owner):
+            self._owner = owner
+            self._result: List[Tuple] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def _find_by_rfq(self, value: str):
+            matches = [row for row in self._owner.dispatch_rows if row["rfq_id"] == value]
+            matches.sort(key=lambda row: row["updated_on"], reverse=True)
+            return matches[0] if matches else None
+
+        def _find_by_candidates(self, suppliers: List[str], emails: List[str]):
+            suppliers_lc = {str(item).lower() for item in suppliers if item}
+            emails_lc = {str(item).lower() for item in emails if item}
+            ordered = sorted(
+                self._owner.dispatch_rows,
+                key=lambda row: row["updated_on"],
+                reverse=True,
+            )
+            for row in ordered:
+                supplier = str(row.get("supplier_id") or "").lower()
+                recipient = str(row.get("recipient_email") or "").lower()
+                if suppliers_lc and supplier in suppliers_lc:
+                    return row
+                if emails_lc and recipient in emails_lc:
+                    return row
+            return None
+
+        def _row_supplier_first(self, row):
+            if not row:
+                return None
+            return (
+                row.get("supplier_id"),
+                row.get("supplier_name"),
+                row.get("rfq_id"),
+                row.get("sent_on"),
+                bool(row.get("sent", True)),
+                row.get("created_on"),
+                row.get("updated_on"),
+            )
+
+        def _row_rfq_first(self, row):
+            if not row:
+                return None
+            return (
+                row.get("rfq_id"),
+                row.get("supplier_id"),
+                row.get("supplier_name"),
+                row.get("sent_on"),
+                bool(row.get("sent", True)),
+                row.get("created_on"),
+                row.get("updated_on"),
+            )
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            params = params or ()
+            if normalized.startswith(
+                "select supplier_id, supplier_name, rfq_id, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                rfq_value = params[0]
+                row = self._find_by_rfq(rfq_value)
+                self._result = [self._row_supplier_first(row)] if row else []
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                suppliers = params[0] if len(params) > 0 else []
+                emails = params[1] if len(params) > 1 else []
+                row = self._find_by_candidates(list(suppliers or []), list(emails or []))
+                self._result = [self._row_rfq_first(row)] if row else []
+            elif normalized.startswith(
+                "select target_price, negotiation_round from proc.rfq_targets"
+            ):
+                rfq_value = params[0]
+                price = self._owner.target_prices.get(rfq_value)
+                self._result = [(price, 1)] if price is not None else []
+            elif normalized.startswith(
+                "select awaiting_response, last_supplier_msg_id from proc.negotiation_session_state"
+            ):
+                self._result = []
+            elif normalized.startswith("insert into proc.processed_emails"):
+                self._result = []
+            else:
+                self._owner.ddl_statements.append(statement.strip())
+                self._result = []
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+    class DispatchAwareConn:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return DispatchAwareCursor(self._owner)
+
+        def commit(self):
+            pass
+
+    class DispatchAwareNick(DummyNick):
+        def __init__(self, rows, target_price):
+            super().__init__()
+            self.dispatch_rows = list(rows)
+            self.target_prices = {target_price[0]: target_price[1]} if target_price else {}
+            self.marked_responses: List[Dict[str, object]] = []
+
+        def get_db_connection(self):
+            return DispatchAwareConn(self)
+
+    nick = DispatchAwareNick(dispatch_rows, (rfq_id, 1000.0))
+
+    mark_calls: List[Dict[str, object]] = []
+
+    def fake_mark_response(connection, **kwargs):
+        mark_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "services.email_watcher.mark_dispatch_response",
+        fake_mark_response,
+    )
+
+    responses = [
+        {
+            "id": "msg-alpha",
+            "subject": "Re: Pricing for multi RFQ",
+            "body": "Offer 850",
+            "from": "alpha@example.com",
+            "rfq_id": rfq_id,
+            "supplier_id": "SUP-A",
+            "target_price": 1000,
+        },
+        {
+            "id": "msg-bravo",
+            "subject": "Re: Pricing for multi RFQ",
+            "body": "Offer 1250",
+            "from": "bravo@example.com",
+            "rfq_id": rfq_id,
+            "supplier_id": "SUP-B",
+            "target_price": 1000,
+        },
+    ]
+
+    response_iter = iter(responses)
+    loader_calls: List[int] = []
+
+    def loader(limit=None):
+        loader_calls.append(len(loader_calls))
+        try:
+            payload = next(response_iter)
+        except StopIteration:
+            return []
+        return [dict(payload)]
+
+    watcher = _make_watcher(nick, loader=loader)
+    watcher.poll_interval_seconds = 0
+    rfq_key = watcher._normalise_rfq_value(rfq_id)
+
+    first_batch = watcher.poll_once(match_filters={"rfq_id": rfq_id})
+    assert [payload["message_id"] for payload in first_batch] == ["msg-alpha"]
+    assert watcher.supplier_agent.contexts[0].input_data["message_id"] == "msg-alpha"
+    assert len(watcher.supplier_agent.contexts) == 1
+    assert len(watcher.negotiation_agent.contexts) == 0
+    assert rfq_key in watcher._completed_targets
+    assert watcher._rfq_run_counts.get(rfq_key) == 1
+    assert len(mark_calls) == 1
+
+    second_batch = watcher.poll_once(match_filters={"rfq_id": rfq_id})
+    assert [payload["message_id"] for payload in second_batch] == ["msg-bravo"]
+    assert len(watcher.supplier_agent.contexts) == 2
+    assert len(watcher.negotiation_agent.contexts) == 1
+    assert watcher.negotiation_agent.contexts[0].input_data.get("message_id") == "msg-bravo"
+    assert watcher._rfq_run_counts.get(rfq_key) == 2
+    assert rfq_key in watcher._completed_targets
+    assert len(mark_calls) == 2
+    assert {call.get("rfq_id") for call in mark_calls} == {rfq_id}
+    assert {call.get("response_message_id") for call in mark_calls} == {"msg-alpha", "msg-bravo"}
+
+    assert len(list(watcher.state_store.items())) == 2
+    assert len(loader_calls) == 2
+
 def test_poll_once_continues_until_all_filters_match():
     nick = DummyNick()
     messages = [
