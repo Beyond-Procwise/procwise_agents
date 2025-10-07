@@ -700,10 +700,10 @@ class DataExtractionAgent(BaseAgent):
         document_type_hint: Optional[str],
         metadata: Dict[str, Any],
     ):
-        extractor = self._get_document_extractor()
         suffix = Path(object_key).suffix or ".bin"
         temp_path: Optional[Path] = None
         try:
+            extractor = self._get_document_extractor()
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
                 handle.write(file_bytes)
                 handle.flush()
