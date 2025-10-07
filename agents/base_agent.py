@@ -338,6 +338,7 @@ class BaseAgent:
         """Return the cached list of Ollama models available on the host."""
 
         cached: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
+        previous_cache: Optional[List[str]] = list(cached) if cached else None
         if force_refresh or cached is None:
             names: List[str] = []
             try:
@@ -351,10 +352,14 @@ class BaseAgent:
                         names.append(name)
             except Exception as exc:  # pragma: no cover - external dependency failure
                 logger.warning("Failed to retrieve available Ollama models: %s", exc)
-            if not names:
-                names = list(_OLLAMA_FALLBACK_MODELS)
-            cached = names
-            setattr(self.agent_nick, "_available_ollama_models", cached)
+            if names:
+                cached = names
+                setattr(self.agent_nick, "_available_ollama_models", cached)
+            elif previous_cache is not None:
+                cached = previous_cache
+            else:
+                cached = list(_OLLAMA_FALLBACK_MODELS)
+                setattr(self.agent_nick, "_available_ollama_models", cached)
         if not cached:
             cached = list(_OLLAMA_FALLBACK_MODELS)
             setattr(self.agent_nick, "_available_ollama_models", cached)
