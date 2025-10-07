@@ -1617,6 +1617,64 @@ def test_negotiation_counters_reset_between_rounds(monkeypatch):
 
 
 
+def test_workflow_expectation_reduction_flushes_queued_jobs():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    workflow_id = "WF-EXPECT-REDUCE"
+    workflow_key = watcher._normalise_workflow_key(workflow_id)
+
+    def make_metadata(expected: int) -> Dict[str, object]:
+        return {"workflow_id": workflow_id, "expected_supplier_count": expected}
+
+    def make_processed(idx: int) -> Dict[str, object]:
+        return {"message_id": f"msg-{idx}", "negotiation_triggered": False}
+
+    def make_job(idx: int) -> Dict[str, object]:
+        context = AgentContext(
+            workflow_id=workflow_id,
+            agent_id="NegotiationAgent",
+            user_id="tester",
+            input_data={"rfq_id": f"RFQ-{idx}", "target_price": 1000 + idx},
+        )
+        return {
+            "context": context,
+            "rfq_id": f"RFQ-{idx}",
+            "round": 1,
+            "supplier_id": f"SUP-{idx}",
+        }
+
+    for idx in range(3):
+        triggered, output = watcher._register_processed_response(
+            workflow_id,
+            make_metadata(5),
+            make_processed(idx),
+            make_job(idx),
+        )
+        assert triggered is False
+        assert output is None
+
+    assert len(watcher._workflow_negotiation_jobs[workflow_key]) == 3
+    assert watcher._workflow_processed_counts.get(workflow_key) == 3
+    assert watcher._workflow_expected_counts.get(workflow_key) == 5
+
+    final_processed = make_processed(3)
+    triggered, output = watcher._register_processed_response(
+        workflow_id,
+        make_metadata(2),
+        final_processed,
+        make_job(3),
+    )
+
+    assert triggered is True
+    assert output is not None
+    assert final_processed["negotiation_triggered"] is True
+    assert workflow_key not in watcher._workflow_negotiation_jobs
+    assert workflow_key not in watcher._workflow_processed_counts
+    assert workflow_key not in watcher._workflow_expected_counts
+    assert len(watcher.negotiation_agent.contexts) == 4
+
+
+
 def test_sqs_email_loader_extracts_records():
     class StubSQSClient:
         def __init__(self):

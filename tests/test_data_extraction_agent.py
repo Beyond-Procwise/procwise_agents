@@ -234,6 +234,25 @@ def test_raw_payload_merges_into_persistence(monkeypatch):
     assert res["data"]["header_data"]["invoice_id"] == "INV-1"
 
 
+def test_run_document_extraction_handles_extractor_initialisation_failure(monkeypatch):
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+
+    def boom():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(agent, "_get_document_extractor", boom)
+
+    result = agent._run_document_extraction(
+        "invoice.pdf",
+        b"binary",
+        document_type_hint=None,
+        metadata={},
+    )
+
+    assert result is None
+
+
 def test_vectorize_structured_data_creates_points(monkeypatch):
     captured = {}
 
