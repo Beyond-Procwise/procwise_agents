@@ -269,6 +269,20 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
                         json.dumps({}),
                     )
                 ]
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
+                    )
+                ]
             elif normalized.startswith("select target_price"):
                 self._result = []
             else:
@@ -358,6 +372,28 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
             ):
                 self._result = []
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
+            ):
+                payload = json.dumps(
+                    {
+                        "subject": row["subject"],
+                        "body": row["body"],
+                        "recipients": [row["recipient_email"]],
+                    }
+                )
+                self._result = [
+                    (
+                        row["rfq_id"],
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                        payload,
+                    )
+                ]
             elif normalized.startswith(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, subject, body, recipient_email, sender from proc.draft_rfq_emails"
             ):
@@ -1673,6 +1709,64 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     assert workflow_key not in watcher._workflow_expected_counts
     assert len(watcher.negotiation_agent.contexts) == 4
 
+
+def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-123",
+        workflow_id="wf-123",
+        draft_ids=(101, 102, 103),
+        draft_count=3,
+        supplier_count=3,
+    )
+
+    ts = datetime.now(timezone.utc)
+    messages = [
+        {
+            "id": f"emails/msg-{idx}.eml",
+            "subject": f"Subject {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx} -->\nBody {idx}",
+            "_last_modified": ts,
+            "_prefix": watcher._prefixes[0],
+        }
+        for idx in range(1, 4)
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=100 + idx,
+            rfq_id=f"RFQ-{idx}",
+            subject=f"Subject {idx}",
+            body=f"Body {idx}",
+            dispatch_token=f"token-{idx}",
+        )
+        for idx in range(1, 4)
+    ]
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_from_s3",
+        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+
+    watcher._s3_prefix_watchers = {watcher._prefixes[0]: S3ObjectWatcher(limit=10)}
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=True)
+
+    for message in messages:
+        key = message["id"]
+        assert key in state
+        metadata = state.get(key)
+        assert metadata["status"] == "dispatch_copy"
+        assert metadata["dispatch_completed"] is True
 
 
 def test_sqs_email_loader_extracts_records():
