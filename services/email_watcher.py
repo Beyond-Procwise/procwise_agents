@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import imaplib
 import logging
 import mimetypes
@@ -397,6 +398,9 @@ class SESEmailWatcher:
         )
         self._last_dispatch_notified_at: Optional[float] = None
         self._last_dispatch_wait_acknowledged: Optional[float] = None
+        self._dispatch_expectations: Dict[str, "_DispatchExpectation"] = {}
+        self._completed_dispatch_actions: Set[str] = set()
+        self._workflow_dispatch_actions: Dict[str, str] = {}
 
         logger.info(
             "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
@@ -495,7 +499,7 @@ class SESEmailWatcher:
                 )
                 return []
 
-            self._respect_post_dispatch_wait()
+            self._respect_post_dispatch_wait(filters)
 
             attempts = 0
             poll_deadline: Optional[float] = None
@@ -2504,7 +2508,270 @@ class SESEmailWatcher:
         except Exception:  # pragma: no cover - defensive
             logger.debug("Unable to persist dispatch timestamp on agent context")
 
-    def _respect_post_dispatch_wait(self) -> None:
+    @dataclass
+    class _DispatchExpectation:
+        action_id: Optional[str]
+        workflow_id: Optional[str]
+        draft_ids: Tuple[int, ...]
+        draft_count: int
+        supplier_count: int
+
+    @staticmethod
+    def _coerce_identifier(value: object) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    @staticmethod
+    def _coerce_process_output(value: object) -> Optional[Dict[str, object]]:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                logger.debug("Unable to decode process_output JSON", exc_info=True)
+                return None
+        return None
+
+    def _build_dispatch_expectation(
+        self,
+        action_id: Optional[str],
+        workflow_id: Optional[str],
+        drafts: Iterable[object],
+    ) -> Optional["_DispatchExpectation"]:
+        draft_ids: List[int] = []
+        supplier_keys: Set[str] = set()
+        draft_count = 0
+
+        for entry in drafts:
+            if not isinstance(entry, dict):
+                continue
+            draft_count += 1
+            candidate_id = entry.get("draft_record_id") or entry.get("id")
+            try:
+                if candidate_id is not None:
+                    draft_ids.append(int(candidate_id))
+            except Exception:
+                logger.debug("Ignoring non-numeric draft identifier: %r", candidate_id)
+            supplier = entry.get("supplier_id")
+            supplier_key = self._coerce_identifier(supplier)
+            if supplier_key:
+                supplier_keys.add(supplier_key.lower())
+
+        if draft_count == 0:
+            return None
+
+        return self._DispatchExpectation(
+            action_id=action_id,
+            workflow_id=workflow_id,
+            draft_ids=tuple(sorted(set(draft_ids))),
+            draft_count=draft_count,
+            supplier_count=len(supplier_keys),
+        )
+
+    def _load_dispatch_expectation(
+        self,
+        action_id: Optional[str],
+        workflow_id: Optional[str],
+    ) -> Optional["_DispatchExpectation"]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+
+        rows: List[Tuple[object, object]] = []
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if action_id:
+                        cur.execute(
+                            """
+                            SELECT action_id, process_output
+                            FROM proc.action
+                            WHERE action_id = %s
+                            """,
+                            (action_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            rows.append(row)
+                    else:
+                        cur.execute(
+                            """
+                            SELECT action_id, process_output
+                            FROM proc.action
+                            WHERE agent_type = %s
+                            ORDER BY action_date DESC
+                            LIMIT 20
+                            """,
+                            ("EmailDraftingAgent",),
+                        )
+                        rows.extend(cur.fetchall() or [])
+        except Exception:
+            logger.exception(
+                "Failed to load dispatch expectation for action=%s workflow=%s",
+                action_id,
+                workflow_id,
+            )
+            return None
+
+        workflow_key = self._normalise_filter_value(workflow_id)
+        for row_action_id, payload in rows:
+            output = self._coerce_process_output(payload)
+            if not isinstance(output, dict):
+                continue
+            candidate_workflow = self._coerce_identifier(output.get("workflow_id"))
+            if workflow_key and candidate_workflow:
+                if self._normalise_filter_value(candidate_workflow) != workflow_key:
+                    continue
+            elif workflow_key and not action_id:
+                # Without an explicit action identifier prefer matching workflow metadata
+                continue
+
+            drafts = output.get("drafts") if isinstance(output.get("drafts"), list) else []
+            expectation = self._build_dispatch_expectation(
+                self._coerce_identifier(row_action_id),
+                candidate_workflow or workflow_id,
+                drafts,
+            )
+            if expectation is not None:
+                return expectation
+
+        return None
+
+    def _resolve_dispatch_expectation(
+        self, filters: Optional[Dict[str, object]]
+    ) -> Optional["_DispatchExpectation"]:
+        if not filters:
+            return None
+
+        workflow_candidate = self._coerce_identifier(filters.get("workflow_id"))
+        workflow_key = self._normalise_filter_value(workflow_candidate) if workflow_candidate else None
+        action_candidate: Optional[str] = None
+        for key in ("action_id", "draft_action_id", "email_action_id"):
+            candidate = self._coerce_identifier(filters.get(key)) if filters else None
+            if candidate:
+                action_candidate = candidate
+                break
+
+        if workflow_key and action_candidate:
+            self._workflow_dispatch_actions[workflow_key] = action_candidate
+        elif workflow_key and workflow_key in self._workflow_dispatch_actions:
+            action_candidate = self._workflow_dispatch_actions[workflow_key]
+
+        if not action_candidate and not workflow_candidate:
+            return None
+
+        if action_candidate and action_candidate in self._completed_dispatch_actions:
+            return None
+
+        if action_candidate and action_candidate in self._dispatch_expectations:
+            return self._dispatch_expectations[action_candidate]
+
+        expectation = self._load_dispatch_expectation(action_candidate, workflow_candidate)
+        if expectation and expectation.action_id:
+            self._dispatch_expectations[expectation.action_id] = expectation
+            if expectation.workflow_id:
+                mapped_key = self._normalise_filter_value(expectation.workflow_id)
+                if mapped_key:
+                    self._workflow_dispatch_actions[mapped_key] = expectation.action_id
+        return expectation
+
+    def _count_sent_drafts(self, expectation: "_DispatchExpectation") -> Optional[int]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if expectation.draft_ids:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM proc.draft_rfq_emails
+                            WHERE sent = TRUE AND id = ANY(%s)
+                            """,
+                            (list(expectation.draft_ids),),
+                        )
+                    elif expectation.action_id:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM proc.draft_rfq_emails
+                            WHERE sent = TRUE AND payload::jsonb ->> 'action_id' = %s
+                            """,
+                            (expectation.action_id,),
+                        )
+                    else:
+                        return None
+                    row = cur.fetchone()
+                    if not row:
+                        return 0
+                    return int(row[0])
+        except Exception:
+            logger.exception(
+                "Failed to count sent drafts for action=%s",
+                expectation.action_id,
+            )
+            return None
+
+    def _wait_for_dispatch_completion(
+        self, expectation: "_DispatchExpectation"
+    ) -> bool:
+        if expectation.draft_count <= 0:
+            return True
+
+        timeout = max(self._dispatch_wait_seconds, expectation.draft_count * 60)
+        poll_interval = self._dispatch_wait_seconds if self._dispatch_wait_seconds > 0 else 5.0
+        poll_interval = max(1.0, min(10.0, float(poll_interval)))
+        deadline = time.time() + timeout
+
+        while True:
+            sent_count = self._count_sent_drafts(expectation)
+            if sent_count is None:
+                return False
+            if sent_count >= expectation.draft_count:
+                logger.info(
+                    "Detected %d/%d dispatched RFQ emails for action=%s (workflow=%s); proceeding with inbound poll",
+                    sent_count,
+                    expectation.draft_count,
+                    expectation.action_id,
+                    expectation.workflow_id,
+                )
+                return True
+
+            now = time.time()
+            if now >= deadline:
+                logger.warning(
+                    "Timed out waiting for %d dispatched RFQ emails (current=%d) for action=%s",
+                    expectation.draft_count,
+                    sent_count,
+                    expectation.action_id,
+                )
+                return False
+
+            sleep_for = min(poll_interval, max(0.5, deadline - now))
+            logger.debug(
+                "Waiting %.1fs for dispatched RFQ emails (current=%d/%d, action=%s)",
+                sleep_for,
+                sent_count,
+                expectation.draft_count,
+                expectation.action_id,
+            )
+            time.sleep(sleep_for)
+
+    def _respect_post_dispatch_wait(self, filters: Optional[Dict[str, object]] = None) -> None:
         if self._dispatch_wait_seconds <= 0:
             return
 
@@ -2521,6 +2788,20 @@ class SESEmailWatcher:
             self._last_dispatch_wait_acknowledged is not None
             and candidate_time <= self._last_dispatch_wait_acknowledged
         ):
+            return
+
+        expectation = self._resolve_dispatch_expectation(filters)
+        if expectation is not None and expectation.draft_count > 0:
+            completed = self._wait_for_dispatch_completion(expectation)
+            if expectation.action_id:
+                self._dispatch_expectations.pop(expectation.action_id, None)
+                self._completed_dispatch_actions.add(expectation.action_id)
+                if not completed:
+                    logger.debug(
+                        "Dispatch count check for action=%s ended without reaching target", 
+                        expectation.action_id,
+                    )
+            self._last_dispatch_wait_acknowledged = candidate_time
             return
 
         now = time.time()
