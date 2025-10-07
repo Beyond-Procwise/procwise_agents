@@ -1658,8 +1658,9 @@ class SESEmailWatcher:
             if action_payload:
                 workflow_id = self._extract_workflow_id_from_payload(action_payload)
         if not workflow_id:
-            workflow_id = str(uuid.uuid4())
-        metadata.setdefault("workflow_id", workflow_id)
+            workflow_id = self._build_fallback_workflow_id(primary_canonical, rfq_id)
+        if workflow_id:
+            metadata.setdefault("workflow_id", workflow_id)
 
         if target_price is not None:
             try:
@@ -2200,6 +2201,14 @@ class SESEmailWatcher:
 
     def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
         return self._normalise_filter_value(workflow_id) if workflow_id else None
+
+    def _build_fallback_workflow_id(
+        self, primary_canonical: Optional[str], rfq_id: Optional[str]
+    ) -> Optional[str]:
+        canonical = primary_canonical or self._canonical_rfq(rfq_id)
+        if not canonical:
+            return None
+        return f"rfq::{canonical}"
 
     def _flush_negotiation_jobs(
         self, workflow_key: str, current_processed: Dict[str, object]
