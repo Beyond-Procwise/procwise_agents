@@ -1658,6 +1658,12 @@ class SESEmailWatcher:
             if action_payload:
                 workflow_id = self._extract_workflow_id_from_payload(action_payload)
         if not workflow_id:
+            expected_hint = self._derive_expected_supplier_count(metadata, action_payload)
+            if expected_hint:
+                workflow_id = self._resolve_expected_workflow_id(
+                    metadata, rfq_id, negotiation_round
+                )
+        if not workflow_id:
             workflow_id = str(uuid.uuid4())
         metadata.setdefault("workflow_id", workflow_id)
 
@@ -2200,6 +2206,39 @@ class SESEmailWatcher:
 
     def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
         return self._normalise_filter_value(workflow_id) if workflow_id else None
+
+    def _resolve_expected_workflow_id(
+        self,
+        metadata: Dict[str, object],
+        rfq_id: Optional[str],
+        negotiation_round: Optional[int],
+    ) -> Optional[str]:
+        canonical_rfq = metadata.get("canonical_rfq_id")
+        base_identifier: Optional[str] = None
+        if isinstance(canonical_rfq, str) and canonical_rfq.strip():
+            base_identifier = canonical_rfq.strip()
+        elif isinstance(rfq_id, str) and rfq_id.strip():
+            base_identifier = rfq_id.strip()
+        else:
+            metadata_rfq = metadata.get("rfq_id")
+            if isinstance(metadata_rfq, str) and metadata_rfq.strip():
+                base_identifier = metadata_rfq.strip()
+
+        if not base_identifier:
+            return None
+
+        round_hint = metadata.get("round") or negotiation_round
+        if isinstance(round_hint, int):
+            round_value: Optional[str] = str(round_hint)
+        elif isinstance(round_hint, str) and round_hint.strip():
+            round_value = round_hint.strip()
+        else:
+            round_value = None
+
+        if round_value:
+            return f"expected:{base_identifier}:round:{round_value}"
+
+        return f"expected:{base_identifier}"
 
     def _flush_negotiation_jobs(
         self, workflow_key: str, current_processed: Dict[str, object]
