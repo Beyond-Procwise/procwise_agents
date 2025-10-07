@@ -5,6 +5,7 @@ import uuid
 import os
 import tempfile
 import textwrap
+import threading
 from io import BytesIO
 from functools import lru_cache
 from pathlib import Path
@@ -57,6 +58,10 @@ from utils.procurement_schema import (
     PROCUREMENT_SCHEMAS,
     TableSchema,
     extract_structured_content,
+)
+from services.document_extractor import (
+    DocumentExtractor,
+    RAW_TABLE_MAPPING as DOC_EXTRACTOR_RAW_TABLES,
 )
 
 
@@ -632,10 +637,184 @@ class DataExtractionAgent(BaseAgent):
             "document_extraction_model",
             self.settings.extraction_model,
         )
+        self._document_extractor: Optional[DocumentExtractor] = None
+        self._document_extractor_lock = threading.Lock()
 
     # --------------------------------------------------------------------
     # Regex-based header extraction
     # --------------------------------------------------------------------
+    def _get_document_extractor(self) -> DocumentExtractor:
+        extractor = self._document_extractor
+        if extractor is not None:
+            return extractor
+        with self._document_extractor_lock:
+            extractor = self._document_extractor
+            if extractor is None:
+                def _factory():
+                    return self.agent_nick.get_db_connection()
+
+                extractor = DocumentExtractor(
+                    _factory,
+                    reference_path=REFERENCE_PATH,
+                )
+                self._document_extractor = extractor
+        return extractor
+
+    def _build_extractor_metadata(
+        self,
+        object_key: str,
+        text_bundle: DocumentTextBundle,
+        *,
+        force_ocr: bool,
+    ) -> Dict[str, Any]:
+        page_results = text_bundle.page_results or []
+        routing_log = list(text_bundle.routing_log or [])
+        if not routing_log and page_results:
+            routing_log = [
+                {
+                    "page": page.page_number,
+                    "route": page.route,
+                    "digital_chars": getattr(page, "char_count", 0),
+                }
+                for page in page_results
+            ]
+        ocr_pages = sum(1 for page in page_results if getattr(page, "route", "") == "ocr")
+        total_pages = len(page_results)
+        ingestion_mode = "digital"
+        if force_ocr or (total_pages and ocr_pages >= max(1, (total_pages + 1) // 2)):
+            ingestion_mode = "scanned"
+        return {
+            "source_object_key": object_key,
+            "ingestion_mode": ingestion_mode,
+            "ocr": bool(force_ocr or ingestion_mode == "scanned"),
+            "routing_log": routing_log,
+            "page_count": total_pages,
+            "ocr_page_count": ocr_pages,
+        }
+
+    def _run_document_extraction(
+        self,
+        object_key: str,
+        file_bytes: bytes,
+        *,
+        document_type_hint: Optional[str],
+        metadata: Dict[str, Any],
+    ):
+        extractor = self._get_document_extractor()
+        suffix = Path(object_key).suffix or ".bin"
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(file_bytes)
+                handle.flush()
+                temp_path = Path(handle.name)
+            return extractor.extract(
+                temp_path,
+                document_type=document_type_hint,
+                metadata=metadata,
+                source_label=object_key,
+            )
+        except Exception:
+            logger.exception("Document extractor failed for %s", object_key)
+            return None
+        finally:
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    logger.debug(
+                        "Failed to remove temporary file %s", temp_path, exc_info=True
+                    )
+
+    def _fetch_raw_document_payload(
+        self, document_id: Optional[str], document_type: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not document_id or not document_type:
+            return None
+        table_name = DOC_EXTRACTOR_RAW_TABLES.get(document_type)
+        if not table_name:
+            return None
+        table_parts = [part.strip('"') for part in table_name.split(".") if part]
+        quoted_table = ".".join(f'"{part}"' for part in table_parts)
+        conn = None
+        try:
+            conn = self.agent_nick.get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT header_json, line_items_json, tables_json,
+                           raw_text, metadata_json, schema_reference_json
+                    FROM {quoted_table}
+                    WHERE document_id = %s
+                    """,
+                    (document_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            header_json, line_json, tables_json, raw_text, meta_json, schema_json = row
+            payload = {
+                "header": json.loads(header_json) if header_json else {},
+                "line_items": json.loads(line_json) if line_json else [],
+                "tables": json.loads(tables_json) if tables_json else [],
+                "raw_text": raw_text or "",
+                "metadata": json.loads(meta_json) if meta_json else {},
+                "schema_reference": json.loads(schema_json) if schema_json else {},
+            }
+            return payload
+        except Exception:
+            logger.exception(
+                "Unable to read raw extraction payload for %s", document_id
+            )
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.debug("Failed to close raw payload connection", exc_info=True)
+
+    def _trigger_document_extraction(
+        self,
+        object_key: str,
+        file_bytes: bytes,
+        text_bundle: DocumentTextBundle,
+        *,
+        doc_type_hint: Optional[str],
+        force_ocr: bool,
+    ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        metadata = self._build_extractor_metadata(
+            object_key,
+            text_bundle,
+            force_ocr=force_ocr,
+        )
+        result = self._run_document_extraction(
+            object_key,
+            file_bytes,
+            document_type_hint=doc_type_hint,
+            metadata=metadata,
+        )
+        if result is None:
+            return None, None
+        raw_payload = self._fetch_raw_document_payload(
+            getattr(result, "document_id", None),
+            getattr(result, "document_type", None),
+        )
+        if raw_payload is None:
+            raw_payload = {
+                "header": getattr(result, "header", {}) or {},
+                "line_items": getattr(result, "line_items", []) or [],
+                "tables": getattr(result, "tables", []) or [],
+                "raw_text": getattr(result, "raw_text", "") or "",
+                "metadata": getattr(result, "metadata", {}) or metadata,
+                "schema_reference": getattr(result, "schema_reference", {}) or {},
+            }
+        else:
+            raw_metadata = raw_payload.setdefault("metadata", {})
+            raw_metadata.setdefault("source_object_key", metadata.get("source_object_key"))
+            raw_metadata.setdefault("ingestion_mode", metadata.get("ingestion_mode"))
+        return result, raw_payload
+
     def _extract_header_regex(self, text: str, doc_type: str) -> Dict[str, Any]:
         """
         Best-effort extraction of key header fields using simple regular expressions.
@@ -1017,14 +1196,50 @@ class DataExtractionAgent(BaseAgent):
         if not unique_id:
             unique_id = uuid.uuid4().hex[:8]
 
+        extraction_result, raw_payload = self._trigger_document_extraction(
+            object_key,
+            file_bytes,
+            text_bundle,
+            doc_type_hint=doc_type,
+            force_ocr=force_ocr,
+        )
+
+        raw_header: Dict[str, Any] = {}
+        raw_line_items: List[Dict[str, Any]] = []
+        raw_tables: List[Dict[str, Any]] = []
+        raw_schema_reference: Dict[str, Any] = {}
+        if extraction_result:
+            doc_type = getattr(extraction_result, "document_type", doc_type) or doc_type
+            doc_identifier = getattr(extraction_result, "document_id", None)
+            if doc_identifier:
+                unique_id = doc_identifier
+        if raw_payload:
+            raw_header = dict(raw_payload.get("header") or {})
+            raw_line_items = list(raw_payload.get("line_items") or [])
+            raw_tables = raw_payload.get("tables") or []
+            raw_schema_reference = raw_payload.get("schema_reference") or {}
+            raw_text_payload = raw_payload.get("raw_text") or ""
+            if raw_text_payload and (not text or len(raw_text_payload) > len(text)):
+                text = raw_text_payload
+            if not vendor_name:
+                vendor_name = (
+                    raw_header.get("supplier_name")
+                    or raw_header.get("vendor_name")
+                    or vendor_name
+                )
+
         # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
 
-        header: Dict[str, Any] = {"doc_type": doc_type, "product_type": product_type}
-        if vendor_name:
+        header: Dict[str, Any] = self._merge_record_fields(
+            {"doc_type": doc_type, "product_type": product_type}, raw_header
+        )
+        if vendor_name and not header.get("vendor_name"):
             header["vendor_name"] = vendor_name
-        line_items: List[Dict[str, Any]] = []
+        line_items: List[Dict[str, Any]] = list(raw_line_items)
         table_report: Dict[str, Any] = {}
+        if raw_tables:
+            table_report["raw_tables"] = raw_tables
         pk_value = unique_id
         data: Optional[Dict[str, Any]] = None
 
@@ -1032,11 +1247,18 @@ class DataExtractionAgent(BaseAgent):
             structured = self._extract_structured_data(
                 text, file_bytes, doc_type
             )
-            header = structured.header
-            line_items = structured.line_items
-            table_report = structured.report
-            header["doc_type"] = doc_type
-            header["product_type"] = product_type
+            merged_header = self._merge_record_fields(structured.header, raw_header)
+            if vendor_name:
+                merged_header.setdefault("vendor_name", vendor_name)
+            merged_header["doc_type"] = doc_type
+            merged_header["product_type"] = product_type
+            header = merged_header
+            line_items = self._merge_line_items(structured.line_items, raw_line_items)
+            table_report = dict(structured.report or {})
+            if raw_tables:
+                table_report.setdefault("raw_tables", raw_tables)
+            if raw_schema_reference:
+                table_report.setdefault("schema_reference", raw_schema_reference)
 
             if doc_type == "Invoice" and not header.get("invoice_id"):
                 header["invoice_id"] = unique_id
@@ -1075,13 +1297,25 @@ class DataExtractionAgent(BaseAgent):
                 },
                 "report": table_report,
             }
+            if raw_payload:
+                data["raw_extraction"] = {
+                    "header": raw_header,
+                    "line_items": raw_line_items,
+                    "tables": raw_tables,
+                    "metadata": raw_payload.get("metadata", {}),
+                    "schema_reference": raw_schema_reference,
+                    "raw_text": raw_payload.get("raw_text", ""),
+                }
 
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
             self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
 
         result = {"object_key": object_key, "id": pk_value or object_key, "doc_type": doc_type or "", "status": "success"}
         if data:
-            data["raw_text"] = text_bundle.raw_text
+            if raw_payload and raw_payload.get("raw_text"):
+                data["raw_text"] = raw_payload.get("raw_text", "")
+            else:
+                data["raw_text"] = text_bundle.raw_text
             data["ocr_text"] = text_bundle.ocr_text
             data["page_routes"] = text_bundle.routing_log
             result["data"] = data

@@ -3,12 +3,17 @@ import sys
 import json
 from types import SimpleNamespace
 
+import pandas as pd
 from pytest import approx
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
-from agents.data_extraction_agent import DataExtractionAgent, DocumentTextBundle
+from agents.data_extraction_agent import (
+    DataExtractionAgent,
+    DocumentTextBundle,
+    StructuredExtractionResult,
+)
 
 
 def test_vectorize_document_normalizes_labels(monkeypatch):
@@ -98,6 +103,7 @@ def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
     monkeypatch.setattr(agent, "_classify_product_type", lambda t: "it hardware")
     monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "C123")
     monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: captured.setdefault("persist", True))
+    monkeypatch.setattr(agent, "_trigger_document_extraction", lambda *args, **kwargs: (None, None))
 
     def fake_vectorize(text, pk, dt, pt, key):
         captured["doc_type"] = dt
@@ -114,6 +120,118 @@ def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
     assert "persist" in captured  # should attempt DB insert
     assert res["id"] == "C123"
     assert res["doc_type"] == "Contract"
+
+
+def test_raw_payload_merges_into_persistence(monkeypatch):
+    from io import BytesIO
+    import numpy as np
+
+    captured = {}
+    flags = {}
+
+    nick = SimpleNamespace(
+        s3_client=SimpleNamespace(
+            get_object=lambda Bucket, Key: {"Body": BytesIO(b"fake")}
+        ),
+        embedding_model=SimpleNamespace(
+            encode=lambda chunks, **kwargs: [np.zeros(3) for _ in chunks]
+        ),
+        qdrant_client=SimpleNamespace(upsert=lambda **kwargs: None),
+        _initialize_qdrant_collection=lambda: None,
+        settings=SimpleNamespace(
+            s3_bucket_name="bucket",
+            s3_prefixes=[],
+            qdrant_collection_name="collection",
+            extraction_model="model",
+        ),
+    )
+
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(
+        agent,
+        "_extract_text",
+        lambda b, k, force_ocr=False: DocumentTextBundle(
+            full_text="invoice text",
+            page_results=[],
+            raw_text="invoice raw",
+            ocr_text="",
+        ),
+    )
+    monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Invoice")
+    monkeypatch.setattr(agent, "_classify_product_type", lambda t: "hardware")
+    monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "")
+    monkeypatch.setattr(agent, "_vectorize_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_vectorize_structured_data", lambda *args, **kwargs: None)
+
+    structured = StructuredExtractionResult(
+        header={"invoice_id": "INV-1", "payment_terms": "Net 30"},
+        line_items=[{"item_description": "Laptop", "quantity": "2"}],
+        header_df=pd.DataFrame([{"invoice_id": "INV-1"}]),
+        line_df=pd.DataFrame([{"item_description": "Laptop"}]),
+        report={"table_method": "none"},
+    )
+    monkeypatch.setattr(
+        agent, "_extract_structured_data", lambda text, fb, dt: structured
+    )
+
+    stub_result = SimpleNamespace(
+        document_type="Invoice",
+        document_id="INV-1",
+        header={"invoice_id": "INV-1"},
+        line_items=[{"item_description": "Laptop", "quantity": "2"}],
+        tables=[],
+        raw_text="invoice text from extractor",
+        metadata={"ingestion_mode": "digital"},
+        schema_reference={"document_type": "Invoice"},
+    )
+
+    def fake_run(object_key, file_bytes, document_type_hint=None, metadata=None):
+        flags["extract_called"] = True
+        return stub_result
+
+    monkeypatch.setattr(agent, "_run_document_extraction", fake_run)
+
+    stub_raw_payload = {
+        "header": {"invoice_id": "INV-1", "supplier_name": "ACME Components"},
+        "line_items": [
+            {
+                "item_description": "Laptop",
+                "quantity": "2",
+                "unit_price": "700",
+                "line_amount": "1400",
+            }
+        ],
+        "tables": [],
+        "raw_text": "invoice text from extractor",
+        "metadata": {"ingestion_mode": "digital"},
+        "schema_reference": {"document_type": "Invoice"},
+    }
+
+    def fake_fetch(doc_id, doc_type):
+        flags["raw_fetch"] = (doc_id, doc_type)
+        return stub_raw_payload
+
+    monkeypatch.setattr(agent, "_fetch_raw_document_payload", fake_fetch)
+
+    def fake_persist(header, line_items, doc_type, pk_value):
+        captured["header"] = header
+        captured["line_items"] = line_items
+        captured["doc_type"] = doc_type
+        captured["pk"] = pk_value
+
+    monkeypatch.setattr(agent, "_persist_to_postgres", fake_persist)
+
+    res = agent._process_single_document("invoice.pdf")
+
+    assert flags.get("extract_called") is True
+    assert flags.get("raw_fetch") == ("INV-1", "Invoice")
+    assert captured["header"]["supplier_name"] == "ACME Components"
+    assert captured["doc_type"] == "Invoice"
+    assert captured["pk"] == "INV-1"
+    assert captured["line_items"][0]["line_amount"] == "1400"
+    assert res["data"]["raw_extraction"]["header"]["supplier_name"] == "ACME Components"
+    assert res["data"]["header_data"]["invoice_id"] == "INV-1"
 
 
 def test_vectorize_structured_data_creates_points(monkeypatch):
