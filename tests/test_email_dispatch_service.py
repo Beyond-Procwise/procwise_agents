@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
-from utils.email_markers import extract_rfq_id, split_hidden_marker
+from utils.email_markers import extract_rfq_id, extract_run_id, split_hidden_marker
 
 
 class InMemoryDraftStore:
@@ -242,6 +242,14 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert body_comment and extract_rfq_id(body_comment) == "RFQ-UNIT"
     assert "RFQ-UNIT" not in body_visible
     assert result["draft"]["dispatch_metadata"].get("dispatch_token")
+    assert result["draft"]["dispatch_metadata"].get("run_id")
+    assert (
+        result["draft"]["dispatch_metadata"].get("dispatch_token")
+        == result["draft"]["dispatch_metadata"].get("run_id")
+    )
+    assert result["draft"].get("dispatch_run_id") == result["draft"]["dispatch_metadata"]["run_id"]
+    comment_run_id = extract_run_id(body_comment)
+    assert comment_run_id == result["draft"]["dispatch_metadata"]["run_id"]
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
@@ -252,4 +260,5 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert sent_args["sender"] == "sender@example.com"
     sent_comment, sent_visible = split_hidden_marker(sent_args["body"])
     assert sent_comment and extract_rfq_id(sent_comment) == "RFQ-UNIT"
+    assert extract_run_id(sent_comment) == result["draft"]["dispatch_metadata"]["run_id"]
     assert "RFQ-UNIT" not in sent_visible

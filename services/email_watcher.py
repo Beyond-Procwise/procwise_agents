@@ -39,6 +39,12 @@ from services.email_thread_store import (
     lookup_rfq_from_threads,
     sanitise_thread_table_name,
 )
+from utils.email_markers import (
+    extract_marker_token,
+    extract_rfq_id,
+    extract_run_id,
+    split_hidden_marker,
+)
 from utils.gpu import configure_gpu
 
 
@@ -555,7 +561,17 @@ class SESEmailWatcher:
                 )
                 return []
 
-            self._respect_post_dispatch_wait(filters)
+            dispatch_expectation, dispatch_completed = self._respect_post_dispatch_wait(
+                filters
+            )
+            if dispatch_expectation is not None and self._custom_loader is None:
+                try:
+                    self._acknowledge_recent_dispatch(dispatch_expectation, dispatch_completed)
+                except Exception:
+                    logger.exception(
+                        "Failed to reconcile dispatched emails for action=%s",
+                        dispatch_expectation.action_id,
+                    )
 
             attempts = 0
             poll_deadline: Optional[float] = None
@@ -969,6 +985,9 @@ class SESEmailWatcher:
                 "status": "processed",
                 "payload": processed_payload,
             }
+            run_identifier = processed_payload.get("dispatch_run_id")
+            if run_identifier:
+                metadata["dispatch_run_id"] = run_identifier
         else:
             logger.warning(
                 "Skipped message %s for mailbox %s: %s",
@@ -1670,6 +1689,9 @@ class SESEmailWatcher:
 
         message_identifier = message.get("message_id") or message.get("id")
         processed: Dict[str, object] = {"message_id": message_identifier}
+        dispatch_run_id = metadata.get("dispatch_run_id") or message.get("dispatch_run_id")
+        if dispatch_run_id:
+            processed["dispatch_run_id"] = dispatch_run_id
         if message.get("s3_key"):
             processed["s3_key"] = message.get("s3_key")
         if message.get("_bucket"):
@@ -1899,6 +1921,21 @@ class SESEmailWatcher:
                         if dispatch_payload:
                             dispatch_record["payload"] = dispatch_payload
                             details["dispatch_payload"] = dispatch_payload
+                            run_identifier = (
+                                dispatch_payload.get("dispatch_run_id")
+                                or dispatch_payload.get("run_id")
+                            )
+                            if not run_identifier:
+                                meta_block = dispatch_payload.get("dispatch_metadata")
+                                if isinstance(meta_block, dict):
+                                    run_identifier = (
+                                        meta_block.get("run_id")
+                                        or meta_block.get("dispatch_run_id")
+                                        or meta_block.get("dispatch_token")
+                                    )
+                            if run_identifier:
+                                details["dispatch_run_id"] = run_identifier
+                                dispatch_record["run_id"] = run_identifier
                             action_identifier = self._extract_action_id_from_payload(
                                 dispatch_payload
                             )
@@ -2912,6 +2949,11 @@ class SESEmailWatcher:
         payload_sender_email = self._normalise_email(payload.get("from_address"))
         payload_message = self._normalise_filter_value(payload.get("message_id")) or self._normalise_filter_value(payload.get("id"))
         payload_workflow = self._normalise_filter_value(payload.get("workflow_id"))
+        payload_run_id = self._normalise_filter_value(
+            payload.get("dispatch_run_id")
+            or payload.get("run_id")
+            or payload.get("dispatch_token")
+        )
 
         payload_rfq_canonicals: Set[str] = set()
         primary_canonical = self._canonical_rfq(payload.get("rfq_id"))
@@ -3013,6 +3055,10 @@ class SESEmailWatcher:
             elif key == "message_id_like":
                 if not _like(payload_message, expected):
                     return False
+            elif key == "dispatch_run_id":
+                expected_run = self._normalise_filter_value(expected)
+                if expected_run and payload_run_id != expected_run:
+                    return False
         return True
 
     @staticmethod
@@ -3031,7 +3077,7 @@ class SESEmailWatcher:
             except Exception:
                 return False
 
-        for field in ("rfq_id", "supplier_id", "from_address", "workflow_id"):
+        for field in ("rfq_id", "supplier_id", "from_address", "workflow_id", "dispatch_run_id"):
             if field in filters and _should_fill(field):
                 candidate = filters.get(field)
                 if candidate not in (None, ""):
@@ -3121,6 +3167,43 @@ class SESEmailWatcher:
         draft_ids: Tuple[int, ...]
         draft_count: int
         supplier_count: int
+
+    @dataclass
+    class _DraftSnapshot:
+        id: int
+        rfq_id: Optional[str]
+        subject: str
+        body: str
+        dispatch_token: Optional[str]
+        run_id: Optional[str] = None
+        recipients: Tuple[str, ...] = ()
+        subject_norm: str = field(init=False)
+        body_norm: str = field(init=False)
+        matched_via: str = field(default="unknown")
+
+        def __post_init__(self) -> None:
+            comment, remainder = split_hidden_marker(self.body or "")
+            cleaned_body = remainder or self.body or ""
+            token = extract_marker_token(comment)
+            run_identifier = extract_run_id(comment)
+            if self.dispatch_token is None and token:
+                object.__setattr__(self, "dispatch_token", token)
+            if self.run_id is None:
+                candidate_run = run_identifier or token or self.dispatch_token
+                if candidate_run:
+                    object.__setattr__(self, "run_id", candidate_run)
+            object.__setattr__(self, "subject_norm", _norm(self.subject or ""))
+            object.__setattr__(self, "body_norm", _norm(cleaned_body))
+
+        def normalised_recipients(self) -> Set[str]:
+            recipients = set()
+            for item in self.recipients:
+                if not isinstance(item, str):
+                    continue
+                cleaned = item.strip().lower()
+                if cleaned:
+                    recipients.add(cleaned)
+            return recipients
 
     @staticmethod
     def _coerce_identifier(value: object) -> Optional[str]:
@@ -3339,8 +3422,9 @@ class SESEmailWatcher:
             return True
 
         timeout = max(self._dispatch_wait_seconds, expectation.draft_count * 60)
-        poll_interval = self._dispatch_wait_seconds if self._dispatch_wait_seconds > 0 else 5.0
-        poll_interval = max(1.0, min(10.0, float(poll_interval)))
+        timeout = min(timeout, 300)
+        base_interval = self._dispatch_wait_seconds if self._dispatch_wait_seconds > 0 else 5.0
+        poll_interval = max(1.0, min(10.0, float(base_interval)))
         deadline = time.time() + timeout
 
         while True:
@@ -3377,9 +3461,229 @@ class SESEmailWatcher:
             )
             time.sleep(sleep_for)
 
-    def _respect_post_dispatch_wait(self, filters: Optional[Dict[str, object]] = None) -> None:
-        if self._dispatch_wait_seconds <= 0:
+    def _acknowledge_recent_dispatch(
+        self,
+        expectation: "_DispatchExpectation",
+        completed: bool,
+    ) -> None:
+        expected_count = max(0, expectation.draft_count)
+        if expected_count == 0:
             return
+
+        messages: List[Dict[str, object]] = []
+        try:
+            messages = self._load_from_s3(
+                expected_count,
+                prefixes=self._prefixes,
+                newest_first=True,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to load recent dispatch copies for action=%s",
+                expectation.action_id,
+            )
+            return
+
+        if not messages:
+            return
+
+        drafts = self._fetch_recent_dispatched_drafts(expectation, expected_count)
+        if not drafts:
+            return
+
+        unmatched: List[SESEmailWatcher._DraftSnapshot] = list(drafts)
+        for message in messages:
+            if not unmatched:
+                break
+            match = self._match_dispatched_message(message, unmatched)
+            if match is None:
+                continue
+            unmatched.remove(match)
+            message_id = str(message.get("id") or "")
+            if not message_id:
+                continue
+            metadata = {
+                "status": "dispatch_copy",
+                "draft_id": match.id,
+                "rfq_id": match.rfq_id,
+                "run_id": match.run_id,
+                "matched_via": match.matched_via,
+                "dispatch_completed": completed,
+            }
+            if self.state_store is not None:
+                self.state_store.add(message_id, metadata)
+            last_modified = message.get("_last_modified")
+            if isinstance(last_modified, datetime):
+                self._update_watermark(last_modified, message_id)
+            prefix_hint = message.get("_prefix")
+            if isinstance(prefix_hint, str):
+                watcher = self._s3_prefix_watchers.get(prefix_hint)
+                if watcher is not None:
+                    watcher.mark_known(message_id, last_modified if isinstance(last_modified, datetime) else None)
+            logger.debug(
+                "Recorded dispatched email copy %s for draft_id=%s (matched_via=%s)",
+                message_id,
+                match.id,
+                match.matched_via,
+            )
+
+    def _fetch_recent_dispatched_drafts(
+        self,
+        expectation: "_DispatchExpectation",
+        limit: int,
+    ) -> List["_DraftSnapshot"]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return []
+
+        query: str
+        params: Tuple[object, ...]
+        if expectation.draft_ids:
+            query = (
+                """
+                SELECT id, rfq_id, subject, body, payload
+                FROM proc.draft_rfq_emails
+                WHERE id = ANY(%s)
+                ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
+                LIMIT %s
+                """
+            )
+            params = (list(expectation.draft_ids), limit)
+        else:
+            query = (
+                """
+                SELECT id, rfq_id, subject, body, payload
+                FROM proc.draft_rfq_emails
+                WHERE sent = TRUE
+                ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
+                LIMIT %s
+                """
+            )
+            params = (limit,)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    rows = cur.fetchall() or []
+        except Exception:
+            logger.exception(
+                "Failed to fetch dispatched draft rows for action=%s",
+                expectation.action_id,
+            )
+            return []
+
+        snapshots: List[SESEmailWatcher._DraftSnapshot] = []
+        for row in rows:
+            if not row:
+                continue
+            draft_id = row[0]
+            rfq_id = row[1]
+            subject = row[2] or ""
+            body = row[3] or ""
+            payload_doc = self._safe_parse_json(row[4]) if len(row) > 4 else None
+
+            dispatch_token: Optional[str] = None
+            run_id: Optional[str] = None
+            recipients: Tuple[str, ...] = ()
+            if isinstance(payload_doc, dict):
+                dispatch_meta = payload_doc.get("dispatch_metadata")
+                if isinstance(dispatch_meta, dict):
+                    dispatch_token = dispatch_meta.get("dispatch_token") or dispatch_meta.get("token")
+                    run_id = (
+                        dispatch_meta.get("run_id")
+                        or dispatch_meta.get("dispatch_run_id")
+                        or run_id
+                    )
+                meta_field = payload_doc.get("metadata")
+                if isinstance(meta_field, dict):
+                    if not dispatch_token:
+                        dispatch_token = meta_field.get("dispatch_token")
+                    if run_id is None:
+                        run_id = meta_field.get("run_id")
+                payload_subject = payload_doc.get("subject")
+                payload_body = payload_doc.get("body") or payload_doc.get("negotiation_message")
+                if not subject and isinstance(payload_subject, str):
+                    subject = payload_subject
+                if isinstance(payload_body, str) and payload_body.strip():
+                    body = payload_body
+                recipients_field = payload_doc.get("recipients")
+                if isinstance(recipients_field, (list, tuple)):
+                    recipients = tuple(
+                        str(item).strip()
+                        for item in recipients_field
+                        if isinstance(item, str) and item.strip()
+                    )
+
+            if run_id is None and dispatch_token:
+                run_id = dispatch_token
+
+            try:
+                draft_id_int = int(draft_id)
+            except Exception:
+                logger.debug("Ignoring draft with non-numeric id: %r", draft_id)
+                continue
+
+            snapshots.append(
+                self._DraftSnapshot(
+                    id=draft_id_int,
+                    rfq_id=str(rfq_id) if rfq_id is not None else None,
+                    subject=str(subject),
+                    body=str(body),
+                    dispatch_token=dispatch_token,
+                    run_id=run_id,
+                    recipients=recipients,
+                )
+            )
+
+        return snapshots
+
+    def _match_dispatched_message(
+        self,
+        message: Dict[str, object],
+        drafts: List["_DraftSnapshot"],
+    ) -> Optional["_DraftSnapshot"]:
+        if not drafts:
+            return None
+
+        body = str(message.get("body") or "")
+        comment, remainder = split_hidden_marker(body)
+        token = extract_marker_token(comment)
+        run_identifier = extract_run_id(comment)
+        subject_norm = _norm(str(message.get("subject") or ""))
+        body_norm = _norm(remainder or body)
+
+        # 1) Match by run identifier / dispatch token
+        identifier = run_identifier or token
+        if identifier:
+            for draft in drafts:
+                candidate = draft.run_id or draft.dispatch_token
+                if candidate and identifier == candidate:
+                    object.__setattr__(draft, "matched_via", "dispatch_token")
+                    return draft
+
+        # 2) Match by normalised subject/body
+        for draft in drafts:
+            if draft.subject_norm and subject_norm:
+                if subject_norm == draft.subject_norm:
+                    object.__setattr__(draft, "matched_via", "subject")
+                    return draft
+            if draft.body_norm and body_norm and draft.body_norm == body_norm:
+                object.__setattr__(draft, "matched_via", "body")
+                return draft
+            if draft.body_norm and body_norm and (
+                draft.body_norm in body_norm or body_norm in draft.body_norm
+            ):
+                object.__setattr__(draft, "matched_via", "body_contains")
+                return draft
+
+        return None
+
+    def _respect_post_dispatch_wait(
+        self, filters: Optional[Dict[str, object]] = None
+    ) -> Tuple[Optional["_DispatchExpectation"], bool]:
+        if self._dispatch_wait_seconds <= 0:
+            return None, False
 
         candidate_time: Optional[float] = self._last_dispatch_notified_at
         agent_time = getattr(self.agent_nick, "email_dispatch_last_sent_at", None)
@@ -3388,15 +3692,16 @@ class SESEmailWatcher:
             candidate_time = agent_value if candidate_time is None else max(candidate_time, agent_value)
 
         if candidate_time is None:
-            return
+            return None, False
 
         if (
             self._last_dispatch_wait_acknowledged is not None
             and candidate_time <= self._last_dispatch_wait_acknowledged
         ):
-            return
+            return None, False
 
         expectation = self._resolve_dispatch_expectation(filters)
+        completed = False
         if expectation is not None and expectation.draft_count > 0:
             completed = self._wait_for_dispatch_completion(expectation)
             if expectation.action_id:
@@ -3404,11 +3709,11 @@ class SESEmailWatcher:
                 self._completed_dispatch_actions.add(expectation.action_id)
                 if not completed:
                     logger.debug(
-                        "Dispatch count check for action=%s ended without reaching target", 
+                        "Dispatch count check for action=%s ended without reaching target",
                         expectation.action_id,
                     )
             self._last_dispatch_wait_acknowledged = candidate_time
-            return
+            return expectation, completed
 
         now = time.time()
         elapsed = now - candidate_time
@@ -3425,6 +3730,7 @@ class SESEmailWatcher:
             time.sleep(pause_seconds)
 
         self._last_dispatch_wait_acknowledged = candidate_time
+        return expectation, False
 
     def _scan_recent_s3_objects(
         self,
@@ -3652,8 +3958,22 @@ class SESEmailWatcher:
             parsed["s3_key"] = key
             parsed["_s3_etag"] = etag
             parsed["_last_modified"] = last_modified
+            parsed["_prefix"] = prefix
             if size_bytes is not None:
                 parsed["_content_length"] = size_bytes
+            body_text = str(parsed.get("body") or "")
+            comment, _body_remainder = split_hidden_marker(body_text)
+            token = extract_marker_token(comment)
+            run_identifier = extract_run_id(comment) or token
+            if run_identifier:
+                parsed["dispatch_run_id"] = run_identifier
+                parsed.setdefault("dispatch_token", run_identifier)
+            if token and "dispatch_token" not in parsed:
+                parsed["dispatch_token"] = token
+            if comment and "rfq_id" not in parsed:
+                rfq_hint = extract_rfq_id(comment)
+                if rfq_hint:
+                    parsed["rfq_id"] = rfq_hint
             collected.append((last_modified, parsed))
             seen_keys.add(key)
             watcher.mark_known(key, last_modified)
