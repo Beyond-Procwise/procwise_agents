@@ -2180,20 +2180,11 @@ class SESEmailWatcher:
                         metadata["workflow_id"] = workflow_hint
 
         existing_expected = self._workflow_expected_counts.get(workflow_key)
-        existing_processed = self._workflow_processed_counts.get(workflow_key)
         expected = self._derive_expected_supplier_count(metadata, action_payload)
         if expected is not None:
             if existing_expected != expected:
                 self._workflow_expected_counts[workflow_key] = expected
-                if expected <= 0:
-                    self._workflow_processed_counts.pop(workflow_key, None)
-                elif existing_processed is not None:
-                    self._workflow_processed_counts[workflow_key] = min(
-                        existing_processed,
-                        expected,
-                    )
-                else:
-                    self._workflow_processed_counts.pop(workflow_key, None)
+                self._workflow_processed_counts.pop(workflow_key, None)
             return expected
 
         return existing_expected
