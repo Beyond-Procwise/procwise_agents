@@ -240,6 +240,20 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
         def execute(self, statement, params=None):
             normalized = " ".join(statement.split()).lower()
             if normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
+                    )
+                ]
+            elif normalized.startswith(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
             ):
                 self._result = [
@@ -374,6 +388,27 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
                         row["body"],
                         row["recipient_email"],
                         row["sender"],
+                    )
+                ]
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
+            ):
+                payload = {
+                    "subject": row["subject"],
+                    "body": row["body"],
+                    "recipient_email": row["recipient_email"],
+                    "sender": row["sender"],
+                }
+                self._result = [
+                    (
+                        row["rfq_id"],
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                        json.dumps(payload),
                     )
                 ]
             elif normalized.startswith(
@@ -720,7 +755,7 @@ def test_email_watcher_maps_multiple_rfq_ids():
     assert watcher._matches_filters(secondary_payload, {"workflow_id": payload["workflow_id"]})
 
 
-def test_email_watcher_matches_mixed_case_workflow_filters(monkeypatch):
+def test_email_watcher_matches_mixed_case_workflow_filters():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
 
@@ -733,15 +768,15 @@ def test_email_watcher_matches_mixed_case_workflow_filters(monkeypatch):
         }
     ]
 
-    monkeypatch.setattr("services.email_watcher.uuid.uuid4", lambda: "WF-Alpha-01")
-
     watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    canonical_rfq = watcher._canonical_rfq("RFQ-20240101-abcd1234")
+    fallback_workflow = f"rfq::{canonical_rfq}"
 
-    results = watcher.poll_once(match_filters={"workflow_id": "wf-alpha-01"})
+    results = watcher.poll_once(match_filters={"workflow_id": fallback_workflow.lower()})
 
     assert len(results) == 1
     payload = results[0]
-    assert payload["workflow_id"] == "WF-Alpha-01"
+    assert payload["workflow_id"] == fallback_workflow
 
     workflow_key = watcher._normalise_filter_value(payload["workflow_id"])
     canonical_rfq = watcher._canonical_rfq(payload["rfq_id"])
