@@ -41,6 +41,181 @@ RAW_TABLE_MAPPING = {
     "Quote": "proc.raw_quotes",
 }
 
+# Canonical procurement structures derived from ``docs/procurement_table_reference.md``.
+# The keywords are used to align observed keys and column headers with the
+# database schema so extracted payloads remain faithful to downstream tables.
+PROCUREMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
+    "Invoice": {
+        "header_fields": [
+            "invoice_id",
+            "po_id",
+            "supplier_name",
+            "invoice_date",
+            "due_date",
+            "invoice_paid_date",
+            "payment_terms",
+            "currency",
+            "invoice_amount",
+            "tax_percent",
+            "tax_amount",
+            "invoice_total_incl_tax",
+        ],
+        "line_item_fields": [
+            "item_description",
+            "item_id",
+            "quantity",
+            "unit_of_measure",
+            "unit_price",
+            "line_amount",
+            "tax_percent",
+            "tax_amount",
+            "total_amount_incl_tax",
+        ],
+    },
+    "Purchase_Order": {
+        "header_fields": [
+            "po_id",
+            "supplier_name",
+            "buyer_id",
+            "requisition_id",
+            "requested_by",
+            "requested_date",
+            "order_date",
+            "expected_delivery_date",
+            "currency",
+            "total_amount",
+            "payment_terms",
+        ],
+        "line_item_fields": [
+            "item_description",
+            "item_id",
+            "line_number",
+            "quantity",
+            "unit_price",
+            "unit_of_measure",
+            "line_total",
+            "tax_percent",
+            "tax_amount",
+        ],
+    },
+    "Contract": {
+        "header_fields": [
+            "contract_id",
+            "contract_title",
+            "contract_type",
+            "supplier_name",
+            "contract_start_date",
+            "contract_end_date",
+            "currency",
+            "total_contract_value",
+            "payment_terms",
+        ],
+        "line_item_fields": [
+            "item_description",
+            "quantity",
+            "unit_price",
+            "line_amount",
+        ],
+    },
+    "Quote": {
+        "header_fields": [
+            "quote_id",
+            "supplier_name",
+            "buyer_id",
+            "quote_date",
+            "validity_date",
+            "currency",
+            "total_amount",
+            "tax_percent",
+            "tax_amount",
+            "total_amount_incl_tax",
+        ],
+        "line_item_fields": [
+            "item_description",
+            "quantity",
+            "unit_price",
+            "line_amount",
+            "tax_percent",
+            "tax_amount",
+        ],
+    },
+}
+
+HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
+    "*": {
+        "supplier_name": [("supplier",), ("vendor",), ("seller",), ("payee",)],
+        "payment_terms": [("payment", "terms"), ("terms", "payment")],
+        "currency": [("currency",), ("curr",), ("currency", "code"), ("amount", "usd"), ("amount", "eur")],
+        "total_amount": [("total", "amount"), ("grand", "total"), ("amount", "due")],
+        "tax_amount": [("tax", "amount")],
+        "tax_percent": [("tax", "percent"), ("tax", "rate")],
+    },
+    "Invoice": {
+        "invoice_id": [("invoice", "number"), ("invoice", "no"), ("invoice", "#")],
+        "invoice_date": [("invoice", "date")],
+        "due_date": [("due", "date")],
+        "invoice_paid_date": [("paid", "date"), ("payment", "date")],
+        "invoice_total_incl_tax": [
+            ("total", "incl", "tax"),
+            ("invoice", "total"),
+            ("total", "due"),
+            ("total", "invoice"),
+            ("total", "amount"),
+        ],
+        "invoice_amount": [("invoice", "amount"), ("amount", "due"), ("amount", "payable")],
+        "po_id": [
+            ("purchase", "order", "number"),
+            ("purchase", "order", "no"),
+            ("po", "number"),
+            ("po", "no"),
+        ],
+    },
+    "Purchase_Order": {
+        "po_id": [("purchase", "order", "number"), ("purchase", "order", "no"), ("po", "number"), ("po", "#")],
+        "order_date": [("order", "date")],
+        "requested_date": [("requested", "date")],
+        "expected_delivery_date": [("delivery", "date"), ("expected", "delivery")],
+        "total_amount": [("total", "amount"), ("order", "total")],
+    },
+    "Contract": {
+        "contract_id": [("contract", "number"), ("contract", "no"), ("contract", "#")],
+        "contract_title": [("contract", "title"), ("title", "contract")],
+        "contract_start_date": [("start", "date"), ("commencement", "date")],
+        "contract_end_date": [("end", "date"), ("expiry", "date"), ("expiration", "date")],
+        "total_contract_value": [("total", "value"), ("contract", "value")],
+    },
+    "Quote": {
+        "quote_id": [("quote", "number"), ("quotation", "number"), ("quote", "#"), ("quotation", "#")],
+        "quote_date": [("quote", "date"), ("quotation", "date")],
+        "validity_date": [("valid", "until"), ("valid", "date"), ("expiry", "date")],
+        "total_amount": [("total", "amount"), ("quote", "total")],
+    },
+}
+
+LINE_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
+    "*": {
+        "item_description": [
+            ("item",),
+            ("description",),
+            ("product",),
+            ("service",),
+        ],
+        "quantity": [("qty",), ("quantity",), ("units",), ("unit", "qty")],
+        "unit_price": [("unit", "price"), ("price", "unit"), ("unit", "cost")],
+        "line_amount": [("line", "total"), ("line", "amount"), ("amount",), ("total",)],
+        "unit_of_measure": [("uom",), ("unit", "measure"), ("measure",)],
+    },
+    "Purchase_Order": {
+        "line_total": [("line", "total"), ("total",)],
+    },
+    "Quote": {
+        "line_amount": [("amount",), ("line", "total")],
+    },
+    "Invoice": {
+        "line_amount": [("line", "total"), ("line", "amount"), ("amount",)],
+    },
+}
+
 
 class _LocalModelExtractor:
     """Thin wrapper around a local Ollama model for structured extraction."""
@@ -277,8 +452,11 @@ class DocumentExtractor:
             detected_type = "Contract"
 
         header = self._extract_header_fields(text, detected_type)
-        line_items, derived_tables = self._extract_line_items_from_text(text)
+        line_items, derived_tables = self._extract_line_items_from_text(
+            text, detected_type
+        )
         field_hints = self._build_field_hints(
+            detected_type,
             header,
             line_items,
             detected_tables,
@@ -296,11 +474,17 @@ class DocumentExtractor:
             header = self._merge_header_fields(
                 header, llm_payload.get("header"), detected_type
             )
-            llm_line_items = self._normalise_llm_line_items(llm_payload.get("line_items"))
+            llm_line_items = self._normalise_llm_line_items(
+                llm_payload.get("line_items"), detected_type
+            )
             line_items = self._merge_line_items(line_items, llm_line_items)
-            derived_tables.extend(self._normalise_llm_tables(llm_payload.get("tables")))
+            derived_tables.extend(
+                self._normalise_llm_tables(llm_payload.get("tables"), detected_type)
+            )
 
-        tables = self._normalise_tables(detected_tables, line_items, derived_tables)
+        tables = self._normalise_tables(
+            detected_tables, line_items, derived_tables, detected_type
+        )
         if not line_items and tables:
             line_items = [dict(row) for row in tables[0]["rows"]]
 
@@ -401,13 +585,17 @@ class DocumentExtractor:
 
     def _build_field_hints(
         self,
+        document_type: str,
         header: Dict[str, Any],
         line_items: List[Dict[str, Any]],
         raw_tables: List[List[List[str]]],
         derived_tables: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        canonical = PROCUREMENT_STRUCTURE.get(document_type, {})
+
         header_fields = [key for key, value in header.items() if self._clean_cell(value)]
-        line_item_fields: set[str] = set()
+        header_fields.extend(canonical.get("header_fields", []))
+        line_item_fields: set[str] = set(canonical.get("line_item_fields", []))
         for item in line_items:
             line_item_fields.update(item.keys())
 
@@ -421,7 +609,10 @@ class DocumentExtractor:
         for table in raw_tables:
             if not table or not table[0]:
                 continue
-            headers = [self._normalise_column_name(self._clean_cell(cell)) for cell in table[0]]
+            headers = [
+                self._normalise_line_header(self._clean_cell(cell), document_type)
+                for cell in table[0]
+            ]
             normalised_headers = [header for header in headers if header]
             if normalised_headers:
                 table_headers.append(normalised_headers)
@@ -440,6 +631,7 @@ class DocumentExtractor:
         line_items: List[Dict[str, Any]],
         tables: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        canonical = PROCUREMENT_STRUCTURE.get(document_type, {})
         header_fields = sorted(header.keys())
         line_fields: set[str] = set()
         for item in line_items:
@@ -456,6 +648,8 @@ class DocumentExtractor:
             "header_fields": header_fields,
             "line_item_fields": sorted(line_fields),
             "table_summaries": table_summaries,
+            "expected_header_fields": canonical.get("header_fields", []),
+            "expected_line_item_fields": canonical.get("line_item_fields", []),
         }
 
     def _normalise_tables(
@@ -463,6 +657,7 @@ class DocumentExtractor:
         raw_tables: List[List[List[str]]],
         line_items: List[Dict[str, Any]],
         derived_tables: List[Dict[str, Any]],
+        document_type: str,
     ) -> List[Dict[str, Any]]:
         tables: List[Dict[str, Any]] = [
             {"headers": table["headers"], "rows": table["rows"]}
@@ -472,7 +667,10 @@ class DocumentExtractor:
         for raw in raw_tables:
             if not raw:
                 continue
-            header_row = [self._normalise_column_name(self._clean_cell(cell)) for cell in raw[0]]
+            header_row = [
+                self._normalise_line_header(self._clean_cell(cell), document_type)
+                for cell in raw[0]
+            ]
             rows = []
             for row in raw[1:]:
                 row_dict: Dict[str, Any] = {}
@@ -514,6 +712,8 @@ class DocumentExtractor:
             if supplier:
                 header["supplier_name"] = supplier
 
+        self._enrich_currency(header, lines)
+        self._standardise_header_values(header)
         return header
 
     def _candidate_header_pairs(self, lines: List[str]) -> List[Tuple[str, str]]:
@@ -537,11 +737,19 @@ class DocumentExtractor:
             )
             if dash_match:
                 pairs.append((dash_match.group("key"), dash_match.group("value")))
+                continue
+
+            hash_match = re.match(
+                r"^(?P<key>[A-Za-z][A-Za-z0-9 .&/-]{2,})\s*#\s*(?P<value>.+)$",
+                line,
+            )
+            if hash_match:
+                pairs.append((hash_match.group("key"), hash_match.group("value")))
 
         return pairs
 
     def _extract_line_items_from_text(
-        self, text: str
+        self, text: str, document_type: str
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         lines = [line.rstrip() for line in text.splitlines()]
         collected_tables: List[Dict[str, Any]] = []
@@ -551,10 +759,11 @@ class DocumentExtractor:
                 continue
 
             header_tokens = [
-                self._normalise_column_name(token)
+                self._normalise_line_header(token, document_type)
                 for token in re.split(r"\s{2,}", line.strip())
                 if token.strip()
             ]
+            header_tokens = [token for token in header_tokens if token]
             if not header_tokens:
                 continue
 
@@ -596,23 +805,51 @@ class DocumentExtractor:
         lowered = line.lower()
         return (
             "description" in lowered
-            and ("qty" in lowered or "quantity" in lowered)
+            and (
+                "qty" in lowered
+                or "quantity" in lowered
+                or "amount" in lowered
+                or "total" in lowered
+            )
             and re.search(r"\s{2,}", line) is not None
         )
 
-    @staticmethod
-    def _normalise_column_name(label: str) -> str:
-        label = label.strip().lower()
-        label = label.replace("#", "number")
-        label = re.sub(r"[^a-z0-9]+", "_", label)
-        label = re.sub(r"_+", "_", label).strip("_")
+    def _normalise_column_name(self, label: str) -> str:
+        return self._normalise_line_header(label, "*")
+
+    def _normalise_line_header(self, label: str, document_type: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9]+", " ", label).strip().lower()
+        if not cleaned:
+            return ""
+        tokens = cleaned.split()
+
+        def matches(pattern: Tuple[str, ...]) -> bool:
+            for keyword in pattern:
+                if not any(keyword in token for token in tokens):
+                    return False
+            return True
+
+        for scope in (document_type, "*"):
+            if not scope:
+                continue
+            keyword_map = LINE_KEYWORDS.get(scope, {})
+            for canonical, patterns in keyword_map.items():
+                for pattern in patterns:
+                    if matches(pattern):
+                        return canonical
+
+        base_key = re.sub(r"[^a-z0-9]+", "_", cleaned)
+        base_key = re.sub(r"_+", "_", base_key).strip("_")
         replacements = {
-            "item": "item_description",
-            "line_description": "item_description",
-            "item_description": "item_description",
-            "description": "item_description",
+            "qty": "quantity",
+            "amount": "line_amount",
+            "total": "line_amount",
         }
-        return replacements.get(label, label)
+        if base_key in replacements:
+            return replacements[base_key]
+        if base_key:
+            return base_key
+        return ""
 
     def _normalise_header_key(self, key: str, document_type: Optional[str] = None) -> str:
         cleaned = re.sub(r"[^A-Za-z0-9]+", " ", key).strip().lower()
@@ -621,55 +858,41 @@ class DocumentExtractor:
 
         tokens = cleaned.split()
         token_set = set(tokens)
-
-        def has(*keywords: str) -> bool:
-            return all(any(keyword == token or keyword in token for token in token_set) for keyword in keywords)
-
         document_type = document_type or ""
 
-        if has("invoice") and (has("number") or has("no") or "#" in key):
-            return "invoice_id"
-        if has("invoice") and has("date"):
-            return "invoice_date"
-        if has("due") and has("date"):
-            return "due_date"
-        if (has("purchase") and has("order") and (has("number") or has("no"))) or (
-            "po" in token_set and (has("number") or has("no"))
-        ):
-            return "po_id"
-        if has("order") and has("date"):
-            return "order_date"
-        if has("contract") and (has("number") or has("no")):
-            return "contract_id"
-        if has("contract") and has("title"):
-            return "contract_title"
-        if document_type == "Contract" and has("start") and has("date"):
-            return "contract_start_date"
-        if document_type == "Contract" and has("end") and has("date"):
-            return "contract_end_date"
-        if has("payment") and has("terms"):
-            return "payment_terms"
-        if has("quotation") or has("quote"):
-            if has("date"):
-                return "quote_date"
-            if (has("total") and has("amount")) or has("grand"):
-                return "total_amount"
-            if has("number") or has("no") or "#" in key or len(tokens) == 1:
-                return "quote_id"
-        if has("supplier") or has("vendor") or has("seller"):
-            return "supplier_name"
-        if has("total") and (has("amount") or has("invoice") or has("grand") or has("due")):
-            return "total_amount"
+        def matches(pattern: Tuple[str, ...]) -> bool:
+            for keyword in pattern:
+                if not any(keyword in token for token in tokens):
+                    return False
+            return True
 
-        base_key = "_".join(token for token in tokens if token not in {"#"})
+        for scope in (document_type, "*"):
+            if not scope:
+                continue
+            keyword_map = HEADER_KEYWORDS.get(scope, {})
+            for canonical, patterns in keyword_map.items():
+                for pattern in patterns:
+                    if matches(pattern):
+                        return canonical
+
+        if "invoice" in token_set and not ("date" in token_set or "total" in token_set or "amount" in token_set):
+            return "invoice_id"
+        if (
+            document_type == "Quote"
+            and ("quote" in token_set or "quotation" in token_set)
+            and not ("date" in token_set or "total" in token_set or "amount" in token_set)
+        ):
+            return "quote_id"
+
+        base_key = "_".join(token for token in tokens if token != "#")
         if base_key.endswith("_number"):
-            if "invoice" in token_set:
+            if "invoice" in tokens:
                 return "invoice_id"
-            if "purchase" in token_set or "po" in token_set:
+            if "purchase" in tokens or "po" in tokens:
                 return "po_id"
-            if "contract" in token_set:
+            if "contract" in tokens:
                 return "contract_id"
-            if "quote" in token_set or "quotation" in token_set:
+            if "quote" in tokens or "quotation" in tokens:
                 return "quote_id"
         if base_key and base_key not in {
             "item_description",
@@ -689,6 +912,34 @@ class DocumentExtractor:
                 if value:
                     return value
         return None
+
+    def _enrich_currency(self, header: Dict[str, Any], lines: List[str]) -> None:
+        if header.get("currency"):
+            header["currency"] = header["currency"].strip().upper()
+            return
+
+        currency_codes = {"USD", "EUR", "GBP", "AUD", "CAD", "INR", "SGD"}
+        joined = " ".join(lines)
+        code_match = re.search(r"\b([A-Z]{3})\b", joined)
+        if code_match and code_match.group(1) in currency_codes:
+            header["currency"] = code_match.group(1)
+            return
+
+        symbol_map = {"$": "USD", "€": "EUR", "£": "GBP", "₹": "INR"}
+        for symbol, code in symbol_map.items():
+            if symbol in joined:
+                header["currency"] = code
+                return
+
+    def _standardise_header_values(self, header: Dict[str, Any]) -> None:
+        for key, value in list(header.items()):
+            cleaned = self._clean_cell(value)
+            if key.endswith("_id"):
+                header[key] = cleaned.upper()
+            elif key in {"currency"}:
+                header[key] = cleaned.upper()
+            else:
+                header[key] = cleaned
 
     @staticmethod
     def _normalise_document_type(value: Optional[str]) -> Optional[str]:
@@ -729,7 +980,9 @@ class DocumentExtractor:
                 merged[normalized_key] = cleaned_value
         return merged
 
-    def _normalise_llm_line_items(self, items: Any) -> List[Dict[str, Any]]:
+    def _normalise_llm_line_items(
+        self, items: Any, document_type: str
+    ) -> List[Dict[str, Any]]:
         if not isinstance(items, list):
             return []
 
@@ -738,7 +991,7 @@ class DocumentExtractor:
             if isinstance(item, dict):
                 row: Dict[str, Any] = {}
                 for key, value in item.items():
-                    normalized_key = self._normalise_column_name(str(key))
+                    normalized_key = self._normalise_line_header(str(key), document_type)
                     if not normalized_key:
                         continue
                     row[normalized_key] = self._clean_cell(value)
@@ -771,7 +1024,9 @@ class DocumentExtractor:
             seen.add(signature)
         return merged
 
-    def _normalise_llm_tables(self, tables: Any) -> List[Dict[str, Any]]:
+    def _normalise_llm_tables(
+        self, tables: Any, document_type: str
+    ) -> List[Dict[str, Any]]:
         if tables is None:
             return []
         if isinstance(tables, dict):
@@ -788,7 +1043,9 @@ class DocumentExtractor:
             headers: List[str] = []
             if isinstance(headers_raw, list):
                 for header in headers_raw:
-                    normalized_header = self._normalise_column_name(str(header))
+                    normalized_header = self._normalise_line_header(
+                        str(header), document_type
+                    )
                     if normalized_header and normalized_header not in headers:
                         headers.append(normalized_header)
 
@@ -799,7 +1056,9 @@ class DocumentExtractor:
                     for row in raw_rows:
                         normalised_row: Dict[str, Any] = {}
                         for key, value in row.items():
-                            normalized_key = self._normalise_column_name(str(key))
+                            normalized_key = self._normalise_line_header(
+                                str(key), document_type
+                            )
                             if not normalized_key:
                                 continue
                             normalised_row[normalized_key] = self._clean_cell(value)
