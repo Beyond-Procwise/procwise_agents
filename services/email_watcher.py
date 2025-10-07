@@ -2183,8 +2183,29 @@ class SESEmailWatcher:
         expected = self._derive_expected_supplier_count(metadata, action_payload)
         if expected is not None:
             if existing_expected != expected:
+                queue = self._workflow_negotiation_jobs.get(workflow_key, [])
+                queued_jobs = [
+                    entry
+                    for entry in queue
+                    if isinstance(entry, dict) and entry.get("job")
+                ]
+                queued_count = len(queued_jobs)
+
                 self._workflow_expected_counts[workflow_key] = expected
                 self._workflow_processed_counts.pop(workflow_key, None)
+
+                if queued_count:
+                    if queued_count >= expected:
+                        current_processed: Dict[str, object] = {}
+                        for entry in reversed(queued_jobs):
+                            processed = entry.get("processed")
+                            if isinstance(processed, dict):
+                                current_processed = processed
+                                break
+                        self._flush_negotiation_jobs(workflow_key, current_processed)
+                        self._workflow_expected_counts[workflow_key] = expected
+                    else:
+                        self._workflow_processed_counts[workflow_key] = queued_count
             return expected
 
         return existing_expected
