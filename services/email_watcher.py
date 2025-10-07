@@ -2678,6 +2678,7 @@ class SESEmailWatcher:
                 effective_limit,
                 prefixes=prefixes,
                 on_message=on_message,
+                mark_seen=bool(mark_seen),
             )
         else:
             logger.warning("S3 bucket not configured; skipping direct poll for mailbox %s", self.mailbox_address)
@@ -3476,6 +3477,7 @@ class SESEmailWatcher:
                 expected_count,
                 prefixes=self._prefixes,
                 newest_first=True,
+                mark_seen=False,
             )
         except Exception:
             logger.exception(
@@ -3956,6 +3958,7 @@ class SESEmailWatcher:
         parser: Optional[Callable[[bytes], Dict[str, object]]] = None,
         newest_first: bool = True,
         on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
+        mark_seen: bool = True,
     ) -> List[Dict[str, object]]:
         if not self.bucket:
             logger.warning("SES inbound bucket not configured; skipping poll")
@@ -4015,7 +4018,8 @@ class SESEmailWatcher:
 
             if skip_known_checks:
                 if self.state_store and key in self.state_store:
-                    watcher.mark_known(key, last_modified)
+                    if mark_seen:
+                        watcher.mark_known(key, last_modified)
                     continue
                 if not watcher.is_new(key):
                     continue
@@ -4048,7 +4052,8 @@ class SESEmailWatcher:
                     parsed["rfq_id"] = rfq_hint
             collected.append((last_modified, parsed))
             seen_keys.add(key)
-            watcher.mark_known(key, last_modified)
+            if mark_seen:
+                watcher.mark_known(key, last_modified)
             processed_prefixes[prefix] = True
             logger.debug(
                 "Queued message %s for processing from mailbox %s",
@@ -4069,7 +4074,7 @@ class SESEmailWatcher:
             if should_stop:
                 break
 
-        if bypass_known_filters:
+        if mark_seen and bypass_known_filters:
             for prefix, processed in processed_prefixes.items():
                 if processed:
                     watcher = self._s3_prefix_watchers.get(prefix)
