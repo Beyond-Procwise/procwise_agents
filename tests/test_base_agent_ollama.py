@@ -42,6 +42,12 @@ def test_call_ollama_prefers_fallback_when_list_empty(monkeypatch):
 
     captured = {}
 
+    assert base_agent._OLLAMA_FALLBACK_MODELS == (
+        "qwen3:30b",
+        "mixtral:8x7b",
+        "gemma3",
+    )
+
     def fake_generate(model, **kwargs):
         captured["model"] = model
         return {"response": "ok", "model": model, "kwargs": kwargs}
