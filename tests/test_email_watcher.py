@@ -269,6 +269,20 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
                         json.dumps({}),
                     )
                 ]
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
+                    )
+                ]
             elif normalized.startswith("select target_price"):
                 self._result = []
             else:
@@ -358,6 +372,28 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
             ):
                 self._result = []
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
+            ):
+                payload = json.dumps(
+                    {
+                        "subject": row["subject"],
+                        "body": row["body"],
+                        "recipients": [row["recipient_email"]],
+                    }
+                )
+                self._result = [
+                    (
+                        row["rfq_id"],
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                        payload,
+                    )
+                ]
             elif normalized.startswith(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, subject, body, recipient_email, sender from proc.draft_rfq_emails"
             ):
@@ -1673,6 +1709,132 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     assert workflow_key not in watcher._workflow_expected_counts
     assert len(watcher.negotiation_agent.contexts) == 4
 
+
+def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-123",
+        workflow_id="wf-123",
+        draft_ids=(101, 102, 103),
+        draft_count=3,
+        supplier_count=3,
+    )
+
+    ts = datetime.now(timezone.utc)
+    messages = [
+        {
+            "id": f"emails/msg-{idx}.eml",
+            "subject": f"Subject {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx} -->\nBody {idx}",
+            "_last_modified": ts,
+            "_prefix": watcher._prefixes[0],
+        }
+        for idx in range(1, 4)
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=100 + idx,
+            rfq_id=f"RFQ-{idx}",
+            subject=f"Subject {idx}",
+            body=f"Body {idx}",
+            dispatch_token=f"token-{idx}",
+        )
+        for idx in range(1, 4)
+    ]
+
+    monkeypatch.setattr(
+        watcher,
+        "_peek_recent_s3_messages",
+        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+
+    watcher._s3_prefix_watchers = {watcher._prefixes[0]: S3ObjectWatcher(limit=10)}
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=True)
+
+    for message in messages:
+        key = message["id"]
+        assert key in state
+        metadata = state.get(key)
+        assert metadata["status"] == "dispatch_copy"
+        assert metadata["dispatch_completed"] is True
+
+
+def test_acknowledge_recent_dispatch_leaves_unmatched_available(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-456",
+        workflow_id="wf-456",
+        draft_ids=(201, 202),
+        draft_count=2,
+        supplier_count=2,
+    )
+
+    ts = datetime.now(timezone.utc)
+    prefix = watcher._prefixes[0]
+    matched_key = "emails/matched.eml"
+    unmatched_key = "emails/unmatched.eml"
+
+    messages = [
+        {
+            "id": matched_key,
+            "subject": "Matched",
+            "body": "<!-- PROCWISE:RFQ_ID=RFQ-1;TOKEN=token-1 -->\nBody",
+            "_last_modified": ts,
+            "_prefix": prefix,
+        },
+        {
+            "id": unmatched_key,
+            "subject": "Unmatched",
+            "body": "Body without token",
+            "_last_modified": ts,
+            "_prefix": prefix,
+        },
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=201,
+            rfq_id="RFQ-1",
+            subject="Matched",
+            body="Body",
+            dispatch_token="token-1",
+        )
+    ]
+
+    monkeypatch.setattr(
+        watcher,
+        "_peek_recent_s3_messages",
+        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+
+    watcher._s3_prefix_watchers = {prefix: S3ObjectWatcher(limit=10)}
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=False)
+
+    assert matched_key in state
+    assert unmatched_key not in state
+
+    watcher_state = watcher._s3_prefix_watchers[prefix]
+    assert matched_key in watcher_state.known
+    assert unmatched_key not in watcher_state.known
 
 
 def test_sqs_email_loader_extracts_records():
