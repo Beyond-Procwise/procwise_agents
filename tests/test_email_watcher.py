@@ -1780,10 +1780,13 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
         for idx in range(1, 4)
     ]
 
+    def fake_load(limit, prefixes=None, newest_first=True, mark_seen=True):
+        return list(messages)[:limit]
+
     monkeypatch.setattr(
         watcher,
         "_load_from_s3",
-        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
+        fake_load,
     )
     monkeypatch.setattr(
         watcher,
@@ -1802,6 +1805,94 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
         assert metadata["status"] == "dispatch_copy"
         assert metadata["dispatch_completed"] is True
         assert metadata["run_id"] == f"run-{idx}"
+
+
+def test_acknowledge_recent_dispatch_leaves_unmatched_messages(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-456",
+        workflow_id="wf-456",
+        draft_ids=(201, 202),
+        draft_count=3,
+        supplier_count=2,
+    )
+
+    ts = datetime.now(timezone.utc)
+    prefix = watcher._prefixes[0]
+    messages = [
+        {
+            "id": "emails/unmatched.eml",
+            "subject": "Subject unmatched",
+            "body": "Body unmatched",
+            "_last_modified": ts,
+            "_prefix": prefix,
+        },
+        {
+            "id": "emails/msg-1.eml",
+            "subject": "Subject 1",
+            "body": "<!-- PROCWISE:RFQ_ID=RFQ-1;TOKEN=token-1;RUN_ID=run-1 -->\nBody 1",
+            "_last_modified": ts,
+            "_prefix": prefix,
+        },
+        {
+            "id": "emails/msg-2.eml",
+            "subject": "Subject 2",
+            "body": "<!-- PROCWISE:RFQ_ID=RFQ-2;TOKEN=token-2;RUN_ID=run-2 -->\nBody 2",
+            "_last_modified": ts,
+            "_prefix": prefix,
+        },
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=201,
+            rfq_id="RFQ-1",
+            subject="Subject 1",
+            body="Body 1",
+            dispatch_token="token-1",
+            run_id="run-1",
+        ),
+        watcher._DraftSnapshot(
+            id=202,
+            rfq_id="RFQ-2",
+            subject="Subject 2",
+            body="Body 2",
+            dispatch_token="token-2",
+            run_id="run-2",
+        ),
+    ]
+
+    loaded_mark_seen: List[bool] = []
+
+    def fake_load(limit, prefixes=None, newest_first=True, mark_seen=True):
+        loaded_mark_seen.append(bool(mark_seen))
+        return list(messages)[:limit]
+
+    monkeypatch.setattr(watcher, "_load_from_s3", fake_load)
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+
+    watcher._s3_prefix_watchers = {prefix: S3ObjectWatcher(limit=10)}
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=False)
+
+    assert loaded_mark_seen == [False]
+
+    prefix_watcher = watcher._s3_prefix_watchers[prefix]
+    assert "emails/unmatched.eml" not in prefix_watcher.known
+    assert state.get("emails/unmatched.eml") is None
+    assert prefix_watcher.is_new("emails/unmatched.eml") is True
+
+    for idx in (1, 2):
+        matched_key = f"emails/msg-{idx}.eml"
+        assert matched_key in prefix_watcher.known
+        assert state.get(matched_key)["dispatch_completed"] is False
 
 
 def test_sqs_email_loader_extracts_records():
