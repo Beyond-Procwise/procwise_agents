@@ -1616,6 +1616,94 @@ def test_negotiation_counters_reset_between_rounds(monkeypatch):
     assert workflow_key not in watcher._workflow_expected_counts
 
 
+def test_negotiation_jobs_flush_when_expected_drops(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-expected-high-1",
+            "subject": "Re: RFQ-20240103-DROP1",
+            "body": "Price 1600",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240103-DROP1",
+            "supplier_id": "SUP-1",
+        },
+        {
+            "id": "msg-expected-high-2",
+            "subject": "Re: RFQ-20240103-DROP2",
+            "body": "Price 1700",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240103-DROP2",
+            "supplier_id": "SUP-2",
+        },
+        {
+            "id": "msg-expected-high-3",
+            "subject": "Re: RFQ-20240103-DROP3",
+            "body": "Price 1800",
+            "from": "supplier3@example.com",
+            "rfq_id": "RFQ-20240103-DROP3",
+            "supplier_id": "SUP-3",
+        },
+    ]
+
+    batches = [[messages[0]], [messages[1]], [messages[2]], []]
+
+    def loader(limit=None):
+        return batches.pop(0) if batches else []
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    metadata_map = {
+        "RFQ-20240103-DROP1": {
+            "supplier_id": "SUP-1",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-EXPECT-DROP",
+            "expected_supplier_count": 5,
+        },
+        "RFQ-20240103-DROP2": {
+            "supplier_id": "SUP-2",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-EXPECT-DROP",
+            "expected_supplier_count": 5,
+        },
+        "RFQ-20240103-DROP3": {
+            "supplier_id": "SUP-3",
+            "target_price": 1000,
+            "round": 1,
+            "workflow_id": "WF-EXPECT-DROP",
+            "expected_supplier_count": 5,
+        },
+    }
+
+    def fake_metadata(rfq_id):
+        return dict(metadata_map[rfq_id])
+
+    monkeypatch.setattr(watcher, "_load_metadata", fake_metadata, raising=False)
+
+    for _ in range(3):
+        results = watcher.poll_once(limit=1)
+        assert results and len(results) == 1
+
+    workflow_key = watcher._normalise_workflow_key("WF-EXPECT-DROP")
+    assert watcher._workflow_expected_counts.get(workflow_key) == 5
+    assert watcher._workflow_processed_counts.get(workflow_key) == 3
+    queued_jobs = watcher._workflow_negotiation_jobs.get(workflow_key)
+    assert queued_jobs and len(queued_jobs) == 3
+    assert watcher.negotiation_agent.contexts == []
+
+    watcher._ensure_workflow_expectations(
+        "WF-EXPECT-DROP",
+        {"workflow_id": "WF-EXPECT-DROP", "expected_supplier_count": 2},
+    )
+
+    assert len(watcher.negotiation_agent.contexts) == 3
+    assert workflow_key not in watcher._workflow_negotiation_jobs
+    assert workflow_key not in watcher._workflow_processed_counts
+    assert watcher._workflow_expected_counts.get(workflow_key) == 2
+
 
 def test_sqs_email_loader_extracts_records():
     class StubSQSClient:
