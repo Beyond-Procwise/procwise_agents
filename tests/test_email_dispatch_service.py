@@ -12,6 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
+from utils.email_markers import extract_rfq_id, split_hidden_marker
 
 
 class InMemoryDraftStore:
@@ -237,7 +238,10 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "supplier_id": "S1",
         "recipients": ["buyer@example.com"],
     }
-    assert "RFQ-UNIT" not in result["body"]
+    body_comment, body_visible = split_hidden_marker(result["body"])
+    assert body_comment and extract_rfq_id(body_comment) == "RFQ-UNIT"
+    assert "RFQ-UNIT" not in body_visible
+    assert result["draft"]["dispatch_metadata"].get("dispatch_token")
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
@@ -246,4 +250,6 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert updated_action["sent_status"] == "True"
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
-    assert "RFQ-UNIT" not in sent_args["body"]
+    sent_comment, sent_visible = split_hidden_marker(sent_args["body"])
+    assert sent_comment and extract_rfq_id(sent_comment) == "RFQ-UNIT"
+    assert "RFQ-UNIT" not in sent_visible

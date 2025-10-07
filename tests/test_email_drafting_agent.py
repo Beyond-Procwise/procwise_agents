@@ -8,12 +8,18 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents import email_drafting_agent as module
 from agents.base_agent import AgentContext, AgentStatus
 from agents.email_drafting_agent import DecisionContext, EmailDraftingAgent, ThreadHeaders
+from utils.email_markers import extract_rfq_id, split_hidden_marker
 
 
 @pytest.fixture(autouse=True)
 def restore_env(monkeypatch):
     monkeypatch.delenv("EMAIL_POLISH_ENABLED", raising=False)
     yield
+
+
+def _visible_body(body: str) -> str:
+    _comment, remainder = split_hidden_marker(body)
+    return remainder or ""
 
 
 def test_from_decision_formats_payload(monkeypatch):
@@ -52,7 +58,10 @@ def test_from_decision_formats_payload(monkeypatch):
     result = agent.from_decision(decision)
 
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
-    assert result["body"] == result["text"]
+    comment, remainder = split_hidden_marker(result["body"])
+    assert comment and extract_rfq_id(comment) == result["rfq_id"]
+    assert remainder.strip() == result["text"].strip()
+    assert result["metadata"].get("dispatch_token")
     assert "Please confirm if 44.8 GBP is workable." in result["text"]
     assert "<ul>" in result["html"] and "<li>Please confirm if 44.8 GBP is workable.</li>" in result["html"]
     assert result["headers"]["In-Reply-To"] == "<msg1>"
@@ -204,9 +213,9 @@ def test_supplier_context_is_not_injected_into_email_body():
 
     assert result.status == AgentStatus.SUCCESS
     draft = result.data["drafts"][0]
-    body = draft["body"]
-    assert "Supplier context" not in body
-    assert "£28,487.89" not in body
+    visible = _visible_body(draft["body"])
+    assert "Supplier context" not in visible
+    assert "£28,487.89" not in visible
 
     metadata = draft.get("metadata") or {}
     internal = metadata.get("internal_context") or {}
@@ -453,10 +462,10 @@ def test_email_drafting_personalises_supplier_content(monkeypatch):
     first = drafts[0]
     second = drafts[1]
 
-    assert "£250,000.00" not in first["body"]
-    assert "Long-term frame agreement" not in first["body"]
-    assert "£80,000.00" not in second["body"]
-    assert "New vendor onboarding" not in second["body"]
+    assert "£250,000.00" not in _visible_body(first["body"])
+    assert "Long-term frame agreement" not in _visible_body(first["body"])
+    assert "£80,000.00" not in _visible_body(second["body"])
+    assert "New vendor onboarding" not in _visible_body(second["body"])
 
     first_internal = (first.get("metadata") or {}).get("internal_context") or {}
     second_internal = (second.get("metadata") or {}).get("internal_context") or {}

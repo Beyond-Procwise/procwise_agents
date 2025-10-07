@@ -10,6 +10,7 @@ from email import message_from_bytes
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
+from services.email_dispatch_chain_store import pending_dispatch_count
 from utils.gpu import configure_gpu
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -688,6 +689,8 @@ class SupplierInteractionAgent(BaseAgent):
             except Exception:
                 safe_interval = None
 
+        deadline = time.time() + max(timeout, 0)
+
         results: List[Optional[Dict]] = [None] * len(drafts)
         errors: List[Optional[BaseException]] = [None] * len(drafts)
         lock = threading.Lock()
@@ -777,7 +780,115 @@ class SupplierInteractionAgent(BaseAgent):
             if error is not None:
                 raise error
 
+        if any(result is None for result in results):
+            self._await_outstanding_dispatch_responses(
+                drafts,
+                results,
+                deadline=deadline,
+                poll_interval=safe_interval,
+                limit=limit,
+                enable_negotiation=enable_negotiation,
+            )
+
         return results
+
+    def _await_outstanding_dispatch_responses(
+        self,
+        drafts: List[Dict[str, Any]],
+        results: List[Optional[Dict[str, Any]]],
+        *,
+        deadline: float,
+        poll_interval: Optional[int],
+        limit: int,
+        enable_negotiation: bool,
+    ) -> None:
+        """Continue polling until dispatch-tracked replies have arrived."""
+
+        if not drafts or not results:
+            return
+
+        poll_setting = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
+        interval = poll_interval
+        if interval is None:
+            interval = poll_setting
+        else:
+            try:
+                interval = max(1, int(interval))
+            except Exception:
+                interval = poll_setting
+
+        while time.time() < deadline:
+            outstanding = [idx for idx, value in enumerate(results) if value is None]
+            if not outstanding:
+                break
+
+            awaiting = False
+            for idx in outstanding:
+                rfq_id = drafts[idx].get("rfq_id")
+                if not rfq_id:
+                    continue
+                pending_total = self._pending_dispatch_count(rfq_id)
+                if pending_total > 0:
+                    awaiting = True
+            if not awaiting:
+                break
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            per_attempt = max(1, min(interval, int(remaining)))
+
+            for idx in list(outstanding):
+                if results[idx] is not None or time.time() >= deadline:
+                    continue
+                draft = drafts[idx]
+                rfq_id = draft.get("rfq_id")
+                supplier_id = draft.get("supplier_id")
+                recipient_hint = draft.get("receiver") or draft.get("recipient_email")
+                if recipient_hint is None:
+                    recipients_field = draft.get("recipients")
+                    if isinstance(recipients_field, (list, tuple)) and recipients_field:
+                        recipient_hint = recipients_field[0]
+                    elif isinstance(recipients_field, str):
+                        recipient_hint = recipients_field
+
+                subject_hint = draft.get("subject")
+
+                result = self.wait_for_response(
+                    timeout=per_attempt,
+                    poll_interval=poll_interval,
+                    limit=limit,
+                    rfq_id=rfq_id,
+                    supplier_id=supplier_id,
+                    subject_hint=subject_hint,
+                    from_address=recipient_hint,
+                    enable_negotiation=enable_negotiation,
+                )
+                if result is not None:
+                    results[idx] = result
+
+            if any(results[idx] is None for idx in outstanding) and time.time() < deadline:
+                sleep_window = min(interval, max(0, deadline - time.time()))
+                if sleep_window > 0:
+                    time.sleep(sleep_window)
+
+    def _pending_dispatch_count(self, rfq_id: Optional[str]) -> int:
+        if not rfq_id:
+            return 0
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return 0
+
+        try:
+            with get_conn() as conn:
+                return pending_dispatch_count(conn, rfq_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(
+                "Failed to fetch pending dispatch count for rfq_id=%s", rfq_id, exc_info=True
+            )
+            return 0
 
     def _get_negotiation_agent(self) -> Optional["NegotiationAgent"]:
         if self._negotiation_agent is not None:
