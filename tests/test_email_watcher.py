@@ -1170,6 +1170,103 @@ def test_poll_once_respects_dispatch_wait(monkeypatch):
     assert sleep_calls == [pytest.approx(1.0), pytest.approx(1.0)]
 
 
+def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
+    import services.email_watcher as email_watcher_module
+
+    class DispatchCursor(DummyNick._DummyCursor):
+        def __init__(self, owner):
+            super().__init__(owner)
+            self._result: List[Tuple] = []
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            if normalized.startswith("select action_id, process_output from proc.action where action_id ="):
+                self._result = [(self._owner.action_id, self._owner.process_output)]
+            elif normalized.startswith(
+                "select count(*) from proc.draft_rfq_emails where sent = true and id = any"
+            ):
+                index = min(self._owner.sent_count_index, len(self._owner.sent_count_sequence) - 1)
+                count = self._owner.sent_count_sequence[index]
+                self._owner.sent_count_index = min(
+                    self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
+                )
+                self._owner.sent_count_calls += 1
+                self._result = [(count,)]
+            elif normalized.startswith(
+                "select count(*) from proc.draft_rfq_emails where sent = true and payload::jsonb ->> 'action_id'"
+            ):
+                index = min(self._owner.sent_count_index, len(self._owner.sent_count_sequence) - 1)
+                count = self._owner.sent_count_sequence[index]
+                self._owner.sent_count_index = min(
+                    self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
+                )
+                self._owner.sent_count_calls += 1
+                self._result = [(count,)]
+            else:
+                super().execute(statement, params)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+    class DispatchConnection(DummyNick._DummyConn):
+        def cursor(self):
+            return DispatchCursor(self._owner)
+
+    class DispatchNick(DummyNick):
+        def __init__(self):
+            super().__init__()
+            self.settings.email_inbound_initial_wait_seconds = 5
+            self.action_id = "action-test-001"
+            self.process_output = json.dumps(
+                {
+                    "drafts": [
+                        {"draft_record_id": 101, "supplier_id": "S1"},
+                        {"draft_record_id": 102, "supplier_id": "S2"},
+                    ]
+                }
+            )
+            self.sent_count_sequence = [1, 2]
+            self.sent_count_index = 0
+            self.sent_count_calls = 0
+
+        def get_db_connection(self):
+            return DispatchConnection(self)
+
+    fake_clock = {"now": 0.0, "sleeps": []}
+
+    def fake_time() -> float:
+        return fake_clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        fake_clock["sleeps"].append(seconds)
+        fake_clock["now"] += seconds
+
+    monkeypatch.setattr(
+        email_watcher_module,
+        "time",
+        SimpleNamespace(time=fake_time, sleep=fake_sleep),
+    )
+
+    nick = DispatchNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.bucket = None
+
+    watcher.record_dispatch_timestamp()
+
+    results = watcher.poll_once(match_filters={"action_id": nick.action_id})
+    assert results == []
+    assert fake_clock["sleeps"][0] == pytest.approx(5.0)
+    assert nick.sent_count_calls >= 2
+
+    fake_clock["sleeps"].clear()
+    previous_calls = nick.sent_count_calls
+    watcher.poll_once(match_filters={"action_id": nick.action_id})
+    assert fake_clock["sleeps"] == []
+    assert nick.sent_count_calls == previous_calls
+
 def test_s3_poll_prioritises_newest_objects(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
