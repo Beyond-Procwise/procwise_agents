@@ -1515,6 +1515,12 @@ class NegotiationAgent(BaseAgent):
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
 
+        workflow_hint = getattr(context, "workflow_id", None)
+        if workflow_hint:
+            for draft in candidate_drafts:
+                if isinstance(draft, dict) and not draft.get("workflow_id"):
+                    draft["workflow_id"] = workflow_hint
+
         watch_payload: Dict[str, Any] = {
             "await_response": True,
             "message": "",
@@ -1523,6 +1529,7 @@ class NegotiationAgent(BaseAgent):
             "rfq_id": rfq_id,
             "supplier_id": supplier,
             "response_poll_interval": poll_interval,
+            "workflow_id": workflow_hint,
         }
 
         batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
@@ -1628,6 +1635,28 @@ class NegotiationAgent(BaseAgent):
                 elif isinstance(recipients_field, str):
                     recipient_hint = recipients_field
 
+            draft_action_id = None
+            for key in ("action_id", "draft_action_id", "email_action_id"):
+                candidate = target.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    draft_action_id = candidate.strip()
+                    break
+            workflow_hint = target.get("workflow_id") or watch_payload.get("workflow_id")
+            if not workflow_hint and isinstance(target.get("metadata"), dict):
+                meta_workflow = target["metadata"].get("workflow_id") or target["metadata"].get("process_workflow_id")
+                if isinstance(meta_workflow, str) and meta_workflow.strip():
+                    workflow_hint = meta_workflow.strip()
+            dispatch_run_id = None
+            for key in ("dispatch_run_id", "run_id"):
+                candidate = target.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    dispatch_run_id = candidate.strip()
+                    break
+            if dispatch_run_id is None and isinstance(target.get("metadata"), dict):
+                meta_run = target["metadata"].get("dispatch_run_id") or target["metadata"].get("run_id")
+                if isinstance(meta_run, str) and meta_run.strip():
+                    dispatch_run_id = meta_run.strip()
+
             return [
                 supplier_agent.wait_for_response(
                     timeout=timeout,
@@ -1638,6 +1667,9 @@ class NegotiationAgent(BaseAgent):
                     subject_hint=target.get("subject"),
                     from_address=recipient_hint,
                     enable_negotiation=False,
+                    draft_action_id=draft_action_id,
+                    workflow_id=workflow_hint,
+                    dispatch_run_id=dispatch_run_id,
                 )
             ]
         except Exception:  # pragma: no cover - defensive

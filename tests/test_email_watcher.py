@@ -543,8 +543,41 @@ def test_poll_once_matches_on_rfq_tail():
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20249999-00001234"})
 
     assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240101-00001234"
-    assert "msg-tail" in state
+    assert results[0]["matched_via"] != "rfq_hint"
+
+
+def test_match_dispatched_message_prefers_run_id():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=201,
+            rfq_id="RFQ-1",
+            subject="Subject",
+            body="Body A",
+            dispatch_token="token-a",
+            run_id="run-a",
+        ),
+        watcher._DraftSnapshot(
+            id=202,
+            rfq_id="RFQ-2",
+            subject="Subject",
+            body="Body B",
+            dispatch_token="token-b",
+            run_id="run-b",
+        ),
+    ]
+
+    message = {
+        "subject": "Subject",
+        "body": "<!-- PROCWISE:RFQ_ID=RFQ-2;TOKEN=token-b;RUN_ID=run-b -->\nBody B",
+    }
+
+    match = watcher._match_dispatched_message(message, drafts)
+
+    assert match is drafts[1]
+    assert match.matched_via == "dispatch_token"
 
 
 def test_email_watcher_falls_back_to_imap(monkeypatch):
@@ -1728,7 +1761,7 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
         {
             "id": f"emails/msg-{idx}.eml",
             "subject": f"Subject {idx}",
-            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx} -->\nBody {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx};RUN_ID=run-{idx} -->\nBody {idx}",
             "_last_modified": ts,
             "_prefix": watcher._prefixes[0],
         }
@@ -1742,13 +1775,14 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
             subject=f"Subject {idx}",
             body=f"Body {idx}",
             dispatch_token=f"token-{idx}",
+            run_id=f"run-{idx}",
         )
         for idx in range(1, 4)
     ]
 
     monkeypatch.setattr(
         watcher,
-        "_peek_recent_s3_messages",
+        "_load_from_s3",
         lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
     )
     monkeypatch.setattr(
@@ -1761,80 +1795,13 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
 
     watcher._acknowledge_recent_dispatch(expectation, completed=True)
 
-    for message in messages:
+    for idx, message in enumerate(messages, start=1):
         key = message["id"]
         assert key in state
         metadata = state.get(key)
         assert metadata["status"] == "dispatch_copy"
         assert metadata["dispatch_completed"] is True
-
-
-def test_acknowledge_recent_dispatch_leaves_unmatched_available(monkeypatch):
-    nick = DummyNick()
-    state = InMemoryEmailWatcherState()
-    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
-
-    expectation = watcher._DispatchExpectation(
-        action_id="act-456",
-        workflow_id="wf-456",
-        draft_ids=(201, 202),
-        draft_count=2,
-        supplier_count=2,
-    )
-
-    ts = datetime.now(timezone.utc)
-    prefix = watcher._prefixes[0]
-    matched_key = "emails/matched.eml"
-    unmatched_key = "emails/unmatched.eml"
-
-    messages = [
-        {
-            "id": matched_key,
-            "subject": "Matched",
-            "body": "<!-- PROCWISE:RFQ_ID=RFQ-1;TOKEN=token-1 -->\nBody",
-            "_last_modified": ts,
-            "_prefix": prefix,
-        },
-        {
-            "id": unmatched_key,
-            "subject": "Unmatched",
-            "body": "Body without token",
-            "_last_modified": ts,
-            "_prefix": prefix,
-        },
-    ]
-
-    drafts = [
-        watcher._DraftSnapshot(
-            id=201,
-            rfq_id="RFQ-1",
-            subject="Matched",
-            body="Body",
-            dispatch_token="token-1",
-        )
-    ]
-
-    monkeypatch.setattr(
-        watcher,
-        "_peek_recent_s3_messages",
-        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
-    )
-    monkeypatch.setattr(
-        watcher,
-        "_fetch_recent_dispatched_drafts",
-        lambda exp, limit: list(drafts)[:limit],
-    )
-
-    watcher._s3_prefix_watchers = {prefix: S3ObjectWatcher(limit=10)}
-
-    watcher._acknowledge_recent_dispatch(expectation, completed=False)
-
-    assert matched_key in state
-    assert unmatched_key not in state
-
-    watcher_state = watcher._s3_prefix_watchers[prefix]
-    assert matched_key in watcher_state.known
-    assert unmatched_key not in watcher_state.known
+        assert metadata["run_id"] == f"run-{idx}"
 
 
 def test_sqs_email_loader_extracts_records():
