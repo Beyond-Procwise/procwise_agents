@@ -88,6 +88,57 @@ def _rfq_match_key(value: object) -> Optional[str]:
 
 
 RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
+_SIMILARITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+
+
+def _extract_similarity_tokens(*values: object, limit: int = 64) -> Set[str]:
+    """Return a set of normalised tokens for fuzzy comparisons."""
+
+    tokens: Set[str] = set()
+    if limit <= 0:
+        limit = 0
+
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            text = _norm(str(value))
+        except Exception:
+            continue
+        if not text:
+            continue
+        lowered = text.lower()
+        for match in _SIMILARITY_TOKEN_RE.findall(lowered):
+            if not match:
+                continue
+            if limit and len(tokens) >= limit:
+                break
+            tokens.add(match)
+        if limit and len(tokens) >= limit:
+            break
+    return tokens
+
+
+def _extract_email_domain(value: object) -> Optional[str]:
+    """Extract a lowercase domain from an email-like value."""
+
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        _, address = parseaddr(text)
+    except Exception:
+        address = None
+    candidate = address.strip() if address else text
+    if "@" not in candidate:
+        return None
+    domain = candidate.split("@")[-1].strip().lower()
+    return domain or None
 
 # Ensure GPU related environment flags are consistently applied even when the
 # watcher is used standalone (e.g. in a scheduled job).
@@ -795,6 +846,22 @@ class SESEmailWatcher:
 
         if processed:
             processed_payload = self._record_processed_payload(message_id, processed)
+            dispatch_record = (
+                message.get("_dispatch_record")
+                if isinstance(message.get("_dispatch_record"), dict)
+                else None
+            )
+            if dispatch_record:
+                record_rfq = dispatch_record.get("rfq_id")
+                record_supplier = dispatch_record.get("supplier_id")
+                if record_rfq and processed_payload.get("rfq_id") is None:
+                    processed_payload["rfq_id"] = record_rfq
+                    if isinstance(processed, dict) and processed.get("rfq_id") is None:
+                        processed["rfq_id"] = record_rfq
+                if record_supplier and processed_payload.get("supplier_id") is None:
+                    processed_payload["supplier_id"] = record_supplier
+                    if isinstance(processed, dict) and processed.get("supplier_id") is None:
+                        processed["supplier_id"] = record_supplier
             original_rfq = processed_payload.get("rfq_id") if processed_payload else None
             rfq_extracted = (
                 self._normalise_rfq_value(original_rfq) if original_rfq else None
@@ -863,8 +930,12 @@ class SESEmailWatcher:
                     and canonical_rfq_full in _norm(str(body_candidate)).upper()
                 ):
                     match_source = "body"
-            if match_source == "unknown" and message.get("_dispatch_record"):
-                match_source = "dispatch"
+            if match_source == "unknown" and dispatch_record:
+                record_source = dispatch_record.get("match_source")
+                if isinstance(record_source, str) and record_source:
+                    match_source = record_source
+                else:
+                    match_source = "dispatch"
             if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
@@ -1538,10 +1609,19 @@ class SESEmailWatcher:
                 additional_canonicals = fallback_canonicals
 
         metadata = self._load_metadata(rfq_id)
+        existing_dispatch_record = (
+            message.get("_dispatch_record")
+            if isinstance(message.get("_dispatch_record"), dict)
+            else None
+        )
         canonical_rfq_id = metadata.get("canonical_rfq_id")
         if canonical_rfq_id:
             rfq_id = str(canonical_rfq_id)
         dispatch_record = metadata.get("dispatch_record")
+        if isinstance(dispatch_record, dict) and existing_dispatch_record:
+            for key in ("match_source", "matched_tokens", "matched_domains"):
+                if key in existing_dispatch_record and key not in dispatch_record:
+                    dispatch_record[key] = existing_dispatch_record[key]
         supplier_id = metadata.get("supplier_id") or message.get("supplier_id")
         if dispatch_record:
             message["_dispatch_record"] = dispatch_record
@@ -1940,13 +2020,17 @@ class SESEmailWatcher:
 
         headers = message.get("headers")
         if isinstance(headers, dict):
-            for header_key in ("From", "from", "Reply-To", "reply-to", "Return-Path", "return-path"):
+            for header_key in (
+                "From",
+                "from",
+                "Reply-To",
+                "reply-to",
+                "Return-Path",
+                "return-path",
+            ):
                 candidate = self._normalise_email(headers.get(header_key))
                 if candidate and candidate not in email_candidates:
                     email_candidates.append(candidate)
-
-        if not supplier_candidates and not email_candidates:
-            return None
 
         where_clauses: List[str] = []
         params: List[object] = []
@@ -1959,27 +2043,167 @@ class SESEmailWatcher:
             where_clauses.append("LOWER(COALESCE(recipient_email, '')) = ANY(%s)")
             params.append(email_candidates)
 
-        if not where_clauses:
+        if where_clauses:
+            query = """
+                SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on
+                FROM proc.draft_rfq_emails
+                WHERE sent = TRUE AND ({})
+                ORDER BY updated_on DESC, created_on DESC
+                LIMIT 1
+            """.format(" OR ".join(where_clauses))
+
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(query, tuple(params))
+                        row = cur.fetchone()
+            except Exception:
+                logger.debug("Failed to resolve RFQ from dispatch history", exc_info=True)
+                row = None
+
+            if row:
+                (
+                    rfq_value,
+                    supplier_value,
+                    supplier_name,
+                    sent_on,
+                    sent_flag,
+                    created_on,
+                    updated_on,
+                ) = row
+
+                if rfq_value:
+                    dispatch_record = {
+                        "rfq_id": rfq_value,
+                        "supplier_id": supplier_value,
+                        "supplier_name": supplier_name,
+                        "sent_on": sent_on,
+                        "sent": bool(sent_flag),
+                        "created_on": created_on,
+                        "updated_on": updated_on,
+                        "match_source": "dispatch",
+                    }
+                    return str(rfq_value), supplier_value, dispatch_record
+
+        return self._resolve_recent_dispatch_by_similarity(message, get_conn)
+
+    def _resolve_recent_dispatch_by_similarity(
+        self,
+        message: Dict[str, object],
+        get_conn: Callable[[], object],
+    ) -> Optional[Tuple[str, Optional[str], Optional[Dict[str, object]]]]:
+        subject = message.get("subject")
+        body = message.get("body")
+
+        body_segment: Optional[str]
+        if isinstance(body, str):
+            body_segment = body[:2000]
+        else:
+            body_segment = None
+
+        inbound_tokens = _extract_similarity_tokens(subject, body_segment)
+        if not inbound_tokens:
             return None
 
-        query = """
-            SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on
-            FROM proc.draft_rfq_emails
-            WHERE sent = TRUE AND ({})
-            ORDER BY updated_on DESC, created_on DESC
-            LIMIT 1
-        """.format(" OR ".join(where_clauses))
+        inbound_domains: List[str] = []
+        for key in ("from", "reply_to", "supplier_email"):
+            domain = _extract_email_domain(message.get(key))
+            if domain and domain not in inbound_domains:
+                inbound_domains.append(domain)
 
+        headers = message.get("headers")
+        if isinstance(headers, dict):
+            for header_key in ("From", "from", "Reply-To", "reply-to"):
+                domain = _extract_email_domain(headers.get(header_key))
+                if domain and domain not in inbound_domains:
+                    inbound_domains.append(domain)
+
+        query = """
+            SELECT rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on,
+                   subject, body, recipient_email, sender
+            FROM proc.draft_rfq_emails
+            WHERE sent = TRUE
+              AND updated_on >= NOW() - INTERVAL '7 days'
+            ORDER BY updated_on DESC, created_on DESC
+            LIMIT %s
+        """
+
+        rows: List[Tuple] = []
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(query, tuple(params))
-                    row = cur.fetchone()
+                    cur.execute(query, (25,))
+                    fetched = cur.fetchall()
+                    if fetched:
+                        rows = list(fetched)
         except Exception:
-            logger.debug("Failed to resolve RFQ from dispatch history", exc_info=True)
+            logger.debug("Failed to load recent RFQ dispatches for similarity", exc_info=True)
             return None
 
-        if not row:
+        if not rows:
+            return None
+
+        best_row: Optional[Tuple] = None
+        best_score = -1.0
+        best_overlap: Set[str] = set()
+        best_domains: List[str] = []
+
+        min_overlap = 1 if len(inbound_tokens) <= 4 else 2
+
+        for row in rows:
+            if not row or not row[0]:
+                continue
+
+            candidate_subject = row[7] if len(row) > 7 else None
+            candidate_body = row[8] if len(row) > 8 else None
+            if isinstance(candidate_body, str):
+                candidate_body = candidate_body[:2000]
+
+            candidate_tokens = _extract_similarity_tokens(
+                candidate_subject, candidate_body
+            )
+            if not candidate_tokens:
+                continue
+
+            overlap = inbound_tokens & candidate_tokens
+
+            recipient_domain = _extract_email_domain(row[9] if len(row) > 9 else None)
+            sender_domain = _extract_email_domain(row[10] if len(row) > 10 else None)
+            candidate_domains = [d for d in (recipient_domain, sender_domain) if d]
+            domain_match = False
+            if inbound_domains and candidate_domains:
+                domain_match = any(domain in inbound_domains for domain in candidate_domains)
+
+            if len(overlap) < min_overlap and not domain_match:
+                continue
+
+            token_score = len(overlap) / max(len(inbound_tokens), 1)
+            domain_bonus = 0.3 if domain_match else 0.0
+            score = token_score + domain_bonus
+
+            if score < 0.2:
+                continue
+
+            updated_on = row[6] if len(row) > 6 else None
+
+            if score > best_score:
+                best_row = row
+                best_score = score
+                best_overlap = set(overlap)
+                best_domains = list(candidate_domains)
+            elif score == best_score and best_row is not None:
+                current_updated = best_row[6] if len(best_row) > 6 else None
+                if isinstance(updated_on, datetime) and isinstance(current_updated, datetime):
+                    if updated_on > current_updated:
+                        best_row = row
+                        best_overlap = set(overlap)
+                        best_domains = list(candidate_domains)
+                elif updated_on and not current_updated:
+                    best_row = row
+                    best_overlap = set(overlap)
+                    best_domains = list(candidate_domains)
+
+        if not best_row:
             return None
 
         (
@@ -1990,7 +2214,8 @@ class SESEmailWatcher:
             sent_flag,
             created_on,
             updated_on,
-        ) = row
+            *_
+        ) = best_row
 
         if not rfq_value:
             return None
@@ -2003,7 +2228,12 @@ class SESEmailWatcher:
             "sent": bool(sent_flag),
             "created_on": created_on,
             "updated_on": updated_on,
+            "match_source": "dispatch_similarity",
+            "matched_tokens": sorted(best_overlap),
         }
+
+        if best_domains:
+            dispatch_record["matched_domains"] = best_domains
 
         return str(rfq_value), supplier_value, dispatch_record
 
