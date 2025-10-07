@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 import threading
 
@@ -211,17 +211,57 @@ class BaseAgent:
         if adapter:
             options.setdefault("adapter", adapter)
 
-        candidate_models: List[tuple[str, bool]] = []
+        requested_candidates: List[Tuple[str, bool]] = []
         if (
             quantized
             and (model is None or model == base_model)
             and quantized not in missing_models
         ):
-            candidate_models.append((quantized, True))
-        candidate_models.append((model or base_model, False))
+            requested_candidates.append((quantized, True))
+
+        base_candidate = model or base_model
+        if base_candidate:
+            requested_candidates.append((base_candidate, False))
+
+        deduped_candidates: List[Tuple[str, bool]] = []
+        seen_names: set[str] = set()
+        for name, is_quantized in requested_candidates:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            deduped_candidates.append((name, is_quantized))
+        requested_candidates = deduped_candidates
+
+        available_models = self._get_available_ollama_models()
+        available_set = set(available_models)
+
+        candidate_models: List[Tuple[str, bool]] = []
+        if available_models:
+            for name, is_quantized in requested_candidates:
+                if name in available_set:
+                    candidate_models.append((name, is_quantized))
+            if not candidate_models:
+                fallback_model = next((m for m in available_models if m), None)
+                if fallback_model:
+                    logger.warning(
+                        "Requested Ollama models %s not available; falling back to '%s'.",
+                        [name for name, _ in requested_candidates],
+                        fallback_model,
+                    )
+                    candidate_models.append((fallback_model, False))
+
+        if not candidate_models:
+            error_msg = "No available Ollama models detected from 'ollama list'."
+            logger.error(error_msg)
+            return {"response": "", "error": error_msg}
 
         last_error: Optional[Exception] = None
-        for model_to_use, is_quantized in candidate_models:
+        attempted_models: set[str] = set()
+        idx = 0
+        while idx < len(candidate_models):
+            model_to_use, is_quantized = candidate_models[idx]
+            idx += 1
+            attempted_models.add(model_to_use)
             try:
                 attempt_options = dict(options)
                 if messages is not None:
@@ -252,7 +292,23 @@ class BaseAgent:
                         status_code,
                         base_model,
                     )
+                    self._remove_cached_ollama_model(model_to_use)
                     continue
+                if is_not_found:
+                    logger.warning(
+                        "Ollama model '%s' unavailable (status: %s); refreshing available model list.",
+                        model_to_use,
+                        status_code,
+                    )
+                    self._remove_cached_ollama_model(model_to_use)
+                    available_models = self._get_available_ollama_models(force_refresh=True)
+                    fallback_model = next(
+                        (m for m in available_models if m not in attempted_models),
+                        None,
+                    )
+                    if fallback_model:
+                        candidate_models.append((fallback_model, False))
+                        continue
                 last_error = exc
                 break
             except Exception as exc:  # pragma: no cover - network / runtime issues
@@ -266,6 +322,41 @@ class BaseAgent:
         # Defensive fallback if the loop completes without returning (should not happen)
         logger.error("Ollama call failed for unknown reasons")
         return {"response": "", "error": "Unknown Ollama invocation failure"}
+
+    def _get_available_ollama_models(self, force_refresh: bool = False) -> List[str]:
+        """Return the cached list of Ollama models available on the host."""
+
+        cached: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
+        if force_refresh or cached is None:
+            try:
+                response = ollama.list()
+                models = response.get("models", []) if isinstance(response, dict) else []
+                names: List[str] = []
+                for entry in models:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name") or entry.get("model")
+                    if name:
+                        names.append(name)
+                cached = names
+                setattr(self.agent_nick, "_available_ollama_models", cached)
+            except Exception as exc:  # pragma: no cover - external dependency failure
+                logger.warning("Failed to retrieve available Ollama models: %s", exc)
+                if cached is None:
+                    setattr(self.agent_nick, "_available_ollama_models", [])
+                    return []
+        return list(cached or [])
+
+    def _remove_cached_ollama_model(self, model_name: str) -> None:
+        """Remove a model from the cached ``ollama list`` response."""
+
+        cache: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
+        if not cache:
+            return
+        if model_name not in cache:
+            return
+        updated = [name for name in cache if name != model_name]
+        setattr(self.agent_nick, "_available_ollama_models", updated)
 
     def vector_search(self, query: str, top_k: int = 5):
         """Search the vector database for similar content.
