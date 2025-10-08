@@ -136,6 +136,7 @@ class EmailDispatchService:
             headers = {"X-Procwise-RFQ-ID": rfq_id}
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
+                backend_metadata["mailbox"] = mailbox_header
                 headers["X-Procwise-Mailbox"] = mailbox_header
 
             send_result = self.email_service.send_email(
@@ -552,3 +553,69 @@ class EmailDispatchService:
             if lower == "false":
                 return "False"
         return None
+
+
+def find_recent_sent_for_supplier(
+    connection,
+    message: Dict[str, object],
+    *,
+    mailbox: Optional[str] = None,
+    window_minutes: int = 10,
+) -> Optional[Dict[str, object]]:
+    """Return the most recent dispatch-chain entry for ``message``'s supplier."""
+
+    supplier_value = message.get("supplier_id")
+    if supplier_value in (None, ""):
+        return None
+
+    try:
+        supplier_norm = str(supplier_value).strip().lower()
+    except Exception:
+        return None
+
+    if not supplier_norm:
+        return None
+
+    try:
+        interval = max(int(window_minutes), 1)
+    except Exception:
+        interval = 10
+
+    mailbox_filter = mailbox or None
+
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT rfq_id, supplier_id, dispatch_metadata, message_id, thread_index, created_at
+            FROM proc.email_dispatch_chains
+            WHERE awaiting_response = TRUE
+              AND created_at >= NOW() - (%s || ' minutes')::INTERVAL
+              AND LOWER(supplier_id) = %s
+              AND (%s IS NULL
+                   OR dispatch_metadata ->> 'mailbox' IS NULL
+                   OR dispatch_metadata ->> 'mailbox' = %s)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (str(interval), supplier_norm, mailbox_filter, mailbox_filter),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    metadata = row[2]
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = None
+
+    return {
+        "rfq_id": row[0],
+        "supplier_id": row[1],
+        "dispatch_metadata": metadata,
+        "message_id": row[3],
+        "thread_index": row[4],
+        "created_at": row[5],
+    }
