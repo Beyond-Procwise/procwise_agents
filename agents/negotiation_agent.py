@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -16,7 +17,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-MAX_SUPPLIER_REPLIES = 3
+# -----------------------------
+# Tunables & feature toggles
+# -----------------------------
+MAX_SUPPLIER_REPLIES = int(os.getenv("NEG_MAX_SUPPLIER_REPLIES", "3"))
+LLM_ENABLED = os.getenv("NEG_ENABLE_LLM", "1").strip() not in {"0", "false", "False"}
+LLM_MODEL = os.getenv("NEG_LLM_MODEL", "llama3.2:latest")
+COST_OF_CAPITAL_APR = float(os.getenv("NEG_COST_OF_CAPITAL_APR", "0.12"))
+LEAD_TIME_VALUE_PCT_PER_WEEK = float(os.getenv("NEG_LT_VALUE_PCT_PER_WEEK", "0.01"))
+AGGRESSIVE_FIRST_COUNTER_PCT = float(os.getenv("NEG_FIRST_COUNTER_AGGR_PCT", "0.12"))
 FINAL_OFFER_PATTERNS = (
     "best and final",
     "best final",
@@ -99,7 +108,7 @@ def decide_strategy(
             "rationale": "Narrow gap; split the difference with rationale.",
         }
 
-    counter = round(max(target, price * 0.88), 2)
+    counter = round(max(target, price * (1 - AGGRESSIVE_FIRST_COUNTER_PCT)), 2)
     return {
         "strategy": "anchor-lower",
         "counter_price": counter,
@@ -169,12 +178,40 @@ class NegotiationAgent(BaseAgent):
             or context.input_data.get("message")
         )
 
+        # Load state before subject normalization (bug fix)
+        state, _ = self._load_session_state(rfq_id, supplier)
+
         incoming_subject = self._coerce_text(context.input_data.get("subject"))
         base_candidate = self._normalise_base_subject(incoming_subject)
         if base_candidate and not state.get("base_subject"):
             state["base_subject"] = base_candidate
 
+        signals = self._extract_negotiation_signals(
+            supplier_message=supplier_message,
+            snippets=supplier_snippets,
+            market=context.input_data.get("market_context") or {},
+            performance=context.input_data.get("supplier_performance") or {},
+        )
+
+        zopa = self._estimate_zopa(
+            price=price,
+            target=target_price,
+            history=context.input_data.get("history") or {},
+            benchmarks=context.input_data.get("benchmarks") or {},
+            should_cost=context.input_data.get("should_cost"),
+            signals=signals,
+        )
+
         decision = decide_strategy(price, target_price, lead_weeks=lead_weeks, constraints=constraints)
+        decision = self._adaptive_strategy(
+            base_decision=decision,
+            zopa=zopa,
+            signals=signals,
+            round_hint=raw_round,
+            lead_weeks=lead_weeks,
+            target_price=target_price,
+            price=price,
+        )
         decision.setdefault("strategy", "clarify")
         decision.setdefault("counter_price", None)
         decision.setdefault("asks", [])
@@ -200,7 +237,6 @@ class NegotiationAgent(BaseAgent):
         else:
             decision.setdefault("play_recommendations", [])
 
-        state, _ = self._load_session_state(rfq_id, supplier)
         message_id = context.input_data.get("message_id")
         supplier_reply_registered = False
         if message_id and state.get("last_supplier_msg_id") != message_id:
@@ -234,12 +270,11 @@ class NegotiationAgent(BaseAgent):
 
         draft_records: List[Dict[str, Any]] = []
 
+        counter_options: List[Dict[str, Any]] = []
+
         if not should_continue:
             state["status"] = new_status
-            if halt_reason == "Awaiting supplier response.":
-                state["awaiting_response"] = True
-            else:
-                state["awaiting_response"] = False
+            state["awaiting_response"] = halt_reason == "Awaiting supplier response."
             stop_message = self._build_stop_message(new_status, halt_reason, round_no)
             decision.setdefault("status_reason", halt_reason)
             self._save_session_state(rfq_id, supplier, state)
@@ -260,7 +295,7 @@ class NegotiationAgent(BaseAgent):
                 "supplier": supplier,
                 "rfq_id": rfq_id,
                 "round": round_no,
-                "counter_proposals": [],
+                "counter_proposals": counter_options,
                 "decision": decision,
                 "savings_score": savings_score,
                 "decision_log": decision_log,
@@ -308,6 +343,23 @@ class NegotiationAgent(BaseAgent):
                 next_agents=next_agents,
             )
 
+        optimized = self._optimize_multi_issue(
+            price=price,
+            currency=currency,
+            target=target_price,
+            lead_weeks=lead_weeks,
+            weights=context.input_data.get("weights") or {},
+            policy=context.input_data.get("policy_guidance") or {},
+            constraints=context.input_data.get("hard_constraints") or {},
+            zopa=zopa,
+            signals=signals,
+            round_no=round_no,
+        )
+        decision.update(optimized.get("decision_overrides", {}))
+        counter_options = optimized.get("counter_options") or []
+        if not counter_options and decision.get("counter_price") is not None:
+            counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
+
         negotiation_message = self._build_summary(
             rfq_id,
             decision,
@@ -325,12 +377,8 @@ class NegotiationAgent(BaseAgent):
                 playbook_context,
             )
 
-        counter_options: List[Dict[str, Any]] = []
-        counter_price = decision.get("counter_price")
-        if counter_price is not None:
-            counter_options.append({"price": counter_price, "terms": None, "bundle": None})
         if rfq_id and supplier:
-            self._store_session(rfq_id, supplier, round_no, counter_price)
+            self._store_session(rfq_id, supplier, round_no, decision.get("counter_price"))
 
         try:
             supplier_reply_count = int(state.get("supplier_reply_count", 0))
@@ -344,7 +392,7 @@ class NegotiationAgent(BaseAgent):
             "current_offer": price_raw,
             "current_offer_numeric": price,
             "target_price": target_price,
-            "counter_price": counter_price,
+            "counter_price": decision.get("counter_price"),
             "currency": currency,
             "decision": decision,
             "asks": decision.get("asks", []),
@@ -359,6 +407,7 @@ class NegotiationAgent(BaseAgent):
             "play_recommendations": play_recommendations,
             "playbook_descriptor": playbook_context.get("descriptor"),
             "playbook_examples": playbook_context.get("examples"),
+            "counter_options": counter_options,
         }
 
         draft_payload.setdefault("subject", self._format_negotiation_subject(state))
@@ -368,7 +417,7 @@ class NegotiationAgent(BaseAgent):
             draft_payload.setdefault("recipients", recipients)
 
         draft_metadata = {
-            "counter_price": counter_price,
+            "counter_price": decision.get("counter_price"),
             "target_price": target_price,
             "current_offer": price,
             "round": round_no,
@@ -662,7 +711,7 @@ class NegotiationAgent(BaseAgent):
             if supplier_name:
                 merge_payload.setdefault("supplier_name", supplier_name)
             merge_payload.setdefault("round", round_no)
-            merge_payload.setdefault("counter_price", counter_price)
+            merge_payload.setdefault("counter_price", decision.get("counter_price"))
             merge_payload.setdefault("target_price", target_price)
             merge_payload.setdefault("current_offer", price)
             merge_payload.setdefault("current_offer_numeric", price)
@@ -686,30 +735,11 @@ class NegotiationAgent(BaseAgent):
             if descriptor:
                 merge_payload.setdefault("playbook_descriptor", descriptor)
 
-            sync_keys = {
-                "supplier_id",
-                "supplier_name",
-                "rfq_id",
-                "counter_price",
-                "target_price",
-                "current_offer",
-                "current_offer_numeric",
-                "currency",
-                "asks",
-                "lead_time_request",
-                "rationale",
-                "negotiation_message",
-                "supplier_message",
-                "supplier_reply_count",
-                "session_state",
-                "intent",
-                "round",
-                "recipients",
-                "sender",
-            }
-            for key in sync_keys:
-                if key in merge_payload:
-                    data[key] = merge_payload[key]
+            if counter_options:
+                merge_payload.setdefault("counter_options", counter_options)
+
+            for key, value in merge_payload.items():
+                data[key] = value
 
             pass_fields.update(merge_payload)
         logger.info(
@@ -722,6 +752,315 @@ class NegotiationAgent(BaseAgent):
             pass_fields=pass_fields,
             next_agents=next_agents,
         )
+
+    # ------------------------------------------------------------------
+    # NEW: Intelligence helpers
+    # ------------------------------------------------------------------
+    def _extract_negotiation_signals(
+        self,
+        *,
+        supplier_message: Optional[str],
+        snippets: List[str],
+        market: Dict[str, Any],
+        performance: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        text = " ".join([t for t in ([supplier_message] + snippets) if t])[:8000]
+        signals: Dict[str, Any] = {
+            "finality_hint": False,
+            "capacity_tight": False,
+            "moq": None,
+            "payment_terms_hint": None,
+            "delivery_flex": None,
+            "alt_part_offered": False,
+            "tone": "neutral",
+            "concession_band_pct": None,
+        }
+
+        lowered = text.lower() if text else ""
+        if any(p in lowered for p in ("capacity", "backlog", "constrained")):
+            signals["capacity_tight"] = True
+        if "moq" in lowered:
+            m = re.search(r"moq[^0-9]*([0-9]{2,})", lowered)
+            if m:
+                try:
+                    signals["moq"] = int(m.group(1))
+                except Exception:
+                    pass
+        if any(x in lowered for x in ("net-30", "net30", "net 30", "net-45", "net 45", "early payment")):
+            signals["payment_terms_hint"] = "tradeable"
+        if any(x in lowered for x in ("expedite", "split shipment", "partial", "air freight")):
+            signals["delivery_flex"] = "possible"
+        if any(x in lowered for x in ("alternate", "alternative", "equivalent", "substitute", "brand b")):
+            signals["alt_part_offered"] = True
+        if any(x in lowered for x in ("cannot go lower", "final", "last price", "our best price", "rock bottom")):
+            signals["finality_hint"] = True
+            signals["tone"] = "firm"
+
+        if LLM_ENABLED and text:
+            try:  # pragma: no cover - optional dependency
+                import ollama  # type: ignore
+
+                prompt = (
+                    "Extract JSON with keys: tone (firm/flexible/neutral), finality_hint (bool), "
+                    "capacity_tight (bool), moq (int or null), payment_terms_hint (tradeable/fixed/null), "
+                    "delivery_flex (possible/unlikely/null), concession_band_pct (float or null). Only return JSON.\n\n"
+                    f"Text:\n{text}"
+                )
+                resp = ollama.generate(model=LLM_MODEL, prompt=prompt, options={"temperature": 0.1})
+                content = resp.get("response") or ""
+                if "{" in content and "}" in content:
+                    content = content[content.find("{") : content.rfind("}") + 1]
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        for key in signals:
+                            if key in parsed and parsed[key] is not None:
+                                signals[key] = parsed[key]
+            except Exception:
+                logger.debug("LLM signal extraction skipped/failed", exc_info=True)
+
+        signals["market"] = market or {}
+        signals["performance"] = performance or {}
+        return signals
+
+    def _estimate_zopa(
+        self,
+        *,
+        price: Optional[float],
+        target: Optional[float],
+        history: Dict[str, Any],
+        benchmarks: Dict[str, Any],
+        should_cost: Optional[float],
+        signals: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        buyer_max = None
+        if target is not None and price is not None:
+            buyer_max = min(target, price)
+        elif target is not None:
+            buyer_max = target
+        elif price is not None:
+            buyer_max = price
+
+        candidates: List[float] = []
+        if should_cost is not None and should_cost > 0:
+            candidates.append(float(should_cost))
+        bench_low = self._coerce_float(benchmarks.get("p10") or benchmarks.get("low"))
+        if bench_low:
+            candidates.append(bench_low)
+        hist_min = self._coerce_float(history.get("min_accepted_price"))
+        if hist_min:
+            candidates.append(hist_min)
+        supplier_floor = min(candidates) if candidates else (price * 0.85 if price else None)
+
+        if supplier_floor:
+            if signals.get("capacity_tight"):
+                supplier_floor *= 1.03
+            if signals.get("tone") == "firm":
+                supplier_floor *= 1.01
+
+        concession = signals.get("concession_band_pct") or 0.05
+        entry = None
+        if price:
+            entry = round(price * (1 - max(0.03, min(0.12, concession))), 2)
+
+        return {
+            "buyer_max": float(buyer_max) if buyer_max is not None else None,
+            "supplier_floor": float(supplier_floor) if supplier_floor is not None else None,
+            "entry_counter": entry,
+        }
+
+    def _adaptive_strategy(
+        self,
+        *,
+        base_decision: Dict[str, Any],
+        zopa: Dict[str, Any],
+        signals: Dict[str, Any],
+        round_hint: Any,
+        lead_weeks: Optional[float],
+        target_price: Optional[float],
+        price: Optional[float],
+    ) -> Dict[str, Any]:
+        decision = dict(base_decision)
+        current_round = int(round_hint) if isinstance(round_hint, (int, float)) else 1
+
+        if signals.get("finality_hint"):
+            decision["strategy"] = "package-trade"
+            decision["asks"] = (decision.get("asks") or []) + [
+                "Consider payment-terms trade (early pay discount vs Net45/60)",
+                "Bundle volume commitment for stepped pricing",
+            ]
+            if lead_weeks and lead_weeks > 3:
+                decision["lead_time_request"] = "Split shipment or expedite slot if possible"
+            return decision
+
+        buyer_max = zopa.get("buyer_max")
+        supplier_floor = zopa.get("supplier_floor")
+        entry = zopa.get("entry_counter")
+        if price and target_price and entry:
+            if current_round == 1:
+                decision["counter_price"] = min(entry, (price + target_price) / 2)
+            else:
+                if buyer_max and supplier_floor and supplier_floor < buyer_max:
+                    midpoint = (buyer_max + supplier_floor) / 2
+                    decision["counter_price"] = round(
+                        min(decision.get("counter_price") or entry, midpoint), 2
+                    )
+                else:
+                    decision["counter_price"] = round(
+                        min(decision.get("counter_price") or entry, (price + target_price) / 2), 2
+                    )
+
+        asks = decision.get("asks", [])
+        if signals.get("payment_terms_hint") == "tradeable":
+            asks.append("Offer early payment for additional 1–2% discount")
+        if signals.get("delivery_flex") == "possible" and (lead_weeks or 0) > 3:
+            asks.append("Split shipment or expedite window swap")
+        decision["asks"] = list(dict.fromkeys(asks))
+        return decision
+
+    def _optimize_multi_issue(
+        self,
+        *,
+        price: Optional[float],
+        currency: Optional[str],
+        target: Optional[float],
+        lead_weeks: Optional[float],
+        weights: Dict[str, Any],
+        policy: Dict[str, Any],
+        constraints: Dict[str, Any],
+        zopa: Dict[str, Any],
+        signals: Dict[str, Any],
+        round_no: int,
+    ) -> Dict[str, Any]:
+        w_price = float(weights.get("price", 0.5))
+        w_delivery = float(weights.get("delivery", 0.2))
+        w_risk = float(weights.get("risk", 0.2))
+        w_terms = float(weights.get("terms", 0.1))
+        normalizer = max(w_price + w_delivery + w_risk + w_terms, 1e-9)
+        w_price, w_delivery, w_risk, w_terms = [w / normalizer for w in (w_price, w_delivery, w_risk, w_terms)]
+
+        _ = policy, constraints  # reserved for future constraint-aware adjustments
+
+        buyer_max = zopa.get("buyer_max")
+        supplier_floor = zopa.get("supplier_floor")
+        entry = zopa.get("entry_counter")
+
+        price_candidates: List[float] = []
+        if target and price:
+            price_candidates.extend(
+                [
+                    round(max(supplier_floor or 0, target * 0.98), 2),
+                    round(max(supplier_floor or 0, (price + target) / 2 * 0.97), 2),
+                ]
+            )
+        if entry:
+            price_candidates.append(round(entry, 2))
+        if price and target:
+            price_candidates.append(
+                round(max(supplier_floor or 0, price * (1 - AGGRESSIVE_FIRST_COUNTER_PCT)), 2)
+            )
+
+        sanitized: List[float] = []
+        for candidate in price_candidates:
+            if candidate is None:
+                continue
+            value = candidate
+            if buyer_max and value > buyer_max:
+                value = buyer_max
+            if supplier_floor and value < supplier_floor:
+                value = supplier_floor
+            sanitized.append(round(value, 2))
+        price_candidates = sorted(set(sanitized))
+
+        daily_rate = COST_OF_CAPITAL_APR / 365.0
+        term_pkgs = [
+            {"label": "Net15 with 2% disc", "apr_equiv": -0.02},
+            {"label": "Net30 std", "apr_equiv": 0.0},
+            {"label": "Net45 std", "apr_equiv": daily_rate * 15},
+            {"label": "Net60 std", "apr_equiv": daily_rate * 30},
+        ]
+
+        if lead_weeks is not None and lead_weeks > 3:
+            lead_packages = [{"label": "≤2w or split shipment", "weeks_gain": (lead_weeks - 2)}]
+        else:
+            lead_packages = [{"label": "as quoted", "weeks_gain": 0}]
+
+        volume_tiers = [None, 100, 250, 500]
+
+        option_grid: List[Dict[str, Any]] = []
+        for price_option in price_candidates[:5]:
+            for term_option in term_pkgs:
+                for lead_option in lead_packages:
+                    for tier in volume_tiers:
+                        option_grid.append(
+                            {
+                                "price": price_option,
+                                "terms": term_option,
+                                "lead": lead_option,
+                                "volume": tier,
+                            }
+                        )
+
+        best_option = None
+        best_score = -1e9
+        for option in option_grid:
+            counter_price = option["price"]
+            price_score = 0.0
+            if target and counter_price:
+                price_score = (target - counter_price) / max(target, 1e-9)
+
+            terms_score = -float(option["terms"]["apr_equiv"])
+
+            delivery_score = 0.0
+            weeks_gain = float(option["lead"].get("weeks_gain") or 0)
+            delivery_score = weeks_gain * LEAD_TIME_VALUE_PCT_PER_WEEK
+
+            risk_score = 0.0
+            performance = signals.get("performance") or {}
+            on_time = self._coerce_float(
+                performance.get("on_time_delivery")
+                or performance.get("delivery_score")
+                or performance.get("otif")
+            )
+            if on_time is not None and on_time < 0.9:
+                risk_score += 0.02
+            if signals.get("capacity_tight") and "split" in option["lead"]["label"].lower():
+                risk_score += 0.02
+
+            total_score = (
+                (w_price * price_score)
+                + (w_terms * terms_score)
+                + (w_delivery * delivery_score)
+                + (w_risk * risk_score)
+            )
+
+            if total_score > best_score:
+                best_score = total_score
+                best_option = option
+
+        decision_overrides: Dict[str, Any] = {}
+        counter_options: List[Dict[str, Any]] = []
+        if best_option:
+            decision_overrides["counter_price"] = round(best_option["price"], 2)
+            asks = decision_overrides.get("asks", [])
+            if "≤2w" in best_option["lead"]["label"]:
+                asks.append("≤ 2 weeks or split shipment (20–30% now, balance later)")
+            if "2% disc" in best_option["terms"]["label"]:
+                asks.append("2% discount for Net15 / early payment")
+            if best_option["volume"]:
+                asks.append(f"Tiers @ {best_option['volume']}/250/500 for stepped pricing")
+            decision_overrides["asks"] = list(dict.fromkeys(asks))
+            counter_options.append(
+                {
+                    "price": round(best_option["price"], 2),
+                    "terms": best_option["terms"]["label"],
+                    "bundle": {
+                        "lead_time": best_option["lead"]["label"],
+                        "volume_tier": best_option["volume"],
+                    },
+                }
+            )
+
+        return {"decision_overrides": decision_overrides, "counter_options": counter_options}
 
     # ------------------------------------------------------------------
     # State management helpers
