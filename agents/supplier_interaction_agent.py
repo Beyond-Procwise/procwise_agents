@@ -167,6 +167,27 @@ class SupplierInteractionAgent(BaseAgent):
                             candidate.get("supplier_id"),
                         )
             else:
+                draft_action_id = None
+                workflow_hint = None
+                dispatch_run_id = None
+                if watch_candidates:
+                    primary_candidate = watch_candidates[0]
+                    if isinstance(primary_candidate, dict):
+                        for key in ("action_id", "draft_action_id", "email_action_id"):
+                            candidate_action = primary_candidate.get(key)
+                            if isinstance(candidate_action, str) and candidate_action.strip():
+                                draft_action_id = candidate_action.strip()
+                                break
+                        workflow_hint = primary_candidate.get("workflow_id")
+                        if not workflow_hint:
+                            meta = primary_candidate.get("metadata")
+                            if isinstance(meta, dict):
+                                meta_workflow = meta.get("workflow_id") or meta.get("process_workflow_id")
+                                if isinstance(meta_workflow, str) and meta_workflow.strip():
+                                    workflow_hint = meta_workflow.strip()
+                        dispatch_run_id = self._extract_dispatch_run_id(primary_candidate)
+                if workflow_hint is None:
+                    workflow_hint = getattr(context, "workflow_id", None)
                 wait_result = self.wait_for_response(
                     timeout=timeout,
                     poll_interval=poll_interval,
@@ -175,6 +196,9 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_id=supplier_id,
                     subject_hint=subject,
                     from_address=expected_sender,
+                    draft_action_id=draft_action_id,
+                    workflow_id=workflow_hint,
+                    dispatch_run_id=dispatch_run_id,
                 )
 
             if not wait_result:
@@ -426,6 +450,9 @@ class SupplierInteractionAgent(BaseAgent):
         from_address: Optional[str] = None,
         max_attempts: Optional[int] = None,
         enable_negotiation: bool = True,
+        draft_action_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        dispatch_run_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """Wait for an inbound supplier email and return the processed result.
 
@@ -521,20 +548,18 @@ class SupplierInteractionAgent(BaseAgent):
             active_watcher = self._email_watcher
 
         result: Optional[Dict] = None
-        rfq_normalised = self._normalise_identifier(rfq_id)
         supplier_normalised = self._normalise_identifier(supplier_id)
+        run_normalised = self._normalise_identifier(dispatch_run_id)
         subject_norm = str(subject_hint or "").strip().lower()
         sender_normalised = self._normalise_identifier(from_address)
 
         match_filters: Dict[str, object] = {}
-        if rfq_id:
-            match_filters["rfq_id"] = rfq_id
         if supplier_id:
             match_filters["supplier_id"] = supplier_id
-        if subject_hint:
-            match_filters["subject_contains"] = subject_hint
-        if from_address:
-            match_filters["from_address"] = from_address
+        if dispatch_run_id:
+            match_filters["dispatch_run_id"] = dispatch_run_id
+        if draft_action_id:
+            match_filters["draft_action_id"] = draft_action_id
 
         while time.time() <= deadline:
             if attempt_cap is not None and attempts_made >= attempt_cap:
@@ -554,36 +579,28 @@ class SupplierInteractionAgent(BaseAgent):
                 logger.exception("wait_for_response poll failed")
                 batch = []
             if batch:
-                rfq_only_match: Optional[Dict[str, object]] = None
                 for candidate in batch:
-                    if rfq_normalised and self._normalise_identifier(
-                        candidate.get("rfq_id")
-                    ) != rfq_normalised:
-                        continue
-                    rfq_matches = bool(rfq_normalised)
                     if supplier_normalised and self._normalise_identifier(
                         candidate.get("supplier_id")
                     ) != supplier_normalised:
-                        if rfq_matches and rfq_only_match is None:
-                            rfq_only_match = candidate
                         continue
+                    if run_normalised:
+                        candidate_run = self._normalise_identifier(
+                            candidate.get("dispatch_run_id") or candidate.get("run_id")
+                        )
+                        if candidate_run != run_normalised:
+                            continue
                     if subject_norm:
                         subj = str(candidate.get("subject") or "").lower()
                         if subject_norm not in subj:
-                            if rfq_matches and rfq_only_match is None:
-                                rfq_only_match = candidate
                             continue
                     if sender_normalised:
                         sender = self._normalise_identifier(candidate.get("from_address"))
                         if sender and sender != sender_normalised:
-                            if rfq_matches and rfq_only_match is None:
-                                rfq_only_match = candidate
                             continue
                     status_value = str(candidate.get("supplier_status") or "").lower()
                     payload_ready = candidate.get("supplier_output")
                     if status_value in {"processing", "pending"} and not payload_ready:
-                        if rfq_matches and rfq_only_match is None:
-                            rfq_only_match = candidate
                         logger.debug(
                             "Supplier response still processing for RFQ %s (supplier=%s); status=%s",
                             candidate.get("rfq_id") or rfq_id,
@@ -602,8 +619,6 @@ class SupplierInteractionAgent(BaseAgent):
                         result = candidate
                         break
                     if not payload_ready:
-                        if rfq_matches and rfq_only_match is None:
-                            rfq_only_match = candidate
                         logger.debug(
                             "Supplier response for RFQ %s matched filters but has no payload yet; continuing to wait",
                             candidate.get("rfq_id") or rfq_id,
@@ -611,21 +626,6 @@ class SupplierInteractionAgent(BaseAgent):
                         continue
                     result = candidate
                     break
-                if result is None and rfq_only_match is not None:
-                    fallback_status = str(rfq_only_match.get("supplier_status") or "").lower()
-                    fallback_payload_ready = rfq_only_match.get("supplier_output")
-                    if fallback_status in {"processing", "pending"} and not fallback_payload_ready:
-                        rfq_only_match = None
-                    else:
-                        logger.info(
-                            "Returning RFQ-matched response for %s despite secondary filter mismatch",
-                            rfq_id,
-                        )
-                        result = rfq_only_match
-                if result is None and not any(
-                    [rfq_normalised, supplier_normalised, subject_norm, sender_normalised]
-                ):
-                    result = batch[-1]
                 if result is not None:
                     break
             interval_value = poll_interval or getattr(
@@ -721,6 +721,29 @@ class SupplierInteractionAgent(BaseAgent):
                 elif isinstance(recipients_field, str):
                     recipient_hint = recipients_field
             subject_hint = draft.get("subject")
+            draft_action_id = None
+            for key in ("action_id", "draft_action_id", "email_action_id"):
+                candidate = draft.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    draft_action_id = candidate.strip()
+                    break
+            workflow_hint = draft.get("workflow_id")
+            if not workflow_hint:
+                meta = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else None
+                if meta:
+                    meta_workflow = meta.get("workflow_id") or meta.get("process_workflow_id")
+                    if isinstance(meta_workflow, str) and meta_workflow.strip():
+                        workflow_hint = meta_workflow.strip()
+            dispatch_run_id = None
+            for key in ("dispatch_run_id", "run_id"):
+                candidate = draft.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    dispatch_run_id = candidate.strip()
+                    break
+            if dispatch_run_id is None and isinstance(draft.get("metadata"), dict):
+                meta_run = draft["metadata"].get("dispatch_run_id") or draft["metadata"].get("run_id")
+                if isinstance(meta_run, str) and meta_run.strip():
+                    dispatch_run_id = meta_run.strip()
 
             poll_setting = getattr(
                 self.agent_nick.settings, "email_response_poll_seconds", 60
@@ -749,6 +772,9 @@ class SupplierInteractionAgent(BaseAgent):
                     subject_hint=subject_hint,
                     from_address=recipient_hint,
                     enable_negotiation=enable_negotiation,
+                    draft_action_id=draft_action_id,
+                    workflow_id=workflow_hint,
+                    dispatch_run_id=dispatch_run_id,
 
                 )
                 with lock:
@@ -854,6 +880,13 @@ class SupplierInteractionAgent(BaseAgent):
                         recipient_hint = recipients_field
 
                 subject_hint = draft.get("subject")
+                dispatch_run_id = self._extract_dispatch_run_id(draft)
+                draft_action_id = None
+                for key in ("action_id", "draft_action_id", "email_action_id"):
+                    candidate_action = draft.get(key)
+                    if isinstance(candidate_action, str) and candidate_action.strip():
+                        draft_action_id = candidate_action.strip()
+                        break
 
                 result = self.wait_for_response(
                     timeout=per_attempt,
@@ -864,6 +897,8 @@ class SupplierInteractionAgent(BaseAgent):
                     subject_hint=subject_hint,
                     from_address=recipient_hint,
                     enable_negotiation=enable_negotiation,
+                    draft_action_id=draft_action_id,
+                    dispatch_run_id=dispatch_run_id,
                 )
                 if result is not None:
                     results[idx] = result
@@ -1161,6 +1196,45 @@ class SupplierInteractionAgent(BaseAgent):
             return None
         lowered = text.lower()
         return lowered or None
+
+    @staticmethod
+    def _extract_dispatch_run_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        def _clean(value: Optional[Any]) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                text = str(value).strip()
+            except Exception:
+                return None
+            return text or None
+
+        for key in ("dispatch_run_id", "run_id"):
+            candidate = _clean(payload.get(key))
+            if candidate:
+                return candidate
+
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+        if metadata:
+            for key in ("dispatch_run_id", "run_id"):
+                candidate = _clean(metadata.get(key))
+                if candidate:
+                    return candidate
+
+        dispatch_meta = (
+            payload.get("dispatch_metadata")
+            if isinstance(payload.get("dispatch_metadata"), dict)
+            else None
+        )
+        if dispatch_meta:
+            for key in ("run_id", "dispatch_run_id", "dispatch_token"):
+                candidate = _clean(dispatch_meta.get(key))
+                if candidate:
+                    return candidate
+
+        return None
 
     def _select_draft(
         self,
