@@ -470,7 +470,7 @@ class SESEmailWatcher:
             default=3,
             minimum=1,
         )
-        self._consecutive_empty_s3_batches = 0
+        self._consecutive_empty_imap_batches = 0
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
             0,
@@ -3219,52 +3219,55 @@ class SESEmailWatcher:
             effective_limit = None
 
         messages: List[Dict[str, object]] = []
-        attempted_s3 = False
+        attempted_imap = False
+
+        if self._imap_configured():
+            attempted_imap = True
+            messages = self._load_from_imap(
+                effective_limit,
+                mark_seen=bool(mark_seen),
+                on_message=on_message,
+            )
+            if messages:
+                self._consecutive_empty_imap_batches = 0
+                return messages
+            self._consecutive_empty_imap_batches += 1
+        else:
+            self._consecutive_empty_imap_batches = 0
 
         if self.bucket:
-            attempted_s3 = True
+            if attempted_imap:
+                if self._consecutive_empty_imap_batches == 1:
+                    logger.info(
+                        "No IMAP messages detected; falling back to S3 for mailbox %s",
+                        self.mailbox_address,
+                    )
+                elif (
+                    self._imap_fallback_attempts > 0
+                    and self._consecutive_empty_imap_batches == self._imap_fallback_attempts
+                ):
+                    logger.info(
+                        "No IMAP messages after %d poll(s); still falling back to S3 for mailbox %s",
+                        self._imap_fallback_attempts,
+                        self.mailbox_address,
+                    )
+
             messages = self._load_from_s3(
                 effective_limit,
                 prefixes=prefixes,
                 on_message=on_message,
             )
+            if messages:
+                self._consecutive_empty_imap_batches = 0
+                return messages
         else:
-            logger.warning("S3 bucket not configured; skipping direct poll for mailbox %s", self.mailbox_address)
-
-        if messages:
-            self._consecutive_empty_s3_batches = 0
-            return messages
-
-        if attempted_s3:
-            self._consecutive_empty_s3_batches += 1
-        else:
-            self._consecutive_empty_s3_batches = 0
-
-        if self._imap_configured():
-            if attempted_s3:
-                if self._consecutive_empty_s3_batches == 1:
-                    logger.info(
-                        "No S3 messages detected; falling back to IMAP for mailbox %s",
-                        self.mailbox_address,
-                    )
-                elif (
-                    self._imap_fallback_attempts > 0
-                    and self._consecutive_empty_s3_batches == self._imap_fallback_attempts
-                ):
-                    logger.info(
-                        "No new S3 messages after %d poll(s); still falling back to IMAP for mailbox %s",
-                        self._imap_fallback_attempts,
-                        self.mailbox_address,
-                    )
-
-            imap_messages = self._load_from_imap(
-                effective_limit,
-                mark_seen=bool(mark_seen),
-                on_message=on_message,
+            logger.warning(
+                "S3 bucket not configured; skipping direct poll for mailbox %s",
+                self.mailbox_address,
             )
-            if imap_messages:
-                self._consecutive_empty_s3_batches = 0
-                return imap_messages
+
+        if not attempted_imap:
+            self._consecutive_empty_imap_batches = 0
 
         return messages
 
