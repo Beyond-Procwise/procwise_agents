@@ -102,11 +102,16 @@ def test_supplier_interaction_wait_for_response():
 
     def poll_once(limit=None, match_filters=None):
         calls["count"] += 1
+        assert match_filters is not None
+        assert "rfq_id" not in match_filters
         if calls["count"] == 1:
             return [
                 {
                     "rfq_id": "RFQ-20240101-abcd1234",
                     "supplier_id": "S1",
+                    "dispatch_run_id": "run-001",
+                    "supplier_status": "success",
+                    "supplier_output": {"price": 1200},
                     "negotiation_output": {"message": "counter"},
                 }
             ]
@@ -114,7 +119,14 @@ def test_supplier_interaction_wait_for_response():
 
     watcher = SimpleNamespace(poll_once=poll_once)
 
-    result = agent.wait_for_response(watcher=watcher, timeout=1, poll_interval=0)
+    result = agent.wait_for_response(
+        watcher=watcher,
+        timeout=1,
+        poll_interval=0,
+        rfq_id="RFQ-20240101-abcd1234",
+        supplier_id="S1",
+        dispatch_run_id="run-001",
+    )
 
     assert result is not None
     assert result["rfq_id"] == "RFQ-20240101-abcd1234"
@@ -132,6 +144,7 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
                 "supplier_id": "S1",
                 "supplier_status": "processing",
                 "supplier_output": None,
+                "dispatch_run_id": "run-002",
             }
         ],
         [
@@ -140,6 +153,7 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
                 "supplier_id": "S1",
                 "supplier_status": "success",
                 "supplier_output": {"price": 900},
+                "dispatch_run_id": "run-002",
             }
         ],
     ]
@@ -148,6 +162,8 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
 
     def poll_once(limit=None, match_filters=None):
         calls["count"] += 1
+        assert match_filters is not None
+        assert "rfq_id" not in match_filters
         return batches.pop(0) if batches else []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -160,6 +176,7 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
         poll_interval=0,
         rfq_id="RFQ-20240101-abcd1234",
         supplier_id="S1",
+        dispatch_run_id="run-002",
     )
 
     assert result is not None
@@ -176,6 +193,8 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
 
     def poll_once(limit=None, match_filters=None):
         calls["count"] += 1
+        assert match_filters is not None
+        assert "rfq_id" not in match_filters
         return []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -187,6 +206,8 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
         timeout=30,
         poll_interval=None,
         rfq_id="RFQ-20240101-missing",
+        supplier_id="S1",
+        dispatch_run_id="run-missing",
         max_attempts=3,
     )
 

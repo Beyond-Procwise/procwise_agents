@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -97,17 +98,24 @@ class EmailDispatchService:
 
             body_source = body_override if body_override is not None else draft.get("body")
             body_text = str(body_source).strip() if body_source else ""
-            draft_metadata = (
+            draft_metadata_source = (
                 draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
             )
+            draft_metadata = dict(draft_metadata_source)
+            dispatch_run_id = uuid.uuid4().hex
+            draft_metadata["dispatch_token"] = dispatch_run_id
+            draft_metadata["run_id"] = dispatch_run_id
             body, backend_metadata = self._ensure_rfq_annotation(
                 body_text,
                 rfq_id,
                 supplier_id=draft.get("supplier_id"),
-                dispatch_token=draft_metadata.get("dispatch_token"),
+                dispatch_token=dispatch_run_id,
+                run_id=dispatch_run_id,
             )
+            backend_metadata["run_id"] = dispatch_run_id
 
             dispatch_payload = dict(draft)
+            dispatch_payload["metadata"] = draft_metadata
             dispatch_payload.update(
                 {
                     "subject": subject,
@@ -117,8 +125,13 @@ class EmailDispatchService:
                     "contact_level": 1 if recipient_list else 0,
                     "sender": sender_email,
                     "dispatch_metadata": backend_metadata,
+                    "dispatch_run_id": dispatch_run_id,
                 }
             )
+            dispatch_payload.setdefault("metadata", {})
+            if isinstance(dispatch_payload["metadata"], dict):
+                dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
+                dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
             headers = {"X-Procwise-RFQ-ID": rfq_id}
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
@@ -444,6 +457,7 @@ class EmailDispatchService:
         *,
         supplier_id: Optional[str] = None,
         dispatch_token: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         text = body or ""
         comment, remainder = split_hidden_marker(text)
@@ -458,11 +472,15 @@ class EmailDispatchService:
             rfq_id=rfq_id,
             supplier_id=supplier_id,
             token=marker_token,
+            run_id=run_id or marker_token,
         )
 
         metadata: Dict[str, Any] = {"rfq_id": rfq_id}
         if marker_token:
             metadata["dispatch_token"] = marker_token
+            metadata.setdefault("run_id", marker_token)
+        elif run_id:
+            metadata["run_id"] = run_id
         return annotated_body, metadata
 
     @staticmethod
