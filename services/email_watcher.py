@@ -33,7 +33,11 @@ except Exception:  # pragma: no cover - psycopg2 may be unavailable in tests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
-from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
+from services.email_dispatch_chain_store import (
+    find_best_chain_match,
+    mark_response as mark_dispatch_response,
+)
+from services.email_dispatch_service import find_recent_sent_for_supplier
 from services.email_thread_store import (
     ensure_thread_table,
     lookup_rfq_from_threads,
@@ -96,6 +100,15 @@ def _rfq_match_key(value: object) -> Optional[str]:
 
 RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
 _SIMILARITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+
+
+@dataclass
+class MatchResult:
+    rfq_id: str
+    supplier_id: Optional[str]
+    dispatch_message_id: Optional[str]
+    matched_via: str
+    confidence: float
 
 
 def _extract_similarity_tokens(*values: object, limit: int = 64) -> Set[str]:
@@ -269,6 +282,15 @@ def _strip_html(value: str) -> str:
 
 class SESEmailWatcher:
     """Poll and process inbound supplier RFQ responses."""
+
+    _MATCH_PRIORITIES: Dict[str, int] = {
+        "header": 0,
+        "thread_map": 1,
+        "body": 4,
+        "subject": 3,
+        "dispatch_chain": 5,
+        "fallback": 6,
+    }
 
     def __init__(
         self,
@@ -448,7 +470,7 @@ class SESEmailWatcher:
             default=3,
             minimum=1,
         )
-        self._consecutive_empty_s3_batches = 0
+        self._consecutive_empty_imap_batches = 0
         self._require_new_s3_objects = False
         self._dispatch_wait_seconds = max(
             0,
@@ -458,11 +480,24 @@ class SESEmailWatcher:
                 minimum=0,
             ),
         )
+        self._post_dispatch_settle_seconds = max(
+            0,
+            self._coerce_int(
+                getattr(
+                    self.settings,
+                    "email_inbound_post_dispatch_delay_seconds",
+                    60,
+                ),
+                default=60,
+                minimum=0,
+            ),
+        )
         self._last_dispatch_notified_at: Optional[float] = None
         self._last_dispatch_wait_acknowledged: Optional[float] = None
         self._dispatch_expectations: Dict[str, "_DispatchExpectation"] = {}
         self._completed_dispatch_actions: Set[str] = set()
         self._workflow_dispatch_actions: Dict[str, str] = {}
+        self._last_candidate_source: str = "none"
 
         logger.info(
             "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
@@ -655,9 +690,16 @@ class SESEmailWatcher:
                             on_message=_on_message,
                         )
                         batch_count = len(processed_batch) if filters else len(messages)
+                        if self._last_candidate_source == "imap":
+                            source_label = "IMAP"
+                        elif self._last_candidate_source == "s3":
+                            source_label = "S3"
+                        else:
+                            source_label = "mail source"
                         logger.info(
-                            "Retrieved %d candidate message(s) from S3 for mailbox %s",
+                            "Retrieved %d candidate message(s) from %s for mailbox %s",
                             batch_count,
+                            source_label,
                             self.mailbox_address,
                         )
                         if not filters:
@@ -986,55 +1028,60 @@ class SESEmailWatcher:
                     canonical_rfq_full = _canon_id(str(processed_payload.get("rfq_id")))
             except Exception:
                 canonical_rfq_full = None
-            header_candidate = message.get("rfq_id_header")
-            match_source = "unknown"
-            header_tail = (
-                self._normalise_rfq_value(header_candidate)
-                if isinstance(header_candidate, str)
-                else None
-            )
-            if canonical_rfq_full and header_tail and header_tail == rfq_extracted:
-                match_source = "header"
-            else:
-                subject_candidate = (
-                    processed_payload.get("subject") or message.get("subject")
-                )
-                body_candidate = (
-                    processed_payload.get("message_body") or message.get("body")
-                )
-                if (
-                    match_source == "unknown"
-                    and canonical_rfq_full
-                    and subject_candidate
-                    and canonical_rfq_full in _norm(str(subject_candidate)).upper()
-                ):
-                    match_source = "subject"
-                if (
-                    match_source == "unknown"
-                    and canonical_rfq_full
-                    and body_candidate
-                    and canonical_rfq_full in _norm(str(body_candidate)).upper()
-                ):
-                    match_source = "body"
-            if match_source == "unknown" and dispatch_record:
-                record_source = dispatch_record.get("match_source")
-                if isinstance(record_source, str) and record_source:
-                    match_source = record_source
-                else:
-                    match_source = "dispatch"
-            if match_source == "unknown" and canonical_rfq_full:
-                match_source = "body"
 
-            existing_match = processed_payload.get("matched_via")
-            if existing_match == "dispatch_fallback":
-                match_source = existing_match
-            processed_payload["matched_via"] = match_source
+            match_source = processed_payload.get("matched_via") or processed.get("matched_via")
+            match_score = processed_payload.get("match_score")
+            if match_score is None and isinstance(processed, dict):
+                match_score = processed.get("match_score")
+
+            if not match_source or match_source == "unknown":
+                header_candidate = message.get("rfq_id_header")
+                header_tail = (
+                    self._normalise_rfq_value(header_candidate)
+                    if isinstance(header_candidate, str)
+                    else None
+                )
+                if canonical_rfq_full and header_tail and header_tail == rfq_extracted:
+                    match_source = "header"
+                else:
+                    subject_candidate = (
+                        processed_payload.get("subject") or message.get("subject")
+                    )
+                    body_candidate = (
+                        processed_payload.get("message_body") or message.get("body")
+                    )
+                    if (
+                        canonical_rfq_full
+                        and subject_candidate
+                        and canonical_rfq_full in _norm(str(subject_candidate)).upper()
+                    ):
+                        match_source = "subject"
+                    elif (
+                        canonical_rfq_full
+                        and body_candidate
+                        and canonical_rfq_full in _norm(str(body_candidate)).upper()
+                    ):
+                        match_source = "body"
+                if (not match_source or match_source == "unknown") and dispatch_record:
+                    record_source = dispatch_record.get("match_source")
+                    if isinstance(record_source, str) and record_source:
+                        match_source = record_source
+                    else:
+                        match_source = "dispatch"
+                if not match_source or match_source == "unknown":
+                    match_source = "body" if canonical_rfq_full else "unknown"
+
+            processed_payload["matched_via"] = match_source or "unknown"
             if isinstance(processed, dict):
-                processed["matched_via"] = match_source
+                processed["matched_via"] = match_source or "unknown"
+            if match_score is not None:
+                processed_payload["match_score"] = match_score
+                if isinstance(processed, dict):
+                    processed["match_score"] = match_score
             processed_payload.setdefault("mailbox", self.mailbox_address)
 
             logger.info(
-                "rfq_email_processed mailbox=%s rfq_id=%s supplier_id=%s s3_key=%s etag=%s size_bytes=%s price=%s lead_time=%s matched_via=%s",
+                "rfq_email_processed mailbox=%s rfq_id=%s supplier_id=%s s3_key=%s etag=%s size_bytes=%s price=%s lead_time=%s matched_via=%s score=%s",
                 self.mailbox_address,
                 processed_payload.get("rfq_id"),
                 processed_payload.get("supplier_id"),
@@ -1043,7 +1090,8 @@ class SESEmailWatcher:
                 size_bytes if size_bytes is not None else "unknown",
                 processed_payload.get("price"),
                 processed_payload.get("lead_time"),
-                match_source,
+                processed_payload.get("matched_via"),
+                processed_payload.get("match_score"),
             )
 
             metadata = {
@@ -1594,6 +1642,283 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("Failed to record processed email %s in registry", key)
 
+    def _process_message_fields_only(self, message: Dict[str, object]) -> Dict[str, object]:
+        processed: Dict[str, object] = {}
+
+        subject = str(message.get("subject") or "")
+        body = str(message.get("body") or "")
+        processed["subject"] = subject
+        processed["message_body"] = body
+
+        supplier_hint = message.get("supplier_id")
+        if supplier_hint not in (None, ""):
+            try:
+                processed["supplier_id"] = str(supplier_hint)
+            except Exception:
+                processed["supplier_id"] = str(supplier_hint)
+
+        comment, remainder = split_hidden_marker(body)
+        analysis_body = remainder or body
+
+        rfq_candidate: Optional[str] = None
+        matched_via: Optional[str] = None
+        hidden_marker = False
+
+        hidden_rfq = extract_rfq_id(comment)
+        if hidden_rfq:
+            rfq_candidate = hidden_rfq
+            matched_via = "body"
+            hidden_marker = True
+
+        if not rfq_candidate:
+            field_rfq = message.get("rfq_id")
+            if isinstance(field_rfq, str) and field_rfq.strip():
+                rfq_candidate = field_rfq.strip()
+                matched_via = message.get("matched_via") or "body"
+
+        if not rfq_candidate and subject:
+            subject_norm = _norm(subject)
+            subject_match = self._extract_rfq_id(
+                subject,
+                raw_subject=subject,
+                normalised_subject=subject_norm,
+            )
+            if subject_match:
+                rfq_candidate = subject_match
+                matched_via = "subject"
+
+        if not rfq_candidate and analysis_body:
+            body_match = self._extract_rfq_id(analysis_body)
+            if body_match:
+                rfq_candidate = body_match
+                matched_via = "body"
+
+        if not rfq_candidate:
+            metadata_candidates = self._rfq_candidates_from_metadata(message)
+            if metadata_candidates:
+                rfq_candidate, supplier_from_meta = metadata_candidates[0]
+                if supplier_from_meta not in (None, ""):
+                    try:
+                        processed.setdefault("supplier_id", str(supplier_from_meta))
+                    except Exception:
+                        processed.setdefault("supplier_id", str(supplier_from_meta))
+                matched_via = "body"
+
+        if rfq_candidate:
+            processed["rfq_id"] = rfq_candidate
+            processed["matched_via"] = matched_via or "body"
+            if hidden_marker:
+                processed["_hidden_marker_match"] = True
+
+        return processed
+
+    def match_inbound_email(self, message: Dict[str, object]) -> Optional[MatchResult]:
+        header_value = message.get("rfq_id_header")
+        header_tail = self._normalise_rfq_value(header_value)
+        if header_tail:
+            canonical = self._canonical_rfq(header_value) or _canon_id(header_tail)
+            if canonical:
+                supplier_hint = message.get("supplier_id")
+                supplier_value = (
+                    str(supplier_hint).strip()
+                    if supplier_hint not in (None, "")
+                    else None
+                )
+                return MatchResult(
+                    rfq_id=canonical,
+                    supplier_id=supplier_value,
+                    dispatch_message_id=None,
+                    matched_via="header",
+                    confidence=1.0,
+                )
+
+        thread_identifiers = self._collect_thread_identifiers(message)
+        if thread_identifiers:
+            message.setdefault("_match_thread_ids", thread_identifiers)
+
+        rfq_from_threads: Optional[str] = None
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if thread_identifiers and callable(get_conn) and self._thread_table_name:
+            try:
+                with get_conn() as conn:
+                    if self._ensure_thread_table_ready(conn):
+                        rfq_from_threads = lookup_rfq_from_threads(
+                            conn,
+                            self._thread_table_name,
+                            thread_identifiers,
+                            logger=logger,
+                        )
+            except Exception:
+                logger.exception(
+                    "Failed to resolve RFQ from thread headers for mailbox %s",
+                    self.mailbox_address,
+                )
+                rfq_from_threads = None
+        if rfq_from_threads:
+            canonical = self._canonical_rfq(rfq_from_threads) or _canon_id(rfq_from_threads)
+            if canonical:
+                supplier_hint = message.get("supplier_id")
+                supplier_value = (
+                    str(supplier_hint).strip()
+                    if supplier_hint not in (None, "")
+                    else None
+                )
+                return MatchResult(
+                    rfq_id=canonical,
+                    supplier_id=supplier_value,
+                    dispatch_message_id=None,
+                    matched_via="thread_map",
+                    confidence=0.95,
+                )
+
+        processed = self._process_message_fields_only(message)
+        rfq_value = processed.get("rfq_id")
+        rfq_norm = self._normalise_rfq_value(rfq_value)
+        if rfq_norm and rfq_value:
+            canonical = self._canonical_rfq(rfq_value) or _canon_id(rfq_value)
+            if canonical:
+                supplier_hint = processed.get("supplier_id") or message.get("supplier_id")
+                supplier_value = (
+                    str(supplier_hint).strip()
+                    if supplier_hint not in (None, "")
+                    else None
+                )
+                via = processed.get("matched_via") or "body"
+                hidden_marker = bool(processed.get("_hidden_marker_match"))
+                score = 0.7
+                if via == "subject":
+                    score = 0.8
+                elif via == "body":
+                    score = 0.9 if hidden_marker else 0.7
+                return MatchResult(
+                    rfq_id=canonical,
+                    supplier_id=supplier_value,
+                    dispatch_message_id=None,
+                    matched_via=via,
+                    confidence=score,
+                )
+
+        chain_hit: Optional[Dict[str, object]] = None
+        if callable(get_conn):
+            raw_lookback = getattr(self.settings, "dispatch_chain_lookback_days", 5)
+            try:
+                lookback_days = int(raw_lookback)
+            except Exception:
+                lookback_days = 5
+            if lookback_days <= 0:
+                lookback_days = 1
+            try:
+                with get_conn() as conn:
+                    chain_hit = find_best_chain_match(
+                        conn,
+                        message,
+                        mailbox=self.mailbox_address,
+                        lookback_days=lookback_days,
+                        thread_identifiers=message.get("_match_thread_ids") or thread_identifiers,
+                        recipients_hint=True,
+                    )
+            except Exception:
+                logger.debug("Failed to resolve RFQ via dispatch chain", exc_info=True)
+                chain_hit = None
+        if chain_hit and chain_hit.get("rfq_id"):
+            canonical = self._canonical_rfq(chain_hit.get("rfq_id")) or _canon_id(
+                chain_hit.get("rfq_id")
+            )
+            if canonical:
+                metadata_doc = chain_hit.get("dispatch_metadata")
+                dispatch_record = {
+                    "rfq_id": chain_hit.get("rfq_id"),
+                    "supplier_id": chain_hit.get("supplier_id"),
+                    "match_source": chain_hit.get("matched_via") or "dispatch_chain",
+                }
+                if chain_hit.get("message_id"):
+                    dispatch_record["message_id"] = chain_hit.get("message_id")
+                if chain_hit.get("thread_index") is not None:
+                    dispatch_record["thread_index"] = chain_hit.get("thread_index")
+                if chain_hit.get("created_at") is not None:
+                    dispatch_record["created_at"] = chain_hit.get("created_at")
+                if isinstance(metadata_doc, dict):
+                    dispatch_record["dispatch_metadata"] = metadata_doc
+                    run_identifier = metadata_doc.get("run_id") or metadata_doc.get("dispatch_token")
+                    if run_identifier:
+                        dispatch_record["run_id"] = run_identifier
+                message["_dispatch_record"] = dispatch_record
+                supplier_hint = chain_hit.get("supplier_id") or message.get("supplier_id")
+                supplier_value = (
+                    str(supplier_hint).strip()
+                    if supplier_hint not in (None, "")
+                    else None
+                )
+                matched_label = chain_hit.get("matched_via") or "dispatch_chain"
+                confidence = 0.6 if matched_label == "time_window" else 0.75
+                dispatch_message_id = chain_hit.get("message_id")
+                return MatchResult(
+                    rfq_id=canonical,
+                    supplier_id=supplier_value,
+                    dispatch_message_id=dispatch_message_id,
+                    matched_via="dispatch_chain",
+                    confidence=confidence,
+                )
+
+        fallback_hit: Optional[Dict[str, object]] = None
+        if callable(get_conn):
+            try:
+                with get_conn() as conn:
+                    fallback_hit = find_recent_sent_for_supplier(
+                        conn,
+                        message,
+                        mailbox=self.mailbox_address,
+                        window_minutes=getattr(
+                            self.settings,
+                            "recent_supplier_fallback_minutes",
+                            10,
+                        ),
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to resolve recent supplier dispatch fallback", exc_info=True
+                )
+                fallback_hit = None
+        if fallback_hit and fallback_hit.get("rfq_id"):
+            canonical = self._canonical_rfq(fallback_hit.get("rfq_id")) or _canon_id(
+                fallback_hit.get("rfq_id")
+            )
+            if canonical:
+                metadata_doc = fallback_hit.get("dispatch_metadata")
+                dispatch_record = {
+                    "rfq_id": fallback_hit.get("rfq_id"),
+                    "supplier_id": fallback_hit.get("supplier_id"),
+                    "match_source": "fallback",
+                }
+                if fallback_hit.get("message_id"):
+                    dispatch_record["message_id"] = fallback_hit.get("message_id")
+                if fallback_hit.get("thread_index") is not None:
+                    dispatch_record["thread_index"] = fallback_hit.get("thread_index")
+                if fallback_hit.get("created_at") is not None:
+                    dispatch_record["created_at"] = fallback_hit.get("created_at")
+                if isinstance(metadata_doc, dict):
+                    dispatch_record["dispatch_metadata"] = metadata_doc
+                    run_identifier = metadata_doc.get("run_id") or metadata_doc.get("dispatch_token")
+                    if run_identifier:
+                        dispatch_record["run_id"] = run_identifier
+                message["_dispatch_record"] = dispatch_record
+                supplier_hint = fallback_hit.get("supplier_id") or message.get("supplier_id")
+                supplier_value = (
+                    str(supplier_hint).strip()
+                    if supplier_hint not in (None, "")
+                    else None
+                )
+                dispatch_message_id = fallback_hit.get("message_id")
+                return MatchResult(
+                    rfq_id=canonical,
+                    supplier_id=supplier_value,
+                    dispatch_message_id=dispatch_message_id,
+                    matched_via="fallback",
+                    confidence=0.5,
+                )
+
+        return None
+
     def _process_message(
         self,
         message: Dict[str, object],
@@ -1602,118 +1927,242 @@ class SESEmailWatcher:
     ) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
         body = str(message.get("body", ""))
+        comment, body_remainder = split_hidden_marker(body)
+        analysis_body = body_remainder or body
         subject_normalised = _norm(subject)
-        body_normalised = _norm(body)
+        body_normalised = _norm(analysis_body)
         from_address = str(message.get("from", ""))
-        rfq_candidates: List[str] = []
+
+        match_hint = self.match_inbound_email(message)
+
         tail_supplier_map: Dict[str, Optional[str]] = {}
+        canonical_map: Dict[str, str] = {}
+        canonical_order: Dict[str, int] = {}
+        ordered_canonicals: List[str] = []
+        candidates: Dict[str, SESEmailWatcher._MatchCandidate] = {}
+
+        def _register_candidate(
+            rfq_value: Optional[str],
+            *,
+            supplier_hint: Optional[object] = None,
+            matched_via: str,
+            score: float,
+            priority: Optional[int] = None,
+            dispatch_record: Optional[Dict[str, object]] = None,
+            thread_index: Optional[int] = None,
+            created_at: Optional[datetime] = None,
+        ) -> None:
+            if not rfq_value:
+                return
+            canonical = self._canonical_rfq(rfq_value)
+            if not canonical:
+                return
+            order_index = canonical_order.get(canonical)
+            if order_index is None:
+                order_index = len(canonical_order)
+                canonical_order[canonical] = order_index
+                canonical_map[canonical] = str(rfq_value)
+                ordered_canonicals.append(canonical)
+            supplier_value: Optional[str] = None
+            if supplier_hint not in (None, ""):
+                supplier_value = str(supplier_hint)
+                tail_supplier_map.setdefault(canonical, supplier_value)
+            candidate = SESEmailWatcher._MatchCandidate(
+                rfq_id=str(rfq_value),
+                supplier_id=supplier_value,
+                matched_via=matched_via,
+                score=score,
+                priority=priority if priority is not None else self._priority_for(matched_via),
+                order=order_index,
+                dispatch_record=dict(dispatch_record) if isinstance(dispatch_record, dict) else dispatch_record,
+                thread_index=thread_index,
+                created_at=created_at if isinstance(created_at, datetime) else None,
+            )
+            existing = candidates.get(canonical)
+            if existing is None or self._prefer_candidate(candidate, existing):
+                if existing is not None:
+                    if not candidate.supplier_id and existing.supplier_id:
+                        candidate.supplier_id = existing.supplier_id
+                    if candidate.dispatch_record is None and existing.dispatch_record is not None:
+                        candidate.dispatch_record = existing.dispatch_record
+                    if candidate.thread_index is None and existing.thread_index is not None:
+                        candidate.thread_index = existing.thread_index
+                    if candidate.created_at is None and existing.created_at is not None:
+                        candidate.created_at = existing.created_at
+                candidates[canonical] = candidate
+            else:
+                if supplier_value and not existing.supplier_id:
+                    existing.supplier_id = supplier_value
+                if dispatch_record and existing.dispatch_record is None:
+                    existing.dispatch_record = dict(dispatch_record)
+                if thread_index is not None and (existing.thread_index or 0) < thread_index:
+                    existing.thread_index = thread_index
+                if created_at and existing.created_at is None and isinstance(created_at, datetime):
+                    existing.created_at = created_at
+
+        def _best_score() -> float:
+            if not candidates:
+                return -1.0
+            return max(candidate.score for candidate in candidates.values())
+
+        if match_hint:
+            dispatch_hint = (
+                message.get("_dispatch_record")
+                if isinstance(message.get("_dispatch_record"), dict)
+                else None
+            )
+            supplier_hint_value = match_hint.supplier_id or message.get("supplier_id")
+            _register_candidate(
+                match_hint.rfq_id,
+                supplier_hint=supplier_hint_value,
+                matched_via=match_hint.matched_via,
+                score=match_hint.confidence,
+                dispatch_record=dispatch_hint,
+            )
+
         raw_rfq = message.get("rfq_id")
+        supplier_hint = message.get("supplier_id")
         if isinstance(raw_rfq, str) and raw_rfq.strip():
-            rfq_candidates.append(raw_rfq)
+            _register_candidate(raw_rfq, supplier_hint=supplier_hint, matched_via="body", score=0.7)
         elif isinstance(raw_rfq, (list, tuple, set)):
             for entry in raw_rfq:
                 if isinstance(entry, str) and entry.strip():
-                    rfq_candidates.append(entry)
+                    _register_candidate(entry, supplier_hint=supplier_hint, matched_via="body", score=0.7)
 
-        extracted_candidates = self._extract_rfq_ids(
-            f"{subject_normalised} {body_normalised}",
+        header_candidate = message.get("rfq_id_header")
+        if isinstance(header_candidate, str) and header_candidate.strip():
+            _register_candidate(header_candidate, supplier_hint=supplier_hint, matched_via="header", score=1.0)
+
+        thread_identifiers = message.get("_match_thread_ids") or self._collect_thread_identifiers(
+            message
+        )
+        if _best_score() < 0.95:
+            thread_match = self._resolve_rfq_from_thread_headers(message)
+            if thread_match:
+                rfq_value, supplier_from_thread = thread_match
+                _register_candidate(
+                    rfq_value,
+                    supplier_hint=supplier_from_thread or supplier_hint,
+                    matched_via="thread_map",
+                    score=0.95,
+                )
+
+        hidden_rfq = extract_rfq_id(comment)
+        if hidden_rfq:
+            _register_candidate(hidden_rfq, supplier_hint=supplier_hint, matched_via="body", score=0.9)
+
+        subject_matches = self._extract_rfq_ids(
+            subject,
             raw_subject=subject,
             normalised_subject=subject_normalised,
         )
-        rfq_candidates.extend(extracted_candidates)
+        for match in subject_matches:
+            _register_candidate(match, supplier_hint=supplier_hint, matched_via="subject", score=0.8)
+
+        body_matches = self._extract_rfq_ids(analysis_body)
+        for match in body_matches:
+            _register_candidate(match, supplier_hint=supplier_hint, matched_via="body", score=0.7)
 
         metadata_candidates = self._rfq_candidates_from_metadata(message)
-        for candidate, supplier_hint in metadata_candidates:
-            if candidate not in rfq_candidates:
-                rfq_candidates.append(candidate)
-            canonical_hint = self._canonical_rfq(candidate)
-            if canonical_hint and supplier_hint and canonical_hint not in tail_supplier_map:
-                tail_supplier_map[canonical_hint] = supplier_hint
-
-        if not rfq_candidates:
-            thread_match = self._resolve_rfq_from_thread_headers(message)
-            if thread_match:
-                rfq_value, supplier_hint = thread_match
-                if rfq_value not in rfq_candidates:
-                    rfq_candidates.append(rfq_value)
-                if supplier_hint:
-                    canonical_hint = self._canonical_rfq(rfq_value)
-                    if canonical_hint and canonical_hint not in tail_supplier_map:
-                        tail_supplier_map[canonical_hint] = supplier_hint
-
-        canonical_map: Dict[str, str] = {}
-        ordered_canonicals: List[str] = []
-        for candidate in rfq_candidates:
-            canonical = self._canonical_rfq(candidate)
-            if not canonical or canonical in canonical_map:
-                continue
-            canonical_map[canonical] = str(candidate)
-            ordered_canonicals.append(canonical)
-
-        if not ordered_canonicals:
-            search_text = " ".join(
-                value
-                for value in (subject_normalised, body_normalised)
-                if isinstance(value, str)
+        for candidate, supplier_from_meta in metadata_candidates:
+            _register_candidate(
+                candidate,
+                supplier_hint=supplier_from_meta or supplier_hint,
+                matched_via="body",
+                score=0.7,
             )
-            for canonical, resolved_value, supplier_hint in self._resolve_rfq_from_tail_tokens(
-                search_text, message
-            ):
-                if canonical in canonical_map:
-                    continue
-                canonical_map[canonical] = resolved_value
-                ordered_canonicals.append(canonical)
-                if supplier_hint and canonical not in tail_supplier_map:
-                    tail_supplier_map[canonical] = supplier_hint
 
-        if not ordered_canonicals:
-            thread_match = self._resolve_rfq_from_thread_headers(message)
-            if thread_match:
-                rfq_value, supplier_hint = thread_match
-                canonical = self._canonical_rfq(rfq_value)
-                if canonical and canonical not in canonical_map:
-                    canonical_map[canonical] = rfq_value
-                    ordered_canonicals.append(canonical)
-                    if supplier_hint and canonical not in tail_supplier_map:
-                        tail_supplier_map[canonical] = supplier_hint
+        search_text = " ".join(
+            value
+            for value in (subject_normalised, body_normalised)
+            if isinstance(value, str)
+        )
+        for canonical, resolved_value, supplier_from_tail in self._resolve_rfq_from_tail_tokens(
+            search_text, message
+        ):
+            _register_candidate(
+                resolved_value,
+                supplier_hint=supplier_from_tail or supplier_hint,
+                matched_via="body",
+                score=0.7,
+            )
+
+        if _best_score() < 0.75:
+            for match in self._resolve_rfq_via_dispatch_chain(message, thread_identifiers):
+                rfq_value = match.get("rfq_id")
+                if not rfq_value:
+                    continue
+                metadata_doc = self._safe_parse_json(match.get("dispatch_metadata"))
+                dispatch_record = {
+                    "rfq_id": rfq_value,
+                    "supplier_id": match.get("supplier_id"),
+                    "match_source": "dispatch_chain",
+                }
+                if match.get("message_id"):
+                    dispatch_record["message_id"] = match.get("message_id")
+                if match.get("thread_index") is not None:
+                    dispatch_record["thread_index"] = match.get("thread_index")
+                created_at = match.get("created_at") if isinstance(match.get("created_at"), datetime) else None
+                if created_at is not None:
+                    dispatch_record["created_at"] = created_at
+                if metadata_doc:
+                    dispatch_record["dispatch_metadata"] = metadata_doc
+                    run_identifier = metadata_doc.get("run_id") or metadata_doc.get("dispatch_token")
+                    if run_identifier:
+                        dispatch_record["run_id"] = run_identifier
+                _register_candidate(
+                    rfq_value,
+                    supplier_hint=match.get("supplier_id") or supplier_hint,
+                    matched_via="dispatch_chain",
+                    score=float(match.get("score", 0.6)),
+                    dispatch_record=dispatch_record,
+                    thread_index=match.get("thread_index"),
+                    created_at=created_at,
+                )
 
         if not ordered_canonicals:
             dispatch_resolution = self._resolve_rfq_from_recent_dispatch(message)
             if dispatch_resolution:
                 dispatch_rfq, dispatch_supplier, dispatch_record = dispatch_resolution
-                canonical = self._canonical_rfq(dispatch_rfq)
-                if canonical:
-                    if canonical not in canonical_map:
-                        canonical_map[canonical] = dispatch_rfq
-                        ordered_canonicals.append(canonical)
-                    if dispatch_supplier and canonical not in tail_supplier_map:
-                        tail_supplier_map[canonical] = dispatch_supplier
-                    if dispatch_record:
-                        message["_dispatch_record"] = dispatch_record
+                if dispatch_record:
+                    dispatch_record = dict(dispatch_record)
+                    dispatch_record.setdefault("match_source", "fallback")
+                _register_candidate(
+                    dispatch_rfq,
+                    supplier_hint=dispatch_supplier or supplier_hint,
+                    matched_via="fallback",
+                    score=0.5,
+                    dispatch_record=dispatch_record,
+                )
 
-        if not ordered_canonicals:
+        if not ordered_canonicals or not candidates:
             logger.debug("Skipping email without RFQ identifier: %s", subject)
             return None, "missing_rfq_id"
 
-        primary_canonical = ordered_canonicals[0]
+        best_canonical = None
+        best_candidate: Optional[SESEmailWatcher._MatchCandidate] = None
+        for canonical, candidate in candidates.items():
+            if best_candidate is None:
+                best_candidate = candidate
+                best_canonical = canonical
+                continue
+            if self._prefer_candidate(candidate, best_candidate):
+                best_candidate = candidate
+                best_canonical = canonical
+
+        if best_candidate is None or best_canonical is None:
+            logger.debug("Unable to determine RFQ candidate for message: %s", subject)
+            return None, "missing_rfq_id"
+
+        primary_canonical = best_canonical
         rfq_id = canonical_map[primary_canonical]
+
+        if best_candidate.dispatch_record:
+            message["_dispatch_record"] = best_candidate.dispatch_record
+        if best_candidate.supplier_id and primary_canonical not in tail_supplier_map:
+            tail_supplier_map[primary_canonical] = best_candidate.supplier_id
         additional_canonicals = ordered_canonicals[1:]
         additional_rfqs = [canonical_map[c] for c in additional_canonicals]
-
-        if not additional_rfqs and len(rfq_candidates) > 1:
-            fallback_values: List[str] = []
-            fallback_canonicals: List[str] = []
-            for candidate in rfq_candidates:
-                canonical = self._canonical_rfq(candidate)
-                if not canonical or canonical == primary_canonical:
-                    continue
-                if canonical in fallback_canonicals:
-                    continue
-                fallback_canonicals.append(canonical)
-                fallback_values.append(canonical_map.get(canonical, str(candidate)))
-            if fallback_values:
-                additional_rfqs = fallback_values
-                additional_canonicals = fallback_canonicals
 
         metadata = self._load_metadata(rfq_id)
         existing_dispatch_record = (
@@ -1792,6 +2241,8 @@ class SESEmailWatcher:
                 "related_rfq_ids": additional_rfqs,
             }
         )
+        processed["matched_via"] = best_candidate.matched_via
+        processed["match_score"] = best_candidate.score
 
         if not execute_supplier:
             return processed, None
@@ -2788,47 +3239,73 @@ class SESEmailWatcher:
             effective_limit = None
 
         messages: List[Dict[str, object]] = []
-        attempted_s3 = False
+        attempted_imap = False
+        self._last_candidate_source = "none"
 
-        if self.bucket:
-            attempted_s3 = True
+        fallback_enabled = self._imap_fallback_attempts != 0
+        fallback_threshold = max(self._imap_fallback_attempts, 1)
+        should_attempt_s3 = False
+
+        if self._imap_configured():
+            attempted_imap = True
+            messages = self._load_from_imap(
+                effective_limit,
+                mark_seen=bool(mark_seen),
+                on_message=on_message,
+            )
+            if messages:
+                self._last_candidate_source = "imap"
+                self._consecutive_empty_imap_batches = 0
+                return messages
+
+            self._consecutive_empty_imap_batches += 1
+            self._last_candidate_source = "imap"
+
+            if self.bucket:
+                if fallback_enabled and self._consecutive_empty_imap_batches >= fallback_threshold:
+                    if self._consecutive_empty_imap_batches == fallback_threshold:
+                        logger.info(
+                            "No IMAP messages after %d poll(s); falling back to S3 for mailbox %s",
+                            self._consecutive_empty_imap_batches,
+                            self.mailbox_address,
+                        )
+                    should_attempt_s3 = True
+                else:
+                    if self._consecutive_empty_imap_batches == 1:
+                        if fallback_enabled:
+                            logger.info(
+                                "IMAP poll yielded no messages for mailbox %s; deferring S3 fallback until %d consecutive empty poll(s) are observed",
+                                self.mailbox_address,
+                                fallback_threshold,
+                            )
+                        else:
+                            logger.info(
+                                "IMAP poll yielded no messages for mailbox %s; S3 fallback disabled by configuration",
+                                self.mailbox_address,
+                            )
+        else:
+            self._consecutive_empty_imap_batches = 0
+            if self.bucket:
+                should_attempt_s3 = True
+
+        if should_attempt_s3 and self.bucket:
             messages = self._load_from_s3(
                 effective_limit,
                 prefixes=prefixes,
                 on_message=on_message,
             )
-        else:
-            logger.warning("S3 bucket not configured; skipping direct poll for mailbox %s", self.mailbox_address)
-
-        if messages:
-            self._consecutive_empty_s3_batches = 0
-            return messages
-
-        if attempted_s3:
-            self._consecutive_empty_s3_batches += 1
-        else:
-            self._consecutive_empty_s3_batches = 0
-
-        should_fallback_to_imap = not attempted_s3 or (
-            self._imap_fallback_attempts > 0
-            and self._consecutive_empty_s3_batches >= self._imap_fallback_attempts
-        )
-
-        if should_fallback_to_imap and self._imap_configured():
-            if attempted_s3 and self._consecutive_empty_s3_batches == self._imap_fallback_attempts:
-                logger.info(
-                    "No new S3 messages after %d poll(s); falling back to IMAP for mailbox %s",
-                    self._imap_fallback_attempts,
-                    self.mailbox_address,
-                )
-            imap_messages = self._load_from_imap(
-                effective_limit,
-                mark_seen=bool(mark_seen),
-                on_message=on_message,
+            self._last_candidate_source = "s3"
+            if messages:
+                self._consecutive_empty_imap_batches = 0
+                return messages
+        elif not self.bucket:
+            logger.warning(
+                "S3 bucket not configured; skipping direct poll for mailbox %s",
+                self.mailbox_address,
             )
-            if imap_messages:
-                self._consecutive_empty_s3_batches = 0
-                return imap_messages
+
+        if not attempted_imap:
+            self._consecutive_empty_imap_batches = 0
 
         return messages
 
@@ -3268,6 +3745,18 @@ class SESEmailWatcher:
         supplier_count: int
 
     @dataclass
+    class _MatchCandidate:
+        rfq_id: str
+        supplier_id: Optional[str]
+        matched_via: str
+        score: float
+        priority: int
+        order: int
+        dispatch_record: Optional[Dict[str, object]] = None
+        thread_index: Optional[int] = None
+        created_at: Optional[datetime] = None
+
+    @dataclass
     class _DraftSnapshot:
         id: int
         rfq_id: Optional[str]
@@ -3552,6 +4041,13 @@ class SESEmailWatcher:
                     expectation.action_id,
                     expectation.workflow_id,
                 )
+                if self._post_dispatch_settle_seconds > 0:
+                    logger.info(
+                        "Waiting %ds after dispatch completion before polling inbound for mailbox %s",
+                        self._post_dispatch_settle_seconds,
+                        self.mailbox_address,
+                    )
+                    time.sleep(self._post_dispatch_settle_seconds)
                 return True
 
             now = time.time()
@@ -3862,7 +4358,8 @@ class SESEmailWatcher:
             if run_value:
                 processed_payload["dispatch_run_id"] = run_value
 
-        processed_payload["matched_via"] = "dispatch_fallback"
+        processed_payload["matched_via"] = "fallback"
+        processed_payload["match_score"] = 0.5
 
         return True
 
@@ -4900,6 +5397,175 @@ class SESEmailWatcher:
             message_ids.append(trimmed)
 
         return message_ids
+
+    def _collect_body_message_ids(self, message: Dict[str, object]) -> List[str]:
+        body = message.get("body")
+        if not isinstance(body, str) or "<" not in body:
+            return []
+
+        pattern = re.compile(r"<([^>]+)>")
+        collected: List[str] = []
+        seen: Set[str] = set()
+        for match in pattern.findall(body):
+            candidate = match.strip()
+            if not candidate:
+                continue
+            lowered = candidate.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            collected.append(candidate)
+        return collected
+
+    def _priority_for(self, matched_via: str) -> int:
+        return self._MATCH_PRIORITIES.get(matched_via, 10)
+
+    def _prefer_candidate(
+        self,
+        new: "SESEmailWatcher._MatchCandidate",
+        existing: "SESEmailWatcher._MatchCandidate",
+    ) -> bool:
+        if new.score > existing.score:
+            return True
+        if new.score < existing.score:
+            return False
+
+        if new.priority < existing.priority:
+            return True
+        if new.priority > existing.priority:
+            return False
+
+        if (
+            new.matched_via == existing.matched_via == "dispatch_chain"
+        ):
+            new_index = new.thread_index or 0
+            existing_index = existing.thread_index or 0
+            if new_index > existing_index:
+                return True
+            if new_index < existing_index:
+                return False
+
+            new_created = new.created_at or datetime.min.replace(tzinfo=timezone.utc)
+            existing_created = existing.created_at or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            if new_created > existing_created:
+                return True
+            if new_created < existing_created:
+                return False
+
+        if new.score == existing.score and new.priority == existing.priority:
+            if new.order < existing.order:
+                return True
+
+        return False
+
+    def _resolve_rfq_via_dispatch_chain(
+        self,
+        message: Dict[str, object],
+        thread_identifiers: Optional[List[str]] = None,
+    ) -> List[Dict[str, object]]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return []
+
+        supplier_hint = self._normalise_filter_value(message.get("supplier_id"))
+        identifiers: List[str] = []
+        if thread_identifiers:
+            identifiers.extend(thread_identifiers)
+        identifiers.extend(self._collect_body_message_ids(message))
+
+        seen: Set[str] = set()
+        ordered_identifiers: List[str] = []
+        for value in identifiers:
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            ordered_identifiers.append(value)
+
+        matches: List[Dict[str, object]] = []
+
+        lookback_days = max(getattr(self.settings, "dispatch_chain_lookback_days", 5), 1)
+        lookback_text = str(lookback_days)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if ordered_identifiers:
+                        cur.execute(
+                            """
+                            SELECT rfq_id, supplier_id, dispatch_metadata, thread_index, created_at, message_id
+                            FROM proc.email_dispatch_chains
+                            WHERE awaiting_response = TRUE
+                              AND message_id = ANY(%s)
+                              AND (
+                                  dispatch_metadata ->> 'mailbox' IS NULL
+                                  OR dispatch_metadata ->> 'mailbox' = %s
+                              )
+                            ORDER BY thread_index DESC, created_at DESC
+                            LIMIT 1
+                            """,
+                            (ordered_identifiers, self.mailbox_address),
+                        )
+                        direct_row = cur.fetchone()
+                    else:
+                        direct_row = None
+
+                    if direct_row:
+                        matches.append(
+                            {
+                                "rfq_id": direct_row[0],
+                                "supplier_id": direct_row[1],
+                                "dispatch_metadata": direct_row[2],
+                                "thread_index": direct_row[3],
+                                "created_at": direct_row[4],
+                                "message_id": direct_row[5],
+                                "score": 0.75,
+                            }
+                        )
+                        return matches
+
+                    cur.execute(
+                        """
+                        SELECT rfq_id, supplier_id, dispatch_metadata, thread_index, created_at, message_id
+                        FROM proc.email_dispatch_chains
+                        WHERE awaiting_response = TRUE
+                          AND created_at >= NOW() - (%s || ' days')::INTERVAL
+                          AND (
+                              dispatch_metadata ->> 'mailbox' IS NULL
+                              OR dispatch_metadata ->> 'mailbox' = %s
+                          )
+                          AND (%s IS NULL OR supplier_id = %s)
+                        ORDER BY thread_index DESC, created_at DESC
+                        LIMIT 5
+                        """,
+                        (lookback_text, self.mailbox_address, supplier_hint, supplier_hint),
+                    )
+                    rows = cur.fetchall() or []
+        except Exception:
+            logger.debug("Failed to resolve RFQ via dispatch chain", exc_info=True)
+            return matches
+
+        for row in rows:
+            score = 0.6
+            if supplier_hint:
+                score = max(score, 0.7)
+            matches.append(
+                {
+                    "rfq_id": row[0],
+                    "supplier_id": row[1],
+                    "dispatch_metadata": row[2],
+                    "thread_index": row[3],
+                    "created_at": row[4],
+                    "message_id": row[5],
+                    "score": score,
+                }
+            )
+
+        return matches
 
     def _ensure_thread_table_ready(self, conn) -> bool:
         if self._thread_table_ready:

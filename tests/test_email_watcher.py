@@ -101,6 +101,7 @@ class DummyNick:
             s3_bucket_name=None,
             email_response_poll_seconds=1,
             email_inbound_initial_wait_seconds=0,
+            email_inbound_post_dispatch_delay_seconds=0,
         )
         self.agents: Dict[str, object] = {}
         self.ddl_statements: List[str] = []
@@ -244,7 +245,8 @@ def test_poll_once_matches_with_recent_supplier_when_run_diff(monkeypatch):
 
     assert len(results) == 1
     processed = results[0]
-    assert processed.get("matched_via") == "dispatch_fallback"
+    assert processed.get("matched_via") == "fallback"
+    assert processed.get("match_score") == 0.5
     assert processed.get("supplier_id") == "S1"
     assert processed.get("dispatch_run_id") == "run-303"
 
@@ -290,7 +292,8 @@ def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
     assert len(results) == 1
     processed = results[0]
     assert processed["dispatch_run_id"] == "run-202"
-    assert processed.get("matched_via") == "dispatch_fallback"
+    assert processed.get("matched_via") == "fallback"
+    assert processed.get("match_score") == 0.5
 
 
 def test_load_recent_drafts_filters_by_supplier_and_time():
@@ -553,7 +556,8 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
     processed = results[0]
     assert processed["rfq_id"] == dispatch_row["rfq_id"]
     assert processed["supplier_id"] == dispatch_row["supplier_id"]
-    assert processed["matched_via"] == "dispatch"
+    assert processed["matched_via"] == "fallback"
+    assert processed["match_score"] == 0.5
     assert watcher.supplier_agent.contexts
     context = watcher.supplier_agent.contexts[0]
     assert context.input_data["rfq_id"] == dispatch_row["rfq_id"]
@@ -696,7 +700,8 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
     processed = results[0]
     assert processed["rfq_id"] == row["rfq_id"]
     assert processed["supplier_id"] == row["supplier_id"]
-    assert processed["matched_via"] == "dispatch_similarity"
+    assert processed["matched_via"] == "fallback"
+    assert processed["match_score"] == 0.5
     assert watcher.supplier_agent.contexts
     context = watcher.supplier_agent.contexts[0]
     assert context.input_data["rfq_id"] == row["rfq_id"]
@@ -854,7 +859,7 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
     assert payload["subject"] == "Re: RFQ-20240101-abcd1234"
 
 
-def test_imap_fallback_triggers_after_three_empty_s3_batches(monkeypatch):
+def test_imap_primary_prefers_imap_over_s3(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
     nick.settings.imap_user = "inbound@example.com"
@@ -887,14 +892,62 @@ def test_imap_fallback_triggers_after_three_empty_s3_batches(monkeypatch):
     monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
     monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
 
-    assert watcher.poll_once(limit=1) == []
-    assert watcher.poll_once(limit=1) == []
-    third_batch = watcher.poll_once(limit=1)
+    batch = watcher.poll_once(limit=1)
 
-    assert counters["s3"] >= 3
     assert counters["imap"] == 1
-    assert third_batch
-    assert third_batch[0]["message_id"].startswith("imap-msg-")
+    assert counters["s3"] == 0
+    assert batch
+    assert batch[0]["message_id"].startswith("imap-msg-")
+    assert watcher._last_candidate_source == "imap"
+
+
+def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = "procwise-bucket"
+    watcher._imap_fallback_attempts = 2
+
+    counters = {"s3": 0, "imap": 0}
+
+    def _stub_s3(self, limit, *, prefixes=None, on_message=None):
+        counters["s3"] += 1
+        return [
+            {
+                "id": "s3-msg-1",
+                "message_id": "s3-msg-1",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Quoted price 1250",
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "from": "supplier@example.com",
+                "from_address": "supplier@example.com",
+            }
+        ]
+
+    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+        counters["imap"] += 1
+        return []
+
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
+
+    batch = watcher.poll_once(limit=1)
+
+    assert counters["imap"] == 1
+    assert counters["s3"] == 0
+    assert batch == []
+    assert watcher._last_candidate_source == "imap"
+
+    batch = watcher.poll_once(limit=1)
+    assert counters["imap"] == 2
+    assert counters["s3"] == 1
+    assert batch
+    assert batch[0]["message_id"].startswith("s3-msg-")
+    assert watcher._last_candidate_source == "s3"
 
 
 def test_imap_loader_records_processed_email(monkeypatch):
@@ -961,7 +1014,49 @@ def test_imap_loader_records_processed_email(monkeypatch):
     bucket, key, _, rfq_id = recorded[0]
     assert bucket.startswith("imap::")
     assert key.startswith("imap/")
-    assert rfq_id
+
+
+def test_imap_fallback_can_be_disabled(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = "procwise-bucket"
+    watcher._imap_fallback_attempts = 0
+
+    counters = {"s3": 0, "imap": 0}
+
+    def _stub_s3(self, limit, *, prefixes=None, on_message=None):
+        counters["s3"] += 1
+        return [
+            {
+                "id": "s3-msg-disabled",
+                "message_id": "s3-msg-disabled",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Quoted price 1250",
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "from": "supplier@example.com",
+                "from_address": "supplier@example.com",
+            }
+        ]
+
+    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+        counters["imap"] += 1
+        return []
+
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
+
+    for _ in range(3):
+        batch = watcher.poll_once(limit=1)
+        assert batch == []
+        assert watcher._last_candidate_source == "imap"
+
+    assert counters["imap"] == 3
+    assert counters["s3"] == 0
 
 
 def test_email_watcher_maps_multiple_rfq_ids():
@@ -1594,6 +1689,33 @@ def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
     watcher.poll_once(match_filters={"action_id": nick.action_id})
     assert fake_clock["sleeps"] == []
     assert nick.sent_count_calls == previous_calls
+
+
+def test_wait_for_dispatch_completion_adds_post_dispatch_delay(monkeypatch):
+    nick = DummyNick()
+    nick.settings.email_inbound_post_dispatch_delay_seconds = 3
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    expectation = watcher._DispatchExpectation(
+        action_id="action-123",
+        workflow_id=None,
+        draft_ids=(1,),
+        draft_count=1,
+        supplier_count=1,
+    )
+
+    monkeypatch.setattr(watcher, "_count_sent_drafts", lambda exp: exp.draft_count)
+
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("services.email_watcher.time.sleep", fake_sleep)
+
+    assert watcher._wait_for_dispatch_completion(expectation) is True
+    assert sleep_calls and sleep_calls[-1] == pytest.approx(3.0)
+
 
 def test_s3_poll_prioritises_newest_objects(monkeypatch):
     nick = DummyNick()
