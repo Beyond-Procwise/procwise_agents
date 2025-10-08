@@ -1742,6 +1742,26 @@ def test_poll_once_skips_s3_polling_even_when_configured(monkeypatch):
     assert watcher._last_candidate_source == "imap"
 
 
+def test_poll_once_logs_error_when_imap_not_configured(monkeypatch, caplog):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    watcher.bucket = "procwisemvp"
+    watcher._prefixes = ["emails/"]
+
+    def _unexpected_s3_call():  # pragma: no cover - defensive guard
+        raise AssertionError("S3 client should not be requested without IMAP")
+
+    monkeypatch.setattr(watcher, "_get_s3_client", _unexpected_s3_call)
+
+    caplog.set_level(logging.ERROR)
+
+    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+
+    assert results == []
+    assert "IMAP mailbox credentials" in caplog.text
+    assert watcher._last_candidate_source == "none"
+
+
 def test_scan_recent_objects_includes_backlog_without_watermark():
     nick = DummyNick()
     watcher = _make_watcher(nick, loader=lambda limit=None: [])

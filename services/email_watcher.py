@@ -394,6 +394,7 @@ class SESEmailWatcher:
         )
 
         self._prefixes = [self._ensure_trailing_slash(prefix_value)]
+        self._imap_warning_logged = False
 
         # Ensure supporting negotiation tables exist so metadata lookups do
         # not fail on freshly provisioned databases.  The statements are safe
@@ -3243,12 +3244,20 @@ class SESEmailWatcher:
 
         if not self._imap_configured():
             self._consecutive_empty_imap_batches = 0
-            if self.bucket:
-                logger.info(
-                    "Skipping S3 poll for mailbox %s because IMAP is not configured",
-                    self.mailbox_address,
+            if not self._imap_warning_logged:
+                logger.error(
+                    "IMAP mailbox credentials (imap_host, imap_user, imap_password) are not configured for %s; inbound polling is disabled",
+                    self.mailbox_address or "<unknown>",
                 )
+                self._imap_warning_logged = True
             return messages
+
+        if self._imap_warning_logged:
+            logger.info(
+                "IMAP mailbox credentials configured for %s; resuming inbound polling",
+                self.mailbox_address or "<unknown>",
+            )
+            self._imap_warning_logged = False
 
         messages = self._load_from_imap(
             effective_limit,
