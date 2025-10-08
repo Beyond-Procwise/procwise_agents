@@ -615,7 +615,7 @@ class SESEmailWatcher:
                             )
                             if was_processed:
                                 total_processed += 1
-                            if matched or rfq_matched:
+                            if matched:
                                 match_found = True
                             if should_stop:
                                 if not match_found:
@@ -643,8 +643,7 @@ class SESEmailWatcher:
                                 self._update_watermark(last_modified, str(parsed.get("id") or ""))
                             if was_processed:
                                 total_processed += 1
-                            # Treat RFQ match as authoritative regardless of additional filters
-                            if matched or rfq_matched:
+                            if matched:
                                 match_found = True
                             return should_stop
 
@@ -676,8 +675,7 @@ class SESEmailWatcher:
                                 )
                                 if was_processed:
                                     total_processed += 1
-                                # RFQ match is authoritative even when filters are present
-                                if matched or rfq_matched:
+                                if matched:
                                     match_found = True
                                 if should_stop:
                                     break
@@ -895,9 +893,6 @@ class SESEmailWatcher:
             if match_filters:
                 self._apply_filter_defaults(processed_payload, match_filters)
                 message_match = self._matches_filters(processed_payload, match_filters)
-                # Treat RFQ match as authoritative even if other filters fail
-                if target_rfq_normalised and rfq_match:
-                    message_match = True
             was_processed = True
 
             canonical_key = self._ensure_s3_mapping(s3_key, processed_payload.get("rfq_id"))
@@ -1032,9 +1027,13 @@ class SESEmailWatcher:
                 "Stopping poll once after matching filters for message %s",
                 message_id,
             )
-        elif rfq_match:
+        elif rfq_match and not match_filters:
+            # Only stop early on bare RFQ matches when no additional filters were supplied.
             should_stop = True
-            logger.debug("Stopping poll after RFQ match for message %s", message_id)
+            logger.debug(
+                "Stopping poll after RFQ match for message %s with no additional filters",
+                message_id,
+            )
 
         return matched, should_stop, bool(rfq_match), was_processed
 
@@ -2195,10 +2194,15 @@ class SESEmailWatcher:
         return None
 
     def _ensure_workflow_expectations(
-        self, workflow_id: Optional[str], metadata: Dict[str, object]
+        self,
+        workflow_id: Optional[str],
+        metadata: Dict[str, object],
+        *,
+        group_key: Optional[str] = None,
     ) -> Optional[int]:
         workflow_key = self._normalise_workflow_key(workflow_id)
-        if not workflow_key:
+        tracking_key = group_key or workflow_key
+        if not tracking_key:
             return None
         action_payload = metadata.get("action_payload")
         if not action_payload:
@@ -2216,26 +2220,39 @@ class SESEmailWatcher:
                     if workflow_hint and not metadata.get("workflow_id"):
                         metadata["workflow_id"] = workflow_hint
 
-        existing_expected = self._workflow_expected_counts.get(workflow_key)
-        existing_processed = self._workflow_processed_counts.get(workflow_key)
+        existing_expected = self._workflow_expected_counts.get(tracking_key)
+        existing_processed = self._workflow_processed_counts.get(tracking_key)
         expected = self._derive_expected_supplier_count(metadata, action_payload)
         if expected is not None:
             if existing_expected != expected:
-                self._workflow_expected_counts[workflow_key] = expected
+                self._workflow_expected_counts[tracking_key] = expected
                 if existing_processed is None:
-                    self._workflow_processed_counts.pop(workflow_key, None)
+                    self._workflow_processed_counts.pop(tracking_key, None)
                 else:
                     adjusted = min(existing_processed, expected)
                     if adjusted > 0:
-                        self._workflow_processed_counts[workflow_key] = adjusted
+                        self._workflow_processed_counts[tracking_key] = adjusted
                     else:
-                        self._workflow_processed_counts.pop(workflow_key, None)
+                        self._workflow_processed_counts.pop(tracking_key, None)
             return expected
 
         return existing_expected
 
     def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
         return self._normalise_filter_value(workflow_id) if workflow_id else None
+
+    def _normalise_group_key(
+        self,
+        run_id: Optional[object],
+        workflow_id: Optional[str],
+    ) -> Optional[str]:
+        run_candidate = self._normalise_filter_value(run_id) if run_id else None
+        if run_candidate:
+            return f"run::{run_candidate}"
+        workflow_candidate = self._normalise_filter_value(workflow_id) if workflow_id else None
+        if workflow_candidate:
+            return f"wf::{workflow_candidate}"
+        return None
 
     def _flush_negotiation_jobs(
         self, workflow_key: str, current_processed: Dict[str, object]
@@ -2289,21 +2306,28 @@ class SESEmailWatcher:
         processed: Dict[str, object],
         negotiation_job: Optional[Dict[str, object]],
     ) -> Tuple[bool, Optional[AgentOutput]]:
+        run_identifier = metadata.get("dispatch_run_id") or processed.get("dispatch_run_id")
         workflow_key = self._normalise_workflow_key(workflow_id)
+        group_key = self._normalise_group_key(run_identifier, workflow_id)
+        tracking_key = group_key or workflow_key
         default_result: Tuple[bool, Optional[AgentOutput]] = (
             processed.get("negotiation_triggered", False),
             None,
         )
 
-        if workflow_key:
-            expected = self._ensure_workflow_expectations(workflow_id, metadata)
+        if tracking_key:
+            expected = self._ensure_workflow_expectations(
+                workflow_id,
+                metadata,
+                group_key=group_key,
+            )
             if negotiation_job:
-                queue = self._workflow_negotiation_jobs.setdefault(workflow_key, [])
+                queue = self._workflow_negotiation_jobs.setdefault(tracking_key, [])
                 queue.append({"job": negotiation_job, "processed": processed})
-            count = self._workflow_processed_counts.get(workflow_key, 0) + 1
-            self._workflow_processed_counts[workflow_key] = count
+            count = self._workflow_processed_counts.get(tracking_key, 0) + 1
+            self._workflow_processed_counts[tracking_key] = count
             if expected is None or count >= expected:
-                return self._flush_negotiation_jobs(workflow_key, processed)
+                return self._flush_negotiation_jobs(tracking_key, processed)
             return default_result
 
         if negotiation_job:
@@ -2941,8 +2965,6 @@ class SESEmailWatcher:
         if not filters:
             return False
 
-        payload_rfq_tail = self._normalise_rfq_value(payload.get("rfq_id"))
-        payload_rfq_full = self._normalise_filter_value(payload.get("rfq_id"))
         payload_supplier = self._normalise_filter_value(payload.get("supplier_id"))
         payload_subject = self._normalise_filter_value(payload.get("subject")) or ""
         payload_sender = self._normalise_filter_value(payload.get("from_address"))
@@ -2955,16 +2977,8 @@ class SESEmailWatcher:
             or payload.get("dispatch_token")
         )
 
-        payload_rfq_canonicals: Set[str] = set()
-        primary_canonical = self._canonical_rfq(payload.get("rfq_id"))
-        if primary_canonical:
-            payload_rfq_canonicals.add(primary_canonical)
-        related = payload.get("related_rfq_ids")
-        if isinstance(related, list):
-            for entry in related:
-                canonical = self._canonical_rfq(entry)
-                if canonical:
-                    payload_rfq_canonicals.add(canonical)
+        required_supplier = False
+        required_run = False
 
         def _like(actual: Optional[str], expected_like: object) -> bool:
             needle = self._normalise_filter_value(expected_like)
@@ -2974,7 +2988,6 @@ class SESEmailWatcher:
                 return False
 
             pattern = re.escape(needle)
-            # Support SQL-style and glob-style wildcards for convenience.
             pattern = (
                 pattern.replace("%", ".*")
                 .replace(r"\%", ".*")
@@ -2986,7 +2999,6 @@ class SESEmailWatcher:
             if regex.fullmatch(actual):
                 return True
 
-            # Allow bare substrings (without wildcards) to behave like ``LIKE %needle%``
             if needle and "%" not in needle and "_" not in needle and "*" not in needle:
                 return needle in actual
 
@@ -2995,18 +3007,14 @@ class SESEmailWatcher:
         for key, expected in filters.items():
             if expected in (None, ""):
                 continue
-            if key == "rfq_id":
-                if payload_rfq_tail != self._normalise_rfq_value(expected):
-                    return False
-            elif key == "rfq_id_like":
-                if not _like(payload_rfq_full, expected):
-                    return False
-            elif key == "supplier_id":
+            if key == "supplier_id":
                 if payload_supplier != self._normalise_filter_value(expected):
                     return False
+                required_supplier = True
             elif key == "supplier_id_like":
                 if not _like(payload_supplier, expected):
                     return False
+                required_supplier = True
             elif key == "from_address":
                 expected_normalised = self._normalise_filter_value(expected)
                 expected_email = self._normalise_email(expected)
@@ -3022,19 +3030,8 @@ class SESEmailWatcher:
                 expected_workflow = self._normalise_filter_value(expected)
                 if not expected_workflow:
                     continue
-                if payload_workflow == expected_workflow:
-                    continue
-                workflow_map = self._workflow_rfq_index.get(expected_workflow, set())
-                if payload_rfq_canonicals and workflow_map:
-                    if any(candidate in workflow_map for candidate in payload_rfq_canonicals):
-                        continue
-                if payload_rfq_canonicals:
-                    if any(
-                        expected_workflow in self._rfq_workflow_index.get(candidate, set())
-                        for candidate in payload_rfq_canonicals
-                    ):
-                        continue
-                return False
+                if payload_workflow != expected_workflow:
+                    return False
             elif key == "from_address_like":
                 if not any(
                     _like(candidate, expected)
@@ -3055,11 +3052,19 @@ class SESEmailWatcher:
             elif key == "message_id_like":
                 if not _like(payload_message, expected):
                     return False
-            elif key == "dispatch_run_id":
+            elif key in {"dispatch_run_id", "run_id"}:
                 expected_run = self._normalise_filter_value(expected)
                 if expected_run and payload_run_id != expected_run:
                     return False
-        return True
+                if expected_run:
+                    required_run = True
+
+        if required_supplier and payload_supplier is None:
+            return False
+        if required_run and payload_run_id is None:
+            return False
+
+        return required_supplier or required_run or bool(filters)
 
     @staticmethod
     def _apply_filter_defaults(
@@ -3077,7 +3082,7 @@ class SESEmailWatcher:
             except Exception:
                 return False
 
-        for field in ("rfq_id", "supplier_id", "from_address", "workflow_id", "dispatch_run_id"):
+        for field in ("supplier_id", "from_address", "workflow_id", "dispatch_run_id", "run_id"):
             if field in filters and _should_fill(field):
                 candidate = filters.get(field)
                 if candidate not in (None, ""):
@@ -3346,7 +3351,11 @@ class SESEmailWatcher:
             return None
 
         workflow_candidate = self._coerce_identifier(filters.get("workflow_id"))
+        run_candidate = self._coerce_identifier(
+            filters.get("dispatch_run_id") or filters.get("run_id")
+        )
         workflow_key = self._normalise_filter_value(workflow_candidate) if workflow_candidate else None
+        group_key = self._normalise_group_key(run_candidate, workflow_candidate)
         action_candidate: Optional[str] = None
         for key in ("action_id", "draft_action_id", "email_action_id"):
             candidate = self._coerce_identifier(filters.get(key)) if filters else None
@@ -3354,12 +3363,13 @@ class SESEmailWatcher:
                 action_candidate = candidate
                 break
 
-        if workflow_key and action_candidate:
-            self._workflow_dispatch_actions[workflow_key] = action_candidate
-        elif workflow_key and workflow_key in self._workflow_dispatch_actions:
-            action_candidate = self._workflow_dispatch_actions[workflow_key]
+        mapping_key = group_key or workflow_key
+        if mapping_key and action_candidate:
+            self._workflow_dispatch_actions[mapping_key] = action_candidate
+        elif mapping_key and mapping_key in self._workflow_dispatch_actions:
+            action_candidate = self._workflow_dispatch_actions[mapping_key]
 
-        if not action_candidate and not workflow_candidate:
+        if not action_candidate and not (workflow_candidate or run_candidate):
             return None
 
         if action_candidate and action_candidate in self._completed_dispatch_actions:

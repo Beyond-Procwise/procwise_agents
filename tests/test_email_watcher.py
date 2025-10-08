@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from email.message import EmailMessage
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -163,18 +163,103 @@ def test_poll_once_triggers_supplier_agent_on_match():
             "body": "Quoted price 1500",
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "dispatch_run_id": "run-001",
             "target_price": 1000,
         }
     ]
 
     watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "S1", "dispatch_run_id": "run-001"}
+    )
 
     assert len(results) == 1
     result = results[0]
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
     assert watcher.supplier_agent.contexts
     assert "msg-1" in state
+
+
+def test_poll_once_requires_supplier_match_when_filters_present():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1400",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-MISMATCH",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "SUP-EXPECTED", "dispatch_run_id": "run-202"}
+    )
+
+    assert results == []
+
+
+def test_poll_once_requires_run_match_when_filters_present():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-3",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1350",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "dispatch_run_id": "run-303",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "S1", "dispatch_run_id": "run-404"}
+    )
+
+    assert results == []
+
+
+def test_register_processed_response_waits_for_complete_run(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    expectation_calls: List[Optional[str]] = []
+
+    def fake_expectations(workflow_id, metadata, *, group_key=None):
+        expectation_calls.append(group_key)
+        return 2
+
+    monkeypatch.setattr(
+        watcher,
+        "_ensure_workflow_expectations",
+        fake_expectations,
+        raising=False,
+    )
+
+    tracking_key = watcher._normalise_group_key("run-500", "wf-500")
+
+    metadata = {"dispatch_run_id": "run-500", "status": "processed", "payload": {}}
+    processed_one = {"message_id": "msg-run-1", "dispatch_run_id": "run-500"}
+    processed_two = {"message_id": "msg-run-2", "dispatch_run_id": "run-500"}
+
+    result_one = watcher._register_processed_response("wf-500", metadata, processed_one, None)
+    assert result_one == (False, None)
+    assert watcher._workflow_processed_counts.get(tracking_key) == 1
+
+    result_two = watcher._register_processed_response("wf-500", metadata, processed_two, None)
+    assert result_two == (False, None)
+    assert tracking_key not in watcher._workflow_processed_counts
+    assert expectation_calls and expectation_calls[0] == tracking_key
+    assert not watcher.supplier_agent.contexts
 
 
 def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
