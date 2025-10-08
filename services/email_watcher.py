@@ -631,7 +631,8 @@ class SESEmailWatcher:
                         ) -> bool:
                             nonlocal total_processed, total_candidates, match_found
                             total_candidates += 1
-                            processed_batch.append(parsed)
+                            if filters:
+                                processed_batch.append(parsed)
                             matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
                                 parsed,
                                 match_filters=filters,
@@ -646,7 +647,6 @@ class SESEmailWatcher:
                             if matched:
                                 match_found = True
                             return should_stop
-
 
                         messages = self._load_messages(
                             limit,
@@ -874,6 +874,9 @@ class SESEmailWatcher:
                 if isinstance(message.get("_dispatch_record"), dict)
                 else None
             )
+            self._hydrate_payload_from_marker(processed_payload, message)
+            if isinstance(processed, dict):
+                self._hydrate_payload_from_marker(processed, message)
             if dispatch_record:
                 record_rfq = dispatch_record.get("rfq_id")
                 record_supplier = dispatch_record.get("supplier_id")
@@ -3064,37 +3067,31 @@ class SESEmailWatcher:
         )
 
         supplier_filter = self._normalise_filter_value(filters.get("supplier_id"))
-        supplier_like_filter = self._normalise_filter_value(filters.get("supplier_id_like"))
         run_filter = self._normalise_filter_value(
             filters.get("dispatch_run_id") or filters.get("run_id")
         )
+        supplier_like_filter = self._normalise_filter_value(
+            filters.get("supplier_id_like")
+        )
 
-        if supplier_filter or supplier_like_filter or run_filter:
-            supplier_matches = False
-            if supplier_filter and payload_supplier:
-                supplier_matches = payload_supplier == supplier_filter
-            elif supplier_like_filter and payload_supplier:
-                supplier_matches = supplier_like_filter in payload_supplier
-
-            if not supplier_matches:
-                return False
-
+        if supplier_filter or run_filter:
+            if supplier_filter:
+                if not payload_supplier or payload_supplier != supplier_filter:
+                    return False
             if run_filter:
                 if not payload_run_id or payload_run_id != run_filter:
                     return False
-
             return True
+
+        if supplier_like_filter and payload_supplier:
+            if supplier_like_filter not in payload_supplier:
+                return False
 
         payload_subject = self._normalise_filter_value(payload.get("subject")) or ""
         payload_sender = self._normalise_filter_value(payload.get("from_address"))
         payload_sender_email = self._normalise_email(payload.get("from_address"))
         payload_message = self._normalise_filter_value(payload.get("message_id")) or self._normalise_filter_value(payload.get("id"))
         payload_workflow = self._normalise_filter_value(payload.get("workflow_id"))
-        payload_run_id = self._normalise_filter_value(
-            payload.get("dispatch_run_id")
-            or payload.get("run_id")
-            or payload.get("dispatch_token")
-        )
 
         def _like(actual: Optional[str], expected_like: object) -> bool:
             needle = self._normalise_filter_value(expected_like)
@@ -3883,6 +3880,38 @@ class SESEmailWatcher:
         processed_payload["matched_via"] = "dispatch_fallback"
 
         return True
+
+    def _hydrate_payload_from_marker(
+        self,
+        payload: Optional[Dict[str, object]],
+        message: Dict[str, object],
+    ) -> None:
+        if not payload:
+            return
+
+        body_source = payload.get("message_body") or message.get("body") or ""
+        body_text = str(body_source)
+        if not body_text:
+            return
+
+        comment, _ = split_hidden_marker(body_text)
+        if not comment:
+            return
+
+        if not payload.get("dispatch_run_id"):
+            run_identifier = extract_run_id(comment)
+            if run_identifier:
+                payload["dispatch_run_id"] = run_identifier
+
+        if not payload.get("dispatch_token"):
+            token = extract_marker_token(comment)
+            if token:
+                payload.setdefault("dispatch_token", token)
+
+        if not payload.get("rfq_id"):
+            rfq_hint = extract_rfq_id(comment)
+            if rfq_hint:
+                payload["rfq_id"] = rfq_hint
 
     def _match_dispatched_message(
         self,
