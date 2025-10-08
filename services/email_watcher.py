@@ -5473,7 +5473,8 @@ class SESEmailWatcher:
 
         matches: List[Dict[str, object]] = []
 
-        lookback_days = max(getattr(self.settings, "dispatch_chain_lookback_days", 5), 1)
+        lookback_setting = getattr(self.settings, "dispatch_chain_lookback_days", 5)
+        lookback_days = self._coerce_int(lookback_setting, default=5, minimum=1)
         lookback_text = str(lookback_days)
 
         try:
