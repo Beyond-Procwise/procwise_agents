@@ -3090,6 +3090,11 @@ class SESEmailWatcher:
         payload_sender_email = self._normalise_email(payload.get("from_address"))
         payload_message = self._normalise_filter_value(payload.get("message_id")) or self._normalise_filter_value(payload.get("id"))
         payload_workflow = self._normalise_filter_value(payload.get("workflow_id"))
+        payload_run_id = self._normalise_filter_value(
+            payload.get("dispatch_run_id")
+            or payload.get("run_id")
+            or payload.get("dispatch_token")
+        )
 
         def _like(actual: Optional[str], expected_like: object) -> bool:
             needle = self._normalise_filter_value(expected_like)
@@ -4116,6 +4121,78 @@ class SESEmailWatcher:
             "subject": _decode_mime_header(message.get("Subject")),
             "to": _decode_mime_header(message.get("To")),
         }
+
+    def _peek_recent_s3_messages(
+        self,
+        limit: Optional[int] = None,
+        *,
+        prefixes: Optional[Sequence[str]] = None,
+        parser: Optional[Callable[[bytes], Dict[str, object]]] = None,
+        newest_first: bool = True,
+    ) -> List[Dict[str, object]]:
+        if not self.bucket:
+            logger.warning("SES inbound bucket not configured; skipping poll")
+            return []
+
+        active_prefixes = list(prefixes) if prefixes is not None else list(self._prefixes)
+        if not active_prefixes:
+            return []
+
+        for prefix in active_prefixes:
+            if prefix not in self._s3_prefix_watchers:
+                self._s3_prefix_watchers[prefix] = S3ObjectWatcher(
+                    limit=self._s3_watch_history_limit
+                )
+
+        client = self._get_s3_client()
+        parser_fn = parser or self._parse_inbound_object
+
+        object_refs = self._scan_recent_s3_objects(
+            client,
+            active_prefixes,
+            watermark_ts=self._last_watermark_ts,
+            watermark_key=self._last_watermark_key,
+            enforce_window=True,
+        )
+
+        if not object_refs:
+            return []
+
+        collected: List[Tuple[Optional[datetime], Dict[str, object]]] = []
+        seen_keys: Set[str] = set()
+
+        for prefix, key, last_modified, etag in object_refs:
+            if key in seen_keys:
+                continue
+
+            download = self._download_object(client, key, bucket=self.bucket)
+            if download is None:
+                continue
+            raw, size_bytes = download
+
+            parsed = self._invoke_parser(parser_fn, raw, key)
+            parsed["id"] = key
+            parsed["s3_key"] = key
+            parsed["_s3_etag"] = etag
+            parsed["_last_modified"] = last_modified
+            parsed["_prefix"] = prefix
+            if size_bytes is not None:
+                parsed["_content_length"] = size_bytes
+            collected.append((last_modified, parsed))
+            seen_keys.add(key)
+
+            if limit is not None and len(collected) >= limit:
+                break
+
+        if limit is not None and len(collected) >= limit:
+            logger.debug(
+                "Reached dispatch peek limit (%s) for mailbox %s",
+                limit,
+                self.mailbox_address,
+            )
+
+        collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
+        return [payload for _, payload in collected]
 
     def _load_from_s3(
         self,
