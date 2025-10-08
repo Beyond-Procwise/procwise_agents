@@ -204,7 +204,7 @@ def test_poll_once_requires_supplier_match_when_filters_present():
     assert results == []
 
 
-def test_poll_once_requires_run_match_when_filters_present():
+def test_poll_once_matches_with_recent_supplier_when_run_diff(monkeypatch):
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
 
@@ -221,11 +221,32 @@ def test_poll_once_requires_run_match_when_filters_present():
     ]
 
     watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    draft = watcher._DraftSnapshot(
+        id=99,
+        rfq_id="RFQ-20240101-ABCD1234",
+        subject="RFQ message",
+        body="Thanks",
+        dispatch_token="run-expected",
+        run_id="run-expected",
+        recipients=("supplier@example.com",),
+        supplier_id="S1",
+    )
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_recent_drafts_for_fallback",
+        lambda supplier_filter, limit=10, within_minutes=10: [draft],
+    )
+
     results = watcher.poll_once(
         match_filters={"supplier_id": "S1", "dispatch_run_id": "run-404"}
     )
 
-    assert results == []
+    assert len(results) == 1
+    processed = results[0]
+    assert processed.get("matched_via") == "dispatch_fallback"
+    assert processed.get("supplier_id") == "S1"
+    assert processed.get("dispatch_run_id") == "run-303"
 
 
 def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
@@ -259,7 +280,7 @@ def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
     monkeypatch.setattr(
         watcher,
         "_load_recent_drafts_for_fallback",
-        lambda supplier_filter, limit=10: [draft],
+        lambda supplier_filter, limit=10, within_minutes=10: [draft],
     )
 
     results = watcher.poll_once(
@@ -270,6 +291,56 @@ def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
     processed = results[0]
     assert processed["dispatch_run_id"] == "run-202"
     assert processed.get("matched_via") == "dispatch_fallback"
+
+
+def test_load_recent_drafts_filters_by_supplier_and_time():
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    captured: Dict[str, object] = {}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params):
+            captured["statement"] = statement.strip()
+            captured["params"] = params
+
+        def fetchall(self):
+            return [
+                (
+                    501,
+                    "RFQ-20240101-ABCD1234",
+                    "SUPPLIER-EXPECTED",
+                    "Subject",
+                    "Body",
+                    None,
+                )
+            ]
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return _Cursor()
+
+    watcher.agent_nick.get_db_connection = lambda: _Conn()
+
+    snapshots = watcher._load_recent_drafts_for_fallback(
+        "supplier-expected", limit=5, within_minutes=10
+    )
+
+    assert snapshots and snapshots[0].supplier_id == "SUPPLIER-EXPECTED"
+    assert "CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')" in captured.get("statement", "")
+    assert captured.get("params") == (10, "supplier-expected", 5)
 
 
 def test_register_processed_response_waits_for_complete_run(monkeypatch):
