@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence
 
 try:  # pragma: no cover - psycopg2 may be optional
     from psycopg2.extras import Json
@@ -218,6 +218,177 @@ def mark_response(
     if updated:
         logger.debug("Marked dispatch chain responded for rfq=%s ids=%s", rfq_id, identifiers)
     return updated
+
+
+def _collect_thread_identifiers_from_message(message: dict) -> list[str]:
+    identifiers: list[str] = []
+
+    def _gather(value: object) -> None:
+        if value in (None, ""):
+            return
+        if isinstance(value, (list, tuple, set)):
+            for entry in value:
+                _gather(entry)
+            return
+        try:
+            text = str(value)
+        except Exception:
+            return
+        trimmed = text.strip()
+        if trimmed:
+            identifiers.append(trimmed)
+
+    _gather(message.get("in_reply_to"))
+    _gather(message.get("references"))
+
+    headers = message.get("headers")
+    if isinstance(headers, dict):
+        _gather(headers.get("In-Reply-To") or headers.get("in-reply-to"))
+        _gather(headers.get("References") or headers.get("references"))
+
+    return identifiers
+
+
+def _collect_body_message_ids(message: dict) -> list[str]:
+    body = message.get("body")
+    if not isinstance(body, str) or "<" not in body:
+        return []
+
+    pattern = re.compile(r"<([^>]+)>")
+    collected: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.findall(body):
+        candidate = match.strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        collected.append(candidate)
+    return collected
+
+
+def find_best_chain_match(
+    connection,
+    message: dict,
+    *,
+    mailbox: Optional[str] = None,
+    lookback_days: int = 5,
+    thread_identifiers: Optional[Sequence[str]] = None,
+    recipients_hint: bool = False,
+) -> Optional[dict]:
+    """Return the most relevant dispatch-chain match for ``message``."""
+
+    ensure_chain_table(connection)
+
+    identifiers: list[str] = []
+    if thread_identifiers:
+        identifiers.extend(thread_identifiers)
+    identifiers.extend(_collect_thread_identifiers_from_message(message))
+    identifiers.extend(_collect_body_message_ids(message))
+
+    message_ids = _collect_message_ids(identifiers)
+
+    supplier_hint = message.get("supplier_id")
+    supplier_norm: Optional[str] = None
+    if supplier_hint not in (None, ""):
+        try:
+            supplier_norm = str(supplier_hint).strip().lower() or None
+        except Exception:
+            supplier_norm = None
+
+    if lookback_days <= 0:
+        lookback_days = 1
+
+    mailbox_filter = mailbox or None
+
+    with connection.cursor() as cur:
+        direct_row = None
+        if message_ids:
+            cur.execute(
+                f"""
+                SELECT rfq_id, supplier_id, dispatch_metadata, thread_index, created_at, message_id
+                FROM {CHAIN_TABLE}
+                WHERE awaiting_response = TRUE
+                  AND message_id = ANY(%s)
+                  AND (%s IS NULL
+                       OR dispatch_metadata ->> 'mailbox' IS NULL
+                       OR dispatch_metadata ->> 'mailbox' = %s)
+                ORDER BY thread_index DESC, created_at DESC
+                LIMIT 1
+                """,
+                (message_ids, mailbox_filter, mailbox_filter),
+            )
+            direct_row = cur.fetchone()
+
+        if direct_row:
+            metadata = direct_row[2]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = None
+            return {
+                "rfq_id": direct_row[0],
+                "supplier_id": direct_row[1],
+                "dispatch_metadata": metadata,
+                "thread_index": direct_row[3],
+                "created_at": direct_row[4],
+                "message_id": direct_row[5],
+                "matched_via": "message_id",
+                "score": 0.75,
+            }
+
+        lookback_text = str(int(lookback_days))
+
+        cur.execute(
+            f"""
+            SELECT rfq_id, supplier_id, dispatch_metadata, thread_index, created_at, message_id
+            FROM {CHAIN_TABLE}
+            WHERE awaiting_response = TRUE
+              AND created_at >= NOW() - (%s || ' days')::INTERVAL
+              AND (%s IS NULL
+                   OR dispatch_metadata ->> 'mailbox' IS NULL
+                   OR dispatch_metadata ->> 'mailbox' = %s)
+              AND (%s IS NULL OR LOWER(supplier_id) = %s)
+            ORDER BY thread_index DESC, created_at DESC
+            LIMIT 1
+            """,
+            (
+                lookback_text,
+                mailbox_filter,
+                mailbox_filter,
+                supplier_norm,
+                supplier_norm,
+            ),
+        )
+        window_row = cur.fetchone()
+
+    if not window_row:
+        return None
+
+    metadata = window_row[2]
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = None
+
+    score = 0.6
+    if supplier_norm:
+        score = max(score, 0.7)
+
+    return {
+        "rfq_id": window_row[0],
+        "supplier_id": window_row[1],
+        "dispatch_metadata": metadata,
+        "thread_index": window_row[3],
+        "created_at": window_row[4],
+        "message_id": window_row[5],
+        "matched_via": "time_window",
+        "score": score,
+    }
 
 
 def pending_dispatch_count(connection, rfq_id: Optional[str]) -> int:
