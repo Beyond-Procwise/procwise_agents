@@ -3,6 +3,8 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict
 
+import pytest
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
@@ -156,13 +158,13 @@ def test_negotiation_agent_composes_counter(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.data["decision"]["strategy"] == "midpoint"
-    assert output.data["decision"]["counter_price"] == 1250.0
+    assert output.data["decision"]["strategy"] == "counter"
+    assert output.data["decision"]["counter_price"] == pytest.approx(1267.75, rel=1e-4)
     assert output.data["negotiation_allowed"] is True
     assert output.data["intent"] == "NEGOTIATION_COUNTER"
-    assert "$" in output.data["message"] or "1250" in output.data["message"]
+    assert "$" in output.data["message"] or "1267" in output.data["message"]
     draft_payload = output.data["draft_payload"]
-    assert draft_payload["counter_price"] == 1250.0
+    assert draft_payload["counter_price"] == pytest.approx(1267.75, rel=1e-4)
     assert draft_payload["negotiation_message"].startswith("Round 1 plan")
     assert draft_payload["recipients"] == ["quotes@supplier.test"]
     assert "Recommended plays" in draft_payload["negotiation_message"]

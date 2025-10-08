@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
+from agents.negotiation_pricer import NegotiationContext, SupplierSignals, plan_counter
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -62,15 +63,65 @@ TRADE_OFF_HINTS = {
 PLAYBOOK_PATH = Path(__file__).resolve().parent.parent / "resources" / "reference_data" / "negotiation_playbook.json"
 
 
+def compute_decision(
+    payload: Dict[str, Any],
+    supplier_message_text: str = "",
+    offer_prev: Optional[float] = None,
+) -> Dict[str, Any]:
+    ask_disc_raw = payload.get("ask_early_pay_disc", 0.02)
+    try:
+        ask_disc = float(ask_disc_raw) if ask_disc_raw is not None else None
+    except (TypeError, ValueError):
+        ask_disc = None
+
+    walkaway_raw = payload.get("walkaway_price")
+    try:
+        walkaway = float(walkaway_raw) if walkaway_raw is not None else None
+    except (TypeError, ValueError):
+        walkaway = None
+
+    current_offer = float(payload["current_offer"])
+    target_price = float(payload["target_price"])
+    round_idx = int(payload.get("round", 1))
+
+    ctx = NegotiationContext(
+        current_offer=current_offer,
+        target_price=target_price,
+        round_index=round_idx,
+        currency=payload.get("currency"),
+        aggressiveness=0.75,
+        leverage=0.6,
+        urgency=0.3,
+        risk_buffer_pct=0.06,
+        min_abs_buffer=3.0,
+        step_pct_of_gap=0.12,
+        min_abs_step=4.0,
+        max_rounds=int(payload.get("max_rounds", 3)),
+        walkaway_price=walkaway,
+        ask_early_pay_disc=ask_disc,
+        ask_lead_time_keep=bool(payload.get("ask_lead_time_keep", True)),
+    )
+    signals = SupplierSignals(
+        offer_prev=offer_prev,
+        offer_new=current_offer,
+        message_text=supplier_message_text or "",
+    )
+    return plan_counter(ctx, signals)
+
+
 def decide_strategy(
-    price: Optional[float],
-    target: Optional[float],
+    payload: Dict[str, Any],
+    *,
     lead_weeks: Optional[float] = None,
     constraints: Optional[List[str]] = None,
+    supplier_message: Optional[str] = None,
+    offer_prev: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Deterministic negotiation logic shared across tests and runtime."""
+    """Plan price counter proposals using deterministic negotiation heuristics."""
 
-    if price is None or target is None:
+    current_offer = payload.get("current_offer")
+    target = payload.get("target_price")
+    if current_offer is None or target is None:
         return {
             "strategy": "clarify",
             "counter_price": None,
@@ -79,44 +130,30 @@ def decide_strategy(
             "rationale": "Price missing; request structured quote.",
         }
 
-    gap = (price - target) / target
-    asks: List[str] = []
-    lead_req = None
+    plan = compute_decision(payload, supplier_message_text=supplier_message or "", offer_prev=offer_prev)
+
+    decision: Dict[str, Any] = {
+        "strategy": plan.get("decision", "counter"),
+        "counter_price": plan.get("counter_price"),
+        "asks": plan.get("asks", []),
+        "lead_time_request": plan.get("lead_time_request"),
+        "rationale": plan.get("message", ""),
+        "decision_origin": "plan_counter",
+        "price_plan_locked": True,
+    }
 
     if lead_weeks and lead_weeks > 3:
-        lead_req = "≤ 2 weeks or split shipment (20–30% now, balance later)"
-        asks.append("Split shipment or expedite option")
+        lead_req = plan.get("lead_time_request") or "≤ 2 weeks or split shipment (20–30% now, balance later)"
+        decision["lead_time_request"] = lead_req
+        if plan.get("asks") is None:
+            decision["asks"] = []
+        decision["asks"] = list(dict.fromkeys((decision.get("asks") or []) + ["Split shipment or expedite option"]))
 
-    if gap <= 0:
-        counter = round(min(price, target * 0.99), 2)
-        return {
-            "strategy": "accept-with-sweetener",
-            "counter_price": counter,
-            "asks": asks
-            + ["Net-30 (or 1–2% discount)", "Volume price break @ 100/250/500"],
-            "lead_time_request": lead_req,
-            "rationale": "Offer meets or beats target; seek small concession.",
-        }
+    if constraints:
+        decision.setdefault("constraints", constraints)
 
-    if gap <= 0.10:
-        counter = round((price + target) / 2, 2)
-        return {
-            "strategy": "midpoint",
-            "counter_price": counter,
-            "asks": asks + ["Volume price break @ 100/250/500"],
-            "lead_time_request": lead_req,
-            "rationale": "Narrow gap; split the difference with rationale.",
-        }
-
-    counter = round(max(target, price * (1 - AGGRESSIVE_FIRST_COUNTER_PCT)), 2)
-    return {
-        "strategy": "anchor-lower",
-        "counter_price": counter,
-        "asks": asks
-        + ["Volume price break @ 100/250/500", "Alternative part/brand if needed"],
-        "lead_time_request": lead_req,
-        "rationale": "Wide gap; anchor lower and open multiple paths.",
-    }
+    decision.setdefault("decision_log", plan.get("log", []))
+    return decision
 
 
 class NegotiationAgent(BaseAgent):
@@ -202,7 +239,29 @@ class NegotiationAgent(BaseAgent):
             signals=signals,
         )
 
-        decision = decide_strategy(price, target_price, lead_weeks=lead_weeks, constraints=constraints)
+        pricing_payload: Dict[str, Any] = {
+            "current_offer": price,
+            "target_price": target_price,
+            "round": raw_round,
+            "currency": currency,
+            "max_rounds": context.input_data.get("max_rounds") or 3,
+            "walkaway_price": self._coerce_float(context.input_data.get("walkaway_price")),
+            "ask_early_pay_disc": context.input_data.get("ask_early_pay_disc", 0.02),
+            "ask_lead_time_keep": context.input_data.get("ask_lead_time_keep", True),
+        }
+        offer_prev = self._coerce_float(
+            context.input_data.get("previous_offer")
+            or context.input_data.get("supplier_previous_offer")
+            or context.input_data.get("last_supplier_offer")
+        )
+
+        decision = decide_strategy(
+            pricing_payload,
+            lead_weeks=lead_weeks,
+            constraints=constraints,
+            supplier_message=supplier_message,
+            offer_prev=offer_prev,
+        )
         decision = self._adaptive_strategy(
             base_decision=decision,
             zopa=zopa,
@@ -355,7 +414,10 @@ class NegotiationAgent(BaseAgent):
             signals=signals,
             round_no=round_no,
         )
-        decision.update(optimized.get("decision_overrides", {}))
+        overrides = optimized.get("decision_overrides", {}) or {}
+        if decision.get("price_plan_locked"):
+            overrides = {k: v for k, v in overrides.items() if k != "counter_price"}
+        decision.update(overrides)
         counter_options = optimized.get("counter_options") or []
         if not counter_options and decision.get("counter_price") is not None:
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
@@ -880,6 +942,7 @@ class NegotiationAgent(BaseAgent):
         price: Optional[float],
     ) -> Dict[str, Any]:
         decision = dict(base_decision)
+        price_locked = bool(base_decision.get("price_plan_locked"))
         current_round = int(round_hint) if isinstance(round_hint, (int, float)) else 1
 
         if signals.get("finality_hint"):
@@ -895,7 +958,7 @@ class NegotiationAgent(BaseAgent):
         buyer_max = zopa.get("buyer_max")
         supplier_floor = zopa.get("supplier_floor")
         entry = zopa.get("entry_counter")
-        if price and target_price and entry:
+        if not price_locked and price and target_price and entry:
             if current_round == 1:
                 decision["counter_price"] = min(entry, (price + target_price) / 2)
             else:
@@ -915,6 +978,7 @@ class NegotiationAgent(BaseAgent):
         if signals.get("delivery_flex") == "possible" and (lead_weeks or 0) > 3:
             asks.append("Split shipment or expedite window swap")
         decision["asks"] = list(dict.fromkeys(asks))
+        decision["price_plan_locked"] = price_locked
         return decision
 
     def _optimize_multi_issue(
