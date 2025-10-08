@@ -244,7 +244,8 @@ def test_poll_once_matches_with_recent_supplier_when_run_diff(monkeypatch):
 
     assert len(results) == 1
     processed = results[0]
-    assert processed.get("matched_via") == "dispatch_fallback"
+    assert processed.get("matched_via") == "fallback"
+    assert processed.get("match_score") == 0.5
     assert processed.get("supplier_id") == "S1"
     assert processed.get("dispatch_run_id") == "run-303"
 
@@ -290,7 +291,8 @@ def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
     assert len(results) == 1
     processed = results[0]
     assert processed["dispatch_run_id"] == "run-202"
-    assert processed.get("matched_via") == "dispatch_fallback"
+    assert processed.get("matched_via") == "fallback"
+    assert processed.get("match_score") == 0.5
 
 
 def test_load_recent_drafts_filters_by_supplier_and_time():
@@ -553,7 +555,8 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
     processed = results[0]
     assert processed["rfq_id"] == dispatch_row["rfq_id"]
     assert processed["supplier_id"] == dispatch_row["supplier_id"]
-    assert processed["matched_via"] == "dispatch"
+    assert processed["matched_via"] == "fallback"
+    assert processed["match_score"] == 0.5
     assert watcher.supplier_agent.contexts
     context = watcher.supplier_agent.contexts[0]
     assert context.input_data["rfq_id"] == dispatch_row["rfq_id"]
@@ -696,7 +699,8 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
     processed = results[0]
     assert processed["rfq_id"] == row["rfq_id"]
     assert processed["supplier_id"] == row["supplier_id"]
-    assert processed["matched_via"] == "dispatch_similarity"
+    assert processed["matched_via"] == "fallback"
+    assert processed["match_score"] == 0.5
     assert watcher.supplier_agent.contexts
     context = watcher.supplier_agent.contexts[0]
     assert context.input_data["rfq_id"] == row["rfq_id"]
