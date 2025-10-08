@@ -812,8 +812,9 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
     watcher.bucket = None
 
     class StubIMAP:
-        def __init__(self, host):
+        def __init__(self, host, port=None):
             self.host = host
+            self.port = port
 
         def __enter__(self):
             return self
@@ -901,7 +902,7 @@ def test_imap_primary_prefers_imap_over_s3(monkeypatch):
     assert watcher._last_candidate_source == "imap"
 
 
-def test_imap_does_not_use_s3_when_imap_empty(monkeypatch):
+def test_imap_falls_back_to_s3_after_three_empty_polls(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
     nick.settings.imap_user = "inbound@example.com"
@@ -910,7 +911,7 @@ def test_imap_does_not_use_s3_when_imap_empty(monkeypatch):
 
     watcher = _make_watcher(nick, loader=None)
     watcher.bucket = "procwise-bucket"
-    watcher._imap_fallback_attempts = 2
+    watcher._imap_fallback_attempts = 3
 
     counters = {"s3": 0, "imap": 0}
 
@@ -935,18 +936,24 @@ def test_imap_does_not_use_s3_when_imap_empty(monkeypatch):
     monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
     monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
 
-    batch = watcher.poll_once(limit=1)
-
+    batch_one = watcher.poll_once(limit=1)
+    assert batch_one == []
     assert counters["imap"] == 1
     assert counters["s3"] == 0
-    assert batch == []
     assert watcher._last_candidate_source == "imap"
 
-    batch = watcher.poll_once(limit=1)
+    batch_two = watcher.poll_once(limit=1)
+    assert batch_two == []
     assert counters["imap"] == 2
     assert counters["s3"] == 0
-    assert batch == []
     assert watcher._last_candidate_source == "imap"
+
+    batch_three = watcher.poll_once(limit=1)
+    assert counters["imap"] == 3
+    assert counters["s3"] == 1
+    assert batch_three
+    assert batch_three[0]["message_id"].startswith("s3-msg")
+    assert watcher._last_candidate_source == "s3"
 
 
 def test_imap_loader_records_processed_email(monkeypatch):
@@ -960,8 +967,9 @@ def test_imap_loader_records_processed_email(monkeypatch):
     watcher.bucket = None
 
     class StubIMAP:
-        def __init__(self, host):
+        def __init__(self, host, port=None):
             self.host = host
+            self.port = port
 
         def __enter__(self):
             return self
@@ -1742,24 +1750,43 @@ def test_poll_once_skips_s3_polling_even_when_configured(monkeypatch):
     assert watcher._last_candidate_source == "imap"
 
 
-def test_poll_once_logs_error_when_imap_not_configured(monkeypatch, caplog):
+def test_poll_once_logs_error_when_imap_fails_and_uses_s3(monkeypatch, caplog):
     nick = DummyNick()
     watcher = _make_watcher(nick)
     watcher.bucket = "procwisemvp"
     watcher._prefixes = ["emails/"]
+    watcher._imap_fallback_attempts = 3
+    fallback_calls: List[int] = []
 
-    def _unexpected_s3_call():  # pragma: no cover - defensive guard
-        raise AssertionError("S3 client should not be requested without IMAP")
+    class FailingIMAP:
+        def __init__(self, host, port=None, *args, **kwargs):
+            raise OSError("unable to connect")
 
-    monkeypatch.setattr(watcher, "_get_s3_client", _unexpected_s3_call)
+    def _stub_s3(
+        self,
+        limit=None,
+        *,
+        prefixes=None,
+        parser=None,
+        newest_first=True,
+        on_message=None,
+    ):
+        fallback_calls.append(1)
+        return []
+
+    monkeypatch.setattr("services.email_watcher.imaplib.IMAP4_SSL", FailingIMAP)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
 
     caplog.set_level(logging.ERROR)
 
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    results: List[Dict[str, object]] = []
+    for _ in range(3):
+        results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
     assert results == []
-    assert "IMAP mailbox credentials" in caplog.text
-    assert watcher._last_candidate_source == "none"
+    assert fallback_calls == [1, 1, 1]
+    assert watcher._last_candidate_source == "s3"
+    assert "IMAP fallback polling failed" in caplog.text
 
 
 def test_scan_recent_objects_includes_backlog_without_watermark():

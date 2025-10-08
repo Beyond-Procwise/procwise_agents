@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import gzip
-import json
 import imaplib
-import json
 import logging
 import mimetypes
 import re
 import time
 import unicodedata
 import uuid
+import json
+import os
 from urllib.parse import unquote_plus, urlparse
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
@@ -3242,56 +3242,118 @@ class SESEmailWatcher:
         messages: List[Dict[str, object]] = []
         self._last_candidate_source = "none"
 
-        if not self._imap_configured():
-            self._consecutive_empty_imap_batches = 0
+        imap_configured = self._imap_configured()
+
+        if not imap_configured:
             if not self._imap_warning_logged:
                 logger.error(
                     "IMAP mailbox credentials (imap_host, imap_user, imap_password) are not configured for %s; inbound polling is disabled",
                     self.mailbox_address or "<unknown>",
                 )
                 self._imap_warning_logged = True
-            return messages
-
-        if self._imap_warning_logged:
-            logger.info(
-                "IMAP mailbox credentials configured for %s; resuming inbound polling",
-                self.mailbox_address or "<unknown>",
+            # Treat a missing configuration the same as an empty IMAP batch so we
+            # can fall back to S3 once the retry threshold is hit.
+            self._consecutive_empty_imap_batches = max(
+                self._consecutive_empty_imap_batches,
+                self._imap_fallback_attempts,
             )
-            self._imap_warning_logged = False
+        else:
+            if self._imap_warning_logged:
+                logger.info(
+                    "IMAP mailbox credentials configured for %s; resuming inbound polling",
+                    self.mailbox_address or "<unknown>",
+                )
+                self._imap_warning_logged = False
 
-        messages = self._load_from_imap(
-            effective_limit,
-            mark_seen=bool(mark_seen),
-            on_message=on_message,
+            messages = self._load_from_imap(
+                effective_limit,
+                mark_seen=bool(mark_seen),
+                on_message=on_message,
+            )
+
+            self._last_candidate_source = "imap"
+
+            if messages:
+                self._consecutive_empty_imap_batches = 0
+                return messages
+
+            self._consecutive_empty_imap_batches += 1
+
+        fallback_due = (
+            self._imap_fallback_attempts > 0
+            and self._consecutive_empty_imap_batches >= self._imap_fallback_attempts
         )
 
-        self._last_candidate_source = "imap"
-
-        if messages:
+        if fallback_due and self.bucket:
+            logger.info(
+                "No IMAP messages after %d poll(s); falling back to S3 for mailbox %s",
+                self._consecutive_empty_imap_batches,
+                self.mailbox_address,
+            )
+            messages = self._load_from_s3(
+                effective_limit,
+                prefixes=prefixes,
+                on_message=on_message,
+            )
+            self._last_candidate_source = "s3"
             self._consecutive_empty_imap_batches = 0
             return messages
 
-        self._consecutive_empty_imap_batches += 1
+        if fallback_due and not self.bucket:
+            logger.debug(
+                "IMAP fallback to S3 skipped for mailbox %s because no bucket is configured",
+                self.mailbox_address,
+            )
+            self._consecutive_empty_imap_batches = 0
+
+        if not imap_configured:
+            self._last_candidate_source = "imap"
 
         return messages
 
     def _imap_configured(self) -> bool:
-        host, user, password, _, _ = self._imap_settings()
+        host, user, password, _, _, _ = self._imap_settings()
         return bool(host and user and password)
 
-    def _imap_settings(self) -> Tuple[
+    def _imap_settings(
+        self,
+    ) -> Tuple[
         Optional[str],
         Optional[str],
         Optional[str],
         str,
         str,
+        Optional[int],
     ]:
-        host = getattr(self.settings, "imap_host", None)
-        user = getattr(self.settings, "imap_user", None)
-        password = getattr(self.settings, "imap_password", None)
+        host = (
+            getattr(self.settings, "imap_host", None)
+            or getattr(self.settings, "ses_smtp_endpoint", None)
+            or os.getenv("SES_SMTP_ENDPOINT")
+            or "email-smtp.eu-west-1.amazonaws.com"
+        )
+        user = (
+            getattr(self.settings, "imap_user", None)
+            or getattr(self.settings, "ses_user_name", None)
+            or os.getenv("SES_USER_NAME")
+            or "supplierconnect"
+        )
+        password = (
+            getattr(self.settings, "imap_password", None)
+            or getattr(self.settings, "ses_user_password", None)
+            or os.getenv("SES_USER_PASSWORD")
+            or "SConnect12$"
+        )
         mailbox = getattr(self.settings, "imap_mailbox", "INBOX") or "INBOX"
         search_criteria = getattr(self.settings, "imap_search_criteria", "ALL") or "ALL"
-        return host, user, password, mailbox, search_criteria
+        port_value = getattr(self.settings, "imap_port", None)
+        if port_value in (None, ""):
+            port_value = (
+                getattr(self.settings, "ses_smtp_port", None)
+                or os.getenv("SES_SMTP_PORT")
+                or "587"
+            )
+        port = self._coerce_int_value(port_value) if port_value not in (None, "") else None
+        return host, user, password, mailbox, search_criteria, port
 
     def _load_from_imap(
         self,
@@ -3300,7 +3362,7 @@ class SESEmailWatcher:
         mark_seen: bool,
         on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
-        host, user, password, mailbox, search_criteria = self._imap_settings()
+        host, user, password, mailbox, search_criteria, port = self._imap_settings()
         if not host or not user or not password:
             return []
 
@@ -3308,7 +3370,12 @@ class SESEmailWatcher:
         seen_ids: Set[str] = set()
 
         try:
-            with imaplib.IMAP4_SSL(host) as client:
+            if port:
+                client_manager = imaplib.IMAP4_SSL(host, port)
+            else:
+                client_manager = imaplib.IMAP4_SSL(host)
+
+            with client_manager as client:
                 client.login(user, password)
                 status, _ = client.select(mailbox)
                 if status != "OK":
