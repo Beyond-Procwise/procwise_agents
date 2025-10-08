@@ -51,11 +51,45 @@ class AgentContext:
     input_data: Dict[str, Any]
     parent_agent: Optional[str] = None
     routing_history: List[str] = field(default_factory=list)
+    task_profile: Dict[str, Any] = field(default_factory=dict)
+    policy_context: List[Dict[str, Any]] = field(default_factory=list)
+    knowledge_base: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # track invocation time and update routing path
         self.timestamp = datetime.utcnow()
         self.routing_history.append(self.agent_id)
+
+    # ------------------------------------------------------------------
+    # Convenience helpers
+    # ------------------------------------------------------------------
+    def apply_manifest(self, manifest: Optional[Dict[str, Any]]) -> None:
+        """Populate task, policy, and knowledge slots from ``manifest``.
+
+        ``manifest`` mirrors the structure returned by
+        :class:`services.agent_manifest.AgentManifestService`.
+        """
+
+        if not manifest:
+            return
+        task_profile = manifest.get("task")
+        if isinstance(task_profile, dict):
+            self.task_profile = dict(task_profile)
+        policies = manifest.get("policies")
+        if isinstance(policies, list):
+            self.policy_context = [dict(policy) for policy in policies]
+        knowledge = manifest.get("knowledge")
+        if isinstance(knowledge, dict):
+            self.knowledge_base = dict(knowledge)
+
+    def manifest(self) -> Dict[str, Any]:
+        """Return a manifest-style payload summarising the context."""
+
+        return {
+            "task": dict(self.task_profile),
+            "policies": [dict(policy) for policy in self.policy_context],
+            "knowledge": dict(self.knowledge_base),
+        }
 
 
 @dataclass
