@@ -857,7 +857,9 @@ class NegotiationAgent(BaseAgent):
             if signals.get("tone") == "firm":
                 supplier_floor *= 1.01
 
-        concession = signals.get("concession_band_pct") or 0.05
+        concession = self._coerce_float(signals.get("concession_band_pct"))
+        if concession is None:
+            concession = 0.05
         entry = None
         if price:
             entry = round(price * (1 - max(0.03, min(0.12, concession))), 2)
