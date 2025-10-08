@@ -809,6 +809,31 @@ class SESEmailWatcher:
                 self._store_watermark()
             self._require_new_s3_objects = previous_new_flag
 
+    def _should_stop_after_match(self, match_filters: Dict[str, object]) -> bool:
+        if not match_filters:
+            return True
+
+        active_keys = {
+            key
+            for key, value in match_filters.items()
+            if value not in (None, "", [], {}, ())
+        }
+        if not active_keys:
+            return True
+
+        workflow_aggregate_keys = {
+            "workflow_id",
+            "action_id",
+            "draft_action_id",
+            "email_action_id",
+        }
+
+        if active_keys <= workflow_aggregate_keys and active_keys:
+            # Allow processing of every response associated with the workflow/action.
+            return False
+
+        return True
+
     def _process_candidate_message(
         self,
         message: Dict[str, object],
@@ -1149,7 +1174,7 @@ class SESEmailWatcher:
                 should_stop = True
 
         # Stop conditions: either a filter match or an RFQ match should stop polling
-        if matched:
+        if matched and self._should_stop_after_match(match_filters):
             should_stop = True
             logger.debug(
                 "Stopping poll once after matching filters for message %s",
@@ -3326,7 +3351,27 @@ class SESEmailWatcher:
         Optional[int],
     ]:
         host = getattr(self.settings, "imap_host", None) or os.getenv("IMAP_HOST")
-        user = getattr(self.settings, "imap_user", None) or os.getenv("IMAP_USER")
+
+        login_override = getattr(self.settings, "imap_login", None) or os.getenv("IMAP_LOGIN")
+        raw_user = getattr(self.settings, "imap_user", None) or os.getenv("IMAP_USER")
+        username_hint = getattr(self.settings, "imap_username", None) or os.getenv("IMAP_USERNAME")
+        domain_hint = getattr(self.settings, "imap_domain", None) or os.getenv("IMAP_DOMAIN")
+
+        user = login_override or raw_user or username_hint
+        domain_str = str(domain_hint) if domain_hint else None
+        if not user and domain_str:
+            user = domain_str
+        elif domain_str:
+            user_str = str(user) if user is not None else ""
+            if "@" in domain_str:
+                if user_str and "@" not in user_str:
+                    suffix = domain_str.split("@", 1)[-1]
+                    user = f"{user_str}@{suffix}" if suffix else user_str
+                elif not user_str:
+                    user = domain_str
+            elif user_str and "@" not in user_str:
+                user = f"{user_str}@{domain_str}" if domain_str else user_str
+
         password = (
             getattr(self.settings, "imap_password", None)
             or os.getenv("IMAP_PASSWORD")
