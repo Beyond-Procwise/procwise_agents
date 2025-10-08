@@ -3770,34 +3770,41 @@ class SESEmailWatcher:
         supplier_filter: Optional[str],
         *,
         limit: int = 10,
+        within_minutes: int = 10,
     ) -> List["_DraftSnapshot"]:
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         if not callable(get_conn):
             return []
 
-        supplier_clause = ""
-        params: Tuple[object, ...]
-        if supplier_filter:
-            supplier_clause = " AND LOWER(supplier_id) = %s"
-            params = (supplier_filter, limit)
-        else:
-            params = (limit,)
+        if not supplier_filter:
+            return []
+
+        try:
+            interval_minutes = max(0, int(within_minutes))
+        except Exception:
+            interval_minutes = 0
+
+        if interval_minutes <= 0:
+            return []
 
         query = (
             """
             SELECT id, rfq_id, supplier_id, subject, body, payload
             FROM proc.draft_rfq_emails
             WHERE sent = TRUE
-            {supplier_condition}
+              AND COALESCE(sent_on, updated_on, created_on) >= (
+                CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+              )
+              AND LOWER(supplier_id) = %s
             ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
             LIMIT %s
             """
-        ).format(supplier_condition=supplier_clause)
+        )
 
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(query, params)
+                    cur.execute(query, (interval_minutes, supplier_filter, limit))
                     rows = cur.fetchall() or []
         except Exception:
             logger.exception(
@@ -3822,48 +3829,26 @@ class SESEmailWatcher:
         if not processed_payload or not filters:
             return False
 
-        supplier_filter = self._normalise_filter_value(filters.get("supplier_id"))
-        supplier_like_filter = self._normalise_filter_value(filters.get("supplier_id_like"))
-        if not supplier_filter and not supplier_like_filter:
+        supplier_filter = self._normalise_filter_value(
+            processed_payload.get("supplier_id")
+            or filters.get("supplier_id")
+        )
+        if not supplier_filter:
             return False
 
-        run_filter = self._normalise_filter_value(
-            filters.get("dispatch_run_id") or filters.get("run_id")
+        drafts = self._load_recent_drafts_for_fallback(
+            supplier_filter,
+            limit=10,
+            within_minutes=10,
         )
-
-        drafts = self._load_recent_drafts_for_fallback(supplier_filter, limit=10)
         if not drafts:
             return False
 
-        candidates: List[SESEmailWatcher._DraftSnapshot] = []
+        match = None
         for draft in drafts:
-            if supplier_filter:
-                if not draft.supplier_norm or draft.supplier_norm != supplier_filter:
-                    continue
-            elif supplier_like_filter:
-                if not draft.supplier_norm or supplier_like_filter not in draft.supplier_norm:
-                    continue
-            if run_filter:
-                candidate_run = self._normalise_filter_value(
-                    draft.run_id or draft.dispatch_token
-                )
-                if candidate_run != run_filter:
-                    continue
-            candidates.append(draft)
-
-        if not candidates:
-            return False
-
-        match = self._match_dispatched_message(processed_payload, candidates)
-        if match is None:
-            if run_filter:
-                for draft in candidates:
-                    candidate_run = self._normalise_filter_value(
-                        draft.run_id or draft.dispatch_token
-                    )
-                    if candidate_run and candidate_run == run_filter:
-                        match = draft
-                        break
+            if draft.supplier_norm == supplier_filter:
+                match = draft
+                break
 
         if match is None:
             return False
