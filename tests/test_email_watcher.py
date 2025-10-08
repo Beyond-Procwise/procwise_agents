@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from email.message import EmailMessage
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -163,18 +163,147 @@ def test_poll_once_triggers_supplier_agent_on_match():
             "body": "Quoted price 1500",
             "from": "supplier@example.com",
             "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "dispatch_run_id": "run-001",
             "target_price": 1000,
         }
     ]
 
     watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
-    results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "S1", "dispatch_run_id": "run-001"}
+    )
 
     assert len(results) == 1
     result = results[0]
     assert result["rfq_id"].lower() == "rfq-20240101-abcd1234"
     assert watcher.supplier_agent.contexts
     assert "msg-1" in state
+
+
+def test_poll_once_requires_supplier_match_when_filters_present():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1400",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-MISMATCH",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "SUP-EXPECTED", "dispatch_run_id": "run-202"}
+    )
+
+    assert results == []
+
+
+def test_poll_once_requires_run_match_when_filters_present():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-3",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1350",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "S1",
+            "dispatch_run_id": "run-303",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "S1", "dispatch_run_id": "run-404"}
+    )
+
+    assert results == []
+
+
+def test_poll_once_uses_draft_fallback_when_run_missing(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-fallback",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1400",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+            "supplier_id": "SUP-EXPECTED",
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    draft = watcher._DraftSnapshot(
+        id=301,
+        rfq_id="RFQ-20240101-ABCD1234",
+        subject="Re: RFQ-20240101-ABCD1234",
+        body="Thank you",
+        dispatch_token="run-202",
+        run_id="run-202",
+        recipients=("supplier@example.com",),
+        supplier_id="SUP-EXPECTED",
+    )
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_recent_drafts_for_fallback",
+        lambda supplier_filter, limit=10: [draft],
+    )
+
+    results = watcher.poll_once(
+        match_filters={"supplier_id": "SUP-EXPECTED", "dispatch_run_id": "run-202"}
+    )
+
+    assert len(results) == 1
+    processed = results[0]
+    assert processed["dispatch_run_id"] == "run-202"
+    assert processed.get("matched_via") == "dispatch_fallback"
+
+
+def test_register_processed_response_waits_for_complete_run(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+
+    expectation_calls: List[Optional[str]] = []
+
+    def fake_expectations(workflow_id, metadata, *, group_key=None):
+        expectation_calls.append(group_key)
+        return 2
+
+    monkeypatch.setattr(
+        watcher,
+        "_ensure_workflow_expectations",
+        fake_expectations,
+        raising=False,
+    )
+
+    tracking_key = watcher._normalise_group_key("run-500", "wf-500")
+
+    metadata = {"dispatch_run_id": "run-500", "status": "processed", "payload": {}}
+    processed_one = {"message_id": "msg-run-1", "dispatch_run_id": "run-500"}
+    processed_two = {"message_id": "msg-run-2", "dispatch_run_id": "run-500"}
+
+    result_one = watcher._register_processed_response("wf-500", metadata, processed_one, None)
+    assert result_one == (False, None)
+    assert watcher._workflow_processed_counts.get(tracking_key) == 1
+
+    result_two = watcher._register_processed_response("wf-500", metadata, processed_two, None)
+    assert result_two == (False, None)
+    assert tracking_key not in watcher._workflow_processed_counts
+    assert expectation_calls and expectation_calls[0] == tracking_key
+    assert not watcher.supplier_agent.contexts
 
 
 def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
@@ -240,6 +369,19 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
         def execute(self, statement, params=None):
             normalized = " ".join(statement.split()).lower()
             if normalized.startswith(
+                "select id, rfq_id, supplier_id, subject, body, payload from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        101,
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        "Re: Pricing",
+                        "Here is our latest quote",
+                        json.dumps({}),
+                    )
+                ]
+            elif normalized.startswith(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
             ):
                 self._result = [
@@ -267,6 +409,20 @@ def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
                         dispatch_row["created_on"],
                         dispatch_row["updated_on"],
                         json.dumps({}),
+                    )
+                ]
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
+            ):
+                self._result = [
+                    (
+                        dispatch_row["rfq_id"],
+                        dispatch_row["supplier_id"],
+                        dispatch_row["supplier_name"],
+                        dispatch_row["sent_on"],
+                        True,
+                        dispatch_row["created_on"],
+                        dispatch_row["updated_on"],
                     )
                 ]
             elif normalized.startswith("select target_price"):
@@ -358,6 +514,28 @@ def test_email_watcher_resolves_rfq_via_dispatch_similarity(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on from proc.draft_rfq_emails"
             ):
                 self._result = []
+            elif normalized.startswith(
+                "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, payload from proc.draft_rfq_emails"
+            ):
+                payload = json.dumps(
+                    {
+                        "subject": row["subject"],
+                        "body": row["body"],
+                        "recipients": [row["recipient_email"]],
+                    }
+                )
+                self._result = [
+                    (
+                        row["rfq_id"],
+                        row["supplier_id"],
+                        row["supplier_name"],
+                        row["sent_on"],
+                        True,
+                        row["created_on"],
+                        row["updated_on"],
+                        payload,
+                    )
+                ]
             elif normalized.startswith(
                 "select rfq_id, supplier_id, supplier_name, sent_on, sent, created_on, updated_on, subject, body, recipient_email, sender from proc.draft_rfq_emails"
             ):
@@ -484,9 +662,12 @@ def test_poll_once_continues_until_all_filters_match():
         match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-2"}
     )
 
-    # RFQ match is authoritative, so the first candidate ends the poll
-    assert [result["supplier_id"] for result in results] == ["SUP-1"]
-    assert len(watcher.supplier_agent.contexts) == 1
+    assert len(results) == 1
+    matched = results[0]
+    assert matched["supplier_id"] == "SUP-2"
+    assert matched["rfq_id"].upper() == "RFQ-20240101-ABCD1234"
+    assert watcher.supplier_agent.contexts
+    assert watcher.supplier_agent.contexts[0].input_data["supplier_id"] == "SUP-2"
 
 
 def test_poll_once_matches_on_rfq_tail():
@@ -507,8 +688,41 @@ def test_poll_once_matches_on_rfq_tail():
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20249999-00001234"})
 
     assert len(results) == 1
-    assert results[0]["rfq_id"] == "RFQ-20240101-00001234"
-    assert "msg-tail" in state
+    assert results[0]["matched_via"] != "rfq_hint"
+
+
+def test_match_dispatched_message_prefers_run_id():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=201,
+            rfq_id="RFQ-1",
+            subject="Subject",
+            body="Body A",
+            dispatch_token="token-a",
+            run_id="run-a",
+        ),
+        watcher._DraftSnapshot(
+            id=202,
+            rfq_id="RFQ-2",
+            subject="Subject",
+            body="Body B",
+            dispatch_token="token-b",
+            run_id="run-b",
+        ),
+    ]
+
+    message = {
+        "subject": "Subject",
+        "body": "<!-- PROCWISE:RFQ_ID=RFQ-2;TOKEN=token-b;RUN_ID=run-b -->\nBody B",
+    }
+
+    match = watcher._match_dispatched_message(message, drafts)
+
+    assert match is drafts[1]
+    assert match.matched_via == "dispatch_token"
 
 
 def test_email_watcher_falls_back_to_imap(monkeypatch):
@@ -764,6 +978,47 @@ def test_email_watcher_filter_matches_legacy_payload_without_workflow():
 
     assert payload["workflow_id"] == "WF-Legacy-01"
     assert watcher._matches_filters(payload, filters)
+
+
+def test_email_watcher_ignores_workflow_when_run_filter_present(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-run-check",
+            "subject": "Re: RFQ-20240101-ABCD1234",
+            "body": "Quoted price 1230",
+            "from": "supplier@example.com",
+            "rfq_id": "RFQ-20240101-ABCD1234",
+            "supplier_id": "SUP-1",
+            "_dispatch_record": {
+                "rfq_id": "RFQ-20240101-ABCD1234",
+                "supplier_id": "SUP-1",
+                "run_id": "run-fallback",
+            },
+        }
+    ]
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: list(messages), state_store=state)
+
+    def fake_metadata(_rfq_id):
+        return {"supplier_id": "SUP-1", "workflow_id": "WF-FALLBACK"}
+
+    monkeypatch.setattr(watcher, "_load_metadata", fake_metadata, raising=False)
+
+    filters = {
+        "supplier_id": "SUP-1",
+        "dispatch_run_id": "run-fallback",
+        "workflow_id": "WF-IGNORED",
+    }
+
+    results = watcher.poll_once(match_filters=filters)
+
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["dispatch_run_id"] == "run-fallback"
+    assert payload["workflow_id"] == "WF-FALLBACK"
 
 
 def test_normalise_rfq_value_uses_last_eight_digits():
@@ -1599,7 +1854,7 @@ def test_negotiation_counters_reset_between_rounds(monkeypatch):
     assert first_round_second and len(first_round_second) == 1
     assert len(watcher.negotiation_agent.contexts) == 1
 
-    workflow_key = watcher._normalise_workflow_key("WF-MULTI-RESET")
+    workflow_key = watcher._normalise_group_key(None, "WF-MULTI-RESET")
     assert workflow_key not in watcher._workflow_processed_counts
     assert workflow_key not in watcher._workflow_expected_counts
 
@@ -1621,7 +1876,7 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     nick = DummyNick()
     watcher = _make_watcher(nick)
     workflow_id = "WF-EXPECT-REDUCE"
-    workflow_key = watcher._normalise_workflow_key(workflow_id)
+    workflow_key = watcher._normalise_group_key(None, workflow_id)
 
     def make_metadata(expected: int) -> Dict[str, object]:
         return {"workflow_id": workflow_id, "expected_supplier_count": expected}
@@ -1673,6 +1928,66 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     assert workflow_key not in watcher._workflow_expected_counts
     assert len(watcher.negotiation_agent.contexts) == 4
 
+
+def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [], state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-123",
+        workflow_id="wf-123",
+        draft_ids=(101, 102, 103),
+        draft_count=3,
+        supplier_count=3,
+    )
+
+    ts = datetime.now(timezone.utc)
+    messages = [
+        {
+            "id": f"emails/msg-{idx}.eml",
+            "subject": f"Subject {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx};RUN_ID=run-{idx} -->\nBody {idx}",
+            "_last_modified": ts,
+            "_prefix": watcher._prefixes[0],
+        }
+        for idx in range(1, 4)
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=100 + idx,
+            rfq_id=f"RFQ-{idx}",
+            subject=f"Subject {idx}",
+            body=f"Body {idx}",
+            dispatch_token=f"token-{idx}",
+            run_id=f"run-{idx}",
+        )
+        for idx in range(1, 4)
+    ]
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_from_s3",
+        lambda limit, prefixes=None, newest_first=True: list(messages)[:limit],
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+
+    watcher._s3_prefix_watchers = {watcher._prefixes[0]: S3ObjectWatcher(limit=10)}
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=True)
+
+    for idx, message in enumerate(messages, start=1):
+        key = message["id"]
+        assert key in state
+        metadata = state.get(key)
+        assert metadata["status"] == "dispatch_copy"
+        assert metadata["dispatch_completed"] is True
+        assert metadata["run_id"] == f"run-{idx}"
 
 
 def test_sqs_email_loader_extracts_records():

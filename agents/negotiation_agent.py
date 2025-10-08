@@ -315,6 +315,7 @@ class NegotiationAgent(BaseAgent):
             target_price,
             currency,
             round_no,
+            playbook_context=playbook_context,
         )
 
         if play_recommendations:
@@ -1042,9 +1043,22 @@ class NegotiationAgent(BaseAgent):
     ) -> str:
         lines: List[str] = [summary.strip()]
         descriptor = playbook_context.get("descriptor")
-        if descriptor:
+        style = playbook_context.get("style")
+        supplier_type = playbook_context.get("supplier_type")
+        lever_priorities = playbook_context.get("lever_priorities") or []
+        if descriptor or style or supplier_type:
             lines.append("")
+        if descriptor:
             lines.append(f"Playbook focus: {descriptor}")
+        if style or supplier_type or lever_priorities:
+            lever_text = ", ".join(lever_priorities[:3]) if lever_priorities else "balanced"
+            context_bits: List[str] = []
+            if supplier_type:
+                context_bits.append(f"Supplier type: {supplier_type}")
+            if style:
+                context_bits.append(f"Style: {style}")
+            context_bits.append(f"Lever focus: {lever_text}")
+            lines.append("; ".join(context_bits))
         if plays:
             lines.append("")
             lines.append("Recommended plays from negotiation playbook:")
@@ -1385,30 +1399,92 @@ class NegotiationAgent(BaseAgent):
         target_price: Optional[float],
         currency: Optional[str],
         round_no: int,
+        *,
+        playbook_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        parts: List[str] = []
         rfq_text = rfq_id or "RFQ"
-        parts.append(f"Round {round_no} plan for {rfq_text}: {decision.get('strategy')}")
+        strategy = decision.get("strategy")
+        lines: List[str] = []
+        header = f"Round {round_no} plan for {rfq_text}"
+        if strategy:
+            header += f": {strategy}"
+        lines.append(header)
+
+        descriptor: Optional[str] = None
+        supplier_type: Optional[str] = None
+        negotiation_style: Optional[str] = None
+        lever_priorities: List[str] = []
+        if playbook_context:
+            descriptor_candidate = playbook_context.get("descriptor")
+            descriptor = str(descriptor_candidate).strip() if descriptor_candidate else None
+            supplier_candidate = playbook_context.get("supplier_type")
+            supplier_type = str(supplier_candidate).strip() if supplier_candidate else None
+            style_candidate = playbook_context.get("style")
+            negotiation_style = (
+                str(style_candidate).strip() if isinstance(style_candidate, str) else None
+            )
+            lever_values = playbook_context.get("lever_priorities")
+            if isinstance(lever_values, (list, tuple)):
+                lever_priorities = [
+                    str(value).strip()
+                    for value in lever_values
+                    if isinstance(value, str) and value.strip()
+                ]
+
+        if supplier_type or descriptor:
+            descriptor_parts: List[str] = []
+            if supplier_type:
+                descriptor_parts.append(f"Supplier category: {supplier_type}")
+            if descriptor:
+                descriptor_parts.append(descriptor)
+            if descriptor_parts:
+                lines.append("- " + " — ".join(descriptor_parts))
+
+        if negotiation_style:
+            if lever_priorities:
+                lever_text = ", ".join(lever_priorities[:3])
+            else:
+                lever_text = "balanced levers"
+            lines.append(
+                f"- Negotiation style: {negotiation_style}; focus levers: {lever_text}"
+            )
+
         counter_price = decision.get("counter_price")
+        formatted_offer: Optional[str] = None
+        if price is not None:
+            formatted_offer = self._format_currency(price, currency)
+
         if counter_price is not None:
-            parts.append(
-                f"Counter at {self._format_currency(counter_price, currency)} against supplier offer"
-            )
-        elif price is not None:
-            parts.append(
-                f"Seek clarification before accepting {self._format_currency(price, currency)}"
-            )
+            counter_text = self._format_currency(counter_price, currency)
+            if formatted_offer:
+                lines.append(
+                    f"- Counter at {counter_text} against supplier offer {formatted_offer}"
+                )
+            else:
+                lines.append(f"- Counter target: {counter_text}")
+        elif formatted_offer:
+            lines.append(f"- Seek clarification before accepting {formatted_offer}")
+
         if target_price is not None and price is not None:
-            parts.append(
-                f"Target {self._format_currency(target_price, currency)} vs offer {self._format_currency(price, currency)}"
+            target_text = self._format_currency(target_price, currency)
+            delta = price - target_price
+            try:
+                delta_text = self._format_currency(delta, currency)
+            except Exception:
+                delta_text = f"{delta:0.2f}"
+            lines.append(
+                f"- Target {target_text} vs offer {formatted_offer} (gap {delta_text})"
             )
+
         lead_time = decision.get("lead_time_request")
         if lead_time:
-            parts.append(f"Lead time ask: {lead_time}")
+            lines.append(f"- Lead time ask: {lead_time}")
+
         asks = decision.get("asks") or []
         if asks:
-            parts.append("Key asks: " + "; ".join(asks))
-        return ". ".join(parts)
+            lines.append("- Key asks: " + "; ".join(str(item) for item in asks if item))
+
+        return "\n".join(lines)
 
     def _build_supplier_watch_fields(
         self,
@@ -1439,6 +1515,12 @@ class NegotiationAgent(BaseAgent):
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
 
+        workflow_hint = getattr(context, "workflow_id", None)
+        if workflow_hint:
+            for draft in candidate_drafts:
+                if isinstance(draft, dict) and not draft.get("workflow_id"):
+                    draft["workflow_id"] = workflow_hint
+
         watch_payload: Dict[str, Any] = {
             "await_response": True,
             "message": "",
@@ -1447,6 +1529,7 @@ class NegotiationAgent(BaseAgent):
             "rfq_id": rfq_id,
             "supplier_id": supplier,
             "response_poll_interval": poll_interval,
+            "workflow_id": workflow_hint,
         }
 
         batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
@@ -1552,6 +1635,28 @@ class NegotiationAgent(BaseAgent):
                 elif isinstance(recipients_field, str):
                     recipient_hint = recipients_field
 
+            draft_action_id = None
+            for key in ("action_id", "draft_action_id", "email_action_id"):
+                candidate = target.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    draft_action_id = candidate.strip()
+                    break
+            workflow_hint = target.get("workflow_id") or watch_payload.get("workflow_id")
+            if not workflow_hint and isinstance(target.get("metadata"), dict):
+                meta_workflow = target["metadata"].get("workflow_id") or target["metadata"].get("process_workflow_id")
+                if isinstance(meta_workflow, str) and meta_workflow.strip():
+                    workflow_hint = meta_workflow.strip()
+            dispatch_run_id = None
+            for key in ("dispatch_run_id", "run_id"):
+                candidate = target.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    dispatch_run_id = candidate.strip()
+                    break
+            if dispatch_run_id is None and isinstance(target.get("metadata"), dict):
+                meta_run = target["metadata"].get("dispatch_run_id") or target["metadata"].get("run_id")
+                if isinstance(meta_run, str) and meta_run.strip():
+                    dispatch_run_id = meta_run.strip()
+
             return [
                 supplier_agent.wait_for_response(
                     timeout=timeout,
@@ -1562,6 +1667,9 @@ class NegotiationAgent(BaseAgent):
                     subject_hint=target.get("subject"),
                     from_address=recipient_hint,
                     enable_negotiation=False,
+                    draft_action_id=draft_action_id,
+                    workflow_id=workflow_hint,
+                    dispatch_run_id=dispatch_run_id,
                 )
             ]
         except Exception:  # pragma: no cover - defensive
