@@ -1571,11 +1571,11 @@ class EmailDraftingAgent(BaseAgent):
                 if cleaned:
                     statements.append(cleaned)
 
-        avg_price = self._as_float(
-            supplier.get("avg_unit_price")
-            or supplier.get("current_price")
-            or supplier.get("price")
-        )
+        avg_price = None
+        for price_key in ("avg_unit_price", "current_price", "price"):
+            avg_price = self._as_float(supplier.get(price_key))
+            if avg_price is not None:
+                break
         if avg_price is not None:
             price_text = self._format_currency_value(avg_price, currency)
             _append(f"Recent average submitted pricing on record is {price_text}.")
