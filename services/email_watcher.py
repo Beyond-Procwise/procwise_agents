@@ -480,11 +480,24 @@ class SESEmailWatcher:
                 minimum=0,
             ),
         )
+        self._post_dispatch_settle_seconds = max(
+            0,
+            self._coerce_int(
+                getattr(
+                    self.settings,
+                    "email_inbound_post_dispatch_delay_seconds",
+                    60,
+                ),
+                default=60,
+                minimum=0,
+            ),
+        )
         self._last_dispatch_notified_at: Optional[float] = None
         self._last_dispatch_wait_acknowledged: Optional[float] = None
         self._dispatch_expectations: Dict[str, "_DispatchExpectation"] = {}
         self._completed_dispatch_actions: Set[str] = set()
         self._workflow_dispatch_actions: Dict[str, str] = {}
+        self._last_candidate_source: str = "none"
 
         logger.info(
             "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
@@ -677,9 +690,16 @@ class SESEmailWatcher:
                             on_message=_on_message,
                         )
                         batch_count = len(processed_batch) if filters else len(messages)
+                        if self._last_candidate_source == "imap":
+                            source_label = "IMAP"
+                        elif self._last_candidate_source == "s3":
+                            source_label = "S3"
+                        else:
+                            source_label = "mail source"
                         logger.info(
-                            "Retrieved %d candidate message(s) from S3 for mailbox %s",
+                            "Retrieved %d candidate message(s) from %s for mailbox %s",
                             batch_count,
+                            source_label,
                             self.mailbox_address,
                         )
                         if not filters:
@@ -3220,6 +3240,7 @@ class SESEmailWatcher:
 
         messages: List[Dict[str, object]] = []
         attempted_imap = False
+        self._last_candidate_source = "none"
 
         if self._imap_configured():
             attempted_imap = True
@@ -3229,6 +3250,7 @@ class SESEmailWatcher:
                 on_message=on_message,
             )
             if messages:
+                self._last_candidate_source = "imap"
                 self._consecutive_empty_imap_batches = 0
                 return messages
             self._consecutive_empty_imap_batches += 1
@@ -3257,6 +3279,7 @@ class SESEmailWatcher:
                 prefixes=prefixes,
                 on_message=on_message,
             )
+            self._last_candidate_source = "s3"
             if messages:
                 self._consecutive_empty_imap_batches = 0
                 return messages
@@ -4003,6 +4026,13 @@ class SESEmailWatcher:
                     expectation.action_id,
                     expectation.workflow_id,
                 )
+                if self._post_dispatch_settle_seconds > 0:
+                    logger.info(
+                        "Waiting %ds after dispatch completion before polling inbound for mailbox %s",
+                        self._post_dispatch_settle_seconds,
+                        self.mailbox_address,
+                    )
+                    time.sleep(self._post_dispatch_settle_seconds)
                 return True
 
             now = time.time()

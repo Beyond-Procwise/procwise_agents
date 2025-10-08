@@ -101,6 +101,7 @@ class DummyNick:
             s3_bucket_name=None,
             email_response_poll_seconds=1,
             email_inbound_initial_wait_seconds=0,
+            email_inbound_post_dispatch_delay_seconds=0,
         )
         self.agents: Dict[str, object] = {}
         self.ddl_statements: List[str] = []
@@ -897,6 +898,7 @@ def test_imap_primary_prefers_imap_over_s3(monkeypatch):
     assert counters["s3"] == 0
     assert batch
     assert batch[0]["message_id"].startswith("imap-msg-")
+    assert watcher._last_candidate_source == "imap"
 
 
 def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
@@ -938,6 +940,7 @@ def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
     assert counters["s3"] == 1
     assert batch
     assert batch[0]["message_id"].startswith("s3-msg-")
+    assert watcher._last_candidate_source == "s3"
 
 
 def test_imap_loader_records_processed_email(monkeypatch):
@@ -1637,6 +1640,33 @@ def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
     watcher.poll_once(match_filters={"action_id": nick.action_id})
     assert fake_clock["sleeps"] == []
     assert nick.sent_count_calls == previous_calls
+
+
+def test_wait_for_dispatch_completion_adds_post_dispatch_delay(monkeypatch):
+    nick = DummyNick()
+    nick.settings.email_inbound_post_dispatch_delay_seconds = 3
+
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    expectation = watcher._DispatchExpectation(
+        action_id="action-123",
+        workflow_id=None,
+        draft_ids=(1,),
+        draft_count=1,
+        supplier_count=1,
+    )
+
+    monkeypatch.setattr(watcher, "_count_sent_drafts", lambda exp: exp.draft_count)
+
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("services.email_watcher.time.sleep", fake_sleep)
+
+    assert watcher._wait_for_dispatch_completion(expectation) is True
+    assert sleep_calls and sleep_calls[-1] == pytest.approx(3.0)
+
 
 def test_s3_poll_prioritises_newest_objects(monkeypatch):
     nick = DummyNick()
