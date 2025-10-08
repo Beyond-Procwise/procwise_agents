@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 import logging
 import os
 from pydantic import BaseModel
@@ -52,6 +52,17 @@ async def get_agent_status(agent_name: str, agent_nick=Depends(get_agent_nick)):
         "class": agent.__class__.__name__,
         "status": "ready"
     }
+
+
+@router.get("/{agent_name}/manifest")
+async def get_agent_manifest(agent_name: str, orchestrator: Orchestrator = Depends(get_orchestrator)):
+    """Return the manifest describing the agent's responsibilities and knowledge."""
+
+    try:
+        return orchestrator.manifest_service.build_manifest(agent_name)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to build manifest for %s", agent_name)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/reload-policies")

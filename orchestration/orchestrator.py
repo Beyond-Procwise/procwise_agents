@@ -22,6 +22,7 @@ from engines.query_engine import QueryEngine
 from services.process_routing_service import ProcessRoutingService
 from services.backend_scheduler import BackendScheduler
 from services.event_bus import get_event_bus, workflow_scope
+from services.agent_manifest import AgentManifestService
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ class Orchestrator:
             agent_nick, training_endpoint=training_endpoint
         )
         self.event_bus = get_event_bus()
+        self.manifest_service = AgentManifestService(agent_nick)
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
 
@@ -147,12 +149,25 @@ class Orchestrator:
             # Create initial context
             enriched_input: Dict[str, Any] = {**(input_data or {})}
             self._ensure_workflow_metadata(enriched_input, workflow_name)
+            manifest = self.manifest_service.build_manifest(workflow_name)
+            if isinstance(enriched_input, dict):
+                enriched_input.setdefault("agent_manifest", manifest)
+                enriched_input.setdefault(
+                    "policy_context", manifest.get("policies", [])
+                )
+                enriched_input.setdefault(
+                    "knowledge_context", manifest.get("knowledge", {})
+                )
             context = AgentContext(
                 workflow_id=workflow_id,
                 agent_id=workflow_name,
                 user_id=user_id or self.settings.script_user,
                 input_data=enriched_input,
+                task_profile=manifest.get("task", {}),
+                policy_context=manifest.get("policies", []),
+                knowledge_base=manifest.get("knowledge", {}),
             )
+            context.apply_manifest(manifest)
 
             # Validate against policies
             if not self._validate_workflow(workflow_name, context):
@@ -181,6 +196,7 @@ class Orchestrator:
                 result=result,
                 status="completed",
             )
+            self._trigger_automatic_training(workflow_name)
 
             return {
                 "status": "completed",
@@ -198,6 +214,7 @@ class Orchestrator:
                 result={"error": str(e)},
                 status="failed",
             )
+            self._trigger_automatic_training(workflow_name)
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
     @staticmethod
@@ -482,6 +499,18 @@ class Orchestrator:
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to resolve model training service from endpoint")
             return None
+
+    def _trigger_automatic_training(self, workflow_name: str) -> None:
+        """Kick off background training using procurement datasets."""
+
+        service = self._get_model_training_service()
+        if service is None:
+            return
+        try:
+            service.dispatch_training_and_refresh(force=False, limit=1)
+            logger.debug("Automatic training dispatch executed for %s", workflow_name)
+        except Exception:  # pragma: no cover - defensive execution
+            logger.exception("Automatic training dispatch failed for %s", workflow_name)
 
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:
@@ -966,12 +995,20 @@ class Orchestrator:
             )
             while attempt <= retries and not success:
                 attempt += 1
+                manifest = self.manifest_service.build_manifest(agent_key)
+                agent_input.setdefault("agent_manifest", manifest)
+                agent_input.setdefault("policy_context", manifest.get("policies", []))
+                agent_input.setdefault("knowledge_context", manifest.get("knowledge", {}))
                 context = AgentContext(
                     workflow_id=str(uuid.uuid4()),
                     agent_id=agent_key,
                     user_id=self.settings.script_user,
                     input_data=agent_input,
+                    task_profile=manifest.get("task", {}),
+                    policy_context=manifest.get("policies", []),
+                    knowledge_base=manifest.get("knowledge", {}),
                 )
+                context.apply_manifest(manifest)
                 try:
                     if timeout:
                         fut = self.executor.submit(agent.execute, context)
@@ -1098,13 +1135,21 @@ class Orchestrator:
                 node.get("workflow"),
                 agent_key=agent_key,
             )
+            manifest = self.manifest_service.build_manifest(agent_key)
+            input_data.setdefault("agent_manifest", manifest)
+            input_data.setdefault("policy_context", manifest.get("policies", []))
+            input_data.setdefault("knowledge_context", manifest.get("knowledge", {}))
 
             context = AgentContext(
                 workflow_id=_new_id(),
                 agent_id=agent_key,
                 user_id=self.settings.script_user,
                 input_data=input_data,
+                task_profile=manifest.get("task", {}),
+                policy_context=manifest.get("policies", []),
+                knowledge_base=manifest.get("knowledge", {}),
             )
+            context.apply_manifest(manifest)
             if prs and process_id is not None:
                 # Mark the agent as validated when execution begins to mirror
                 # the real-time status transitions expected by the workflow
@@ -1817,11 +1862,20 @@ class Orchestrator:
             agent_key=agent_name,
         )
         self._inject_agent_instructions(agent_name, child_input)
-        return AgentContext(
+        manifest = self.manifest_service.build_manifest(agent_name)
+        child_input.setdefault("agent_manifest", manifest)
+        child_input.setdefault("policy_context", manifest.get("policies", []))
+        child_input.setdefault("knowledge_context", manifest.get("knowledge", {}))
+        child_context = AgentContext(
             workflow_id=parent_context.workflow_id,
             agent_id=agent_name,
             user_id=parent_context.user_id,
             input_data=child_input,
             parent_agent=parent_context.agent_id,
             routing_history=parent_context.routing_history.copy(),
+            task_profile=manifest.get("task", {}),
+            policy_context=manifest.get("policies", []),
+            knowledge_base=manifest.get("knowledge", {}),
         )
+        child_context.apply_manifest(manifest)
+        return child_context
