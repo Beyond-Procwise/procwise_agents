@@ -104,6 +104,7 @@ def test_supplier_interaction_wait_for_response():
         calls["count"] += 1
         assert match_filters is not None
         assert "rfq_id" not in match_filters
+        assert match_filters == {"supplier_id": "S1", "dispatch_run_id": "run-001"}
         if calls["count"] == 1:
             return [
                 {
@@ -164,6 +165,7 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
         calls["count"] += 1
         assert match_filters is not None
         assert "rfq_id" not in match_filters
+        assert match_filters == {"supplier_id": "S1", "dispatch_run_id": "run-002"}
         return batches.pop(0) if batches else []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -195,6 +197,7 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
         calls["count"] += 1
         assert match_filters is not None
         assert "rfq_id" not in match_filters
+        assert match_filters == {"supplier_id": "S1", "dispatch_run_id": "run-missing"}
         return []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -312,12 +315,14 @@ def test_wait_for_multiple_responses_starts_parallel_watchers(monkeypatch):
             "supplier_id": "SUP-1",
             "recipients": ["one@example.com"],
             "subject": "Re: RFQ-20240101-AAA11111",
+            "dispatch_run_id": "run-sup-1",
         },
         {
             "rfq_id": "RFQ-20240101-BBB22222",
             "supplier_id": "SUP-2",
             "receiver": "two@example.com",
             "subject": "Re: RFQ-20240101-BBB22222",
+            "dispatch_run_id": "run-sup-2",
         },
     ]
 
@@ -369,6 +374,7 @@ def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
         limit: int = 1,
         rfq_id: Optional[str] = None,
         supplier_id: Optional[str] = None,
+        dispatch_run_id: Optional[str] = None,
         **_kwargs,
     ):
         key = (rfq_id, supplier_id)
@@ -378,6 +384,8 @@ def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
             return None
         if rfq_id:
             pending_map[rfq_id] = 0
+        expected_run = draft_runs.get(key)
+        assert dispatch_run_id == expected_run
         return {
             "rfq_id": rfq_id,
             "supplier_id": supplier_id,
@@ -406,13 +414,20 @@ def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
             "rfq_id": "RFQ-20240101-AAA11111",
             "supplier_id": "SUP-1",
             "recipients": ["one@example.com"],
+            "dispatch_run_id": "run-aaa",
         },
         {
             "rfq_id": "RFQ-20240101-BBB22222",
             "supplier_id": "SUP-2",
             "recipients": ["two@example.com"],
+            "dispatch_run_id": "run-bbb",
         },
     ]
+
+    draft_runs = {
+        (draft["rfq_id"], draft["supplier_id"]): draft["dispatch_run_id"]
+        for draft in drafts
+    }
 
     results = agent.wait_for_multiple_responses(
         drafts,

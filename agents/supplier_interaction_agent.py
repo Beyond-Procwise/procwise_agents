@@ -185,18 +185,7 @@ class SupplierInteractionAgent(BaseAgent):
                                 meta_workflow = meta.get("workflow_id") or meta.get("process_workflow_id")
                                 if isinstance(meta_workflow, str) and meta_workflow.strip():
                                     workflow_hint = meta_workflow.strip()
-                        for key in ("dispatch_run_id", "run_id"):
-                            candidate_run = primary_candidate.get(key)
-                            if isinstance(candidate_run, str) and candidate_run.strip():
-                                dispatch_run_id = candidate_run.strip()
-                                break
-                        if dispatch_run_id is None and isinstance(primary_candidate.get("metadata"), dict):
-                            meta_run = (
-                                primary_candidate["metadata"].get("dispatch_run_id")
-                                or primary_candidate["metadata"].get("run_id")
-                            )
-                            if isinstance(meta_run, str) and meta_run.strip():
-                                dispatch_run_id = meta_run.strip()
+                        dispatch_run_id = self._extract_dispatch_run_id(primary_candidate)
                 if workflow_hint is None:
                     workflow_hint = getattr(context, "workflow_id", None)
                 wait_result = self.wait_for_response(
@@ -567,16 +556,10 @@ class SupplierInteractionAgent(BaseAgent):
         match_filters: Dict[str, object] = {}
         if supplier_id:
             match_filters["supplier_id"] = supplier_id
-        if subject_hint:
-            match_filters["subject_contains"] = subject_hint
-        if from_address:
-            match_filters["from_address"] = from_address
-        if draft_action_id:
-            match_filters["draft_action_id"] = draft_action_id
-        if workflow_id:
-            match_filters["workflow_id"] = workflow_id
         if dispatch_run_id:
             match_filters["dispatch_run_id"] = dispatch_run_id
+        if draft_action_id:
+            match_filters["draft_action_id"] = draft_action_id
 
         while time.time() <= deadline:
             if attempt_cap is not None and attempts_made >= attempt_cap:
@@ -897,6 +880,13 @@ class SupplierInteractionAgent(BaseAgent):
                         recipient_hint = recipients_field
 
                 subject_hint = draft.get("subject")
+                dispatch_run_id = self._extract_dispatch_run_id(draft)
+                draft_action_id = None
+                for key in ("action_id", "draft_action_id", "email_action_id"):
+                    candidate_action = draft.get(key)
+                    if isinstance(candidate_action, str) and candidate_action.strip():
+                        draft_action_id = candidate_action.strip()
+                        break
 
                 result = self.wait_for_response(
                     timeout=per_attempt,
@@ -907,6 +897,8 @@ class SupplierInteractionAgent(BaseAgent):
                     subject_hint=subject_hint,
                     from_address=recipient_hint,
                     enable_negotiation=enable_negotiation,
+                    draft_action_id=draft_action_id,
+                    dispatch_run_id=dispatch_run_id,
                 )
                 if result is not None:
                     results[idx] = result
@@ -1204,6 +1196,45 @@ class SupplierInteractionAgent(BaseAgent):
             return None
         lowered = text.lower()
         return lowered or None
+
+    @staticmethod
+    def _extract_dispatch_run_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        def _clean(value: Optional[Any]) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                text = str(value).strip()
+            except Exception:
+                return None
+            return text or None
+
+        for key in ("dispatch_run_id", "run_id"):
+            candidate = _clean(payload.get(key))
+            if candidate:
+                return candidate
+
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+        if metadata:
+            for key in ("dispatch_run_id", "run_id"):
+                candidate = _clean(metadata.get(key))
+                if candidate:
+                    return candidate
+
+        dispatch_meta = (
+            payload.get("dispatch_metadata")
+            if isinstance(payload.get("dispatch_metadata"), dict)
+            else None
+        )
+        if dispatch_meta:
+            for key in ("run_id", "dispatch_run_id", "dispatch_token"):
+                candidate = _clean(dispatch_meta.get(key))
+                if candidate:
+                    return candidate
+
+        return None
 
     def _select_draft(
         self,

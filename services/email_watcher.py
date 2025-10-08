@@ -851,8 +851,12 @@ class SESEmailWatcher:
             )
             return False, False, False, False
 
+        execute_supplier_now = not match_filters
+
         try:
-            processed, reason = self._process_message(message)
+            processed, reason = self._process_message(
+                message, execute_supplier=execute_supplier_now
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to process SES message %s", message_id)
             processed, reason = None, "processing_error"
@@ -881,6 +885,12 @@ class SESEmailWatcher:
                     processed_payload["supplier_id"] = record_supplier
                     if isinstance(processed, dict) and processed.get("supplier_id") is None:
                         processed["supplier_id"] = record_supplier
+                if processed_payload.get("dispatch_run_id") in (None, ""):
+                    record_run = dispatch_record.get("run_id") or dispatch_record.get("dispatch_run_id")
+                    if record_run:
+                        processed_payload["dispatch_run_id"] = record_run
+                        if isinstance(processed, dict) and not processed.get("dispatch_run_id"):
+                            processed["dispatch_run_id"] = record_run
             original_rfq = processed_payload.get("rfq_id") if processed_payload else None
             rfq_extracted = (
                 self._normalise_rfq_value(original_rfq) if original_rfq else None
@@ -893,6 +903,63 @@ class SESEmailWatcher:
             if match_filters:
                 self._apply_filter_defaults(processed_payload, match_filters)
                 message_match = self._matches_filters(processed_payload, match_filters)
+                if not message_match:
+                    message_match = self._fallback_match_via_recent_drafts(
+                        processed_payload,
+                        match_filters,
+                    )
+                if (
+                    message_match
+                    and not execute_supplier_now
+                    and reason != "processing_error"
+                ):
+                    try:
+                        processed, reason = self._process_message(
+                            message, execute_supplier=True
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception(
+                            "Failed to finalise supplier processing for %s", message_id
+                        )
+                        processed, reason = None, "processing_error"
+                        message_match = False
+                    else:
+                        if processed:
+                            processed_payload = self._record_processed_payload(
+                                message_id, processed
+                            )
+                            if dispatch_record:
+                                record_rfq = dispatch_record.get("rfq_id")
+                                record_supplier = dispatch_record.get("supplier_id")
+                                if record_rfq and not processed_payload.get("rfq_id"):
+                                    processed_payload["rfq_id"] = record_rfq
+                                    if isinstance(processed, dict) and not processed.get("rfq_id"):
+                                        processed["rfq_id"] = record_rfq
+                                if record_supplier and not processed_payload.get("supplier_id"):
+                                    processed_payload["supplier_id"] = record_supplier
+                                    if isinstance(processed, dict) and not processed.get("supplier_id"):
+                                        processed["supplier_id"] = record_supplier
+                                if processed_payload.get("dispatch_run_id") in (None, ""):
+                                    record_run = dispatch_record.get("run_id") or dispatch_record.get(
+                                        "dispatch_run_id"
+                                    )
+                                    if record_run:
+                                        processed_payload["dispatch_run_id"] = record_run
+                                        if isinstance(processed, dict) and not processed.get(
+                                            "dispatch_run_id"
+                                        ):
+                                            processed["dispatch_run_id"] = record_run
+                            self._apply_filter_defaults(
+                                processed_payload, match_filters
+                            )
+                            message_match = self._matches_filters(
+                                processed_payload, match_filters
+                            )
+                            if not message_match:
+                                message_match = self._fallback_match_via_recent_drafts(
+                                    processed_payload,
+                                    match_filters,
+                                )
             was_processed = True
 
             canonical_key = self._ensure_s3_mapping(s3_key, processed_payload.get("rfq_id"))
@@ -955,7 +1022,12 @@ class SESEmailWatcher:
             if match_source == "unknown" and canonical_rfq_full:
                 match_source = "body"
 
+            existing_match = processed_payload.get("matched_via")
+            if existing_match == "dispatch_fallback":
+                match_source = existing_match
             processed_payload["matched_via"] = match_source
+            if isinstance(processed, dict):
+                processed["matched_via"] = match_source
             processed_payload.setdefault("mailbox", self.mailbox_address)
 
             logger.info(
@@ -1008,7 +1080,11 @@ class SESEmailWatcher:
 
         include_payload = False
         if processed_payload:
-            if not match_filters or matched or (target_rfq_normalised and rfq_match):
+            if match_filters:
+                include_payload = message_match
+            elif target_rfq_normalised and rfq_match:
+                include_payload = True
+            elif not match_filters:
                 include_payload = True
 
         if include_payload and effective_limit != 0:
@@ -1515,7 +1591,12 @@ class SESEmailWatcher:
         except Exception:
             logger.exception("Failed to record processed email %s in registry", key)
 
-    def _process_message(self, message: Dict[str, object]) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    def _process_message(
+        self,
+        message: Dict[str, object],
+        *,
+        execute_supplier: bool = True,
+    ) -> tuple[Optional[Dict[str, object]], Optional[str]]:
         subject = str(message.get("subject", ""))
         body = str(message.get("body", ""))
         subject_normalised = _norm(subject)
@@ -1696,6 +1777,22 @@ class SESEmailWatcher:
         if message.get("_bucket"):
             processed["_bucket"] = message.get("_bucket")
 
+        processed.update(
+            {
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "subject": subject,
+                "from_address": from_address,
+                "message_body": body,
+                "target_price": target_price,
+                "workflow_id": workflow_id,
+                "related_rfq_ids": additional_rfqs,
+            }
+        )
+
+        if not execute_supplier:
+            return processed, None
+
         try:
             get_conn = getattr(self.agent_nick, "get_db_connection", None)
             if callable(get_conn) and rfq_id:
@@ -1823,14 +1920,8 @@ class SESEmailWatcher:
 
         processed.update(
             {
-                "rfq_id": rfq_id,
-                "supplier_id": supplier_id,
-                "subject": subject,
-                "from_address": from_address,
-                "message_body": body,
                 "price": interaction_output.data.get("price"),
                 "lead_time": interaction_output.data.get("lead_time"),
-                "target_price": target_price,
                 "negotiation_triggered": triggered,
                 "supplier_status": interaction_output.status.value,
                 "negotiation_status": negotiation_output.status.value if negotiation_output else None,
@@ -2966,6 +3057,34 @@ class SESEmailWatcher:
             return False
 
         payload_supplier = self._normalise_filter_value(payload.get("supplier_id"))
+        payload_run_id = self._normalise_filter_value(
+            payload.get("dispatch_run_id")
+            or payload.get("run_id")
+            or payload.get("dispatch_token")
+        )
+
+        supplier_filter = self._normalise_filter_value(filters.get("supplier_id"))
+        supplier_like_filter = self._normalise_filter_value(filters.get("supplier_id_like"))
+        run_filter = self._normalise_filter_value(
+            filters.get("dispatch_run_id") or filters.get("run_id")
+        )
+
+        if supplier_filter or supplier_like_filter or run_filter:
+            supplier_matches = False
+            if supplier_filter and payload_supplier:
+                supplier_matches = payload_supplier == supplier_filter
+            elif supplier_like_filter and payload_supplier:
+                supplier_matches = supplier_like_filter in payload_supplier
+
+            if not supplier_matches:
+                return False
+
+            if run_filter:
+                if not payload_run_id or payload_run_id != run_filter:
+                    return False
+
+            return True
+
         payload_subject = self._normalise_filter_value(payload.get("subject")) or ""
         payload_sender = self._normalise_filter_value(payload.get("from_address"))
         payload_sender_email = self._normalise_email(payload.get("from_address"))
@@ -2976,9 +3095,6 @@ class SESEmailWatcher:
             or payload.get("run_id")
             or payload.get("dispatch_token")
         )
-
-        required_supplier = False
-        required_run = False
 
         def _like(actual: Optional[str], expected_like: object) -> bool:
             needle = self._normalise_filter_value(expected_like)
@@ -3007,15 +3123,7 @@ class SESEmailWatcher:
         for key, expected in filters.items():
             if expected in (None, ""):
                 continue
-            if key == "supplier_id":
-                if payload_supplier != self._normalise_filter_value(expected):
-                    return False
-                required_supplier = True
-            elif key == "supplier_id_like":
-                if not _like(payload_supplier, expected):
-                    return False
-                required_supplier = True
-            elif key == "from_address":
+            if key == "from_address":
                 expected_normalised = self._normalise_filter_value(expected)
                 expected_email = self._normalise_email(expected)
                 candidates = [payload_sender, payload_sender_email]
@@ -3052,19 +3160,8 @@ class SESEmailWatcher:
             elif key == "message_id_like":
                 if not _like(payload_message, expected):
                     return False
-            elif key in {"dispatch_run_id", "run_id"}:
-                expected_run = self._normalise_filter_value(expected)
-                if expected_run and payload_run_id != expected_run:
-                    return False
-                if expected_run:
-                    required_run = True
 
-        if required_supplier and payload_supplier is None:
-            return False
-        if required_run and payload_run_id is None:
-            return False
-
-        return required_supplier or required_run or bool(filters)
+        return bool(filters)
 
     @staticmethod
     def _apply_filter_defaults(
@@ -3082,7 +3179,7 @@ class SESEmailWatcher:
             except Exception:
                 return False
 
-        for field in ("supplier_id", "from_address", "workflow_id", "dispatch_run_id", "run_id"):
+        for field in ("from_address", "workflow_id"):
             if field in filters and _should_fill(field):
                 candidate = filters.get(field)
                 if candidate not in (None, ""):
@@ -3182,8 +3279,10 @@ class SESEmailWatcher:
         dispatch_token: Optional[str]
         run_id: Optional[str] = None
         recipients: Tuple[str, ...] = ()
+        supplier_id: Optional[str] = None
         subject_norm: str = field(init=False)
         body_norm: str = field(init=False)
+        supplier_norm: Optional[str] = field(init=False, default=None)
         matched_via: str = field(default="unknown")
 
         def __post_init__(self) -> None:
@@ -3199,6 +3298,13 @@ class SESEmailWatcher:
                     object.__setattr__(self, "run_id", candidate_run)
             object.__setattr__(self, "subject_norm", _norm(self.subject or ""))
             object.__setattr__(self, "body_norm", _norm(cleaned_body))
+            supplier_norm: Optional[str] = None
+            if self.supplier_id:
+                try:
+                    supplier_norm = _norm(str(self.supplier_id)).lower() or None
+                except Exception:
+                    supplier_norm = None
+            object.__setattr__(self, "supplier_norm", supplier_norm)
 
         def normalised_recipients(self) -> Set[str]:
             recipients = set()
@@ -3537,6 +3643,77 @@ class SESEmailWatcher:
                 match.matched_via,
             )
 
+    def _snapshot_from_draft_row(
+        self,
+        row: Sequence[object],
+    ) -> Optional["_DraftSnapshot"]:
+        if not row:
+            return None
+
+        try:
+            draft_id = row[0]
+            rfq_id = row[1]
+            supplier_id = row[2] if len(row) > 2 else None
+            subject = row[3] if len(row) > 3 else ""
+            body = row[4] if len(row) > 4 else ""
+            payload_raw = row[5] if len(row) > 5 else None
+        except Exception:
+            return None
+
+        payload_doc = self._safe_parse_json(payload_raw) if payload_raw else None
+
+        dispatch_token: Optional[str] = None
+        run_id: Optional[str] = None
+        recipients: Tuple[str, ...] = ()
+        if isinstance(payload_doc, dict):
+            dispatch_meta = payload_doc.get("dispatch_metadata")
+            if isinstance(dispatch_meta, dict):
+                dispatch_token = dispatch_meta.get("dispatch_token") or dispatch_meta.get("token")
+                run_id = (
+                    dispatch_meta.get("run_id")
+                    or dispatch_meta.get("dispatch_run_id")
+                    or run_id
+                )
+            meta_field = payload_doc.get("metadata")
+            if isinstance(meta_field, dict):
+                if not dispatch_token:
+                    dispatch_token = meta_field.get("dispatch_token")
+                if run_id is None:
+                    run_id = meta_field.get("run_id")
+            payload_subject = payload_doc.get("subject")
+            payload_body = payload_doc.get("body") or payload_doc.get("negotiation_message")
+            if not subject and isinstance(payload_subject, str):
+                subject = payload_subject
+            if isinstance(payload_body, str) and payload_body.strip():
+                body = payload_body
+            recipients_field = payload_doc.get("recipients")
+            if isinstance(recipients_field, (list, tuple)):
+                recipients = tuple(
+                    str(item).strip()
+                    for item in recipients_field
+                    if isinstance(item, str) and item.strip()
+                )
+
+        if run_id is None and dispatch_token:
+            run_id = dispatch_token
+
+        try:
+            draft_id_int = int(draft_id)
+        except Exception:
+            logger.debug("Ignoring draft with non-numeric id: %r", draft_id)
+            return None
+
+        return self._DraftSnapshot(
+            id=draft_id_int,
+            rfq_id=str(rfq_id) if rfq_id is not None else None,
+            subject=str(subject or ""),
+            body=str(body or ""),
+            dispatch_token=dispatch_token,
+            run_id=run_id,
+            recipients=recipients,
+            supplier_id=str(supplier_id) if supplier_id is not None else None,
+        )
+
     def _fetch_recent_dispatched_drafts(
         self,
         expectation: "_DispatchExpectation",
@@ -3551,7 +3728,7 @@ class SESEmailWatcher:
         if expectation.draft_ids:
             query = (
                 """
-                SELECT id, rfq_id, subject, body, payload
+                SELECT id, rfq_id, supplier_id, subject, body, payload
                 FROM proc.draft_rfq_emails
                 WHERE id = ANY(%s)
                 ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
@@ -3562,7 +3739,7 @@ class SESEmailWatcher:
         else:
             query = (
                 """
-                SELECT id, rfq_id, subject, body, payload
+                SELECT id, rfq_id, supplier_id, subject, body, payload
                 FROM proc.draft_rfq_emails
                 WHERE sent = TRUE
                 ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
@@ -3585,68 +3762,127 @@ class SESEmailWatcher:
 
         snapshots: List[SESEmailWatcher._DraftSnapshot] = []
         for row in rows:
-            if not row:
-                continue
-            draft_id = row[0]
-            rfq_id = row[1]
-            subject = row[2] or ""
-            body = row[3] or ""
-            payload_doc = self._safe_parse_json(row[4]) if len(row) > 4 else None
-
-            dispatch_token: Optional[str] = None
-            run_id: Optional[str] = None
-            recipients: Tuple[str, ...] = ()
-            if isinstance(payload_doc, dict):
-                dispatch_meta = payload_doc.get("dispatch_metadata")
-                if isinstance(dispatch_meta, dict):
-                    dispatch_token = dispatch_meta.get("dispatch_token") or dispatch_meta.get("token")
-                    run_id = (
-                        dispatch_meta.get("run_id")
-                        or dispatch_meta.get("dispatch_run_id")
-                        or run_id
-                    )
-                meta_field = payload_doc.get("metadata")
-                if isinstance(meta_field, dict):
-                    if not dispatch_token:
-                        dispatch_token = meta_field.get("dispatch_token")
-                    if run_id is None:
-                        run_id = meta_field.get("run_id")
-                payload_subject = payload_doc.get("subject")
-                payload_body = payload_doc.get("body") or payload_doc.get("negotiation_message")
-                if not subject and isinstance(payload_subject, str):
-                    subject = payload_subject
-                if isinstance(payload_body, str) and payload_body.strip():
-                    body = payload_body
-                recipients_field = payload_doc.get("recipients")
-                if isinstance(recipients_field, (list, tuple)):
-                    recipients = tuple(
-                        str(item).strip()
-                        for item in recipients_field
-                        if isinstance(item, str) and item.strip()
-                    )
-
-            if run_id is None and dispatch_token:
-                run_id = dispatch_token
-
-            try:
-                draft_id_int = int(draft_id)
-            except Exception:
-                logger.debug("Ignoring draft with non-numeric id: %r", draft_id)
-                continue
-
-            snapshots.append(
-                self._DraftSnapshot(
-                    id=draft_id_int,
-                    rfq_id=str(rfq_id) if rfq_id is not None else None,
-                    subject=str(subject),
-                    body=str(body),
-                    dispatch_token=dispatch_token,
-                    run_id=run_id,
-                    recipients=recipients,
-                )
-            )
+            snapshot = self._snapshot_from_draft_row(row)
+            if snapshot is not None:
+                snapshots.append(snapshot)
 
         return snapshots
+
+    def _load_recent_drafts_for_fallback(
+        self,
+        supplier_filter: Optional[str],
+        *,
+        limit: int = 10,
+    ) -> List["_DraftSnapshot"]:
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            return []
+
+        supplier_clause = ""
+        params: Tuple[object, ...]
+        if supplier_filter:
+            supplier_clause = " AND LOWER(supplier_id) = %s"
+            params = (supplier_filter, limit)
+        else:
+            params = (limit,)
+
+        query = (
+            """
+            SELECT id, rfq_id, supplier_id, subject, body, payload
+            FROM proc.draft_rfq_emails
+            WHERE sent = TRUE
+            {supplier_condition}
+            ORDER BY COALESCE(sent_on, updated_on) DESC, updated_on DESC, created_on DESC
+            LIMIT %s
+            """
+        ).format(supplier_condition=supplier_clause)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    rows = cur.fetchall() or []
+        except Exception:
+            logger.exception(
+                "Failed to load recent draft rows for fallback supplier match (supplier=%s)",
+                supplier_filter,
+            )
+            return []
+
+        snapshots: List[SESEmailWatcher._DraftSnapshot] = []
+        for row in rows:
+            snapshot = self._snapshot_from_draft_row(row)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+
+        return snapshots
+
+    def _fallback_match_via_recent_drafts(
+        self,
+        processed_payload: Dict[str, object],
+        filters: Dict[str, object],
+    ) -> bool:
+        if not processed_payload or not filters:
+            return False
+
+        supplier_filter = self._normalise_filter_value(filters.get("supplier_id"))
+        supplier_like_filter = self._normalise_filter_value(filters.get("supplier_id_like"))
+        if not supplier_filter and not supplier_like_filter:
+            return False
+
+        run_filter = self._normalise_filter_value(
+            filters.get("dispatch_run_id") or filters.get("run_id")
+        )
+
+        drafts = self._load_recent_drafts_for_fallback(supplier_filter, limit=10)
+        if not drafts:
+            return False
+
+        candidates: List[SESEmailWatcher._DraftSnapshot] = []
+        for draft in drafts:
+            if supplier_filter:
+                if not draft.supplier_norm or draft.supplier_norm != supplier_filter:
+                    continue
+            elif supplier_like_filter:
+                if not draft.supplier_norm or supplier_like_filter not in draft.supplier_norm:
+                    continue
+            if run_filter:
+                candidate_run = self._normalise_filter_value(
+                    draft.run_id or draft.dispatch_token
+                )
+                if candidate_run != run_filter:
+                    continue
+            candidates.append(draft)
+
+        if not candidates:
+            return False
+
+        match = self._match_dispatched_message(processed_payload, candidates)
+        if match is None:
+            if run_filter:
+                for draft in candidates:
+                    candidate_run = self._normalise_filter_value(
+                        draft.run_id or draft.dispatch_token
+                    )
+                    if candidate_run and candidate_run == run_filter:
+                        match = draft
+                        break
+
+        if match is None:
+            return False
+
+        if match.rfq_id and not processed_payload.get("rfq_id"):
+            processed_payload["rfq_id"] = match.rfq_id
+        if match.supplier_id and not processed_payload.get("supplier_id"):
+            processed_payload["supplier_id"] = match.supplier_id
+        if not processed_payload.get("dispatch_run_id"):
+            run_value = match.run_id or match.dispatch_token
+            if run_value:
+                processed_payload["dispatch_run_id"] = run_value
+
+        processed_payload["matched_via"] = "dispatch_fallback"
+
+        return True
 
     def _match_dispatched_message(
         self,
