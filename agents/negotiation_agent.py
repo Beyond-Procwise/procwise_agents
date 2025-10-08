@@ -63,6 +63,14 @@ TRADE_OFF_HINTS = {
 PLAYBOOK_PATH = Path(__file__).resolve().parent.parent / "resources" / "reference_data" / "negotiation_playbook.json"
 
 
+def _coerce_positive_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
 def compute_decision(
     payload: Dict[str, Any],
     supplier_message_text: str = "",
@@ -82,7 +90,7 @@ def compute_decision(
 
     current_offer = float(payload["current_offer"])
     target_price = float(payload["target_price"])
-    round_idx = int(payload.get("round", 1))
+    round_idx = _coerce_positive_int(payload.get("round"), 1)
 
     ctx = NegotiationContext(
         current_offer=current_offer,
@@ -96,7 +104,7 @@ def compute_decision(
         min_abs_buffer=3.0,
         step_pct_of_gap=0.12,
         min_abs_step=4.0,
-        max_rounds=int(payload.get("max_rounds", 3)),
+        max_rounds=_coerce_positive_int(payload.get("max_rounds"), 3),
         walkaway_price=walkaway,
         ask_early_pay_disc=ask_disc,
         ask_lead_time_keep=bool(payload.get("ask_lead_time_keep", True)),
