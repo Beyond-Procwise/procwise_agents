@@ -27,6 +27,12 @@ import textwrap
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from utils.procurement_schema import (
+    DOC_TYPE_TO_TABLE,
+    PROCUREMENT_SCHEMAS,
+    extract_structured_content,
+)
+
 try:  # Optional dependency – only required for PDF handling in tests.
     import pdfplumber  # type: ignore
 except Exception:  # pragma: no cover - optional dependency is best-effort
@@ -141,6 +147,78 @@ PROCUREMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
     },
 }
 
+CANONICAL_HEADER_KEYS: set[str] = set()
+for structure in PROCUREMENT_STRUCTURE.values():
+    CANONICAL_HEADER_KEYS.update(structure.get("header_fields", []))
+
+
+def _normalise_schema_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", label.lower())
+
+
+SCHEMA_CANONICAL_OVERRIDES = {
+    "unit_of_measue": "unit_of_measure",
+    "supplier_id": "supplier_name",
+}
+
+
+def _build_schema_lookup() -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    header_lookup: Dict[str, Dict[str, str]] = {}
+    line_lookup: Dict[str, Dict[str, str]] = {}
+
+    for document_type, (header_table, line_table) in DOC_TYPE_TO_TABLE.items():
+        canonical_headers = set(
+            PROCUREMENT_STRUCTURE.get(document_type, {}).get("header_fields", [])
+        )
+        canonical_lines = set(
+            PROCUREMENT_STRUCTURE.get(document_type, {}).get("line_item_fields", [])
+        )
+
+        header_lookup[document_type] = {}
+        line_lookup[document_type] = {}
+
+        if header_table:
+            schema = PROCUREMENT_SCHEMAS.get(header_table)
+            if schema:
+                for column in schema.columns:
+                    mapped = SCHEMA_CANONICAL_OVERRIDES.get(column, column)
+                    if canonical_headers and mapped not in canonical_headers:
+                        continue
+                    header_lookup[document_type][_normalise_schema_label(column)] = mapped
+                    for synonym in schema.synonyms.get(column, []):
+                        header_lookup[document_type][
+                            _normalise_schema_label(synonym)
+                        ] = mapped
+
+        if line_table:
+            schema = PROCUREMENT_SCHEMAS.get(line_table)
+            if schema:
+                for column in schema.columns:
+                    mapped = SCHEMA_CANONICAL_OVERRIDES.get(column, column)
+                    if canonical_lines and mapped not in canonical_lines:
+                        continue
+                    line_lookup[document_type][_normalise_schema_label(column)] = mapped
+                    for synonym in schema.synonyms.get(column, []):
+                        line_lookup[document_type][
+                            _normalise_schema_label(synonym)
+                        ] = mapped
+
+    # Provide a fallback scope with all known keys for cases where the
+    # document type has not yet been detected when performing lookups.
+    aggregated_headers: Dict[str, str] = {}
+    aggregated_lines: Dict[str, str] = {}
+    for lookup in header_lookup.values():
+        aggregated_headers.update(lookup)
+    for lookup in line_lookup.values():
+        aggregated_lines.update(lookup)
+    header_lookup["*"] = aggregated_headers
+    line_lookup["*"] = aggregated_lines
+
+    return header_lookup, line_lookup
+
+
+SCHEMA_HEADER_LOOKUP, SCHEMA_LINE_LOOKUP = _build_schema_lookup()
+
 HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
     "*": {
         "supplier_name": [("supplier",), ("vendor",), ("seller",), ("payee",)],
@@ -151,7 +229,12 @@ HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
         "tax_percent": [("tax", "percent"), ("tax", "rate")],
     },
     "Invoice": {
-        "invoice_id": [("invoice", "number"), ("invoice", "no"), ("invoice", "#")],
+        "invoice_id": [
+            ("invoice", "number"),
+            ("invoice", "no"),
+            ("invoice", "#"),
+            ("bill", "number"),
+        ],
         "invoice_date": [("invoice", "date")],
         "due_date": [("due", "date")],
         "invoice_paid_date": [("paid", "date"), ("payment", "date")],
@@ -161,6 +244,7 @@ HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
             ("total", "due"),
             ("total", "invoice"),
             ("total", "amount"),
+            ("grand", "total"),
         ],
         "invoice_amount": [("invoice", "amount"), ("amount", "due"), ("amount", "payable")],
         "po_id": [
@@ -171,17 +255,42 @@ HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
         ],
     },
     "Purchase_Order": {
-        "po_id": [("purchase", "order", "number"), ("purchase", "order", "no"), ("po", "number"), ("po", "#")],
+        "po_id": [
+            ("purchase", "order", "number"),
+            ("purchase", "order", "no"),
+            ("po", "number"),
+            ("po", "#"),
+            ("po", "reference"),
+        ],
         "order_date": [("order", "date")],
         "requested_date": [("requested", "date")],
         "expected_delivery_date": [("delivery", "date"), ("expected", "delivery")],
         "total_amount": [("total", "amount"), ("order", "total")],
     },
     "Contract": {
-        "contract_id": [("contract", "number"), ("contract", "no"), ("contract", "#")],
-        "contract_title": [("contract", "title"), ("title", "contract")],
-        "contract_start_date": [("start", "date"), ("commencement", "date")],
-        "contract_end_date": [("end", "date"), ("expiry", "date"), ("expiration", "date")],
+        "contract_id": [
+            ("contract", "number"),
+            ("contract", "no"),
+            ("contract", "#"),
+            ("contract", "ref"),
+            ("contract", "reference"),
+        ],
+        "contract_title": [
+            ("contract", "title"),
+            ("title", "contract"),
+            ("agreement", "title"),
+            ("agreement", "name"),
+        ],
+        "contract_start_date": [
+            ("start", "date"),
+            ("commencement", "date"),
+            ("effective", "date"),
+        ],
+        "contract_end_date": [
+            ("end", "date"),
+            ("expiry", "date"),
+            ("expiration", "date"),
+        ],
         "total_contract_value": [("total", "value"), ("contract", "value")],
     },
     "Quote": {
@@ -201,7 +310,12 @@ LINE_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
             ("service",),
         ],
         "quantity": [("qty",), ("quantity",), ("units",), ("unit", "qty")],
-        "unit_price": [("unit", "price"), ("price", "unit"), ("unit", "cost")],
+        "unit_price": [
+            ("unit", "price"),
+            ("price", "unit"),
+            ("unit", "cost"),
+            ("unit", "rate"),
+        ],
         "line_amount": [("line", "total"), ("line", "amount"), ("amount",), ("total",)],
         "unit_of_measure": [("uom",), ("unit", "measure"), ("measure",)],
     },
@@ -455,6 +569,9 @@ class DocumentExtractor:
         line_items, derived_tables = self._extract_line_items_from_text(
             text, detected_type
         )
+        header, line_items = self._apply_schema_guidance(
+            text, detected_type, header, line_items
+        )
         field_hints = self._build_field_hints(
             detected_type,
             header,
@@ -477,7 +594,9 @@ class DocumentExtractor:
             llm_line_items = self._normalise_llm_line_items(
                 llm_payload.get("line_items"), detected_type
             )
-            line_items = self._merge_line_items(line_items, llm_line_items)
+            line_items = self._merge_line_items(
+                line_items, llm_line_items, document_type=detected_type
+            )
             derived_tables.extend(
                 self._normalise_llm_tables(llm_payload.get("tables"), detected_type)
             )
@@ -701,7 +820,7 @@ class DocumentExtractor:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         header: Dict[str, Any] = {}
 
-        for key, value in self._candidate_header_pairs(lines):
+        for key, value in self._candidate_header_pairs(lines, document_type):
             canonical_key = self._normalise_header_key(key, document_type)
             if not canonical_key:
                 continue
@@ -716,11 +835,15 @@ class DocumentExtractor:
         self._standardise_header_values(header)
         return header
 
-    def _candidate_header_pairs(self, lines: List[str]) -> List[Tuple[str, str]]:
+    def _candidate_header_pairs(
+        self, lines: List[str], document_type: str
+    ) -> List[Tuple[str, str]]:
         pairs: List[Tuple[str, str]] = []
-        for raw_line in lines:
-            line = raw_line.strip()
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx]
             if not line:
+                idx += 1
                 continue
 
             if ":" in line:
@@ -729,6 +852,7 @@ class DocumentExtractor:
                 value = value.strip()
                 if key and value:
                     pairs.append((key, value))
+                    idx += 1
                     continue
 
             dash_match = re.match(
@@ -737,6 +861,7 @@ class DocumentExtractor:
             )
             if dash_match:
                 pairs.append((dash_match.group("key"), dash_match.group("value")))
+                idx += 1
                 continue
 
             hash_match = re.match(
@@ -745,8 +870,77 @@ class DocumentExtractor:
             )
             if hash_match:
                 pairs.append((hash_match.group("key"), hash_match.group("value")))
+                idx += 1
+                continue
+
+            # Support vertically stacked key/value pairs such as::
+            #   Invoice Number
+            #   INV-1001
+            normalized_key = self._normalise_header_key(line, document_type)
+            if normalized_key and not self._is_line_item_key(normalized_key):
+                next_index = idx + 1
+                if next_index < len(lines):
+                    candidate_value = lines[next_index]
+                    if self._is_probable_multiline_value(
+                        candidate_value, document_type
+                    ):
+                        pairs.append((line, candidate_value))
+                        idx += 2
+                        continue
+
+            idx += 1
 
         return pairs
+
+    def _is_line_item_key(self, key: str) -> bool:
+        return key in {
+            "item_description",
+            "quantity",
+            "unit_price",
+            "line_total",
+            "line_amount",
+            "unit_of_measure",
+            "tax_percent",
+            "tax_amount",
+        }
+
+    def _is_probable_multiline_value(self, line: str, document_type: str) -> bool:
+        if not line:
+            return False
+        if self._looks_like_table_header(line):
+            return False
+        if self._is_probable_table_row(line):
+            return False
+        if ":" in line or re.search(r"\s+-\s+", line):
+            return False
+        normalized = self._normalise_header_key(line, document_type)
+        if normalized and (
+            normalized in CANONICAL_HEADER_KEYS or not self._looks_like_identifier_value(line)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _looks_like_identifier_value(line: str) -> bool:
+        if not line:
+            return False
+        stripped = line.strip()
+        if len(stripped) > 40:
+            return False
+        if re.search(r"\s{2,}", stripped):
+            return False
+        if re.match(r"^[A-Za-z0-9._\-_/]+$", stripped):
+            return True
+        return bool(re.match(r"^[A-Za-z][A-Za-z0-9 .&/-]*$", stripped))
+
+    def _is_probable_table_row(self, line: str) -> bool:
+        if not line:
+            return False
+        if "|" in line:
+            return True
+        if re.search(r"\s{2,}\S+\s{2,}", line):
+            return True
+        return False
 
     def _extract_line_items_from_text(
         self, text: str, document_type: str
@@ -779,6 +973,18 @@ class DocumentExtractor:
                     for token in re.split(r"\s{2,}", row_line.strip())
                     if token.strip()
                 ]
+                if (
+                    header_tokens
+                    and header_tokens[0] == "item_description"
+                    and tokens
+                    and len(tokens) < len(header_tokens)
+                ):
+                    match = re.match(r"^(.*?)(\b\d+(?:[.,]\d+)?)$", tokens[0])
+                    if match:
+                        description = match.group(1).strip()
+                        quantity_token = match.group(2).replace(",", "")
+                        if description:
+                            tokens = [description, quantity_token] + tokens[1:]
                 if len(tokens) < 2:
                     if rows:
                         break
@@ -804,7 +1010,12 @@ class DocumentExtractor:
     def _looks_like_table_header(line: str) -> bool:
         lowered = line.lower()
         return (
-            "description" in lowered
+            (
+                "description" in lowered
+                or "item" in lowered
+                or "service" in lowered
+                or "product" in lowered
+            )
             and (
                 "qty" in lowered
                 or "quantity" in lowered
@@ -837,6 +1048,12 @@ class DocumentExtractor:
                 for pattern in patterns:
                     if matches(pattern):
                         return canonical
+
+        for scope in filter(None, (document_type, "*")):
+            lookup = SCHEMA_LINE_LOOKUP.get(scope, {})
+            mapped = lookup.get(_normalise_schema_label(label))
+            if mapped:
+                return mapped
 
         base_key = re.sub(r"[^a-z0-9]+", "_", cleaned)
         base_key = re.sub(r"_+", "_", base_key).strip("_")
@@ -874,6 +1091,12 @@ class DocumentExtractor:
                 for pattern in patterns:
                     if matches(pattern):
                         return canonical
+
+        for scope in filter(None, (document_type, "*")):
+            lookup = SCHEMA_HEADER_LOOKUP.get(scope, {})
+            mapped = lookup.get(_normalise_schema_label(key))
+            if mapped:
+                return mapped
 
         if "invoice" in token_set and not ("date" in token_set or "total" in token_set or "amount" in token_set):
             return "invoice_id"
@@ -959,6 +1182,40 @@ class DocumentExtractor:
         }
         return mapping.get(normalised)
 
+    def _apply_schema_guidance(
+        self,
+        text: str,
+        document_type: str,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        if document_type not in DOC_TYPE_TO_TABLE:
+            return header, line_items
+
+        try:
+            payload = extract_structured_content(text, document_type)
+        except Exception:
+            logger.debug(
+                "Schema-guided extraction failed for document type %s", document_type,
+                exc_info=True,
+            )
+            return header, line_items
+
+        schema_header = (
+            payload.get("header") if isinstance(payload, dict) else None
+        ) or {}
+        schema_lines = (
+            payload.get("line_items") if isinstance(payload, dict) else None
+        ) or []
+
+        merged_header = self._merge_header_fields(
+            header, schema_header, document_type
+        )
+        merged_lines = self._merge_line_items(
+            line_items, schema_lines, document_type=document_type
+        )
+        return merged_header, merged_lines
+
     def _merge_header_fields(
         self,
         base_header: Dict[str, Any],
@@ -972,6 +1229,22 @@ class DocumentExtractor:
         for key, value in llm_header.items():
             normalized_key = self._normalise_header_key(str(key), document_type)
             if not normalized_key:
+                continue
+            canonical_fields = []
+            if document_type:
+                canonical_fields = PROCUREMENT_STRUCTURE.get(document_type, {}).get(
+                    "header_fields", []
+                )
+            if (
+                canonical_fields
+                and normalized_key not in canonical_fields
+                and normalized_key not in base_header
+            ):
+                continue
+            if (
+                normalized_key not in CANONICAL_HEADER_KEYS
+                and normalized_key not in base_header
+            ):
                 continue
             cleaned_value = self._clean_cell(value)
             if not cleaned_value:
@@ -989,12 +1262,7 @@ class DocumentExtractor:
         normalised: List[Dict[str, Any]] = []
         for item in items:
             if isinstance(item, dict):
-                row: Dict[str, Any] = {}
-                for key, value in item.items():
-                    normalized_key = self._normalise_line_header(str(key), document_type)
-                    if not normalized_key:
-                        continue
-                    row[normalized_key] = self._clean_cell(value)
+                row = self._normalise_line_item(item, document_type)
                 if row:
                     normalised.append(row)
             elif isinstance(item, list):
@@ -1004,25 +1272,68 @@ class DocumentExtractor:
     def _merge_line_items(
         self,
         base_items: List[Dict[str, Any]],
-        llm_items: List[Dict[str, Any]],
+        additional_items: List[Dict[str, Any]],
+        *,
+        document_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        if not base_items and not additional_items:
+            return []
         if not base_items:
-            return [dict(item) for item in llm_items]
-        if not llm_items:
-            return base_items
+            return [
+                item
+                for item in (
+                    self._normalise_line_item(row, document_type)
+                    for row in additional_items
+                )
+                if item
+            ]
+        if not additional_items:
+            return [dict(item) for item in base_items]
 
         merged = [dict(item) for item in base_items]
-        seen = {
-            tuple(sorted((key, str(value)) for key, value in item.items()))
-            for item in merged
-        }
-        for item in llm_items:
-            signature = tuple(sorted((key, str(value)) for key, value in item.items()))
+
+        def _signature(row: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+            return tuple(
+                sorted((key, str(value)) for key, value in row.items() if value is not None)
+            )
+
+        seen = {_signature(self._normalise_line_item(item, document_type)) for item in merged}
+        description_index: Dict[str, int] = {}
+        for idx, item in enumerate(merged):
+            description = self._clean_cell(item.get("item_description", "")).lower()
+            if description:
+                description_index.setdefault(description, idx)
+        for item in additional_items:
+            normalised = self._normalise_line_item(item, document_type)
+            if not normalised:
+                continue
+            signature = _signature(normalised)
             if signature in seen:
                 continue
-            merged.append(dict(item))
+            description = self._clean_cell(normalised.get("item_description", "")).lower()
+            if description and description in description_index:
+                target = merged[description_index[description]]
+                for key, value in normalised.items():
+                    if value and (key not in target or not target[key]):
+                        target[key] = value
+                seen.add(signature)
+                continue
+            merged.append(normalised)
+            if description:
+                description_index.setdefault(description, len(merged) - 1)
             seen.add(signature)
         return merged
+
+    def _normalise_line_item(
+        self, item: Dict[str, Any], document_type: Optional[str]
+    ) -> Dict[str, Any]:
+        normalised: Dict[str, Any] = {}
+        for key, value in item.items():
+            canonical = self._normalise_line_header(str(key), document_type or "*")
+            if not canonical:
+                continue
+            normalised[canonical] = self._clean_cell(value)
+        return normalised
 
     def _normalise_llm_tables(
         self, tables: Any, document_type: str
