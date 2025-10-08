@@ -901,7 +901,7 @@ def test_imap_primary_prefers_imap_over_s3(monkeypatch):
     assert watcher._last_candidate_source == "imap"
 
 
-def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
+def test_imap_does_not_use_s3_when_imap_empty(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
     nick.settings.imap_user = "inbound@example.com"
@@ -944,10 +944,9 @@ def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
 
     batch = watcher.poll_once(limit=1)
     assert counters["imap"] == 2
-    assert counters["s3"] == 1
-    assert batch
-    assert batch[0]["message_id"].startswith("s3-msg-")
-    assert watcher._last_candidate_source == "s3"
+    assert counters["s3"] == 0
+    assert batch == []
+    assert watcher._last_candidate_source == "imap"
 
 
 def test_imap_loader_records_processed_email(monkeypatch):
@@ -1016,7 +1015,7 @@ def test_imap_loader_records_processed_email(monkeypatch):
     assert key.startswith("imap/")
 
 
-def test_imap_fallback_can_be_disabled(monkeypatch):
+def test_imap_never_invokes_s3_even_when_configured(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
     nick.settings.imap_user = "inbound@example.com"
@@ -1717,75 +1716,30 @@ def test_wait_for_dispatch_completion_adds_post_dispatch_delay(monkeypatch):
     assert sleep_calls and sleep_calls[-1] == pytest.approx(3.0)
 
 
-def test_s3_poll_prioritises_newest_objects(monkeypatch):
+def test_poll_once_skips_s3_polling_even_when_configured(monkeypatch):
     nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
     watcher = _make_watcher(nick)
     watcher.bucket = "procwisemvp"
     watcher._prefixes = ["emails/"]
     watcher.poll_interval_seconds = 0
 
-    now = datetime.now(timezone.utc)
-    s3_objects = [
-        {"Key": "emails/newest.eml", "LastModified": now},
-        {"Key": "emails/matching.eml", "LastModified": now - timedelta(seconds=30)},
-        {"Key": "emails/older.eml", "LastModified": now - timedelta(minutes=5)},
-    ]
+    def _fake_imap(self, limit, *, mark_seen, on_message=None):
+        return []
 
-    raw_non_match = b"Subject: General update\nFrom: supplier@example.com\n\nNo RFQ reference here."
-    raw_match = (
-        b"Subject: Re: RFQ-20240101-abcd1234\n"
-        b"From: supplier@example.com\n"
-        b"Message-ID: <matching@example.com>\n\n"
-        b"Quoted price 950"
-    )
-    raw_older = b"Subject: Re: RFQ-20231231-deadbeef\nFrom: supplier@example.com\n\nSome other offer"
+    def _unexpected_s3_call():  # pragma: no cover - defensive guard
+        raise AssertionError("S3 client should not be requested when IMAP is available")
 
-    object_store = {
-        "emails/newest.eml": raw_non_match,
-        "emails/matching.eml": raw_match,
-        "emails/older.eml": raw_older,
-    }
-
-    class DummyBody:
-        def __init__(self, data: bytes) -> None:
-            self._buffer = io.BytesIO(data)
-
-        def read(self) -> bytes:
-            return self._buffer.getvalue()
-
-    expected_ingest_prefix = watcher._ensure_trailing_slash(
-        "emails/RFQ-20240101-ABCD1234/ingest"
-    )
-
-    class DummyPaginator:
-        def paginate(self, *, Bucket, Prefix):
-            assert Bucket == watcher.bucket
-            if Prefix == expected_ingest_prefix:
-                return [{"Contents": []}]
-            assert Prefix == watcher._prefixes[0]
-            return [{"Contents": list(s3_objects)}]
-
-    requested_keys: List[str] = []
-
-    class DummyClient:
-        def get_paginator(self, name):
-            assert name == "list_objects_v2"
-            return DummyPaginator()
-
-        def get_object(self, *, Bucket, Key):
-            assert Bucket == watcher.bucket
-            requested_keys.append(Key)
-            return {"Body": DummyBody(object_store[Key])}
-
-    monkeypatch.setattr(watcher, "_get_s3_client", lambda: DummyClient())
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _fake_imap, raising=False)
+    monkeypatch.setattr(watcher, "_get_s3_client", _unexpected_s3_call)
 
     results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
-    assert len(results) == 1
-    assert results[0]["message_id"] in {"emails/matching.eml", "<matching@example.com>"}
-    assert requested_keys == ["emails/newest.eml", "emails/matching.eml"]
-    assert watcher._last_watermark_key == "emails/newest.eml"
-    assert watcher._last_watermark_ts is not None
+    assert results == []
+    assert watcher._last_candidate_source == "imap"
 
 
 def test_scan_recent_objects_includes_backlog_without_watermark():

@@ -565,7 +565,7 @@ class SESEmailWatcher:
                         }
                     )
                     logger.info(
-                        "RFQ %s matched via index at %s — skipping S3 scan for mailbox %s",
+                        "RFQ %s matched via index at %s — skipping mailbox poll for %s",
                         target_rfq_normalised,
                         hit["processed_at"],
                         self.mailbox_address,
@@ -573,8 +573,8 @@ class SESEmailWatcher:
                     return results
 
         logger.info(
-            "Scanning %s for new supplier responses (limit=%s)",
-            self._format_bucket_prefixes(),
+            "Polling IMAP mailbox %s for new supplier responses (limit=%s)",
+            self.mailbox_address or "<unknown>",
             limit if limit is not None else "unbounded",
         )
 
@@ -3239,73 +3239,30 @@ class SESEmailWatcher:
             effective_limit = None
 
         messages: List[Dict[str, object]] = []
-        attempted_imap = False
         self._last_candidate_source = "none"
 
-        fallback_enabled = self._imap_fallback_attempts != 0
-        fallback_threshold = max(self._imap_fallback_attempts, 1)
-        should_attempt_s3 = False
-
-        if self._imap_configured():
-            attempted_imap = True
-            messages = self._load_from_imap(
-                effective_limit,
-                mark_seen=bool(mark_seen),
-                on_message=on_message,
-            )
-            if messages:
-                self._last_candidate_source = "imap"
-                self._consecutive_empty_imap_batches = 0
-                return messages
-
-            self._consecutive_empty_imap_batches += 1
-            self._last_candidate_source = "imap"
-
-            if self.bucket:
-                if fallback_enabled and self._consecutive_empty_imap_batches >= fallback_threshold:
-                    if self._consecutive_empty_imap_batches == fallback_threshold:
-                        logger.info(
-                            "No IMAP messages after %d poll(s); falling back to S3 for mailbox %s",
-                            self._consecutive_empty_imap_batches,
-                            self.mailbox_address,
-                        )
-                    should_attempt_s3 = True
-                else:
-                    if self._consecutive_empty_imap_batches == 1:
-                        if fallback_enabled:
-                            logger.info(
-                                "IMAP poll yielded no messages for mailbox %s; deferring S3 fallback until %d consecutive empty poll(s) are observed",
-                                self.mailbox_address,
-                                fallback_threshold,
-                            )
-                        else:
-                            logger.info(
-                                "IMAP poll yielded no messages for mailbox %s; S3 fallback disabled by configuration",
-                                self.mailbox_address,
-                            )
-        else:
+        if not self._imap_configured():
             self._consecutive_empty_imap_batches = 0
             if self.bucket:
-                should_attempt_s3 = True
+                logger.info(
+                    "Skipping S3 poll for mailbox %s because IMAP is not configured",
+                    self.mailbox_address,
+                )
+            return messages
 
-        if should_attempt_s3 and self.bucket:
-            messages = self._load_from_s3(
-                effective_limit,
-                prefixes=prefixes,
-                on_message=on_message,
-            )
-            self._last_candidate_source = "s3"
-            if messages:
-                self._consecutive_empty_imap_batches = 0
-                return messages
-        elif not self.bucket:
-            logger.warning(
-                "S3 bucket not configured; skipping direct poll for mailbox %s",
-                self.mailbox_address,
-            )
+        messages = self._load_from_imap(
+            effective_limit,
+            mark_seen=bool(mark_seen),
+            on_message=on_message,
+        )
 
-        if not attempted_imap:
+        self._last_candidate_source = "imap"
+
+        if messages:
             self._consecutive_empty_imap_batches = 0
+            return messages
+
+        self._consecutive_empty_imap_batches += 1
 
         return messages
 
