@@ -3325,33 +3325,19 @@ class SESEmailWatcher:
         str,
         Optional[int],
     ]:
-        host = (
-            getattr(self.settings, "imap_host", None)
-            or getattr(self.settings, "ses_smtp_endpoint", None)
-            or os.getenv("SES_SMTP_ENDPOINT")
-            or "email-smtp.eu-west-1.amazonaws.com"
-        )
-        user = (
-            getattr(self.settings, "imap_user", None)
-            or getattr(self.settings, "ses_user_name", None)
-            or os.getenv("SES_USER_NAME")
-            or "supplierconnect"
-        )
+        host = getattr(self.settings, "imap_host", None) or os.getenv("IMAP_HOST")
+        user = getattr(self.settings, "imap_user", None) or os.getenv("IMAP_USER")
         password = (
             getattr(self.settings, "imap_password", None)
-            or getattr(self.settings, "ses_user_password", None)
-            or os.getenv("SES_USER_PASSWORD")
-            or "SConnect12$"
+            or os.getenv("IMAP_PASSWORD")
         )
         mailbox = getattr(self.settings, "imap_mailbox", "INBOX") or "INBOX"
         search_criteria = getattr(self.settings, "imap_search_criteria", "ALL") or "ALL"
         port_value = getattr(self.settings, "imap_port", None)
         if port_value in (None, ""):
-            port_value = (
-                getattr(self.settings, "ses_smtp_port", None)
-                or os.getenv("SES_SMTP_PORT")
-                or "587"
-            )
+            port_value = os.getenv("IMAP_PORT")
+        if port_value in (None, "") and host:
+            port_value = "993"
         port = self._coerce_int_value(port_value) if port_value not in (None, "") else None
         return host, user, password, mailbox, search_criteria, port
 
