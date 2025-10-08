@@ -1135,6 +1135,64 @@ def test_email_watcher_matches_mixed_case_workflow_filters(monkeypatch):
     assert canonical_rfq in watcher._workflow_rfq_index.get(workflow_key, set())
 
 
+def test_email_watcher_collects_all_workflow_responses(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-workflow-1",
+            "subject": "Re: RFQ-20240101-aaaa1111",
+            "body": "Offer 900",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240101-AAAA1111",
+            "supplier_id": "SUP-001",
+        },
+        {
+            "id": "msg-workflow-2",
+            "subject": "Re: RFQ-20240101-bbbb2222",
+            "body": "Offer 880",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240101-BBBB2222",
+            "supplier_id": "SUP-002",
+        },
+        {
+            "id": "msg-workflow-3",
+            "subject": "Re: RFQ-20240101-cccc3333",
+            "body": "Offer 910",
+            "from": "supplier3@example.com",
+            "rfq_id": "RFQ-20240101-CCCC3333",
+            "supplier_id": "SUP-003",
+        },
+    ]
+
+    watcher = _make_watcher(
+        nick, loader=lambda limit=None: list(messages), state_store=state
+    )
+
+    metadata_map = {
+        msg["rfq_id"]: {
+            "workflow_id": "WF-Group-01",
+            "target_price": 1000,
+        }
+        for msg in messages
+    }
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_metadata",
+        lambda rfq: dict(metadata_map.get(rfq, {})),
+    )
+
+    results = watcher.poll_once(match_filters={"workflow_id": "WF-Group-01"})
+
+    assert len(results) == 3
+    suppliers = {result["supplier_id"] for result in results}
+    assert suppliers == {"SUP-001", "SUP-002", "SUP-003"}
+    for message in messages:
+        assert message["id"] in state
+
+
 def test_email_watcher_filter_matches_legacy_payload_without_workflow():
     nick = DummyNick()
     watcher = _make_watcher(nick)
