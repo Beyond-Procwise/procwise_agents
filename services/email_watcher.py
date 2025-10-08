@@ -3242,6 +3242,10 @@ class SESEmailWatcher:
         attempted_imap = False
         self._last_candidate_source = "none"
 
+        fallback_enabled = self._imap_fallback_attempts != 0
+        fallback_threshold = max(self._imap_fallback_attempts, 1)
+        should_attempt_s3 = False
+
         if self._imap_configured():
             attempted_imap = True
             messages = self._load_from_imap(
@@ -3253,27 +3257,38 @@ class SESEmailWatcher:
                 self._last_candidate_source = "imap"
                 self._consecutive_empty_imap_batches = 0
                 return messages
+
             self._consecutive_empty_imap_batches += 1
+            self._last_candidate_source = "imap"
+
+            if self.bucket:
+                if fallback_enabled and self._consecutive_empty_imap_batches >= fallback_threshold:
+                    if self._consecutive_empty_imap_batches == fallback_threshold:
+                        logger.info(
+                            "No IMAP messages after %d poll(s); falling back to S3 for mailbox %s",
+                            self._consecutive_empty_imap_batches,
+                            self.mailbox_address,
+                        )
+                    should_attempt_s3 = True
+                else:
+                    if self._consecutive_empty_imap_batches == 1:
+                        if fallback_enabled:
+                            logger.info(
+                                "IMAP poll yielded no messages for mailbox %s; deferring S3 fallback until %d consecutive empty poll(s) are observed",
+                                self.mailbox_address,
+                                fallback_threshold,
+                            )
+                        else:
+                            logger.info(
+                                "IMAP poll yielded no messages for mailbox %s; S3 fallback disabled by configuration",
+                                self.mailbox_address,
+                            )
         else:
             self._consecutive_empty_imap_batches = 0
+            if self.bucket:
+                should_attempt_s3 = True
 
-        if self.bucket:
-            if attempted_imap:
-                if self._consecutive_empty_imap_batches == 1:
-                    logger.info(
-                        "No IMAP messages detected; falling back to S3 for mailbox %s",
-                        self.mailbox_address,
-                    )
-                elif (
-                    self._imap_fallback_attempts > 0
-                    and self._consecutive_empty_imap_batches == self._imap_fallback_attempts
-                ):
-                    logger.info(
-                        "No IMAP messages after %d poll(s); still falling back to S3 for mailbox %s",
-                        self._imap_fallback_attempts,
-                        self.mailbox_address,
-                    )
-
+        if should_attempt_s3 and self.bucket:
             messages = self._load_from_s3(
                 effective_limit,
                 prefixes=prefixes,
@@ -3283,7 +3298,7 @@ class SESEmailWatcher:
             if messages:
                 self._consecutive_empty_imap_batches = 0
                 return messages
-        else:
+        elif not self.bucket:
             logger.warning(
                 "S3 bucket not configured; skipping direct poll for mailbox %s",
                 self.mailbox_address,

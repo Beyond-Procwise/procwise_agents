@@ -910,6 +910,7 @@ def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
 
     watcher = _make_watcher(nick, loader=None)
     watcher.bucket = "procwise-bucket"
+    watcher._imap_fallback_attempts = 2
 
     counters = {"s3": 0, "imap": 0}
 
@@ -937,6 +938,12 @@ def test_imap_fallback_to_s3_when_imap_empty(monkeypatch):
     batch = watcher.poll_once(limit=1)
 
     assert counters["imap"] == 1
+    assert counters["s3"] == 0
+    assert batch == []
+    assert watcher._last_candidate_source == "imap"
+
+    batch = watcher.poll_once(limit=1)
+    assert counters["imap"] == 2
     assert counters["s3"] == 1
     assert batch
     assert batch[0]["message_id"].startswith("s3-msg-")
@@ -1007,7 +1014,49 @@ def test_imap_loader_records_processed_email(monkeypatch):
     bucket, key, _, rfq_id = recorded[0]
     assert bucket.startswith("imap::")
     assert key.startswith("imap/")
-    assert rfq_id
+
+
+def test_imap_fallback_can_be_disabled(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.example.com"
+    nick.settings.imap_user = "inbound@example.com"
+    nick.settings.imap_password = "secret"
+    nick.settings.imap_mailbox = "INBOX"
+
+    watcher = _make_watcher(nick, loader=None)
+    watcher.bucket = "procwise-bucket"
+    watcher._imap_fallback_attempts = 0
+
+    counters = {"s3": 0, "imap": 0}
+
+    def _stub_s3(self, limit, *, prefixes=None, on_message=None):
+        counters["s3"] += 1
+        return [
+            {
+                "id": "s3-msg-disabled",
+                "message_id": "s3-msg-disabled",
+                "subject": "Re: RFQ-20240101-abcd1234",
+                "body": "Quoted price 1250",
+                "rfq_id": "RFQ-20240101-abcd1234",
+                "from": "supplier@example.com",
+                "from_address": "supplier@example.com",
+            }
+        ]
+
+    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+        counters["imap"] += 1
+        return []
+
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
+    monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
+
+    for _ in range(3):
+        batch = watcher.poll_once(limit=1)
+        assert batch == []
+        assert watcher._last_candidate_source == "imap"
+
+    assert counters["imap"] == 3
+    assert counters["s3"] == 0
 
 
 def test_email_watcher_maps_multiple_rfq_ids():
