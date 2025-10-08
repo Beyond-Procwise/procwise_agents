@@ -858,7 +858,7 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
     assert payload["subject"] == "Re: RFQ-20240101-abcd1234"
 
 
-def test_imap_fallback_triggers_after_three_empty_s3_batches(monkeypatch):
+def test_imap_fallback_triggers_immediately_when_s3_empty(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
     nick.settings.imap_user = "inbound@example.com"
@@ -891,14 +891,12 @@ def test_imap_fallback_triggers_after_three_empty_s3_batches(monkeypatch):
     monkeypatch.setattr(SESEmailWatcher, "_load_from_s3", _stub_s3, raising=False)
     monkeypatch.setattr(SESEmailWatcher, "_load_from_imap", _stub_imap, raising=False)
 
-    assert watcher.poll_once(limit=1) == []
-    assert watcher.poll_once(limit=1) == []
-    third_batch = watcher.poll_once(limit=1)
+    batch = watcher.poll_once(limit=1)
 
-    assert counters["s3"] >= 3
+    assert counters["s3"] == 1
     assert counters["imap"] == 1
-    assert third_batch
-    assert third_batch[0]["message_id"].startswith("imap-msg-")
+    assert batch
+    assert batch[0]["message_id"].startswith("imap-msg-")
 
 
 def test_imap_loader_records_processed_email(monkeypatch):
