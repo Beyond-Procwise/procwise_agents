@@ -215,6 +215,68 @@ def test_digital_purchase_order_extraction(tmp_path, extractor):
     assert payload["po_id"] == "PO-9001"
 
 
+def test_document_type_detection_prefers_invoice(tmp_path, extractor):
+    doc = tmp_path / "ambiguous_invoice.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Commercial Document",
+                "Invoice Number: INV-8800",
+                "Purchase Order Reference: PO-7711",
+                "Vendor: Apex Integration",
+                "Invoice Date: 2024-05-11",
+                "Due Date: 2024-05-25",
+                "Total Due: 980.00",
+                "Item Description    Qty    Unit Price    Line Total",
+                "Enterprise Support   1      980.00        980.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "digital"})
+
+    assert result.document_type == "Invoice"
+    expected_keys = [
+        "invoice_id",
+        "supplier_name",
+        "invoice_date",
+        "due_date",
+        "invoice_total_incl_tax",
+        "po_id",
+    ]
+    assert _header_f1(result.header, expected_keys) >= 0.95
+    assert result.header["invoice_id"] == "INV-8800"
+    assert result.line_items and result.line_items[0]["line_amount"].startswith("980")
+
+
+def test_document_type_detection_for_agreement(tmp_path, extractor):
+    doc = tmp_path / "service_agreement.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Master Service Agreement",
+                "Agreement Number: C-5501",
+                "Agreement Title: Managed Infrastructure Support",
+                "Supplier: Horizon Digital",
+                "Effective Date: 2024-01-15",
+                "Expiry Date: 2025-01-14",
+                "Payment Terms: Net 45",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "digital"})
+
+    assert result.document_type == "Contract"
+    assert result.header["contract_id"] == "C-5501"
+    assert result.header["contract_title"].startswith("Managed Infrastructure")
+    assert result.header["payment_terms"] == "Net 45"
+
+
 def test_scanned_contract_with_multiline_headers(tmp_path, extractor):
     doc = tmp_path / "contract_multiline.txt"
     doc.write_text(
@@ -322,6 +384,59 @@ def test_scanned_quote_with_table(tmp_path, extractor):
     row = _read_table(db_path, "proc.raw_quotes")
     tables = json.loads(row["tables_json"])
     assert tables[0]["rows"][1]["item_description"].lower() == "standing desk"
+
+
+def test_document_type_detection_scanned_purchase_order(tmp_path, extractor):
+    doc = tmp_path / "scanned_po_detection.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Order Summary",
+                "Order Reference #: PO-3300",
+                "Vendor: Summit Gear",
+                "Order Date: 2024-04-15",
+                "Expected Delivery Date: 2024-04-30",
+                "Line Description    Qty    Unit Price    Total",
+                "Rugged Tablet       10     650.00        6500.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "scanned"})
+
+    assert result.document_type == "Purchase_Order"
+    assert result.header["po_id"] == "PO-3300"
+    assert result.header["supplier_name"].lower() == "summit gear"
+    assert result.line_items[0]["line_total"].startswith("6500")
+
+
+def test_document_type_detection_scanned_quote(tmp_path, extractor):
+    doc = tmp_path / "scanned_quote_detection.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Commercial Proposal",
+                "Proposal Number: Q-9090",
+                "Supplier: Skyline Interiors",
+                "Valid Until: 2024-05-30",
+                "Total Amount: 1450.00",
+                "Item Description    Qty    Unit Price    Amount",
+                "Boardroom Table     1      850.00        850.00",
+                "Leather Chairs      4      150.00        600.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "scanned"})
+
+    assert result.document_type == "Quote"
+    assert result.header["quote_id"] == "Q-9090"
+    assert result.header["supplier_name"].lower() == "skyline interiors"
+    assert len(result.line_items) == 2
 
 
 def test_accuracy_metrics_digital_invoice(tmp_path, extractor):

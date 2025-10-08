@@ -47,6 +47,38 @@ RAW_TABLE_MAPPING = {
     "Quote": "proc.raw_quotes",
 }
 
+DOCUMENT_TYPE_KEYWORDS: Dict[str, List[Tuple[str, ...]]] = {
+    "Invoice": [
+        ("invoice",),
+        ("tax", "invoice"),
+        ("amount", "due"),
+        ("due", "date"),
+        ("invoice", "total"),
+        ("total", "incl", "tax"),
+    ],
+    "Purchase_Order": [
+        ("purchase", "order"),
+        ("po", "number"),
+        ("order", "date"),
+        ("delivery", "date"),
+        ("order", "total"),
+    ],
+    "Contract": [
+        ("contract",),
+        ("agreement",),
+        ("service", "agreement"),
+        ("contract", "number"),
+        ("payment", "terms"),
+    ],
+    "Quote": [
+        ("quote",),
+        ("quotation",),
+        ("proposal",),
+        ("quote", "total"),
+        ("valid", "until"),
+    ],
+}
+
 # Canonical procurement structures derived from ``docs/procurement_table_reference.md``.
 # The keywords are used to align observed keys and column headers with the
 # database schema so extracted payloads remain faithful to downstream tables.
@@ -274,6 +306,8 @@ HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
             ("contract", "#"),
             ("contract", "ref"),
             ("contract", "reference"),
+            ("agreement", "number"),
+            ("agreement", "id"),
         ],
         "contract_title": [
             ("contract", "title"),
@@ -557,7 +591,11 @@ class DocumentExtractor:
         source_name = source_label or path.name
 
         text, detected_tables = self._extract_text_and_tables(path)
-        detected_type = document_type or self._detect_document_type(text)
+        schema_payload: Optional[Dict[str, Any]] = None
+        if document_type:
+            detected_type = document_type
+        else:
+            detected_type, schema_payload = self._detect_document_type(text)
         if detected_type not in RAW_TABLE_MAPPING:
             logger.warning(
                 "Document type '%s' not recognised; defaulting to Contract",
@@ -570,7 +608,11 @@ class DocumentExtractor:
             text, detected_type
         )
         header, line_items = self._apply_schema_guidance(
-            text, detected_type, header, line_items
+            text,
+            detected_type,
+            header,
+            line_items,
+            schema_payload=schema_payload,
         )
         field_hints = self._build_field_hints(
             detected_type,
@@ -643,18 +685,116 @@ class DocumentExtractor:
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         return f"{stem or 'document'}-{timestamp}"
 
-    def _detect_document_type(self, text: str) -> str:
+    def _detect_document_type(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         lowered = text.lower()
-        keyword_map = {
-            "Invoice": ["invoice", "tax invoice", "amount due"],
-            "Purchase_Order": ["purchase order", "po number", "order date"],
-            "Contract": ["contract", "agreement", "terms"],
-            "Quote": ["quotation", "quote", "proposal"],
-        }
-        for doc_type, keywords in keyword_map.items():
-            if any(keyword in lowered for keyword in keywords):
-                return doc_type
-        return "Contract"  # Fallback to the safest structure
+        if not lowered.strip():
+            return "Contract", None
+
+        best_type = "Contract"
+        best_score = float("-inf")
+        best_payload: Optional[Dict[str, Any]] = None
+
+        for document_type in PROCUREMENT_STRUCTURE.keys():
+            payload: Optional[Dict[str, Any]] = None
+            schema_score = 0.0
+            if document_type in DOC_TYPE_TO_TABLE:
+                try:
+                    payload = extract_structured_content(text, document_type)
+                except Exception:
+                    payload = None
+                schema_score = self._schema_detection_score(document_type, payload)
+
+            keyword_score = self._keyword_detection_score(lowered, document_type)
+            total_score = schema_score + keyword_score
+
+            if total_score > best_score:
+                best_score = total_score
+                best_type = document_type
+                best_payload = payload
+
+        if best_score <= 0:
+            fallback = self._fallback_document_type(lowered)
+            if fallback:
+                return fallback, None
+            return "Contract", None
+
+        if best_score < 6 and best_type != "Contract":
+            return "Contract", None
+
+        return best_type, best_payload if isinstance(best_payload, dict) else None
+
+    def _schema_detection_score(
+        self,
+        document_type: str,
+        payload: Optional[Dict[str, Any]],
+    ) -> float:
+        if not isinstance(payload, dict):
+            return 0.0
+
+        structure = PROCUREMENT_STRUCTURE.get(document_type, {})
+        expected_headers = len(structure.get("header_fields", [])) or 1
+        expected_line_fields = len(structure.get("line_item_fields", [])) or 1
+
+        header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
+        header_hits = sum(1 for value in header.values() if str(value).strip())
+        header_score = 0.0
+        if header_hits:
+            header_score = (header_hits / expected_headers) * 3.0 + header_hits
+
+        line_items = (
+            payload.get("line_items")
+            if isinstance(payload.get("line_items"), list)
+            else []
+        )
+        unique_line_fields: set[str] = set()
+        populated_rows = 0
+        for item in line_items:
+            if not isinstance(item, dict):
+                continue
+            cleaned = {k: v for k, v in item.items() if str(v).strip()}
+            if cleaned:
+                populated_rows += 1
+                unique_line_fields.update(cleaned.keys())
+
+        line_field_score = 0.0
+        if unique_line_fields:
+            line_field_score = (
+                len(unique_line_fields) / expected_line_fields
+            ) * 2.0 + len(unique_line_fields) * 0.5
+        row_score = populated_rows * 0.5
+
+        return header_score + line_field_score + row_score
+
+    def _keyword_detection_score(self, lowered: str, document_type: str) -> float:
+        score = 0.0
+        for sequence in DOCUMENT_TYPE_KEYWORDS.get(document_type, []):
+            frequency = self._sequence_score(lowered, sequence)
+            if frequency:
+                score += (2.5 + 0.5 * (len(sequence) - 1)) * frequency
+
+        for mapping in (HEADER_KEYWORDS.get(document_type, {}), LINE_KEYWORDS.get(document_type, {})):
+            for sequences in mapping.values():
+                for sequence in sequences:
+                    frequency = self._sequence_score(lowered, sequence)
+                    if frequency:
+                        score += 0.75 * frequency
+        return score
+
+    def _fallback_document_type(self, lowered: str) -> Optional[str]:
+        for candidate in ("Invoice", "Purchase_Order", "Quote", "Contract"):
+            sequences = DOCUMENT_TYPE_KEYWORDS.get(candidate, [])
+            if any(self._sequence_score(lowered, sequence) for sequence in sequences):
+                return candidate
+        return None
+
+    @staticmethod
+    def _sequence_score(text: str, sequence: Tuple[str, ...]) -> float:
+        if not sequence:
+            return 0.0
+        counts = [text.count(token) for token in sequence if token]
+        if not counts or any(count == 0 for count in counts):
+            return 0.0
+        return float(min(counts))
 
     def _extract_text_and_tables(self, path: Path) -> Tuple[str, List[List[List[str]]]]:
         if path.suffix.lower() == ".txt":
@@ -1188,18 +1328,25 @@ class DocumentExtractor:
         document_type: str,
         header: Dict[str, Any],
         line_items: List[Dict[str, Any]],
+        *,
+        schema_payload: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         if document_type not in DOC_TYPE_TO_TABLE:
             return header, line_items
 
-        try:
-            payload = extract_structured_content(text, document_type)
-        except Exception:
-            logger.debug(
-                "Schema-guided extraction failed for document type %s", document_type,
-                exc_info=True,
-            )
-            return header, line_items
+        payload: Optional[Dict[str, Any]] = None
+        if schema_payload is not None:
+            payload = schema_payload
+        else:
+            try:
+                payload = extract_structured_content(text, document_type)
+            except Exception:
+                logger.debug(
+                    "Schema-guided extraction failed for document type %s",
+                    document_type,
+                    exc_info=True,
+                )
+                return header, line_items
 
         schema_header = (
             payload.get("header") if isinstance(payload, dict) else None
