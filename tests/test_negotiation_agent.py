@@ -3,6 +3,8 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict
 
+import pytest
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
@@ -15,12 +17,13 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
 class DummyNick:
-    def __init__(self):
+    def __init__(self, *, enable_learning: bool = False):
         self.settings = SimpleNamespace(
             qdrant_collection_name="dummy",
             extraction_model="gpt-oss",
             script_user="tester",
             ses_default_sender="noreply@example.com",
+            enable_learning=enable_learning,
         )
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: 1,
@@ -156,13 +159,13 @@ def test_negotiation_agent_composes_counter(monkeypatch):
 
     output = agent.run(context)
 
-    assert output.data["decision"]["strategy"] == "midpoint"
-    assert output.data["decision"]["counter_price"] == 1250.0
+    assert output.data["decision"]["strategy"] == "counter"
+    assert output.data["decision"]["counter_price"] == pytest.approx(1267.75, rel=1e-4)
     assert output.data["negotiation_allowed"] is True
     assert output.data["intent"] == "NEGOTIATION_COUNTER"
-    assert "$" in output.data["message"] or "1250" in output.data["message"]
+    assert "$" in output.data["message"] or "1267" in output.data["message"]
     draft_payload = output.data["draft_payload"]
-    assert draft_payload["counter_price"] == 1250.0
+    assert draft_payload["counter_price"] == pytest.approx(1267.75, rel=1e-4)
     assert draft_payload["negotiation_message"].startswith("Round 1 plan")
     assert draft_payload["recipients"] == ["quotes@supplier.test"]
     assert "Recommended plays" in draft_payload["negotiation_message"]
@@ -551,3 +554,121 @@ def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
     assert output.next_agents == ["EmailDraftingAgent", "SupplierInteractionAgent"]
     assert output.data.get("email_action_id") is None
     assert recorded_state.get("awaiting_response") is True
+
+
+def test_learning_snapshot_skipped_when_learning_disabled():
+    class Recorder:
+        def __init__(self):
+            self.calls = 0
+
+        def record_negotiation_learning(self, **_):
+            self.calls += 1
+
+    nick = DummyNick(enable_learning=False)
+    repo = Recorder()
+    nick.learning_repository = repo
+
+    agent = NegotiationAgent(nick)
+    context = AgentContext(
+        workflow_id="wf-disabled",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+
+    agent._record_learning_snapshot(
+        context,
+        rfq_id="RFQ-001",
+        supplier="SUP-1",
+        decision={"strategy": "counter"},
+        state={"current_round": 1},
+        awaiting_response=False,
+        supplier_reply_registered=False,
+    )
+
+    assert repo.calls == 0
+
+
+def test_learning_snapshot_captured_when_learning_enabled():
+    class Recorder:
+        def __init__(self):
+            self.calls = 0
+            self.payloads = []
+
+        def record_negotiation_learning(self, **payload):
+            self.calls += 1
+            self.payloads.append(payload)
+
+    nick = DummyNick(enable_learning=True)
+    repo = Recorder()
+    nick.learning_repository = repo
+
+    agent = NegotiationAgent(nick)
+    context = AgentContext(
+        workflow_id="wf-enabled",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+
+    agent._record_learning_snapshot(
+        context,
+        rfq_id="RFQ-002",
+        supplier="SUP-2",
+        decision={"strategy": "counter", "counter_price": 100.0},
+        state={"current_round": 2, "supplier_reply_count": 1},
+        awaiting_response=True,
+        supplier_reply_registered=True,
+    )
+
+    assert repo.calls == 1
+    payload = repo.payloads[0]
+    assert payload["workflow_id"] == "wf-enabled"
+    assert payload["rfq_id"] == "RFQ-002"
+
+
+def test_learning_snapshot_queued_via_training_endpoint():
+    class EndpointRecorder:
+        def __init__(self):
+            self.calls = []
+
+        def queue_negotiation_learning(self, **payload):
+            self.calls.append(payload)
+
+    class RepoSpy:
+        def __init__(self):
+            self.calls = 0
+
+        def record_negotiation_learning(self, **_):
+            self.calls += 1
+
+    nick = DummyNick(enable_learning=True)
+    endpoint = EndpointRecorder()
+    repo = RepoSpy()
+    nick.model_training_endpoint = endpoint
+    nick.learning_repository = repo
+
+    agent = NegotiationAgent(nick)
+    context = AgentContext(
+        workflow_id="wf-queue",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+
+    agent._record_learning_snapshot(
+        context,
+        rfq_id="RFQ-100",
+        supplier="SUP-9",
+        decision={"strategy": "counter", "round": 2},
+        state={"supplier_reply_count": 3},
+        awaiting_response=False,
+        supplier_reply_registered=True,
+    )
+
+    assert len(endpoint.calls) == 1
+    queued = endpoint.calls[0]
+    assert queued["workflow_id"] == "wf-queue"
+    assert queued["rfq_id"] == "RFQ-100"
+    assert queued["decision"]["round"] == 2
+    assert repo.calls == 0

@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from copy import deepcopy
 
 from services.event_bus import get_event_bus
 from models.supplier_ranking_trainer import SupplierRankingTrainer
@@ -33,6 +34,7 @@ class ModelTrainingService:
         self._subscription_registered = False
         self._supplier_trainer = SupplierRankingTrainer()
         self._learning_repo = getattr(agent_nick, "learning_repository", None)
+        self._pending_negotiation_learnings: List[Dict[str, Any]] = []
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -298,11 +300,81 @@ class ModelTrainingService:
                 workflow_context = self._learning_repo.get_recent_learnings(limit=25)
             except Exception:
                 logger.exception("Failed to gather workflow learning context during dispatch")
+        negotiation_learnings: List[Dict[str, Any]] = []
+        if self._pending_negotiation_learnings:
+            pending_items = self._pending_negotiation_learnings
+            self._pending_negotiation_learnings = []
+            requeue: List[Dict[str, Any]] = []
+            for item in pending_items:
+                payload = {
+                    "workflow_id": item.get("workflow_id"),
+                    "rfq_id": item.get("rfq_id"),
+                    "supplier_id": item.get("supplier_id"),
+                    "decision": deepcopy(item.get("decision") or {}),
+                    "state": deepcopy(item.get("state") or {}),
+                    "awaiting_response": item.get("awaiting_response", False),
+                    "supplier_reply_registered": item.get(
+                        "supplier_reply_registered", False
+                    ),
+                }
+                status = "skipped"
+                point_id: Optional[str] = None
+                if self._learning_repo is not None:
+                    try:
+                        point_id = self._learning_repo.record_negotiation_learning(**payload)
+                        status = "recorded"
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist negotiation learning for %s/%s",
+                            payload.get("rfq_id"),
+                            payload.get("supplier_id"),
+                        )
+                        status = "failed"
+                        requeue.append(item)
+                else:
+                    requeue.append(item)
+                negotiation_learnings.append(
+                    {
+                        "rfq_id": payload.get("rfq_id"),
+                        "supplier_id": payload.get("supplier_id"),
+                        "workflow_id": payload.get("workflow_id"),
+                        "round": payload["decision"].get("round"),
+                        "status": status,
+                        "point_id": point_id,
+                    }
+                )
+            if requeue:
+                self._pending_negotiation_learnings.extend(requeue)
         return {
             "training_jobs": training_jobs,
             "relationship_jobs": relationship_jobs,
             "workflow_context": workflow_context,
+            "negotiation_learnings": negotiation_learnings,
         }
+
+    def queue_negotiation_learning(
+        self,
+        *,
+        workflow_id: Optional[str],
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+        decision: Dict[str, Any],
+        state: Dict[str, Any],
+        awaiting_response: bool,
+        supplier_reply_registered: bool,
+    ) -> None:
+        """Store a negotiation learning snapshot for later dispatch."""
+
+        record = {
+            "workflow_id": workflow_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "decision": deepcopy(decision or {}),
+            "state": deepcopy(state or {}),
+            "awaiting_response": awaiting_response,
+            "supplier_reply_registered": supplier_reply_registered,
+        }
+        self._pending_negotiation_learnings.append(record)
 
     def record_workflow_outcome(
         self, workflow_name: str, workflow_id: str, result: Dict[str, Any]
