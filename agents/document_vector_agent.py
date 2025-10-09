@@ -23,15 +23,30 @@ class DocumentVectorAgent(DataExtractionAgent):
     enabling Retrieval Augmented Generation.
     """
 
+    AGENTIC_PLAN_STEPS = (
+        "Collect eligible documents from the configured S3 prefixes for vector indexing.",
+        "Extract raw text snippets and generate embeddings using the local model stack.",
+        "Upsert embeddings into Qdrant and report indexing status for retrieval workflows.",
+    )
+
     def run(self, context: AgentContext) -> AgentOutput:
         try:
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
             details = self._process_documents_vector_only(s3_prefix, s3_object_key)
-            return AgentOutput(status=AgentStatus.SUCCESS, data={"status": "completed", "details": details})
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data={"status": "completed", "details": details},
+                ),
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("DocumentVectorAgent failed: %s", exc)
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+            return self._with_plan(
+                context,
+                AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc)),
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers

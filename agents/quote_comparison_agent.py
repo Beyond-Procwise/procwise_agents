@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 class QuoteComparisonAgent(BaseAgent):
     """Aggregate quote data for candidate suppliers."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Aggregate quotes, line items, and supplier metadata for the requested scope.",
+        "Normalise currencies and performance metrics, then compute weighted comparisons.",
+        "Highlight the recommended supplier and share structured insights for negotiations.",
+    )
+
     DEFAULT_METRIC_WEIGHTS: Dict[str, float] = {
         "total_cost": 0.6,
         "tenure": 0.25,
@@ -109,10 +115,13 @@ class QuoteComparisonAgent(BaseAgent):
                 payload = {"comparison": finalised}
                 if recommended_summary:
                     payload["recommended_quote"] = recommended_summary
-                return AgentOutput(
-                    status=AgentStatus.SUCCESS,
-                    data=payload,
-                    pass_fields=payload,
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.SUCCESS,
+                        data=payload,
+                        pass_fields=payload,
+                    ),
                 )
 
         quotes = self._read_table("proc.quote_agent")
@@ -130,10 +139,13 @@ class QuoteComparisonAgent(BaseAgent):
             payload = {"comparison": results}
             if recommended_summary:
                 payload["recommended_quote"] = recommended_summary
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=payload,
-                pass_fields=payload,
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                ),
             )
 
         quotes["quote_id"] = quotes["quote_id"].astype(str)
@@ -149,10 +161,13 @@ class QuoteComparisonAgent(BaseAgent):
             payload = {"comparison": results}
             if recommended_summary:
                 payload["recommended_quote"] = recommended_summary
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=payload,
-                pass_fields=payload,
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                ),
             )
 
         merged = quote_lines.merge(
@@ -224,10 +239,13 @@ class QuoteComparisonAgent(BaseAgent):
         if recommended_summary:
             payload["recommended_quote"] = recommended_summary
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=payload,
-            pass_fields=payload,
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=payload,
+                pass_fields=payload,
+            ),
         )
 
     def _extract_passed_quotes(self, input_data: Dict) -> List[Dict]:

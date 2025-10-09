@@ -15,6 +15,12 @@ configure_gpu()
 class DiscrepancyDetectionAgent(BaseAgent):
     """Agent that validates extracted documents and logs mismatches."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Review extracted documents and ingestion warnings from upstream agents.",
+        "Cross-check key header fields against warehouse tables to detect mismatches.",
+        "Log discrepancies with remediation guidance for downstream review.",
+    )
+
     REQUIRED_INVOICE_FIELDS = ["vendor_name", "invoice_date", "total_amount"]
 
     def run(self, context: AgentContext) -> AgentOutput:
@@ -161,10 +167,13 @@ class DiscrepancyDetectionAgent(BaseAgent):
                             )
         except Exception as exc:  # pragma: no cover - database connectivity
             logger.error("DiscrepancyDetectionAgent failed: %s", exc)
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error=str(exc),
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error=str(exc),
+                ),
             )
 
         self._persist_mismatches(mismatches)
@@ -193,9 +202,12 @@ class DiscrepancyDetectionAgent(BaseAgent):
         if processing_issues:
             summary["processing_issues"] = len(processing_issues)
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data={"mismatches": mismatches, "summary": summary},
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"mismatches": mismatches, "summary": summary},
+            ),
         )
 
     def _persist_mismatches(self, mismatches: List[Dict]) -> None:

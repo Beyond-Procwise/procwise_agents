@@ -110,11 +110,11 @@ def test_rag_agent_generates_agentic_plan(monkeypatch):
 
     result = agent.run("How is Supplier One performing?", "user-1")
 
-    assert result["answer"] == "Final answer"
-    assert result["follow_up_questions"] == ["Next step"]
+    assert isinstance(result, rag_module.AgentOutput)
+    assert result.data["answer"] == "Final answer"
+    assert result.data["follow_up_questions"] == ["Next step"]
 
-    retrieved = result["retrieved_documents"]
-    assert any(item.get("document_type") == "agentic_plan" for item in retrieved)
+    retrieved = result.data["retrieved_documents"]
     knowledge_entry = next(
         item
         for item in retrieved
@@ -125,3 +125,4 @@ def test_rag_agent_generates_agentic_plan(monkeypatch):
     assert captured_plan["knowledge_summary"]
     assert "Supplier One" in captured_plan["knowledge_summary"]
     assert "Invoice" in captured_plan["outline"]
+    assert result.agentic_plan == "1. Investigate supplier coverage\n2. Confirm invoice specifics"

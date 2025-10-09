@@ -159,6 +159,12 @@ def decide_strategy(
 class NegotiationAgent(BaseAgent):
     """Generate deterministic negotiation decisions and coordinate counter drafting."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Analyse supplier offers, historical spend, and negotiation constraints for the active RFQ session.",
+        "Compute pricing and terms strategy including counter targets, concessions, and playbook actions.",
+        "Coordinate email drafting and state persistence to deliver the counter proposal and next steps.",
+    )
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
@@ -401,11 +407,14 @@ class NegotiationAgent(BaseAgent):
                 if watch_fields:
                     pass_fields.update(watch_fields)
                     next_agents.append("SupplierInteractionAgent")
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=data,
-                pass_fields=pass_fields,
-                next_agents=next_agents,
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=data,
+                    pass_fields=pass_fields,
+                    next_agents=next_agents,
+                ),
             )
 
         optimized = self._optimize_multi_issue(
@@ -686,10 +695,13 @@ class NegotiationAgent(BaseAgent):
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
                     }
-                    return AgentOutput(
-                        status=AgentStatus.FAILED,
-                        data=error_payload,
-                        error="supplier response timeout",
+                    return self._with_plan(
+                        context,
+                        AgentOutput(
+                            status=AgentStatus.FAILED,
+                            data=error_payload,
+                            error="supplier response timeout",
+                        ),
                     )
                 supplier_responses = [res for res in wait_results if isinstance(res, dict)]
                 if not supplier_responses:
@@ -705,10 +717,13 @@ class NegotiationAgent(BaseAgent):
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
                     }
-                    return AgentOutput(
-                        status=AgentStatus.FAILED,
-                        data=error_payload,
-                        error="supplier response missing",
+                    return self._with_plan(
+                        context,
+                        AgentOutput(
+                            status=AgentStatus.FAILED,
+                            data=error_payload,
+                            error="supplier response missing",
+                        ),
                     )
                 known_ids: Set[str] = set()
                 current_message = self._coerce_text(context.input_data.get("message_id"))
@@ -817,11 +832,14 @@ class NegotiationAgent(BaseAgent):
             "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
         )
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=data,
-            pass_fields=pass_fields,
-            next_agents=next_agents,
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                pass_fields=pass_fields,
+                next_agents=next_agents,
+            ),
         )
 
     # ------------------------------------------------------------------

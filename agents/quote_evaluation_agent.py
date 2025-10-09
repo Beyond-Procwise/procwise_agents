@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 class QuoteEvaluationAgent(BaseAgent):
     """Agent for retrieving and exposing quote data from Qdrant."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Gather RFQ context, supplier candidates, and historical quotes from databases and the vector store.",
+        "Normalise pricing, delivery, and risk attributes while applying weighting strategies.",
+        "Select recommended quotes, route approvals, and provide evidence for downstream agents.",
+    )
+
     def run(self, context: AgentContext) -> AgentOutput:
         return self.process(context)
 
@@ -42,11 +48,14 @@ class QuoteEvaluationAgent(BaseAgent):
                     len(quotes_sorted),
                     rfq_id,
                 )
-                return AgentOutput(
-                    status=AgentStatus.SUCCESS,
-                    data={"quotes": quotes_sorted, "best_quote": best},
-                    pass_fields={"quotes": quotes_sorted, "best_quote": best},
-                    next_agents=next_agents,
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.SUCCESS,
+                        data={"quotes": quotes_sorted, "best_quote": best},
+                        pass_fields={"quotes": quotes_sorted, "best_quote": best},
+                        next_agents=next_agents,
+                    ),
                 )
 
             product_category = (
@@ -207,10 +216,13 @@ class QuoteEvaluationAgent(BaseAgent):
                         "retrieval_strategy": retrieval_strategy,
                     }
                 )
-                return AgentOutput(
-                    status=AgentStatus.SUCCESS,
-                    data=empty_payload,
-                    pass_fields=empty_payload,
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.SUCCESS,
+                        data=empty_payload,
+                        pass_fields=empty_payload,
+                    ),
                 )
 
             output_data = self._to_native(
@@ -225,17 +237,23 @@ class QuoteEvaluationAgent(BaseAgent):
                 "QuoteEvaluationAgent returning %d supplier quotes",
                 max(len(standardized_quotes) - 1, 0),
             )
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=output_data,
-                pass_fields=output_data,
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=output_data,
+                    pass_fields=output_data,
+                ),
             )
         except Exception as exc:
             logger.error("QuoteEvaluationAgent error: %s", exc)
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error=str(exc),
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error=str(exc),
+                ),
             )
 
     def _fetch_quotes(

@@ -503,6 +503,9 @@ class Orchestrator:
     def _trigger_automatic_training(self, workflow_name: str) -> None:
         """Kick off background training using procurement datasets."""
 
+        if getattr(self, "model_training_endpoint", None) is None:
+            return
+
         service = self._get_model_training_service()
         if service is None:
             return

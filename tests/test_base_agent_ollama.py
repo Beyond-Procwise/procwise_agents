@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Callable, List, Optional
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -8,18 +9,22 @@ from agents import base_agent
 
 
 class DummyProcessRoutingService:
+    def __init__(self):
+        self._counter = 0
+
     def log_process(self, **_kwargs):
-        return None
+        self._counter += 1
+        return self._counter
 
     def log_run_detail(self, **_kwargs):
-        return None
+        return f"run-{self._counter}"
 
     def log_action(self, **_kwargs):
-        return "action"
+        return f"action-{self._counter}"
 
 
 class DummyAgentNick:
-    def __init__(self):
+    def __init__(self, connection_factory: Optional[Callable[[], object]] = None):
         self.settings = SimpleNamespace(
             script_user="tester",
             extraction_model="gpt-oss",
@@ -28,9 +33,15 @@ class DummyAgentNick:
         self.prompt_engine = SimpleNamespace()
         self.learning_repository = None
         self.process_routing_service = DummyProcessRoutingService()
+        self._connection_factory = connection_factory
 
     def ollama_options(self):
         return {}
+
+    def get_db_connection(self):
+        if self._connection_factory is None:
+            raise AttributeError("No connection factory configured")
+        return self._connection_factory()
 
 
 def make_base_agent():
@@ -73,3 +84,91 @@ def test_get_available_models_returns_fallback_when_empty(monkeypatch):
     models = agent._get_available_ollama_models(force_refresh=True)
 
     assert models == list(base_agent._OLLAMA_FALLBACK_MODELS)
+
+
+def test_execute_persists_agentic_plan(monkeypatch):
+    executed_statements: List[str] = []
+    executed_params: List[Optional[tuple]] = []
+    commit_calls: List[bool] = []
+
+    class RecordingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            executed_statements.append(statement.strip())
+            executed_params.append(params)
+
+    class RecordingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return RecordingCursor()
+
+        def commit(self):
+            commit_calls.append(True)
+
+    def connection_factory():
+        return RecordingConnection()
+
+    class PlanningAgent(base_agent.BaseAgent):
+        AGENTIC_PLAN_STEPS = ("Gather inputs", "Compute outputs")
+
+        def run(self, context):
+            return base_agent.AgentOutput(
+                status=base_agent.AgentStatus.SUCCESS,
+                data={},
+            )
+
+    agent = PlanningAgent(DummyAgentNick(connection_factory=connection_factory))
+
+    context_one = base_agent.AgentContext(
+        workflow_id="wf-1",
+        agent_id="agent-1",
+        user_id="user-1",
+        input_data={},
+    )
+    context_two = base_agent.AgentContext(
+        workflow_id="wf-2",
+        agent_id="agent-1",
+        user_id="user-1",
+        input_data={},
+    )
+
+    agent.execute(context_one)
+    agent.execute(context_two)
+
+    create_statements = [
+        stmt for stmt in executed_statements if "CREATE TABLE IF NOT EXISTS proc.agent_plan" in stmt
+    ]
+    insert_statements = [
+        stmt for stmt in executed_statements if "INSERT INTO proc.agent_plan" in stmt
+    ]
+
+    assert len(create_statements) == 1
+    assert len(insert_statements) == 2
+    assert len(commit_calls) == 2
+
+    insert_params = [params for params in executed_params if isinstance(params, tuple)]
+    assert len(insert_params) == 2
+
+    expected_plan = "1. Gather inputs\n2. Compute outputs"
+    first_params = insert_params[0]
+    second_params = insert_params[1]
+
+    assert first_params[0] == "wf-1"
+    assert first_params[1] == "agent-1"
+    assert first_params[2] == "PlanningAgent"
+    assert first_params[3] == "action-1"
+    assert first_params[4] == expected_plan
+
+    assert second_params[0] == "wf-2"
+    assert second_params[3] == "action-2"
+    assert second_params[4] == expected_plan

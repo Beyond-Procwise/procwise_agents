@@ -630,6 +630,11 @@ def _initialize_qdrant_collection_idempotent(client, collection_name: str, vecto
 # AGENT
 # ---------------------------------------------------------------------------
 class DataExtractionAgent(BaseAgent):
+    AGENTIC_PLAN_STEPS = (
+        "Collect source documents from S3 prefixes or targeted object keys, tagging scanned versus digital content.",
+        "Extract header fields, line items, and structured tables using schema-driven parsing with OCR fallbacks.",
+        "Validate results, detect discrepancies, and summarise extraction quality for downstream workflows.",
+    )
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.extraction_model = getattr(
@@ -1082,7 +1087,10 @@ class DataExtractionAgent(BaseAgent):
                     "documents_valid": 0,
                     "documents_with_discrepancies": len(docs),
                 }
-                return AgentOutput(status=AgentStatus.FAILED, data=data, error=err)
+                return self._with_plan(
+                    context,
+                    AgentOutput(status=AgentStatus.FAILED, data=data, error=err),
+                )
 
             mismatches = discrepancy_result.data.get("mismatches", [])
             data["summary"] = {
@@ -1093,11 +1101,16 @@ class DataExtractionAgent(BaseAgent):
             }
             if mismatches:
                 data["mismatches"] = mismatches
-            return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+            return self._with_plan(
+                context, AgentOutput(status=AgentStatus.SUCCESS, data=data)
+            )
 
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+            return self._with_plan(
+                context,
+                AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc)),
+            )
 
     def _run_discrepancy_detection(
         self,

@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 class ApprovalsAgent(BaseAgent):
     """Determine approval decisions based on simple thresholds."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Review the approval request, supplier context, and monetary amount.",
+        "Check threshold and policy data from the approvals store and supporting embeddings.",
+        "Return the approval decision with rationale and any routing recommendations.",
+    )
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
@@ -24,16 +30,24 @@ class ApprovalsAgent(BaseAgent):
             )
             approved = price is not None and float(price) <= threshold
             self._store_approval(rfq_id, best, approved)
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={"approved": approved, "best_quote": best},
-                next_agents=[],
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data={"approved": approved, "best_quote": best},
+                    next_agents=[],
+                ),
             )
 
         amount = context.input_data.get("amount")
         supplier_id = context.input_data.get("supplier_id")
         if amount is None:
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error="amount not provided")
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED, data={}, error="amount not provided"
+                ),
+            )
 
         # Retrieve approval threshold from Postgres
         threshold = context.input_data.get("threshold", 1000)
@@ -66,16 +80,19 @@ class ApprovalsAgent(BaseAgent):
         except Exception:  # pragma: no cover - external dependency
             logger.exception("qdrant search failed")
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data={
-                "amount": amount,
-                "threshold": threshold,
-                "decision": decision,
-                "decision_log": log,
-                "references": references,
-            },
-            next_agents=[],
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={
+                    "amount": amount,
+                    "threshold": threshold,
+                    "decision": decision,
+                    "decision_log": log,
+                    "references": references,
+                },
+                next_agents=[],
+            ),
         )
 
     def _store_approval(self, rfq_id: str, best: Dict, approved: bool) -> None:

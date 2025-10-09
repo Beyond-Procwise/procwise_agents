@@ -245,7 +245,12 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
             "proc.quote_line_items_agent",
             "proc.supplier",
         },
-        "outputs": ["policy_opportunities", "supplier_candidates", "knowledge_graph"],
+        "outputs": [
+            "policy_opportunities",
+            "supplier_candidates",
+            "knowledge_graph",
+            "agentic_plan",
+        ],
         "include_flows": True,
     },
     "SupplierRankingAgent": {
@@ -261,7 +266,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
             "proc.contracts",
             "proc.quote_agent",
         },
-        "outputs": ["supplier_rankings", "supplier_profiles"],
+        "outputs": ["supplier_rankings", "supplier_profiles", "agentic_plan"],
         "include_flows": True,
     },
     "SupplierInteractionAgent": {
@@ -275,7 +280,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
             "proc.purchase_order_agent",
             "proc.quote_agent",
         },
-        "outputs": ["rfq_responses", "negotiation_prompts"],
+        "outputs": ["rfq_responses", "negotiation_prompts", "agentic_plan"],
         "include_flows": False,
     },
     "NegotiationAgent": {
@@ -289,7 +294,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
             "proc.purchase_order_agent",
             "proc.invoice_agent",
         },
-        "outputs": ["negotiation_outcomes"],
+        "outputs": ["negotiation_outcomes", "agentic_plan"],
         "include_flows": False,
     },
     "RAGAgent": {

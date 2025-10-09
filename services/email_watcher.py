@@ -4604,38 +4604,20 @@ class SESEmailWatcher:
         if expected_count == 0:
             return
 
-        messages: List[Dict[str, object]] = []
-        try:
-            messages = self._load_from_s3(
-                expected_count,
-                prefixes=self._prefixes,
-                newest_first=True,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to load recent dispatch copies for action=%s",
-                expectation.action_id,
-            )
-            return
-
-        if not messages:
-            return
-
         drafts = self._fetch_recent_dispatched_drafts(expectation, expected_count)
         if not drafts:
             return
 
         unmatched: List[SESEmailWatcher._DraftSnapshot] = list(drafts)
-        for message in messages:
-            if not unmatched:
-                break
-            match = self._match_dispatched_message(message, unmatched)
-            if match is None:
-                continue
-            unmatched.remove(match)
+
+        def _record_message(
+            source_label: str,
+            message: Dict[str, object],
+            match: SESEmailWatcher._DraftSnapshot,
+        ) -> None:
             message_id = str(message.get("id") or "")
             if not message_id:
-                continue
+                return
             metadata = {
                 "status": "dispatch_copy",
                 "draft_id": match.id,
@@ -4653,13 +4635,74 @@ class SESEmailWatcher:
             if isinstance(prefix_hint, str):
                 watcher = self._s3_prefix_watchers.get(prefix_hint)
                 if watcher is not None:
-                    watcher.mark_known(message_id, last_modified if isinstance(last_modified, datetime) else None)
+                    watcher.mark_known(
+                        message_id,
+                        last_modified if isinstance(last_modified, datetime) else None,
+                    )
             logger.debug(
-                "Recorded dispatched email copy %s for draft_id=%s (matched_via=%s)",
+                "Recorded dispatched email copy %s for draft_id=%s (matched_via=%s, source=%s)",
                 message_id,
                 match.id,
                 match.matched_via,
+                source_label,
             )
+
+        def _consume_batch(
+            source_label: str, messages: Iterable[Dict[str, object]]
+        ) -> None:
+            for message in messages:
+                if not unmatched:
+                    break
+                match = self._match_dispatched_message(message, unmatched)
+                if match is None:
+                    continue
+                unmatched.remove(match)
+                _record_message(source_label, message, match)
+
+        loaders: List[Tuple[str, Callable[[], List[Dict[str, object]]]]] = []
+        if self._imap_configured():
+            loaders.append(
+                (
+                    "imap",
+                    lambda: self._load_from_imap(
+                        expected_count, mark_seen=False
+                    ),
+                )
+            )
+        if self.bucket:
+            loaders.append(
+                (
+                    "s3",
+                    lambda: self._load_from_s3(
+                        expected_count,
+                        prefixes=self._prefixes,
+                        newest_first=True,
+                    ),
+                )
+            )
+
+        for source_label, loader in loaders:
+            if not unmatched:
+                break
+            try:
+                messages = loader() or []
+            except Exception:
+                logger.exception(
+                    "Failed to load recent dispatch copies from %s for action=%s",
+                    source_label.upper(),
+                    expectation.action_id,
+                )
+                continue
+
+            if not messages:
+                logger.debug(
+                    "No dispatched copies retrieved from %s for action=%s",
+                    source_label.upper(),
+                    expectation.action_id,
+                )
+                continue
+
+            _consume_batch(source_label, messages)
 
     def _snapshot_from_draft_row(
         self,
