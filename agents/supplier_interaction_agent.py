@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 class SupplierInteractionAgent(BaseAgent):
     """Monitor and parse supplier RFQ responses."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Gather supplier communications from monitored mailboxes or direct payloads.",
+        "Classify intent, extract negotiation signals, and align with RFQ session state.",
+        "Return structured responses or trigger downstream negotiation actions.",
+    )
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
@@ -42,13 +48,27 @@ class SupplierInteractionAgent(BaseAgent):
         if action == "poll":
             count = self.poll_mailbox()
             payload = {"polled": count}
-            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                ),
+            )
         if action == "monitor":
             interval = int(context.input_data.get("interval", 30))
             duration = int(context.input_data.get("duration", 300))
             count = self.monitor_inbox(interval=interval, duration=duration)
             payload = {"monitored": count}
-            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                ),
+            )
         if action == "business_monitor":
             start_hour = int(context.input_data.get("business_start_hour", 9))
             end_hour = int(context.input_data.get("business_end_hour", 17))
@@ -65,7 +85,14 @@ class SupplierInteractionAgent(BaseAgent):
                 max_cycles=cycle_limit,
             )
             payload = {"business_polls": count}
-            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, pass_fields=payload)
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                ),
+            )
 
         input_data = dict(context.input_data)
         subject = str(input_data.get("subject") or "")
@@ -110,10 +137,13 @@ class SupplierInteractionAgent(BaseAgent):
                 )
                 rfq_id = self._extract_rfq_id(subject)
             if not rfq_id:
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error="rfq_id required to await supplier response",
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error="rfq_id required to await supplier response",
+                    ),
                 )
 
             timeout = self._coerce_int(input_data.get("response_timeout"), default=900)
@@ -214,10 +244,13 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_id,
                     timeout,
                 )
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error="supplier response not received",
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error="supplier response not received",
+                    ),
                 )
 
             supplier_status = str(wait_result.get("supplier_status") or "").lower()
@@ -230,10 +263,13 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_status,
                     error_detail,
                 )
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error=error_detail,
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error=error_detail,
+                    ),
                 )
 
             subject = str(wait_result.get("subject") or subject)
@@ -266,7 +302,14 @@ class SupplierInteractionAgent(BaseAgent):
                 rfq_id,
                 supplier_id,
             )
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error="message not provided")
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="message not provided",
+                ),
+            )
 
         if not rfq_id:
             rfq_id = self._extract_rfq_id(subject + " " + body)
@@ -325,11 +368,14 @@ class SupplierInteractionAgent(BaseAgent):
         if target is not None:
             payload["target_price"] = target
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=payload,
-            pass_fields=payload,
-            next_agents=next_agent,
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=payload,
+                pass_fields=payload,
+                next_agents=next_agent,
+            ),
         )
 
     def poll_mailbox(self) -> int:

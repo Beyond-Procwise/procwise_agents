@@ -287,6 +287,12 @@ DEFAULT_NEGOTIATION_MODEL = "mistral"
 class EmailDraftingAgent(BaseAgent):
     """Agent that drafts a plain-text RFQ email and sends it via SES."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Review negotiation or sourcing context plus relevant policy guidance for tone and compliance.",
+        "Compile structured data, pricing rationales, and requested actions to inform the draft email.",
+        "Generate candidate drafts, validate for policy alignment, and surface routing metadata for follow-up.",
+    )
+
     TEXT_TEMPLATE = (
         "<p>Dear {supplier_contact_name_html},</p>"
         "<p>We are writing to request a formal quotation for the requirement outlined below.</p>"
@@ -1013,10 +1019,13 @@ class EmailDraftingAgent(BaseAgent):
         if action_id:
             pass_fields["action_id"] = action_id
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=output_data,
-            pass_fields=pass_fields,
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=output_data,
+                pass_fields=pass_fields,
+            ),
         )
 
     def _render_negotiation_table(self, line_items: Optional[Any]) -> List[str]:
@@ -2103,10 +2112,13 @@ class EmailDraftingAgent(BaseAgent):
             recipients = draft.get("recipients")
             if recipients:
                 output_data["recipients"] = recipients
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=output_data,
-                pass_fields={"drafts": [draft]},
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=output_data,
+                    pass_fields={"drafts": [draft]},
+                ),
             )
 
         prompt_text: Optional[str] = None
@@ -2131,10 +2143,13 @@ class EmailDraftingAgent(BaseAgent):
             recipients = draft.get("recipients")
             if recipients:
                 output_data["recipients"] = recipients
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=output_data,
-                pass_fields={"drafts": [draft]},
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=output_data,
+                    pass_fields={"drafts": [draft]},
+                ),
             )
 
         intent_value = data.get("intent")
@@ -2500,10 +2515,13 @@ class EmailDraftingAgent(BaseAgent):
 
         self._record_learning_events(context, drafts, data)
 
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=output_data,
-            pass_fields=pass_fields,
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=output_data,
+                pass_fields=pass_fields,
+            ),
         )
 
 

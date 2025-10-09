@@ -1781,6 +1781,9 @@ def test_opportunity_miner_skips_without_supplier(monkeypatch, caplog):
         output = agent.run(context)
 
     assert output.status == AgentStatus.SUCCESS
-    assert output.data == {"skipped": True, "reason": "missing_supplier_id"}
+    payload = dict(output.data)
+    payload.pop("agentic_plan", None)
+    assert payload == {"skipped": True, "reason": "missing_supplier_id"}
+    assert output.agentic_plan
     assert ingest_called["value"] is False
     assert not any(record.levelno >= logging.WARNING for record in caplog.records)

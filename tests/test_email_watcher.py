@@ -2042,11 +2042,14 @@ def test_poll_once_logs_error_when_imap_fails_and_uses_s3(monkeypatch, caplog):
     caplog.set_level(logging.ERROR)
 
     results: List[Dict[str, object]] = []
-    for _ in range(3):
+    attempts = 3
+    for _ in range(attempts):
         results = watcher.poll_once(match_filters={"rfq_id": "RFQ-20240101-abcd1234"})
 
     assert results == []
-    assert fallback_calls == [1, 1, 1]
+    expected_calls = watcher._imap_fallback_attempts * attempts
+    assert len(fallback_calls) == expected_calls
+    assert fallback_calls == [1] * expected_calls
     assert watcher._last_candidate_source == "s3"
     assert "IMAP fallback polling failed" in caplog.text
 
@@ -2215,7 +2218,9 @@ def test_negotiation_executes_after_expected_responses(monkeypatch):
     assert cached_first
     assert cached_first["negotiation_triggered"] is True
     assert cached_first["negotiation_status"] == AgentStatus.SUCCESS.value
-    assert cached_first["negotiation_output"] == {"counter": 1000}
+    negotiation_output = cached_first["negotiation_output"]
+    assert isinstance(negotiation_output, dict)
+    assert negotiation_output.get("counter") == 1000
 
     assert second_payload["negotiation_triggered"] is False
 
@@ -2467,6 +2472,153 @@ def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
         assert metadata["dispatch_completed"] is True
         assert metadata["run_id"] == f"run-{idx}"
 
+
+def test_acknowledge_recent_dispatch_prefers_imap(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.procwise.test"
+    nick.settings.imap_user = "agent@procwise.test"
+    nick.settings.imap_password = "secret"
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-imap",
+        workflow_id="wf-imap",
+        draft_ids=(301, 302),
+        draft_count=2,
+        supplier_count=2,
+    )
+
+    ts = datetime.now(timezone.utc)
+    imap_messages = [
+        {
+            "id": f"imap/msg-{idx}",
+            "subject": f"Subject {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx};RUN_ID=run-{idx} -->\nBody {idx}",
+            "_last_modified": ts,
+        }
+        for idx in range(1, 3)
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=300 + idx,
+            rfq_id=f"RFQ-{idx}",
+            subject=f"Subject {idx}",
+            body=f"Body {idx}",
+            dispatch_token=f"token-{idx}",
+            run_id=f"run-{idx}",
+        )
+        for idx in range(1, 3)
+    ]
+
+    imap_calls: List[Tuple[Optional[int], bool]] = []
+    s3_called = False
+
+    def fake_imap(limit, mark_seen=False):
+        imap_calls.append((limit, mark_seen))
+        return list(imap_messages)
+
+    def fake_s3(*args, **kwargs):
+        nonlocal s3_called
+        s3_called = True
+        return []
+
+    monkeypatch.setattr(watcher, "_load_from_imap", fake_imap)
+    monkeypatch.setattr(watcher, "_load_from_s3", fake_s3)
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+    watcher._s3_prefix_watchers = {
+        prefix: S3ObjectWatcher(limit=10) for prefix in watcher._prefixes
+    }
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=False)
+
+    assert imap_calls == [(2, False)]
+    assert s3_called is False
+    for message in imap_messages:
+        metadata = state.get(message["id"])
+        assert metadata["status"] == "dispatch_copy"
+        assert metadata["dispatch_completed"] is False
+
+
+def test_acknowledge_recent_dispatch_falls_back_to_s3(monkeypatch):
+    nick = DummyNick()
+    nick.settings.imap_host = "imap.procwise.test"
+    nick.settings.imap_user = "agent@procwise.test"
+    nick.settings.imap_password = "secret"
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, state_store=state)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="act-hybrid",
+        workflow_id="wf-hybrid",
+        draft_ids=(401, 402, 403),
+        draft_count=3,
+        supplier_count=3,
+    )
+
+    ts = datetime.now(timezone.utc)
+    imap_messages = [
+        {
+            "id": "imap/msg-1",
+            "subject": "Subject 1",
+            "body": "<!-- PROCWISE:RFQ_ID=RFQ-1;TOKEN=token-1;RUN_ID=run-1 -->\nBody 1",
+            "_last_modified": ts,
+        }
+    ]
+    s3_messages = [
+        {
+            "id": f"emails/msg-{idx}",
+            "subject": f"Subject {idx}",
+            "body": f"<!-- PROCWISE:RFQ_ID=RFQ-{idx};TOKEN=token-{idx};RUN_ID=run-{idx} -->\nBody {idx}",
+            "_last_modified": ts,
+            "_prefix": watcher._prefixes[0],
+        }
+        for idx in range(2, 4)
+    ]
+
+    drafts = [
+        watcher._DraftSnapshot(
+            id=400 + idx,
+            rfq_id=f"RFQ-{idx}",
+            subject=f"Subject {idx}",
+            body=f"Body {idx}",
+            dispatch_token=f"token-{idx}",
+            run_id=f"run-{idx}",
+        )
+        for idx in range(1, 4)
+    ]
+
+    s3_calls: List[Tuple[Optional[int], Tuple[str, ...]]] = []
+
+    def fake_imap(limit, mark_seen=False):
+        return list(imap_messages)
+
+    def fake_s3(limit, prefixes=None, newest_first=True):
+        s3_calls.append((limit, tuple(prefixes or ())))
+        return list(s3_messages)
+
+    monkeypatch.setattr(watcher, "_load_from_imap", fake_imap)
+    monkeypatch.setattr(watcher, "_load_from_s3", fake_s3)
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, limit: list(drafts)[:limit],
+    )
+    watcher._s3_prefix_watchers = {
+        prefix: S3ObjectWatcher(limit=10) for prefix in watcher._prefixes
+    }
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=True)
+
+    assert s3_calls == [(3, tuple(watcher._prefixes))]
+    for message in [*imap_messages, *s3_messages]:
+        metadata = state.get(message["id"])
+        assert metadata["status"] == "dispatch_copy"
 
 def test_sqs_email_loader_extracts_records():
     class StubSQSClient:

@@ -8,7 +8,7 @@ from qdrant_client import models
 from sentence_transformers import CrossEncoder
 
 from services.rag_service import RAGService
-from .base_agent import BaseAgent
+from .base_agent import AgentOutput, AgentStatus, BaseAgent
 from utils.gpu import configure_gpu, load_cross_encoder
 
 configure_gpu()
@@ -229,19 +229,16 @@ class RAGAgent(BaseAgent):
                     "summary": knowledge_summary,
                 }
             )
-        if plan_text:
-            retrieved_payloads.append(
-                {
-                    "document_type": "agentic_plan",
-                    "plan": plan_text,
-                }
-            )
-
-        return {
-            "answer": answer,
-            "follow_up_questions": followups,
-            "retrieved_documents": retrieved_payloads,
-        }
+        result = AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={
+                "answer": answer,
+                "follow_up_questions": followups,
+                "retrieved_documents": retrieved_payloads,
+            },
+            agentic_plan=plan_text,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -103,8 +103,15 @@ class AgentOutput:
     error: Optional[str] = None
     confidence: Optional[float] = None
     action_id: Optional[str] = None
+    agentic_plan: Optional[str] = None
 
 class BaseAgent:
+    DEFAULT_AGENTIC_PLAN_STEPS: Tuple[str, ...] = (
+        "Review the incoming context and clarify the task objectives.",
+        "Consult relevant knowledge bases, policies, and historical records.",
+        "Synthesise findings into structured outputs and recommended next actions.",
+    )
+
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
@@ -139,9 +146,12 @@ class BaseAgent:
         start_ts = datetime.utcnow()
         try:
             result = self.run(context)
+            if isinstance(result, AgentOutput):
+                result = self._with_plan(context, result)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("%s execution failed", self.__class__.__name__)
             result = AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+            result = self._with_plan(context, result)
         end_ts = datetime.utcnow()
 
         status = result.status.value
@@ -188,7 +198,119 @@ class BaseAgent:
         logger.info(
             "%s: completed with status %s", self.__class__.__name__, result.status.value
         )
+
+        self._persist_agentic_plan(context, result)
+
         return result
+
+    # ------------------------------------------------------------------
+    # Agentic planning helpers
+    # ------------------------------------------------------------------
+    def _agentic_plan_steps(self, context: "AgentContext") -> List[str]:
+        steps_source = getattr(self, "AGENTIC_PLAN_STEPS", None)
+        steps: List[str]
+        if callable(steps_source):
+            generated = steps_source(context)
+            if isinstance(generated, (list, tuple)):
+                steps = [str(step) for step in generated if str(step).strip()]
+            else:
+                steps = []
+        elif isinstance(steps_source, (list, tuple)):
+            steps = [str(step) for step in steps_source if str(step).strip()]
+        else:
+            steps = []
+        if not steps:
+            steps = list(self.DEFAULT_AGENTIC_PLAN_STEPS)
+        return steps
+
+    def _format_agentic_plan(self, steps: List[str]) -> str:
+        numbered: List[str] = []
+        for idx, step in enumerate(steps, start=1):
+            clean = str(step).strip()
+            if clean:
+                numbered.append(f"{idx}. {clean}")
+        return "\n".join(numbered)
+
+    def _build_agentic_plan(self, context: "AgentContext") -> str:
+        steps = self._agentic_plan_steps(context)
+        return self._format_agentic_plan(steps)
+
+    def _with_plan(self, context: "AgentContext", output: AgentOutput) -> AgentOutput:
+        try:
+            plan = output.agentic_plan or self._build_agentic_plan(context)
+        except Exception:  # pragma: no cover - defensive fallback
+            logger.debug("Failed to build agentic plan", exc_info=True)
+            plan = output.agentic_plan or self._format_agentic_plan(
+                list(self.DEFAULT_AGENTIC_PLAN_STEPS)
+            )
+        output.agentic_plan = plan
+        if isinstance(output.data, dict) and plan:
+            output.data.setdefault("agentic_plan", plan)
+        return output
+
+    def _persist_agentic_plan(
+        self, context: "AgentContext", output: AgentOutput
+    ) -> None:
+        """Store the agent's reasoning plan for auditing and replay."""
+
+        plan = (output.agentic_plan or "").strip()
+        if not plan:
+            return
+
+        get_connection = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_connection):
+            logger.debug(
+                "Skipping agentic plan persistence for %s because AgentNick lacks a DB connection",
+                self.__class__.__name__,
+            )
+            return
+
+        table_flag = "_agent_plan_table_ready"
+
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    if not getattr(self.agent_nick, table_flag, False):
+                        cursor.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS proc.agent_plan (
+                                plan_id BIGSERIAL PRIMARY KEY,
+                                workflow_id text,
+                                agent_id text,
+                                agent_name text,
+                                action_id text,
+                                plan text NOT NULL,
+                                created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                                created_by text DEFAULT CURRENT_USER
+                            )
+                            """
+                        )
+                        setattr(self.agent_nick, table_flag, True)
+
+                    cursor.execute(
+                        """
+                        INSERT INTO proc.agent_plan (
+                            workflow_id,
+                            agent_id,
+                            agent_name,
+                            action_id,
+                            plan
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            getattr(context, "workflow_id", None),
+                            getattr(context, "agent_id", None),
+                            self.__class__.__name__,
+                            getattr(output, "action_id", None),
+                            plan,
+                        ),
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception(
+                "Failed to persist agentic plan for %s", self.__class__.__name__
+            )
 
     # ------------------------------------------------------------------
     # Utility helpers

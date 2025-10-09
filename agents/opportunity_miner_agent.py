@@ -370,6 +370,12 @@ class Finding:
 class OpportunityMinerAgent(BaseAgent):
     """Agent for identifying procurement anomalies and savings opportunities."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Aggregate spend, contract, invoice, and supplier datasets relevant to the workflow scope.",
+        "Run heuristics and ML signals to detect anomalies, policy gaps, and savings opportunities.",
+        "Prioritise opportunities with structured context and recommend follow-up actions for downstream agents.",
+    )
+
     def __init__(self, agent_nick, min_financial_impact: float = 100.0) -> None:
         super().__init__(agent_nick)
         self.min_financial_impact = min_financial_impact
@@ -1579,9 +1585,12 @@ class OpportunityMinerAgent(BaseAgent):
                     logger.info(
                         "OpportunityMinerAgent skipping run due to missing supplier identifier"
                     )
-                    return AgentOutput(
-                        status=AgentStatus.SUCCESS,
-                        data={"skipped": True, "reason": "missing_supplier_id"},
+                    return self._with_plan(
+                        context,
+                        AgentOutput(
+                            status=AgentStatus.SUCCESS,
+                            data={"skipped": True, "reason": "missing_supplier_id"},
+                        ),
                     )
             input_keys = sorted(input_data.keys()) if isinstance(input_data, dict) else []
             preview = ", ".join(input_keys[:5]) if input_keys else "none"
@@ -2193,15 +2202,21 @@ class OpportunityMinerAgent(BaseAgent):
             logger.info("OpportunityMinerAgent finishing processing")
             workflow_completed = True
 
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data=data,
-                pass_fields=data,
-                confidence=1.0,
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=data,
+                    pass_fields=data,
+                    confidence=1.0,
+                ),
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("OpportunityMinerAgent error: %s", exc)
-            return AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+            return self._with_plan(
+                context,
+                AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc)),
+            )
 
     # ------------------------------------------------------------------
     # Data ingestion and preparation
@@ -2792,11 +2807,18 @@ class OpportunityMinerAgent(BaseAgent):
         if policy_id:
             data["policy_id"] = policy_id
         logger.warning("OpportunityMinerAgent blocked execution: %s", message)
-        return AgentOutput(
-            status=AgentStatus.FAILED,
-            data=data,
-            pass_fields=data,
-            error=message,
+        dummy_context = AgentContext(
+            workflow_id="blocked", agent_id="opportunity_miner", user_id="system", input_data={}
+        )
+        dummy_context.routing_history = ["opportunity_miner"]
+        return self._with_plan(
+            dummy_context,
+            AgentOutput(
+                status=AgentStatus.FAILED,
+                data=data,
+                pass_fields=data,
+                error=message,
+            ),
         )
 
     def _missing_required_fields(

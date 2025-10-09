@@ -114,6 +114,12 @@ def ensure_payment_terms_score(df: pd.DataFrame) -> pd.DataFrame:
 class SupplierRankingAgent(BaseAgent):
     """Rank suppliers using procurement data, policies and contextual scores."""
 
+    AGENTIC_PLAN_STEPS = (
+        "Aggregate supplier performance, spend, and policy context relevant to the query.",
+        "Normalise metrics, apply weightings, and compute composite supplier scores.",
+        "Return ranked suppliers with rationale and hand-offs for downstream decisions.",
+    )
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.prompt_library: Dict[str, Any] = {}
@@ -397,10 +403,13 @@ class SupplierRankingAgent(BaseAgent):
                 )
             except Exception:
                 logger.exception("Failed to fetch supplier data")
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error="Failed to fetch supplier data",
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error="Failed to fetch supplier data",
+                    ),
                 )
         try:
             df = (
@@ -410,10 +419,13 @@ class SupplierRankingAgent(BaseAgent):
             )
         except Exception:
             logger.exception("Invalid supplier_data format")
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error="Failed to parse supplier_data into DataFrame",
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="Failed to parse supplier_data into DataFrame",
+                ),
             )
 
         if "supplier_id" in df.columns:
@@ -421,10 +433,13 @@ class SupplierRankingAgent(BaseAgent):
 
 
         if df.empty:
-            return AgentOutput(
-                status=AgentStatus.FAILED,
-                data={},
-                error="supplier_data is empty",
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error="supplier_data is empty",
+                ),
             )
 
         if "supplier_id" not in df.columns:
@@ -435,10 +450,13 @@ class SupplierRankingAgent(BaseAgent):
                 )
             else:
                 logger.error("supplier_data missing 'supplier_id' column")
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error="supplier_data missing 'supplier_id' column",
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error="supplier_data missing 'supplier_id' column",
+                    ),
                 )
 
         self._ensure_prompt_assets(context)
@@ -499,10 +517,13 @@ class SupplierRankingAgent(BaseAgent):
                     df["supplier_name"] = mapped_names
 
             if df.empty:
-                return AgentOutput(
-                    status=AgentStatus.FAILED,
-                    data={},
-                    error="No matching suppliers found for candidates",
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={},
+                        error="No matching suppliers found for candidates",
+                    ),
                 )
 
         if "supplier_name" in df.columns:
@@ -734,11 +755,14 @@ class SupplierRankingAgent(BaseAgent):
         }
         if total_rankings:
             pass_fields["rank_count"] = total_rankings
-        return AgentOutput(
-            status=AgentStatus.SUCCESS,
-            data=output_data,
-            pass_fields=pass_fields,
-            next_agents=["EmailDraftingAgent"],
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=output_data,
+                pass_fields=pass_fields,
+                next_agents=["EmailDraftingAgent"],
+            ),
         )
 
     # ------------------------------------------------------------------

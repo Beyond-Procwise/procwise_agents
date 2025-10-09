@@ -166,6 +166,18 @@ PRIMARY KEY (po_id)
     last_modified_by text COLLATE pg_catalog."default",
     last_modified_date timestamp without time zone,
 ```
+
+### `proc.agent_plan`
+```
+plan_id bigserial PRIMARY KEY,
+workflow_id text,
+agent_id text,
+agent_name text,
+action_id text,
+plan text NOT NULL,
+created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+created_by text DEFAULT CURRENT_USER
+```
 ### `proc.invoice_agent`
 ```
 invoice_id text NOT NULL DEFAULT ('IN'::text || lpad((nextval('proc.inv_sequence_new'::regclass))::text, 6, '0')),
