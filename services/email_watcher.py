@@ -4184,6 +4184,79 @@ class SESEmailWatcher:
                 return None
         return None
 
+    def _extract_dispatch_entries(self, payload: object) -> List[Dict[str, object]]:
+        """Return potential dispatch records from an action payload."""
+
+        entries: List[Dict[str, object]] = []
+        seen: Set[str] = set()
+        visited: Set[int] = set()
+
+        def _key(entry: Dict[str, object]) -> Optional[str]:
+            identifier = entry.get("draft_record_id") or entry.get("id")
+            if identifier not in (None, ""):
+                return f"id:{identifier}"
+            supplier = self._coerce_identifier(entry.get("supplier_id")) or ""
+            rfq = self._coerce_identifier(entry.get("rfq_id")) or ""
+            recipients = entry.get("recipients")
+            recipient_key: str = ""
+            if isinstance(recipients, (list, tuple, set)):
+                cleaned = []
+                for item in recipients:
+                    if item in (None, ""):
+                        continue
+                    try:
+                        cleaned.append(str(item).strip().lower())
+                    except Exception:
+                        continue
+                recipient_key = ",".join(sorted(cleaned))
+            elif recipients not in (None, ""):
+                try:
+                    recipient_key = str(recipients).strip().lower()
+                except Exception:
+                    recipient_key = ""
+            if not (supplier or recipient_key):
+                return None
+            return f"meta:{supplier}|{rfq}|{recipient_key}"
+
+        def _add(entry: Optional[Dict[str, object]]) -> None:
+            if not isinstance(entry, dict):
+                return
+            if id(entry) in visited:
+                return
+            visited.add(id(entry))
+            key = _key(entry)
+            if key is None or key in seen:
+                return
+            seen.add(key)
+            entries.append(entry)
+
+        def _walk(obj: object) -> None:
+            if isinstance(obj, dict):
+                _add(obj)
+                for candidate_key in ("draft", "dispatch"):
+                    candidate = obj.get(candidate_key)
+                    if isinstance(candidate, dict):
+                        _walk(candidate)
+                for group_key in ("drafts", "dispatches"):
+                    group = obj.get(group_key)
+                    if isinstance(group, dict):
+                        _walk(group)
+                    elif isinstance(group, (list, tuple, set)):
+                        for item in group:
+                            _walk(item)
+                for value in obj.values():
+                    if isinstance(value, dict):
+                        _walk(value)
+                    elif isinstance(value, (list, tuple, set)):
+                        for item in value:
+                            _walk(item)
+            elif isinstance(obj, (list, tuple, set)):
+                for item in obj:
+                    _walk(item)
+
+        _walk(payload)
+        return entries
+
     def _build_dispatch_expectation(
         self,
         action_id: Optional[str],
@@ -4250,11 +4323,11 @@ class SESEmailWatcher:
                             """
                             SELECT action_id, process_output
                             FROM proc.action
-                            WHERE agent_type = %s
+                            WHERE agent_type = %s OR agent_type = %s
                             ORDER BY action_date DESC
                             LIMIT 20
                             """,
-                            ("EmailDraftingAgent",),
+                            ("EmailDraftingAgent", "email_dispatch"),
                         )
                         rows.extend(cur.fetchall() or [])
         except Exception:
@@ -4278,7 +4351,13 @@ class SESEmailWatcher:
                 # Without an explicit action identifier prefer matching workflow metadata
                 continue
 
-            drafts = output.get("drafts") if isinstance(output.get("drafts"), list) else []
+            dispatch_entries = self._extract_dispatch_entries(output)
+            if dispatch_entries:
+                drafts = dispatch_entries
+            else:
+                drafts = (
+                    output.get("drafts") if isinstance(output.get("drafts"), list) else []
+                )
             expectation = self._build_dispatch_expectation(
                 self._coerce_identifier(row_action_id),
                 candidate_workflow or workflow_id,
