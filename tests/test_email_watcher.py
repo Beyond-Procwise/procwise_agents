@@ -233,6 +233,106 @@ def test_build_dispatch_expectation_from_dispatch_entries():
 
 
 
+def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "dispatches": [
+                {
+                    "draft": {
+                        "draft_record_id": 501,
+                        "supplier_id": "SUP-SENT",
+                        "recipients": ["sent@example.com"],
+                        "sent_status": True,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 502,
+                        "supplier_id": "SUP-FAILED",
+                        "recipients": ["failed@example.com"],
+                        "sent_status": False,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 503,
+                        "supplier_id": "SUP-PENDING",
+                        "recipients": ["pending@example.com"],
+                        "metadata": {"status": "pending"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 504,
+                        "supplier_id": "SUP-ERROR",
+                        "recipients": ["error@example.com"],
+                        "metadata": {"status": "failed"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 505,
+                        "supplier_id": "SUP-SUCCESS",
+                        "recipients": ["ok@example.com"],
+                        "metadata": {"status": "success"},
+                    }
+                },
+            ]
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    suppliers = {entry.get("supplier_id") for entry in entries}
+    assert suppliers == {"SUP-SENT", "SUP-SUCCESS"}
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-ok",
+        "workflow-ok",
+        entries,
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 2
+    assert set(expectation.draft_ids) == {501, 505}
+
+
+def test_extract_dispatch_entries_ignores_draft_metadata_records():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "draft": {
+                "id": 900,
+                "supplier_id": "SUP-META",
+                "recipients": ["meta@example.com"],
+                "metadata": {
+                    "supplier_id": "SUP-META",
+                    "rfq_id": "RFQ-META",
+                },
+            }
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert entries == [
+        {
+            "id": 900,
+            "supplier_id": "SUP-META",
+            "recipients": ["meta@example.com"],
+            "metadata": {
+                "supplier_id": "SUP-META",
+                "rfq_id": "RFQ-META",
+            },
+        }
+    ]
+
+
 def test_email_watcher_watch_respects_limit(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)
