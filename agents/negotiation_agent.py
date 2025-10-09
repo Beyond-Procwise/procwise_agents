@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -61,6 +62,71 @@ TRADE_OFF_HINTS = {
 }
 
 PLAYBOOK_PATH = Path(__file__).resolve().parent.parent / "resources" / "reference_data" / "negotiation_playbook.json"
+
+MARKET_REVIEW_THRESHOLD = float(os.getenv("NEG_MARKET_REVIEW_PCT", "0.2"))
+MARKET_ESCALATION_THRESHOLD = float(os.getenv("NEG_MARKET_ESCALATION_PCT", "0.4"))
+MAX_VOLUME_LIMIT = float(os.getenv("NEG_MAX_VOLUME_LIMIT", "1000"))
+MAX_TERM_DAYS = int(os.getenv("NEG_MAX_TERM_DAYS", "120"))
+
+
+@dataclass
+class NegotiationPositions:
+    start: Optional[float]
+    desired: Optional[float]
+    no_deal: Optional[float]
+    supplier_offer: Optional[float] = None
+    history: List[Dict[str, Any]] = field(default_factory=list)
+
+    def serialise(self) -> Dict[str, Any]:
+        return {
+            "start": self.start,
+            "desired": self.desired,
+            "no_deal": self.no_deal,
+            "supplier_offer": self.supplier_offer,
+            "history": list(self.history),
+        }
+
+    def snapshot_for_next_round(
+        self, counter_price: Optional[float], round_no: int
+    ) -> Dict[str, Any]:
+        history = list(self.history)
+
+        def _append(entry_type: str, value: Optional[float]) -> None:
+            if value is None:
+                return
+            record = {
+                "round": round_no,
+                "type": entry_type,
+                "value": value,
+            }
+            if not any(
+                existing.get("round") == record["round"]
+                and existing.get("type") == record["type"]
+                and self._is_close(existing.get("value"), record["value"])
+                for existing in history
+            ):
+                history.append(record)
+
+        _append("supplier_offer", self.supplier_offer)
+        _append("counter", counter_price)
+
+        next_start = counter_price if counter_price is not None else self.start
+
+        return {
+            "start": next_start,
+            "desired": self.desired,
+            "no_deal": self.no_deal,
+            "supplier_offer": self.supplier_offer,
+            "history": history,
+            "last_counter": counter_price if counter_price is not None else next_start,
+        }
+
+    @staticmethod
+    def _is_close(value_a: Any, value_b: Any, *, tolerance: float = 1e-6) -> bool:
+        try:
+            return abs(float(value_a) - float(value_b)) <= tolerance
+        except (TypeError, ValueError):
+            return False
 
 
 def compute_decision(
@@ -180,32 +246,31 @@ class NegotiationAgent(BaseAgent):
             if context.input_data.get("current_offer") is not None
             else context.input_data.get("price")
         )
-        target_raw = context.input_data.get("target_price")
-        currency = self._normalise_currency(
-            context.input_data.get("currency")
-            or context.input_data.get("current_offer_currency")
-            or context.input_data.get("price_currency")
+
+        normalised_inputs, validation_issues = self._normalise_negotiation_inputs(
+            context.input_data
         )
+
+        price = normalised_inputs.get("current_offer")
+        target_price = normalised_inputs.get("target_price")
+        walkaway_price = normalised_inputs.get("walkaway_price")
+        currency = normalised_inputs.get("currency")
+        lead_weeks = normalised_inputs.get("lead_time_weeks")
+        volume_units = normalised_inputs.get("volume_units")
+        term_days = normalised_inputs.get("term_days")
+        valid_until = normalised_inputs.get("valid_until")
+        market_floor = normalised_inputs.get("market_floor_price")
+
         currency_conf = self._coerce_float(
             context.input_data.get("currency_confidence")
             or context.input_data.get("current_offer_currency_confidence")
         )
-
-        price = self._coerce_float(price_raw)
-        target_price = self._coerce_float(target_raw)
-
         if currency_conf is not None and currency_conf < 0.5:
             logger.warning(
                 "Currency confidence %.2f below threshold; withholding price data", currency_conf
             )
             currency = None
             price = None
-
-        lead_weeks = self._parse_lead_weeks(
-            context.input_data.get("lead_time_weeks")
-            or context.input_data.get("lead_time")
-            or context.input_data.get("lead_time_days")
-        )
 
         constraints = self._ensure_list(context.input_data.get("constraints"))
         supplier_snippets = self._collect_supplier_snippets(context.input_data)
@@ -225,6 +290,34 @@ class NegotiationAgent(BaseAgent):
             except (TypeError, ValueError):
                 round_no = max(round_no, 1)
         state["current_round"] = max(round_no, 1)
+
+        previous_positions = state.get("positions") if isinstance(state.get("positions"), dict) else None
+        previous_counter_hint = (
+            context.input_data.get("agent_previous_offer")
+            or context.input_data.get("previous_counter_price")
+            or (
+                previous_positions.get("last_counter")
+                if isinstance(previous_positions, dict)
+                else None
+            )
+            or state.get("last_counter_price")
+        )
+        previous_counter = self._coerce_float(previous_counter_hint)
+        positions = self._build_positions(
+            supplier_offer=price,
+            target_price=target_price,
+            walkaway_price=walkaway_price,
+            previous_counter=previous_counter,
+            previous_positions=previous_positions,
+            round_no=round_no,
+        )
+        target_price = positions.desired
+        walkaway_price = positions.no_deal
+        price = (
+            positions.supplier_offer
+            if positions.supplier_offer is not None
+            else positions.start
+        )
 
         incoming_subject = self._coerce_text(context.input_data.get("subject"))
         base_candidate = self._normalise_base_subject(incoming_subject)
@@ -253,15 +346,28 @@ class NegotiationAgent(BaseAgent):
             "round": raw_round,
             "currency": currency,
             "max_rounds": context.input_data.get("max_rounds") or 3,
-            "walkaway_price": self._coerce_float(context.input_data.get("walkaway_price")),
+            "walkaway_price": walkaway_price,
             "ask_early_pay_disc": context.input_data.get("ask_early_pay_disc", 0.02),
             "ask_lead_time_keep": context.input_data.get("ask_lead_time_keep", True),
         }
-        offer_prev = self._coerce_float(
-            context.input_data.get("previous_offer")
-            or context.input_data.get("supplier_previous_offer")
-            or context.input_data.get("last_supplier_offer")
-        )
+        pricing_payload["start_position"] = positions.start
+        pricing_payload["desired_position"] = positions.desired
+        pricing_payload["no_deal_position"] = positions.no_deal
+
+        offer_prev = normalised_inputs.get("previous_offer")
+        if offer_prev is None and positions.history:
+            for entry in reversed(positions.history):
+                if entry.get("type") != "supplier_offer":
+                    continue
+                value = self._coerce_float(entry.get("value"))
+                if value is None:
+                    continue
+                if positions.supplier_offer is not None and NegotiationPositions._is_close(
+                    value, positions.supplier_offer
+                ):
+                    continue
+                offer_prev = value
+                break
 
         decision = decide_strategy(
             pricing_payload,
@@ -279,12 +385,77 @@ class NegotiationAgent(BaseAgent):
             target_price=target_price,
             price=price,
         )
+        base_plan_message = decision.get("rationale")
         decision.setdefault("strategy", "clarify")
         decision.setdefault("counter_price", None)
         decision.setdefault("asks", [])
         decision.setdefault("lead_time_request", None)
         decision.setdefault("rationale", "")
         decision["closing_round"] = round_no >= 3
+        decision["counter_price"] = self._respect_positions(
+            decision.get("counter_price"), positions
+        )
+        decision["positions"] = positions.serialise()
+        if validation_issues:
+            decision["validation_issues"] = validation_issues
+        if volume_units is not None:
+            decision["volume_units"] = volume_units
+        if term_days is not None:
+            decision["term_days"] = term_days
+        if valid_until:
+            decision["valid_until"] = valid_until
+        if market_floor is not None:
+            decision["market_floor_price"] = market_floor
+        decision["plan_counter_message"] = base_plan_message
+
+        outlier_result = self._detect_outliers(
+            supplier_offer=positions.supplier_offer,
+            target_price=positions.desired,
+            walkaway_price=positions.no_deal,
+            market_floor=market_floor,
+            volume_units=volume_units,
+            term_days=term_days,
+        )
+        if outlier_result.get("alerts"):
+            decision.setdefault("alerts", [])
+            for alert in outlier_result["alerts"]:
+                if alert not in decision["alerts"]:
+                    decision["alerts"].append(alert)
+            decision["outlier_alerts"] = outlier_result["alerts"]
+        if outlier_result.get("requires_review"):
+            decision["strategy"] = "review"
+            decision.setdefault("flags", {})
+            decision["flags"]["review_recommended"] = True
+            decision["recommendation"] = (
+                outlier_result.get("recommendation") or "query_for_human_review"
+            )
+            asks = list(decision.get("asks", []))
+            asks.append("Please justify the requested pricing/terms for internal review.")
+            decision["asks"] = list(dict.fromkeys(asks))
+            if not outlier_result.get("human_override"):
+                decision["counter_price"] = self._respect_positions(
+                    decision.get("counter_price"), positions
+                )
+        if outlier_result.get("human_override"):
+            decision.setdefault("flags", {})
+            decision["flags"]["human_override_required"] = True
+            decision["human_override_required"] = True
+            decision["counter_price"] = None
+
+        structured_rationale = self._compose_rationale(
+            positions=positions,
+            decision=decision,
+            currency=currency,
+            lead_weeks=lead_weeks,
+            volume_units=volume_units,
+            term_days=term_days,
+            outlier_message=outlier_result.get("message"),
+            validation_issues=validation_issues,
+        )
+        if base_plan_message and base_plan_message not in structured_rationale:
+            decision["rationale"] = f"{structured_rationale} {base_plan_message}".strip()
+        else:
+            decision["rationale"] = structured_rationale
 
         playbook_context = self._resolve_playbook_context(context, decision)
         play_recommendations = playbook_context.get("plays", [])
@@ -318,11 +489,23 @@ class NegotiationAgent(BaseAgent):
             supplier_reply_registered = True
 
         decision["round"] = round_no
+        state["positions"] = positions.snapshot_for_next_round(
+            decision.get("counter_price"), round_no
+        )
+        state["last_counter_price"] = decision.get("counter_price")
 
         final_offer_reason = self._detect_final_offer(supplier_message, supplier_snippets)
         should_continue, new_status, halt_reason = self._should_continue(
             state, supplier_reply_registered, final_offer_reason
         )
+
+        if outlier_result.get("human_override"):
+            should_continue = False
+            new_status = "PAUSED"
+            halt_reason = outlier_result.get("message") or "Human override required."
+            decision.setdefault("status_reason", halt_reason)
+        elif outlier_result.get("requires_review") and outlier_result.get("message"):
+            decision.setdefault("status_reason", outlier_result.get("message"))
 
         savings_score = 0.0
         if price and price > 0 and target_price is not None:
@@ -354,7 +537,10 @@ class NegotiationAgent(BaseAgent):
             )
             awaiting_now = bool(state.get("awaiting_response", False))
             negotiation_open = (
-                new_status not in {"COMPLETED", "EXHAUSTED"} and not awaiting_now
+                new_status not in {"COMPLETED", "EXHAUSTED"}
+                and not awaiting_now
+                and decision.get("strategy") != "review"
+                and not decision.get("human_override_required")
             )
             data = {
                 "supplier": supplier,
@@ -381,6 +567,15 @@ class NegotiationAgent(BaseAgent):
                 "play_recommendations": play_recommendations,
                 "playbook_descriptor": playbook_context.get("descriptor"),
                 "playbook_examples": playbook_context.get("examples"),
+                "positions": decision.get("positions"),
+                "validation_issues": decision.get("validation_issues"),
+                "outlier_alerts": decision.get("outlier_alerts"),
+                "volume_units": volume_units,
+                "term_days": term_days,
+                "valid_until": valid_until,
+                "flags": decision.get("flags"),
+                "market_floor_price": market_floor,
+                "normalised_inputs": normalised_inputs,
             }
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s rfq_id=%s reason=%s",
@@ -477,6 +672,16 @@ class NegotiationAgent(BaseAgent):
             "playbook_descriptor": playbook_context.get("descriptor"),
             "playbook_examples": playbook_context.get("examples"),
             "counter_options": counter_options,
+            "positions": decision.get("positions"),
+            "validation_issues": decision.get("validation_issues"),
+            "outlier_alerts": decision.get("outlier_alerts"),
+            "flags": decision.get("flags"),
+            "volume_units": volume_units,
+            "term_days": term_days,
+            "valid_until": valid_until,
+            "market_floor_price": market_floor,
+            "normalised_inputs": normalised_inputs,
+            "human_override_required": decision.get("human_override_required", False),
         }
 
         draft_payload.setdefault("subject", self._format_negotiation_subject(state))
@@ -498,6 +703,14 @@ class NegotiationAgent(BaseAgent):
             "rationale": decision.get("rationale"),
             "intent": "NEGOTIATION_COUNTER",
             "play_recommendations": play_recommendations,
+            "positions": decision.get("positions"),
+            "validation_issues": decision.get("validation_issues"),
+            "outlier_alerts": decision.get("outlier_alerts"),
+            "flags": decision.get("flags"),
+            "volume_units": volume_units,
+            "term_days": term_days,
+            "valid_until": valid_until,
+            "market_floor_price": market_floor,
         }
 
         email_action_id: Optional[str] = None
@@ -646,6 +859,15 @@ class NegotiationAgent(BaseAgent):
             "play_recommendations": play_recommendations,
             "playbook_descriptor": playbook_context.get("descriptor"),
             "playbook_examples": playbook_context.get("examples"),
+            "positions": decision.get("positions"),
+            "validation_issues": decision.get("validation_issues"),
+            "outlier_alerts": decision.get("outlier_alerts"),
+            "flags": decision.get("flags"),
+            "volume_units": volume_units,
+            "term_days": term_days,
+            "valid_until": valid_until,
+            "market_floor_price": market_floor,
+            "normalised_inputs": normalised_inputs,
         }
 
         if email_subject:
@@ -1149,6 +1371,8 @@ class NegotiationAgent(BaseAgent):
             "last_email_sent_at": None,
             "base_subject": None,
             "initial_body": None,
+            "positions": {},
+            "last_counter_price": None,
         }
 
     def _public_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2252,6 +2476,459 @@ class NegotiationAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Parsing helpers
     # ------------------------------------------------------------------
+    def _normalise_negotiation_inputs(
+        self, payload: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        normalised: Dict[str, Any] = {}
+        issues: List[str] = []
+
+        price_sources = [
+            payload.get("current_offer"),
+            payload.get("price"),
+            payload.get("supplier_offer"),
+        ]
+        target_sources = [payload.get("target_price"), payload.get("target")]
+        walkaway_sources = [payload.get("walkaway_price"), payload.get("walkaway"), payload.get("no_deal_price")]
+        previous_offer_sources = [
+            payload.get("previous_offer"),
+            payload.get("supplier_previous_offer"),
+            payload.get("last_supplier_offer"),
+            payload.get("offer_prev"),
+        ]
+
+        def _pick_first(values: List[Any], parser) -> Optional[float]:
+            for candidate in values:
+                parsed = parser(candidate)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        normalised["current_offer"] = _pick_first(price_sources, self._parse_money)
+        normalised["target_price"] = _pick_first(target_sources, self._parse_money)
+        normalised["walkaway_price"] = _pick_first(walkaway_sources, self._parse_money)
+        normalised["previous_offer"] = _pick_first(previous_offer_sources, self._parse_money)
+
+        currency = (
+            payload.get("currency")
+            or payload.get("current_offer_currency")
+            or payload.get("price_currency")
+        )
+        normalised["currency"] = self._normalise_currency(currency)
+
+        lead_sources = [
+            payload.get("lead_time_weeks"),
+            payload.get("lead_time"),
+            payload.get("lead_time_days"),
+        ]
+        lead_weeks = None
+        for candidate in lead_sources:
+            lead_weeks = self._parse_lead_weeks(candidate)
+            if lead_weeks is not None:
+                break
+        normalised["lead_time_weeks"] = lead_weeks
+
+        volume_sources = [
+            payload.get("volume"),
+            payload.get("volume_commitment"),
+            payload.get("order_volume"),
+            payload.get("order_quantity"),
+            payload.get("quantity"),
+            payload.get("units"),
+        ]
+        normalised["volume_units"] = _pick_first(volume_sources, self._parse_quantity)
+
+        term_sources = [
+            payload.get("term_days"),
+            payload.get("payment_terms"),
+            payload.get("payment_term"),
+            payload.get("terms"),
+        ]
+        normalised["term_days"] = _pick_first(term_sources, self._parse_term_days)
+
+        valid_until_sources = [
+            payload.get("valid_until"),
+            payload.get("offer_valid_until"),
+            payload.get("validity"),
+            payload.get("expiration_date"),
+            payload.get("expiry_date"),
+        ]
+        valid_until = None
+        for candidate in valid_until_sources:
+            valid_until = self._parse_date(candidate)
+            if valid_until is not None:
+                break
+        normalised["valid_until"] = valid_until
+
+        reference_prices = self._extract_reference_prices(payload)
+        normalised.update(reference_prices)
+
+        essential_labels = {
+            "current_offer": "Supplier offer",
+            "target_price": "Target price",
+        }
+        for field, label in essential_labels.items():
+            if normalised.get(field) is None:
+                issues.append(f"{label} missing or invalid")
+
+        return normalised, issues
+
+    def _parse_money(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            cleaned = re.sub(r"[\s,]", "", text)
+            match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+            if match:
+                try:
+                    return float(match.group())
+                except ValueError:
+                    return None
+        return None
+
+    def _parse_quantity(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            match = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
+            if match:
+                try:
+                    return float(match.group())
+                except ValueError:
+                    return None
+        return None
+
+    def _parse_term_days(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            candidate = int(round(float(value)))
+            return candidate if candidate > 0 else None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if not text:
+                return None
+            numbers = re.findall(r"\d+(?:\.\d+)?", text)
+            if not numbers:
+                return None
+            try:
+                numeric = float(numbers[0])
+            except ValueError:
+                return None
+            if "week" in text and numeric > 0:
+                return int(round(numeric * 7))
+            return int(round(numeric)) if numeric > 0 else None
+        return None
+
+    def _parse_date(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            for fmt in (
+                "%Y-%m-%d",
+                "%d/%m/%Y",
+                "%m/%d/%Y",
+                "%d-%m-%Y",
+                "%d %b %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    return dt.replace(tzinfo=timezone.utc).isoformat()
+                except ValueError:
+                    continue
+            try:
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                return None
+        return None
+
+    def _extract_reference_prices(self, payload: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        candidates: List[float] = []
+
+        def _ingest(value: Any) -> None:
+            parsed = self._parse_money(value)
+            if parsed is not None:
+                candidates.append(parsed)
+
+        for key in ("benchmarks", "market_context", "market_prices", "history"):
+            source = payload.get(key)
+            if isinstance(source, dict):
+                for sub_key, sub_value in source.items():
+                    lowered = str(sub_key).lower()
+                    if any(
+                        token in lowered
+                        for token in ("price", "p10", "p25", "low", "min", "floor")
+                    ):
+                        _ingest(sub_value)
+            elif isinstance(source, list):
+                for item in source:
+                    if isinstance(item, dict):
+                        for sub_value in item.values():
+                            _ingest(sub_value)
+                    else:
+                        _ingest(item)
+
+        lowest_market = min(candidates) if candidates else None
+        return {"market_floor_price": lowest_market}
+
+    def _build_positions(
+        self,
+        *,
+        supplier_offer: Optional[float],
+        target_price: Optional[float],
+        walkaway_price: Optional[float],
+        previous_counter: Optional[float],
+        previous_positions: Optional[Dict[str, Any]],
+        round_no: int,
+    ) -> NegotiationPositions:
+        history: List[Dict[str, Any]] = []
+        if isinstance(previous_positions, dict):
+            stored_history = previous_positions.get("history")
+            if isinstance(stored_history, list):
+                history = [
+                    entry
+                    for entry in stored_history
+                    if isinstance(entry, dict) and entry.get("round") is not None
+                ]
+        desired = self._coerce_float(target_price)
+        if desired is None and isinstance(previous_positions, dict):
+            desired = self._coerce_float(previous_positions.get("desired"))
+        no_deal = self._coerce_float(walkaway_price)
+        if no_deal is None and isinstance(previous_positions, dict):
+            no_deal = self._coerce_float(previous_positions.get("no_deal"))
+
+        candidate_starts: List[Optional[float]] = []
+        candidate_starts.append(self._coerce_float(previous_counter))
+        if isinstance(previous_positions, dict):
+            candidate_starts.append(self._coerce_float(previous_positions.get("last_counter")))
+            candidate_starts.append(self._coerce_float(previous_positions.get("start")))
+        candidate_starts.append(self._coerce_float(supplier_offer))
+
+        start_value: Optional[float] = None
+        for candidate in candidate_starts:
+            if candidate is not None:
+                start_value = candidate
+                break
+
+        positions = NegotiationPositions(
+            start=start_value,
+            desired=desired,
+            no_deal=no_deal,
+            supplier_offer=self._coerce_float(supplier_offer),
+            history=history,
+        )
+
+        if positions.supplier_offer is not None:
+            positions.history.append(
+                {
+                    "round": round_no,
+                    "type": "supplier_offer",
+                    "value": positions.supplier_offer,
+                }
+            )
+
+        return positions
+
+    def _respect_positions(
+        self, counter: Optional[float], positions: NegotiationPositions
+    ) -> Optional[float]:
+        if counter is None:
+            return None
+        try:
+            candidate = float(counter)
+        except (TypeError, ValueError):
+            return None
+
+        if positions.desired is not None:
+            try:
+                candidate = max(candidate, float(positions.desired))
+            except (TypeError, ValueError):
+                pass
+        if positions.no_deal is not None:
+            try:
+                candidate = min(candidate, float(positions.no_deal))
+            except (TypeError, ValueError):
+                pass
+        if positions.start is not None:
+            try:
+                candidate = min(candidate, float(positions.start))
+            except (TypeError, ValueError):
+                pass
+
+        return round(candidate, 2)
+
+    def _detect_outliers(
+        self,
+        *,
+        supplier_offer: Optional[float],
+        target_price: Optional[float],
+        walkaway_price: Optional[float],
+        market_floor: Optional[float],
+        volume_units: Optional[float],
+        term_days: Optional[int],
+    ) -> Dict[str, Any]:
+        alerts: List[str] = []
+        requires_review = False
+        human_override = False
+        review_recommendation: Optional[str] = None
+        rationale_notes: List[str] = []
+
+        def _percentage_gap(reference: Optional[float], offer: Optional[float]) -> Optional[float]:
+            try:
+                if reference is None or offer is None or reference <= 0:
+                    return None
+                return (reference - offer) / reference
+            except (TypeError, ValueError):
+                return None
+
+        market_gap = _percentage_gap(market_floor, supplier_offer)
+        walkaway_gap = _percentage_gap(walkaway_price, supplier_offer)
+
+        if market_gap is not None and market_gap >= MARKET_REVIEW_THRESHOLD:
+            requires_review = True
+            review_recommendation = "query_for_human_review"
+            alerts.append(
+                f"Supplier offer is {market_gap * 100:.1f}% below market reference {market_floor:.2f}."
+            )
+            rationale_notes.append("Requested price is materially below market benchmarks; seek justification.")
+            if market_gap >= MARKET_ESCALATION_THRESHOLD:
+                human_override = True
+                rationale_notes.append(
+                    "Supplier offer breaches escalation threshold relative to market floor."
+                )
+
+        if walkaway_gap is not None and walkaway_gap >= MARKET_REVIEW_THRESHOLD:
+            requires_review = True
+            review_recommendation = review_recommendation or "query_for_human_review"
+            alerts.append(
+                f"Supplier offer is {walkaway_gap * 100:.1f}% below walk-away price {walkaway_price:.2f}."
+            )
+            rationale_notes.append(
+                "Requested price undercuts internal walk-away guardrail; confirm intent before proceeding."
+            )
+            if walkaway_gap >= MARKET_ESCALATION_THRESHOLD:
+                human_override = True
+                rationale_notes.append(
+                    "The requested price is more than 20% below our walk-away price; escalation required."
+                )
+
+        if volume_units is not None and volume_units > MAX_VOLUME_LIMIT:
+            requires_review = True
+            review_recommendation = review_recommendation or "query_for_human_review"
+            alerts.append(
+                f"Requested volume {volume_units:.0f} exceeds configured limit {MAX_VOLUME_LIMIT:.0f}."
+            )
+            rationale_notes.append("Request supplier rationale for above-capacity volume.")
+            if volume_units > MAX_VOLUME_LIMIT * 1.5:
+                human_override = True
+                rationale_notes.append("Volume exceeds escalation ceiling; seek human approval.")
+
+        if term_days is not None and term_days > MAX_TERM_DAYS:
+            requires_review = True
+            review_recommendation = review_recommendation or "query_for_human_review"
+            alerts.append(
+                f"Requested payment term {term_days} days exceeds policy limit {MAX_TERM_DAYS} days."
+            )
+            rationale_notes.append("Payment term exceeds policy; confirm via human review.")
+            if term_days > MAX_TERM_DAYS * 2:
+                human_override = True
+                rationale_notes.append("Payment term far exceeds tolerance; human intervention required.")
+
+        message = None
+        if human_override:
+            for note in rationale_notes[::-1]:
+                if "escalation required" in note.lower():
+                    message = note
+                    break
+            message = message or "Escalation required before proceeding."
+        elif requires_review and rationale_notes:
+            message = rationale_notes[-1]
+
+        return {
+            "alerts": alerts,
+            "requires_review": requires_review,
+            "human_override": human_override,
+            "recommendation": review_recommendation,
+            "message": message,
+        }
+
+    def _compose_rationale(
+        self,
+        *,
+        positions: NegotiationPositions,
+        decision: Dict[str, Any],
+        currency: Optional[str],
+        lead_weeks: Optional[float],
+        volume_units: Optional[float],
+        term_days: Optional[int],
+        outlier_message: Optional[str],
+        validation_issues: List[str],
+    ) -> str:
+        counter_price = decision.get("counter_price")
+        parts: List[str] = []
+
+        def _format(amount: Optional[float]) -> Optional[str]:
+            if amount is None:
+                return None
+            text = self._format_currency(amount, currency)
+            return text or f"{amount:0.2f}"
+
+        start_text = _format(positions.start)
+        target_text = _format(positions.desired)
+        counter_text = _format(counter_price)
+
+        if start_text and target_text and counter_text:
+            rationale = (
+                f"Because the starting price is {start_text} and the target is {target_text}, "
+                f"we counter at {counter_text}"
+            )
+        elif counter_text:
+            rationale = f"We counter at {counter_text} based on the available pricing guardrails"
+        else:
+            rationale = "Pricing inputs incomplete; request clarification before committing to a counter"
+
+        additions: List[str] = []
+        if term_days:
+            additions.append(f"{int(term_days)}-day term")
+        if volume_units:
+            additions.append(f"{int(round(volume_units))}-unit volume")
+        if lead_weeks:
+            additions.append(f"{lead_weeks:.1f}-week lead time request")
+        if additions and counter_text:
+            rationale += " with " + " and ".join(additions)
+
+        parts.append(rationale + ".")
+
+        if validation_issues:
+            issue_text = "; ".join(sorted(set(validation_issues)))
+            parts.append(f"Data validation flagged: {issue_text}.")
+
+        if outlier_message:
+            parts.append(outlier_message)
+
+        return " ".join(part for part in parts if part)
+
     def _format_currency(self, value: Optional[float], currency: Optional[str]) -> str:
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return ""
