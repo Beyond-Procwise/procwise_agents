@@ -218,6 +218,14 @@ class NegotiationAgent(BaseAgent):
         # Load state before subject normalization (bug fix)
         state, _ = self._load_session_state(rfq_id, supplier)
 
+        round_no = int(state.get("current_round", 1))
+        if isinstance(raw_round, (int, float)):
+            try:
+                round_no = max(round_no, int(raw_round))
+            except (TypeError, ValueError):
+                round_no = max(round_no, 1)
+        state["current_round"] = max(round_no, 1)
+
         incoming_subject = self._coerce_text(context.input_data.get("subject"))
         base_candidate = self._normalise_base_subject(incoming_subject)
         if base_candidate and not state.get("base_subject"):
@@ -309,9 +317,6 @@ class NegotiationAgent(BaseAgent):
             state["awaiting_response"] = False
             supplier_reply_registered = True
 
-        round_no = int(state.get("current_round", 1))
-        if isinstance(raw_round, (int, float)):
-            round_no = max(round_no, int(raw_round))
         decision["round"] = round_no
 
         final_offer_reason = self._detect_final_offer(supplier_message, supplier_snippets)
@@ -2133,46 +2138,10 @@ class NegotiationAgent(BaseAgent):
         awaiting_response: bool,
         supplier_reply_registered: bool,
     ) -> None:
-        settings = getattr(self.agent_nick, "settings", None)
-        if settings is not None and not getattr(settings, "enable_learning", False):
-            return
-        training_endpoint = getattr(self.agent_nick, "model_training_endpoint", None)
-        if training_endpoint is not None and hasattr(
-            training_endpoint, "queue_negotiation_learning"
-        ):
-            try:
-                training_endpoint.queue_negotiation_learning(
-                    workflow_id=getattr(context, "workflow_id", None),
-                    rfq_id=rfq_id,
-                    supplier_id=supplier,
-                    decision=dict(decision or {}),
-                    state=dict(state or {}),
-                    awaiting_response=awaiting_response,
-                    supplier_reply_registered=supplier_reply_registered,
-                )
-                return
-            except Exception:
-                logger.debug(
-                    "Failed to queue negotiation learning via training endpoint", exc_info=True
-                )
-        repository = getattr(self, "learning_repository", None)
-        if repository is None:
-            return
-        try:
-            repository.record_negotiation_learning(
-                workflow_id=getattr(context, "workflow_id", None),
-                rfq_id=rfq_id,
-                supplier_id=supplier,
-                decision=decision,
-                state=state,
-                awaiting_response=awaiting_response,
-                supplier_reply_registered=supplier_reply_registered,
-            )
-        except Exception:
-            logger.debug(
-                "Failed to capture negotiation learning for %s/%s", rfq_id, supplier,
-                exc_info=True,
-            )
+        logger.debug(
+            "Negotiation learning capture skipped (rfq_id=%s, supplier=%s)", rfq_id, supplier
+        )
+        return
 
     def _collect_recipient_candidates(self, context: AgentContext) -> List[str]:
         seen: Set[str] = set()

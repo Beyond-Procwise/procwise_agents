@@ -556,7 +556,7 @@ def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
     assert recorded_state.get("awaiting_response") is True
 
 
-def test_learning_snapshot_skipped_when_learning_disabled():
+def test_learning_snapshot_noop_when_learning_disabled():
     class Recorder:
         def __init__(self):
             self.calls = 0
@@ -589,15 +589,13 @@ def test_learning_snapshot_skipped_when_learning_disabled():
     assert repo.calls == 0
 
 
-def test_learning_snapshot_captured_when_learning_enabled():
+def test_learning_snapshot_noop_even_when_learning_enabled():
     class Recorder:
         def __init__(self):
             self.calls = 0
-            self.payloads = []
 
-        def record_negotiation_learning(self, **payload):
+        def record_negotiation_learning(self, **_):
             self.calls += 1
-            self.payloads.append(payload)
 
     nick = DummyNick(enable_learning=True)
     repo = Recorder()
@@ -621,19 +619,16 @@ def test_learning_snapshot_captured_when_learning_enabled():
         supplier_reply_registered=True,
     )
 
-    assert repo.calls == 1
-    payload = repo.payloads[0]
-    assert payload["workflow_id"] == "wf-enabled"
-    assert payload["rfq_id"] == "RFQ-002"
+    assert repo.calls == 0
 
 
-def test_learning_snapshot_queued_via_training_endpoint():
+def test_learning_snapshot_ignores_training_endpoint():
     class EndpointRecorder:
         def __init__(self):
-            self.calls = []
+            self.calls = 0
 
-        def queue_negotiation_learning(self, **payload):
-            self.calls.append(payload)
+        def queue_negotiation_learning(self, **_):
+            self.calls += 1
 
     class RepoSpy:
         def __init__(self):
@@ -666,9 +661,5 @@ def test_learning_snapshot_queued_via_training_endpoint():
         supplier_reply_registered=True,
     )
 
-    assert len(endpoint.calls) == 1
-    queued = endpoint.calls[0]
-    assert queued["workflow_id"] == "wf-queue"
-    assert queued["rfq_id"] == "RFQ-100"
-    assert queued["decision"]["round"] == 2
+    assert endpoint.calls == 0
     assert repo.calls == 0
