@@ -300,6 +300,39 @@ def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
     assert set(expectation.draft_ids) == {501, 505}
 
 
+def test_extract_dispatch_entries_ignores_draft_metadata_records():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "draft": {
+                "id": 900,
+                "supplier_id": "SUP-META",
+                "recipients": ["meta@example.com"],
+                "metadata": {
+                    "supplier_id": "SUP-META",
+                    "rfq_id": "RFQ-META",
+                },
+            }
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert entries == [
+        {
+            "id": 900,
+            "supplier_id": "SUP-META",
+            "recipients": ["meta@example.com"],
+            "metadata": {
+                "supplier_id": "SUP-META",
+                "rfq_id": "RFQ-META",
+            },
+        }
+    ]
+
+
 def test_email_watcher_watch_respects_limit(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)

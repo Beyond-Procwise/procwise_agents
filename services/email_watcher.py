@@ -4275,10 +4275,10 @@ class SESEmailWatcher:
             identifier = entry.get("draft_record_id") or entry.get("id")
             if identifier not in (None, ""):
                 return f"id:{identifier}"
-            supplier = self._coerce_identifier(entry.get("supplier_id")) or ""
-            rfq = self._coerce_identifier(entry.get("rfq_id")) or ""
+
             recipients = entry.get("recipients")
             recipient_key: str = ""
+            has_recipients = False
             if isinstance(recipients, (list, tuple, set)):
                 cleaned = []
                 for item in recipients:
@@ -4288,14 +4288,23 @@ class SESEmailWatcher:
                         cleaned.append(str(item).strip().lower())
                     except Exception:
                         continue
-                recipient_key = ",".join(sorted(cleaned))
+                if cleaned:
+                    has_recipients = True
+                    recipient_key = ",".join(sorted(cleaned))
             elif recipients not in (None, ""):
                 try:
                     recipient_key = str(recipients).strip().lower()
                 except Exception:
                     recipient_key = ""
-            if not (supplier or recipient_key):
+                else:
+                    if recipient_key:
+                        has_recipients = True
+
+            if not has_recipients:
                 return None
+
+            supplier = self._coerce_identifier(entry.get("supplier_id")) or ""
+            rfq = self._coerce_identifier(entry.get("rfq_id")) or ""
             return f"meta:{supplier}|{rfq}|{recipient_key}"
 
         def _add(entry: Optional[Dict[str, object]]) -> None:
