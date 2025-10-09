@@ -5,6 +5,7 @@ import logging
 import re
 import sys
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,10 +47,24 @@ class StubSupplierInteractionAgent:
 class StubNegotiationAgent:
     def __init__(self):
         self.contexts: List[AgentContext] = []
+        self._lock = threading.Lock()
+
+    def execute(self, context: AgentContext) -> AgentOutput:
+        with self._lock:
+            self.contexts.append(context)
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={"counter": context.input_data.get("target_price"), "round": context.input_data.get("round")},
+        )
+
+
+class StubQuoteComparisonAgent:
+    def __init__(self):
+        self.contexts: List[AgentContext] = []
 
     def execute(self, context: AgentContext) -> AgentOutput:
         self.contexts.append(context)
-        return AgentOutput(status=AgentStatus.SUCCESS, data={"counter": context.input_data.get("target_price")})
+        return AgentOutput(status=AgentStatus.SUCCESS, data={})
 
 
 class DummyNick:
@@ -114,12 +129,14 @@ class DummyNick:
 def _make_watcher(nick, *, loader=None, state_store=None):
     supplier_agent = StubSupplierInteractionAgent()
     negotiation_agent = StubNegotiationAgent()
+    quote_agent = StubQuoteComparisonAgent()
     return SESEmailWatcher(
         nick,
         supplier_agent=supplier_agent,
         negotiation_agent=negotiation_agent,
         message_loader=loader,
         state_store=state_store or InMemoryEmailWatcherState(),
+        quote_comparison_agent=quote_agent,
     )
 
 
@@ -151,6 +168,193 @@ def test_email_watcher_bootstraps_negotiation_tables():
     assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
     assert "CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx" in ddl
 
+
+def test_extract_dispatch_entries_handles_email_dispatch_payload():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "status": "completed",
+        "result": {
+            "rfq_id": "RFQ-20240601-ABC12345",
+            "draft": {
+                "id": 501,
+                "supplier_id": "SUP-001",
+                "recipients": ["one@example.com"],
+            },
+            "dispatches": [
+                {
+                    "draft": {
+                        "draft_record_id": 777,
+                        "supplier_id": "SUP-002",
+                        "recipients": ["two@example.com"],
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 778,
+                        "supplier_id": "SUP-003",
+                        "recipients": ["three@example.com"],
+                    }
+                },
+            ],
+        },
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert {entry.get("supplier_id") for entry in entries} == {
+        "SUP-001",
+        "SUP-002",
+        "SUP-003",
+    }
+    assert {entry.get("id") for entry in entries} == {501, None}
+    assert {entry.get("draft_record_id") for entry in entries} == {None, 777, 778}
+
+
+def test_build_dispatch_expectation_from_dispatch_entries():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    entries = [
+        {"draft_record_id": 101, "supplier_id": "SUP-100"},
+        {"id": 102, "supplier_id": "SUP-200"},
+        {"supplier_id": "SUP-300", "rfq_id": "RFQ-XYZ", "recipients": ["a@ex.com"]},
+    ]
+
+    expectation = watcher._build_dispatch_expectation("action-999", "workflow-555", entries)
+
+    assert expectation is not None
+    assert expectation.action_id == "action-999"
+    assert expectation.workflow_id == "workflow-555"
+    assert expectation.draft_count == 3
+    assert expectation.draft_ids == (101, 102)
+    assert expectation.supplier_count == 3
+
+
+
+def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "dispatches": [
+                {
+                    "draft": {
+                        "draft_record_id": 501,
+                        "supplier_id": "SUP-SENT",
+                        "recipients": ["sent@example.com"],
+                        "sent_status": True,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 502,
+                        "supplier_id": "SUP-FAILED",
+                        "recipients": ["failed@example.com"],
+                        "sent_status": False,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 503,
+                        "supplier_id": "SUP-PENDING",
+                        "recipients": ["pending@example.com"],
+                        "metadata": {"status": "pending"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 504,
+                        "supplier_id": "SUP-ERROR",
+                        "recipients": ["error@example.com"],
+                        "metadata": {"status": "failed"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 505,
+                        "supplier_id": "SUP-SUCCESS",
+                        "recipients": ["ok@example.com"],
+                        "metadata": {"status": "success"},
+                    }
+                },
+            ]
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    suppliers = {entry.get("supplier_id") for entry in entries}
+    assert suppliers == {"SUP-SENT", "SUP-SUCCESS"}
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-ok",
+        "workflow-ok",
+        entries,
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 2
+    assert set(expectation.draft_ids) == {501, 505}
+
+
+def test_extract_dispatch_entries_ignores_draft_metadata_records():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "draft": {
+                "id": 900,
+                "supplier_id": "SUP-META",
+                "recipients": ["meta@example.com"],
+                "metadata": {
+                    "supplier_id": "SUP-META",
+                    "rfq_id": "RFQ-META",
+                },
+            }
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert entries == [
+        {
+            "id": 900,
+            "supplier_id": "SUP-META",
+            "recipients": ["meta@example.com"],
+            "metadata": {
+                "supplier_id": "SUP-META",
+                "rfq_id": "RFQ-META",
+            },
+        }
+    ]
+
+
+def test_email_watcher_watch_respects_limit(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    batches = [
+        [{"message_id": "msg-1"}],
+        [{"message_id": "msg-2"}],
+        [{"message_id": "msg-3"}],
+    ]
+
+    limits_seen: List[Optional[int]] = []
+
+    def fake_poll(limit=None):
+        limits_seen.append(limit)
+        return batches.pop(0) if batches else []
+
+    monkeypatch.setattr(watcher, "poll_once", fake_poll)
+
+    processed = watcher.watch(limit=3, timeout_seconds=5)
+
+    assert processed == 3
+    assert limits_seen[:3] == [3, 2, 1]
 
 
 def test_poll_once_triggers_supplier_agent_on_match():
@@ -1135,6 +1339,64 @@ def test_email_watcher_matches_mixed_case_workflow_filters(monkeypatch):
     assert canonical_rfq in watcher._workflow_rfq_index.get(workflow_key, set())
 
 
+def test_email_watcher_collects_all_workflow_responses(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-workflow-1",
+            "subject": "Re: RFQ-20240101-aaaa1111",
+            "body": "Offer 900",
+            "from": "supplier1@example.com",
+            "rfq_id": "RFQ-20240101-AAAA1111",
+            "supplier_id": "SUP-001",
+        },
+        {
+            "id": "msg-workflow-2",
+            "subject": "Re: RFQ-20240101-bbbb2222",
+            "body": "Offer 880",
+            "from": "supplier2@example.com",
+            "rfq_id": "RFQ-20240101-BBBB2222",
+            "supplier_id": "SUP-002",
+        },
+        {
+            "id": "msg-workflow-3",
+            "subject": "Re: RFQ-20240101-cccc3333",
+            "body": "Offer 910",
+            "from": "supplier3@example.com",
+            "rfq_id": "RFQ-20240101-CCCC3333",
+            "supplier_id": "SUP-003",
+        },
+    ]
+
+    watcher = _make_watcher(
+        nick, loader=lambda limit=None: list(messages), state_store=state
+    )
+
+    metadata_map = {
+        msg["rfq_id"]: {
+            "workflow_id": "WF-Group-01",
+            "target_price": 1000,
+        }
+        for msg in messages
+    }
+
+    monkeypatch.setattr(
+        watcher,
+        "_load_metadata",
+        lambda rfq: dict(metadata_map.get(rfq, {})),
+    )
+
+    results = watcher.poll_once(match_filters={"workflow_id": "WF-Group-01"})
+
+    assert len(results) == 3
+    suppliers = {result["supplier_id"] for result in results}
+    assert suppliers == {"SUP-001", "SUP-002", "SUP-003"}
+    for message in messages:
+        assert message["id"] in state
+
+
 def test_email_watcher_filter_matches_legacy_payload_without_workflow():
     nick = DummyNick()
     watcher = _make_watcher(nick)
@@ -2073,17 +2335,35 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     workflow_key = watcher._normalise_group_key(None, workflow_id)
 
     def make_metadata(expected: int) -> Dict[str, object]:
-        return {"workflow_id": workflow_id, "expected_supplier_count": expected}
+        return {
+            "workflow_id": workflow_id,
+            "expected_supplier_count": expected,
+            "round": 1,
+        }
 
     def make_processed(idx: int) -> Dict[str, object]:
-        return {"message_id": f"msg-{idx}", "negotiation_triggered": False}
+        return {
+            "message_id": f"msg-{idx}",
+            "negotiation_triggered": False,
+            "rfq_id": f"RFQ-{idx}",
+            "supplier_id": f"SUP-{idx}",
+            "subject": f"Quote update {idx}",
+            "message_body": f"Supplier {idx} price {1000 + idx}",
+            "workflow_id": workflow_id,
+            "round": 1,
+            "supplier_output": {"price": 1000 + idx, "lead_time": 4 + idx},
+        }
 
     def make_job(idx: int) -> Dict[str, object]:
         context = AgentContext(
             workflow_id=workflow_id,
             agent_id="NegotiationAgent",
             user_id="tester",
-            input_data={"rfq_id": f"RFQ-{idx}", "target_price": 1000 + idx},
+            input_data={
+                "rfq_id": f"RFQ-{idx}",
+                "target_price": 1000 + idx,
+                "round": 1,
+            },
         )
         return {
             "context": context,
@@ -2121,6 +2401,10 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     assert workflow_key not in watcher._workflow_processed_counts
     assert workflow_key not in watcher._workflow_expected_counts
     assert len(watcher.negotiation_agent.contexts) == 4
+    convo = watcher.negotiation_agent.contexts[-1].input_data.get("conversation_history")
+    assert isinstance(convo, list) and len(convo) == 4
+    quote_contexts = watcher.quote_comparison_agent.contexts
+    assert quote_contexts and quote_contexts[-1].input_data.get("quotes")
 
 
 def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):

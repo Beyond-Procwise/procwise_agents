@@ -284,6 +284,7 @@ class NegotiationAgent(BaseAgent):
         decision.setdefault("asks", [])
         decision.setdefault("lead_time_request", None)
         decision.setdefault("rationale", "")
+        decision["closing_round"] = round_no >= 3
 
         playbook_context = self._resolve_playbook_context(context, decision)
         play_recommendations = playbook_context.get("plays", [])
@@ -466,6 +467,7 @@ class NegotiationAgent(BaseAgent):
             "lead_time_request": decision.get("lead_time_request"),
             "rationale": decision.get("rationale"),
             "round": round_no,
+            "closing_round": round_no >= 3,
             "supplier_reply_count": supplier_reply_count,
             "supplier_message": supplier_message,
             "supplier_snippets": supplier_snippets,
@@ -488,6 +490,7 @@ class NegotiationAgent(BaseAgent):
             "target_price": target_price,
             "current_offer": price,
             "round": round_no,
+            "closing_round": round_no >= 3,
             "supplier_reply_count": supplier_reply_count,
             "strategy": decision.get("strategy"),
             "asks": decision.get("asks", []),
@@ -518,6 +521,7 @@ class NegotiationAgent(BaseAgent):
             "thread_index": round_no,
             "subject": subject_seed,
         }
+        draft_stub["closing_round"] = round_no >= 3
         if currency:
             draft_stub["currency"] = currency
         if supplier_snippets:
@@ -1817,6 +1821,11 @@ class NegotiationAgent(BaseAgent):
         if strategy:
             header += f": {strategy}"
         lines.append(header)
+
+        if round_no >= 3:
+            lines.append(
+                "- Closing round: request the supplier's best and final quote and confirm readiness to award"
+            )
 
         descriptor: Optional[str] = None
         supplier_type: Optional[str] = None

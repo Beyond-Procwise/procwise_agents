@@ -74,6 +74,17 @@ class Settings(BaseSettings):
         default=60, env="EMAIL_INBOUND_INITIAL_WAIT_SECONDS"
     )
 
+    # IMAP mailbox configuration
+    imap_host: Optional[str] = Field(default=None, env="IMAP_HOST")
+    imap_port: Optional[int] = Field(default=None, env="IMAP_PORT")
+    imap_user: Optional[str] = Field(default=None, env="IMAP_USER")
+    imap_username: Optional[str] = Field(default=None, env="IMAP_USERNAME")
+    imap_domain: Optional[str] = Field(default=None, env="IMAP_DOMAIN")
+    imap_login: Optional[str] = Field(default=None, env="IMAP_LOGIN")
+    imap_password: Optional[str] = Field(default=None, env="IMAP_PASSWORD")
+    imap_mailbox: str = Field(default="INBOX", env="IMAP_MAILBOX")
+    imap_search_criteria: str = Field(default="ALL", env="IMAP_SEARCH_CRITERIA")
+
     extraction_model: str = "gpt-oss:20b"
     document_extraction_model: str = Field(
         default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
