@@ -5,6 +5,7 @@ import logging
 import re
 import sys
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,10 +47,24 @@ class StubSupplierInteractionAgent:
 class StubNegotiationAgent:
     def __init__(self):
         self.contexts: List[AgentContext] = []
+        self._lock = threading.Lock()
+
+    def execute(self, context: AgentContext) -> AgentOutput:
+        with self._lock:
+            self.contexts.append(context)
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={"counter": context.input_data.get("target_price"), "round": context.input_data.get("round")},
+        )
+
+
+class StubQuoteComparisonAgent:
+    def __init__(self):
+        self.contexts: List[AgentContext] = []
 
     def execute(self, context: AgentContext) -> AgentOutput:
         self.contexts.append(context)
-        return AgentOutput(status=AgentStatus.SUCCESS, data={"counter": context.input_data.get("target_price")})
+        return AgentOutput(status=AgentStatus.SUCCESS, data={})
 
 
 class DummyNick:
@@ -114,12 +129,14 @@ class DummyNick:
 def _make_watcher(nick, *, loader=None, state_store=None):
     supplier_agent = StubSupplierInteractionAgent()
     negotiation_agent = StubNegotiationAgent()
+    quote_agent = StubQuoteComparisonAgent()
     return SESEmailWatcher(
         nick,
         supplier_agent=supplier_agent,
         negotiation_agent=negotiation_agent,
         message_loader=loader,
         state_store=state_store or InMemoryEmailWatcherState(),
+        quote_comparison_agent=quote_agent,
     )
 
 
@@ -151,6 +168,30 @@ def test_email_watcher_bootstraps_negotiation_tables():
     assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
     assert "CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx" in ddl
 
+
+
+def test_email_watcher_watch_respects_limit(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    batches = [
+        [{"message_id": "msg-1"}],
+        [{"message_id": "msg-2"}],
+        [{"message_id": "msg-3"}],
+    ]
+
+    limits_seen: List[Optional[int]] = []
+
+    def fake_poll(limit=None):
+        limits_seen.append(limit)
+        return batches.pop(0) if batches else []
+
+    monkeypatch.setattr(watcher, "poll_once", fake_poll)
+
+    processed = watcher.watch(limit=3, timeout_seconds=5)
+
+    assert processed == 3
+    assert limits_seen[:3] == [3, 2, 1]
 
 
 def test_poll_once_triggers_supplier_agent_on_match():
@@ -2131,17 +2172,35 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     workflow_key = watcher._normalise_group_key(None, workflow_id)
 
     def make_metadata(expected: int) -> Dict[str, object]:
-        return {"workflow_id": workflow_id, "expected_supplier_count": expected}
+        return {
+            "workflow_id": workflow_id,
+            "expected_supplier_count": expected,
+            "round": 1,
+        }
 
     def make_processed(idx: int) -> Dict[str, object]:
-        return {"message_id": f"msg-{idx}", "negotiation_triggered": False}
+        return {
+            "message_id": f"msg-{idx}",
+            "negotiation_triggered": False,
+            "rfq_id": f"RFQ-{idx}",
+            "supplier_id": f"SUP-{idx}",
+            "subject": f"Quote update {idx}",
+            "message_body": f"Supplier {idx} price {1000 + idx}",
+            "workflow_id": workflow_id,
+            "round": 1,
+            "supplier_output": {"price": 1000 + idx, "lead_time": 4 + idx},
+        }
 
     def make_job(idx: int) -> Dict[str, object]:
         context = AgentContext(
             workflow_id=workflow_id,
             agent_id="NegotiationAgent",
             user_id="tester",
-            input_data={"rfq_id": f"RFQ-{idx}", "target_price": 1000 + idx},
+            input_data={
+                "rfq_id": f"RFQ-{idx}",
+                "target_price": 1000 + idx,
+                "round": 1,
+            },
         )
         return {
             "context": context,
@@ -2179,6 +2238,10 @@ def test_workflow_expectation_reduction_flushes_queued_jobs():
     assert workflow_key not in watcher._workflow_processed_counts
     assert workflow_key not in watcher._workflow_expected_counts
     assert len(watcher.negotiation_agent.contexts) == 4
+    convo = watcher.negotiation_agent.contexts[-1].input_data.get("conversation_history")
+    assert isinstance(convo, list) and len(convo) == 4
+    quote_contexts = watcher.quote_comparison_agent.contexts
+    assert quote_contexts and quote_contexts[-1].input_data.get("quotes")
 
 
 def test_acknowledge_recent_dispatch_marks_all_messages(monkeypatch):
