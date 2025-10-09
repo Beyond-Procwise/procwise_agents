@@ -844,6 +844,13 @@ class SESEmailWatcher:
         if not active_keys:
             return True
 
+        non_stop_keys = {"supplier_id", "rfq_id"}
+        if active_keys & non_stop_keys:
+            # When matching on supplier/RFQ identifiers we want to process the
+            # full batch of responses instead of short-circuiting on the first
+            # hit.
+            return False
+
         workflow_aggregate_keys = {
             "workflow_id",
             "action_id",

@@ -2667,3 +2667,31 @@ def test_sqs_email_loader_extracts_records():
     assert record["_bucket"] == "procwisemvp"
     assert isinstance(record.get("_last_modified"), datetime)
     assert stub.deleted == ["r1"]
+
+
+def test_should_not_stop_after_supplier_or_rfq_filters():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    assert watcher._should_stop_after_match({"supplier_id": "supplier-1"}) is False
+    assert (
+        watcher._should_stop_after_match({"rfq_id": "RFQ-20240215-SIM12345"})
+        is False
+    )
+    assert (
+        watcher._should_stop_after_match(
+            {
+                "supplier_id": "supplier-1",
+                "rfq_id": "RFQ-20240215-SIM12345",
+                "workflow_id": "workflow-1",
+            }
+        )
+        is False
+    )
+
+
+def test_should_stop_after_unrelated_filters():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    assert watcher._should_stop_after_match({"status": "open"}) is True
