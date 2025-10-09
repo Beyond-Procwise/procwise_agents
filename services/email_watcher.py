@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, Future
 from urllib.parse import unquote_plus, urlparse
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
@@ -33,6 +34,11 @@ except Exception:  # pragma: no cover - psycopg2 may be unavailable in tests
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
+
+try:  # pragma: no cover - optional dependency in constrained environments
+    from agents.quote_comparison_agent import QuoteComparisonAgent
+except Exception:  # pragma: no cover - quote comparison may be unavailable during tests
+    QuoteComparisonAgent = None  # type: ignore[assignment]
 from services.email_dispatch_chain_store import (
     find_best_chain_match,
     mark_response as mark_dispatch_response,
@@ -303,6 +309,7 @@ class SESEmailWatcher:
         state_store: Optional[EmailWatcherState] = None,
         enable_negotiation: bool = True,
         response_poll_seconds: Optional[int] = None,
+        quote_comparison_agent: Optional["QuoteComparisonAgent"] = None,
     ) -> None:
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
@@ -318,6 +325,13 @@ class SESEmailWatcher:
                 self.negotiation_agent = NegotiationAgent(agent_nick)
         else:
             self.negotiation_agent = None
+        if quote_comparison_agent is not None:
+            self.quote_comparison_agent = quote_comparison_agent
+        else:
+            candidate = None
+            if isinstance(getattr(agent_nick, "agents", None), dict):
+                candidate = agent_nick.agents.get("quote_comparison")
+            self.quote_comparison_agent = candidate
         self.metadata_provider = metadata_provider
         self.state_store = state_store or InMemoryEmailWatcherState()
         self._custom_loader = message_loader
@@ -498,7 +512,16 @@ class SESEmailWatcher:
         self._dispatch_expectations: Dict[str, "_DispatchExpectation"] = {}
         self._completed_dispatch_actions: Set[str] = set()
         self._workflow_dispatch_actions: Dict[str, str] = {}
+        self._workflow_context_buffer: Dict[str, List[Dict[str, object]]] = {}
         self._last_candidate_source: str = "none"
+        self._negotiation_parallel_workers = max(
+            1,
+            self._coerce_int(
+                getattr(self.settings, "negotiation_parallel_workers", 4),
+                default=4,
+                minimum=1,
+            ),
+        )
 
         logger.info(
             "Initialised email watcher for mailbox %s using %s (poll_interval=%ss)",
@@ -1219,7 +1242,21 @@ class SESEmailWatcher:
         poll_delay = self.poll_interval_seconds if interval is None else max(interval, 1)
         start_time = time.time()
         while True:
-            batch = self.poll_once(limit=limit)
+            effective_limit = None
+            if limit is not None:
+                try:
+                    remaining = int(limit) - processed_total
+                except Exception:
+                    remaining = limit  # type: ignore[assignment]
+                if remaining <= 0:
+                    logger.info(
+                        "Email watcher reached requested limit (%s) after %d iteration(s)",
+                        limit,
+                        iterations,
+                    )
+                    break
+                effective_limit = max(1, remaining)
+            batch = self.poll_once(limit=effective_limit)
             processed_total += len(batch)
             iterations += 1
             logger.info(
@@ -1233,6 +1270,19 @@ class SESEmailWatcher:
                     "Email watcher exiting after processing %d new message(s) in iteration %d",
                     len(batch),
                     iterations,
+                )
+                if limit is None or processed_total >= (limit or 0):
+                    break
+                logger.debug(
+                    "Processed batch below requested limit (%s); continuing polling for remaining %d message(s)",
+                    limit,
+                    max(0, (limit or 0) - processed_total),
+                )
+                continue
+            if processed_total > 0:
+                logger.info(
+                    "Email watcher processed %d message(s) but no further matches were found; exiting",
+                    processed_total,
                 )
                 break
             if stop_after is not None and iterations >= stop_after:
@@ -2265,6 +2315,7 @@ class SESEmailWatcher:
                 "target_price": target_price,
                 "workflow_id": workflow_id,
                 "related_rfq_ids": additional_rfqs,
+                "round": negotiation_round,
             }
         )
         processed["matched_via"] = best_candidate.matched_via
@@ -2829,28 +2880,255 @@ class SESEmailWatcher:
         self, workflow_key: str, current_processed: Dict[str, object]
     ) -> Tuple[bool, Optional[AgentOutput]]:
         jobs = self._workflow_negotiation_jobs.pop(workflow_key, [])
+        history_entries = self._workflow_context_buffer.pop(workflow_key, [])
         self._workflow_processed_counts.pop(workflow_key, None)
         self._workflow_expected_counts.pop(workflow_key, None)
+
+        conversation_payload: List[Dict[str, object]] = []
+        if history_entries:
+            conversation_payload = [
+                self._build_conversation_entry(entry)
+                for entry in history_entries
+                if isinstance(entry, dict)
+            ]
+
         result: Tuple[bool, Optional[AgentOutput]] = (
             current_processed.get("negotiation_triggered", False),
             None,
         )
-        for entry in jobs:
-            job = entry.get("job") if isinstance(entry, dict) else None
-            processed = entry.get("processed") if isinstance(entry, dict) else None
-            if not job or not isinstance(processed, dict):
-                continue
-            triggered, output = self._execute_negotiation_job(job)
+
+        if not jobs:
+            if conversation_payload:
+                for entry in history_entries:
+                    if isinstance(entry, dict):
+                        entry.setdefault("conversation_history", conversation_payload)
+                self._dispatch_quote_comparison(history_entries)
+            return result
+
+        def _apply_result(
+            processed: Optional[Dict[str, object]],
+            triggered: bool,
+            output: Optional[AgentOutput],
+        ) -> None:
+            if not isinstance(processed, dict):
+                return
             processed["negotiation_triggered"] = triggered
-            processed["negotiation_status"] = (
-                output.status.value if output else None
-            )
+            processed["negotiation_status"] = output.status.value if output else None
             processed["negotiation_output"] = output.data if output else None
+            if output and isinstance(output.data, dict):
+                processed["negotiation_round"] = output.data.get("round")
+            if conversation_payload:
+                processed.setdefault("conversation_history", conversation_payload)
             self._update_processed_snapshot(processed)
+            nonlocal result
             if processed is current_processed:
                 result = (triggered, output)
+
+        worker_count = min(self._negotiation_parallel_workers, max(len(jobs), 1))
+        futures: List[Tuple[Optional[Dict[str, object]], Optional[Future]]]
+        futures = []
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for entry in jobs:
+                if not isinstance(entry, dict):
+                    futures.append((None, None))
+                    continue
+                job = entry.get("job")
+                processed = entry.get("processed")
+                if isinstance(processed, dict) and conversation_payload:
+                    processed.setdefault("conversation_history", conversation_payload)
+                context = job.get("context") if isinstance(job, dict) else None
+                if isinstance(context, AgentContext) and conversation_payload:
+                    context.input_data = dict(context.input_data)
+                    context.input_data.setdefault("conversation_history", conversation_payload)
+                if not job:
+                    futures.append((processed if isinstance(processed, dict) else None, None))
+                    continue
+                future = executor.submit(self._execute_negotiation_job, job)
+                futures.append((processed if isinstance(processed, dict) else None, future))
+
+            for processed, future in futures:
+                if future is None:
+                    _apply_result(processed, False, None)
+                    continue
+                try:
+                    triggered, output = future.result()
+                except Exception:  # pragma: no cover - defensive guard
+                    logger.exception("Negotiation job execution failed")
+                    triggered, output = False, None
+                _apply_result(processed, triggered, output)
+
+        if conversation_payload:
+            for entry in history_entries:
+                if isinstance(entry, dict):
+                    entry.setdefault("conversation_history", conversation_payload)
+            self._dispatch_quote_comparison(history_entries)
+
         return result
 
+    def _build_conversation_entry(self, processed: Dict[str, object]) -> Dict[str, object]:
+        entry: Dict[str, object] = {
+            "message_id": processed.get("message_id"),
+            "rfq_id": processed.get("rfq_id"),
+            "supplier_id": processed.get("supplier_id"),
+            "subject": processed.get("subject"),
+            "from_address": processed.get("from_address"),
+            "message_body": processed.get("message_body"),
+            "round": processed.get("round"),
+            "negotiation_round": processed.get("negotiation_round"),
+            "workflow_id": processed.get("workflow_id"),
+            "matched_via": processed.get("matched_via"),
+        }
+        supplier_output = processed.get("supplier_output")
+        if isinstance(supplier_output, dict):
+            entry["supplier_output"] = deepcopy(supplier_output)
+            if "price" in supplier_output and entry.get("price") is None:
+                entry["price"] = supplier_output.get("price")
+            if "lead_time" in supplier_output and entry.get("lead_time") is None:
+                entry["lead_time"] = supplier_output.get("lead_time")
+        negotiation_output = processed.get("negotiation_output")
+        if isinstance(negotiation_output, dict):
+            entry["negotiation_output"] = deepcopy(negotiation_output)
+            entry.setdefault("negotiation_message", negotiation_output.get("message"))
+            entry.setdefault("counter_proposals", negotiation_output.get("counter_proposals"))
+            if negotiation_output.get("round") and entry.get("negotiation_round") is None:
+                entry["negotiation_round"] = negotiation_output.get("round")
+        return entry
+
+    def _ensure_quote_comparison_agent(self) -> Optional["QuoteComparisonAgent"]:
+        agent = getattr(self, "quote_comparison_agent", None)
+        if agent is not None:
+            return agent
+        if QuoteComparisonAgent is None:
+            return None
+        try:
+            agent = QuoteComparisonAgent(self.agent_nick)
+        except Exception:  # pragma: no cover - defensive initialisation
+            logger.exception("Failed to initialise QuoteComparisonAgent")
+            agent = None
+        self.quote_comparison_agent = agent
+        return agent
+
+    def _build_quote_payload(self, processed: Dict[str, object]) -> Optional[Dict[str, object]]:
+        supplier_id = processed.get("supplier_id")
+        supplier_name = (
+            processed.get("supplier_name")
+            or processed.get("supplier_display_name")
+            or supplier_id
+        )
+        supplier_output = processed.get("supplier_output")
+        negotiation_output = processed.get("negotiation_output")
+
+        price: Optional[float] = None
+        if isinstance(negotiation_output, dict):
+            proposals = negotiation_output.get("counter_proposals")
+            if isinstance(proposals, list):
+                for proposal in proposals:
+                    if isinstance(proposal, dict) and proposal.get("price") is not None:
+                        try:
+                            price = float(proposal.get("price"))
+                            break
+                        except Exception:
+                            continue
+            if price is None:
+                counter_price = negotiation_output.get("counter_price")
+                try:
+                    price = float(counter_price) if counter_price is not None else None
+                except Exception:
+                    price = None
+        if price is None and isinstance(supplier_output, dict):
+            try:
+                raw_price = supplier_output.get("price")
+                price = float(raw_price) if raw_price is not None else None
+            except Exception:
+                price = None
+
+        lead_time = None
+        if isinstance(negotiation_output, dict):
+            lead_time = negotiation_output.get("lead_time_request")
+        if lead_time is None and isinstance(supplier_output, dict):
+            lead_time = supplier_output.get("lead_time")
+
+        currency = None
+        if isinstance(negotiation_output, dict):
+            currency = negotiation_output.get("currency")
+        if currency is None and isinstance(supplier_output, dict):
+            currency = supplier_output.get("currency") or supplier_output.get("currency_code")
+
+        if supplier_id is None and supplier_name is None and price is None:
+            return None
+
+        payload: Dict[str, object] = {
+            "name": supplier_name or "Unknown supplier",
+            "supplier_id": supplier_id,
+            "total_cost": price,
+            "tenure": lead_time,
+            "currency": currency,
+            "quote_file_s3_path": processed.get("s3_key"),
+        }
+
+        negotiation_round = processed.get("negotiation_round") or processed.get("round")
+        if negotiation_round is not None:
+            payload["round"] = negotiation_round
+            try:
+                payload["closing_round"] = int(negotiation_round) >= 3
+            except Exception:
+                payload["closing_round"] = False
+
+        return payload
+
+    def _dispatch_quote_comparison(
+        self, history_entries: Sequence[Dict[str, object]]
+    ) -> None:
+        if not history_entries:
+            return
+
+        quote_agent = self._ensure_quote_comparison_agent()
+        if quote_agent is None:
+            return
+
+        quotes: List[Dict[str, object]] = []
+        supplier_ids: Set[str] = set()
+
+        for entry in history_entries:
+            if not isinstance(entry, dict):
+                continue
+            payload = self._build_quote_payload(entry)
+            if not payload:
+                continue
+            quotes.append(payload)
+            supplier_token = payload.get("supplier_id")
+            if supplier_token:
+                supplier_ids.add(str(supplier_token))
+
+        if not quotes:
+            return
+
+        workflow_id = None
+        for entry in history_entries:
+            candidate = entry.get("workflow_id") if isinstance(entry, dict) else None
+            if candidate:
+                workflow_id = str(candidate)
+                break
+        if workflow_id is None:
+            workflow_id = str(uuid.uuid4())
+
+        context = AgentContext(
+            workflow_id=workflow_id,
+            agent_id="quote_comparison",
+            user_id=self.settings.script_user,
+            input_data={
+                "quotes": quotes,
+                "supplier_ids": list(supplier_ids),
+            },
+        )
+
+        try:
+            quote_agent.execute(context)
+        except Exception:  # pragma: no cover - analysis should not break watcher
+            logger.exception(
+                "Quote comparison analysis failed for workflow %s", workflow_id
+            )
     def _execute_negotiation_job(
         self, job: Dict[str, object]
     ) -> Tuple[bool, Optional[AgentOutput]]:
@@ -2887,6 +3165,8 @@ class SESEmailWatcher:
         )
 
         if tracking_key:
+            history = self._workflow_context_buffer.setdefault(tracking_key, [])
+            history.append(processed)
             expected = self._ensure_workflow_expectations(
                 workflow_id,
                 metadata,
@@ -2902,13 +3182,22 @@ class SESEmailWatcher:
             return default_result
 
         if negotiation_job:
+            history_payload = [self._build_conversation_entry(processed)]
+            context = negotiation_job.get("context")
+            if isinstance(context, AgentContext):
+                context.input_data = dict(context.input_data)
+                context.input_data.setdefault("conversation_history", history_payload)
+            processed["conversation_history"] = history_payload
             triggered, output = self._execute_negotiation_job(negotiation_job)
             processed["negotiation_triggered"] = triggered
             processed["negotiation_status"] = (
                 output.status.value if output else None
             )
             processed["negotiation_output"] = output.data if output else None
+            if output and isinstance(output.data, dict):
+                processed["negotiation_round"] = output.data.get("round")
             self._update_processed_snapshot(processed)
+            self._dispatch_quote_comparison([processed])
             return triggered, output
 
         return default_result
