@@ -4227,6 +4227,13 @@ class SESEmailWatcher:
             key = _key(entry)
             if key is None or key in seen:
                 return
+            has_identifier = entry.get("draft_record_id") not in (None, "") or entry.get("id") not in (None, "")
+            has_nested_payload = any(
+                isinstance(entry.get(candidate_key), dict)
+                for candidate_key in ("draft", "dispatch")
+            )
+            if has_nested_payload and not has_identifier:
+                return
             seen.add(key)
             entries.append(entry)
 

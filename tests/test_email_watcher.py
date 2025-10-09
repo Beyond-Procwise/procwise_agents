@@ -184,6 +184,7 @@ def test_extract_dispatch_entries_handles_email_dispatch_payload():
             },
             "dispatches": [
                 {
+                    "recipients": ["two@example.com"],
                     "draft": {
                         "draft_record_id": 777,
                         "supplier_id": "SUP-002",
@@ -191,6 +192,7 @@ def test_extract_dispatch_entries_handles_email_dispatch_payload():
                     }
                 },
                 {
+                    "recipients": ["three@example.com"],
                     "draft": {
                         "draft_record_id": 778,
                         "supplier_id": "SUP-003",
@@ -203,6 +205,7 @@ def test_extract_dispatch_entries_handles_email_dispatch_payload():
 
     entries = watcher._extract_dispatch_entries(payload)
 
+    assert len(entries) == 3
     assert {entry.get("supplier_id") for entry in entries} == {
         "SUP-001",
         "SUP-002",
