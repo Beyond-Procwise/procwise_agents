@@ -169,6 +169,136 @@ def test_email_watcher_bootstraps_negotiation_tables():
     assert "CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx" in ddl
 
 
+def test_extract_dispatch_entries_handles_email_dispatch_payload():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "status": "completed",
+        "result": {
+            "rfq_id": "RFQ-20240601-ABC12345",
+            "draft": {
+                "id": 501,
+                "supplier_id": "SUP-001",
+                "recipients": ["one@example.com"],
+            },
+            "dispatches": [
+                {
+                    "draft": {
+                        "draft_record_id": 777,
+                        "supplier_id": "SUP-002",
+                        "recipients": ["two@example.com"],
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 778,
+                        "supplier_id": "SUP-003",
+                        "recipients": ["three@example.com"],
+                    }
+                },
+            ],
+        },
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert {entry.get("supplier_id") for entry in entries} == {
+        "SUP-001",
+        "SUP-002",
+        "SUP-003",
+    }
+    assert {entry.get("id") for entry in entries} == {501, None}
+    assert {entry.get("draft_record_id") for entry in entries} == {None, 777, 778}
+
+
+def test_build_dispatch_expectation_from_dispatch_entries():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    entries = [
+        {"draft_record_id": 101, "supplier_id": "SUP-100"},
+        {"id": 102, "supplier_id": "SUP-200"},
+        {"supplier_id": "SUP-300", "rfq_id": "RFQ-XYZ", "recipients": ["a@ex.com"]},
+    ]
+
+    expectation = watcher._build_dispatch_expectation("action-999", "workflow-555", entries)
+
+    assert expectation is not None
+    assert expectation.action_id == "action-999"
+    assert expectation.workflow_id == "workflow-555"
+    assert expectation.draft_count == 3
+    assert expectation.draft_ids == (101, 102)
+    assert expectation.supplier_count == 3
+
+
+
+def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "dispatches": [
+                {
+                    "draft": {
+                        "draft_record_id": 501,
+                        "supplier_id": "SUP-SENT",
+                        "recipients": ["sent@example.com"],
+                        "sent_status": True,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 502,
+                        "supplier_id": "SUP-FAILED",
+                        "recipients": ["failed@example.com"],
+                        "sent_status": False,
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 503,
+                        "supplier_id": "SUP-PENDING",
+                        "recipients": ["pending@example.com"],
+                        "metadata": {"status": "pending"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 504,
+                        "supplier_id": "SUP-ERROR",
+                        "recipients": ["error@example.com"],
+                        "metadata": {"status": "failed"},
+                    }
+                },
+                {
+                    "draft": {
+                        "draft_record_id": 505,
+                        "supplier_id": "SUP-SUCCESS",
+                        "recipients": ["ok@example.com"],
+                        "metadata": {"status": "success"},
+                    }
+                },
+            ]
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    suppliers = {entry.get("supplier_id") for entry in entries}
+    assert suppliers == {"SUP-SENT", "SUP-SUCCESS"}
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-ok",
+        "workflow-ok",
+        entries,
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 2
+    assert set(expectation.draft_ids) == {501, 505}
+
 
 def test_email_watcher_watch_respects_limit(monkeypatch):
     nick = DummyNick()
