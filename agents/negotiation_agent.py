@@ -309,15 +309,15 @@ class NegotiationAgent(BaseAgent):
             state["awaiting_response"] = False
             supplier_reply_registered = True
 
-        final_offer_reason = self._detect_final_offer(supplier_message, supplier_snippets)
-        should_continue, new_status, halt_reason = self._should_continue(
-            state, supplier_reply_registered, final_offer_reason
-        )
-
         round_no = int(state.get("current_round", 1))
         if isinstance(raw_round, (int, float)):
             round_no = max(round_no, int(raw_round))
         decision["round"] = round_no
+
+        final_offer_reason = self._detect_final_offer(supplier_message, supplier_snippets)
+        should_continue, new_status, halt_reason = self._should_continue(
+            state, supplier_reply_registered, final_offer_reason
+        )
 
         savings_score = 0.0
         if price and price > 0 and target_price is not None:
@@ -2133,6 +2133,28 @@ class NegotiationAgent(BaseAgent):
         awaiting_response: bool,
         supplier_reply_registered: bool,
     ) -> None:
+        settings = getattr(self.agent_nick, "settings", None)
+        if settings is not None and not getattr(settings, "enable_learning", False):
+            return
+        training_endpoint = getattr(self.agent_nick, "model_training_endpoint", None)
+        if training_endpoint is not None and hasattr(
+            training_endpoint, "queue_negotiation_learning"
+        ):
+            try:
+                training_endpoint.queue_negotiation_learning(
+                    workflow_id=getattr(context, "workflow_id", None),
+                    rfq_id=rfq_id,
+                    supplier_id=supplier,
+                    decision=dict(decision or {}),
+                    state=dict(state or {}),
+                    awaiting_response=awaiting_response,
+                    supplier_reply_registered=supplier_reply_registered,
+                )
+                return
+            except Exception:
+                logger.debug(
+                    "Failed to queue negotiation learning via training endpoint", exc_info=True
+                )
         repository = getattr(self, "learning_repository", None)
         if repository is None:
             return

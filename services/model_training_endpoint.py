@@ -61,6 +61,30 @@ class ModelTrainingEndpoint:
         service = self._resolve_service()
         return service.dispatch_training_and_refresh(force=force, limit=limit)
 
+    def queue_negotiation_learning(
+        self,
+        *,
+        workflow_id: Optional[str],
+        rfq_id: Optional[str],
+        supplier_id: Optional[str],
+        decision: Dict[str, Any],
+        state: Dict[str, Any],
+        awaiting_response: bool,
+        supplier_reply_registered: bool,
+    ) -> None:
+        """Capture negotiation learnings for later dispatch processing."""
+
+        service = self._resolve_service()
+        service.queue_negotiation_learning(
+            workflow_id=workflow_id,
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            decision=decision,
+            state=state,
+            awaiting_response=awaiting_response,
+            supplier_reply_registered=supplier_reply_registered,
+        )
+
     def get_service(self) -> ModelTrainingService:
         """Expose the underlying service for advanced integrations."""
 

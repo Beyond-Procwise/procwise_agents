@@ -45,6 +45,10 @@ class TrainingDispatchResponse(BaseModel):
         default_factory=list,
         description="Summaries of supplier relationship refresh executions",
     )
+    negotiation_learnings: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Negotiation learning records processed during dispatch",
+    )
 
 
 def _get_training_endpoint(request: Request) -> ModelTrainingEndpoint:
@@ -86,6 +90,7 @@ def trigger_training_dispatch(
     result = endpoint.dispatch(force=True, limit=limit)
     jobs = result.get("training_jobs", [])
     relationship_jobs = result.get("relationship_jobs", [])
+    negotiation_learnings = result.get("negotiation_learnings", [])
     summaries = [
         TrainingJobSummary(
             job_id=job.get("job_id"),
@@ -96,5 +101,8 @@ def trigger_training_dispatch(
         for job in jobs
     ]
     return TrainingDispatchResponse(
-        dispatched=len(summaries), jobs=summaries, relationship_jobs=relationship_jobs
+        dispatched=len(summaries),
+        jobs=summaries,
+        relationship_jobs=relationship_jobs,
+        negotiation_learnings=negotiation_learnings,
     )
