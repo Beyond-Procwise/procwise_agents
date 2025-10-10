@@ -2,13 +2,14 @@
 
 import boto3
 from botocore.config import Config
+import json
 import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
 import threading
 
@@ -28,6 +29,12 @@ from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
 from services.learning_repository import LearningRepository
 from utils.gpu import configure_gpu
+
+try:  # Optional imports used for dataset persistence
+    from models.context_trainer import ConversationDatasetWriter, TrainingConfig
+except Exception:  # pragma: no cover - optional dependency failures handled gracefully
+    ConversationDatasetWriter = None  # type: ignore[assignment]
+    TrainingConfig = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +111,7 @@ class AgentOutput:
     confidence: Optional[float] = None
     action_id: Optional[str] = None
     agentic_plan: Optional[str] = None
+    context_snapshot: Optional[Dict[str, Any]] = None
 
 class BaseAgent:
     DEFAULT_AGENTIC_PLAN_STEPS: Tuple[str, ...] = (
@@ -131,6 +139,22 @@ class BaseAgent:
             setattr(agent_nick, "prompt_engine", prompt_engine)
         self.prompt_engine = prompt_engine
         self.learning_repository = getattr(agent_nick, "learning_repository", None)
+        dataset_writer = getattr(agent_nick, "_context_dataset_writer", None)
+        if dataset_writer is None and ConversationDatasetWriter and TrainingConfig:
+            try:
+                data_dir = getattr(
+                    self.settings,
+                    "context_training_data_dir",
+                    TrainingConfig().data_dir if TrainingConfig else None,
+                )
+                if data_dir:
+                    dataset_writer = ConversationDatasetWriter(data_dir)
+            except Exception:
+                logger.debug("Failed to initialise context dataset writer", exc_info=True)
+                dataset_writer = None
+            if dataset_writer is not None:
+                setattr(agent_nick, "_context_dataset_writer", dataset_writer)
+        self._context_dataset_writer = dataset_writer
 
     def run(self, *args, **kwargs):
         raise NotImplementedError("Each agent must implement its own 'run' method.")
@@ -145,13 +169,17 @@ class BaseAgent:
         logger.info("%s: starting", self.__class__.__name__)
         start_ts = datetime.utcnow()
         try:
+            snapshot = self._prepare_context(context)
             result = self.run(context)
             if isinstance(result, AgentOutput):
                 result = self._with_plan(context, result)
+                result = self._with_context_snapshot(context, result, snapshot)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("%s execution failed", self.__class__.__name__)
             result = AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc))
+            snapshot = getattr(context, "_prepared_context_snapshot", None)
             result = self._with_plan(context, result)
+            result = self._with_context_snapshot(context, result, snapshot)
         end_ts = datetime.utcnow()
 
         status = result.status.value
@@ -200,8 +228,224 @@ class BaseAgent:
         )
 
         self._persist_agentic_plan(context, result)
+        try:
+            self._record_context_example(context, result)
+        except Exception:  # pragma: no cover - dataset capture should never fail hard
+            logger.debug("Context dataset capture failed", exc_info=True)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Context preparation helpers
+    # ------------------------------------------------------------------
+    def _conversation_memory_service(self):
+        service = getattr(self.agent_nick, "conversation_memory", None)
+        if service is not None:
+            return service
+        try:
+            from services.conversation_memory import ConversationMemoryService
+        except Exception:  # pragma: no cover - optional dependency missing
+            logger.debug("Conversation memory service unavailable", exc_info=True)
+            return None
+        if not getattr(self.agent_nick, "qdrant_client", None):
+            return None
+        if not getattr(self.agent_nick, "embedding_model", None):
+            return None
+        try:
+            service = ConversationMemoryService(self.agent_nick)
+        except Exception:  # pragma: no cover - guard against runtime setup errors
+            logger.debug("Failed to initialise conversation memory", exc_info=True)
+            return None
+        setattr(self.agent_nick, "conversation_memory", service)
+        return service
+
+    def _prepare_context(self, context: "AgentContext") -> Optional[Dict[str, Any]]:
+        snapshot: Dict[str, Any] = {
+            "workflow_id": getattr(context, "workflow_id", None),
+            "agent_id": getattr(context, "agent_id", None),
+            "user_id": getattr(context, "user_id", None),
+        }
+
+        conversation_entries = self._normalise_conversation_history(
+            context.input_data.get("conversation_history")
+        )
+        if conversation_entries:
+            snapshot["conversation_history"] = conversation_entries
+            memory = self._conversation_memory_service()
+            if memory is not None:
+                try:
+                    memory.ingest(snapshot.get("workflow_id"), conversation_entries)
+                except Exception:
+                    logger.debug("Failed to persist conversation history", exc_info=True)
+
+        query_text = self._extract_query_text(context)
+        memory = self._conversation_memory_service()
+        if memory is not None and query_text:
+            try:
+                retrieved = memory.retrieve(snapshot.get("workflow_id"), query_text, limit=5)
+            except Exception:
+                logger.debug("Conversation retrieval failed", exc_info=True)
+                retrieved = []
+            if retrieved:
+                snapshot["retrieved_memory"] = [
+                    {
+                        "content": item.content,
+                        "score": item.score,
+                        "metadata": item.metadata,
+                    }
+                    for item in retrieved
+                ]
+
+        procurement_context = self._collect_procurement_context(context, conversation_entries)
+        if procurement_context:
+            snapshot["procurement_context"] = procurement_context
+
+        manifest = context.manifest()
+        if manifest:
+            snapshot["manifest"] = manifest
+
+        if any(value for key, value in snapshot.items() if key not in {"workflow_id", "agent_id", "user_id"}):
+            context.input_data = dict(context.input_data)
+            context.input_data.setdefault("context_snapshot", snapshot)
+            context._prepared_context_snapshot = snapshot  # type: ignore[attr-defined]
+            return snapshot
+        context._prepared_context_snapshot = None  # type: ignore[attr-defined]
+        return None
+
+    def _with_context_snapshot(
+        self,
+        context: "AgentContext",
+        output: AgentOutput,
+        snapshot: Optional[Dict[str, Any]],
+    ) -> AgentOutput:
+        snapshot = snapshot or getattr(context, "_prepared_context_snapshot", None)
+        if not snapshot:
+            return output
+        output.context_snapshot = snapshot
+        if isinstance(output.data, dict):
+            output.data.setdefault("context_snapshot", snapshot)
+        return output
+
+    def _normalise_conversation_history(
+        self, history: Optional[Iterable[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        normalised: List[Dict[str, Any]] = []
+        if not history:
+            return normalised
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            clean: Dict[str, Any] = {}
+            for key in (
+                "message_id",
+                "rfq_id",
+                "supplier_id",
+                "subject",
+                "from_address",
+                "message_body",
+                "round",
+                "negotiation_round",
+                "workflow_id",
+                "matched_via",
+                "document_origin",
+                "speaker",
+                "summary",
+                "negotiation_message",
+            ):
+                if key in entry:
+                    clean[key] = entry[key]
+            for sub in ("supplier_output", "negotiation_output"):
+                payload = entry.get(sub)
+                if isinstance(payload, dict):
+                    clean[sub] = payload
+            if clean:
+                normalised.append(clean)
+        return normalised
+
+    def _extract_query_text(self, context: "AgentContext") -> str:
+        candidates = []
+        for key in (
+            "prompt",
+            "user_query",
+            "user_input",
+            "message_body",
+            "question",
+            "task_description",
+        ):
+            value = context.input_data.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        if not candidates:
+            value = context.input_data.get("input")
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        combined = "\n".join(candidates)
+        return combined.strip()
+
+    def _collect_procurement_context(
+        self,
+        context: "AgentContext",
+        conversation_entries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        query_engine = getattr(self.agent_nick, "query_engine", None)
+        if query_engine is None:
+            return []
+        supplier_ids: List[str] = []
+        supplier_names: List[str] = []
+        for key in ("supplier_id", "supplier_ids"):
+            value = context.input_data.get(key)
+            if isinstance(value, str) and value.strip():
+                supplier_ids.append(value.strip())
+            elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+                supplier_ids.extend(
+                    str(item).strip() for item in value if str(item).strip()
+                )
+        supplier_name = context.input_data.get("supplier_name")
+        if isinstance(supplier_name, str) and supplier_name.strip():
+            supplier_names.append(supplier_name.strip())
+        for entry in conversation_entries:
+            candidate_id = entry.get("supplier_id")
+            if isinstance(candidate_id, str) and candidate_id.strip():
+                supplier_ids.append(candidate_id.strip())
+        try:
+            supplier_ids = list(dict.fromkeys(supplier_ids))
+            supplier_names = list(dict.fromkeys(supplier_names))
+        except Exception:
+            supplier_ids = [sid for sid in supplier_ids if sid]
+            supplier_names = [name for name in supplier_names if name]
+        if not supplier_ids and not supplier_names:
+            return []
+        try:
+            df = query_engine.fetch_procurement_flow(
+                embed=True,
+                supplier_ids=supplier_ids or None,
+                supplier_names=supplier_names or None,
+            )
+        except Exception:
+            logger.debug("Failed to fetch procurement context", exc_info=True)
+            return []
+        try:
+            subset = df.head(10)
+            important_cols = [
+                col
+                for col in (
+                    "supplier_id",
+                    "supplier_name",
+                    "po_id",
+                    "item_description",
+                    "invoice_id",
+                    "product",
+                    "category_level_1",
+                    "category_level_2",
+                )
+                if col in subset.columns
+            ]
+            if not important_cols:
+                return []
+            return subset[important_cols].to_dict("records")
+        except Exception:
+            logger.debug("Failed to normalise procurement context", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------
     # Agentic planning helpers
@@ -311,6 +555,113 @@ class BaseAgent:
             logger.exception(
                 "Failed to persist agentic plan for %s", self.__class__.__name__
             )
+
+    # ------------------------------------------------------------------
+    # Dataset capture helpers
+    # ------------------------------------------------------------------
+    def _record_context_example(
+        self, context: "AgentContext", output: AgentOutput
+    ) -> None:
+        writer = getattr(self, "_context_dataset_writer", None)
+        snapshot = output.context_snapshot or getattr(
+            context, "_prepared_context_snapshot", None
+        )
+        if writer is None or snapshot is None:
+            return
+        try:
+            context_text = self._format_training_context(snapshot)
+            response_text = self._extract_response_text(output.data)
+            metadata = {
+                "workflow_id": snapshot.get("workflow_id"),
+                "agent_id": snapshot.get("agent_id"),
+                "agent_name": self.__class__.__name__,
+            }
+            writer.write_record(
+                context_text=context_text,
+                response_text=response_text,
+                metadata=metadata,
+            )
+        except ValueError:
+            logger.debug("Skipped empty training example for %s", self.__class__.__name__)
+
+    def _format_training_context(self, snapshot: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        conversation = snapshot.get("conversation_history") or []
+        for entry in conversation:
+            if not isinstance(entry, dict):
+                continue
+            speaker = (
+                entry.get("speaker")
+                or entry.get("from_address")
+                or entry.get("document_origin")
+                or "participant"
+            )
+            body = entry.get("message_body") or entry.get("negotiation_message") or entry.get("summary")
+            if not isinstance(body, str):
+                try:
+                    body = json.dumps(body, ensure_ascii=False)
+                except Exception:
+                    body = str(body)
+            body = (body or "").strip()
+            if not body:
+                continue
+            round_info = entry.get("negotiation_round") or entry.get("round")
+            origin = entry.get("document_origin")
+            prefix_parts = [speaker]
+            if origin:
+                prefix_parts.append(f"origin={origin}")
+            if round_info is not None:
+                prefix_parts.append(f"round={round_info}")
+            prefix = " ".join(prefix_parts)
+            lines.append(f"{prefix}: {body}")
+        retrieved = snapshot.get("retrieved_memory") or []
+        if retrieved:
+            lines.append("\nRetrieved context:")
+            for item in retrieved[:5]:
+                content = item.get("content") if isinstance(item, dict) else None
+                if content:
+                    lines.append(f"- {content}")
+        procurement_records = snapshot.get("procurement_context") or []
+        if procurement_records:
+            lines.append("\nProcurement records:")
+            for record in procurement_records[:5]:
+                try:
+                    lines.append(f"- {json.dumps(record, ensure_ascii=False)}")
+                except Exception:
+                    lines.append(f"- {record}")
+        manifest = snapshot.get("manifest")
+        if manifest:
+            lines.append("\nManifest:")
+            try:
+                lines.append(json.dumps(manifest, ensure_ascii=False))
+            except Exception:
+                lines.append(str(manifest))
+        text = "\n".join(lines).strip()
+        return text or json.dumps(snapshot, ensure_ascii=False)
+
+    def _extract_response_text(self, data: Dict[str, Any]) -> str:
+        if not isinstance(data, dict):
+            return str(data)
+        for key in (
+            "message",
+            "response",
+            "summary",
+            "draft",
+        ):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        drafts = data.get("drafts")
+        if isinstance(drafts, list) and drafts:
+            first = drafts[0]
+            if isinstance(first, dict):
+                body = first.get("body") or first.get("content") or first.get("message")
+                if isinstance(body, str) and body.strip():
+                    return body.strip()
+        try:
+            return json.dumps(data, ensure_ascii=False)
+        except Exception:
+            return str(data)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -697,6 +1048,7 @@ class AgentNick:
             "document_type": models.PayloadSchemaType.KEYWORD,
             "product_type": models.PayloadSchemaType.KEYWORD,
             "record_id": models.PayloadSchemaType.KEYWORD,
+            "workflow_id": models.PayloadSchemaType.KEYWORD,
         }
 
         def ensure_indexes(schema: Dict[str, Any]) -> None:

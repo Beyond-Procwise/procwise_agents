@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     learning_collection_name: str = Field(
         default="learning", env="LEARNING_COLLECTION_NAME"
     )
+    context_training_data_dir: str = Field(
+        default=os.path.join(PROJECT_ROOT, "resources", "training", "conversations"),
+        env="CONTEXT_TRAINING_DATA_DIR",
+    )
+    context_model_output_dir: str = Field(
+        default=os.path.join(PROJECT_ROOT, "models", "context-aware-model"),
+        env="CONTEXT_MODEL_OUTPUT_DIR",
+    )
 
     # Email settings
     ses_smtp_secret_name: str = Field(
