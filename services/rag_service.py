@@ -155,6 +155,11 @@ class RAGService:
 
         hits = list(candidates.values())
 
+        if hits and filters is not None:
+            hits = [h for h in hits if self._payload_matches_filters(h.payload, filters)]
+            if not hits:
+                candidates = {}
+
         # --- Fallback to Qdrant if local indexes empty ---
         if not hits:
             q_vec = self.embedder.encode(query, normalize_embeddings=True).tolist()
@@ -227,3 +232,89 @@ class RAGService:
                 exc,
             )
             return index
+
+    # ------------------------------------------------------------------
+    # Filtering helpers
+    # ------------------------------------------------------------------
+    def _payload_matches_filters(
+        self, payload: Dict, filters: Optional[models.Filter]
+    ) -> bool:
+        if filters is None:
+            return True
+
+        if getattr(filters, "must", None):
+            for condition in filters.must:
+                if not self._payload_matches_condition(payload, condition):
+                    return False
+
+        if getattr(filters, "must_not", None):
+            for condition in filters.must_not:
+                if self._payload_matches_condition(payload, condition):
+                    return False
+
+        if getattr(filters, "should", None):
+            should_conditions = [
+                condition for condition in filters.should if condition is not None
+            ]
+            if should_conditions and not any(
+                self._payload_matches_condition(payload, condition)
+                for condition in should_conditions
+            ):
+                return False
+
+        return True
+
+    def _payload_matches_condition(self, payload: Dict, condition) -> bool:
+        if condition is None:
+            return True
+
+        if isinstance(condition, models.Filter):
+            return self._payload_matches_filters(payload, condition)
+
+        if isinstance(condition, models.FieldCondition):
+            value = payload.get(condition.key)
+
+            match = getattr(condition, "match", None)
+            if match is not None:
+                if isinstance(match, models.MatchValue):
+                    return value == match.value
+                if isinstance(match, models.MatchAny):
+                    options = getattr(match, "any", None) or []
+                    return value in set(options)
+                match_except = getattr(models, "MatchExcept", None)
+                if match_except is not None and isinstance(match, match_except):
+                    excluded = (
+                        getattr(match, "except_values", None)
+                        or getattr(match, "except_", None)
+                        or []
+                    )
+                    return value not in set(excluded)
+
+            range_ = getattr(condition, "range", None)
+            if range_ is not None and value is not None:
+                try:
+                    return self._value_in_range(float(value), range_)
+                except (TypeError, ValueError):
+                    return False
+
+            return False
+
+        return False
+
+    @staticmethod
+    def _value_in_range(value: float, range_: models.Range) -> bool:
+        lower_inclusive = getattr(range_, "gte", None)
+        lower_exclusive = getattr(range_, "gt", None)
+        upper_inclusive = getattr(range_, "lte", None)
+        upper_exclusive = getattr(range_, "lt", None)
+
+        if lower_inclusive is not None and value < lower_inclusive:
+            return False
+        if lower_exclusive is not None and value <= lower_exclusive:
+            return False
+        if upper_inclusive is not None and value > upper_inclusive:
+            return False
+        if upper_exclusive is not None and value >= upper_exclusive:
+            return False
+
+        return True
