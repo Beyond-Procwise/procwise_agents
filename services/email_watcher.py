@@ -538,11 +538,25 @@ class SESEmailWatcher:
         limit: Optional[int] = None,
         *,
         match_filters: Optional[Dict[str, object]] = None,
+        expected_replies: Optional[int] = None,
+        poll_interval: Optional[int] = None,
     ) -> List[Dict[str, object]]:
-        """Process a single batch of inbound emails."""
+        """Process a single batch of inbound emails.
+
+        When ``expected_replies`` is provided the scan stops early once that many
+        matching messages have been processed.  The ``poll_interval`` argument is
+        accepted for API compatibility with callers coordinating wait intervals
+        but is not used directly by this method.
+        """
 
         filters: Dict[str, object] = dict(match_filters) if match_filters else {}
         results: List[Dict[str, object]] = []
+        expected_cap = None
+        if expected_replies is not None:
+            expected_cap = self._coerce_int_value(expected_replies)
+            if expected_cap is not None and expected_cap <= 0:
+                expected_cap = None
+        processed_matches = 0
         target_rfq_normalised: Optional[str] = None
         if filters:
             target_rfq_normalised = self._normalise_rfq_value(filters.get("rfq_id"))
@@ -609,9 +623,14 @@ class SESEmailWatcher:
         try:
             prefixes = self._derive_prefixes_for_filters(filters)
             effective_limit = self._coerce_limit(limit)
+            if expected_cap is not None:
+                if effective_limit is None or expected_cap > effective_limit:
+                    effective_limit = expected_cap
 
             loader_limit = limit
             if filters and self._filters_should_expand_limit(filters):
+                loader_limit = None
+            if expected_cap is not None:
                 loader_limit = None
 
             match_found = False
@@ -710,13 +729,20 @@ class SESEmailWatcher:
                                 total_processed += 1
                             if matched:
                                 match_found = True
+                                if expected_cap is not None:
+                                    processed_matches += 1
+                                    if processed_matches >= expected_cap:
+                                        stop_requested = True
+                                        break
+                            elif not filters and rfq_matched:
+                                match_found = True
                             if (
                                 effective_limit is not None
                                 and effective_limit != 0
                                 and len(results) >= effective_limit
                             ):
                                 limit_exhausted = True
-                            if should_stop:
+                            if should_stop and expected_cap is None:
                                 stop_requested = True
                                 break
 
@@ -727,7 +753,7 @@ class SESEmailWatcher:
                             parsed: Dict[str, object],
                             last_modified: Optional[datetime] = None,
                         ) -> bool:
-                            nonlocal total_processed, total_candidates, match_found
+                            nonlocal total_processed, total_candidates, match_found, processed_matches, stop_requested
                             total_candidates += 1
                             if filters:
                                 processed_batch.append(parsed)
@@ -746,13 +772,23 @@ class SESEmailWatcher:
                                 total_processed += 1
                             if matched:
                                 match_found = True
+                                if expected_cap is not None:
+                                    processed_matches += 1
                             if (
                                 effective_limit is not None
                                 and effective_limit != 0
                                 and len(results) >= effective_limit
                             ):
                                 limit_exhausted = True
-                            return should_stop
+                            if not filters and rfq_matched:
+                                match_found = True
+                            if expected_cap is not None and matched and processed_matches >= expected_cap:
+                                stop_requested = True
+                                return True
+                            if should_stop and expected_cap is None:
+                                stop_requested = True
+                                return True
+                            return False
 
                         messages = self._load_messages(
                             loader_limit,
@@ -793,23 +829,33 @@ class SESEmailWatcher:
                                     total_processed += 1
                                 if matched:
                                     match_found = True
+                                    if expected_cap is not None:
+                                        processed_matches += 1
+                                        if processed_matches >= expected_cap:
+                                            stop_requested = True
+                                            break
+                                elif not filters and rfq_matched:
+                                    match_found = True
                                 if (
                                     effective_limit is not None
                                     and effective_limit != 0
                                     and len(results) >= effective_limit
                                 ):
                                     limit_exhausted = True
-                                if should_stop:
+                                if should_stop and expected_cap is None:
                                     stop_requested = True
                                     break
                 except Exception:  # pragma: no cover - network/runtime
                     logger.exception("Failed to load inbound SES messages")
                     break
 
+                if expected_cap is None and target_rfq_normalised and match_found:
+                    stop_requested = True
+
                 if limit_exhausted or stop_requested:
                     break
 
-                if match_found and self._should_stop_after_match(filters):
+                if expected_cap is None and match_found and self._should_stop_after_match(filters):
                     break
 
                 if not target_rfq_normalised:
@@ -3902,8 +3948,10 @@ class SESEmailWatcher:
 
                 client.logout()
         except Exception:
-            logger.exception(
-                "IMAP fallback polling failed for mailbox %s", self.mailbox_address
+            logger.error(
+                "IMAP fallback polling failed for mailbox %s",
+                self.mailbox_address or "<unknown>",
+                exc_info=True,
             )
             return []
 
