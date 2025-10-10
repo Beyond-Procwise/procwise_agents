@@ -1011,6 +1011,48 @@ def test_poll_once_expands_loader_limit_for_supplier_filters(monkeypatch):
     assert captured_since == [initial_watermark]
 
 
+def test_poll_once_processes_all_matches_even_when_limit_reached():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1000",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-1",
+            "from": "supplier@example.com",
+        },
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Updated quote 950",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-1",
+            "from": "supplier@example.com",
+        },
+    ]
+
+    def loader(limit=None):
+        return list(messages)
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    results = watcher.poll_once(
+        limit=1,
+        match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-1"},
+    )
+
+    assert len(results) == 1
+    context_ids = {context.input_data["message_id"] for context in watcher.supplier_agent.contexts}
+    assert context_ids == {"msg-1", "msg-2"}
+
+    seen_entries = dict(state.items())
+    assert set(seen_entries) == {"msg-1", "msg-2"}
+    assert all(entry.get("status") == "processed" for entry in seen_entries.values())
+
+
 def test_poll_once_defers_watermark_until_batch_complete(monkeypatch):
     nick = DummyNick()
     watcher = _make_watcher(nick)

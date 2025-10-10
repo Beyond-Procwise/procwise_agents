@@ -615,6 +615,8 @@ class SESEmailWatcher:
                 loader_limit = None
 
             match_found = False
+            limit_exhausted = False
+            stop_requested = False
             latest_candidate_ts: Optional[datetime] = None
             latest_candidate_key: str = ""
 
@@ -708,9 +710,14 @@ class SESEmailWatcher:
                                 total_processed += 1
                             if matched:
                                 match_found = True
+                            if (
+                                effective_limit is not None
+                                and effective_limit != 0
+                                and len(results) >= effective_limit
+                            ):
+                                limit_exhausted = True
                             if should_stop:
-                                if not match_found:
-                                    match_found = True
+                                stop_requested = True
                                 break
 
                     if self._custom_loader is None or loader_empty:
@@ -739,6 +746,12 @@ class SESEmailWatcher:
                                 total_processed += 1
                             if matched:
                                 match_found = True
+                            if (
+                                effective_limit is not None
+                                and effective_limit != 0
+                                and len(results) >= effective_limit
+                            ):
+                                limit_exhausted = True
                             return should_stop
 
                         messages = self._load_messages(
@@ -780,13 +793,23 @@ class SESEmailWatcher:
                                     total_processed += 1
                                 if matched:
                                     match_found = True
+                                if (
+                                    effective_limit is not None
+                                    and effective_limit != 0
+                                    and len(results) >= effective_limit
+                                ):
+                                    limit_exhausted = True
                                 if should_stop:
+                                    stop_requested = True
                                     break
                 except Exception:  # pragma: no cover - network/runtime
                     logger.exception("Failed to load inbound SES messages")
                     break
 
-                if match_found:
+                if limit_exhausted or stop_requested:
+                    break
+
+                if match_found and self._should_stop_after_match(filters):
                     break
 
                 if not target_rfq_normalised:
@@ -1261,13 +1284,15 @@ class SESEmailWatcher:
                 include_payload = True
 
         if include_payload and effective_limit != 0:
-            results.append(processed_payload)
+            can_append = True
             if (
                 effective_limit is not None
                 and effective_limit != 0
                 and len(results) >= effective_limit
             ):
-                should_stop = True
+                can_append = False
+            if can_append:
+                results.append(processed_payload)
 
         # Stop conditions: either a filter match or an RFQ match should stop polling
         if matched and self._should_stop_after_match(match_filters):
