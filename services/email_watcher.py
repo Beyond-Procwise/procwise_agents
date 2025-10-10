@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import inspect
 import imaplib
 import logging
 import mimetypes
@@ -609,10 +610,19 @@ class SESEmailWatcher:
         try:
             prefixes = self._derive_prefixes_for_filters(filters)
             effective_limit = self._coerce_limit(limit)
+            result_limit = effective_limit
 
             loader_limit = limit
             if filters and self._filters_should_expand_limit(filters):
                 loader_limit = None
+                effective_limit = None
+
+            process_candidate = self._process_candidate_message
+            try:
+                process_signature = inspect.signature(process_candidate)
+                accepts_result_limit = "result_limit" in process_signature.parameters
+            except (TypeError, ValueError):
+                accepts_result_limit = False
 
             match_found = False
             latest_candidate_ts: Optional[datetime] = None
@@ -697,12 +707,17 @@ class SESEmailWatcher:
                                     last_modified_hint, str(message.get("id") or "")
                                 )
                             total_candidates += 1
-                            matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                            process_kwargs = {
+                                "match_filters": filters,
+                                "target_rfq_normalised": target_rfq_normalised,
+                                "results": results,
+                                "effective_limit": effective_limit,
+                            }
+                            if accepts_result_limit:
+                                process_kwargs["result_limit"] = result_limit
+                            matched, should_stop, rfq_matched, was_processed = process_candidate(
                                 message,
-                                match_filters=filters,
-                                target_rfq_normalised=target_rfq_normalised,
-                                results=results,
-                                effective_limit=effective_limit,
+                                **process_kwargs,
                             )
                             if was_processed:
                                 total_processed += 1
@@ -724,12 +739,17 @@ class SESEmailWatcher:
                             total_candidates += 1
                             if filters:
                                 processed_batch.append(parsed)
-                            matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                            process_kwargs = {
+                                "match_filters": filters,
+                                "target_rfq_normalised": target_rfq_normalised,
+                                "results": results,
+                                "effective_limit": effective_limit,
+                            }
+                            if accepts_result_limit:
+                                process_kwargs["result_limit"] = result_limit
+                            matched, should_stop, rfq_matched, was_processed = process_candidate(
                                 parsed,
-                                match_filters=filters,
-                                target_rfq_normalised=target_rfq_normalised,
-                                results=results,
-                                effective_limit=effective_limit,
+                                **process_kwargs,
                             )
                             if last_modified is not None:
                                 _record_watermark_candidate(
@@ -769,12 +789,17 @@ class SESEmailWatcher:
                                         last_modified_hint, str(message.get("id") or "")
                                     )
                                 total_candidates += 1
-                                matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
+                                process_kwargs = {
+                                    "match_filters": filters,
+                                    "target_rfq_normalised": target_rfq_normalised,
+                                    "results": results,
+                                    "effective_limit": effective_limit,
+                                }
+                                if accepts_result_limit:
+                                    process_kwargs["result_limit"] = result_limit
+                                matched, should_stop, rfq_matched, was_processed = process_candidate(
                                     message,
-                                    match_filters=filters,
-                                    target_rfq_normalised=target_rfq_normalised,
-                                    results=results,
-                                    effective_limit=effective_limit,
+                                    **process_kwargs,
                                 )
                                 if was_processed:
                                     total_processed += 1
@@ -938,6 +963,7 @@ class SESEmailWatcher:
         target_rfq_normalised: Optional[str],
         results: List[Dict[str, object]],
         effective_limit: Optional[int],
+        result_limit: Optional[int] = None,
     ) -> Tuple[bool, bool, bool, bool]:
         if not isinstance(message, dict):
             return False, False, False, False
@@ -1260,7 +1286,13 @@ class SESEmailWatcher:
             elif not match_filters:
                 include_payload = True
 
-        if include_payload and effective_limit != 0:
+        if include_payload:
+            if result_limit == 0:
+                include_payload = False
+            elif result_limit is not None and len(results) >= result_limit:
+                include_payload = False
+
+        if include_payload and result_limit != 0:
             results.append(processed_payload)
             if (
                 effective_limit is not None
