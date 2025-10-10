@@ -950,6 +950,164 @@ def test_poll_once_continues_until_all_filters_match():
     assert watcher.supplier_agent.contexts[0].input_data["supplier_id"] == "SUP-2"
 
 
+def test_poll_once_expands_loader_limit_for_supplier_filters(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+    watcher._last_watermark_ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    initial_watermark = watcher._last_watermark_ts
+
+    captured_limits: List[Optional[int]] = []
+    captured_since: List[Optional[datetime]] = []
+
+    messages = [
+        {
+            "id": "msg-1",
+            "supplier_id": "SUP-1",
+            "_last_modified": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+        },
+        {
+            "id": "msg-2",
+            "supplier_id": "SUP-2",
+            "_last_modified": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+        },
+    ]
+
+    def fake_process(
+        self,
+        message,
+        *,
+        match_filters,
+        target_rfq_normalised,
+        results,
+        effective_limit,
+    ):
+        matched = message.get("supplier_id") == match_filters.get("supplier_id")
+        if matched:
+            results.append({"message_id": message.get("id"), "supplier_id": message.get("supplier_id")})
+        return matched, False, False, True
+
+    def fake_load_messages(
+        limit,
+        *,
+        mark_seen,
+        prefixes,
+        since,
+        on_message,
+    ):
+        captured_limits.append(limit)
+        captured_since.append(since)
+        for payload in messages:
+            if on_message is not None:
+                on_message(payload, payload.get("_last_modified"))
+        return []
+
+    monkeypatch.setattr(watcher, "_process_candidate_message", fake_process.__get__(watcher, type(watcher)))
+    monkeypatch.setattr(watcher, "_load_messages", fake_load_messages)
+
+    results = watcher.poll_once(match_filters={"supplier_id": "SUP-2"})
+
+    assert [payload["supplier_id"] for payload in results] == ["SUP-2"]
+    assert captured_limits == [None]
+    assert captured_since == [initial_watermark]
+
+
+def test_poll_once_processes_all_matches_even_when_limit_reached():
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+
+    messages = [
+        {
+            "id": "msg-1",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Quoted price 1000",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-1",
+            "from": "supplier@example.com",
+        },
+        {
+            "id": "msg-2",
+            "subject": "Re: RFQ-20240101-abcd1234",
+            "body": "Updated quote 950",
+            "rfq_id": "RFQ-20240101-abcd1234",
+            "supplier_id": "SUP-1",
+            "from": "supplier@example.com",
+        },
+    ]
+
+    def loader(limit=None):
+        return list(messages)
+
+    watcher = _make_watcher(nick, loader=loader, state_store=state)
+
+    results = watcher.poll_once(
+        limit=1,
+        match_filters={"rfq_id": "RFQ-20240101-abcd1234", "supplier_id": "SUP-1"},
+    )
+
+    assert len(results) == 1
+    context_ids = {context.input_data["message_id"] for context in watcher.supplier_agent.contexts}
+    assert context_ids == {"msg-1", "msg-2"}
+
+    seen_entries = dict(state.items())
+    assert set(seen_entries) == {"msg-1", "msg-2"}
+    assert all(entry.get("status") == "processed" for entry in seen_entries.values())
+
+
+def test_poll_once_defers_watermark_until_batch_complete(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    messages = [
+        {
+            "id": "msg-1",
+            "supplier_id": "SUP-1",
+            "_last_modified": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+        },
+        {
+            "id": "msg-2",
+            "supplier_id": "SUP-2",
+            "_last_modified": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+        },
+    ]
+
+    def fake_process(
+        self,
+        message,
+        *,
+        match_filters,
+        target_rfq_normalised,
+        results,
+        effective_limit,
+    ):
+        matched = message.get("supplier_id") == match_filters.get("supplier_id")
+        if matched:
+            results.append({"message_id": message.get("id"), "supplier_id": message.get("supplier_id")})
+        return matched, False, False, True
+
+    calls: List[Tuple[datetime, str]] = []
+    original_update = watcher._update_watermark
+
+    def capture_update(last_modified, key):
+        calls.append((last_modified, key))
+        original_update(last_modified, key)
+
+    def fake_loader(limit=None):
+        return list(messages)
+
+    monkeypatch.setattr(watcher, "_process_candidate_message", fake_process.__get__(watcher, type(watcher)))
+    monkeypatch.setattr(watcher, "_custom_loader", fake_loader)
+    monkeypatch.setattr(watcher, "_update_watermark", capture_update)
+
+    results = watcher.poll_once(match_filters={"supplier_id": "SUP-2"})
+
+    assert [payload["supplier_id"] for payload in results] == ["SUP-2"]
+    assert calls
+    assert len(calls) == 1
+    last_modified, key = calls[0]
+    assert isinstance(last_modified, datetime)
+    assert key == "msg-2"
+
+
 def test_poll_once_matches_on_rfq_tail():
     nick = DummyNick()
     state = InMemoryEmailWatcherState()
@@ -1005,6 +1163,15 @@ def test_match_dispatched_message_prefers_run_id():
     assert match.matched_via == "dispatch_token"
 
 
+def test_compose_imap_search_criteria_includes_since():
+    ts = datetime(2024, 2, 15, 9, 30, tzinfo=timezone.utc)
+    criteria = SESEmailWatcher._compose_imap_search_criteria("ALL", ts)
+    assert criteria == "(UNSEEN) SINCE 15-Feb-2024"
+
+    custom = SESEmailWatcher._compose_imap_search_criteria('UNSEEN FROM "foo"', None)
+    assert custom == 'UNSEEN FROM "foo"'
+
+
 def test_email_watcher_falls_back_to_imap(monkeypatch):
     nick = DummyNick()
     nick.settings.imap_host = "imap.example.com"
@@ -1014,8 +1181,11 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
 
     watcher = _make_watcher(nick, loader=None)
     watcher.bucket = None
+    watcher._last_watermark_ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
     class StubIMAP:
+        last_search: Optional[str] = None
+
         def __init__(self, host, port=None):
             self.host = host
             self.port = port
@@ -1036,6 +1206,7 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
             return "OK", [b""]
 
         def search(self, charset, criteria):
+            StubIMAP.last_search = criteria
             return "OK", [b"1"]
 
         def fetch(self, msg_id, command):
@@ -1062,6 +1233,9 @@ def test_email_watcher_falls_back_to_imap(monkeypatch):
     payload = results[0]
     assert payload["message_id"] in {"<imap-msg-1>", "imap/1"}
     assert payload["subject"] == "Re: RFQ-20240101-abcd1234"
+    assert StubIMAP.last_search is not None
+    assert "UNSEEN" in StubIMAP.last_search
+    assert "SINCE 01-Jan-2024" in StubIMAP.last_search
 
 
 def test_imap_primary_prefers_imap_over_s3(monkeypatch):
@@ -1080,7 +1254,7 @@ def test_imap_primary_prefers_imap_over_s3(monkeypatch):
         counters["s3"] += 1
         return []
 
-    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+    def _stub_imap(self, limit, *, mark_seen, since=None, on_message=None):
         counters["imap"] += 1
         return [
             {
@@ -1133,7 +1307,7 @@ def test_imap_falls_back_to_s3_after_three_empty_polls(monkeypatch):
             }
         ]
 
-    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+    def _stub_imap(self, limit, *, mark_seen, since=None, on_message=None):
         counters["imap"] += 1
         return []
 
@@ -1254,7 +1428,7 @@ def test_imap_never_invokes_s3_even_when_configured(monkeypatch):
             }
         ]
 
-    def _stub_imap(self, limit, *, mark_seen, on_message=None):
+    def _stub_imap(self, limit, *, mark_seen, since=None, on_message=None):
         counters["imap"] += 1
         return []
 
@@ -1997,7 +2171,7 @@ def test_poll_once_skips_s3_polling_even_when_configured(monkeypatch):
     watcher._prefixes = ["emails/"]
     watcher.poll_interval_seconds = 0
 
-    def _fake_imap(self, limit, *, mark_seen, on_message=None):
+    def _fake_imap(self, limit, *, mark_seen, since=None, on_message=None):
         return []
 
     def _unexpected_s3_call():  # pragma: no cover - defensive guard
@@ -2515,7 +2689,7 @@ def test_acknowledge_recent_dispatch_prefers_imap(monkeypatch):
     imap_calls: List[Tuple[Optional[int], bool]] = []
     s3_called = False
 
-    def fake_imap(limit, mark_seen=False):
+    def fake_imap(limit, mark_seen=False, since=None):
         imap_calls.append((limit, mark_seen))
         return list(imap_messages)
 
@@ -2595,7 +2769,7 @@ def test_acknowledge_recent_dispatch_falls_back_to_s3(monkeypatch):
 
     s3_calls: List[Tuple[Optional[int], Tuple[str, ...]]] = []
 
-    def fake_imap(limit, mark_seen=False):
+    def fake_imap(limit, mark_seen=False, since=None):
         return list(imap_messages)
 
     def fake_s3(limit, prefixes=None, newest_first=True):
@@ -2667,3 +2841,44 @@ def test_sqs_email_loader_extracts_records():
     assert record["_bucket"] == "procwisemvp"
     assert isinstance(record.get("_last_modified"), datetime)
     assert stub.deleted == ["r1"]
+
+
+def test_should_not_stop_after_supplier_or_rfq_filters():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    assert watcher._should_stop_after_match({"supplier_id": "supplier-1"}) is False
+    assert (
+        watcher._should_stop_after_match({"rfq_id": "RFQ-20240215-SIM12345"})
+        is False
+    )
+    assert (
+        watcher._should_stop_after_match(
+            {
+                "supplier_id": "supplier-1",
+                "rfq_id": "RFQ-20240215-SIM12345",
+                "workflow_id": "workflow-1",
+            }
+        )
+        is False
+    )
+
+
+def test_should_stop_after_unrelated_filters():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    assert watcher._should_stop_after_match({"status": "open"}) is True
+
+
+def test_filters_should_expand_limit_for_supplier_and_workflow():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    assert watcher._filters_should_expand_limit({"supplier_id": "SUP-1"}) is True
+    assert watcher._filters_should_expand_limit({"rfq_id": "RFQ-2024"}) is True
+    assert (
+        watcher._filters_should_expand_limit({"workflow_id": "wf-1", "action_id": "act-1"})
+        is True
+    )
+    assert watcher._filters_should_expand_limit({"status": "pending"}) is False
