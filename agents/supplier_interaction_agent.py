@@ -2,12 +2,11 @@ import json
 import logging
 import re
 import imaplib
-import threading
 import time
 import os
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
@@ -200,22 +199,18 @@ class SupplierInteractionAgent(BaseAgent):
                 draft_action_id = None
                 workflow_hint = None
                 dispatch_run_id = None
+                action_hint = None
+                email_action_hint = None
                 if watch_candidates:
                     primary_candidate = watch_candidates[0]
                     if isinstance(primary_candidate, dict):
-                        for key in ("action_id", "draft_action_id", "email_action_id"):
-                            candidate_action = primary_candidate.get(key)
-                            if isinstance(candidate_action, str) and candidate_action.strip():
-                                draft_action_id = candidate_action.strip()
-                                break
-                        workflow_hint = primary_candidate.get("workflow_id")
-                        if not workflow_hint:
-                            meta = primary_candidate.get("metadata")
-                            if isinstance(meta, dict):
-                                meta_workflow = meta.get("workflow_id") or meta.get("process_workflow_id")
-                                if isinstance(meta_workflow, str) and meta_workflow.strip():
-                                    workflow_hint = meta_workflow.strip()
-                        dispatch_run_id = self._extract_dispatch_run_id(primary_candidate)
+                        context_hint = self._prepare_watch_context(primary_candidate)
+                        if context_hint:
+                            draft_action_id = context_hint.get("draft_action_id")
+                            workflow_hint = context_hint.get("workflow_id")
+                            dispatch_run_id = context_hint.get("dispatch_run_id")
+                            action_hint = context_hint.get("action_id")
+                            email_action_hint = context_hint.get("email_action_id")
                 if workflow_hint is None:
                     workflow_hint = getattr(context, "workflow_id", None)
                 wait_result = self.wait_for_response(
@@ -229,6 +224,8 @@ class SupplierInteractionAgent(BaseAgent):
                     draft_action_id=draft_action_id,
                     workflow_id=workflow_hint,
                     dispatch_run_id=dispatch_run_id,
+                    action_id=action_hint,
+                    email_action_id=email_action_hint,
                 )
 
             if not wait_result:
@@ -499,6 +496,8 @@ class SupplierInteractionAgent(BaseAgent):
         draft_action_id: Optional[str] = None,
         workflow_id: Optional[str] = None,
         dispatch_run_id: Optional[str] = None,
+        action_id: Optional[str] = None,
+        email_action_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """Wait for an inbound supplier email and return the processed result.
 
@@ -599,13 +598,12 @@ class SupplierInteractionAgent(BaseAgent):
         subject_norm = str(subject_hint or "").strip().lower()
         sender_normalised = self._normalise_identifier(from_address)
 
-        match_filters: Dict[str, object] = {}
-        if supplier_id:
-            match_filters["supplier_id"] = supplier_id
-        if dispatch_run_id:
-            match_filters["dispatch_run_id"] = dispatch_run_id
-        if draft_action_id:
-            match_filters["draft_action_id"] = draft_action_id
+        match_filters = self._build_workflow_filters(
+            workflow_id=workflow_id,
+            action_id=action_id,
+            draft_action_id=draft_action_id,
+            email_action_id=email_action_id,
+        )
 
         while time.time() <= deadline:
             if attempt_cap is not None and attempts_made >= attempt_cap:
@@ -617,10 +615,11 @@ class SupplierInteractionAgent(BaseAgent):
                 break
             attempts_made += 1
             try:
-                if match_filters:
-                    batch = active_watcher.poll_once(limit=limit, match_filters=match_filters)
-                else:
-                    batch = active_watcher.poll_once(limit=limit)
+                poll_kwargs: Dict[str, object] = {
+                    "limit": None,
+                    "match_filters": match_filters or {},
+                }
+                batch = active_watcher.poll_once(**poll_kwargs)
             except Exception:  # pragma: no cover - best effort
                 logger.exception("wait_for_response poll failed")
                 batch = []
@@ -710,20 +709,7 @@ class SupplierInteractionAgent(BaseAgent):
         limit: int = 1,
         enable_negotiation: bool = True,
     ) -> List[Optional[Dict]]:
-        """Spawn concurrent watchers for each draft and wait for supplier replies.
-
-        Args:
-            drafts: A list of draft payloads from ``EmailDraftingAgent``. Each
-                payload should include at least an ``rfq_id`` and ``supplier_id``.
-            timeout: Maximum seconds each watcher should wait for a reply.
-            poll_interval: Optional override for the polling cadence in seconds.
-            limit: Maximum number of messages to fetch per poll iteration.
-
-        Returns:
-            A list of supplier response payloads in the same order as ``drafts``.
-            Entries are ``None`` when the response was not observed before the
-            timeout or if the draft payload was missing required identifiers.
-        """
+        """Poll the shared watcher until every expected supplier responds."""
 
         if not drafts:
             return []
@@ -738,119 +724,244 @@ class SupplierInteractionAgent(BaseAgent):
         deadline = time.time() + max(timeout, 0)
 
         results: List[Optional[Dict]] = [None] * len(drafts)
-        errors: List[Optional[BaseException]] = [None] * len(drafts)
-        lock = threading.Lock()
-        threads: List[threading.Thread] = []
+        contexts: List[Optional[Dict[str, Any]]] = [None] * len(drafts)
 
         try:
             from services.email_watcher import SESEmailWatcher
         except Exception:  # pragma: no cover - optional dependency
-            logger.exception("Unable to initialise email watcher for parallel polling")
+            logger.exception("Unable to initialise email watcher for aggregated polling")
             return results
 
         negotiation_agent = self._get_negotiation_agent() if enable_negotiation else None
 
-        def _watch_single(index: int, draft: Dict[str, Any]) -> None:
-            rfq_id = draft.get("rfq_id")
-            supplier_id = draft.get("supplier_id")
-            if not rfq_id or not supplier_id:
-                logger.warning(
-                    "Skipping parallel watch for draft missing identifiers (index=%s)", index
-                )
-                return
+        poll_setting = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
+        if safe_interval is not None:
+            response_interval = self._coerce_int(safe_interval, default=poll_setting)
+        else:
+            response_interval = poll_setting
 
-            recipient_hint = draft.get("receiver") or draft.get("recipient_email")
-            if recipient_hint is None:
-                recipients_field = draft.get("recipients")
-                if isinstance(recipients_field, (list, tuple)) and recipients_field:
-                    recipient_hint = recipients_field[0]
-                elif isinstance(recipients_field, str):
-                    recipient_hint = recipients_field
-            subject_hint = draft.get("subject")
-            draft_action_id = None
-            for key in ("action_id", "draft_action_id", "email_action_id"):
-                candidate = draft.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    draft_action_id = candidate.strip()
-                    break
-            workflow_hint = draft.get("workflow_id")
-            if not workflow_hint:
-                meta = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else None
-                if meta:
-                    meta_workflow = meta.get("workflow_id") or meta.get("process_workflow_id")
-                    if isinstance(meta_workflow, str) and meta_workflow.strip():
-                        workflow_hint = meta_workflow.strip()
-            dispatch_run_id = None
-            for key in ("dispatch_run_id", "run_id"):
-                candidate = draft.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    dispatch_run_id = candidate.strip()
-                    break
-            if dispatch_run_id is None and isinstance(draft.get("metadata"), dict):
-                meta_run = draft["metadata"].get("dispatch_run_id") or draft["metadata"].get("run_id")
-                if isinstance(meta_run, str) and meta_run.strip():
-                    dispatch_run_id = meta_run.strip()
+        watcher_instance = SESEmailWatcher(
+            self.agent_nick,
+            supplier_agent=self,
+            negotiation_agent=negotiation_agent,
+            enable_negotiation=enable_negotiation,
+            response_poll_seconds=response_interval,
+        )
 
-            poll_setting = getattr(
-                self.agent_nick.settings, "email_response_poll_seconds", 60
-            )
-            if safe_interval is not None:
-                response_interval = self._coerce_int(safe_interval, default=poll_setting)
-            else:
-                response_interval = poll_setting
+        GroupDict = Dict[str, Any]
+        groups: Dict[Tuple[str, str], GroupDict] = {}
+        _MISMATCH = object()
 
-            watcher_instance = SESEmailWatcher(
-                self.agent_nick,
-                supplier_agent=self,
-                negotiation_agent=negotiation_agent,
-                enable_negotiation=enable_negotiation,
-                response_poll_seconds=response_interval,
-            )
-
-            try:
-                result = self.wait_for_response(
-                    watcher=watcher_instance,
-                    timeout=timeout,
-                    poll_interval=safe_interval,
-                    limit=limit,
-                    rfq_id=rfq_id,
-                    supplier_id=supplier_id,
-                    subject_hint=subject_hint,
-                    from_address=recipient_hint,
-                    enable_negotiation=enable_negotiation,
-                    draft_action_id=draft_action_id,
-                    workflow_id=workflow_hint,
-                    dispatch_run_id=dispatch_run_id,
-
-                )
-                with lock:
-                    results[index] = result
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.exception(
-                    "Parallel email watch failed for rfq_id=%s supplier=%s", rfq_id, supplier_id
-                )
-                with lock:
-                    errors[index] = exc
+        def _resolve_group_key(context: Dict[str, Any], index: int) -> Tuple[str, str]:
+            for key in ("workflow_id", "draft_action_id", "action_id", "email_action_id"):
+                value = context.get(key)
+                if isinstance(value, str) and value.strip():
+                    return (key, value.strip())
+            return ("fallback", str(index))
 
         for idx, draft in enumerate(drafts):
-            if not isinstance(draft, dict):
-                logger.debug("Ignoring non-dict draft payload at index %s", idx)
+            context = self._prepare_watch_context(draft)
+            contexts[idx] = context
+            if not context:
                 continue
-            thread = threading.Thread(
-                target=_watch_single,
-                name=f"supplier-watch-{idx}",
-                args=(idx, draft),
-                daemon=True,
+            group_key = _resolve_group_key(context, idx)
+            group = groups.setdefault(
+                group_key,
+                {
+                    "filters": {},
+                    "filter_candidates": {
+                        "workflow_id": context.get("workflow_id"),
+                        "action_id": context.get("action_id"),
+                        "draft_action_id": context.get("draft_action_id"),
+                        "email_action_id": context.get("email_action_id"),
+                    },
+                    "pending": set(),
+                    "contexts": {},
+                    "by_dispatch": {},
+                    "by_supplier_rfq": {},
+                    "by_supplier": {},
+                    "by_rfq": {},
+                    "by_action": {},
+                },
             )
-            threads.append(thread)
-            thread.start()
+            if group is not None:
+                candidates = group.setdefault("filter_candidates", {})
+            else:
+                candidates = {}
+            for key in ("workflow_id", "action_id", "draft_action_id", "email_action_id"):
+                existing = candidates.get(key)
+                candidate_value = context.get(key)
+                if existing is _MISMATCH:
+                    continue
+                if existing is None:
+                    if candidate_value is not None:
+                        candidates[key] = candidate_value
+                    continue
+                if candidate_value is None or candidate_value == existing:
+                    continue
+                candidates[key] = _MISMATCH
 
-        for thread in threads:
-            thread.join(timeout=timeout + 1)
+            def _candidate_or_none(value: object) -> Optional[str]:
+                if value is _MISMATCH:
+                    return None
+                return value  # type: ignore[return-value]
 
-        for error in errors:
-            if error is not None:
-                raise error
+            group["filters"] = self._build_workflow_filters(
+                workflow_id=_candidate_or_none(group["filter_candidates"].get("workflow_id")),
+                action_id=_candidate_or_none(group["filter_candidates"].get("action_id")),
+                draft_action_id=_candidate_or_none(group["filter_candidates"].get("draft_action_id")),
+                email_action_id=_candidate_or_none(group["filter_candidates"].get("email_action_id")),
+            )
+            group["pending"].add(idx)
+            group["contexts"][idx] = context
+            dispatch_key = context.get("dispatch_normalised")
+            if dispatch_key:
+                group["by_dispatch"][dispatch_key] = idx
+            supplier_key = context.get("supplier_normalised")
+            rfq_key = context.get("rfq_normalised")
+            if supplier_key and rfq_key:
+                group["by_supplier_rfq"][(supplier_key, rfq_key)] = idx
+            if supplier_key:
+                group["by_supplier"][supplier_key] = idx
+            if rfq_key:
+                group["by_rfq"][rfq_key] = idx
+            for token in (
+                context.get("draft_action_id"),
+                context.get("action_id"),
+                context.get("email_action_id"),
+            ):
+                normalised = self._normalise_identifier(token)
+                if normalised:
+                    group["by_action"][normalised] = idx
+
+        if not groups:
+            return results
+
+        def _candidate_action_tokens(candidate: Dict[str, Any]) -> List[str]:
+            tokens: List[str] = []
+            metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else None
+            for container in (candidate, metadata):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("draft_action_id", "action_id", "email_action_id"):
+                    value = container.get(key)
+                    normalised = self._normalise_identifier(value)
+                    if normalised:
+                        tokens.append(normalised)
+            return tokens
+
+        def _candidate_ready(candidate: Dict[str, Any]) -> bool:
+            status_value = str(candidate.get("supplier_status") or "").lower()
+            payload_ready = candidate.get("supplier_output")
+            if status_value == AgentStatus.FAILED.value:
+                return True
+            if status_value in {"processing", "pending"} and not payload_ready:
+                return False
+            if payload_ready:
+                return True
+            if candidate.get("error"):
+                return True
+            return False
+
+        def _matches_context(idx: int, candidate: Dict[str, Any]) -> bool:
+            context = contexts[idx]
+            if not context:
+                return False
+            dispatch_norm = self._normalise_identifier(
+                candidate.get("dispatch_run_id") or candidate.get("run_id")
+            )
+            if context.get("dispatch_normalised") and dispatch_norm:
+                if dispatch_norm != context["dispatch_normalised"]:
+                    return False
+            supplier_norm = self._normalise_identifier(candidate.get("supplier_id"))
+            if context.get("supplier_normalised") and supplier_norm:
+                if supplier_norm != context["supplier_normalised"]:
+                    return False
+            rfq_norm = self._normalise_identifier(candidate.get("rfq_id"))
+            if context.get("rfq_normalised") and rfq_norm:
+                if rfq_norm != context["rfq_normalised"]:
+                    return False
+            subject_norm = str(candidate.get("subject") or "").lower()
+            if context.get("subject_normalised"):
+                if context["subject_normalised"] not in subject_norm:
+                    return False
+            sender_norm = self._normalise_identifier(candidate.get("from_address"))
+            if context.get("from_normalised") and sender_norm:
+                if sender_norm != context["from_normalised"]:
+                    return False
+            return True
+
+        def _locate_index(group: GroupDict, candidate: Dict[str, Any]) -> Optional[int]:
+            dispatch_norm = self._normalise_identifier(
+                candidate.get("dispatch_run_id") or candidate.get("run_id")
+            )
+            if dispatch_norm and dispatch_norm in group["by_dispatch"]:
+                idx = group["by_dispatch"][dispatch_norm]
+                if idx in group["pending"] and _matches_context(idx, candidate):
+                    return idx
+            for token in _candidate_action_tokens(candidate):
+                idx = group["by_action"].get(token)
+                if idx in group["pending"] and _matches_context(idx, candidate):
+                    return idx
+            supplier_norm = self._normalise_identifier(candidate.get("supplier_id"))
+            rfq_norm = self._normalise_identifier(candidate.get("rfq_id"))
+            if supplier_norm and rfq_norm:
+                idx = group["by_supplier_rfq"].get((supplier_norm, rfq_norm))
+                if idx in group["pending"] and _matches_context(idx, candidate):
+                    return idx
+            if supplier_norm:
+                idx = group["by_supplier"].get(supplier_norm)
+                if idx in group["pending"] and _matches_context(idx, candidate):
+                    return idx
+            if rfq_norm:
+                idx = group["by_rfq"].get(rfq_norm)
+                if idx in group["pending"] and _matches_context(idx, candidate):
+                    return idx
+            return None
+
+        seen_messages: Set[str] = set()
+
+        def _pending_total() -> int:
+            return sum(len(group["pending"]) for group in groups.values())
+
+        while time.time() <= deadline and _pending_total() > 0:
+            cycle_matched = False
+            for group in groups.values():
+                if not group["pending"]:
+                    continue
+                poll_kwargs: Dict[str, object] = {"limit": None}
+                if group["filters"]:
+                    poll_kwargs["match_filters"] = group["filters"]
+                try:
+                    batch = watcher_instance.poll_once(**poll_kwargs)
+                except Exception:  # pragma: no cover - defensive network/runtime
+                    logger.exception("Aggregated wait_for_multiple_responses poll failed")
+                    batch = []
+                for candidate in batch:
+                    message_id = str(candidate.get("message_id") or candidate.get("id") or "")
+                    if message_id:
+                        if message_id in seen_messages:
+                            continue
+                        seen_messages.add(message_id)
+                    target_index = _locate_index(group, candidate)
+                    if target_index is None:
+                        continue
+                    if not _candidate_ready(candidate):
+                        continue
+                    results[target_index] = candidate
+                    group["pending"].discard(target_index)
+                    cycle_matched = True
+            if _pending_total() == 0:
+                break
+            if cycle_matched:
+                continue
+            interval_value = safe_interval or poll_setting
+            if interval_value <= 0:
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval_value, max(0, remaining)))
 
         if any(result is None for result in results):
             self._await_outstanding_dispatch_responses(
@@ -863,6 +974,96 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
         return results
+
+    def _prepare_watch_context(self, draft: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(draft, dict):
+            return None
+
+        rfq_id = draft.get("rfq_id")
+        supplier_id = draft.get("supplier_id")
+        if not rfq_id or not supplier_id:
+            return None
+
+        recipient_hint = draft.get("receiver") or draft.get("recipient_email")
+        if recipient_hint is None:
+            recipients_field = draft.get("recipients")
+            if isinstance(recipients_field, (list, tuple)) and recipients_field:
+                recipient_hint = recipients_field[0]
+            elif isinstance(recipients_field, str):
+                recipient_hint = recipients_field
+
+        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else None
+
+        def _from_sources(keys: Tuple[str, ...]) -> Optional[str]:
+            for container in (draft, metadata):
+                if not isinstance(container, dict):
+                    continue
+                for key in keys:
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            return None
+
+        action_id = _from_sources(("action_id",))
+        email_action_id = _from_sources(("email_action_id",))
+        draft_action_id = _from_sources(("draft_action_id",))
+        if draft_action_id is None:
+            draft_action_id = action_id or email_action_id
+
+        workflow_candidates: List[str] = []
+        for container in (draft, metadata):
+            if not isinstance(container, dict):
+                continue
+            for key in (
+                "workflow_id",
+                "workflowId",
+                "process_workflow_id",
+                "workflow",
+            ):
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    workflow_candidates.append(value.strip())
+        workflow_hint = workflow_candidates[0] if workflow_candidates else None
+
+        if not workflow_hint:
+            workflow_section = draft.get("workflow")
+            if isinstance(workflow_section, dict):
+                for key in ("workflow_id", "id", "workflowId"):
+                    value = workflow_section.get(key)
+                    if isinstance(value, str) and value.strip():
+                        workflow_hint = value.strip()
+                        break
+
+        if not workflow_hint and isinstance(metadata, dict):
+            context_meta = metadata.get("context")
+            if isinstance(context_meta, dict):
+                for key in ("workflow_id", "workflowId", "process_workflow_id"):
+                    value = context_meta.get(key)
+                    if isinstance(value, str) and value.strip():
+                        workflow_hint = value.strip()
+                        break
+
+        dispatch_run_id = self._extract_dispatch_run_id(draft)
+
+        subject_hint = draft.get("subject")
+        subject_text = subject_hint if isinstance(subject_hint, str) else ""
+
+        return {
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "subject_hint": subject_text,
+            "from_address": recipient_hint,
+            "draft_action_id": draft_action_id,
+            "action_id": action_id,
+            "email_action_id": email_action_id,
+            "workflow_id": workflow_hint,
+            "dispatch_run_id": dispatch_run_id,
+            "supplier_normalised": self._normalise_identifier(supplier_id),
+            "rfq_normalised": self._normalise_identifier(rfq_id),
+            "dispatch_normalised": self._normalise_identifier(dispatch_run_id),
+            "subject_normalised": subject_text.strip().lower() if subject_text else "",
+            "from_normalised": self._normalise_identifier(recipient_hint),
+        }
 
     def _await_outstanding_dispatch_responses(
         self,
@@ -914,37 +1115,23 @@ class SupplierInteractionAgent(BaseAgent):
             for idx in list(outstanding):
                 if results[idx] is not None or time.time() >= deadline:
                     continue
-                draft = drafts[idx]
-                rfq_id = draft.get("rfq_id")
-                supplier_id = draft.get("supplier_id")
-                recipient_hint = draft.get("receiver") or draft.get("recipient_email")
-                if recipient_hint is None:
-                    recipients_field = draft.get("recipients")
-                    if isinstance(recipients_field, (list, tuple)) and recipients_field:
-                        recipient_hint = recipients_field[0]
-                    elif isinstance(recipients_field, str):
-                        recipient_hint = recipients_field
-
-                subject_hint = draft.get("subject")
-                dispatch_run_id = self._extract_dispatch_run_id(draft)
-                draft_action_id = None
-                for key in ("action_id", "draft_action_id", "email_action_id"):
-                    candidate_action = draft.get(key)
-                    if isinstance(candidate_action, str) and candidate_action.strip():
-                        draft_action_id = candidate_action.strip()
-                        break
-
+                context = self._prepare_watch_context(drafts[idx])
+                if not context:
+                    continue
                 result = self.wait_for_response(
                     timeout=per_attempt,
                     poll_interval=poll_interval,
                     limit=limit,
-                    rfq_id=rfq_id,
-                    supplier_id=supplier_id,
-                    subject_hint=subject_hint,
-                    from_address=recipient_hint,
+                    rfq_id=context["rfq_id"],
+                    supplier_id=context["supplier_id"],
+                    subject_hint=context["subject_hint"],
+                    from_address=context["from_address"],
                     enable_negotiation=enable_negotiation,
-                    draft_action_id=draft_action_id,
-                    dispatch_run_id=dispatch_run_id,
+                    draft_action_id=context["draft_action_id"],
+                    dispatch_run_id=context["dispatch_run_id"],
+                    workflow_id=context["workflow_id"],
+                    action_id=context["action_id"],
+                    email_action_id=context["email_action_id"],
                 )
                 if result is not None:
                     results[idx] = result
@@ -1281,6 +1468,34 @@ class SupplierInteractionAgent(BaseAgent):
                     return candidate
 
         return None
+
+    @staticmethod
+    def _build_workflow_filters(
+        *,
+        workflow_id: Optional[str],
+        action_id: Optional[str] = None,
+        draft_action_id: Optional[str] = None,
+        email_action_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        filters: Dict[str, object] = {}
+
+        def _add(key: str, value: Optional[str]) -> None:
+            if value is None:
+                return
+            try:
+                text = str(value).strip()
+            except Exception:
+                return
+            if not text:
+                return
+            filters[key] = text
+
+        _add("workflow_id", workflow_id)
+        _add("action_id", action_id)
+        _add("draft_action_id", draft_action_id)
+        _add("email_action_id", email_action_id)
+
+        return filters
 
     def _select_draft(
         self,
