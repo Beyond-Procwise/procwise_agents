@@ -147,8 +147,12 @@ class BackendScheduler:
         )
 
     def _register_default_jobs(self) -> None:
-        logger.debug(
-            "BackendScheduler default jobs disabled; training and relationship refresh handled via explicit dispatch"
+        training_delay = timedelta(minutes=15)
+        self.register_job(
+            "context-training-dispatch",
+            self._run_model_training,
+            interval=timedelta(hours=6),
+            initial_delay=training_delay,
         )
 
     def _run_loop(self) -> None:

@@ -777,7 +777,13 @@ class QueryEngine(BaseEngine):
             )
 
         rag = rag_module.RAGService(self.agent_nick)
-        rag.upsert_texts(summaries, metadata={"record_id": "procurement_flow"})
+        rag.upsert_texts(
+            summaries,
+            metadata={
+                "record_id": "procurement_flow",
+                "document_type": "procurement_flow",
+            },
+        )
 
     # ------------------------------------------------------------------
     # Agent training helpers

@@ -8,6 +8,7 @@ from copy import deepcopy
 
 from services.event_bus import get_event_bus
 from models.supplier_ranking_trainer import SupplierRankingTrainer
+from models.context_trainer import ContextTrainer, TrainingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ class ModelTrainingService:
         self._supplier_trainer = SupplierRankingTrainer()
         self._learning_repo = getattr(agent_nick, "learning_repository", None)
         self._pending_negotiation_learnings: List[Dict[str, Any]] = []
+        self._context_trainer: Optional[ContextTrainer] = None
+        self._queued_context_workflows: set[str] = set()
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -50,6 +53,24 @@ class ModelTrainingService:
         except Exception:
             logger.exception("Failed to initialise SupplierRelationshipScheduler for training dispatch")
             return None
+
+    def _resolve_context_trainer(self) -> ContextTrainer:
+        trainer = self._context_trainer
+        if not isinstance(trainer, ContextTrainer):
+            data_dir = getattr(
+                self.agent_nick.settings,
+                "context_training_data_dir",
+                TrainingConfig().data_dir,
+            )
+            output_dir = getattr(
+                self.agent_nick.settings,
+                "context_model_output_dir",
+                TrainingConfig().output_dir,
+            )
+            base_cfg = TrainingConfig(data_dir=data_dir, output_dir=output_dir)
+            trainer = ContextTrainer(base_cfg)
+            self._context_trainer = trainer
+        return trainer
 
     # ------------------------------------------------------------------
     # Database utilities
@@ -394,6 +415,32 @@ class ModelTrainingService:
                     "Failed to capture workflow learning context for %s", workflow_id
                 )
 
+        snapshot = result.get("context_snapshot") or {}
+        conversation_history = result.get("conversation_history")
+        workflow_has_context = bool(conversation_history or snapshot)
+        if workflow_has_context and workflow_id not in self._queued_context_workflows:
+            data_dir = getattr(
+                self.agent_nick.settings,
+                "context_training_data_dir",
+                TrainingConfig().data_dir,
+            )
+            output_dir = getattr(
+                self.agent_nick.settings,
+                "context_model_output_dir",
+                TrainingConfig().output_dir,
+            )
+            payload = {
+                "data_dir": data_dir,
+                "output_dir": output_dir,
+            }
+            self.enqueue_training_job(
+                workflow_id=workflow_id,
+                agent_slug="context_trainer",
+                policy_id=None,
+                payload=payload,
+            )
+            self._queued_context_workflows.add(workflow_id)
+
         if workflow_name == "supplier_ranking":
             snapshot = result.get("training_snapshot")
             if isinstance(snapshot, dict) and snapshot.get("rows"):
@@ -536,6 +583,24 @@ class ModelTrainingService:
                 logger.info(
                     "Supplier ranking training skipped due to insufficient labelled samples"
                 )
+        elif agent_slug == "context_trainer":
+            trainer = self._resolve_context_trainer()
+            overrides = {
+                key: payload.get(key)
+                for key in (
+                    "data_dir",
+                    "output_dir",
+                    "model_name",
+                    "epochs",
+                    "batch_size",
+                    "learning_rate",
+                    "max_length",
+                )
+                if payload.get(key) is not None
+            }
+            summary = trainer.train(**overrides)
+            payload["training_result"] = summary
+            logger.info("Context trainer executed: %s", summary)
         else:
             logger.info("No training routine configured for agent '%s'", agent_slug)
         logger.debug("Training payload: %s", payload)
