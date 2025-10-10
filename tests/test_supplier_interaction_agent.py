@@ -100,10 +100,11 @@ def test_supplier_interaction_wait_for_response():
 
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None):
+    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
         calls["count"] += 1
         assert match_filters is not None
         assert match_filters == {"workflow_id": "wf-001", "draft_action_id": "draft-001"}
+        assert expected_replies == 1
         if calls["count"] == 1:
             return [
                 {
@@ -162,10 +163,11 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
 
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None):
+    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
         calls["count"] += 1
         assert match_filters is not None
         assert match_filters == {"workflow_id": "wf-002", "draft_action_id": "draft-002"}
+        assert expected_replies == 1
         return batches.pop(0) if batches else []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -195,10 +197,11 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
 
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None):
+    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
         calls["count"] += 1
         assert match_filters is not None
         assert match_filters == {"workflow_id": "wf-missing", "draft_action_id": "draft-missing"}
+        assert expected_replies == 1
         return []
 
     watcher = SimpleNamespace(poll_once=poll_once)
@@ -219,6 +222,60 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
 
     assert result is None
     assert calls["count"] == 3
+
+
+def test_wait_for_response_aggregated_collects_expected_replies():
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    batches = [
+        [
+            {
+                "rfq_id": "RFQ-20240101-AAA11111",
+                "supplier_id": "SUP-1",
+                "supplier_status": "success",
+                "supplier_output": {"price": 1200},
+            },
+            {
+                "rfq_id": "RFQ-20240101-BBB22222",
+                "supplier_id": "SUP-2",
+                "supplier_status": "success",
+                "supplier_output": {"price": 1300},
+            },
+        ]
+    ]
+
+    observed: Dict[str, object] = {}
+
+    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
+        observed["limit"] = limit
+        observed["match_filters"] = match_filters
+        observed["expected_replies"] = expected_replies
+        return batches.pop(0) if batches else []
+
+    watcher = SimpleNamespace(poll_once=poll_once)
+
+    result = agent.wait_for_response(
+        watcher=watcher,
+        timeout=1,
+        poll_interval=0,
+        workflow_id="wf-agg",
+        suppliers=["SUP-1", "sup-2"],
+    )
+
+    assert isinstance(result, dict)
+    assert result["received"] == 2
+    payload_pairs = {
+        (item.get("rfq_id"), item.get("supplier_id"))
+        for item in result.get("responses", [])
+    }
+    assert payload_pairs == {
+        ("RFQ-20240101-AAA11111", "SUP-1"),
+        ("RFQ-20240101-BBB22222", "SUP-2"),
+    }
+    assert observed["limit"] is None
+    assert observed["match_filters"] == {"workflow_id": "wf-agg"}
+    assert observed["expected_replies"] == 2
 
 
 def test_supplier_interaction_waits_using_drafts():
@@ -285,12 +342,19 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
             created_watchers.append(kwargs)
             self._calls = 0
 
-        def poll_once(self, limit=None, match_filters=None):
-            poll_calls.append({"limit": limit, "match_filters": match_filters})
+        def poll_once(self, limit=None, match_filters=None, expected_replies=None, poll_interval=None):
+            poll_calls.append(
+                {
+                    "limit": limit,
+                    "match_filters": match_filters,
+                    "expected_replies": expected_replies,
+                }
+            )
             self._calls += 1
             if self._calls == 1:
                 assert limit is None
                 assert match_filters == {"workflow_id": "wf-shared"}
+                assert expected_replies == 2
                 return [
                     {
                         "message_id": "m1",
@@ -313,6 +377,7 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
                         "supplier_output": {"price": 1100},
                     },
                 ]
+            assert expected_replies == 1
             return []
 
     monkeypatch.setattr(
@@ -351,6 +416,7 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
     assert len(results) == len(drafts)
     assert created_watchers and len(created_watchers) == 1
     assert poll_calls and poll_calls[0]["match_filters"] == {"workflow_id": "wf-shared"}
+    assert poll_calls[0]["expected_replies"] == 2
     for result, draft in zip(results, drafts):
         assert result is not None
         assert result["rfq_id"] == draft["rfq_id"]
@@ -370,7 +436,13 @@ def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def poll_once(self, limit=None, match_filters=None):
+        def poll_once(
+            self,
+            limit=None,
+            match_filters=None,
+            expected_replies=None,
+            poll_interval=None,
+        ):
             return []
 
     monkeypatch.setattr(
@@ -466,7 +538,13 @@ def test_wait_for_response_initialises_watcher_with_negotiation_toggle(monkeypat
             self.negotiation_agent = kwargs.get("negotiation_agent")
             captured_kwargs.append(kwargs)
 
-        def poll_once(self, limit=None, match_filters=None):
+        def poll_once(
+            self,
+            limit=None,
+            match_filters=None,
+            expected_replies=None,
+            poll_interval=None,
+        ):
             return []
 
     monkeypatch.setattr(

@@ -6,7 +6,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
@@ -498,6 +498,8 @@ class SupplierInteractionAgent(BaseAgent):
         dispatch_run_id: Optional[str] = None,
         action_id: Optional[str] = None,
         email_action_id: Optional[str] = None,
+        suppliers: Optional[Sequence[str]] = None,
+        expected_replies: Optional[int] = None,
     ) -> Optional[Dict]:
         """Wait for an inbound supplier email and return the processed result.
 
@@ -598,12 +600,44 @@ class SupplierInteractionAgent(BaseAgent):
         subject_norm = str(subject_hint or "").strip().lower()
         sender_normalised = self._normalise_identifier(from_address)
 
+        supplier_candidates: Optional[Set[str]] = None
+        if suppliers:
+            candidate_set: Set[str] = set()
+            for supplier in suppliers:
+                normalised = self._normalise_identifier(supplier)
+                if normalised:
+                    candidate_set.add(normalised)
+            if candidate_set:
+                supplier_candidates = candidate_set
+
+        expected_count: Optional[int]
+        if expected_replies is not None:
+            expected_count = self._coerce_int(expected_replies, default=0)
+            if expected_count <= 0:
+                expected_count = None
+        else:
+            if supplier_candidates is not None:
+                expected_count = len(supplier_candidates)
+            elif supplier_normalised:
+                expected_count = 1
+            else:
+                expected_count = None
+
+        aggregated_mode = bool(expected_count and not supplier_normalised)
+        responses_map: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+
         match_filters = self._build_workflow_filters(
             workflow_id=workflow_id,
             action_id=action_id,
             draft_action_id=draft_action_id,
             email_action_id=email_action_id,
         )
+
+        if (
+            aggregated_mode
+            and match_filters.get("workflow_id")
+        ):
+            match_filters = {"workflow_id": match_filters["workflow_id"]}
 
         while time.time() <= deadline:
             if attempt_cap is not None and attempts_made >= attempt_cap:
@@ -619,11 +653,16 @@ class SupplierInteractionAgent(BaseAgent):
                     "limit": None,
                     "match_filters": match_filters or {},
                 }
+                if expected_count:
+                    poll_kwargs["expected_replies"] = expected_count
+                if poll_interval is not None:
+                    poll_kwargs["poll_interval"] = poll_interval
                 batch = active_watcher.poll_once(**poll_kwargs)
             except Exception:  # pragma: no cover - best effort
                 logger.exception("wait_for_response poll failed")
                 batch = []
             if batch:
+                expected_fulfilled = False
                 for candidate in batch:
                     if supplier_normalised and self._normalise_identifier(
                         candidate.get("supplier_id")
@@ -661,6 +700,18 @@ class SupplierInteractionAgent(BaseAgent):
                             candidate.get("supplier_id") or supplier_id,
                             error_detail,
                         )
+                        if aggregated_mode:
+                            response_key = (
+                                self._normalise_identifier(candidate.get("rfq_id")),
+                                self._normalise_identifier(candidate.get("supplier_id")),
+                            )
+                            if any(response_key):
+                                responses_map[response_key] = candidate
+                                if expected_count and len(responses_map) >= expected_count:
+                                    expected_fulfilled = True
+                            if expected_fulfilled:
+                                break
+                            continue
                         result = candidate
                         break
                     if not payload_ready:
@@ -669,9 +720,27 @@ class SupplierInteractionAgent(BaseAgent):
                             candidate.get("rfq_id") or rfq_id,
                         )
                         continue
+                    if aggregated_mode:
+                        response_key = (
+                            self._normalise_identifier(candidate.get("rfq_id")),
+                            self._normalise_identifier(candidate.get("supplier_id")),
+                        )
+                        if any(response_key):
+                            responses_map[response_key] = candidate
+                            if expected_count and len(responses_map) >= expected_count:
+                                expected_fulfilled = True
+                        if expected_fulfilled:
+                            break
+                        continue
                     result = candidate
                     break
+
+
                 if result is not None:
+                    break
+                if aggregated_mode and expected_count and len(responses_map) >= expected_count:
+                    expected_fulfilled = True
+                if expected_fulfilled:
                     break
             interval_value = poll_interval or getattr(
                 self.agent_nick.settings, "email_response_poll_seconds", 60
@@ -681,6 +750,27 @@ class SupplierInteractionAgent(BaseAgent):
             time.sleep(
                 min(max(1, interval_value), max(0, deadline - time.time()))
             )
+
+        if aggregated_mode:
+            received = len(responses_map)
+            if expected_count and received < expected_count:
+                if attempt_cap is not None and attempts_made >= attempt_cap:
+                    logger.warning(
+                        "Stopped waiting for supplier responses (workflow_id=%s) after %s attempt(s); received %s of %s",
+                        workflow_id,
+                        attempts_made,
+                        received,
+                        expected_count,
+                    )
+                else:
+                    logger.warning(
+                        "Timed out waiting for supplier responses (workflow_id=%s) after %ss; received %s of %s",
+                        workflow_id,
+                        timeout,
+                        received,
+                        expected_count,
+                    )
+            return {"responses": list(responses_map.values()), "received": received}
 
         if result is None:
             if attempt_cap is not None and attempts_made >= attempt_cap:
@@ -837,6 +927,11 @@ class SupplierInteractionAgent(BaseAgent):
         if not groups:
             return results
 
+        for group in groups.values():
+            if len(group["pending"]) > 1:
+                workflow_value = group["filters"].get("workflow_id")
+                group["filters"] = {"workflow_id": workflow_value} if workflow_value else {}
+
         def _candidate_action_tokens(candidate: Dict[str, Any]) -> List[str]:
             tokens: List[str] = []
             metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else None
@@ -930,6 +1025,9 @@ class SupplierInteractionAgent(BaseAgent):
                 if not group["pending"]:
                     continue
                 poll_kwargs: Dict[str, object] = {"limit": None}
+                pending_total = len(group["pending"])
+                if pending_total > 0:
+                    poll_kwargs["expected_replies"] = pending_total
                 if group["filters"]:
                     poll_kwargs["match_filters"] = group["filters"]
                 try:
