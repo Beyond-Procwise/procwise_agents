@@ -610,7 +610,37 @@ class SESEmailWatcher:
             prefixes = self._derive_prefixes_for_filters(filters)
             effective_limit = self._coerce_limit(limit)
 
+            loader_limit = limit
+            if filters and self._filters_should_expand_limit(filters):
+                loader_limit = None
+
             match_found = False
+            latest_candidate_ts: Optional[datetime] = None
+            latest_candidate_key: str = ""
+
+            def _record_watermark_candidate(
+                candidate_ts: Optional[datetime],
+                candidate_key: Optional[str],
+            ) -> None:
+                nonlocal latest_candidate_ts, latest_candidate_key
+                if candidate_ts is None:
+                    return
+                key = str(candidate_key or "")
+                timestamp = candidate_ts
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                if latest_candidate_ts is None:
+                    latest_candidate_ts = timestamp
+                    latest_candidate_key = key
+                    return
+                reference = latest_candidate_ts
+                if reference.tzinfo is None:
+                    reference = reference.replace(tzinfo=timezone.utc)
+                if timestamp > reference or (
+                    timestamp == reference and key > latest_candidate_key
+                ):
+                    latest_candidate_ts = timestamp
+                    latest_candidate_key = key
 
             if target_rfq_normalised and target_rfq_normalised in self._completed_targets:
                 logger.info(
@@ -652,7 +682,7 @@ class SESEmailWatcher:
                 try:
                     loader_empty = False
                     if self._custom_loader is not None:
-                        messages = self._custom_loader(limit)
+                        messages = self._custom_loader(loader_limit)
                         candidate_batch = list(messages)
                         logger.info(
                             "Retrieved %d candidate message(s) from loader for mailbox %s",
@@ -663,7 +693,9 @@ class SESEmailWatcher:
                         for message in candidate_batch:
                             last_modified_hint = message.get("_last_modified")
                             if isinstance(last_modified_hint, datetime):
-                                self._update_watermark(last_modified_hint, str(message.get("id") or ""))
+                                _record_watermark_candidate(
+                                    last_modified_hint, str(message.get("id") or "")
+                                )
                             total_candidates += 1
                             matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
                                 message,
@@ -700,7 +732,9 @@ class SESEmailWatcher:
                                 effective_limit=effective_limit,
                             )
                             if last_modified is not None:
-                                self._update_watermark(last_modified, str(parsed.get("id") or ""))
+                                _record_watermark_candidate(
+                                    last_modified, str(parsed.get("id") or "")
+                                )
                             if was_processed:
                                 total_processed += 1
                             if matched:
@@ -708,9 +742,10 @@ class SESEmailWatcher:
                             return should_stop
 
                         messages = self._load_messages(
-                            limit,
+                            loader_limit,
                             mark_seen=True,
                             prefixes=prefixes,
+                            since=self._last_watermark_ts,
                             on_message=_on_message,
                         )
                         batch_count = len(processed_batch) if filters else len(messages)
@@ -730,7 +765,9 @@ class SESEmailWatcher:
                             for message in messages:
                                 last_modified_hint = message.get("_last_modified")
                                 if isinstance(last_modified_hint, datetime):
-                                    self._update_watermark(last_modified_hint, str(message.get("id") or ""))
+                                    _record_watermark_candidate(
+                                        last_modified_hint, str(message.get("id") or "")
+                                    )
                                 total_candidates += 1
                                 matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
                                     message,
@@ -795,6 +832,8 @@ class SESEmailWatcher:
                     time.sleep(sleep_for)
 
             if target_rfq_normalised and match_found:
+                if latest_candidate_ts is not None:
+                    self._update_watermark(latest_candidate_ts, latest_candidate_key)
                 self._completed_targets.add(target_rfq_normalised)
                 if results:
                     match_key = results[-1].get("message_id")
@@ -814,6 +853,8 @@ class SESEmailWatcher:
                     self._format_watermark(),
                 )
             else:
+                if latest_candidate_ts is not None:
+                    self._update_watermark(latest_candidate_ts, latest_candidate_key)
                 logger.info(
                     "Completed scan for mailbox %s (candidates=%d, processed=%d, matched=%s). Watermark=%s",
                     self.mailbox_address,
@@ -863,6 +904,31 @@ class SESEmailWatcher:
             return False
 
         return True
+
+    @staticmethod
+    def _filters_should_expand_limit(match_filters: Dict[str, object]) -> bool:
+        if not match_filters:
+            return False
+
+        active_keys = {
+            key
+            for key, value in match_filters.items()
+            if value not in (None, "", [], {}, ())
+        }
+        if not active_keys:
+            return False
+
+        expand_keys = {"supplier_id", "rfq_id"}
+        if active_keys & expand_keys:
+            return True
+
+        workflow_keys = {
+            "workflow_id",
+            "action_id",
+            "draft_action_id",
+            "email_action_id",
+        }
+        return bool(active_keys <= workflow_keys and active_keys)
 
     def _process_candidate_message(
         self,
@@ -1322,7 +1388,9 @@ class SESEmailWatcher:
         if self._custom_loader is not None:
             messages = self._custom_loader(limit_int)
         else:
-            messages = self._load_messages(limit_int, mark_seen=False, prefixes=None)
+            messages = self._load_messages(
+                limit_int, mark_seen=False, prefixes=None, since=None
+            )
 
         preview: List[Dict[str, object]] = []
         for message in messages[:limit_int]:
@@ -3547,6 +3615,7 @@ class SESEmailWatcher:
         *,
         mark_seen: bool,
         prefixes: Optional[Sequence[str]] = None,
+        since: Optional[datetime] = None,
         on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
 
@@ -3589,6 +3658,7 @@ class SESEmailWatcher:
             messages = self._load_from_imap(
                 effective_limit,
                 mark_seen=bool(mark_seen),
+                since=since,
                 on_message=on_message,
             )
 
@@ -3682,11 +3752,32 @@ class SESEmailWatcher:
         port = self._coerce_int_value(port_value) if port_value not in (None, "") else None
         return host, user, password, mailbox, search_criteria, port
 
+    @staticmethod
+    def _compose_imap_search_criteria(
+        base: Optional[str], since: Optional[datetime]
+    ) -> str:
+        criteria = (base or "").strip()
+        if not criteria or criteria.upper() == "ALL":
+            criteria = "UNSEEN"
+
+        since_clause = ""
+        if since is not None:
+            reference = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+            since_clause = reference.strftime("SINCE %d-%b-%Y")
+
+        if since_clause:
+            if criteria:
+                return f"({criteria}) {since_clause}"
+            return since_clause
+
+        return criteria or "ALL"
+
     def _load_from_imap(
         self,
         limit: Optional[int],
         *,
         mark_seen: bool,
+        since: Optional[datetime] = None,
         on_message: Optional[Callable[[Dict[str, object], Optional[datetime]], bool]] = None,
     ) -> List[Dict[str, object]]:
         host, user, password, mailbox, search_criteria, port = self._imap_settings()
@@ -3712,7 +3803,8 @@ class SESEmailWatcher:
                     client.logout()
                     return []
 
-                status, data = client.search(None, search_criteria)
+                final_criteria = self._compose_imap_search_criteria(search_criteria, since)
+                status, data = client.search(None, final_criteria)
                 if status != "OK" or not data:
                     client.logout()
                     return []
@@ -4672,7 +4764,7 @@ class SESEmailWatcher:
                 (
                     "imap",
                     lambda: self._load_from_imap(
-                        expected_count, mark_seen=False
+                        expected_count, mark_seen=False, since=None
                     ),
                 )
             )
