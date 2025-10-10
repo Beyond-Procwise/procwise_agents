@@ -809,7 +809,7 @@ class SESEmailWatcher:
                 if limit_exhausted or stop_requested:
                     break
 
-                if match_found and not self._should_stop_after_match(filters):
+                if match_found and self._should_stop_after_match(filters):
                     break
 
                 if not target_rfq_normalised:
