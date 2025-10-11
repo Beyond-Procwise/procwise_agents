@@ -508,6 +508,8 @@ def already_processed(
 
     table_sql = _table_identifier(PROCESSED_TABLE)
 
+    mailbox_filter_value = bucket or ""
+
     try:
         with conn.cursor() as cur:
             if bucket:
@@ -523,17 +525,27 @@ def already_processed(
             if message_id:
                 cur.execute(
                     sql.SQL(
-                        "SELECT 1 FROM {table} WHERE bucket = %s AND key = %s LIMIT 1"
+                        """
+                        SELECT 1
+                        FROM {table}
+                        WHERE bucket = %s AND key = %s AND COALESCE(mailbox, '') = %s
+                        LIMIT 1
+                        """
                     ).format(table=table_sql),
-                    (MESSAGE_SENTINEL_BUCKET, message_id),
+                    (MESSAGE_SENTINEL_BUCKET, message_id, mailbox_filter_value),
                 )
                 if cur.fetchone():
                     return True
                 cur.execute(
                     sql.SQL(
-                        "SELECT 1 FROM {table} WHERE message_id = %s LIMIT 1"
+                        """
+                        SELECT 1
+                        FROM {table}
+                        WHERE message_id = %s AND COALESCE(mailbox, '') = %s
+                        LIMIT 1
+                        """
                     ).format(table=table_sql),
-                    (message_id,),
+                    (message_id, mailbox_filter_value),
                 )
                 if cur.fetchone():
                     return True
@@ -541,17 +553,27 @@ def already_processed(
             if provider_id:
                 cur.execute(
                     sql.SQL(
-                        "SELECT 1 FROM {table} WHERE bucket = %s AND key = %s LIMIT 1"
+                        """
+                        SELECT 1
+                        FROM {table}
+                        WHERE bucket = %s AND key = %s AND COALESCE(mailbox, '') = %s
+                        LIMIT 1
+                        """
                     ).format(table=table_sql),
-                    (ETAG_SENTINEL_BUCKET, provider_id),
+                    (ETAG_SENTINEL_BUCKET, provider_id, mailbox_filter_value),
                 )
                 if cur.fetchone():
                     return True
                 cur.execute(
                     sql.SQL(
-                        "SELECT 1 FROM {table} WHERE etag = %s LIMIT 1"
+                        """
+                        SELECT 1
+                        FROM {table}
+                        WHERE etag = %s AND COALESCE(mailbox, '') = %s
+                        LIMIT 1
+                        """
                     ).format(table=table_sql),
-                    (provider_id,),
+                    (provider_id, mailbox_filter_value),
                 )
                 if cur.fetchone():
                     return True
