@@ -1048,7 +1048,25 @@ class SESEmailWatcher:
                         bucket_hint = bucket_for_fetch
                         message["_bucket"] = bucket_hint
 
-        message_id = str(message.get("id") or uuid.uuid4())
+        message_identifier = message.get("message_id") or message.get("message-id")
+        if isinstance(message_identifier, bytes):
+            try:
+                message_identifier = message_identifier.decode()
+            except Exception:
+                message_identifier = str(message_identifier)
+        if isinstance(message_identifier, str):
+            message_identifier = message_identifier.strip()
+        if not message_identifier:
+            message_identifier = message.get("id")
+        if isinstance(message_identifier, bytes):
+            try:
+                message_identifier = message_identifier.decode()
+            except Exception:
+                message_identifier = str(message_identifier)
+        if not isinstance(message_identifier, str) or not message_identifier:
+            message_identifier = str(uuid.uuid4())
+        message_id = message_identifier
+        message["message_id"] = message_id
         bucket = bucket_hint or getattr(self, "bucket", None)
         s3_key = message.get("id") if isinstance(message.get("id"), str) else message.get("s3_key")
         etag = message.get("_s3_etag") or message.get("s3_etag")
@@ -1075,7 +1093,13 @@ class SESEmailWatcher:
             )
             return False, False, False, False
 
-        if self._is_processed_in_registry(bucket, s3_key, etag):
+        if self._is_processed_in_registry(
+            bucket,
+            s3_key,
+            etag,
+            message_id=message_id,
+            mailbox=self.mailbox_address,
+        ):
             logger.debug(
                 "Skipping S3 object %s (etag=%s) for mailbox %s; already processed",
                 s3_key,
@@ -1315,7 +1339,14 @@ class SESEmailWatcher:
 
         if was_processed and processed_payload:
             rfq_id = processed_payload.get("rfq_id")
-            self._record_processed_in_registry(bucket, s3_key, etag, rfq_id)
+            self._record_processed_in_registry(
+                bucket,
+                s3_key,
+                etag,
+                rfq_id,
+                message_id=message_id,
+                mailbox=self.mailbox_address,
+            )
 
         matched = bool(message_match)
         should_stop = False
@@ -1612,7 +1643,9 @@ class SESEmailWatcher:
                             key TEXT NOT NULL,
                             etag TEXT NOT NULL DEFAULT '',
                             rfq_id TEXT,
-                            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            mailbox TEXT,
+                            message_id TEXT
                         )
                         """
                     )
@@ -1620,6 +1653,18 @@ class SESEmailWatcher:
                         """
                         ALTER TABLE proc.processed_emails
                             ALTER COLUMN etag SET DEFAULT ''
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE proc.processed_emails
+                            ADD COLUMN IF NOT EXISTS mailbox TEXT
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE proc.processed_emails
+                            ADD COLUMN IF NOT EXISTS message_id TEXT
                         """
                     )
                     cur.execute(
@@ -1638,6 +1683,19 @@ class SESEmailWatcher:
                         """
                         CREATE INDEX IF NOT EXISTS processed_emails_rfq_key_idx
                             ON proc.processed_emails (rfq_id, key)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS processed_emails_message_id_idx
+                            ON proc.processed_emails (message_id)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_mailbox_message_id_uidx
+                            ON proc.processed_emails (COALESCE(mailbox, ''), message_id)
+                            WHERE message_id IS NOT NULL AND message_id <> ''
                         """
                     )
                 conn.commit()
@@ -1711,9 +1769,13 @@ class SESEmailWatcher:
         bucket: Optional[str],
         key: Optional[str],
         etag: Optional[str],
+        *,
+        message_id: Optional[str] = None,
+        mailbox: Optional[str] = None,
     ) -> bool:
-        if not bucket or not key:
-            return False
+        bucket_checked = False
+        if bucket and key:
+            bucket_checked = True
 
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         if not callable(get_conn):
@@ -1722,17 +1784,35 @@ class SESEmailWatcher:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT 1
-                        FROM proc.processed_emails
-                        WHERE bucket = %s AND key = %s AND etag = COALESCE(%s, '')
-                        LIMIT 1
-                        """,
-                        (bucket, key, etag or ""),
-                    )
-                    row = cur.fetchone()
-                    return bool(row)
+                    if bucket_checked:
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM proc.processed_emails
+                            WHERE bucket = %s AND key = %s AND etag = COALESCE(%s, '')
+                            LIMIT 1
+                            """,
+                            (bucket, key, etag or ""),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            return True
+
+                    if message_id:
+                        mailbox_filter = mailbox or None
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM proc.processed_emails
+                            WHERE message_id = %s
+                              AND (%s IS NULL OR mailbox IS NULL OR mailbox = %s)
+                            LIMIT 1
+                            """,
+                            (message_id, mailbox_filter, mailbox_filter),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            return True
         except Exception:
             logger.exception("Failed to check processed email registry for %s", key)
         return False
@@ -1840,8 +1920,21 @@ class SESEmailWatcher:
         key: Optional[str],
         etag: Optional[str],
         rfq_id: Optional[str],
+        *,
+        message_id: Optional[str] = None,
+        mailbox: Optional[str] = None,
     ) -> None:
-        if not bucket or not key:
+        entries: List[Tuple[str, str, str, Optional[str], Optional[str], Optional[str]]] = []
+
+        if bucket and key:
+            entries.append((bucket, key, etag or "", rfq_id, mailbox, message_id))
+        elif message_id:
+            mailbox_label = str(mailbox or "unknown").strip() or "unknown"
+            sentinel_bucket = f"imap::{mailbox_label}"
+            sentinel_key = message_id
+            entries.append((sentinel_bucket, sentinel_key, "", rfq_id, mailbox, message_id))
+
+        if not entries:
             return
 
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
@@ -1851,18 +1944,41 @@ class SESEmailWatcher:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO proc.processed_emails (bucket, key, etag, rfq_id, processed_at)
-                        VALUES (%s, %s, COALESCE(%s, ''), %s, NOW())
-                        ON CONFLICT (bucket, key, etag)
-                        DO UPDATE SET rfq_id = EXCLUDED.rfq_id, processed_at = NOW()
-                        """,
-                        (bucket, key, etag or "", rfq_id),
-                    )
+                    for entry_bucket, entry_key, entry_etag, entry_rfq, entry_mailbox, entry_message_id in entries:
+                        cur.execute(
+                            """
+                            INSERT INTO proc.processed_emails (
+                                bucket,
+                                key,
+                                etag,
+                                rfq_id,
+                                processed_at,
+                                mailbox,
+                                message_id
+                            )
+                            VALUES (%s, %s, %s, %s, NOW(), %s, %s)
+                            ON CONFLICT (bucket, key, etag)
+                            DO UPDATE SET
+                                rfq_id = EXCLUDED.rfq_id,
+                                mailbox = COALESCE(EXCLUDED.mailbox, proc.processed_emails.mailbox),
+                                message_id = COALESCE(EXCLUDED.message_id, proc.processed_emails.message_id),
+                                processed_at = NOW()
+                            """,
+                            (
+                                entry_bucket,
+                                entry_key,
+                                entry_etag,
+                                entry_rfq,
+                                entry_mailbox,
+                                entry_message_id,
+                            ),
+                        )
                 conn.commit()
         except Exception:
-            logger.exception("Failed to record processed email %s in registry", key)
+            logger.exception(
+                "Failed to record processed email %s in registry",
+                key or message_id,
+            )
 
     def _process_message_fields_only(self, message: Dict[str, object]) -> Dict[str, object]:
         processed: Dict[str, object] = {}
@@ -3915,6 +4031,7 @@ class SESEmailWatcher:
                     parsed.setdefault(
                         "_bucket", f"imap::{self.mailbox_address or 'unknown'}"
                     )
+                    parsed.setdefault("mailbox", mailbox)
                     if not parsed.get("message_id"):
                         parsed["message_id"] = parsed.get("id")
                     parsed.setdefault("_source", "imap")
