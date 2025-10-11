@@ -19,6 +19,7 @@ try:  # Optional heavy dependencies – import lazily and tolerate absence.
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
+        BitsAndBytesConfig,
         Trainer,
         TrainingArguments,
     )
@@ -27,8 +28,16 @@ except Exception:  # pragma: no cover - executed only when deps unavailable
     Dataset = None  # type: ignore[assignment]
     AutoModelForCausalLM = None  # type: ignore[assignment]
     AutoTokenizer = None  # type: ignore[assignment]
+    BitsAndBytesConfig = None  # type: ignore[assignment]
     Trainer = None  # type: ignore[assignment]
     TrainingArguments = None  # type: ignore[assignment]
+
+try:  # LoRA adapters are optional but preferred for efficiency.
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+except Exception:  # pragma: no cover - executed only when deps unavailable
+    LoraConfig = None  # type: ignore[assignment]
+    get_peft_model = None  # type: ignore[assignment]
+    prepare_model_for_kbit_training = None  # type: ignore[assignment]
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -49,6 +58,12 @@ class TrainingConfig:
     batch_size: int = 2
     learning_rate: float = 1e-5
     max_length: int = 2048
+    use_lora: bool = True
+    use_qlora: bool = True
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: Optional[List[str]] = None
 
 
 class ConversationDatasetWriter:
@@ -127,14 +142,65 @@ def _tokenize_examples(
 
 
 def fine_tune_model(cfg: TrainingConfig) -> Dict[str, Any]:
-    if any(dep is None for dep in (Dataset, AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments)):
+    if any(
+        dep is None
+        for dep in (
+            Dataset,
+            AutoTokenizer,
+            AutoModelForCausalLM,
+            Trainer,
+            TrainingArguments,
+        )
+    ):
         raise RuntimeError(
             "Transformers and datasets libraries are required for context training"
         )
 
     dataset = load_conversations(cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-    model = AutoModelForCausalLM.from_pretrained(cfg.model_name)
+
+    quantization_config = None
+    if cfg.use_lora and cfg.use_qlora:
+        if BitsAndBytesConfig is None or torch is None:
+            raise RuntimeError("bitsandbytes is required for QLoRA training but is unavailable")
+        compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+
+    model_kwargs: Dict[str, Any] = {}
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+        model_kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
+
+    if cfg.use_lora:
+        if any(dep is None for dep in (LoraConfig, get_peft_model)):
+            raise RuntimeError("peft library is required for LoRA fine-tuning")
+        if quantization_config is not None and prepare_model_for_kbit_training:
+            model = prepare_model_for_kbit_training(model)
+        target_modules = cfg.lora_target_modules or [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, lora_config)
 
     tokenised = dataset.map(
         lambda batch: _tokenize_examples(batch, tokenizer, cfg.max_length),
@@ -157,13 +223,23 @@ def fine_tune_model(cfg: TrainingConfig) -> Dict[str, Any]:
 
     trainer = Trainer(model=model, args=training_args, train_dataset=tokenised)
     trainer.train()
-    trainer.save_model(cfg.output_dir)
+    if cfg.use_lora:
+        adapter_dir = Path(cfg.output_dir) / "lora_adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        trainer.model.save_pretrained(str(adapter_dir))
+        summary_extra = {"adapter_path": str(adapter_dir)}
+    else:
+        trainer.save_model(cfg.output_dir)
+        summary_extra = {"adapter_path": None}
     tokenizer.save_pretrained(cfg.output_dir)
     return {
         "output_dir": cfg.output_dir,
         "model_name": cfg.model_name,
         "epochs": cfg.epochs,
         "records": len(dataset),
+        "use_lora": cfg.use_lora,
+        "use_qlora": cfg.use_qlora,
+        **summary_extra,
     }
 
 
