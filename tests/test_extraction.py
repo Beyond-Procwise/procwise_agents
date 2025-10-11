@@ -95,6 +95,26 @@ def _line_mismatch_rate(
     return mismatches / len(expected)
 
 
+def _assert_extraction_metrics(
+    result,
+    expected_header_keys: Sequence[str],
+    expected_line_items: Sequence[dict],
+    *,
+    total_key: str,
+) -> None:
+    header_f1 = _header_f1(result.header, expected_header_keys)
+    assert header_f1 >= 0.95, f"Header F1 too low: {header_f1:.2f}"
+
+    mismatch_rate = _line_mismatch_rate(
+        result.line_items,
+        expected_line_items,
+        total_key=total_key,
+    )
+    assert (
+        mismatch_rate < 0.02
+    ), f"Line reconciliation mismatch rate {mismatch_rate:.2%} exceeds threshold"
+
+
 def test_digital_invoice_extraction(tmp_path, extractor):
     doc = tmp_path / "invoice_digital.txt"
     doc.write_text(
@@ -127,6 +147,32 @@ def test_digital_invoice_extraction(tmp_path, extractor):
     assert "invoice_id" in result.schema_reference["header_fields"]
     assert {"item_description", "quantity", "unit_price", "line_amount"}.issubset(
         set(result.schema_reference["line_item_fields"])
+    )
+
+    _assert_extraction_metrics(
+        result,
+        [
+            "invoice_id",
+            "supplier_name",
+            "invoice_date",
+            "due_date",
+            "invoice_total_incl_tax",
+        ],
+        [
+            {
+                "item_description": "Laptop Pro 15",
+                "quantity": "2",
+                "unit_price": "700",
+                "line_amount": "1400",
+            },
+            {
+                "item_description": "Freight",
+                "quantity": "1",
+                "unit_price": "100",
+                "line_amount": "100",
+            },
+        ],
+        total_key="line_amount",
     )
 
     row = _read_table(db_path, "proc.raw_invoice")
@@ -172,6 +218,26 @@ def test_digital_invoice_with_multiline_headers(tmp_path, extractor):
     assert result.header["currency"] == "USD"
     assert result.line_items[0]["item_description"].lower() == "support subscription"
 
+    _assert_extraction_metrics(
+        result,
+        [
+            "invoice_id",
+            "supplier_name",
+            "invoice_date",
+            "currency",
+            "invoice_total_incl_tax",
+        ],
+        [
+            {
+                "item_description": "Support Subscription",
+                "quantity": "1",
+                "unit_price": "500.00",
+                "line_amount": "500.00",
+            }
+        ],
+        total_key="line_amount",
+    )
+
     row = _read_table(db_path, "proc.raw_invoice")
     header = json.loads(row["header_json"])
     assert header["invoice_id"] == "INV-7000"
@@ -208,6 +274,26 @@ def test_digital_purchase_order_extraction(tmp_path, extractor):
     assert "po_id" in result.schema_reference["header_fields"]
     assert {"item_description", "quantity", "unit_price", "line_total"}.issubset(
         set(result.schema_reference["line_item_fields"])
+    )
+
+    _assert_extraction_metrics(
+        result,
+        ["po_id", "supplier_name", "order_date", "total_amount"],
+        [
+            {
+                "item_description": "Workstations",
+                "quantity": "5",
+                "unit_price": "400",
+                "line_total": "2000",
+            },
+            {
+                "item_description": "Docking Stations",
+                "quantity": "5",
+                "unit_price": "100",
+                "line_total": "500",
+            },
+        ],
+        total_key="line_total",
     )
 
     row = _read_table(db_path, "proc.raw_purchase_order")
@@ -984,3 +1070,229 @@ def test_schema_guided_scanned_contract_synonyms(tmp_path, extractor):
     assert result.header["payment_terms"] == "Net 45"
     assert _header_f1(result.header, expected_keys) >= 0.95
 
+
+def test_digital_contract_ml_metrics(tmp_path, extractor):
+    doc = tmp_path / "contract_digital_ml.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Contract Number: C-9901",
+                "Contract Title: Data Center Maintenance",
+                "Supplier: Vertex Infrastructure",
+                "Contract Start Date: 2024-02-01",
+                "Contract End Date: 2025-01-31",
+                "Currency: USD",
+                "Total Contract Value: 240000.00",
+                "Service Description    Quantity    Unit Price    Line Amount",
+                "Preventative Maintenance  12   15000.00   180000.00",
+                "Emergency Callouts        6    10000.00   60000.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "digital"})
+
+    assert result.document_type == "Contract"
+    _assert_extraction_metrics(
+        result,
+        [
+            "contract_id",
+            "contract_title",
+            "supplier_name",
+            "contract_start_date",
+            "contract_end_date",
+            "currency",
+            "total_contract_value",
+        ],
+        [
+            {
+                "item_description": "Preventative Maintenance",
+                "quantity": "12",
+                "unit_price": "15000.00",
+                "line_amount": "180000.00",
+            },
+            {
+                "item_description": "Emergency Callouts",
+                "quantity": "6",
+                "unit_price": "10000.00",
+                "line_amount": "60000.00",
+            },
+        ],
+        total_key="line_amount",
+    )
+
+
+def test_digital_quote_ml_metrics(tmp_path, extractor):
+    doc = tmp_path / "quote_digital_ml.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "Quote Number: Q-5521",
+                "Supplier: Aurora Systems",
+                "Quote Date: 2024-03-15",
+                "Validity Date: 2024-04-15",
+                "Currency: EUR",
+                "Total Amount: 18250.00",
+                "Item Description    Quantity    Unit Price    Amount",
+                "Cloud Migration Assessment    1    7500.00    7500.00",
+                "Implementation Services      2    5000.00    10000.00",
+                "Hypercare Support            1    750.00     750.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "digital"})
+
+    assert result.document_type == "Quote"
+    _assert_extraction_metrics(
+        result,
+        [
+            "quote_id",
+            "supplier_name",
+            "quote_date",
+            "validity_date",
+            "currency",
+            "total_amount",
+        ],
+        [
+            {
+                "item_description": "Cloud Migration Assessment",
+                "quantity": "1",
+                "unit_price": "7500.00",
+                "line_amount": "7500.00",
+            },
+            {
+                "item_description": "Implementation Services",
+                "quantity": "2",
+                "unit_price": "5000.00",
+                "line_amount": "10000.00",
+            },
+            {
+                "item_description": "Hypercare Support",
+                "quantity": "1",
+                "unit_price": "750.00",
+                "line_amount": "750.00",
+            },
+        ],
+        total_key="line_amount",
+    )
+
+
+def test_scanned_invoice_ml_metrics(tmp_path, extractor):
+    doc = tmp_path / "invoice_scanned_ml.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "INVOICE",
+                "Supplier Name",
+                "Zenith Lighting Ltd",
+                "Invoice Number",
+                "INV-8842",
+                "Invoice Date",
+                "2024-02-12",
+                "Due Date",
+                "2024-03-13",
+                "Currency",
+                "EUR",
+                "Total Amount Due",
+                "3180.00",
+                "Item Description    Qty    Unit Price    Line Total",
+                "Lighting Panel Set    10    250.00    2500.00",
+                "Installation Service  1     680.00    680.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "scanned"})
+
+    assert result.document_type == "Invoice"
+    _assert_extraction_metrics(
+        result,
+        [
+            "invoice_id",
+            "supplier_name",
+            "invoice_date",
+            "due_date",
+            "currency",
+            "invoice_total_incl_tax",
+        ],
+        [
+            {
+                "item_description": "Lighting Panel Set",
+                "quantity": "10",
+                "unit_price": "250.00",
+                "line_amount": "2500.00",
+            },
+            {
+                "item_description": "Installation Service",
+                "quantity": "1",
+                "unit_price": "680.00",
+                "line_amount": "680.00",
+            },
+        ],
+        total_key="line_amount",
+    )
+
+
+def test_scanned_purchase_order_ml_metrics(tmp_path, extractor):
+    doc = tmp_path / "po_scanned_ml.txt"
+    doc.write_text(
+        "\n".join(
+            [
+                "PURCHASE ORDER",
+                "Supplier",
+                "City Works Ltd",
+                "PO Number",
+                "PO-7789",
+                "Order Date",
+                "2024-05-01",
+                "Expected Delivery Date",
+                "2024-05-20",
+                "Currency",
+                "USD",
+                "Total Amount",
+                "4575.00",
+                "Line Description    Qty    Unit Price    Total",
+                "Concrete Mix         15    180.00    2700.00",
+                "Steel Rods           25    75.00     1875.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extractor_service, _ = extractor
+    result = extractor_service.extract(doc, metadata={"ingestion_mode": "scanned"})
+
+    assert result.document_type == "Purchase_Order"
+    _assert_extraction_metrics(
+        result,
+        [
+            "po_id",
+            "supplier_name",
+            "order_date",
+            "expected_delivery_date",
+            "currency",
+            "total_amount",
+        ],
+        [
+            {
+                "item_description": "Concrete Mix",
+                "quantity": "15",
+                "unit_price": "180.00",
+                "line_total": "2700.00",
+            },
+            {
+                "item_description": "Steel Rods",
+                "quantity": "25",
+                "unit_price": "75.00",
+                "line_total": "1875.00",
+            },
+        ],
+        total_key="line_total",
+    )
