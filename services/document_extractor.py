@@ -27,6 +27,9 @@ import textwrap
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from services.ml_pipeline import DocumentUnderstandingModel
+from services.ocr_pipeline import OCRPreprocessor
+
 from utils.procurement_schema import (
     DOC_TYPE_TO_TABLE,
     PROCUREMENT_SCHEMAS,
@@ -539,12 +542,21 @@ class DocumentExtractor:
         llm_client: Optional[_LocalModelExtractor] = None,
         preferred_models: Optional[Iterable[str]] = None,
         chat_options: Optional[Dict[str, Any]] = None,
+        ocr_preprocessor: Optional[OCRPreprocessor] = None,
+        ml_model: Optional[DocumentUnderstandingModel] = None,
     ) -> None:
         self._connection_factory = connection_factory
         self._ensured_tables: set[str] = set()
         self._llm = llm_client or _LocalModelExtractor(
             preferred_models=preferred_models,
             chat_options=chat_options,
+        )
+        self._ocr = ocr_preprocessor or OCRPreprocessor()
+        self._ml_model = ml_model or DocumentUnderstandingModel(
+            header_lookup=SCHEMA_HEADER_LOOKUP,
+            line_lookup=SCHEMA_LINE_LOOKUP,
+            header_keywords=HEADER_KEYWORDS,
+            line_keywords=LINE_KEYWORDS,
         )
         self._db_dialect = "generic"
         try:
@@ -590,7 +602,25 @@ class DocumentExtractor:
 
         source_name = source_label or path.name
 
-        text, detected_tables = self._extract_text_and_tables(path)
+        metadata_payload = dict(metadata or {})
+        ingestion_mode_value = str(metadata_payload.get("ingestion_mode", "")).lower()
+        if ingestion_mode_value:
+            metadata_payload["ingestion_mode"] = ingestion_mode_value
+        scanned = ingestion_mode_value in {"scanned", "image"} or bool(
+            metadata_payload.get("ocr")
+        )
+
+        ocr_override = self._ocr.extract(path, scanned=scanned)
+        if ocr_override:
+            text, detected_tables = ocr_override.text, ocr_override.tables
+        else:
+            text, detected_tables = self._extract_text_and_tables(
+                path,
+                ingestion_mode=ingestion_mode_value or None,
+                metadata=metadata_payload or None,
+            )
+
+        text = self._ocr.preprocess_text(text, scanned=scanned)
         schema_payload: Optional[Dict[str, Any]] = None
         if document_type:
             detected_type = document_type
@@ -614,6 +644,27 @@ class DocumentExtractor:
             line_items,
             schema_payload=schema_payload,
         )
+
+        ml_payload = None
+        try:
+            ml_payload = self._ml_model.infer(text, detected_type, scanned=scanned)
+        except Exception:  # pragma: no cover - defensive safety net
+            logger.debug("ML document understanding model failed", exc_info=True)
+            ml_payload = None
+
+        if ml_payload:
+            header = self._merge_header_fields(
+                header, ml_payload.header, detected_type
+            )
+            line_items = self._merge_line_items(
+                line_items,
+                ml_payload.line_items,
+                document_type=detected_type,
+            )
+            for table in ml_payload.tables:
+                if isinstance(table, dict) and table.get("rows"):
+                    derived_tables.append(table)
+
         field_hints = self._build_field_hints(
             detected_type,
             header,
@@ -655,8 +706,6 @@ class DocumentExtractor:
             line_items,
             tables,
         )
-
-        metadata_payload = dict(metadata or {})
 
         result = ExtractionResult(
             document_id=self._generate_document_id(path, header),
@@ -796,7 +845,20 @@ class DocumentExtractor:
             return 0.0
         return float(min(counts))
 
-    def _extract_text_and_tables(self, path: Path) -> Tuple[str, List[List[List[str]]]]:
+    def _extract_text_and_tables(
+        self,
+        path: Path,
+        *,
+        ingestion_mode: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, List[List[List[str]]]]:
+        if ingestion_mode and ingestion_mode not in {"digital", "scanned"}:
+            logger.debug(
+                "Unhandled ingestion mode '%s' provided; defaulting to generic parsing",
+                ingestion_mode,
+            )
+        _ = metadata  # reserved for advanced heuristics such as vendor hints
+
         if path.suffix.lower() == ".txt":
             text = path.read_text(encoding="utf-8")
             return text, []
@@ -1395,6 +1457,9 @@ class DocumentExtractor:
                 continue
             cleaned_value = self._clean_cell(value)
             if not cleaned_value:
+                continue
+            if re.search(r"\d\s{2,}\d", cleaned_value):
+                # Values that look like multi-column table rows are noise for headers.
                 continue
             if normalized_key not in merged or not self._clean_cell(merged[normalized_key]):
                 merged[normalized_key] = cleaned_value
