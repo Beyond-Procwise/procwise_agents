@@ -234,6 +234,8 @@ def plan_counter(ctx: NegotiationContext, signals: SupplierSignals) -> Dict[str,
             decision = "counter"
 
         counter_price = min(counter_price, current_offer)
+        if ctx.walkaway_price is not None:
+            counter_price = min(counter_price, ctx.walkaway_price)
         counter_price = round(counter_price, 2)
 
         if ctx.ask_early_pay_disc:
@@ -257,6 +259,8 @@ def plan_counter(ctx: NegotiationContext, signals: SupplierSignals) -> Dict[str,
         }
 
     counter_price = min(counter_price, current_offer)
+    if ctx.walkaway_price is not None:
+        counter_price = min(counter_price, ctx.walkaway_price)
     counter_price = round(counter_price, 2)
 
     if ctx.ask_early_pay_disc:
