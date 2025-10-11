@@ -38,7 +38,7 @@ from services.email_dispatch_chain_store import mark_response as mark_dispatch_r
 from services.email_thread_store import (
     DEFAULT_THREAD_TABLE,
     ensure_thread_table,
-    lookup_rfq_from_threads,
+    lookup_thread_metadata,
     sanitise_thread_table_name,
 )
 
@@ -284,9 +284,9 @@ def _lookup_rfq_from_thread(in_reply_to: Optional[str], references: Optional[str
     if not keys:
         return None
 
-    rfq_id = lookup_rfq_from_threads(conn, THREAD_TABLE, keys, logger=logger)
-    if rfq_id:
-        return rfq_id
+    metadata = lookup_thread_metadata(conn, THREAD_TABLE, keys, logger=logger)
+    if metadata:
+        return metadata[0]
     return None
 
 

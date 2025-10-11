@@ -11,6 +11,9 @@ _MARKER_DETECTION = re.compile(
 )
 _TOKEN_DETECTION = re.compile(r"TOKEN\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _RUN_ID_DETECTION = re.compile(r"RUN_ID\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+_SUPPLIER_DETECTION = re.compile(
+    r"SUPPLIER\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE
+)
 def split_hidden_marker(body: str) -> Tuple[Optional[str], str]:
     """Split ``body`` into an optional hidden marker comment and the remainder."""
 
@@ -130,6 +133,17 @@ def extract_run_id(comment: Optional[str]) -> Optional[str]:
     if not comment:
         return None
     match = _RUN_ID_DETECTION.search(comment)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def extract_supplier_id(comment: Optional[str]) -> Optional[str]:
+    """Return the supplier identifier embedded in ``comment`` if present."""
+
+    if not comment:
+        return None
+    match = _SUPPLIER_DETECTION.search(comment)
     if match:
         return match.group(1).strip()
     return None

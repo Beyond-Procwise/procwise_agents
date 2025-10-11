@@ -605,12 +605,12 @@ def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
 
     def fake_lookup(conn, table_name, identifiers, logger=None):
         lookup_calls.append((table_name, list(identifiers)))
-        return "RFQ-20240101-THREAD42"
+        return "RFQ-20240101-THREAD42", "SI-THREAD42"
 
     def fake_ensure(conn, table_name, logger=None):
         ensure_calls.append(table_name)
 
-    monkeypatch.setattr("services.email_watcher.lookup_rfq_from_threads", fake_lookup)
+    monkeypatch.setattr("services.email_watcher.lookup_thread_metadata", fake_lookup)
     monkeypatch.setattr("services.email_watcher.ensure_thread_table", fake_ensure)
 
     watcher = _make_watcher(nick, loader=lambda limit=None: [dict(message)])
@@ -619,10 +619,28 @@ def test_email_watcher_resolves_missing_rfq_via_thread_map(monkeypatch):
     assert len(results) == 1
     processed = results[0]
     assert processed["rfq_id"] == "RFQ-20240101-THREAD42"
+    assert processed["supplier_id"] == "SI-THREAD42"
     assert lookup_calls
     assert lookup_calls[0][0] == "proc.email_thread_map"
     assert lookup_calls[0][1] == ["dispatch-001@example.com"]
     assert ensure_calls == ["proc.email_thread_map"]
+
+
+def test_email_watcher_extracts_supplier_from_hidden_marker():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    message = {
+        "id": "msg-hidden-1",
+        "subject": "Re: RFQ-20240101-ABCD1234",
+        "body": "<!-- PROCWISE:RFQ_ID=RFQ-20240101-ABCD1234;SUPPLIER=SI000754;TOKEN=tok123;RUN_ID=run123 -->\nQuote attached",
+        "from": "rep@example.com",
+    }
+
+    processed = watcher._process_message_fields_only(dict(message))
+
+    assert processed["rfq_id"] == "RFQ-20240101-ABCD1234"
+    assert processed["supplier_id"] == "SI000754"
 
 
 def test_email_watcher_resolves_missing_rfq_from_dispatch_history(monkeypatch):
