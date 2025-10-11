@@ -166,6 +166,10 @@ def test_email_watcher_bootstraps_negotiation_tables():
     assert "CREATE TABLE IF NOT EXISTS proc.negotiation_session_state" in ddl
     assert "CREATE TABLE IF NOT EXISTS proc.processed_emails" in ddl
     assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_bucket_key_etag_uidx" in ddl
+    assert "ADD COLUMN IF NOT EXISTS mailbox TEXT" in ddl
+    assert "ADD COLUMN IF NOT EXISTS message_id TEXT" in ddl
+    assert "CREATE INDEX IF NOT EXISTS processed_emails_message_id_idx" in ddl
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS processed_emails_mailbox_message_id_uidx" in ddl
     assert "CREATE INDEX IF NOT EXISTS negotiation_session_state_status_idx" in ddl
 
 
@@ -1387,8 +1391,17 @@ def test_imap_loader_records_processed_email(monkeypatch):
 
     recorded: List[tuple] = []
 
-    def _capture_registry(self, bucket, key, etag, rfq_id):
-        recorded.append((bucket, key, etag, rfq_id))
+    def _capture_registry(
+        self,
+        bucket,
+        key,
+        etag,
+        rfq_id,
+        *,
+        message_id=None,
+        mailbox=None,
+    ):
+        recorded.append((bucket, key, etag, rfq_id, message_id, mailbox))
 
     monkeypatch.setattr(SESEmailWatcher, "_record_processed_in_registry", _capture_registry, raising=False)
 
@@ -1396,9 +1409,11 @@ def test_imap_loader_records_processed_email(monkeypatch):
 
     assert results
     assert recorded
-    bucket, key, _, rfq_id = recorded[0]
+    bucket, key, _, rfq_id, message_id, mailbox = recorded[0]
     assert bucket.startswith("imap::")
     assert key.startswith("imap/")
+    assert message_id == "<imap-msg-42>"
+    assert mailbox == watcher.mailbox_address
 
 
 def test_imap_never_invokes_s3_even_when_configured(monkeypatch):
