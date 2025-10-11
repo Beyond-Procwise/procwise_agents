@@ -1,20 +1,35 @@
 from __future__ import annotations
-import os, json, re, base64, quopri, logging
+
+import os
+import json
+import re
+import base64
+import quopri
+import logging
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
-from typing import Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import boto3
+import psycopg2
+from psycopg2 import sql
 from botocore.exceptions import ClientError
 
 # ---------- Config ----------
 REGION = os.getenv("AWS_REGION", "ap-south-1")
 QUEUE_URL = os.environ["SQS_QUEUE_URL"]
-PROCESSED_TABLE = os.getenv("PROCESSED_TABLE", "procwise_email_processed")
+PROCESSED_TABLE = os.getenv("PROCESSED_TABLE", "proc.processed_emails")
+WATERMARK_TABLE = os.getenv("S3_WATERMARK_TABLE", "proc.email_s3_watermarks")
 DELETE_ON_SUCCESS = os.getenv("DELETE_ON_SUCCESS", "true").lower() == "true"
 LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN", "15"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 
 # Compile RFQ patterns
 _default_patterns = [r"[A-Z]{3}\d{5,}", r"RFQ-\d{4}-\d{3,}[A-Z]?"]
@@ -28,11 +43,225 @@ NOISE = re.compile(r"^(?:(re|fwd|fw)\\s*:\\s*)+|\\[[^\\]]+\\]\\s*", re.IGNORECAS
 # ---------- AWS ----------
 sqs = boto3.client("sqs", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
-ddb = boto3.client("dynamodb", region_name=REGION)
 
 # ---------- Logging ----------
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 log = logging.getLogger("email_watcher")
+
+MESSAGE_SENTINEL_BUCKET = "sentinel::message"
+ETAG_SENTINEL_BUCKET = "sentinel::etag"
+
+_watermark_cache: Dict[str, Tuple[Optional[datetime], str]] = {}
+_db_connection = None
+_processed_table_ready = False
+_watermark_table_ready = False
+
+
+def _table_identifier(table_name: str) -> sql.SQL:
+    if "." in table_name:
+        schema, table = table_name.split(".", 1)
+        return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
+    return sql.Identifier(table_name)
+
+
+def _reset_connection_state() -> None:
+    global _processed_table_ready, _watermark_table_ready
+    _processed_table_ready = False
+    _watermark_table_ready = False
+
+
+def _get_db_connection():
+    global _db_connection
+    if _db_connection is not None:
+        try:
+            if getattr(_db_connection, "closed", 1) == 0:
+                return _db_connection
+        except Exception:
+            _db_connection = None
+
+    if not (DB_HOST and DB_NAME and DB_USER):
+        log.error(
+            "Database credentials not configured; unable to persist inbound email registry state",
+        )
+        return None
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            port=DB_PORT,
+            connect_timeout=5,
+        )
+        conn.autocommit = True
+        _db_connection = conn
+        _reset_connection_state()
+    except Exception:
+        log.exception("Unable to connect to Postgres for email watcher registry")
+        _db_connection = None
+    return _db_connection
+
+
+def _ensure_processed_table(connection) -> None:
+    global _processed_table_ready
+    if _processed_table_ready:
+        return
+
+    table_sql = _table_identifier(PROCESSED_TABLE)
+    index_prefix = PROCESSED_TABLE.replace(".", "_")
+
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        bucket TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        etag TEXT NOT NULL DEFAULT '',
+                        rfq_id TEXT,
+                        processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        mailbox TEXT,
+                        message_id TEXT,
+                        source_last_modified TIMESTAMPTZ
+                    )
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    ALTER TABLE {table}
+                        ALTER COLUMN etag SET DEFAULT ''
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    ALTER TABLE {table}
+                        ADD COLUMN IF NOT EXISTS mailbox TEXT
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    ALTER TABLE {table}
+                        ADD COLUMN IF NOT EXISTS message_id TEXT
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    ALTER TABLE {table}
+                        ADD COLUMN IF NOT EXISTS source_last_modified TIMESTAMPTZ
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS {idx}
+                        ON {table} (bucket, key, etag)
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_bucket_key_etag_uidx"),
+                    table=table_sql,
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {idx}
+                        ON {table} (rfq_id, processed_at DESC)
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_rfq_ts_idx"),
+                    table=table_sql,
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {idx}
+                        ON {table} (rfq_id, key)
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_rfq_key_idx"),
+                    table=table_sql,
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {idx}
+                        ON {table} (message_id)
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_message_id_idx"),
+                    table=table_sql,
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS {idx}
+                        ON {table} (COALESCE(mailbox, ''), message_id)
+                        WHERE message_id IS NOT NULL AND message_id <> ''
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_mailbox_message_uidx"),
+                    table=table_sql,
+                )
+            )
+    except Exception:
+        log.exception("Failed to ensure processed email registry table exists")
+        raise
+
+    _processed_table_ready = True
+
+
+def _ensure_watermark_table(connection) -> None:
+    global _watermark_table_ready
+    if _watermark_table_ready:
+        return
+
+    table_sql = _table_identifier(WATERMARK_TABLE)
+    index_prefix = WATERMARK_TABLE.replace(".", "_")
+
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        bucket TEXT PRIMARY KEY,
+                        last_processed_key TEXT,
+                        last_processed_ts TIMESTAMPTZ NOT NULL,
+                        processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                ).format(table=table_sql)
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {idx}
+                        ON {table} (last_processed_ts DESC)
+                    """
+                ).format(
+                    idx=sql.Identifier(f"{index_prefix}_ts_idx"),
+                    table=table_sql,
+                )
+            )
+    except Exception:
+        log.exception("Failed to ensure S3 watermark table exists")
+        raise
+
+    _watermark_table_ready = True
 
 # ---------- Helpers ----------
 def clean_subject(s: Optional[str]) -> str:
@@ -143,34 +372,313 @@ def match_email_to_rfq(known_ids: Set[str], subject: str, body_text: str, body_h
             return tok, "subject_id"
     return None, "none"
 
-def already_processed(s3_key: str) -> bool:
+def _normalise_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
     try:
-        resp = ddb.get_item(
-            TableName=PROCESSED_TABLE,
-            Key={"s3_key": {"S": s3_key}},
-            ConsistentRead=True,
-        )
-        return "Item" in resp
-    except ClientError as e:
-        log.error(f"DDB get_item failed: {e}")
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        log.warning("Unable to parse watermark timestamp '%s'", value)
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+def load_watermark(bucket: Optional[str]) -> Tuple[Optional[datetime], str]:
+    if not bucket:
+        return None, ""
+    cached = _watermark_cache.get(bucket)
+    if cached is not None:
+        return cached
+
+    conn = _get_db_connection()
+    if conn is None:
+        return None, ""
+
+    try:
+        _ensure_watermark_table(conn)
+    except Exception:
+        return None, ""
+
+    table_sql = _table_identifier(WATERMARK_TABLE)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT last_processed_ts, last_processed_key FROM {table} WHERE bucket = %s"
+                ).format(table=table_sql),
+                (bucket,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        log.exception("Failed to load watermark for bucket %s", bucket)
+        return None, ""
+
+    if not row:
+        return None, ""
+
+    ts, key = row
+    if isinstance(ts, datetime):
+        ts_value = ts.astimezone(timezone.utc)
+    else:
+        ts_value = _normalise_timestamp(str(ts))
+    key_value = str(key or "")
+    result = (ts_value, key_value)
+    _watermark_cache[bucket] = result
+    return result
+
+
+def _store_watermark(bucket: Optional[str], key: str, last_modified: Optional[datetime]) -> None:
+    if not bucket or last_modified is None:
+        return
+
+    conn = _get_db_connection()
+    if conn is None:
+        return
+
+    try:
+        _ensure_watermark_table(conn)
+    except Exception:
+        return
+
+    table_sql = _table_identifier(WATERMARK_TABLE)
+    ts_utc = last_modified.astimezone(timezone.utc)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {table} (bucket, last_processed_key, last_processed_ts, processed_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (bucket) DO UPDATE SET
+                        last_processed_key = EXCLUDED.last_processed_key,
+                        last_processed_ts = EXCLUDED.last_processed_ts,
+                        processed_at = NOW()
+                    """
+                ).format(table=table_sql),
+                (bucket, key or "", ts_utc),
+            )
+    except Exception:
+        log.exception("Failed to store watermark for bucket %s", bucket)
+        return
+
+    _watermark_cache[bucket] = (ts_utc, key or "")
+
+
+def _is_newer_than_watermark(
+    candidate_ts: Optional[datetime],
+    candidate_key: str,
+    watermark_ts: Optional[datetime],
+    watermark_key: str,
+) -> bool:
+    if candidate_ts is None:
+        return True
+    cand = candidate_ts.astimezone(timezone.utc)
+    if watermark_ts is None:
+        return True
+    reference = watermark_ts.astimezone(timezone.utc)
+    if cand > reference:
+        return True
+    if cand < reference:
+        return False
+    if not watermark_key:
+        return True
+    return candidate_key > watermark_key
+
+
+def already_processed(
+    s3_key: str,
+    *,
+    bucket: Optional[str] = None,
+    message_id: Optional[str] = None,
+    provider_id: Optional[str] = None,
+) -> bool:
+    if not s3_key:
         return False
 
-def mark_processed(s3_key: str, message_id: str, provider_id: str, rfq_id: str):
+    conn = _get_db_connection()
+    if conn is None:
+        return False
+
     try:
-        ddb.put_item(
-            TableName=PROCESSED_TABLE,
-            Item={
-                "s3_key": {"S": s3_key},
-                "message_id": {"S": message_id or ""},
-                "provider_id": {"S": provider_id or ""},
-                "rfq_id": {"S": rfq_id or ""},
-                "processed_at": {"S": datetime.now(timezone.utc).isoformat()},
-            },
-            ConditionExpression="attribute_not_exists(s3_key)",
+        _ensure_processed_table(conn)
+    except Exception:
+        return False
+
+    table_sql = _table_identifier(PROCESSED_TABLE)
+
+    try:
+        with conn.cursor() as cur:
+            if bucket:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT 1 FROM {table} WHERE bucket = %s AND key = %s LIMIT 1"
+                    ).format(table=table_sql),
+                    (bucket, s3_key),
+                )
+                if cur.fetchone():
+                    return True
+
+            if message_id:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT 1 FROM {table} WHERE bucket = %s AND key = %s LIMIT 1"
+                    ).format(table=table_sql),
+                    (MESSAGE_SENTINEL_BUCKET, message_id),
+                )
+                if cur.fetchone():
+                    return True
+                cur.execute(
+                    sql.SQL(
+                        "SELECT 1 FROM {table} WHERE message_id = %s LIMIT 1"
+                    ).format(table=table_sql),
+                    (message_id,),
+                )
+                if cur.fetchone():
+                    return True
+
+            if provider_id:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT 1 FROM {table} WHERE bucket = %s AND key = %s LIMIT 1"
+                    ).format(table=table_sql),
+                    (ETAG_SENTINEL_BUCKET, provider_id),
+                )
+                if cur.fetchone():
+                    return True
+                cur.execute(
+                    sql.SQL(
+                        "SELECT 1 FROM {table} WHERE etag = %s LIMIT 1"
+                    ).format(table=table_sql),
+                    (provider_id,),
+                )
+                if cur.fetchone():
+                    return True
+    except Exception:
+        log.exception("Failed to check processed registry for %s", s3_key)
+        return False
+
+    return False
+
+
+def _record_sentinel(
+    *,
+    kind: str,
+    identifier: str,
+    base_bucket: Optional[str],
+    rfq_id: Optional[str],
+) -> None:
+    conn = _get_db_connection()
+    if conn is None:
+        return
+
+    try:
+        _ensure_processed_table(conn)
+    except Exception:
+        return
+
+    table_sql = _table_identifier(PROCESSED_TABLE)
+    bucket_value = MESSAGE_SENTINEL_BUCKET if kind == "message" else ETAG_SENTINEL_BUCKET
+    mailbox_value = base_bucket or bucket_value
+    message_id_value = identifier if kind == "message" else None
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {table} (bucket, key, etag, rfq_id, processed_at, mailbox, message_id)
+                    VALUES (%s, %s, '', %s, NOW(), %s, %s)
+                    ON CONFLICT (bucket, key, etag) DO UPDATE SET
+                        rfq_id = EXCLUDED.rfq_id,
+                        mailbox = COALESCE(EXCLUDED.mailbox, {table}.mailbox),
+                        message_id = COALESCE(EXCLUDED.message_id, {table}.message_id),
+                        processed_at = NOW()
+                    """
+                ).format(table=table_sql),
+                (bucket_value, identifier, rfq_id or "", mailbox_value, message_id_value),
+            )
+    except Exception:
+        log.exception("Failed to record %s sentinel for %s", kind, identifier)
+
+
+def mark_processed(
+    bucket: Optional[str],
+    s3_key: str,
+    message_id: str,
+    provider_id: str,
+    rfq_id: str,
+    last_modified: Optional[datetime],
+) -> None:
+    conn = _get_db_connection()
+    if conn is None:
+        return
+
+    try:
+        _ensure_processed_table(conn)
+    except Exception:
+        return
+
+    table_sql = _table_identifier(PROCESSED_TABLE)
+    last_modified_ts = (
+        last_modified.astimezone(timezone.utc) if last_modified is not None else None
+    )
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {table} (
+                        bucket,
+                        key,
+                        etag,
+                        rfq_id,
+                        processed_at,
+                        mailbox,
+                        message_id,
+                        source_last_modified
+                    )
+                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
+                    ON CONFLICT (bucket, key, etag) DO UPDATE SET
+                        rfq_id = EXCLUDED.rfq_id,
+                        mailbox = COALESCE(EXCLUDED.mailbox, {table}.mailbox),
+                        message_id = COALESCE(EXCLUDED.message_id, {table}.message_id),
+                        source_last_modified = COALESCE(EXCLUDED.source_last_modified, {table}.source_last_modified),
+                        processed_at = NOW()
+                    """
+                ).format(table=table_sql),
+                (
+                    bucket or "",
+                    s3_key,
+                    provider_id or "",
+                    rfq_id or "",
+                    bucket or None,
+                    message_id or None,
+                    last_modified_ts,
+                ),
+            )
+    except Exception:
+        log.exception("Failed to record processed email %s", s3_key)
+        return
+
+    if message_id:
+        _record_sentinel(
+            kind="message",
+            identifier=message_id,
+            base_bucket=bucket,
+            rfq_id=rfq_id or None,
         )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
+    if provider_id:
+        _record_sentinel(
+            kind="etag",
+            identifier=provider_id,
+            base_bucket=bucket,
+            rfq_id=rfq_id or None,
+        )
+
+    _store_watermark(bucket, s3_key, last_modified)
 
 def dead_letter(reason: str, details: dict):
     log.warning(f"DEAD-LETTER reason={reason} details={json.dumps(details)[:1000]}")
@@ -185,9 +693,7 @@ def process_s3_record(bucket: str, key: str) -> bool:
     """
     Returns True if processed successfully (or safely skipped), False if should retry.
     """
-    if already_processed(key):
-        log.info(f"Skip already-processed {key}")
-        return True
+    watermark_ts, watermark_key = load_watermark(bucket)
 
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -197,10 +703,50 @@ def process_s3_record(bucket: str, key: str) -> bool:
 
     raw = obj["Body"].read()
     # In SES->S3 pipeline, object is the raw RFC822 email
-    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    last_modified = obj.get("LastModified")
+    if last_modified and not _is_newer_than_watermark(last_modified, key, watermark_ts, watermark_key):
+        log.info(
+            "Skipping s3://%s/%s; last_modified=%s is not newer than watermark=%s::%s",
+            bucket,
+            key,
+            last_modified,
+            watermark_ts.isoformat() if watermark_ts else "<none>",
+            watermark_key or "<none>",
+        )
+        return True
+
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+    except Exception:
+        provider_id = (obj.get("ETag") or "").strip('"')
+        log.exception("Failed to parse email object s3://%s/%s", bucket, key)
+        dead_letter(
+            "parse_failure",
+            {
+                "s3_key": key,
+                "bucket": bucket,
+            },
+        )
+        mark_processed(bucket, key, "", provider_id, "", last_modified)
+        return True
 
     message_id = (msg.get("Message-Id") or "").strip()
     provider_id = (obj.get("ETag") or "").strip('"')
+
+    if already_processed(
+        key,
+        bucket=bucket,
+        message_id=message_id or None,
+        provider_id=provider_id or None,
+    ):
+        log.info(
+            "Skipping duplicate email s3://%s/%s (message_id=%s, etag=%s)",
+            bucket,
+            key,
+            message_id or "<none>",
+            provider_id or "<none>",
+        )
+        return True
 
     subj = clean_subject(msg.get("Subject"))
     body_text, body_html = extract_text_from_message(msg)
@@ -215,7 +761,7 @@ def process_s3_record(bucket: str, key: str) -> bool:
             "subject": subj[:300],
         })
         # Mark processed to avoid infinite retries; adjust if you want to reprocess later
-        mark_processed(key, message_id, provider_id, rfq_id or "")
+        mark_processed(bucket, key, message_id, provider_id, rfq_id or "", last_modified)
         return True
 
     # >>> Hand off to your pipeline here (NegotiationAgent → DraftingAgent) <<<
@@ -226,7 +772,7 @@ def process_s3_record(bucket: str, key: str) -> bool:
     # draft = drafting_agent.compose_reply(rfq_id=rfq_id, strategy=strategy)
     # send_email_with_anchors(draft, rfq_id)
 
-    mark_processed(key, message_id, provider_id, rfq_id)
+    mark_processed(bucket, key, message_id, provider_id, rfq_id, last_modified)
     return True
 
 def handle_sqs_message(m: dict) -> bool:
