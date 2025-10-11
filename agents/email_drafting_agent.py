@@ -1834,8 +1834,8 @@ class EmailDraftingAgent(BaseAgent):
             else:
                 base = "Please review the requirement and return your quotation using the table below."
 
-        note = " Kindly retain the RFQ ID in the email subject when replying."
-        return self._wrap_paragraph(f"{base}{note}")
+        # note = " Kindly retain the RFQ ID in the email subject when replying."
+        return self._wrap_paragraph(f"{base}")
 
     def _build_dynamic_closing(
         self,
