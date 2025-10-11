@@ -722,6 +722,12 @@ class NegotiationAgent(BaseAgent):
         if recipients:
             draft_payload.setdefault("recipients", recipients)
 
+        thread_headers = None
+        if isinstance(context.input_data, dict):
+            thread_headers = context.input_data.get("thread_headers")
+        if thread_headers:
+            draft_payload.setdefault("thread_headers", thread_headers)
+
         draft_metadata = {
             "counter_price": decision.get("counter_price"),
             "target_price": target_price,
@@ -766,6 +772,8 @@ class NegotiationAgent(BaseAgent):
             "thread_index": round_no,
             "subject": subject_seed,
         }
+        if thread_headers:
+            draft_stub["thread_headers"] = thread_headers
         draft_stub["closing_round"] = round_no >= 3
         if currency:
             draft_stub["currency"] = currency
@@ -3497,7 +3505,18 @@ class NegotiationAgent(BaseAgent):
         if not isinstance(draft_payload, dict):
             return None
         payload = dict(draft_payload)
-        payload.setdefault("decision", decision)
+        decision_payload = dict(decision) if isinstance(decision, dict) else {}
+        thread_headers = (
+            context.input_data.get("thread_headers")
+            if isinstance(context.input_data, dict)
+            else None
+        )
+        if not thread_headers:
+            thread_headers = payload.get("thread_headers")
+        if thread_headers:
+            payload.setdefault("thread_headers", thread_headers)
+            decision_payload.setdefault("thread", thread_headers)
+        payload.setdefault("decision", decision_payload)
         payload.setdefault("session_state", self._public_state(state))
         payload.setdefault("negotiation_message", negotiation_message)
         payload.setdefault("supplier_reply_count", state.get("supplier_reply_count", 0))

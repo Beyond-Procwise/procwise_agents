@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import imaplib
 import logging
 import mimetypes
@@ -106,6 +107,33 @@ def _rfq_match_key(value: object) -> Optional[str]:
 
 RFQ_ID_RE = re.compile(r"\bRFQ-\d{8}-[A-Za-z0-9]{8}\b", re.IGNORECASE)
 _SIMILARITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+_IMAP_UID_RE = re.compile(r"imap/(\d+)")
+
+
+def _generate_unique_id(
+    uid: str,
+    msgid: str,
+    date_hdr: str,
+    sender: str,
+    subject: str,
+) -> str:
+    """Generate a stable composite identifier for an IMAP message."""
+
+    base = f"{uid}|{msgid or ''}|{date_hdr or ''}|{sender or ''}|{subject or ''}"
+    unique_hash = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+    return f"{uid}-{unique_hash}"
+
+
+def _extract_imap_uid(key: Optional[str]) -> Optional[int]:
+    if not key:
+        return None
+    match = _IMAP_UID_RE.search(str(key))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -466,6 +494,7 @@ class SESEmailWatcher:
         self._action_payload_cache: Dict[str, Dict[str, object]] = {}
         self._last_watermark_ts: Optional[datetime] = None
         self._last_watermark_key: str = ""
+        self._last_uid: Optional[int] = None
         self._load_watermark()
         self._match_poll_attempts = self._coerce_int(
             getattr(self.settings, "email_match_poll_attempts", 3),
@@ -715,7 +744,12 @@ class SESEmailWatcher:
                             last_modified_hint = message.get("_last_modified")
                             if isinstance(last_modified_hint, datetime):
                                 _record_watermark_candidate(
-                                    last_modified_hint, str(message.get("id") or "")
+                                    last_modified_hint,
+                                    str(
+                                        message.get("s3_key")
+                                        or message.get("id")
+                                        or ""
+                                    ),
                                 )
                             total_candidates += 1
                             matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
@@ -766,7 +800,12 @@ class SESEmailWatcher:
                             )
                             if last_modified is not None:
                                 _record_watermark_candidate(
-                                    last_modified, str(parsed.get("id") or "")
+                                    last_modified,
+                                    str(
+                                        parsed.get("s3_key")
+                                        or parsed.get("id")
+                                        or ""
+                                    ),
                                 )
                             if was_processed:
                                 total_processed += 1
@@ -815,7 +854,12 @@ class SESEmailWatcher:
                                 last_modified_hint = message.get("_last_modified")
                                 if isinstance(last_modified_hint, datetime):
                                     _record_watermark_candidate(
-                                        last_modified_hint, str(message.get("id") or "")
+                                        last_modified_hint,
+                                        str(
+                                            message.get("s3_key")
+                                            or message.get("id")
+                                            or ""
+                                        ),
                                     )
                                 total_candidates += 1
                                 matched, should_stop, rfq_matched, was_processed = self._process_candidate_message(
@@ -944,7 +988,7 @@ class SESEmailWatcher:
 
     def _should_stop_after_match(self, match_filters: Dict[str, object]) -> bool:
         if not match_filters:
-            return True
+            return False
 
         active_keys = {
             key
@@ -952,7 +996,7 @@ class SESEmailWatcher:
             if value not in (None, "", [], {}, ())
         }
         if not active_keys:
-            return True
+            return False
 
         non_stop_keys = {"supplier_id", "rfq_id"}
         if active_keys & non_stop_keys:
@@ -1126,6 +1170,11 @@ class SESEmailWatcher:
 
         if processed:
             processed_payload = self._record_processed_payload(message_id, processed)
+            thread_headers = message.get("thread_headers")
+            if thread_headers:
+                processed_payload.setdefault("thread_headers", thread_headers)
+                if isinstance(processed, dict):
+                    processed.setdefault("thread_headers", thread_headers)
             dispatch_record = (
                 message.get("_dispatch_record")
                 if isinstance(message.get("_dispatch_record"), dict)
@@ -1188,6 +1237,11 @@ class SESEmailWatcher:
                             processed_payload = self._record_processed_payload(
                                 message_id, processed
                             )
+                            thread_headers = message.get("thread_headers")
+                            if thread_headers:
+                                processed_payload.setdefault("thread_headers", thread_headers)
+                                if isinstance(processed, dict):
+                                    processed.setdefault("thread_headers", thread_headers)
                             if dispatch_record:
                                 record_rfq = dispatch_record.get("rfq_id")
                                 record_supplier = dispatch_record.get("supplier_id")
@@ -1348,6 +1402,21 @@ class SESEmailWatcher:
                 mailbox=self.mailbox_address,
             )
 
+        if processed_payload:
+            logger.info(
+                "Processed inbound email %s → RFQ %s, Supplier %s",
+                message_id,
+                processed_payload.get("rfq_id") or "<unknown>",
+                processed_payload.get("supplier_id") or "<unknown>",
+            )
+        else:
+            logger.info(
+                "Ignored inbound email %s for mailbox %s (status=%s)",
+                message_id,
+                self.mailbox_address,
+                metadata.get("status") if isinstance(metadata, dict) else "unknown",
+            )
+
         matched = bool(message_match)
         should_stop = False
 
@@ -1376,13 +1445,6 @@ class SESEmailWatcher:
             should_stop = True
             logger.debug(
                 "Stopping poll once after matching filters for message %s",
-                message_id,
-            )
-        elif rfq_match and not match_filters:
-            # Only stop early on bare RFQ matches when no additional filters were supplied.
-            should_stop = True
-            logger.debug(
-                "Stopping poll after RFQ match for message %s with no additional filters",
                 message_id,
             )
 
@@ -1875,6 +1937,7 @@ class SESEmailWatcher:
                     ts_value, key_value = row
                     self._last_watermark_ts = ts_value
                     self._last_watermark_key = str(key_value or "")
+                    self._last_uid = _extract_imap_uid(self._last_watermark_key)
         except Exception:
             logger.exception(
                 "Failed to load email watcher watermark for mailbox %s",
@@ -2615,6 +2678,10 @@ class SESEmailWatcher:
                 "Failed to reconcile dispatch chain for message %s", message_identifier, exc_info=True
             )
 
+        thread_headers = self._build_thread_headers_for_reply(message)
+        if thread_headers:
+            message.setdefault("thread_headers", thread_headers)
+
         context = AgentContext(
             workflow_id=workflow_id,
             agent_id="supplier_interaction",
@@ -2630,6 +2697,9 @@ class SESEmailWatcher:
                 "s3_key": message.get("s3_key"),
             },
         )
+
+        if thread_headers:
+            context.input_data["thread_headers"] = thread_headers
 
         self._register_workflow_mapping(
             context.workflow_id, [primary_canonical, *additional_canonicals]
@@ -2704,6 +2774,9 @@ class SESEmailWatcher:
                     parent_agent=context.agent_id,
                     routing_history=list(context.routing_history),
                 )
+                thread_headers = message.get("thread_headers")
+                if thread_headers:
+                    negotiation_context.input_data["thread_headers"] = thread_headers
                 negotiation_job = {
                     "context": negotiation_context,
                     "rfq_id": rfq_id,
@@ -3991,7 +4064,22 @@ class SESEmailWatcher:
                     return []
 
                 final_criteria = self._compose_imap_search_criteria(search_criteria, since)
-                status, data = client.search(None, final_criteria)
+                start_uid: Optional[int] = None
+                if self._last_uid is not None:
+                    try:
+                        start_uid = max(int(self._last_uid) + 1, 1)
+                    except Exception:
+                        start_uid = None
+
+                search_terms: List[str] = []
+                if final_criteria:
+                    search_terms.append(final_criteria)
+                if not search_terms:
+                    search_terms.append("UNSEEN")
+                if start_uid is not None:
+                    search_terms.extend(["UID", f"{start_uid}:*"])
+
+                status, data = client.uid("search", None, *search_terms)
                 if status != "OK" or not data:
                     client.logout()
                     return []
@@ -4006,12 +4094,14 @@ class SESEmailWatcher:
 
                 fetch_command = "(RFC822)" if mark_seen else "(BODY.PEEK[])"
 
+                processed_uids: Set[int] = set()
+
                 for raw_id in reversed(raw_ids):
                     message_id_str = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
                     if message_id_str in seen_ids:
                         continue
 
-                    status, payload = client.fetch(raw_id, fetch_command)
+                    status, payload = client.uid("fetch", message_id_str, fetch_command)
                     if status != "OK" or not payload:
                         continue
 
@@ -4023,27 +4113,44 @@ class SESEmailWatcher:
                     if raw_bytes is None:
                         continue
 
-                    parsed = self._parse_inbound_object(
-                        raw_bytes, key=f"imap/{message_id_str}"
+                    parsed = self._parse_inbound_object(raw_bytes, key=f"imap/{message_id_str}")
+                    uid_str = message_id_str
+                    msg_id_header = str(parsed.get("message_id") or "")
+                    date_header = str(parsed.get("received_at") or "")
+                    sender = str(parsed.get("from") or "")
+                    subject = str(parsed.get("subject") or "")
+                    unique_id = _generate_unique_id(
+                        uid_str,
+                        msg_id_header,
+                        date_header,
+                        sender,
+                        subject,
                     )
-                    parsed.setdefault("id", f"imap/{message_id_str}")
-                    parsed.setdefault("s3_key", f"imap/{message_id_str}")
+                    parsed["id"] = unique_id
+                    parsed.setdefault("s3_key", f"imap/{uid_str}")
                     parsed.setdefault(
                         "_bucket", f"imap::{self.mailbox_address or 'unknown'}"
                     )
                     parsed.setdefault("mailbox", mailbox)
-                    if not parsed.get("message_id"):
-                        parsed["message_id"] = parsed.get("id")
+                    if msg_id_header:
+                        parsed["message_id"] = msg_id_header
+                    else:
+                        parsed["message_id"] = unique_id
+                    parsed.setdefault("_imap_uid", uid_str)
                     parsed.setdefault("_source", "imap")
                     timestamp = self._coerce_imap_timestamp(parsed.get("received_at"))
                     if timestamp is None:
                         timestamp = datetime.now(timezone.utc)
                     collected.append((timestamp, parsed))
                     seen_ids.add(message_id_str)
+                    try:
+                        processed_uids.add(int(uid_str))
+                    except Exception:
+                        pass
 
                     if mark_seen:
                         try:
-                            client.store(raw_id, "+FLAGS", "(\\Seen)")
+                            client.uid("store", message_id_str, "+FLAGS", "(\\Seen)")
                         except Exception:
                             logger.debug(
                                 "Failed to set IMAP seen flag for %s", message_id_str, exc_info=True
@@ -4064,6 +4171,17 @@ class SESEmailWatcher:
                         break
 
                 client.logout()
+
+                if processed_uids:
+                    latest_uid = max(processed_uids)
+                    previous_uid = self._last_uid or 0
+                    if latest_uid > previous_uid:
+                        self._last_uid = latest_uid
+                        logger.debug(
+                            "Updated last seen IMAP UID to %s for mailbox %s",
+                            self._last_uid,
+                            self.mailbox_address,
+                        )
         except Exception:
             logger.error(
                 "IMAP fallback polling failed for mailbox %s",
@@ -4079,7 +4197,24 @@ class SESEmailWatcher:
             key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
-        return [payload for _, payload in collected]
+        messages = [payload for _, payload in collected]
+        if messages:
+            ids = [
+                str(message.get("message_id") or message.get("id") or "<no-id>")
+                for message in messages
+            ]
+            times = [
+                str(message.get("received_at") or message.get("_last_modified") or "?")
+                for message in messages
+            ]
+            logger.debug(
+                "IMAP poll retrieved %d message(s) for mailbox %s: ids=%s times=%s",
+                len(messages),
+                self.mailbox_address,
+                ids,
+                times,
+            )
+        return messages
 
     @staticmethod
     def _coerce_imap_timestamp(value: object) -> Optional[datetime]:
@@ -5647,6 +5782,30 @@ class SESEmailWatcher:
             parsed["_prefix"] = prefix
             if size_bytes is not None:
                 parsed["_content_length"] = size_bytes
+
+            message_identifier = parsed.get("message_id")
+            if isinstance(message_identifier, bytes):
+                try:
+                    message_identifier = message_identifier.decode()
+                except Exception:
+                    message_identifier = str(message_identifier)
+            if isinstance(message_identifier, str):
+                message_identifier = message_identifier.strip()
+            if (
+                isinstance(message_identifier, str)
+                and message_identifier
+                and self.state_store
+                and message_identifier in self.state_store
+            ):
+                watcher.mark_known(key, last_modified)
+                logger.debug(
+                    "Skipping S3 object %s for mailbox %s; message_id %s already processed",
+                    key,
+                    self.mailbox_address,
+                    message_identifier,
+                )
+                continue
+
             body_text = str(parsed.get("body") or "")
             comment, _body_remainder = split_hidden_marker(body_text)
             token = extract_marker_token(comment)
@@ -5699,6 +5858,22 @@ class SESEmailWatcher:
 
         collected.sort(key=lambda item: item[0] or datetime.min, reverse=newest_first)
         messages = [payload for _, payload in collected]
+        if messages:
+            ids = [
+                str(message.get("message_id") or message.get("id") or "<no-id>")
+                for message in messages
+            ]
+            times = [
+                str(message.get("received_at") or message.get("_last_modified") or "?")
+                for message in messages
+            ]
+            logger.debug(
+                "S3 fallback retrieved %d message(s) for mailbox %s: ids=%s times=%s",
+                len(messages),
+                self.mailbox_address,
+                ids,
+                times,
+            )
         return messages
 
     def _is_newer_than_watermark(
@@ -5720,8 +5895,13 @@ class SESEmailWatcher:
             reference = reference.replace(tzinfo=timezone.utc)
         if candidate > reference:
             return True
-        if candidate == reference and key > watermark_key:
-            return True
+        if candidate == reference:
+            new_uid = _extract_imap_uid(key)
+            old_uid = _extract_imap_uid(watermark_key)
+            if new_uid is not None and old_uid is not None:
+                return new_uid > old_uid
+            if key > watermark_key:
+                return True
         return False
 
     def _update_watermark(self, last_modified: datetime, key: str) -> None:
@@ -5733,18 +5913,30 @@ class SESEmailWatcher:
         if self._last_watermark_ts is None:
             self._last_watermark_ts = candidate
             self._last_watermark_key = key
-            return
+        else:
+            reference = self._last_watermark_ts
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=timezone.utc)
 
-        reference = self._last_watermark_ts
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=timezone.utc)
+            if candidate > reference:
+                self._last_watermark_ts = candidate
+                self._last_watermark_key = key
+            elif candidate == reference:
+                new_uid = _extract_imap_uid(key)
+                old_uid = _extract_imap_uid(self._last_watermark_key)
+                if new_uid is not None and old_uid is not None:
+                    if new_uid > old_uid:
+                        self._last_watermark_ts = candidate
+                        self._last_watermark_key = key
+                elif key > self._last_watermark_key:
+                    self._last_watermark_ts = candidate
+                    self._last_watermark_key = key
 
-        if candidate > reference:
-            self._last_watermark_ts = candidate
-            self._last_watermark_key = key
-        elif candidate == reference and key > self._last_watermark_key:
-            self._last_watermark_ts = candidate
-            self._last_watermark_key = key
+        new_uid_value = _extract_imap_uid(key)
+        if new_uid_value is not None:
+            previous_uid = self._last_uid or 0
+            if new_uid_value > previous_uid:
+                self._last_uid = new_uid_value
 
     def _format_watermark(self) -> str:
         if self._last_watermark_ts is None:
@@ -5850,6 +6042,26 @@ class SESEmailWatcher:
             normalised_subject=normalised_subject,
         )
         attachments = self._extract_attachments(message)
+        in_reply_to_header = message.get("In-Reply-To") or message.get("in-reply-to")
+        references_raw = message.get_all("References", []) or []
+        references: List[str] = []
+        for entry in references_raw:
+            if entry in (None, ""):
+                continue
+            try:
+                text = str(entry).strip()
+            except Exception:
+                continue
+            if text:
+                references.append(text)
+        headers: Dict[str, object] = {}
+        for key in message.keys():
+            if key in headers:
+                continue
+            try:
+                headers[key] = message.get(key)
+            except Exception:
+                headers[key] = message.get(key, "")
         return {
             "subject": raw_subject,
             "from": from_address,
@@ -5860,6 +6072,9 @@ class SESEmailWatcher:
             "message_id": message.get("message-id"),
             "recipients": recipients,
             "attachments": attachments,
+            "in_reply_to": in_reply_to_header,
+            "references": references,
+            "headers": headers,
         }
 
     @staticmethod
@@ -6254,6 +6469,53 @@ class SESEmailWatcher:
             message_ids.append(trimmed)
 
         return message_ids
+
+    def _build_thread_headers_for_reply(
+        self, message: Dict[str, object]
+    ) -> Optional[Dict[str, object]]:
+        message_identifier = message.get("message_id")
+        if isinstance(message_identifier, bytes):
+            try:
+                message_identifier = message_identifier.decode()
+            except Exception:
+                message_identifier = str(message_identifier)
+        if not isinstance(message_identifier, str):
+            return None
+
+        trimmed_id = message_identifier.strip()
+        if not trimmed_id:
+            return None
+
+        def _strip_brackets(value: str) -> str:
+            token = value.strip()
+            if token.startswith("<") and token.endswith(">"):
+                token = token[1:-1].strip()
+            return token
+
+        def _ensure_brackets(value: str) -> str:
+            token = value.strip()
+            if token.startswith("<") and token.endswith(">"):
+                return token
+            return f"<{token}>"
+
+        base_identifier = _strip_brackets(trimmed_id)
+        references: List[str] = []
+        for identifier in self._collect_thread_identifiers(message):
+            stripped = _strip_brackets(identifier)
+            if not stripped:
+                continue
+            formatted = _ensure_brackets(stripped)
+            if formatted not in references:
+                references.append(formatted)
+
+        formatted_base = _ensure_brackets(base_identifier or trimmed_id)
+        if formatted_base not in references:
+            references.append(formatted_base)
+
+        thread_payload: Dict[str, object] = {"message_id": formatted_base}
+        if references:
+            thread_payload["references"] = references
+        return thread_payload
 
     def _collect_body_message_ids(self, message: Dict[str, object]) -> List[str]:
         body = message.get("body")

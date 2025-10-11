@@ -2097,6 +2097,15 @@ class EmailDraftingAgent(BaseAgent):
             data = {**prev, **data}
 
         decision_payload = data.get("decision")
+        thread_headers_payload = data.get("thread_headers")
+        if isinstance(thread_headers_payload, dict):
+            if isinstance(decision_payload, dict):
+                decision_payload = dict(decision_payload)
+                decision_payload.setdefault("thread", thread_headers_payload)
+                data["decision"] = decision_payload
+            else:
+                decision_payload = {"thread": thread_headers_payload}
+                data["decision"] = decision_payload
         if isinstance(decision_payload, dict) and decision_payload:
             draft = self.from_decision(decision_payload)
             self._store_draft(draft)
