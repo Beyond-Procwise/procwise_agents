@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -67,6 +68,8 @@ MARKET_REVIEW_THRESHOLD = float(os.getenv("NEG_MARKET_REVIEW_PCT", "0.2"))
 MARKET_ESCALATION_THRESHOLD = float(os.getenv("NEG_MARKET_ESCALATION_PCT", "0.4"))
 MAX_VOLUME_LIMIT = float(os.getenv("NEG_MAX_VOLUME_LIMIT", "1000"))
 MAX_TERM_DAYS = int(os.getenv("NEG_MAX_TERM_DAYS", "120"))
+
+DEFAULT_NEGOTIATION_MESSAGE_TEMPLATE = "{header}\n{details}{context_sections}"
 
 
 @dataclass
@@ -632,14 +635,34 @@ class NegotiationAgent(BaseAgent):
         if not counter_options and decision.get("counter_price") is not None:
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
 
+        supplier_name = context.input_data.get("supplier_name")
+        supplier_identifier = context.input_data.get("supplier_id") or supplier
+        procurement_summary = self._retrieve_procurement_summary(
+            supplier_id=supplier_identifier,
+            supplier_name=supplier_name,
+        )
+        rag_snippets = self._collect_vector_snippets(
+            context=context,
+            supplier_name=supplier_name or supplier_identifier,
+            rfq_id=rfq_id,
+        )
+
         negotiation_message = self._build_summary(
+            context,
             rfq_id,
             decision,
             price,
             target_price,
             currency,
             round_no,
+            supplier=supplier,
+            supplier_snippets=supplier_snippets,
+            supplier_message=supplier_message,
             playbook_context=playbook_context,
+            signals=signals,
+            zopa=zopa,
+            procurement_summary=procurement_summary,
+            rag_snippets=rag_snippets,
         )
 
         if play_recommendations:
@@ -2047,6 +2070,7 @@ class NegotiationAgent(BaseAgent):
 
     def _build_summary(
         self,
+        context: AgentContext,
         rfq_id: Optional[str],
         decision: Dict[str, Any],
         price: Optional[float],
@@ -2054,7 +2078,14 @@ class NegotiationAgent(BaseAgent):
         currency: Optional[str],
         round_no: int,
         *,
+        supplier: Optional[str] = None,
+        supplier_snippets: Optional[List[str]] = None,
+        supplier_message: Optional[str] = None,
         playbook_context: Optional[Dict[str, Any]] = None,
+        signals: Optional[Dict[str, Any]] = None,
+        zopa: Optional[Dict[str, Any]] = None,
+        procurement_summary: Optional[Dict[str, Any]] = None,
+        rag_snippets: Optional[List[str]] = None,
     ) -> str:
         rfq_text = rfq_id or "RFQ"
         strategy = decision.get("strategy")
@@ -2143,7 +2174,432 @@ class NegotiationAgent(BaseAgent):
         if asks:
             lines.append("- Key asks: " + "; ".join(str(item) for item in asks if item))
 
-        return "\n".join(lines)
+        prompt_values = self._build_prompt_context(
+            context=context,
+            header=header,
+            lines=lines,
+            decision=decision,
+            price=price,
+            target_price=target_price,
+            currency=currency,
+            round_no=round_no,
+            supplier=supplier,
+            supplier_snippets=supplier_snippets or [],
+            supplier_message=supplier_message,
+            playbook_context=playbook_context,
+            signals=signals,
+            zopa=zopa,
+            procurement_summary=procurement_summary,
+            rag_snippets=rag_snippets,
+        )
+        template = self._get_prompt_template(context)
+        return self._apply_prompt_template(template, prompt_values, lines)
+
+    def _get_prompt_template(self, context: AgentContext) -> str:
+        template: Optional[str] = None
+        prompt_ids: List[int] = []
+
+        prompts_payload = context.input_data.get("prompts")
+        if isinstance(prompts_payload, list):
+            for prompt in prompts_payload:
+                if not isinstance(prompt, dict):
+                    continue
+                candidate = prompt.get("prompt_template") or prompt.get("template")
+                if candidate:
+                    template = str(candidate)
+                    break
+                pid = prompt.get("promptId") or prompt.get("prompt_id")
+                try:
+                    if pid is not None:
+                        prompt_ids.append(int(pid))
+                except (TypeError, ValueError):
+                    continue
+
+        if template:
+            return template
+
+        prompt_engine = getattr(self, "prompt_engine", None)
+        if prompt_engine is not None:
+            for pid in prompt_ids:
+                prompt_entry = prompt_engine.get_prompt(pid)
+                if prompt_entry and prompt_entry.get("template"):
+                    return str(prompt_entry["template"])
+
+            for prompt_entry in prompt_engine.prompts_for_agent(self.__class__.__name__):
+                candidate = prompt_entry.get("template")
+                if candidate:
+                    return str(candidate)
+
+        return DEFAULT_NEGOTIATION_MESSAGE_TEMPLATE
+
+    def _build_prompt_context(
+        self,
+        *,
+        context: AgentContext,
+        header: str,
+        lines: List[str],
+        decision: Dict[str, Any],
+        price: Optional[float],
+        target_price: Optional[float],
+        currency: Optional[str],
+        round_no: int,
+        supplier: Optional[str],
+        supplier_snippets: List[str],
+        supplier_message: Optional[str],
+        playbook_context: Optional[Dict[str, Any]],
+        signals: Optional[Dict[str, Any]],
+        zopa: Optional[Dict[str, Any]],
+        procurement_summary: Optional[Dict[str, Any]],
+        rag_snippets: Optional[List[str]],
+        rfq_reference: Optional[str] = None,
+    ) -> Dict[str, str]:
+        summary_lines = lines[1:]
+        details = "\n".join(summary_lines)
+        full_summary = "\n".join(lines)
+
+        supplier_name = context.input_data.get("supplier_name")
+        supplier_identifier = context.input_data.get("supplier_id") or supplier or ""
+
+        current_offer_raw = context.input_data.get("current_offer")
+        counter_price = decision.get("counter_price")
+
+        current_offer_formatted = (
+            self._format_currency(price, currency) if price is not None else ""
+        )
+        target_price_formatted = (
+            self._format_currency(target_price, currency) if target_price is not None else ""
+        )
+        counter_price_formatted = (
+            self._format_currency(counter_price, currency) if counter_price is not None else ""
+        )
+
+        supplier_snippet_text = "\n".join(
+            f"- {snippet}" for snippet in supplier_snippets if isinstance(snippet, str) and snippet
+        )
+
+        procurement_lines = ""
+        procurement_metrics = ""
+        procurement_count = ""
+        if procurement_summary:
+            lines_payload = procurement_summary.get("summary_lines") or []
+            if isinstance(lines_payload, list):
+                unique_lines: List[str] = []
+                for entry in lines_payload:
+                    text = str(entry).strip()
+                    if text and text not in unique_lines:
+                        unique_lines.append(text)
+                if unique_lines:
+                    procurement_lines = "\n".join(f"- {text}" for text in unique_lines[:5])
+            metrics_payload = procurement_summary.get("metrics")
+            if metrics_payload:
+                procurement_metrics = self._serialise_for_prompt(metrics_payload)
+            record_count = procurement_summary.get("record_count")
+            if record_count is not None:
+                procurement_count = str(record_count)
+
+        rag_text = ""
+        if rag_snippets:
+            rag_entries = [
+                str(snippet).strip()
+                for snippet in rag_snippets
+                if isinstance(snippet, str) and snippet.strip()
+            ]
+            if rag_entries:
+                rag_text = "\n".join(f"- {snippet}" for snippet in rag_entries)
+
+        policy_payload = context.input_data.get("policies") or context.policy_context
+        policy_text = self._serialise_for_prompt(policy_payload)
+        performance_text = self._serialise_for_prompt(
+            context.input_data.get("supplier_performance")
+        )
+        market_text = self._serialise_for_prompt(context.input_data.get("market_context"))
+
+        context_sections: List[str] = []
+        if procurement_lines:
+            context_sections.append("\n\nContext – Procurement summary:\n" + procurement_lines)
+        if procurement_metrics:
+            context_sections.append("\n\nProcurement metrics:\n" + procurement_metrics)
+        if rag_text:
+            context_sections.append("\n\nRetrieved knowledge snippets:\n" + rag_text)
+        if policy_text:
+            context_sections.append("\n\nPolicy guidance:\n" + policy_text)
+        if performance_text:
+            context_sections.append("\n\nSupplier performance:\n" + performance_text)
+        if market_text:
+            context_sections.append("\n\nMarket context:\n" + market_text)
+
+        decision_positions = self._serialise_for_prompt(decision.get("positions"))
+        decision_flags = self._serialise_for_prompt(decision.get("flags"))
+        decision_outliers = self._serialise_for_prompt(decision.get("outlier_alerts"))
+        decision_validation = self._serialise_for_prompt(decision.get("validation_issues"))
+
+        prompt_values: Dict[str, str] = {
+            "header": header,
+            "details": details,
+            "summary_lines": details,
+            "full_summary": full_summary,
+            "context_sections": "".join(context_sections),
+            "rfq_id": str(rfq_reference or ""),
+            "round_number": str(round_no),
+            "strategy": str(decision.get("strategy") or ""),
+            "supplier_id": str(supplier_identifier),
+            "supplier_name": str(supplier_name or supplier_identifier or ""),
+            "supplier_snippets": supplier_snippet_text,
+            "supplier_message": str(supplier_message or ""),
+            "current_offer": self._serialise_for_prompt(current_offer_raw),
+            "current_offer_formatted": current_offer_formatted,
+            "target_price": self._serialise_for_prompt(target_price),
+            "target_price_formatted": target_price_formatted,
+            "counter_price": self._serialise_for_prompt(counter_price),
+            "counter_price_formatted": counter_price_formatted,
+            "currency": str(currency or ""),
+            "asks": self._serialise_for_prompt(decision.get("asks")),
+            "lead_time_request": str(decision.get("lead_time_request") or ""),
+            "decision_rationale": str(decision.get("rationale") or ""),
+            "decision_plan_message": str(decision.get("plan_counter_message") or ""),
+            "decision_positions": decision_positions,
+            "decision_flags": decision_flags,
+            "decision_outliers": decision_outliers,
+            "decision_validation": decision_validation,
+            "signals_summary": self._serialise_for_prompt(signals),
+            "zopa_summary": self._serialise_for_prompt(zopa),
+            "playbook_context": self._serialise_for_prompt(playbook_context),
+            "policy_context": self._serialise_for_prompt(context.policy_context),
+            "policy_guidance": policy_text,
+            "supplier_performance": performance_text,
+            "market_context": market_text,
+            "task_profile": self._serialise_for_prompt(context.task_profile),
+            "knowledge_base": self._serialise_for_prompt(context.knowledge_base),
+            "workflow_id": str(context.workflow_id),
+            "agent_id": str(context.agent_id),
+            "agentic_plan": "\n".join(self.AGENTIC_PLAN_STEPS),
+            "procurement_summary_lines": procurement_lines,
+            "procurement_summary_metrics": procurement_metrics,
+            "procurement_summary_record_count": procurement_count,
+            "rag_snippets": rag_text,
+            "previous_email_subject": str(
+                context.input_data.get("previous_email_subject") or ""
+            ),
+            "thread_headers": self._serialise_for_prompt(
+                context.input_data.get("thread_headers")
+            ),
+            "supplier_replies": self._serialise_for_prompt(
+                context.input_data.get("supplier_replies")
+                or context.input_data.get("supplier_responses")
+            ),
+            "supplier_reply_count": str(
+                context.input_data.get("supplier_reply_count")
+                or context.input_data.get("supplier_responses_count")
+                or ""
+            ),
+            "positions": decision_positions,
+        }
+
+        return prompt_values
+
+    def _apply_prompt_template(
+        self, template: str, values: Dict[str, str], lines: List[str]
+    ) -> str:
+        safe_values: defaultdict[str, str] = defaultdict(str)
+        for key, value in values.items():
+            if value is None:
+                continue
+            safe_values[key] = value
+
+        rendered: str = ""
+        try:
+            rendered = template.format_map(safe_values).strip()
+        except Exception:
+            logger.debug("Negotiation prompt template formatting failed", exc_info=True)
+
+        if not rendered:
+            rendered = "\n".join(lines)
+
+        return rendered
+
+    def _serialise_for_prompt(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return ""
+
+    def _retrieve_procurement_summary(
+        self,
+        *,
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+    ) -> Dict[str, Any]:
+        engine = getattr(self.agent_nick, "query_engine", None)
+        if engine is None or not hasattr(engine, "fetch_procurement_flow"):
+            return {}
+
+        try:
+            df = engine.fetch_procurement_flow(
+                supplier_ids=[supplier_id] if supplier_id else None,
+                supplier_names=[supplier_name.lower()] if supplier_name else None,
+            )
+        except Exception:
+            logger.debug(
+                "NegotiationAgent: procurement flow retrieval failed", exc_info=True
+            )
+            return {}
+
+        if df is None:
+            return {}
+
+        records: List[Dict[str, Any]] = []
+        try:
+            records = df.to_dict(orient="records")  # type: ignore[attr-defined]
+        except Exception:
+            if isinstance(df, list):
+                records = [dict(row) for row in df if isinstance(row, dict)]
+
+        if not records:
+            return {}
+
+        summary_lines: List[str] = []
+        totals: List[float] = []
+        currency_hint: Optional[str] = None
+
+        for row in records[:10]:
+            if not isinstance(row, dict):
+                continue
+            currency_hint = (
+                row.get("currency")
+                or row.get("default_currency")
+                or row.get("invoice_currency")
+                or currency_hint
+            )
+            amount = (
+                row.get("total_amount")
+                or row.get("total")
+                or row.get("invoice_total_incl_tax")
+                or row.get("order_total")
+            )
+            amount_value = self._coerce_float(amount)
+            po_id = (
+                row.get("po_id")
+                or row.get("purchase_order_number")
+                or row.get("purchase_order_id")
+            )
+            invoice_id = row.get("invoice_id") or row.get("invoice_number")
+            order_date = (
+                row.get("order_date")
+                or row.get("requested_date")
+                or row.get("invoice_date")
+            )
+            if amount_value is not None:
+                totals.append(float(amount_value))
+            reference = po_id or invoice_id
+            if reference and amount_value is not None:
+                amount_text = self._format_currency(amount_value, currency_hint)
+                if order_date:
+                    summary_lines.append(f"{reference} – {amount_text} on {order_date}")
+                else:
+                    summary_lines.append(f"{reference} – {amount_text}")
+
+        metrics: Dict[str, Any] = {}
+        if totals:
+            total_spend = sum(totals)
+            average_value = total_spend / len(totals)
+            metrics["total_spend"] = total_spend
+            metrics["average_transaction_value"] = average_value
+            metrics["total_spend_formatted"] = self._format_currency(
+                total_spend, currency_hint
+            )
+            metrics["average_transaction_value_formatted"] = self._format_currency(
+                average_value, currency_hint
+            )
+
+        unique_lines: List[str] = []
+        for entry in summary_lines:
+            if entry and entry not in unique_lines:
+                unique_lines.append(entry)
+
+        return {
+            "summary_lines": unique_lines[:5],
+            "metrics": metrics,
+            "record_count": len(records),
+        }
+
+    def _collect_vector_snippets(
+        self,
+        *,
+        context: AgentContext,
+        supplier_name: Optional[str],
+        rfq_id: Optional[str],
+    ) -> List[str]:
+        query_tokens: List[str] = []
+        if supplier_name:
+            query_tokens.append(str(supplier_name))
+        category = (
+            context.input_data.get("product_category")
+            or context.input_data.get("category")
+            or context.input_data.get("product_type")
+        )
+        if isinstance(category, str) and category.strip():
+            query_tokens.append(category.strip())
+        description = context.input_data.get("rfq_description") or context.input_data.get(
+            "item_description"
+        )
+        if isinstance(description, str) and description.strip():
+            query_tokens.append(description.strip())
+        if rfq_id:
+            query_tokens.append(str(rfq_id))
+
+        query = " ".join(query_tokens[:3]).strip()
+        if not query:
+            return []
+
+        results = self.vector_search(query, top_k=3)
+        snippets: List[str] = []
+        for result in results or []:
+            payload = getattr(result, "payload", None)
+            if isinstance(payload, dict):
+                snippet = (
+                    payload.get("text")
+                    or payload.get("content")
+                    or payload.get("summary")
+                    or payload.get("body")
+                )
+                if snippet:
+                    text = str(snippet).strip()
+                    if text:
+                        snippets.append(text)
+                continue
+
+            if isinstance(result, dict):
+                payload_data = result.get("payload")
+                if isinstance(payload_data, dict):
+                    snippet = (
+                        payload_data.get("text")
+                        or payload_data.get("content")
+                        or payload_data.get("summary")
+                    )
+                    if snippet:
+                        text = str(snippet).strip()
+                        if text:
+                            snippets.append(text)
+                            continue
+                snippet = (
+                    result.get("text")
+                    or result.get("content")
+                    or result.get("summary")
+                    or result.get("body")
+                )
+                if snippet:
+                    text = str(snippet).strip()
+                    if text:
+                        snippets.append(text)
+
+        return snippets
 
     def _build_supplier_watch_fields(
         self,
