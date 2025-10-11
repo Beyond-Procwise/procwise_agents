@@ -126,14 +126,17 @@ def stub_thread_mapping(monkeypatch):
     def fake_lookup(conn, table_name, keys, logger=None):
         for key in keys:
             if key in mapping:
-                return mapping[key]
+                value = mapping[key]
+                if isinstance(value, tuple):
+                    return value
+                return value, None
         return None
 
     def fake_ensure_table(conn, table_name, logger=None):
         return None
 
     monkeypatch.setattr(ingest, "_get_db_connection", fake_get_db_connection)
-    monkeypatch.setattr(ingest, "lookup_rfq_from_threads", fake_lookup)
+    monkeypatch.setattr(ingest, "lookup_thread_metadata", fake_lookup)
     monkeypatch.setattr(ingest, "ensure_thread_table", fake_ensure_table)
     ingest._THREAD_TABLE_READY = True
 

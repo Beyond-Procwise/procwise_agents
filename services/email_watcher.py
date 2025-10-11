@@ -47,13 +47,14 @@ from services.email_dispatch_chain_store import (
 from services.email_dispatch_service import find_recent_sent_for_supplier
 from services.email_thread_store import (
     ensure_thread_table,
-    lookup_rfq_from_threads,
+    lookup_thread_metadata,
     sanitise_thread_table_name,
 )
 from utils.email_markers import (
     extract_marker_token,
     extract_rfq_id,
     extract_run_id,
+    extract_supplier_id,
     split_hidden_marker,
 )
 from utils.gpu import configure_gpu
@@ -2061,6 +2062,16 @@ class SESEmailWatcher:
         comment, remainder = split_hidden_marker(body)
         analysis_body = remainder or body
 
+        hidden_supplier = extract_supplier_id(comment)
+        if hidden_supplier not in (None, ""):
+            try:
+                supplier_value = str(hidden_supplier).strip()
+            except Exception:
+                supplier_value = str(hidden_supplier)
+            if supplier_value:
+                processed["supplier_id"] = supplier_value
+                message.setdefault("supplier_id", supplier_value)
+
         rfq_candidate: Optional[str] = None
         matched_via: Optional[str] = None
         hidden_marker = False
@@ -2137,13 +2148,13 @@ class SESEmailWatcher:
         if thread_identifiers:
             message.setdefault("_match_thread_ids", thread_identifiers)
 
-        rfq_from_threads: Optional[str] = None
+        thread_match: Optional[Tuple[str, Optional[str]]] = None
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         if thread_identifiers and callable(get_conn) and self._thread_table_name:
             try:
                 with get_conn() as conn:
                     if self._ensure_thread_table_ready(conn):
-                        rfq_from_threads = lookup_rfq_from_threads(
+                        thread_match = lookup_thread_metadata(
                             conn,
                             self._thread_table_name,
                             thread_identifiers,
@@ -2154,11 +2165,15 @@ class SESEmailWatcher:
                     "Failed to resolve RFQ from thread headers for mailbox %s",
                     self.mailbox_address,
                 )
-                rfq_from_threads = None
-        if rfq_from_threads:
+                thread_match = None
+        if thread_match:
+            rfq_from_threads, supplier_from_thread = thread_match
             canonical = self._canonical_rfq(rfq_from_threads) or _canon_id(rfq_from_threads)
             if canonical:
-                supplier_hint = message.get("supplier_id")
+                supplier_hint = (
+                    message.get("supplier_id")
+                    or supplier_from_thread
+                )
                 supplier_value = (
                     str(supplier_hint).strip()
                     if supplier_hint not in (None, "")
@@ -2333,6 +2348,15 @@ class SESEmailWatcher:
         subject_normalised = _norm(subject)
         body_normalised = _norm(analysis_body)
         from_address = str(message.get("from", ""))
+
+        hidden_supplier = extract_supplier_id(comment)
+        if hidden_supplier not in (None, "") and not message.get("supplier_id"):
+            try:
+                supplier_value = str(hidden_supplier).strip()
+            except Exception:
+                supplier_value = str(hidden_supplier)
+            if supplier_value:
+                message["supplier_id"] = supplier_value
 
         match_hint = self.match_inbound_email(message)
 
@@ -6393,7 +6417,7 @@ class SESEmailWatcher:
             with get_conn() as conn:
                 if not self._ensure_thread_table_ready(conn):
                     return None
-                rfq_id = lookup_rfq_from_threads(
+                thread_info = lookup_thread_metadata(
                     conn,
                     self._thread_table_name,
                     identifiers,
@@ -6405,10 +6429,15 @@ class SESEmailWatcher:
             )
             return None
 
+        if not thread_info:
+            return None
+
+        rfq_id, supplier_id = thread_info
         if not rfq_id:
             return None
 
-        return str(rfq_id), None
+        supplier_value = str(supplier_id).strip() if supplier_id not in (None, "") else None
+        return str(rfq_id), supplier_value
 
     def _collect_thread_identifiers(self, message: Dict[str, object]) -> List[str]:
         raw_values: List[str] = []

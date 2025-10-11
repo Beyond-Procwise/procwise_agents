@@ -140,14 +140,14 @@ def record_thread_mapping(
         raise
 
 
-def lookup_rfq_from_threads(
+def lookup_thread_metadata(
     connection,
     table_name: str,
     message_ids: Sequence[str],
     *,
     logger: Optional[logging.Logger] = None,
-) -> Optional[str]:
-    """Return the first RFQ identifier associated with ``message_ids``."""
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Return the RFQ and supplier identifiers associated with ``message_ids``."""
 
     if sql is None:  # pragma: no cover - defensive fallback
         if logger:
@@ -162,19 +162,53 @@ def lookup_rfq_from_threads(
     try:
         with connection.cursor() as cur:
             cur.execute(
-                sql.SQL("SELECT rfq_id FROM {table} WHERE message_id = ANY(%s) LIMIT 1").format(
-                    table=table_sql
-                ),
+                sql.SQL(
+                    "SELECT rfq_id, supplier_id FROM {table} "
+                    "WHERE message_id = ANY(%s) ORDER BY updated_at DESC LIMIT 1"
+                ).format(table=table_sql),
                 (candidates,),
             )
             row = cur.fetchone()
     except Exception:  # pragma: no cover - best effort logging
         if logger:
-            logger.exception("Failed to lookup RFQ from thread map for %s", candidates)
+            logger.exception(
+                "Failed to lookup thread metadata for %s", candidates
+            )
         return None
 
-    if row:
-        rfq_id = row[0]
-        if isinstance(rfq_id, str):
-            return rfq_id.upper()
+    if not row:
+        return None
+
+    rfq_id = row[0]
+    supplier_id = row[1] if len(row) > 1 else None
+    if not isinstance(rfq_id, str) or not rfq_id.strip():
+        return None
+
+    canonical_rfq = rfq_id.upper()
+    supplier_value: Optional[str]
+    if supplier_id in (None, ""):
+        supplier_value = None
+    else:
+        try:
+            supplier_value = str(supplier_id).strip() or None
+        except Exception:
+            supplier_value = str(supplier_id)
+
+    return canonical_rfq, supplier_value
+
+
+def lookup_rfq_from_threads(
+    connection,
+    table_name: str,
+    message_ids: Sequence[str],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[str]:
+    """Return the first RFQ identifier associated with ``message_ids``."""
+
+    metadata = lookup_thread_metadata(
+        connection, table_name, message_ids, logger=logger
+    )
+    if metadata:
+        return metadata[0]
     return None
