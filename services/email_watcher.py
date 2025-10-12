@@ -4719,10 +4719,45 @@ class SESEmailWatcher:
         seen: Set[str] = set()
         visited: Set[int] = set()
 
+        def _run_identifier(entry: Dict[str, object]) -> Optional[str]:
+            visited_nodes: Set[int] = set()
+
+            def _walk(obj: Optional[Dict[str, object]]) -> Optional[str]:
+                if not isinstance(obj, dict):
+                    return None
+                obj_id = id(obj)
+                if obj_id in visited_nodes:
+                    return None
+                visited_nodes.add(obj_id)
+
+                for key in ("dispatch_run_id", "run_id", "dispatch_token"):
+                    candidate = self._coerce_identifier(obj.get(key))
+                    if candidate:
+                        try:
+                            return candidate.strip().lower() or None
+                        except Exception:
+                            return None
+
+                metadata = obj.get("metadata")
+                if isinstance(metadata, dict):
+                    resolved = _walk(metadata)
+                    if resolved:
+                        return resolved
+
+                for nested_key in ("draft", "dispatch"):
+                    nested = obj.get(nested_key)
+                    if isinstance(nested, dict):
+                        resolved = _walk(nested)
+                        if resolved:
+                            return resolved
+
+                return None
+
+            return _walk(entry)
+
         def _key(entry: Dict[str, object]) -> Optional[str]:
+            run_identifier = _run_identifier(entry)
             identifier = entry.get("draft_record_id") or entry.get("id")
-            if identifier not in (None, ""):
-                return f"id:{identifier}"
 
             recipients = entry.get("recipients")
             recipient_key: str = ""
@@ -4748,12 +4783,28 @@ class SESEmailWatcher:
                     if recipient_key:
                         has_recipients = True
 
-            if not has_recipients:
-                return None
-
             supplier = self._coerce_identifier(entry.get("supplier_id")) or ""
             rfq = self._coerce_identifier(entry.get("rfq_id")) or ""
-            return f"meta:{supplier}|{rfq}|{recipient_key}"
+
+            key_parts: List[str] = []
+            if run_identifier:
+                key_parts.append(f"run:{run_identifier}")
+            if identifier not in (None, ""):
+                key_parts.append(f"id:{identifier}")
+            if supplier:
+                key_parts.append(f"supplier:{supplier.lower()}")
+            if rfq:
+                key_parts.append(f"rfq:{rfq.lower()}")
+            if has_recipients:
+                key_parts.append(f"rcpt:{recipient_key}")
+
+            if not key_parts and has_recipients:
+                key_parts.append(f"rcpt:{recipient_key}")
+
+            if key_parts:
+                return "|".join(key_parts)
+
+            return None
 
         def _add(entry: Optional[Dict[str, object]]) -> None:
             if not isinstance(entry, dict):
@@ -4761,6 +4812,28 @@ class SESEmailWatcher:
             if id(entry) in visited:
                 return
             visited.add(id(entry))
+
+            def _has_signal(value: object) -> bool:
+                if value in (None, "", False, 0):
+                    return False
+                if isinstance(value, (list, tuple, set, dict)):
+                    return bool(value)
+                return True
+
+            if not any(
+                _has_signal(entry.get(key))
+                for key in (
+                    "recipients",
+                    "supplier_id",
+                    "rfq_id",
+                    "draft_record_id",
+                    "id",
+                    "message_id",
+                    "dispatch_message_id",
+                )
+            ):
+                return
+
             if self._should_skip_dispatch_entry(entry):
                 return
             key = _key(entry)
