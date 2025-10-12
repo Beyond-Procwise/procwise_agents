@@ -122,7 +122,9 @@ ON CONFLICT(workflow_id, unique_id) DO UPDATE SET
   subject=excluded.subject,
   body_text=excluded.body_text,
   headers_json=excluded.headers_json,
-  received_at=excluded.received_at
+  received_at=excluded.received_at,
+  processed_status='pending',
+  processed_at=NULL
 """
             cur = conn.cursor()
             cur.execute(q, (
@@ -147,7 +149,9 @@ ON CONFLICT (workflow_id, unique_id) DO UPDATE SET
   subject=EXCLUDED.subject,
   body_text=EXCLUDED.body_text,
   headers_json=EXCLUDED.headers_json,
-  received_at=EXCLUDED.received_at
+  received_at=EXCLUDED.received_at,
+  processed_status='pending',
+  processed_at=NULL
 """
             cur = conn.cursor()
             cur.execute(q, (
