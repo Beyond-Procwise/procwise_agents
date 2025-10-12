@@ -272,6 +272,11 @@ def test_extract_dispatch_entries_respects_unique_run_ids():
 
     assert expectation is not None
     assert expectation.draft_count == 3
+    assert set(expectation.run_identifiers) == {
+        "run-001",
+        "run-002",
+        "run-003",
+    }
 
 
 def test_extract_dispatch_entries_handles_shared_run_id_with_distinct_suppliers():
@@ -315,6 +320,153 @@ def test_extract_dispatch_entries_handles_shared_run_id_with_distinct_suppliers(
 
     assert expectation is not None
     assert expectation.draft_count == 3
+    assert set(expectation.run_identifiers) == {"run-shared"}
+
+
+def test_build_dispatch_expectation_deduplicates_nested_entries():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    entries = [
+        {
+            "dispatch_run_id": "RUN-001",
+            "draft_record_id": 101,
+            "recipients": ["alpha@example.com"],
+            "supplier_id": "SUP-ALPHA",
+        },
+        {
+            "dispatch": {
+                "dispatch_run_id": "run-001",
+                "draft_record_id": 101,
+                "recipients": ["alpha@example.com"],
+                "supplier_id": "SUP-ALPHA",
+            }
+        },
+        {
+            "metadata": {
+                "run_id": "RUN-002",
+                "rfq_id": "RFQ-20240101-AAAA1111",
+            },
+            "recipients": ["beta@example.com"],
+            "supplier_id": "SUP-BETA",
+            "draft_record_id": 202,
+        },
+        {
+            "dispatch": {
+                "metadata": {
+                    "run_id": "run-002",
+                    "rfq_id": "RFQ-20240101-AAAA1111",
+                },
+                "recipients": ["beta@example.com"],
+                "supplier_id": "SUP-BETA",
+                "draft_record_id": 202,
+            }
+        },
+        {
+            "run_id": "RUN-003",
+            "message_id": "<msg-003@example.com>",
+            "supplier_id": "SUP-GAMMA",
+            "recipients": ["gamma@example.com"],
+        },
+        {
+            "dispatch_message_id": "<msg-003@example.com>",
+            "supplier_id": "SUP-GAMMA",
+            "recipients": ["gamma@example.com"],
+        },
+    ]
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-dedupe", "workflow-dedupe", entries
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 3
+    assert set(expectation.run_identifiers) == {
+        "run-001",
+        "run-002",
+        "run-003",
+    }
+
+
+def test_dispatch_expectation_records_run_workflow_mapping():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    entries = [
+        {"metadata": {"run_id": "RUN-Alpha"}},
+        {"dispatch": {"dispatch_run_id": "run-beta"}},
+    ]
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-map", "WF-Group", entries
+    )
+
+    assert expectation is not None
+    assert set(expectation.run_identifiers) == {"run-alpha", "run-beta"}
+
+    mapped = watcher._normalise_filter_value("WF-Group")
+    assert mapped is not None
+    for run in expectation.run_identifiers:
+        key = watcher._normalise_group_key(run, None)
+        assert key == f"wf::{mapped}"
+
+
+def test_acknowledge_recent_dispatch_records_workflow(monkeypatch):
+    nick = DummyNick()
+    state = InMemoryEmailWatcherState()
+    watcher = _make_watcher(nick, state_store=state)
+    watcher.bucket = None
+    watcher._prefixes = []
+
+    expectation = watcher._DispatchExpectation(
+        action_id="action-dispatch",
+        workflow_id="WF-Dispatch",
+        draft_ids=(),
+        draft_count=1,
+        supplier_count=1,
+        run_identifiers=("run-d1",),
+    )
+
+    draft = watcher._DraftSnapshot(
+        id=42,
+        rfq_id="RFQ-20240101-AAAA1111",
+        subject="RFQ message",
+        body="Please quote",
+        dispatch_token="run-d1",
+        run_id="run-d1",
+        recipients=("supplier@example.com",),
+        supplier_id="SUP-1",
+        workflow_id=None,
+    )
+
+    monkeypatch.setattr(
+        watcher,
+        "_fetch_recent_dispatched_drafts",
+        lambda exp, expected: [draft],
+    )
+    monkeypatch.setattr(watcher, "_imap_configured", lambda: True)
+    monkeypatch.setattr(
+        watcher,
+        "_load_from_imap",
+        lambda expected_count, mark_seen=False, since=None: [{"id": "msg-d1", "body": "Thanks"}],
+    )
+
+    def fake_match(message, unmatched):
+        return unmatched[0] if unmatched else None
+
+    monkeypatch.setattr(watcher, "_match_dispatched_message", fake_match)
+
+    watcher._acknowledge_recent_dispatch(expectation, completed=True)
+
+    metadata = state.get("msg-d1")
+    assert metadata is not None
+    assert metadata.get("workflow_id") == "WF-Dispatch"
+    assert metadata.get("dispatch_run_id") == "run-d1"
+
+    run_key = watcher._normalise_filter_value("run-d1")
+    wf_key = watcher._normalise_filter_value("WF-Dispatch")
+    assert run_key is not None and wf_key is not None
+    assert watcher._workflow_run_index.get(run_key) == wf_key
 
 
 def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
