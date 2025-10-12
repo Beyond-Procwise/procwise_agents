@@ -277,12 +277,14 @@ class DatabaseBackend:
                     raw_headers, mailbox, received_at, dispatch_run_id
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (message_hash) DO UPDATE SET
+                ON CONFLICT (rfq_id, supplier_id) DO UPDATE SET
                     workflow_id = EXCLUDED.workflow_id,
                     action_id = EXCLUDED.action_id,
                     run_id = EXCLUDED.run_id,
                     rfq_id = EXCLUDED.rfq_id,
                     supplier_id = COALESCE(EXCLUDED.supplier_id, {TABLE_NAME}.supplier_id),
+                    message_id = EXCLUDED.message_id,
+                    message_hash = EXCLUDED.message_hash,
                     from_address = EXCLUDED.from_address,
                     subject = EXCLUDED.subject,
                     body = EXCLUDED.body,
@@ -300,12 +302,14 @@ class DatabaseBackend:
                     raw_headers, mailbox, received_at, dispatch_run_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_hash) DO UPDATE SET
+                ON CONFLICT(rfq_id, supplier_id) DO UPDATE SET
                     workflow_id = excluded.workflow_id,
                     action_id = excluded.action_id,
                     run_id = excluded.run_id,
                     rfq_id = excluded.rfq_id,
                     supplier_id = COALESCE(excluded.supplier_id, supplier_id),
+                    message_id = excluded.message_id,
+                    message_hash = excluded.message_hash,
                     from_address = excluded.from_address,
                     subject = excluded.subject,
                     body = excluded.body,
