@@ -56,7 +56,13 @@ import sqlite3
 from agents.base_agent import AgentContext
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
-from utils.email_markers import extract_rfq_id, extract_run_id, extract_supplier_id, split_hidden_marker
+from utils.email_markers import (
+    extract_marker_token,
+    extract_rfq_id,
+    extract_run_id,
+    extract_supplier_id,
+    split_hidden_marker,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +91,92 @@ class SupplierResponseRecord:
 
     def normalised_rfq(self) -> str:
         return (self.rfq_id or "").strip().upper()
+
+
+@dataclasses.dataclass(frozen=True)
+class DispatchRecord:
+    """Representation of a dispatched email awaiting a supplier reply."""
+
+    rfq_id: Optional[str]
+    supplier_id: Optional[str]
+    workflow_id: Optional[str]
+    action_id: Optional[str]
+    token: Optional[str]
+    message_id: Optional[str]
+    mailbox: Optional[str]
+
+    def normalised_token(self) -> Optional[str]:
+        token = _normalise_identifier(self.token)
+        if token:
+            return token.lower()
+        return None
+
+    def normalised_supplier(self) -> Optional[str]:
+        supplier = _normalise_identifier(self.supplier_id)
+        if supplier:
+            return supplier.lower()
+        return None
+
+
+@dataclasses.dataclass
+class DispatchContext:
+    """Container providing lookup indexes for dispatched emails."""
+
+    records: List[DispatchRecord]
+    by_token: Dict[str, DispatchRecord]
+    by_message_id: Dict[str, DispatchRecord]
+    by_supplier: Dict[str, List[DispatchRecord]]
+
+    @classmethod
+    def build(cls, records: Sequence[DispatchRecord]) -> "DispatchContext":
+        token_index: Dict[str, DispatchRecord] = {}
+        message_index: Dict[str, DispatchRecord] = {}
+        supplier_index: Dict[str, List[DispatchRecord]] = {}
+        for record in records:
+            token_norm = record.normalised_token()
+            if token_norm and token_norm not in token_index:
+                token_index[token_norm] = record
+            message_id = _normalise_identifier(record.message_id)
+            if message_id:
+                lowered = message_id.lower()
+                if lowered not in message_index:
+                    message_index[lowered] = record
+                if message_id.startswith("<") and message_id.endswith(">"):
+                    inner = message_id[1:-1].strip().lower()
+                    if inner and inner not in message_index:
+                        message_index[inner] = record
+            supplier_norm = record.normalised_supplier()
+            if supplier_norm:
+                supplier_index.setdefault(supplier_norm, []).append(record)
+        return cls(list(records), token_index, message_index, supplier_index)
+
+    def match_token(self, token: Optional[str]) -> Optional[DispatchRecord]:
+        if not token:
+            return None
+        return self.by_token.get(token.strip().lower())
+
+    def match_message(self, identifiers: Sequence[str]) -> Optional[DispatchRecord]:
+        for identifier in identifiers:
+            lowered = identifier.strip().lower()
+            if not lowered:
+                continue
+            match = self.by_message_id.get(lowered)
+            if match:
+                return match
+        return None
+
+    def match_supplier(self, supplier_id: Optional[str]) -> Optional[DispatchRecord]:
+        if not supplier_id:
+            return None
+        supplier_norm = supplier_id.strip().lower()
+        if not supplier_norm:
+            return None
+        matches = self.by_supplier.get(supplier_norm)
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
 
 class DatabaseBackend:
@@ -376,12 +468,12 @@ class DatabaseBackend:
                     f"""
                     SELECT id, workflow_id, action_id, run_id, rfq_id, supplier_id,
                            message_id, subject, body, from_address, received_at,
-                           mailbox
+                           mailbox, dispatch_run_id
                     FROM {TABLE_NAME}
                     WHERE (%s IS NULL OR workflow_id = %s)
-                      AND (%s IS NULL OR run_id = %s)
+                      AND (%s IS NULL OR dispatch_run_id = %s)
                       AND (processed_at IS NULL OR processed_at < received_at)
-                    ORDER BY rfq_id, received_at DESC, id DESC
+                    ORDER BY received_at DESC, id DESC
                     """,
                     (workflow_id, workflow_id, run_id, run_id),
                 )
@@ -390,12 +482,12 @@ class DatabaseBackend:
                     f"""
                     SELECT id, workflow_id, action_id, run_id, rfq_id, supplier_id,
                            message_id, subject, body, from_address, received_at,
-                           mailbox
+                           mailbox, dispatch_run_id
                     FROM "{TABLE_NAME}"
                     WHERE (? IS NULL OR workflow_id = ?)
-                      AND (? IS NULL OR run_id = ?)
+                      AND (? IS NULL OR dispatch_run_id = ?)
                       AND (processed_at IS NULL OR processed_at < received_at)
-                    ORDER BY rfq_id, received_at DESC, id DESC
+                    ORDER BY received_at DESC, id DESC
                     """,
                     (workflow_id, workflow_id, run_id, run_id),
                 )
@@ -403,7 +495,7 @@ class DatabaseBackend:
         finally:
             cursor.close()
 
-        latest: Dict[str, Dict[str, object]] = {}
+        latest: Dict[Tuple[str, str, str], Dict[str, object]] = {}
         for row in rows:
             if isinstance(row, sqlite3.Row):
                 record = dict(row)
@@ -420,81 +512,141 @@ class DatabaseBackend:
                     "subject": row[7],
                     "body": row[8],
                     "from_address": row[9],
-                    "received_at": row[10],
+                    "received_at_raw": row[10],
                     "mailbox": row[11],
+                    "dispatch_run_id": row[12],
                 }
                 received_at_value = row[10]
 
-            rfq_key = (record.get("rfq_id") or "").upper()
-            if not rfq_key or rfq_key not in latest:
-                record["received_at"] = _coerce_datetime(received_at_value)
-                latest[rfq_key] = record
+            token_value = record.get("dispatch_run_id") or record.get("run_id")
+            supplier_value = record.get("supplier_id") or ""
+            rfq_value = record.get("rfq_id") or ""
+            key = (
+                (str(token_value).strip().lower() if token_value else ""),
+                str(supplier_value).strip().lower(),
+                str(rfq_value).strip().upper(),
+            )
+            if key in latest:
+                continue
+            record["received_at"] = _coerce_datetime(received_at_value)
+            if token_value:
+                record["run_id"] = str(token_value)
+            latest[key] = record
         return list(latest.values())
 
-    def fetch_dispatch_lookup(
+    def mark_dispatch_by_token(
+        self,
+        *,
+        token: Optional[str],
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not token:
+            return
+        assert self._conn is not None
+        payload = json.dumps(metadata) if metadata else None
+        token_norm = token.strip()
+        if not token_norm:
+            return
+        if self.dialect == "postgres":
+            query = f"""
+                UPDATE {DISPATCH_TABLE}
+                SET awaiting_response = FALSE,
+                    responded_at = NOW(),
+                    response_metadata = COALESCE(%s, response_metadata),
+                    updated_at = NOW()
+                WHERE dispatch_metadata ->> 'run_id' = %s
+                  AND awaiting_response = TRUE
+            """
+            params = (payload, token_norm)
+        else:
+            query = f"""
+                UPDATE "{DISPATCH_TABLE}"
+                SET awaiting_response = 0,
+                    responded_at = CURRENT_TIMESTAMP,
+                    response_metadata = COALESCE(?, response_metadata),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE json_extract(dispatch_metadata, '$.run_id') = ?
+                  AND awaiting_response = 1
+            """
+            params = (payload, token_norm)
+        with self._conn:  # type: ignore[arg-type]
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(query, params)
+            finally:
+                cursor.close()
+
+    def fetch_dispatch_context(
         self,
         *,
         workflow_id: Optional[str],
         action_id: Optional[str],
         run_id: Optional[str],
-    ) -> Dict[str, Dict[str, Optional[str]]]:
+    ) -> Tuple[List[DispatchRecord], Optional[datetime]]:
         assert self._conn is not None
         cursor = self._conn.cursor()
         try:
-            if self.dialect == "postgres":
-                cursor.execute(
-                    f"""
-                    SELECT message_id, rfq_id, workflow_ref, dispatch_metadata
-                    FROM {DISPATCH_TABLE}
-                    WHERE (%s IS NULL OR dispatch_metadata ->> 'run_id' = %s)
-                      AND (%s IS NULL OR dispatch_metadata ->> 'workflow_id' = %s)
-                      AND (%s IS NULL OR workflow_ref = %s OR dispatch_metadata ->> 'action_id' = %s)
-                """,
-                    (
-                        run_id,
-                        run_id,
-                        workflow_id,
-                        workflow_id,
-                        action_id,
-                        action_id,
-                        action_id,
-                    ),
-                )
-            else:
-                cursor.execute(
-                    f"""
-                    SELECT message_id, rfq_id, workflow_ref, dispatch_metadata
-                    FROM "{DISPATCH_TABLE}"
-                    WHERE (? IS NULL OR json_extract(dispatch_metadata, '$.run_id') = ?)
-                      AND (? IS NULL OR json_extract(dispatch_metadata, '$.workflow_id') = ?)
-                      AND (? IS NULL OR workflow_ref = ? OR json_extract(dispatch_metadata, '$.action_id') = ?)
-                """,
-                    (
-                        run_id,
-                        run_id,
-                        workflow_id,
-                        workflow_id,
-                        action_id,
-                        action_id,
-                        action_id,
-                    ),
-                )
-            rows = cursor.fetchall()
-        except Exception as exc:
-            message = str(exc).lower()
-            if "does not exist" in message or "no such table" in message:
-                return {}
-            raise
+            try:
+                if self.dialect == "postgres":
+                    cursor.execute(
+                        f"""
+                        SELECT message_id, rfq_id, workflow_ref, dispatch_metadata,
+                               created_at, awaiting_response
+                        FROM {DISPATCH_TABLE}
+                        WHERE (%s IS NULL OR dispatch_metadata ->> 'workflow_id' = %s)
+                          AND (%s IS NULL OR workflow_ref = %s OR dispatch_metadata ->> 'action_id' = %s)
+                          AND (%s IS NULL OR dispatch_metadata ->> 'run_id' = %s)
+                        """,
+                        (
+                            workflow_id,
+                            workflow_id,
+                            action_id,
+                            action_id,
+                            action_id,
+                            run_id,
+                            run_id,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT message_id, rfq_id, workflow_ref, dispatch_metadata,
+                               created_at, awaiting_response
+                        FROM "{DISPATCH_TABLE}"
+                        WHERE (? IS NULL OR json_extract(dispatch_metadata, '$.workflow_id') = ?)
+                          AND (? IS NULL OR workflow_ref = ? OR json_extract(dispatch_metadata, '$.action_id') = ?)
+                          AND (? IS NULL OR json_extract(dispatch_metadata, '$.run_id') = ?)
+                        """,
+                        (
+                            workflow_id,
+                            workflow_id,
+                            action_id,
+                            action_id,
+                            action_id,
+                            run_id,
+                            run_id,
+                        ),
+                    )
+                rows = cursor.fetchall()
+            except Exception as exc:
+                message = str(exc).lower()
+                if "does not exist" in message or "no such table" in message:
+                    return [], None
+                raise
         finally:
             cursor.close()
 
-        lookup: Dict[str, Dict[str, Optional[str]]] = {}
+        records: List[DispatchRecord] = []
+        last_dispatch: Optional[datetime] = None
         for row in rows:
             message_id = row[0]
-            rfq = row[1]
-            if not message_id or not rfq:
-                continue
+            rfq_id = row[1]
+            workflow_ref = row[2]
             metadata_raw = row[3]
+            created_at = row[4]
+            awaiting = row[5]
+            if awaiting in (False, 0):
+                continue
             metadata: Dict[str, Optional[str]] = {}
             if isinstance(metadata_raw, dict):
                 metadata = {key: metadata_raw.get(key) for key in metadata_raw}
@@ -506,81 +658,24 @@ class DatabaseBackend:
                 except Exception:  # pragma: no cover - tolerate malformed JSON
                     metadata = {}
 
-            key = str(message_id).strip()
-            if key.startswith("<") and key.endswith(">"):
-                key = key[1:-1].strip()
-            if not key:
-                continue
+            token = metadata.get("run_id") or metadata.get("dispatch_token")
+            supplier = metadata.get("supplier_id") or metadata.get("SUPPLIER_ID")
+            workflow_meta = metadata.get("workflow_id") or metadata.get("WORKFLOW_ID")
+            action_meta = metadata.get("action_id") or metadata.get("ACTION_ID")
+            mailbox_meta = metadata.get("mailbox") or metadata.get("MAILBOX")
 
-            lookup[key.lower()] = {
-                "rfq_id": str(rfq).strip() if rfq else None,
-                "workflow_id": _normalise_identifier(
-                    metadata.get("workflow_id") or metadata.get("WORKFLOW_ID")
-                ),
-                "action_id": _normalise_identifier(
-                    metadata.get("action_id") or metadata.get("ACTION_ID") or row[2]
-                ),
-                "run_id": _normalise_identifier(
-                    metadata.get("run_id") or metadata.get("RUN_ID")
-                ),
-                "supplier_id": _normalise_identifier(
-                    metadata.get("supplier_id") or metadata.get("SUPPLIER_ID")
-                ),
-            }
-        return lookup
+            record = DispatchRecord(
+                rfq_id=_normalise_identifier(rfq_id),
+                supplier_id=_normalise_identifier(supplier) or None,
+                workflow_id=_normalise_identifier(workflow_meta) or _normalise_identifier(workflow_id),
+                action_id=_normalise_identifier(action_meta) or _normalise_identifier(workflow_ref),
+                token=_normalise_identifier(token),
+                message_id=_normalise_identifier(message_id),
+                mailbox=_normalise_identifier(mailbox_meta),
+            )
+            records.append(record)
 
-    def fetch_dispatched_rfqs(
-        self,
-        *,
-        workflow_id: Optional[str],
-        action_id: Optional[str],
-        run_id: Optional[str],
-    ) -> Tuple[Sequence[str], Optional[datetime]]:
-        assert self._conn is not None
-        cursor = self._conn.cursor()
-        try:
-            try:
-                if self.dialect == "postgres":
-                    cursor.execute(
-                        f"""
-                        SELECT rfq_id, MAX(created_at)
-                        FROM {DISPATCH_TABLE}
-                        WHERE (%s IS NULL OR workflow_ref = %s)
-                          AND (%s IS NULL OR dispatch_metadata ->> 'run_id' = %s)
-                          AND (%s IS NULL OR dispatch_metadata ->> 'workflow_id' = %s)
-                        GROUP BY rfq_id
-                        """,
-                        (action_id, action_id, run_id, run_id, workflow_id, workflow_id),
-                    )
-                else:
-                    cursor.execute(
-                        f"""
-                        SELECT rfq_id, MAX(created_at)
-                        FROM "{DISPATCH_TABLE}"
-                        WHERE (? IS NULL OR workflow_ref = ?)
-                          AND (? IS NULL OR json_extract(dispatch_metadata, '$.run_id') = ?)
-                          AND (? IS NULL OR json_extract(dispatch_metadata, '$.workflow_id') = ?)
-                        GROUP BY rfq_id
-                        """,
-                        (action_id, action_id, run_id, run_id, workflow_id, workflow_id),
-                    )
-                rows = cursor.fetchall()
-            except Exception as exc:
-                message = str(exc).lower()
-                if "does not exist" in message or "no such table" in message:
-                    return [], None
-                raise
-        finally:
-            cursor.close()
-
-        rfqs: List[str] = []
-        last_dispatch: Optional[datetime] = None
-        for row in rows:
-            rfq_id = row[0]
-            if not rfq_id:
-                continue
-            rfqs.append(str(rfq_id).strip().upper())
-            candidate_time = row[1]
+            candidate_time = created_at
             if isinstance(candidate_time, str):
                 try:
                     candidate_dt = parsedate_to_datetime(candidate_time)
@@ -594,58 +689,68 @@ class DatabaseBackend:
                 )
                 if last_dispatch is None or candidate_aware > last_dispatch:
                     last_dispatch = candidate_aware
-        return rfqs, last_dispatch
 
-    def fetch_unique_inbound_rfqs(
+        return records, last_dispatch
+
+    def fetch_inbound_tokens(
         self,
         *,
         workflow_id: Optional[str],
         action_id: Optional[str],
-        run_id: Optional[str],
-    ) -> List[str]:
+    ) -> Dict[str, Dict[str, Optional[str]]]:
         assert self._conn is not None
         cursor = self._conn.cursor()
         try:
             if self.dialect == "postgres":
                 cursor.execute(
                     f"""
-                    SELECT DISTINCT rfq_id
+                    SELECT DISTINCT COALESCE(dispatch_run_id, run_id) AS token,
+                                    rfq_id,
+                                    supplier_id
                     FROM {TABLE_NAME}
                     WHERE (%s IS NULL OR workflow_id = %s)
                       AND (%s IS NULL OR action_id = %s)
-                      AND (%s IS NULL OR run_id = %s)
                 """,
-                    (workflow_id, workflow_id, action_id, action_id, run_id, run_id),
+                    (workflow_id, workflow_id, action_id, action_id),
                 )
             else:
                 cursor.execute(
                     f"""
-                    SELECT DISTINCT rfq_id
+                    SELECT DISTINCT COALESCE(dispatch_run_id, run_id) AS token,
+                                    rfq_id,
+                                    supplier_id
                     FROM "{TABLE_NAME}"
                     WHERE (? IS NULL OR workflow_id = ?)
                       AND (? IS NULL OR action_id = ?)
-                      AND (? IS NULL OR run_id = ?)
                 """,
-                    (workflow_id, workflow_id, action_id, action_id, run_id, run_id),
+                    (workflow_id, workflow_id, action_id, action_id),
                 )
             rows = cursor.fetchall()
         finally:
             cursor.close()
 
-        rfqs = []
+        tokens: Dict[str, Dict[str, Optional[str]]] = {}
         for row in rows:
             if isinstance(row, sqlite3.Row):
-                value = row[0]
+                token_value = row[0]
+                rfq_value = row[1]
+                supplier_value = row[2]
             elif isinstance(row, (tuple, list)):
-                value = row[0]
+                token_value, rfq_value, supplier_value = row[0], row[1], row[2]
             else:
-                value = row
-            if not value:
+                token_value = getattr(row, "token", None)
+                rfq_value = getattr(row, "rfq_id", None)
+                supplier_value = getattr(row, "supplier_id", None)
+
+            token_norm = _normalise_identifier(token_value)
+            if not token_norm:
                 continue
-            cleaned = str(value).strip().upper()
-            if cleaned:
-                rfqs.append(cleaned)
-        return sorted(set(rfqs))
+            tokens[token_norm.lower()] = {
+                "token": token_norm,
+                "rfq_id": _normalise_identifier(rfq_value),
+                "supplier_id": _normalise_identifier(supplier_value),
+            }
+        return tokens
 
 
 def _hash_message(message_id: Optional[str], body: str) -> str:
@@ -779,49 +884,51 @@ def _extract_rfq_payload(
     action_id: Optional[str],
     run_id: Optional[str],
     mailbox: Optional[str],
-    dispatch_lookup: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    dispatch_context: Optional[DispatchContext] = None,
 ) -> Optional[SupplierResponseRecord]:
     body = _message_body(msg)
     comment, _ = split_hidden_marker(body)
     rfq_id = extract_rfq_id(comment)
     run_identifier = extract_run_id(comment)
+    token = extract_marker_token(comment)
     supplier = extract_supplier_id(comment)
 
-    matched_dispatch: Optional[Dict[str, Optional[str]]] = None
-    if not rfq_id and dispatch_lookup:
-        for identifier in _dispatch_header_identifiers(msg):
-            lowered = identifier.strip().lower()
-            if not lowered:
-                continue
-            dispatch = dispatch_lookup.get(lowered)
-            if not dispatch:
-                continue
-            matched_dispatch = dispatch
-            rfq_id = dispatch.get("rfq_id") or rfq_id
-            if not supplier:
-                supplier = dispatch.get("supplier_id")
-            if not run_identifier:
-                run_identifier = dispatch.get("run_id")
-            if not workflow_id:
-                workflow_id = dispatch.get("workflow_id")
-            if not action_id:
-                action_id = dispatch.get("action_id")
-            break
+    matched_dispatch: Optional[DispatchRecord] = None
+    if dispatch_context:
+        dispatch_token = token or run_identifier
+        matched_dispatch = dispatch_context.match_token(dispatch_token)
+        if not matched_dispatch:
+            matched_dispatch = dispatch_context.match_message(_dispatch_header_identifiers(msg))
+        if not matched_dispatch and supplier:
+            matched_dispatch = dispatch_context.match_supplier(supplier)
 
-    if run_id:
-        if not run_identifier:
-            return None
+    if matched_dispatch:
+        rfq_id = rfq_id or matched_dispatch.rfq_id
+        supplier = supplier or matched_dispatch.supplier_id
+        workflow_id = workflow_id or matched_dispatch.workflow_id
+        action_id = action_id or matched_dispatch.action_id
+        token = token or matched_dispatch.token
+        run_identifier = run_identifier or matched_dispatch.token
+
+    run_candidate = token or run_identifier
+    if run_candidate:
+        run_identifier = run_candidate
+
+    if run_id and run_identifier:
         if run_identifier.strip().lower() != run_id.strip().lower():
-            return None
+            if not dispatch_context or dispatch_context.match_token(run_identifier) is None:
+                return None
     elif not run_identifier:
         return None
 
     rfq_clean = (rfq_id or "").strip()
+    if not rfq_clean and matched_dispatch:
+        rfq_clean = matched_dispatch.rfq_id or ""
     if not rfq_clean:
         return None
 
     if matched_dispatch:
-        dispatch_workflow = matched_dispatch.get("workflow_id")
+        dispatch_workflow = matched_dispatch.workflow_id
         if dispatch_workflow and workflow_id:
             if dispatch_workflow.strip().lower() != workflow_id.strip().lower():
                 return None
@@ -868,7 +975,7 @@ def _collect_imap_messages(
     action_id: Optional[str],
     run_id: Optional[str],
     limit: Optional[int] = None,
-    dispatch_lookup: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    dispatch_context: Optional[DispatchContext] = None,
 ) -> List[SupplierResponseRecord]:
     mailbox = os.getenv("IMAP_FOLDER", "INBOX")
     connection = _imap_connection()
@@ -899,7 +1006,7 @@ def _collect_imap_messages(
                     action_id=action_id,
                     run_id=run_id,
                     mailbox=mailbox,
-                    dispatch_lookup=dispatch_lookup,
+                    dispatch_context=dispatch_context,
                 )
                 if record is None:
                     continue
@@ -920,30 +1027,6 @@ def _wait_for_dispatch_completion(last_dispatch: Optional[datetime]) -> None:
     if remaining > 0:
         logger.debug("Waiting %.1fs after final dispatch before polling IMAP", remaining)
         time.sleep(remaining)
-
-
-def _log_gate_mismatch(
-    *,
-    workflow_id: Optional[str],
-    action_id: Optional[str],
-    run_id: Optional[str],
-    dispatched: Sequence[str],
-    inbound: Sequence[str],
-) -> None:
-    dispatched_set = {rfq for rfq in dispatched if rfq}
-    inbound_set = {rfq for rfq in inbound if rfq}
-    missing = sorted(dispatched_set - inbound_set)
-    extra = sorted(inbound_set - dispatched_set)
-    logger.warning(
-        "Supplier response gate mismatch workflow=%s action=%s run=%s dispatched=%d inbound=%d missing=%s extra=%s",
-        workflow_id,
-        action_id,
-        run_id,
-        len(dispatched_set),
-        len(inbound_set),
-        missing,
-        extra,
-    )
 
 
 def _process_record_with_agent(
@@ -998,65 +1081,74 @@ def run_imap_supplier_response_watcher(
     db = DatabaseBackend()
     try:
         db.ensure_schema()
-        dispatched_rfqs, last_dispatch = db.fetch_dispatched_rfqs(
+        dispatch_records, last_dispatch = db.fetch_dispatch_context(
             workflow_id=workflow_id, action_id=action_id, run_id=run_id
         )
+        dispatch_context = DispatchContext.build(dispatch_records)
         _wait_for_dispatch_completion(last_dispatch)
 
-        dispatch_lookup = db.fetch_dispatch_lookup(
-            workflow_id=workflow_id, action_id=action_id, run_id=run_id
-        )
         records = _collect_imap_messages(
             workflow_id=workflow_id,
             action_id=action_id,
             run_id=run_id,
             limit=mailbox_limit,
-            dispatch_lookup=dispatch_lookup,
+            dispatch_context=dispatch_context,
         )
         for record in records:
             db.upsert_response(record)
+            matched = dispatch_context.match_token(record.run_id)
+            metadata = {
+                "workflow_id": workflow_id,
+                "action_id": action_id,
+                "run_id": record.run_id,
+                "mailbox": record.mailbox,
+            }
             with contextlib.suppress(Exception):
                 conn = db.connection
-                mark_dispatch_response(
+                updated = mark_dispatch_response(
                     conn,
                     rfq_id=record.rfq_id,
                     in_reply_to=record.headers.get("In-Reply-To"),
                     references=record.headers.get("References"),
                     response_message_id=record.message_id,
-                    response_metadata={
-                        "workflow_id": workflow_id,
-                        "action_id": action_id,
-                        "run_id": record.run_id,
-                        "mailbox": record.mailbox,
-                    },
+                    response_metadata=metadata,
                 )
+                if not updated and matched and matched.token:
+                    db.mark_dispatch_by_token(token=matched.token, metadata=metadata)
 
-        inbound_rfqs = db.fetch_unique_inbound_rfqs(
-            workflow_id=workflow_id, action_id=action_id, run_id=run_id
+        expected_tokens = sorted(
+            {rec.normalised_token() for rec in dispatch_records if rec.normalised_token()}
         )
-        dispatched_set = [rfq.strip().upper() for rfq in dispatched_rfqs]
-        if set(dispatched_set) != set(inbound_rfqs):
-            _log_gate_mismatch(
-                workflow_id=workflow_id,
-                action_id=action_id,
-                run_id=run_id,
-                dispatched=dispatched_set,
-                inbound=inbound_rfqs,
+        inbound_tokens = db.fetch_inbound_tokens(workflow_id=workflow_id, action_id=action_id)
+        inbound_token_keys = sorted(inbound_tokens.keys())
+
+        if expected_tokens and set(expected_tokens) != set(inbound_token_keys):
+            missing = sorted(set(expected_tokens) - set(inbound_token_keys))
+            extra = sorted(set(inbound_token_keys) - set(expected_tokens))
+            logger.warning(
+                "Supplier response gate mismatch workflow=%s action=%s run=%s expected=%d inbound=%d missing=%s extra=%s",
+                workflow_id,
+                action_id,
+                run_id,
+                len(expected_tokens),
+                len(inbound_token_keys),
+                missing,
+                extra,
             )
             return {
                 "persisted": len(records),
                 "processed": 0,
-                "dispatched_rfqs": sorted(set(dispatched_set)),
-                "inbound_rfqs": inbound_rfqs,
+                "expected_tokens": expected_tokens,
+                "inbound_tokens": inbound_token_keys,
             }
 
-        latest_records = db.fetch_latest_per_rfq(workflow_id=workflow_id, run_id=run_id)
+        latest_records = db.fetch_latest_per_rfq(workflow_id=workflow_id, run_id=None)
         if not latest_records:
             return {
                 "persisted": len(records),
                 "processed": 0,
-                "dispatched_rfqs": sorted(set(dispatched_set)),
-                "inbound_rfqs": inbound_rfqs,
+                "expected_tokens": expected_tokens,
+                "inbound_tokens": inbound_token_keys,
             }
 
         if process_callback is None:
@@ -1092,8 +1184,8 @@ def run_imap_supplier_response_watcher(
         return {
             "persisted": len(records),
             "processed": len(processed_ids),
-            "dispatched_rfqs": sorted(set(dispatched_set)),
-            "inbound_rfqs": inbound_rfqs,
+            "expected_tokens": expected_tokens,
+            "inbound_tokens": inbound_token_keys,
         }
     finally:
         db.close()
