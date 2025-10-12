@@ -489,6 +489,7 @@ class SESEmailWatcher:
         self._rfq_tail_cache: Dict[str, List[Dict[str, object]]] = {}
         self._workflow_rfq_index: Dict[str, Set[str]] = defaultdict(set)
         self._rfq_workflow_index: Dict[str, Set[str]] = defaultdict(set)
+        self._workflow_run_index: Dict[str, str] = {}
         self._workflow_expected_counts: Dict[str, int] = {}
         self._workflow_processed_counts: Dict[str, int] = {}
         self._workflow_negotiation_jobs: Dict[str, List[Dict[str, object]]] = defaultdict(list)
@@ -2649,6 +2650,7 @@ class SESEmailWatcher:
         dispatch_run_id = metadata.get("dispatch_run_id") or message.get("dispatch_run_id")
         if dispatch_run_id:
             processed["dispatch_run_id"] = dispatch_run_id
+            self._remember_workflow_run(dispatch_run_id, workflow_id)
         if message.get("s3_key"):
             processed["s3_key"] = message.get("s3_key")
         if message.get("_bucket"):
@@ -3222,15 +3224,42 @@ class SESEmailWatcher:
     def _normalise_workflow_key(self, workflow_id: Optional[str]) -> Optional[str]:
         return self._normalise_filter_value(workflow_id) if workflow_id else None
 
+    def _remember_workflow_run(
+        self, run_id: Optional[object], workflow_id: Optional[str]
+    ) -> None:
+        if run_id in (None, "") or workflow_id in (None, ""):
+            return
+
+        run_key = self._normalise_filter_value(run_id)
+        workflow_key = self._normalise_filter_value(workflow_id)
+        if not run_key or not workflow_key:
+            return
+
+        existing = self._workflow_run_index.get(run_key)
+        if existing and existing != workflow_key:
+            logger.debug(
+                "Updating workflow mapping for run_id=%s from %s to %s",
+                run_key,
+                existing,
+                workflow_key,
+            )
+        self._workflow_run_index[run_key] = workflow_key
+
     def _normalise_group_key(
         self,
         run_id: Optional[object],
         workflow_id: Optional[str],
     ) -> Optional[str]:
         run_candidate = self._normalise_filter_value(run_id) if run_id else None
-        if run_candidate:
-            return f"run::{run_candidate}"
         workflow_candidate = self._normalise_filter_value(workflow_id) if workflow_id else None
+        if run_candidate and workflow_candidate:
+            self._workflow_run_index[run_candidate] = workflow_candidate
+            return f"wf::{workflow_candidate}"
+        if run_candidate:
+            mapped = self._workflow_run_index.get(run_candidate)
+            if mapped:
+                return f"wf::{mapped}"
+            return f"run::{run_candidate}"
         if workflow_candidate:
             return f"wf::{workflow_candidate}"
         return None
@@ -3516,6 +3545,7 @@ class SESEmailWatcher:
     ) -> Tuple[bool, Optional[AgentOutput]]:
         run_identifier = metadata.get("dispatch_run_id") or processed.get("dispatch_run_id")
         workflow_key = self._normalise_workflow_key(workflow_id)
+        self._remember_workflow_run(run_identifier, workflow_id)
         group_key = self._normalise_group_key(run_identifier, workflow_id)
         tracking_key = group_key or workflow_key
         default_result: Tuple[bool, Optional[AgentOutput]] = (
@@ -4544,6 +4574,7 @@ class SESEmailWatcher:
         draft_ids: Tuple[int, ...]
         draft_count: int
         supplier_count: int
+        run_identifiers: Tuple[str, ...] = ()
 
     @dataclass
     class _MatchCandidate:
@@ -4567,6 +4598,7 @@ class SESEmailWatcher:
         run_id: Optional[str] = None
         recipients: Tuple[str, ...] = ()
         supplier_id: Optional[str] = None
+        workflow_id: Optional[str] = None
         subject_norm: str = field(init=False)
         body_norm: str = field(init=False)
         supplier_norm: Optional[str] = field(init=False, default=None)
@@ -4712,6 +4744,167 @@ class SESEmailWatcher:
 
         return False
 
+    def _dispatch_entry_run_identifier(self, entry: Dict[str, object]) -> Optional[str]:
+        """Return the first run identifier token embedded in a dispatch entry."""
+
+        if not isinstance(entry, dict):
+            return None
+
+        visited: Set[int] = set()
+        stack: List[Dict[str, object]] = [entry]
+        while stack:
+            candidate = stack.pop()
+            obj_id = id(candidate)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            for key in ("dispatch_run_id", "run_id", "dispatch_token"):
+                value = self._coerce_identifier(candidate.get(key))
+                if value:
+                    return value
+
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, dict):
+                stack.append(metadata)
+
+            for nested_key in ("draft", "dispatch"):
+                nested = candidate.get(nested_key)
+                if isinstance(nested, dict):
+                    stack.append(nested)
+
+        return None
+
+    def _dispatch_entry_unique_key(self, entry: Dict[str, object]) -> Optional[Tuple[str, ...]]:
+        """Return identifying tokens describing a dispatch entry for deduplication."""
+
+        if not isinstance(entry, dict):
+            return None
+
+        recipients: Set[str] = set()
+        supplier_value: Optional[str] = None
+        rfq_value: Optional[str] = None
+        identifier_value: Optional[str] = None
+        message_identifier: Optional[str] = None
+
+        def _collect(obj: object) -> None:
+            nonlocal supplier_value, rfq_value, identifier_value, message_identifier
+            if not isinstance(obj, dict):
+                return
+
+            candidate_supplier = self._coerce_identifier(obj.get("supplier_id"))
+            if candidate_supplier and not supplier_value:
+                supplier_value = candidate_supplier
+
+            candidate_rfq = self._coerce_identifier(obj.get("rfq_id"))
+            if candidate_rfq and not rfq_value:
+                rfq_value = candidate_rfq
+
+            candidate_identifier = obj.get("draft_record_id") or obj.get("id")
+            candidate_identifier = self._coerce_identifier(candidate_identifier)
+            if candidate_identifier and not identifier_value:
+                identifier_value = candidate_identifier
+
+            candidate_message = (
+                obj.get("dispatch_message_id")
+                or obj.get("message_id")
+                or obj.get("message-id")
+            )
+            candidate_message = self._coerce_identifier(candidate_message)
+            if candidate_message and not message_identifier:
+                message_identifier = candidate_message
+
+            recips = obj.get("recipients")
+            if isinstance(recips, (list, tuple, set)):
+                for item in recips:
+                    token = self._coerce_identifier(item)
+                    if token:
+                        token_norm = token.strip().lower()
+                        if token_norm:
+                            recipients.add(token_norm)
+            elif isinstance(recips, str):
+                token_norm = recips.strip().lower()
+                if token_norm:
+                    recipients.add(token_norm)
+
+            metadata = obj.get("metadata")
+            if isinstance(metadata, dict):
+                _collect(metadata)
+
+            for key in ("draft", "dispatch"):
+                nested = obj.get(key)
+                if isinstance(nested, dict):
+                    _collect(nested)
+
+            for group_key in ("drafts", "dispatches"):
+                group = obj.get(group_key)
+                if isinstance(group, dict):
+                    _collect(group)
+                elif isinstance(group, (list, tuple, set)):
+                    for item in group:
+                        _collect(item)
+
+        _collect(entry)
+
+        run_identifier = self._dispatch_entry_run_identifier(entry)
+        run_key = (
+            self._normalise_filter_value(run_identifier)
+            or (_norm(str(run_identifier)).lower() if run_identifier else None)
+        )
+        supplier_key = (
+            self._normalise_filter_value(supplier_value)
+            or (_norm(supplier_value).lower() if supplier_value else None)
+        )
+        rfq_key = (
+            self._normalise_filter_value(rfq_value)
+            or (_norm(rfq_value).lower() if rfq_value else None)
+        )
+        message_key = (
+            self._normalise_filter_value(message_identifier)
+            or (_norm(message_identifier).lower() if message_identifier else None)
+        )
+        identifier_key = identifier_value.strip().lower() if identifier_value else None
+        recipients_key = ",".join(sorted(recipients)) if recipients else None
+
+        strong_tokens: List[str] = []
+        fallback_tokens: List[str] = []
+
+        def _add(token: Optional[str], *, strong: bool = True) -> None:
+            if not token:
+                return
+            if strong:
+                strong_tokens.append(token)
+            else:
+                fallback_tokens.append(token)
+
+        _add(f"msg:{message_key}" if message_key else None)
+        _add(f"id:{identifier_key}" if identifier_key else None)
+
+        if run_key and supplier_key and recipients_key:
+            _add(f"run:{run_key}|supplier:{supplier_key}|rcpt:{recipients_key}")
+        if run_key and rfq_key and supplier_key:
+            _add(f"run:{run_key}|rfq:{rfq_key}|supplier:{supplier_key}")
+        if run_key and rfq_key:
+            _add(f"run:{run_key}|rfq:{rfq_key}")
+        if run_key and supplier_key:
+            _add(f"run:{run_key}|supplier:{supplier_key}")
+        if rfq_key and supplier_key:
+            _add(f"rfq:{rfq_key}|supplier:{supplier_key}")
+        if recipients_key and supplier_key:
+            _add(f"supplier:{supplier_key}|rcpt:{recipients_key}")
+
+        _add(f"rfq:{rfq_key}" if rfq_key else None, strong=False)
+        _add(f"run:{run_key}" if run_key else None, strong=False)
+        _add(f"rcpt:{recipients_key}" if recipients_key else None, strong=False)
+        _add(f"supplier:{supplier_key}" if supplier_key else None, strong=False)
+
+        tokens: List[str] = strong_tokens or fallback_tokens
+        if not tokens:
+            return None
+
+        deduped = tuple(dict.fromkeys(tokens))
+        return deduped if deduped else None
+
     def _extract_dispatch_entries(self, payload: object) -> List[Dict[str, object]]:
         """Return potential dispatch records from an action payload."""
 
@@ -4719,10 +4912,18 @@ class SESEmailWatcher:
         seen: Set[str] = set()
         visited: Set[int] = set()
 
+        def _run_identifier(entry: Dict[str, object]) -> Optional[str]:
+            candidate = self._dispatch_entry_run_identifier(entry)
+            if not candidate:
+                return None
+            try:
+                return candidate.strip().lower() or None
+            except Exception:
+                return None
+
         def _key(entry: Dict[str, object]) -> Optional[str]:
+            run_identifier = _run_identifier(entry)
             identifier = entry.get("draft_record_id") or entry.get("id")
-            if identifier not in (None, ""):
-                return f"id:{identifier}"
 
             recipients = entry.get("recipients")
             recipient_key: str = ""
@@ -4748,12 +4949,28 @@ class SESEmailWatcher:
                     if recipient_key:
                         has_recipients = True
 
-            if not has_recipients:
-                return None
-
             supplier = self._coerce_identifier(entry.get("supplier_id")) or ""
             rfq = self._coerce_identifier(entry.get("rfq_id")) or ""
-            return f"meta:{supplier}|{rfq}|{recipient_key}"
+
+            key_parts: List[str] = []
+            if run_identifier:
+                key_parts.append(f"run:{run_identifier}")
+            if identifier not in (None, ""):
+                key_parts.append(f"id:{identifier}")
+            if supplier:
+                key_parts.append(f"supplier:{supplier.lower()}")
+            if rfq:
+                key_parts.append(f"rfq:{rfq.lower()}")
+            if has_recipients:
+                key_parts.append(f"rcpt:{recipient_key}")
+
+            if not key_parts and has_recipients:
+                key_parts.append(f"rcpt:{recipient_key}")
+
+            if key_parts:
+                return "|".join(key_parts)
+
+            return None
 
         def _add(entry: Optional[Dict[str, object]]) -> None:
             if not isinstance(entry, dict):
@@ -4761,6 +4978,28 @@ class SESEmailWatcher:
             if id(entry) in visited:
                 return
             visited.add(id(entry))
+
+            def _has_signal(value: object) -> bool:
+                if value in (None, "", False, 0):
+                    return False
+                if isinstance(value, (list, tuple, set, dict)):
+                    return bool(value)
+                return True
+
+            if not any(
+                _has_signal(entry.get(key))
+                for key in (
+                    "recipients",
+                    "supplier_id",
+                    "rfq_id",
+                    "draft_record_id",
+                    "id",
+                    "message_id",
+                    "dispatch_message_id",
+                )
+            ):
+                return
+
             if self._should_skip_dispatch_entry(entry):
                 return
             key = _key(entry)
@@ -4805,12 +5044,20 @@ class SESEmailWatcher:
         draft_ids: List[int] = []
         supplier_keys: Set[str] = set()
         draft_count = 0
+        run_identifiers: Set[str] = set()
+
+        unique_dispatch_tokens: Set[str] = set()
 
         for entry in drafts:
             if not isinstance(entry, dict):
                 continue
             if self._should_skip_dispatch_entry(entry):
                 continue
+            tokens = self._dispatch_entry_unique_key(entry)
+            if tokens:
+                if any(token in unique_dispatch_tokens for token in tokens):
+                    continue
+                unique_dispatch_tokens.update(tokens)
             draft_count += 1
             candidate_id = entry.get("draft_record_id") or entry.get("id")
             try:
@@ -4822,17 +5069,31 @@ class SESEmailWatcher:
             supplier_key = self._coerce_identifier(supplier)
             if supplier_key:
                 supplier_keys.add(supplier_key.lower())
+            run_identifier = self._dispatch_entry_run_identifier(entry)
+            if run_identifier:
+                normalised_run = self._normalise_filter_value(run_identifier)
+                if normalised_run:
+                    run_identifiers.add(normalised_run)
+                else:
+                    run_identifiers.add(run_identifier)
 
         if draft_count == 0:
             return None
 
-        return self._DispatchExpectation(
+        expectation = self._DispatchExpectation(
             action_id=action_id,
             workflow_id=workflow_id,
             draft_ids=tuple(sorted(set(draft_ids))),
             draft_count=draft_count,
             supplier_count=len(supplier_keys),
+            run_identifiers=tuple(sorted(run_identifiers)),
         )
+
+        if workflow_id:
+            for run_value in expectation.run_identifiers:
+                self._remember_workflow_run(run_value, workflow_id)
+
+        return expectation
 
     def _load_dispatch_expectation(
         self,
@@ -5066,6 +5327,9 @@ class SESEmailWatcher:
             message_id = str(message.get("id") or "")
             if not message_id:
                 return
+            workflow_id = match.workflow_id or expectation.workflow_id
+            if workflow_id:
+                self._remember_workflow_run(match.run_id or match.dispatch_token, workflow_id)
             metadata = {
                 "status": "dispatch_copy",
                 "draft_id": match.id,
@@ -5074,6 +5338,10 @@ class SESEmailWatcher:
                 "matched_via": match.matched_via,
                 "dispatch_completed": completed,
             }
+            if workflow_id:
+                metadata["workflow_id"] = workflow_id
+            if match.run_id:
+                metadata["dispatch_run_id"] = match.run_id
             if self.state_store is not None:
                 self.state_store.add(message_id, metadata)
             last_modified = message.get("_last_modified")
@@ -5174,7 +5442,9 @@ class SESEmailWatcher:
         dispatch_token: Optional[str] = None
         run_id: Optional[str] = None
         recipients: Tuple[str, ...] = ()
+        workflow_id: Optional[str] = None
         if isinstance(payload_doc, dict):
+            workflow_id = self._extract_workflow_id_from_payload(payload_doc) or None
             dispatch_meta = payload_doc.get("dispatch_metadata")
             if isinstance(dispatch_meta, dict):
                 dispatch_token = dispatch_meta.get("dispatch_token") or dispatch_meta.get("token")
@@ -5221,6 +5491,7 @@ class SESEmailWatcher:
             run_id=run_id,
             recipients=recipients,
             supplier_id=str(supplier_id) if supplier_id is not None else None,
+            workflow_id=workflow_id,
         )
 
     def _fetch_recent_dispatched_drafts(
@@ -5273,6 +5544,13 @@ class SESEmailWatcher:
         for row in rows:
             snapshot = self._snapshot_from_draft_row(row)
             if snapshot is not None:
+                if expectation.workflow_id and not snapshot.workflow_id:
+                    snapshot.workflow_id = expectation.workflow_id
+                if snapshot.workflow_id:
+                    self._remember_workflow_run(
+                        snapshot.run_id or snapshot.dispatch_token,
+                        snapshot.workflow_id,
+                    )
                 snapshots.append(snapshot)
 
         return snapshots
