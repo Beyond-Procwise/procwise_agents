@@ -236,6 +236,86 @@ def test_build_dispatch_expectation_from_dispatch_entries():
     assert expectation.supplier_count == 3
 
 
+def test_extract_dispatch_entries_respects_unique_run_ids():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "drafts": [
+                {
+                    "supplier_id": "SUP-ONE",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-001"},
+                },
+                {
+                    "supplier_id": "SUP-TWO",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-002"},
+                },
+                {
+                    "supplier_id": "SUP-THREE",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-003"},
+                },
+            ]
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert len(entries) == 3
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-run", "workflow-run", entries
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 3
+
+
+def test_extract_dispatch_entries_handles_shared_run_id_with_distinct_suppliers():
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    payload = {
+        "result": {
+            "drafts": [
+                {
+                    "supplier_id": "SUP-ALPHA",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-shared"},
+                },
+                {
+                    "supplier_id": "SUP-BETA",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-shared"},
+                },
+                {
+                    "supplier_id": "SUP-GAMMA",
+                    "recipients": ["shared@example.com"],
+                    "metadata": {"run_id": "run-shared"},
+                },
+            ]
+        }
+    }
+
+    entries = watcher._extract_dispatch_entries(payload)
+
+    assert len(entries) == 3
+    assert {entry.get("supplier_id") for entry in entries} == {
+        "SUP-ALPHA",
+        "SUP-BETA",
+        "SUP-GAMMA",
+    }
+
+    expectation = watcher._build_dispatch_expectation(
+        "action-shared", "workflow-shared", entries
+    )
+
+    assert expectation is not None
+    assert expectation.draft_count == 3
+
 
 def test_extract_dispatch_entries_ignores_unsent_or_failed_dispatches():
     nick = DummyNick()
@@ -2360,8 +2440,6 @@ def test_watermark_disables_recent_window(monkeypatch):
     watcher._load_from_s3(limit=None)
 
     assert captured.get("enforce_window") is False
-
-
 
 
 def test_negotiation_executes_after_expected_responses(monkeypatch):
