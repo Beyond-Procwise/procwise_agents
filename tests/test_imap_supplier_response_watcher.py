@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,9 +40,16 @@ def _prepare_sqlite_dispatch_table(db_path, entries):
         metadata = json.dumps(entry["metadata"])
         conn.execute(
             'INSERT INTO "proc.email_dispatch_chains" '
-            "(rfq_id, workflow_ref, dispatch_metadata, awaiting_response, created_at, updated_at)"
-            " VALUES (?, ?, ?, 1, ?, ?)",
-            (entry["rfq_id"], entry.get("action_id"), metadata, now.isoformat(), now.isoformat()),
+            "(rfq_id, message_id, workflow_ref, dispatch_metadata, awaiting_response, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (
+                entry["rfq_id"],
+                entry.get("message_id"),
+                entry.get("action_id"),
+                metadata,
+                now.isoformat(),
+                now.isoformat(),
+            ),
         )
     conn.commit()
     conn.close()
@@ -160,3 +168,62 @@ def test_run_watcher_halts_when_gate_mismatched(monkeypatch):
     ).fetchone()
     conn.close()
     assert row[0] is None
+
+
+def test_run_watcher_recovers_rfq_via_dispatch_headers(monkeypatch):
+    _prepare_sqlite_dispatch_table(
+        "procwise_dev.sqlite",
+        [
+            {
+                "rfq_id": "RFQ-2",
+                "action_id": "act-headers",
+                "message_id": "<dispatch-headers>",
+                "metadata": {
+                    "run_id": "run-headers",
+                    "workflow_id": "wf-headers",
+                    "supplier_id": "SI-777",
+                },
+            }
+        ],
+    )
+
+    def _fake_collect(**kwargs):
+        dispatch_lookup = kwargs.get("dispatch_lookup") or {}
+        msg = EmailMessage()
+        msg["Subject"] = "Re: Quote"
+        msg["From"] = "supplier@example.com"
+        msg["In-Reply-To"] = "<dispatch-headers>"
+        msg.set_content("Response body without marker")
+        record = watcher._extract_rfq_payload(
+            msg,
+            workflow_id=kwargs.get("workflow_id"),
+            action_id=kwargs.get("action_id"),
+            run_id=kwargs.get("run_id"),
+            mailbox="INBOX",
+            dispatch_lookup=dispatch_lookup,
+        )
+        return [record] if record else []
+
+    monkeypatch.setattr(watcher, "_collect_imap_messages", _fake_collect)
+
+    processed = []
+    result = watcher.run_imap_supplier_response_watcher(
+        agent_nick=SimpleNamespace(),
+        workflow_id="wf-headers",
+        action_id="act-headers",
+        run_id="run-headers",
+        process_callback=lambda payload: processed.append((payload["rfq_id"], payload["supplier_id"])),
+    )
+
+    assert result["processed"] == 1
+    assert result["dispatched_rfqs"] == ["RFQ-2"]
+    assert result["inbound_rfqs"] == ["RFQ-2"]
+    assert processed == [("RFQ-2", "SI-777")]
+
+    conn = sqlite3.connect("procwise_dev.sqlite")
+    row = conn.execute(
+        'SELECT supplier_id, run_id FROM "proc.supplier_responses" WHERE rfq_id = ?',
+        ("RFQ-2",),
+    ).fetchone()
+    conn.close()
+    assert row == ("SI-777", "run-headers")

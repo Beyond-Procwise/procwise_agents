@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import Message
@@ -430,6 +431,104 @@ class DatabaseBackend:
                 latest[rfq_key] = record
         return list(latest.values())
 
+    def fetch_dispatch_lookup(
+        self,
+        *,
+        workflow_id: Optional[str],
+        action_id: Optional[str],
+        run_id: Optional[str],
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        assert self._conn is not None
+        cursor = self._conn.cursor()
+        try:
+            if self.dialect == "postgres":
+                cursor.execute(
+                    f"""
+                    SELECT message_id, rfq_id, workflow_ref, dispatch_metadata
+                    FROM {DISPATCH_TABLE}
+                    WHERE (%s IS NULL OR dispatch_metadata ->> 'run_id' = %s)
+                      AND (%s IS NULL OR dispatch_metadata ->> 'workflow_id' = %s)
+                      AND (%s IS NULL OR workflow_ref = %s OR dispatch_metadata ->> 'action_id' = %s)
+                """,
+                    (
+                        run_id,
+                        run_id,
+                        workflow_id,
+                        workflow_id,
+                        action_id,
+                        action_id,
+                        action_id,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT message_id, rfq_id, workflow_ref, dispatch_metadata
+                    FROM "{DISPATCH_TABLE}"
+                    WHERE (? IS NULL OR json_extract(dispatch_metadata, '$.run_id') = ?)
+                      AND (? IS NULL OR json_extract(dispatch_metadata, '$.workflow_id') = ?)
+                      AND (? IS NULL OR workflow_ref = ? OR json_extract(dispatch_metadata, '$.action_id') = ?)
+                """,
+                    (
+                        run_id,
+                        run_id,
+                        workflow_id,
+                        workflow_id,
+                        action_id,
+                        action_id,
+                        action_id,
+                    ),
+                )
+            rows = cursor.fetchall()
+        except Exception as exc:
+            message = str(exc).lower()
+            if "does not exist" in message or "no such table" in message:
+                return {}
+            raise
+        finally:
+            cursor.close()
+
+        lookup: Dict[str, Dict[str, Optional[str]]] = {}
+        for row in rows:
+            message_id = row[0]
+            rfq = row[1]
+            if not message_id or not rfq:
+                continue
+            metadata_raw = row[3]
+            metadata: Dict[str, Optional[str]] = {}
+            if isinstance(metadata_raw, dict):
+                metadata = {key: metadata_raw.get(key) for key in metadata_raw}
+            elif metadata_raw:
+                try:
+                    parsed = json.loads(metadata_raw)
+                    if isinstance(parsed, dict):
+                        metadata = {key: parsed.get(key) for key in parsed}
+                except Exception:  # pragma: no cover - tolerate malformed JSON
+                    metadata = {}
+
+            key = str(message_id).strip()
+            if key.startswith("<") and key.endswith(">"):
+                key = key[1:-1].strip()
+            if not key:
+                continue
+
+            lookup[key.lower()] = {
+                "rfq_id": str(rfq).strip() if rfq else None,
+                "workflow_id": _normalise_identifier(
+                    metadata.get("workflow_id") or metadata.get("WORKFLOW_ID")
+                ),
+                "action_id": _normalise_identifier(
+                    metadata.get("action_id") or metadata.get("ACTION_ID") or row[2]
+                ),
+                "run_id": _normalise_identifier(
+                    metadata.get("run_id") or metadata.get("RUN_ID")
+                ),
+                "supplier_id": _normalise_identifier(
+                    metadata.get("supplier_id") or metadata.get("SUPPLIER_ID")
+                ),
+            }
+        return lookup
+
     def fetch_dispatched_rfqs(
         self,
         *,
@@ -496,6 +595,57 @@ class DatabaseBackend:
                 if last_dispatch is None or candidate_aware > last_dispatch:
                     last_dispatch = candidate_aware
         return rfqs, last_dispatch
+
+    def fetch_unique_inbound_rfqs(
+        self,
+        *,
+        workflow_id: Optional[str],
+        action_id: Optional[str],
+        run_id: Optional[str],
+    ) -> List[str]:
+        assert self._conn is not None
+        cursor = self._conn.cursor()
+        try:
+            if self.dialect == "postgres":
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT rfq_id
+                    FROM {TABLE_NAME}
+                    WHERE (%s IS NULL OR workflow_id = %s)
+                      AND (%s IS NULL OR action_id = %s)
+                      AND (%s IS NULL OR run_id = %s)
+                """,
+                    (workflow_id, workflow_id, action_id, action_id, run_id, run_id),
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT rfq_id
+                    FROM "{TABLE_NAME}"
+                    WHERE (? IS NULL OR workflow_id = ?)
+                      AND (? IS NULL OR action_id = ?)
+                      AND (? IS NULL OR run_id = ?)
+                """,
+                    (workflow_id, workflow_id, action_id, action_id, run_id, run_id),
+                )
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+
+        rfqs = []
+        for row in rows:
+            if isinstance(row, sqlite3.Row):
+                value = row[0]
+            elif isinstance(row, (tuple, list)):
+                value = row[0]
+            else:
+                value = row
+            if not value:
+                continue
+            cleaned = str(value).strip().upper()
+            if cleaned:
+                rfqs.append(cleaned)
+        return sorted(set(rfqs))
 
 
 def _hash_message(message_id: Optional[str], body: str) -> str:
@@ -576,8 +726,50 @@ def _message_body(msg: Message) -> str:
 def _normalise_identifier(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
-    cleaned = value.strip()
+    if isinstance(value, str):
+        cleaned = value.strip()
+    else:
+        cleaned = str(value).strip()
     return cleaned or None
+
+
+def _dispatch_header_identifiers(msg: Message) -> List[str]:
+    raw_values: List[str] = []
+    for header in ("In-Reply-To", "References"):
+        value = msg.get(header)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            raw_values.extend(str(item) for item in value if item)
+        else:
+            raw_values.append(str(value))
+
+    pattern = re.compile(r"<([^>]+)>")
+    collected: List[str] = []
+    for item in raw_values:
+        stripped = item.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("<") and stripped.endswith(">"):
+            candidate = stripped[1:-1].strip()
+            if candidate:
+                collected.append(candidate)
+            continue
+        matches = pattern.findall(stripped)
+        if matches:
+            collected.extend(match.strip() for match in matches if match.strip())
+            continue
+        collected.append(stripped)
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for candidate in collected:
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        unique.append(candidate)
+    return unique
 
 
 def _extract_rfq_payload(
@@ -587,11 +779,35 @@ def _extract_rfq_payload(
     action_id: Optional[str],
     run_id: Optional[str],
     mailbox: Optional[str],
+    dispatch_lookup: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
 ) -> Optional[SupplierResponseRecord]:
     body = _message_body(msg)
     comment, _ = split_hidden_marker(body)
     rfq_id = extract_rfq_id(comment)
     run_identifier = extract_run_id(comment)
+    supplier = extract_supplier_id(comment)
+
+    matched_dispatch: Optional[Dict[str, Optional[str]]] = None
+    if not rfq_id and dispatch_lookup:
+        for identifier in _dispatch_header_identifiers(msg):
+            lowered = identifier.strip().lower()
+            if not lowered:
+                continue
+            dispatch = dispatch_lookup.get(lowered)
+            if not dispatch:
+                continue
+            matched_dispatch = dispatch
+            rfq_id = dispatch.get("rfq_id") or rfq_id
+            if not supplier:
+                supplier = dispatch.get("supplier_id")
+            if not run_identifier:
+                run_identifier = dispatch.get("run_id")
+            if not workflow_id:
+                workflow_id = dispatch.get("workflow_id")
+            if not action_id:
+                action_id = dispatch.get("action_id")
+            break
+
     if run_id:
         if not run_identifier:
             return None
@@ -604,7 +820,12 @@ def _extract_rfq_payload(
     if not rfq_clean:
         return None
 
-    supplier = extract_supplier_id(comment)
+    if matched_dispatch:
+        dispatch_workflow = matched_dispatch.get("workflow_id")
+        if dispatch_workflow and workflow_id:
+            if dispatch_workflow.strip().lower() != workflow_id.strip().lower():
+                return None
+
     headers = _message_headers(msg)
     subject = _decode_header(msg.get("Subject"))
     from_address = msg.get("From")
@@ -647,6 +868,7 @@ def _collect_imap_messages(
     action_id: Optional[str],
     run_id: Optional[str],
     limit: Optional[int] = None,
+    dispatch_lookup: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
 ) -> List[SupplierResponseRecord]:
     mailbox = os.getenv("IMAP_FOLDER", "INBOX")
     connection = _imap_connection()
@@ -677,6 +899,7 @@ def _collect_imap_messages(
                     action_id=action_id,
                     run_id=run_id,
                     mailbox=mailbox,
+                    dispatch_lookup=dispatch_lookup,
                 )
                 if record is None:
                     continue
@@ -780,8 +1003,15 @@ def run_imap_supplier_response_watcher(
         )
         _wait_for_dispatch_completion(last_dispatch)
 
+        dispatch_lookup = db.fetch_dispatch_lookup(
+            workflow_id=workflow_id, action_id=action_id, run_id=run_id
+        )
         records = _collect_imap_messages(
-            workflow_id=workflow_id, action_id=action_id, run_id=run_id, limit=mailbox_limit
+            workflow_id=workflow_id,
+            action_id=action_id,
+            run_id=run_id,
+            limit=mailbox_limit,
+            dispatch_lookup=dispatch_lookup,
         )
         for record in records:
             db.upsert_response(record)
@@ -801,7 +1031,9 @@ def run_imap_supplier_response_watcher(
                     },
                 )
 
-        inbound_rfqs = [record.normalised_rfq() for record in records]
+        inbound_rfqs = db.fetch_unique_inbound_rfqs(
+            workflow_id=workflow_id, action_id=action_id, run_id=run_id
+        )
         dispatched_set = [rfq.strip().upper() for rfq in dispatched_rfqs]
         if set(dispatched_set) != set(inbound_rfqs):
             _log_gate_mismatch(
@@ -815,7 +1047,7 @@ def run_imap_supplier_response_watcher(
                 "persisted": len(records),
                 "processed": 0,
                 "dispatched_rfqs": sorted(set(dispatched_set)),
-                "inbound_rfqs": sorted(set(inbound_rfqs)),
+                "inbound_rfqs": inbound_rfqs,
             }
 
         latest_records = db.fetch_latest_per_rfq(workflow_id=workflow_id, run_id=run_id)
@@ -824,7 +1056,7 @@ def run_imap_supplier_response_watcher(
                 "persisted": len(records),
                 "processed": 0,
                 "dispatched_rfqs": sorted(set(dispatched_set)),
-                "inbound_rfqs": sorted(set(inbound_rfqs)),
+                "inbound_rfqs": inbound_rfqs,
             }
 
         if process_callback is None:
@@ -861,7 +1093,7 @@ def run_imap_supplier_response_watcher(
             "persisted": len(records),
             "processed": len(processed_ids),
             "dispatched_rfqs": sorted(set(dispatched_set)),
-            "inbound_rfqs": sorted(set(inbound_rfqs)),
+            "inbound_rfqs": inbound_rfqs,
         }
     finally:
         db.close()
