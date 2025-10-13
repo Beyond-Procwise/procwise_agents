@@ -8,7 +8,7 @@ from services.email_watcher_service import EmailWatcherService
 from services.model_training_endpoint import ModelTrainingEndpoint
 from utils.gpu import configure_gpu
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class _ScheduledJob:
