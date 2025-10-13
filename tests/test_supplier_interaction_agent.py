@@ -100,28 +100,34 @@ def test_supplier_interaction_wait_for_response():
 
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
+    def fake_run_email_watcher_for_workflow(**kwargs):
         calls["count"] += 1
-        assert match_filters is not None
-        assert match_filters == {"workflow_id": "wf-001", "draft_action_id": "draft-001"}
-        assert expected_replies == 1
+        assert kwargs["workflow_id"] == "wf-001"
+        assert kwargs["run_id"] == "run-001"
         if calls["count"] == 1:
-            return [
-                {
-                    "rfq_id": "RFQ-20240101-abcd1234",
-                    "supplier_id": "S1",
-                    "dispatch_run_id": "run-001",
-                    "supplier_status": "success",
-                    "supplier_output": {"price": 1200},
-                    "negotiation_output": {"message": "counter"},
-                }
-            ]
-        return []
+            return {
+                "status": "processed",
+                "rows": [
+                    {
+                        "workflow_id": "wf-001",
+                        "unique_id": "uid-001",
+                        "supplier_id": "S1",
+                        "body_text": "Thanks for the opportunity",
+                        "subject": "Re: RFQ-20240101-abcd1234",
+                        "message_id": "m-001",
+                        "from_addr": "supplier@example.com",
+                    }
+                ],
+            }
+        return {"status": "not_ready", "rows": []}
 
-    watcher = SimpleNamespace(poll_once=poll_once)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "services.email_watcher_imap.run_email_watcher_for_workflow",
+        fake_run_email_watcher_for_workflow,
+    )
 
     result = agent.wait_for_response(
-        watcher=watcher,
         timeout=1,
         poll_interval=0,
         rfq_id="RFQ-20240101-abcd1234",
@@ -131,8 +137,9 @@ def test_supplier_interaction_wait_for_response():
         draft_action_id="draft-001",
     )
 
+    monkeypatch.undo()
+
     assert result is not None
-    assert result["rfq_id"] == "RFQ-20240101-abcd1234"
     assert calls["count"] == 1
 
 
@@ -140,42 +147,40 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
-    batches = [
-        [
-            {
-                "rfq_id": "RFQ-20240101-abcd1234",
-                "supplier_id": "S1",
-                "supplier_status": "processing",
-                "supplier_output": None,
-                "dispatch_run_id": "run-002",
-            }
-        ],
-        [
-            {
-                "rfq_id": "RFQ-20240101-abcd1234",
-                "supplier_id": "S1",
-                "supplier_status": "success",
-                "supplier_output": {"price": 900},
-                "dispatch_run_id": "run-002",
-            }
-        ],
-    ]
-
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
-        calls["count"] += 1
-        assert match_filters is not None
-        assert match_filters == {"workflow_id": "wf-002", "draft_action_id": "draft-002"}
-        assert expected_replies == 1
-        return batches.pop(0) if batches else []
+    responses = [
+        {"status": "not_ready", "rows": []},
+        {
+            "status": "processed",
+            "rows": [
+                {
+                    "workflow_id": "wf-002",
+                    "unique_id": "uid-002",
+                    "supplier_id": "S1",
+                    "body_text": "Pricing ready",
+                    "subject": "Re: RFQ-20240101-abcd1234",
+                    "message_id": "m-002",
+                    "from_addr": "supplier@example.com",
+                }
+            ],
+        },
+    ]
 
-    watcher = SimpleNamespace(poll_once=poll_once)
+    def fake_run_email_watcher_for_workflow(**kwargs):
+        calls["count"] += 1
+        assert kwargs["workflow_id"] == "wf-002"
+        assert kwargs["run_id"] == "run-002"
+        return responses.pop(0) if responses else {"status": "not_ready", "rows": []}
+
+    monkeypatch.setattr(
+        "services.email_watcher_imap.run_email_watcher_for_workflow",
+        fake_run_email_watcher_for_workflow,
+    )
 
     monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
 
     result = agent.wait_for_response(
-        watcher=watcher,
         timeout=5,
         poll_interval=0,
         rfq_id="RFQ-20240101-abcd1234",
@@ -187,7 +192,8 @@ def test_wait_for_response_waits_until_payload_ready(monkeypatch):
 
     assert result is not None
     assert result["supplier_status"] == "success"
-    assert result["supplier_output"]["price"] == 900
+    assert result["supplier_output"]["response_text"] == "Pricing ready"
+    assert calls["count"] == 2
     assert calls["count"] == 2
 
 def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypatch):
@@ -197,19 +203,19 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
 
     calls = {"count": 0}
 
-    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
+    def fake_run_email_watcher_for_workflow(**kwargs):
         calls["count"] += 1
-        assert match_filters is not None
-        assert match_filters == {"workflow_id": "wf-missing", "draft_action_id": "draft-missing"}
-        assert expected_replies == 1
-        return []
-
-    watcher = SimpleNamespace(poll_once=poll_once)
+        assert kwargs["workflow_id"] == "wf-missing"
+        assert kwargs["run_id"] == "run-missing"
+        return {"status": "not_ready", "rows": []}
 
     monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "services.email_watcher_imap.run_email_watcher_for_workflow",
+        fake_run_email_watcher_for_workflow,
+    )
 
     result = agent.wait_for_response(
-        watcher=watcher,
         timeout=30,
         poll_interval=None,
         rfq_id="RFQ-20240101-missing",
@@ -222,60 +228,6 @@ def test_supplier_interaction_wait_for_response_respects_attempt_limit(monkeypat
 
     assert result is None
     assert calls["count"] == 3
-
-
-def test_wait_for_response_aggregated_collects_expected_replies():
-    nick = DummyNick()
-    agent = SupplierInteractionAgent(nick)
-
-    batches = [
-        [
-            {
-                "rfq_id": "RFQ-20240101-AAA11111",
-                "supplier_id": "SUP-1",
-                "supplier_status": "success",
-                "supplier_output": {"price": 1200},
-            },
-            {
-                "rfq_id": "RFQ-20240101-BBB22222",
-                "supplier_id": "SUP-2",
-                "supplier_status": "success",
-                "supplier_output": {"price": 1300},
-            },
-        ]
-    ]
-
-    observed: Dict[str, object] = {}
-
-    def poll_once(limit=None, match_filters=None, expected_replies=None, poll_interval=None):
-        observed["limit"] = limit
-        observed["match_filters"] = match_filters
-        observed["expected_replies"] = expected_replies
-        return batches.pop(0) if batches else []
-
-    watcher = SimpleNamespace(poll_once=poll_once)
-
-    result = agent.wait_for_response(
-        watcher=watcher,
-        timeout=1,
-        poll_interval=0,
-        workflow_id="wf-agg",
-        suppliers=["SUP-1", "sup-2"],
-    )
-
-    assert isinstance(result, dict)
-    assert result["received"] == 2
-    payload_pairs = {
-        (item.get("rfq_id"), item.get("supplier_id"))
-        for item in result.get("responses", [])
-    }
-    assert payload_pairs == {
-        ("RFQ-20240101-AAA11111", "SUP-1"),
-        ("RFQ-20240101-BBB22222", "SUP-2"),
-    }
-    assert observed["limit"] is None
-    assert observed["match_filters"] == {"workflow_id": "wf-agg"}
-    assert observed["expected_replies"] == 2
 
 
 def test_supplier_interaction_waits_using_drafts():
@@ -334,55 +286,40 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
-    created_watchers: List[Dict[str, object]] = []
-    poll_calls: List[Dict[str, object]] = []
+    watcher_calls: List[Dict[str, Any]] = []
 
-    class DummyWatcher:
-        def __init__(self, *args, **kwargs):
-            created_watchers.append(kwargs)
-            self._calls = 0
-
-        def poll_once(self, limit=None, match_filters=None, expected_replies=None, poll_interval=None):
-            poll_calls.append(
+    def fake_run_email_watcher_for_workflow(**kwargs):
+        watcher_calls.append(kwargs)
+        return {
+            "status": "processed",
+            "workflow_id": kwargs["workflow_id"],
+            "expected": 2,
+            "found": 2,
+            "rows": [
                 {
-                    "limit": limit,
-                    "match_filters": match_filters,
-                    "expected_replies": expected_replies,
-                }
-            )
-            self._calls += 1
-            if self._calls == 1:
-                assert limit is None
-                assert match_filters == {"workflow_id": "wf-shared"}
-                assert expected_replies == 2
-                return [
-                    {
-                        "message_id": "m1",
-                        "rfq_id": "RFQ-20240101-AAA11111",
-                        "supplier_id": "SUP-1",
-                        "dispatch_run_id": "run-sup-1",
-                        "from_address": "one@example.com",
-                        "subject": "Re: RFQ-20240101-AAA11111",
-                        "supplier_status": "success",
-                        "supplier_output": {"price": 1000},
-                    },
-                    {
-                        "message_id": "m2",
-                        "rfq_id": "RFQ-20240101-BBB22222",
-                        "supplier_id": "SUP-2",
-                        "dispatch_run_id": "run-sup-2",
-                        "from_address": "two@example.com",
-                        "subject": "Re: RFQ-20240101-BBB22222",
-                        "supplier_status": "success",
-                        "supplier_output": {"price": 1100},
-                    },
-                ]
-            assert expected_replies == 1
-            return []
+                    "workflow_id": "wf-shared",
+                    "unique_id": "uid-1",
+                    "supplier_id": "SUP-1",
+                    "body_text": "Quote 1",
+                    "subject": "Re: RFQ-20240101-AAA11111",
+                    "message_id": "m1",
+                    "from_addr": "one@example.com",
+                },
+                {
+                    "workflow_id": "wf-shared",
+                    "unique_id": "uid-2",
+                    "supplier_id": "SUP-2",
+                    "body_text": "Quote 2",
+                    "subject": "Re: RFQ-20240101-BBB22222",
+                    "message_id": "m2",
+                    "from_addr": "two@example.com",
+                },
+            ],
+        }
 
     monkeypatch.setattr(
-        "services.email_watcher.SESEmailWatcher",
-        DummyWatcher,
+        "services.email_watcher_imap.run_email_watcher_for_workflow",
+        fake_run_email_watcher_for_workflow,
     )
 
     drafts = [
@@ -394,6 +331,7 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
             "dispatch_run_id": "run-sup-1",
             "workflow_id": "wf-shared",
             "draft_action_id": "draft-1",
+            "unique_id": "uid-1",
         },
         {
             "rfq_id": "RFQ-20240101-BBB22222",
@@ -403,6 +341,7 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
             "dispatch_run_id": "run-sup-2",
             "workflow_id": "wf-shared",
             "draft_action_id": "draft-2",
+            "unique_id": "uid-2",
         },
     ]
 
@@ -414,174 +353,12 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
     )
 
     assert len(results) == len(drafts)
-    assert created_watchers and len(created_watchers) == 1
-    assert poll_calls and poll_calls[0]["match_filters"] == {"workflow_id": "wf-shared"}
-    assert poll_calls[0]["expected_replies"] == 2
+    assert watcher_calls and watcher_calls[0]["workflow_id"] == "wf-shared"
+    assert watcher_calls[0]["run_id"] is None
     for result, draft in zip(results, drafts):
         assert result is not None
-        assert result["rfq_id"] == draft["rfq_id"]
         assert result["supplier_id"] == draft["supplier_id"]
-
-
-def test_wait_for_multiple_responses_retries_until_dispatch_clears(monkeypatch):
-    nick = DummyNick()
-    agent = SupplierInteractionAgent(nick)
-
-    pending_map = {
-        "RFQ-20240101-AAA11111": 1,
-        "RFQ-20240101-BBB22222": 1,
-    }
-
-    class DummyWatcher:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def poll_once(
-            self,
-            limit=None,
-            match_filters=None,
-            expected_replies=None,
-            poll_interval=None,
-        ):
-            return []
-
-    monkeypatch.setattr(
-        "services.email_watcher.SESEmailWatcher",
-        DummyWatcher,
-    )
-
-    def fake_pending(self, rfq_id):
-        return pending_map.get(rfq_id, 0)
-
-    awaited = {"called": False}
-
-    def fake_await(
-        self,
-        drafts: List[Dict[str, Any]],
-        results: List[Optional[Dict[str, Any]]],
-        *,
-        deadline: float,
-        poll_interval: Optional[int],
-        limit: int,
-        enable_negotiation: bool,
-    ) -> None:
-        awaited["called"] = True
-        for index, draft in enumerate(drafts):
-            if results[index] is not None:
-                continue
-            rfq_id = draft.get("rfq_id")
-            supplier_id = draft.get("supplier_id")
-            if rfq_id:
-                pending_map[rfq_id] = 0
-            results[index] = {
-                "rfq_id": rfq_id,
-                "supplier_id": supplier_id,
-                "supplier_output": {"attempt": 1},
-            }
-
-    monkeypatch.setattr(
-        SupplierInteractionAgent,
-        "_pending_dispatch_count",
-        fake_pending,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        SupplierInteractionAgent,
-        "_await_outstanding_dispatch_responses",
-        fake_await,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "agents.supplier_interaction_agent.time.sleep",
-        lambda *_args, **_kwargs: None,
-    )
-
-    drafts = [
-        {
-            "rfq_id": "RFQ-20240101-AAA11111",
-            "supplier_id": "SUP-1",
-            "recipients": ["one@example.com"],
-            "dispatch_run_id": "run-aaa",
-            "workflow_id": "wf-aaa",
-            "draft_action_id": "draft-aaa",
-        },
-        {
-            "rfq_id": "RFQ-20240101-BBB22222",
-            "supplier_id": "SUP-2",
-            "recipients": ["two@example.com"],
-            "dispatch_run_id": "run-bbb",
-            "workflow_id": "wf-bbb",
-            "draft_action_id": "draft-bbb",
-        },
-    ]
-
-    results = agent.wait_for_multiple_responses(
-        drafts,
-        timeout=3,
-        poll_interval=1,
-        limit=1,
-    )
-
-    assert awaited["called"]
-    assert all(result and result.get("supplier_output") for result in results)
-
-
-def test_wait_for_response_initialises_watcher_with_negotiation_toggle(monkeypatch):
-    nick = DummyNick()
-    agent = SupplierInteractionAgent(nick)
-
-    captured_kwargs: List[Dict[str, object]] = []
-
-    class DummyWatcher:
-        def __init__(self, *args, **kwargs):
-            self.enable_negotiation = kwargs.get("enable_negotiation")
-            self.negotiation_agent = kwargs.get("negotiation_agent")
-            captured_kwargs.append(kwargs)
-
-        def poll_once(
-            self,
-            limit=None,
-            match_filters=None,
-            expected_replies=None,
-            poll_interval=None,
-        ):
-            return []
-
-    monkeypatch.setattr(
-        "services.email_watcher.SESEmailWatcher",
-        DummyWatcher,
-    )
-
-    agent._negotiation_agent = SimpleNamespace(
-        execute=lambda ctx: AgentOutput(status=AgentStatus.SUCCESS, data={})
-    )
-
-    agent.wait_for_response(
-        timeout=0,
-        poll_interval=0,
-        rfq_id="RFQ-20240101-AAA11111",
-        supplier_id="SUP-1",
-    )
-
-    assert captured_kwargs
-    assert captured_kwargs[-1]["enable_negotiation"] is True
-    assert (
-        captured_kwargs[-1]["negotiation_agent"] is agent._negotiation_agent
-    )
-
-    captured_kwargs.clear()
-
-    agent.wait_for_response(
-        timeout=0,
-        poll_interval=0,
-        rfq_id="RFQ-20240101-AAA11111",
-        supplier_id="SUP-1",
-        enable_negotiation=False,
-    )
-
-    assert captured_kwargs
-    assert captured_kwargs[-1]["enable_negotiation"] is False
-    assert captured_kwargs[-1]["negotiation_agent"] is None
+        assert result["unique_id"] == draft["unique_id"]
 
 
 def test_await_all_responses_processes_parallel_results(monkeypatch):
