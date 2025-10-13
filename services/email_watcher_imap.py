@@ -8,6 +8,11 @@ from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailWatcherV2
 
+try:  # pragma: no cover - settings import may fail in minimal environments
+    from config.settings import settings as app_settings
+except Exception:  # pragma: no cover - fallback when settings module unavailable
+    app_settings = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,6 +21,16 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     if value in (None, ""):
         return default
     return value
+
+
+def _setting(*attr_names: str) -> Optional[str]:
+    if not app_settings:
+        return None
+    for name in attr_names:
+        value = getattr(app_settings, name, None)
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _load_dispatch_rows(workflow_id: str) -> List[WorkflowDispatchRow]:
@@ -85,25 +100,54 @@ def run_email_watcher_for_workflow(
             "matched_unique_ids": [],
         }
 
-    imap_host = _env("IMAP_HOST")
-    imap_username = _env("IMAP_USERNAME") or _env("IMAP_USER")
-    imap_password = _env("IMAP_PASSWORD")
-    mailbox = mailbox_name or _env("IMAP_MAILBOX", "INBOX")
+    imap_host = _env("IMAP_HOST") or _setting("imap_host")
+    imap_username = (
+        _env("IMAP_USERNAME")
+        or _env("IMAP_USER")
+        or _setting("imap_username", "imap_user", "imap_login")
+    )
+    imap_password = _env("IMAP_PASSWORD") or _setting("imap_password")
+    mailbox = (
+        mailbox_name
+        or _env("IMAP_MAILBOX")
+        or _setting("imap_mailbox")
+        or "INBOX"
+    )
 
     if not all([imap_host, imap_username, imap_password]):
-        logger.error(
-            "IMAP credentials are required for EmailWatcherV2 (host=%s user=%s)",
+        logger.warning(
+            "IMAP credentials are not configured; skipping EmailWatcherV2 (host=%s user=%s)",
             imap_host,
             imap_username,
         )
         return {
-            "status": "failed",
-            "reason": "Missing IMAP credentials",
+            "status": "skipped",
+            "reason": "IMAP credentials not configured",
             "workflow_id": workflow_key,
             "expected": len(dispatch_rows),
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
+        }
+
+    incomplete_dispatches = [
+        row.unique_id
+        for row in dispatch_rows
+        if not row.message_id or row.dispatched_at is None
+    ]
+    if incomplete_dispatches:
+        logger.debug(
+            "Workflow %s has pending dispatch metadata; deferring watcher start", workflow_key
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "Waiting for all dispatches to complete",
+            "workflow_id": workflow_key,
+            "expected": len(dispatch_rows),
+            "found": 0,
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": sorted(incomplete_dispatches),
         }
 
     try:
