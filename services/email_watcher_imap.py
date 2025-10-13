@@ -358,7 +358,9 @@ def run_email_watcher_for_workflow(
     rows = [r for r in rows if (r.get("unique_id") in expected_uids)]
     results: List[Dict[str, Any]] = []
 
-    if rows:
+    processed_rows = list(rows)
+
+    if processed_rows:
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
             futures = [
                 pool.submit(
@@ -367,7 +369,7 @@ def run_email_watcher_for_workflow(
                     agent_registry=agent_registry,
                     orchestrator=orchestrator,
                 )
-                for row in rows
+                for row in processed_rows
             ]
             for fut in as_completed(futures):
                 try:
@@ -377,7 +379,7 @@ def run_email_watcher_for_workflow(
                     results.append({"status": "failed", "error": str(exc)})
 
         # Mark processed
-        mark_processed_by_ids([int(r["id"]) for r in rows if "id" in r])
+        mark_processed_by_ids([int(r["id"]) for r in processed_rows if "id" in r])
 
     return {
         "status": "processed",
@@ -387,4 +389,6 @@ def run_email_watcher_for_workflow(
         "stored": stored,
         "processed": len(results),
         "results": results,
+        "rows": processed_rows,
+        "matched_unique_ids": sorted(list(matched_unique_ids)),
     }
