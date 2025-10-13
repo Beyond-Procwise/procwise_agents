@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional
 
-from services.db import USING_SQLITE, get_conn
+from services.db import get_conn
 
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
@@ -51,13 +51,6 @@ def _serialise_decimal(value: Optional[Decimal]) -> Optional[str]:
     return str(value)
 
 
-def _assert_postgres_backend() -> None:
-    if USING_SQLITE:
-        raise RuntimeError(
-            "Supplier responses repository requires a PostgreSQL connection."
-        )
-
-
 def _ensure_postgres_column(cur, schema: str, table: str, column: str, definition: str) -> None:
     cur.execute(
         """
@@ -78,7 +71,6 @@ def _ensure_postgres_column(cur, schema: str, table: str, column: str, definitio
 
 def init_schema() -> None:
     with get_conn() as conn:
-        _assert_postgres_backend()
         cur = conn.cursor()
         for statement in filter(None, (stmt.strip() for stmt in DDL_PG.split(";"))):
             cur.execute(statement)
@@ -92,7 +84,6 @@ def insert_response(row: SupplierResponseRow) -> None:
     price_value = _serialise_decimal(row.price)
 
     with get_conn() as conn:
-        _assert_postgres_backend()
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.supplier_response "
@@ -126,7 +117,6 @@ def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
         return
 
     with get_conn() as conn:
-        _assert_postgres_backend()
         cur = conn.cursor()
         q = "DELETE FROM proc.supplier_response WHERE workflow_id=%s AND unique_id = ANY(%s)"
         cur.execute(q, (workflow_id, ids))
@@ -135,7 +125,6 @@ def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
 
 def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
-        _assert_postgres_backend()
         cur = conn.cursor()
         q = (
             "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
@@ -150,7 +139,6 @@ def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
 
 def reset_workflow(*, workflow_id: str) -> None:
     with get_conn() as conn:
-        _assert_postgres_backend()
         cur = conn.cursor()
         cur.execute("DELETE FROM proc.supplier_response WHERE workflow_id=%s", (workflow_id,))
         cur.close()
