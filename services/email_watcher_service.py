@@ -20,12 +20,20 @@ class EmailWatcherService:
         self,
         *,
         poll_interval_seconds: Optional[int] = None,
+        post_dispatch_interval_seconds: Optional[int] = None,
         dispatch_wait_seconds: Optional[int] = None,
     ) -> None:
         if poll_interval_seconds is None:
-            poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="30")
+            poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
         if poll_interval_seconds <= 0:
-            poll_interval_seconds = 30
+            poll_interval_seconds = 90
+
+        if post_dispatch_interval_seconds is None:
+            post_dispatch_interval_seconds = self._env_int(
+                "EMAIL_WATCHER_SERVICE_POST_DISPATCH_INTERVAL", fallback="30"
+            )
+        if post_dispatch_interval_seconds <= 0:
+            post_dispatch_interval_seconds = 30
 
         if dispatch_wait_seconds is None:
             dispatch_wait_seconds = self._env_int("EMAIL_WATCHER_SERVICE_DISPATCH_WAIT", fallback="0")
@@ -33,6 +41,7 @@ class EmailWatcherService:
             dispatch_wait_seconds = 0
 
         self._poll_interval = poll_interval_seconds
+        self._post_dispatch_interval = post_dispatch_interval_seconds
         self._dispatch_wait = dispatch_wait_seconds
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -54,8 +63,9 @@ class EmailWatcherService:
         self._thread = threading.Thread(target=self._run_loop, name="EmailWatcherService", daemon=True)
         self._thread.start()
         logger.info(
-            "EmailWatcherService started (poll_interval=%ss dispatch_wait=%ss)",
+            "EmailWatcherService started (poll_interval=%ss post_dispatch_interval=%ss dispatch_wait=%ss)",
             self._poll_interval,
+            self._post_dispatch_interval,
             self._dispatch_wait,
         )
 
@@ -71,6 +81,8 @@ class EmailWatcherService:
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
+            waiting_for_dispatch = False
+            processed_workflow = False
             try:
                 workflow_ids = workflow_email_tracking_repo.load_active_workflow_ids()
             except Exception:
@@ -93,18 +105,22 @@ class EmailWatcherService:
                         orchestrator=None,
                     )
                     status = str(result.get("status") or "").lower()
+                    processed_workflow = True
                     if status == "failed":
                         logger.error(
                             "Email watcher service failed for workflow=%s: %s",
                             workflow_id,
                             result.get("reason") or result.get("error"),
                         )
+                    elif status == "waiting_for_dispatch":
+                        waiting_for_dispatch = True
                 except Exception:
                     logger.exception("Email watcher service encountered an error for workflow %s", workflow_id)
 
-            sleep_seconds = self._poll_interval
-            if sleep_seconds <= 0:
-                sleep_seconds = 30
+            if waiting_for_dispatch or not processed_workflow:
+                sleep_seconds = self._poll_interval
+            else:
+                sleep_seconds = self._post_dispatch_interval
 
             if self._stop_event.wait(timeout=sleep_seconds):
                 break

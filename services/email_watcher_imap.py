@@ -102,26 +102,63 @@ def run_email_watcher_for_workflow(
         }
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
+    imap_user = _env("IMAP_USER")
     imap_username = (
         _env("IMAP_USERNAME")
-        or _env("IMAP_USER")
         or _setting("imap_username", "imap_user", "imap_login")
+        or (imap_user.split("@")[0] if imap_user and "@" in imap_user else None)
     )
     imap_password = _env("IMAP_PASSWORD") or _setting("imap_password")
     imap_domain = _env("IMAP_DOMAIN") or _setting("imap_domain")
     imap_login = _env("IMAP_LOGIN") or _setting("imap_login")
-    if not imap_login and imap_domain and imap_username and "@" not in imap_username:
-        imap_login = f"{imap_username}@{imap_domain}"
+
+    def _normalise_domain(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        domain = value.strip()
+        if "@" in domain:
+            # When a full email is provided as the "domain" value, keep only the domain portion.
+            domain = domain.split("@", 1)[-1]
+        return domain or None
+
+    def _pick_login() -> Optional[str]:
+        if imap_login:
+            return imap_login.strip()
+        if imap_user:
+            candidate = imap_user.strip()
+            if candidate:
+                return candidate
+        username = (imap_username or "").strip()
+        if not username:
+            return None
+        if "@" in username:
+            return username
+        domain = _normalise_domain(imap_domain)
+        if domain:
+            return f"{username}@{domain}"
+        return username
+
+    imap_login = _pick_login()
     try:
         imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
     except Exception:
         imap_port = None
-    imap_use_ssl_raw = _env("IMAP_USE_SSL") or _setting("imap_use_ssl")
+    imap_use_ssl_raw = (
+        _env("IMAP_USE_SSL")
+        or _env("IMAP_ENCRYPTION")
+        or _setting("imap_use_ssl", "imap_encryption")
+    )
     imap_use_ssl: Optional[bool]
     if imap_use_ssl_raw is None:
         imap_use_ssl = None
     else:
-        imap_use_ssl = str(imap_use_ssl_raw).strip().lower() not in {"0", "false", "no"}
+        raw_value = str(imap_use_ssl_raw).strip().lower()
+        if raw_value in {"0", "false", "no", "none", "off"}:
+            imap_use_ssl = False
+        elif raw_value in {"ssl", "imaps", "true", "1", "yes", "on"}:
+            imap_use_ssl = True
+        else:
+            imap_use_ssl = True
     mailbox = (
         mailbox_name
         or _env("IMAP_MAILBOX")
