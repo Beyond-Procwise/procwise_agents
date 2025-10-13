@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List
 
 import pytest
-
-import sys
-from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -65,7 +64,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
 
     now = datetime.now(timezone.utc)
     unique_id = generate_unique_email_id(workflow_id, "sup-1")
-    original_subject = "RFQ request"
+    original_subject = "Quote request"
     original_message_id = "<msg-001>"
 
     responses = [
@@ -126,6 +125,12 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert result["responded_count"] == 1
     assert supplier_agent.contexts, "Supplier agent should be invoked"
     assert fetcher.calls >= 1
+
+    context = supplier_agent.contexts[0]
+    headers = context.input_data["email_headers"]
+    assert headers["unique_id"] == unique_id
+    assert headers["received_time"] is not None
+    assert "Thanks for the opportunity" in context.input_data["message"]
 
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []

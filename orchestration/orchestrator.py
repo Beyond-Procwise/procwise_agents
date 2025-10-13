@@ -199,7 +199,14 @@ class Orchestrator:
                 result=result,
                 status="completed",
             )
-            self._trigger_automatic_training(workflow_name)
+
+            if self._workflow_completed_successfully(result):
+                self._trigger_automatic_training(workflow_name)
+            else:
+                logger.info(
+                    "Skipping automatic training for %s due to unsuccessful workflow outcome",
+                    workflow_name,
+                )
 
             return {
                 "status": "completed",
@@ -528,6 +535,74 @@ class Orchestrator:
             logger.debug("Automatic training dispatch executed for %s", workflow_name)
         except Exception:  # pragma: no cover - defensive execution
             logger.exception("Automatic training dispatch failed for %s", workflow_name)
+
+    def _workflow_completed_successfully(self, result: Any) -> bool:
+        """Return ``True`` when the workflow outcome represents a success."""
+
+        status_flag = None
+        if isinstance(result, dict):
+            status_flag = self._normalise_status_flag(result.get("status"))
+            if status_flag is False:
+                return False
+            if self._has_error_payload(result.get("error")):
+                return False
+            if self._has_error_payload(result.get("errors")):
+                return False
+            ctx = result.get("ctx")
+            if isinstance(ctx, dict) and self._has_error_payload(ctx.get("errors")):
+                return False
+        elif hasattr(result, "status"):
+            status_flag = self._normalise_status_flag(getattr(result, "status"))
+            if status_flag is False:
+                return False
+            if self._has_error_payload(getattr(result, "error", None)):
+                return False
+
+        return status_flag is not False
+
+    @staticmethod
+    def _has_error_payload(payload: Any) -> bool:
+        """Return ``True`` when an error payload contains meaningful data."""
+
+        if not payload:
+            return False
+        if isinstance(payload, dict):
+            return any(Orchestrator._has_error_payload(value) for value in payload.values())
+        if isinstance(payload, (list, tuple, set)):
+            return any(Orchestrator._has_error_payload(value) for value in payload)
+        return True
+
+    @staticmethod
+    def _normalise_status_flag(status: Any) -> Optional[bool]:
+        """Interpret workflow status payloads into tri-state booleans."""
+
+        if status is None:
+            return None
+        if isinstance(status, bool):
+            return status
+        if isinstance(status, (int, float)):
+            return status > 0
+        if isinstance(status, str):
+            value = status.strip().lower()
+            if not value:
+                return None
+            if value in {"completed", "success", "succeeded", "ok", "done"}:
+                return True
+            if value in {
+                "failed",
+                "error",
+                "errored",
+                "blocked",
+                "incomplete",
+                "partial",
+                "pending",
+                "running",
+                "in_progress",
+                "queued",
+            }:
+                return False
+            return None
+        return None
 
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:
