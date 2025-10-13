@@ -5,9 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional
 
-from services import db
-
-get_conn = db.get_conn
+from services.db import get_conn
 
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
@@ -28,25 +26,6 @@ ON proc.supplier_response (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_supplier_response_supplier
 ON proc.supplier_response (supplier_id);
-"""
-
-DDL_SQLITE = """
-CREATE TABLE IF NOT EXISTS supplier_response (
-    workflow_id TEXT NOT NULL,
-    supplier_id TEXT,
-    unique_id TEXT NOT NULL,
-    response_text TEXT,
-    price TEXT,
-    lead_time INTEGER,
-    received_time TIMESTAMP NOT NULL,
-    PRIMARY KEY (workflow_id, unique_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_supplier_response_wf
-ON supplier_response (workflow_id);
-
-CREATE INDEX IF NOT EXISTS idx_supplier_response_supplier
-ON supplier_response (supplier_id);
 """
 
 @dataclass
@@ -93,14 +72,9 @@ def _ensure_postgres_column(cur, schema: str, table: str, column: str, definitio
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
-        if db.USING_SQLITE:
-            for statement in filter(None, (stmt.strip() for stmt in DDL_SQLITE.split(";"))):
-                cur.execute(statement)
-            conn.commit()
-        else:
-            for statement in filter(None, (stmt.strip() for stmt in DDL_PG.split(";"))):
-                cur.execute(statement)
-            _ensure_postgres_column(cur, "proc", "supplier_response", "response_text", "TEXT")
+        for statement in filter(None, (stmt.strip() for stmt in DDL_PG.split(";"))):
+            cur.execute(statement)
+        _ensure_postgres_column(cur, "proc", "supplier_response", "response_text", "TEXT")
         cur.close()
 
 
@@ -111,55 +85,29 @@ def insert_response(row: SupplierResponseRow) -> None:
 
     with get_conn() as conn:
         cur = conn.cursor()
-        if db.USING_SQLITE:
-            q = (
-                "INSERT INTO supplier_response "
-                "(workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
-                "supplier_id=excluded.supplier_id, "
-                "response_text=excluded.response_text, "
-                "price=excluded.price, "
-                "lead_time=excluded.lead_time, "
-                "received_time=excluded.received_time"
-            )
-            cur.execute(
-                q,
-                (
-                    row.workflow_id,
-                    row.supplier_id,
-                    row.unique_id,
-                    response_text,
-                    price_value,
-                    row.lead_time,
-                    received_time,
-                ),
-            )
-            conn.commit()
-        else:
-            q = (
-                "INSERT INTO proc.supplier_response "
-                "(workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
-                "supplier_id=EXCLUDED.supplier_id, "
-                "response_text=EXCLUDED.response_text, "
-                "price=EXCLUDED.price, "
-                "lead_time=EXCLUDED.lead_time, "
-                "received_time=EXCLUDED.received_time"
-            )
-            cur.execute(
-                q,
-                (
-                    row.workflow_id,
-                    row.supplier_id,
-                    row.unique_id,
-                    response_text,
-                    price_value,
-                    row.lead_time,
-                    received_time,
-                ),
-            )
+        q = (
+            "INSERT INTO proc.supplier_response "
+            "(workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
+            "supplier_id=EXCLUDED.supplier_id, "
+            "response_text=EXCLUDED.response_text, "
+            "price=EXCLUDED.price, "
+            "lead_time=EXCLUDED.lead_time, "
+            "received_time=EXCLUDED.received_time"
+        )
+        cur.execute(
+            q,
+            (
+                row.workflow_id,
+                row.supplier_id,
+                row.unique_id,
+                response_text,
+                price_value,
+                row.lead_time,
+                received_time,
+            ),
+        )
         cur.close()
 
 
@@ -170,37 +118,20 @@ def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
 
     with get_conn() as conn:
         cur = conn.cursor()
-        if db.USING_SQLITE:
-            placeholders = ",".join("?" for _ in ids)
-            q = (
-                f"DELETE FROM supplier_response "
-                f"WHERE workflow_id=? AND unique_id IN ({placeholders})"
-            )
-            cur.execute(q, (workflow_id, *ids))
-            conn.commit()
-        else:
-            q = "DELETE FROM proc.supplier_response WHERE workflow_id=%s AND unique_id = ANY(%s)"
-            cur.execute(q, (workflow_id, ids))
+        q = "DELETE FROM proc.supplier_response WHERE workflow_id=%s AND unique_id = ANY(%s)"
+        cur.execute(q, (workflow_id, ids))
         cur.close()
 
 
 def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
-        if db.USING_SQLITE:
-            q = (
-                "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
-                "FROM supplier_response WHERE workflow_id=?"
-            )
-            cur.execute(q, (workflow_id,))
-            cols = [desc[0] for desc in cur.description]
-        else:
-            q = (
-                "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
-                "FROM proc.supplier_response WHERE workflow_id=%s"
-            )
-            cur.execute(q, (workflow_id,))
-            cols = [c.name for c in cur.description]
+        q = (
+            "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
+            "FROM proc.supplier_response WHERE workflow_id=%s"
+        )
+        cur.execute(q, (workflow_id,))
+        cols = [c.name for c in cur.description]
         rows = [dict(zip(cols, rec)) for rec in cur.fetchall()]
         cur.close()
         return rows
@@ -209,9 +140,5 @@ def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
 def reset_workflow(*, workflow_id: str) -> None:
     with get_conn() as conn:
         cur = conn.cursor()
-        if db.USING_SQLITE:
-            cur.execute("DELETE FROM supplier_response WHERE workflow_id=?", (workflow_id,))
-            conn.commit()
-        else:
-            cur.execute("DELETE FROM proc.supplier_response WHERE workflow_id=%s", (workflow_id,))
+        cur.execute("DELETE FROM proc.supplier_response WHERE workflow_id=%s", (workflow_id,))
         cur.close()
