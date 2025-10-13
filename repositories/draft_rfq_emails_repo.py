@@ -1,8 +1,9 @@
 from __future__ import annotations
-from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
+import sqlite3
+from typing import Dict, List, Optional, Set, Tuple
 
-from services.db import get_conn, USING_SQLITE
+from services.db import get_conn
 
 # DDL is defensive: if tables don't exist (dev), create minimalist schemas
 DDL_PG = """
@@ -47,7 +48,7 @@ ON draft_rfq_emails (workflow_id);
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             cur.executescript(DDL_SQLITE)
         else:
             cur.execute(DDL_PG)
@@ -71,7 +72,7 @@ def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[
       - last dispatch time (max dispatched_at)
     """
     with get_conn() as conn:
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             q = "SELECT unique_id, supplier_id, dispatched_at FROM draft_rfq_emails WHERE workflow_id=?"
             params = [workflow_id]
             if run_id is not None:

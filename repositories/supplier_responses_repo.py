@@ -1,9 +1,10 @@
 from __future__ import annotations
-from typing import Any, Dict, Iterable, List, Optional
 from datetime import datetime, timezone
 import json
+import sqlite3
+from typing import Any, Dict, Iterable, List, Optional
 
-from services.db import get_conn, USING_SQLITE
+from services.db import get_conn
 
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
@@ -75,7 +76,7 @@ ON supplier_responses (supplier_id);
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             cur.executescript(DDL_SQLITE)
         else:
             cur.execute(DDL_PG)
@@ -106,7 +107,7 @@ def upsert_response(
     to_serial = ",".join([t for t in (to_addrs or [])])
 
     with get_conn() as conn:
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             q = """
 INSERT INTO supplier_responses
 (workflow_id, run_id, unique_id, supplier_id, message_id, mailbox, imap_uid, from_addr, to_addrs, subject,
@@ -162,7 +163,7 @@ def fetch_latest_for_workflow(*, workflow_id: str) -> List[Dict[str, Any]]:
     (since unique constraint enforces one per unique_id, this returns all current matches).
     """
     with get_conn() as conn:
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             q = """
 SELECT *
 FROM supplier_responses
@@ -193,7 +194,7 @@ def mark_processed_by_ids(ids: Iterable[int]) -> None:
     if not ids:
         return
     with get_conn() as conn:
-        if USING_SQLITE:
+        if isinstance(conn, sqlite3.Connection):
             q = "UPDATE supplier_responses SET processed_status='processed', processed_at=? WHERE id IN ({})".format(
                 ",".join(["?"] * len(ids))
             )
