@@ -181,25 +181,27 @@ def mark_processed(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
         cur.close()
 
 
-def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
+def fetch_pending(*, workflow_id: str, include_processed: bool = False) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
         if isinstance(conn, sqlite3.Connection):
-            q = (
+            base_query = (
                 "SELECT workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
                 "response_body, response_from, response_date, original_message_id, original_subject, match_confidence "
-                "FROM supplier_response WHERE workflow_id=? AND processed=0"
+                "FROM supplier_response WHERE workflow_id=?"
             )
+            q = base_query if include_processed else f"{base_query} AND processed=0"
             cur.execute(q, (workflow_id,))
             rows = [dict(zip([c[0] for c in cur.description], rec)) for rec in cur.fetchall()]
             cur.close()
             return rows
         else:
-            q = (
+            base_query = (
                 "SELECT workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
                 "response_body, response_from, response_date, original_message_id, original_subject, match_confidence "
-                "FROM proc.supplier_response WHERE workflow_id=%s AND processed=FALSE"
+                "FROM proc.supplier_response WHERE workflow_id=%s"
             )
+            q = base_query if include_processed else f"{base_query} AND processed=FALSE"
             cur.execute(q, (workflow_id,))
             cols = [c.name for c in cur.description]
             rows = [dict(zip(cols, rec)) for rec in cur.fetchall()]

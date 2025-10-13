@@ -106,8 +106,12 @@ def run_email_watcher_for_workflow(
     imap_username = (
         _env("IMAP_USERNAME")
         or _setting("imap_username", "imap_user", "imap_login")
-        or (imap_user.split("@")[0] if imap_user and "@" in imap_user else None)
     )
+    if not imap_username and imap_user:
+        if "@" in imap_user:
+            imap_username = imap_user.split("@", 1)[0]
+        else:
+            imap_username = imap_user
     imap_password = _env("IMAP_PASSWORD") or _setting("imap_password")
     imap_domain = _env("IMAP_DOMAIN") or _setting("imap_domain")
     imap_login = _env("IMAP_LOGIN") or _setting("imap_login")
