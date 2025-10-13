@@ -4,7 +4,7 @@ import re
 import imaplib
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -157,6 +157,18 @@ class SupplierInteractionAgent(BaseAgent):
             "match_confidence": row.get("match_confidence"),
         }
 
+    @staticmethod
+    def _normalise_timestamp(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
     def _load_dispatch_metadata(self, workflow_id: str) -> Optional[Dict[str, Any]]:
         try:
             workflow_email_tracking_repo.init_schema()
@@ -234,6 +246,9 @@ class SupplierInteractionAgent(BaseAgent):
         attempts = 0
         collected: List[Dict[str, Any]] = []
 
+        dispatch_cutoff = self._normalise_timestamp(last_dispatched_at)
+        dispatch_cutoff = dispatch_cutoff or last_dispatched_at
+
         while True:
             pending_rows = supplier_response_repo.fetch_pending(
                 workflow_id=workflow_id,
@@ -244,6 +259,14 @@ class SupplierInteractionAgent(BaseAgent):
                 for row in pending_rows
                 if isinstance(row, dict)
             ]
+
+            if dispatch_cutoff:
+                filtered: List[Dict[str, Any]] = []
+                for row in serialised:
+                    received_at = self._normalise_timestamp(row.get("received_at"))
+                    if received_at is None or received_at >= dispatch_cutoff:
+                        filtered.append(row)
+                serialised = filtered
 
             if supplier_filter:
                 normalised_filter = {
