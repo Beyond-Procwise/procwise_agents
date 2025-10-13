@@ -414,7 +414,10 @@ class EmailWatcherV2:
             login=self._imap_login,
         )
 
-    def _match_responses(self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]) -> None:
+    def _match_responses(
+        self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
+    ) -> List[str]:
+        matched: List[str] = []
         for email in responses:
             matched_id: Optional[str] = None
             best_score = 0.0
@@ -444,17 +447,12 @@ class EmailWatcherV2:
                         workflow_id=tracker.workflow_id,
                         unique_id=matched_id,
                         supplier_id=email.supplier_id,
-                        supplier_email=email.from_address,
-                        response_message_id=email.message_id,
-                        response_subject=email.subject,
-                        response_body=email.body,
-                        response_from=email.from_address,
-                        response_date=email.received_at,
-                        original_message_id=tracker.email_records[matched_id].message_id,
-                        original_subject=tracker.email_records[matched_id].subject,
-                        match_confidence=float(best_score),
+                        response_text=email.body,
+                        received_time=email.received_at,
                     )
                 )
+                matched.append(matched_id)
+        return matched
 
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
@@ -483,7 +481,9 @@ class EmailWatcherV2:
         since = tracker.last_dispatched_at or (self._now() - timedelta(hours=4))
         while attempts < self.max_poll_attempts and not tracker.all_responded:
             responses = self._fetch_emails(since)
-            self._match_responses(tracker, responses)
+            matched_ids = self._match_responses(tracker, responses)
+            if matched_ids:
+                self._process_agents(tracker)
             if tracker.all_responded:
                 break
             attempts += 1
@@ -498,8 +498,7 @@ class EmailWatcherV2:
             "matched_responses": tracker.matched_responses,
         }
 
-        if complete:
-            self._process_agents(tracker)
+        self._process_agents(tracker)
 
         return result
 
@@ -510,19 +509,23 @@ class EmailWatcherV2:
         pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
         processed_ids: List[str] = []
         for row in pending_rows:
+            matched_response = tracker.matched_responses.get(row.get("unique_id"))
             context = AgentContext(
                 workflow_id=tracker.workflow_id,
                 agent_id="EmailWatcherV2",
                 user_id="system",
                 input_data={
-                    "message": row.get("response_body", ""),
+                    "message": row.get("response_text", ""),
                     "email_headers": {
-                        "message_id": row.get("response_message_id"),
-                        "subject": row.get("response_subject"),
-                        "from": row.get("response_from"),
+                        "message_id": matched_response.message_id if matched_response else None,
+                        "subject": matched_response.subject if matched_response else None,
+                        "from": matched_response.from_address if matched_response else None,
                         "workflow_id": tracker.workflow_id,
                         "unique_id": row.get("unique_id"),
                         "supplier_id": row.get("supplier_id"),
+                        "price": row.get("price"),
+                        "lead_time": row.get("lead_time"),
+                        "received_time": row.get("received_time"),
                     },
                 },
             )
@@ -553,4 +556,4 @@ class EmailWatcherV2:
                 except Exception:
                     logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
 
-        supplier_response_repo.mark_processed(workflow_id=tracker.workflow_id, unique_ids=processed_ids)
+        supplier_response_repo.delete_responses(workflow_id=tracker.workflow_id, unique_ids=processed_ids)

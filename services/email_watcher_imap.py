@@ -48,17 +48,15 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
         "workflow_id": row.get("workflow_id"),
         "unique_id": row.get("unique_id"),
         "supplier_id": row.get("supplier_id"),
-        "supplier_email": row.get("supplier_email"),
-        "body_text": row.get("response_body", ""),
-        "subject": row.get("response_subject"),
-        "from_addr": row.get("response_from"),
-        "message_id": row.get("response_message_id"),
-        "received_at": row.get("response_date"),
+        "body_text": row.get("response_text", ""),
+        "subject": row.get("subject"),
+        "from_addr": row.get("from_addr"),
+        "message_id": row.get("message_id"),
+        "received_at": row.get("received_time"),
         "mailbox": mailbox,
         "imap_uid": None,
-        "match_confidence": row.get("match_confidence"),
-        "original_message_id": row.get("original_message_id"),
-        "original_subject": row.get("original_subject"),
+        "price": row.get("price"),
+        "lead_time": row.get("lead_time"),
     }
 
 
@@ -273,13 +271,13 @@ def run_email_watcher_for_workflow(
 
     if matched_ids:
         try:
-            supplier_response_repo.mark_processed(
+            supplier_response_repo.delete_responses(
                 workflow_id=workflow_key,
                 unique_ids=matched_ids,
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
-                "Failed to mark supplier responses processed for workflow %s",
+                "Failed to remove supplier responses for workflow %s",
                 workflow_key,
             )
 

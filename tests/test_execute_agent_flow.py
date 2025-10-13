@@ -3,6 +3,8 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict
 
+import pytest
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from orchestration.orchestrator import Orchestrator
@@ -985,4 +987,78 @@ def test_json_flow_uses_flow_level_workflow_hint():
     orchestrator.execute_agent_flow(flow, {})
 
     assert captured["input"]["workflow"] == "price_variance_check"
+
+
+def test_execute_workflow_skips_training_for_failed_result(monkeypatch):
+    class AllowAllPolicy:
+        def validate_workflow(self, *_, **__):
+            return {"allowed": True}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(
+            script_user="tester",
+            max_workers=1,
+            parallel_processing=False,
+            enable_learning=True,
+        ),
+        agents={},
+        policy_engine=AllowAllPolicy(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model={}),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator.model_training_endpoint = object()
+
+    called = {"value": False}
+
+    def fake_trigger(self, workflow_name: str) -> None:
+        called["value"] = True
+
+    def fake_generic(self, workflow_name: str, context: AgentContext) -> Dict[str, Any]:
+        return {"status": 0, "ctx": {"errors": {"step": "boom"}}}
+
+    monkeypatch.setattr(Orchestrator, "_trigger_automatic_training", fake_trigger)
+    monkeypatch.setattr(Orchestrator, "_execute_generic_workflow", fake_generic)
+
+    orchestrator.execute_workflow("generic", {})
+
+    assert called["value"] is False
+
+
+def test_execute_workflow_triggers_training_after_success(monkeypatch):
+    class AllowAllPolicy:
+        def validate_workflow(self, *_, **__):
+            return {"allowed": True}
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(
+            script_user="tester",
+            max_workers=1,
+            parallel_processing=False,
+            enable_learning=True,
+        ),
+        agents={},
+        policy_engine=AllowAllPolicy(),
+        query_engine=SimpleNamespace(),
+        routing_engine=SimpleNamespace(routing_model={}),
+    )
+
+    orchestrator = Orchestrator(nick)
+    orchestrator.model_training_endpoint = object()
+
+    called = {"value": False}
+
+    def fake_trigger(self, workflow_name: str) -> None:
+        called["value"] = True
+
+    def fake_generic(self, workflow_name: str, context: AgentContext) -> Dict[str, Any]:
+        return {"status": 100, "ctx": {"errors": {}}}
+
+    monkeypatch.setattr(Orchestrator, "_trigger_automatic_training", fake_trigger)
+    monkeypatch.setattr(Orchestrator, "_execute_generic_workflow", fake_generic)
+
+    orchestrator.execute_workflow("generic", {})
+
+    assert called["value"] is True
 

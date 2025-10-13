@@ -100,14 +100,14 @@ class SupplierInteractionAgent(BaseAgent):
 
     @staticmethod
     def _response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-        body = row.get("body_text") or row.get("response_body") or ""
-        subject = row.get("subject") or row.get("response_subject") or ""
+        body = row.get("body_text") or row.get("response_text") or ""
+        subject = row.get("subject") or ""
         supplier_id = row.get("supplier_id")
         workflow_id = row.get("workflow_id")
         unique_id = row.get("unique_id")
-        message_id = row.get("message_id") or row.get("response_message_id")
-        from_addr = row.get("from_addr") or row.get("response_from")
-        received_at = row.get("received_at") or row.get("response_date")
+        message_id = row.get("message_id")
+        from_addr = row.get("from_addr")
+        received_at = row.get("received_at") or row.get("received_time")
         response = {
             "workflow_id": workflow_id,
             "unique_id": unique_id,
@@ -124,6 +124,9 @@ class SupplierInteractionAgent(BaseAgent):
                 "supplier_id": supplier_id,
                 "workflow_id": workflow_id,
                 "unique_id": unique_id,
+                "price": row.get("price"),
+                "lead_time": row.get("lead_time"),
+                "received_time": received_at,
             },
         }
         headers = {
@@ -134,6 +137,9 @@ class SupplierInteractionAgent(BaseAgent):
             "workflow_id": workflow_id,
             "unique_id": unique_id,
             "supplier_id": supplier_id,
+            "price": row.get("price"),
+            "lead_time": row.get("lead_time"),
+            "received_time": received_at,
         }
         response["email_headers"] = headers
         return response
@@ -146,15 +152,13 @@ class SupplierInteractionAgent(BaseAgent):
             "workflow_id": row.get("workflow_id"),
             "unique_id": row.get("unique_id"),
             "supplier_id": row.get("supplier_id"),
-            "supplier_email": row.get("supplier_email"),
-            "body_text": row.get("response_body") or "",
-            "subject": row.get("response_subject"),
-            "message_id": row.get("response_message_id"),
-            "from_addr": row.get("response_from"),
-            "received_at": row.get("response_date"),
-            "mailbox": row.get("mailbox"),
-            "imap_uid": row.get("imap_uid"),
-            "match_confidence": row.get("match_confidence"),
+            "body_text": row.get("response_text") or "",
+            "subject": row.get("subject"),
+            "message_id": row.get("message_id"),
+            "from_addr": row.get("from_addr"),
+            "received_at": row.get("received_time"),
+            "price": row.get("price"),
+            "lead_time": row.get("lead_time"),
         }
 
     def _load_dispatch_metadata(self, workflow_id: str) -> Optional[Dict[str, Any]]:
@@ -903,8 +907,7 @@ class SupplierInteractionAgent(BaseAgent):
         workflow_key = self._coerce_text(workflow_id)
         if not workflow_key:
             logger.error(
-                "wait_for_response requires workflow_id; received rfq_id=%s supplier=%s",
-                rfq_id,
+                "wait_for_response requires workflow_id; supplier=%s",
                 supplier_id,
             )
             return None

@@ -22,6 +22,8 @@ from utils.email_tracking import (
 )
 from utils.gpu import configure_gpu
 
+from services.backend_scheduler import BackendScheduler
+
 from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
 from .email_service import EmailService
 from .email_thread_store import (
@@ -255,6 +257,15 @@ class EmailDispatchService:
                                 )
                             ],
                         )
+                        try:
+                            BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
+                                workflow_identifier
+                            )
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception(
+                                "Failed to trigger email watcher for workflow %s",
+                                workflow_identifier,
+                            )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
                             "Failed to record workflow email dispatch for workflow %s",

@@ -1,64 +1,52 @@
-"""Helpers for persisting supplier responses captured by EmailWatcherV2."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional
 
 import sqlite3
 
 from services.db import get_conn
 
-
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
 
 CREATE TABLE IF NOT EXISTS proc.supplier_response (
-    id BIGSERIAL PRIMARY KEY,
     workflow_id TEXT NOT NULL,
-    unique_id TEXT NOT NULL,
     supplier_id TEXT,
-    supplier_email TEXT,
-    response_message_id TEXT,
-    response_subject TEXT,
-    response_body TEXT,
-    response_from TEXT,
-    response_date TIMESTAMPTZ,
-    original_message_id TEXT,
-    original_subject TEXT,
-    match_confidence NUMERIC(3,2),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    processed BOOLEAN DEFAULT FALSE,
-    UNIQUE (workflow_id, unique_id)
+    unique_id TEXT NOT NULL,
+    response_text TEXT,
+    price NUMERIC(18, 4),
+    lead_time INTEGER,
+    received_time TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (workflow_id, unique_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_supplier_response_wf
 ON proc.supplier_response (workflow_id);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_response_supplier
+ON proc.supplier_response (supplier_id);
 """
 
 DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS supplier_response (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     workflow_id TEXT NOT NULL,
-    unique_id TEXT NOT NULL,
     supplier_id TEXT,
-    supplier_email TEXT,
-    response_message_id TEXT,
-    response_subject TEXT,
-    response_body TEXT,
-    response_from TEXT,
-    response_date TEXT,
-    original_message_id TEXT,
-    original_subject TEXT,
-    match_confidence REAL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    processed INTEGER DEFAULT 0,
-    UNIQUE (workflow_id, unique_id)
+    unique_id TEXT NOT NULL,
+    response_text TEXT,
+    price REAL,
+    lead_time INTEGER,
+    received_time TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, unique_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_supplier_response_wf
 ON supplier_response (workflow_id);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_response_supplier
+ON supplier_response (supplier_id);
 """
 
 
@@ -67,24 +55,22 @@ class SupplierResponseRow:
     workflow_id: str
     unique_id: str
     supplier_id: Optional[str]
-    supplier_email: Optional[str]
-    response_message_id: Optional[str]
-    response_subject: Optional[str]
-    response_body: str
-    response_from: Optional[str]
-    response_date: Optional[datetime]
-    original_message_id: Optional[str]
-    original_subject: Optional[str]
-    match_confidence: float
-    processed: bool = False
+    response_text: str
+    received_time: datetime
+    price: Optional[Decimal] = None
+    lead_time: Optional[int] = None
 
 
-def _normalise_dt(value: Optional[datetime]) -> Optional[datetime]:
+def _normalise_dt(value: datetime) -> datetime:
+    if value.tzinfo:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _serialise_decimal(value: Optional[Decimal]) -> Optional[str]:
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    raise TypeError("expected datetime for response_date")
+    return str(value)
 
 
 def init_schema() -> None:
@@ -98,70 +84,65 @@ def init_schema() -> None:
 
 
 def insert_response(row: SupplierResponseRow) -> None:
-    body = row.response_body or ""
-    params_common = (
-        row.workflow_id,
-        row.unique_id,
-        row.supplier_id,
-        row.supplier_email,
-        row.response_message_id,
-        row.response_subject,
-        body,
-        row.response_from,
-        _normalise_dt(row.response_date) if row.response_date else None,
-        row.original_message_id,
-        row.original_subject,
-        float(row.match_confidence),
-        1 if row.processed else 0,
-    )
+    response_text = row.response_text or ""
+    received_time = _normalise_dt(row.received_time)
+    price_value = _serialise_decimal(row.price)
 
     with get_conn() as conn:
         cur = conn.cursor()
         if isinstance(conn, sqlite3.Connection):
             q = (
                 "INSERT INTO supplier_response "
-                "(workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
-                "response_body, response_from, response_date, original_message_id, original_subject, match_confidence, processed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "(workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
                 "supplier_id=excluded.supplier_id, "
-                "supplier_email=excluded.supplier_email, "
-                "response_message_id=excluded.response_message_id, "
-                "response_subject=excluded.response_subject, "
-                "response_body=excluded.response_body, "
-                "response_from=excluded.response_from, "
-                "response_date=excluded.response_date, "
-                "original_message_id=excluded.original_message_id, "
-                "original_subject=excluded.original_subject, "
-                "match_confidence=excluded.match_confidence, "
-                "processed=excluded.processed"
+                "response_text=excluded.response_text, "
+                "price=excluded.price, "
+                "lead_time=excluded.lead_time, "
+                "received_time=excluded.received_time"
             )
-            cur.execute(q, params_common)
+            cur.execute(
+                q,
+                (
+                    row.workflow_id,
+                    row.supplier_id,
+                    row.unique_id,
+                    response_text,
+                    price_value,
+                    row.lead_time,
+                    received_time.isoformat(),
+                ),
+            )
             conn.commit()
         else:
             q = (
                 "INSERT INTO proc.supplier_response "
-                "(workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
-                "response_body, response_from, response_date, original_message_id, original_subject, match_confidence, processed) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "(workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
                 "supplier_id=EXCLUDED.supplier_id, "
-                "supplier_email=EXCLUDED.supplier_email, "
-                "response_message_id=EXCLUDED.response_message_id, "
-                "response_subject=EXCLUDED.response_subject, "
-                "response_body=EXCLUDED.response_body, "
-                "response_from=EXCLUDED.response_from, "
-                "response_date=EXCLUDED.response_date, "
-                "original_message_id=EXCLUDED.original_message_id, "
-                "original_subject=EXCLUDED.original_subject, "
-                "match_confidence=EXCLUDED.match_confidence, "
-                "processed=EXCLUDED.processed"
+                "response_text=EXCLUDED.response_text, "
+                "price=EXCLUDED.price, "
+                "lead_time=EXCLUDED.lead_time, "
+                "received_time=EXCLUDED.received_time"
             )
-            cur.execute(q, params_common)
+            cur.execute(
+                q,
+                (
+                    row.workflow_id,
+                    row.supplier_id,
+                    row.unique_id,
+                    response_text,
+                    price_value,
+                    row.lead_time,
+                    received_time,
+                ),
+            )
         cur.close()
 
 
-def mark_processed(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
+def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
     ids = [uid for uid in unique_ids if uid]
     if not ids:
         return
@@ -170,13 +151,11 @@ def mark_processed(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
         cur = conn.cursor()
         if isinstance(conn, sqlite3.Connection):
             placeholders = ",".join(["?"] * len(ids))
-            q = f"UPDATE supplier_response SET processed=1 WHERE workflow_id=? AND unique_id IN ({placeholders})"
+            q = f"DELETE FROM supplier_response WHERE workflow_id=? AND unique_id IN ({placeholders})"
             cur.execute(q, [workflow_id, *ids])
             conn.commit()
         else:
-            q = (
-                "UPDATE proc.supplier_response SET processed=TRUE WHERE workflow_id=%s AND unique_id = ANY(%s)"
-            )
+            q = "DELETE FROM proc.supplier_response WHERE workflow_id=%s AND unique_id = ANY(%s)"
             cur.execute(q, (workflow_id, ids))
         cur.close()
 
@@ -186,9 +165,8 @@ def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
         cur = conn.cursor()
         if isinstance(conn, sqlite3.Connection):
             q = (
-                "SELECT workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
-                "response_body, response_from, response_date, original_message_id, original_subject, match_confidence "
-                "FROM supplier_response WHERE workflow_id=? AND processed=0"
+                "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
+                "FROM supplier_response WHERE workflow_id=?"
             )
             cur.execute(q, (workflow_id,))
             rows = [dict(zip([c[0] for c in cur.description], rec)) for rec in cur.fetchall()]
@@ -196,9 +174,8 @@ def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
             return rows
         else:
             q = (
-                "SELECT workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
-                "response_body, response_from, response_date, original_message_id, original_subject, match_confidence "
-                "FROM proc.supplier_response WHERE workflow_id=%s AND processed=FALSE"
+                "SELECT workflow_id, supplier_id, unique_id, response_text, price, lead_time, received_time "
+                "FROM proc.supplier_response WHERE workflow_id=%s"
             )
             cur.execute(q, (workflow_id,))
             cols = [c.name for c in cur.description]

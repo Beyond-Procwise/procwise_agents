@@ -8,6 +8,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import services.backend_scheduler as backend_scheduler
 
 
+class DummyEmailWatcher:
+    def __init__(self, *_, **__):
+        self.started = False
+        self.notifications: list[str] = []
+
+    def start(self):
+        self.started = True
+
+    def stop(self, timeout: float = 5.0):  # pragma: no cover - simple stub
+        self.started = False
+
+    def notify_workflow(self, workflow_id: str):
+        self.notifications.append(workflow_id)
+
+
 class DummyTrainingEndpoint:
     def __init__(self):
         self.dispatched = []
@@ -41,6 +56,7 @@ def _prepare_scheduler(monkeypatch, nick, endpoint=None):
         "start",
         lambda self: None,
     )
+    monkeypatch.setattr(backend_scheduler, "EmailWatcherService", DummyEmailWatcher)
     if endpoint is not None:
         monkeypatch.setattr(
             backend_scheduler.BackendScheduler,
@@ -62,6 +78,8 @@ def test_submit_once_executes_and_removes_job(monkeypatch):
 
     assert executed == ["ran"]
     assert "once" not in scheduler._jobs
+    assert isinstance(scheduler._email_watcher_service, DummyEmailWatcher)
+    assert scheduler._email_watcher_service.started is True
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None
@@ -113,6 +131,17 @@ def test_ensure_updates_training_endpoint_reference(monkeypatch):
         SimpleNamespace(), training_endpoint=second_endpoint
     )
     assert scheduler._training_endpoint is second_endpoint
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
+
+def test_notify_email_dispatch_wakes_watcher(monkeypatch):
+    scheduler = _prepare_scheduler(monkeypatch, SimpleNamespace())
+
+    scheduler.notify_email_dispatch("wf-demo")
+
+    assert scheduler._email_watcher_service.notifications == ["wf-demo"]
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None
