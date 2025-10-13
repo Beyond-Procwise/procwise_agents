@@ -5,10 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from utils.email_tracking import build_tracking_comment, ensure_tracking_prefix, strip_tracking_comment
+from repositories.workflow_email_tracking_repo import (
+    WorkflowDispatchRow,
+    init_schema as init_tracking_schema,
+    record_dispatches as record_workflow_dispatches,
+)
+from utils.email_tracking import (
+    build_tracking_comment,
+    embed_unique_id_in_email_body,
+    ensure_tracking_prefix,
+    generate_unique_email_id,
+    strip_tracking_comment,
+)
 from utils.gpu import configure_gpu
 
 from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
@@ -208,10 +219,47 @@ class EmailDispatchService:
                         recipients=recipient_list,
                         metadata=backend_metadata,
                     )
+                    conn.commit()
                 except Exception:  # pragma: no cover - best effort logging
                     self.logger.exception(
                         "Failed to register dispatch chain for RFQ %s", rfq_id
                     )
+                workflow_identifier = backend_metadata.get("workflow_id")
+                unique_identifier = backend_metadata.get("unique_id")
+                if workflow_identifier and unique_identifier:
+                    try:
+                        init_tracking_schema()
+                        record_workflow_dispatches(
+                            workflow_id=workflow_identifier,
+                            dispatches=[
+                                WorkflowDispatchRow(
+                                    workflow_id=workflow_identifier,
+                                    unique_id=unique_identifier,
+                                    supplier_id=str(
+                                        backend_metadata.get("supplier_id")
+                                        or draft.get("supplier_id")
+                                        or ""
+                                    )
+                                    or None,
+                                    supplier_email=(
+                                        recipient_list[0]
+                                        if recipient_list
+                                        else draft.get("receiver")
+                                    ),
+                                    message_id=message_id,
+                                    subject=subject,
+                                    dispatched_at=datetime.now(timezone.utc),
+                                    responded_at=None,
+                                    response_message_id=None,
+                                    matched=False,
+                                )
+                            ],
+                        )
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to record workflow email dispatch for workflow %s",
+                            workflow_identifier,
+                        )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
 
@@ -247,6 +295,10 @@ class EmailDispatchService:
             return cur.fetchone()
 
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
+        values = list(row)
+        if len(values) < 19:
+            values.extend([None] * (19 - len(values)))
+
         (
             draft_id,
             rfq_id,
@@ -267,7 +319,7 @@ class EmailDispatchService:
             mailbox,
             dispatch_run_id,
             dispatched_at,
-        ) = row
+        ) = values[:19]
 
         hydrated: Dict[str, Any]
         if isinstance(payload, dict):
@@ -321,7 +373,11 @@ class EmailDispatchService:
         recipients: Sequence[str],
         sent: bool,
     ) -> None:
-        draft_id = row[0]
+        values = list(row)
+        if len(values) < 19:
+            values.extend([None] * (19 - len(values)))
+
+        draft_id = values[0]
         recipient = recipients[0] if recipients else payload.get("receiver")
         try:
             contact_level = int(payload.get("contact_level", 1 if recipients else 0))
@@ -331,14 +387,14 @@ class EmailDispatchService:
         payload["sent_status"] = bool(sent)
         payload_json = json.dumps(payload, default=str)
 
-        supplier_id = payload.get("supplier_id") or row[2]
-        supplier_name = payload.get("supplier_name") or row[3]
-        rfq_value = payload.get("rfq_id") or row[1]
-        workflow_id = payload.get("workflow_id") or row[13]
-        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or row[14]
-        unique_id = payload.get("unique_id") or row[15] or uuid.uuid4().hex
-        mailbox = payload.get("mailbox") or row[16]
-        dispatch_run_id = payload.get("dispatch_run_id") or row[17]
+        supplier_id = payload.get("supplier_id") or values[2]
+        supplier_name = payload.get("supplier_name") or values[3]
+        rfq_value = payload.get("rfq_id") or values[1]
+        workflow_id = payload.get("workflow_id") or values[13]
+        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or values[14]
+        unique_id = payload.get("unique_id") or values[15] or uuid.uuid4().hex
+        mailbox = payload.get("mailbox") or values[16]
+        dispatch_run_id = payload.get("dispatch_run_id") or values[17]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -513,6 +569,11 @@ class EmailDispatchService:
         resolved_token = dispatch_token or (existing_metadata.token if existing_metadata else None)
         resolved_run = run_id or (existing_metadata.run_id if existing_metadata else None)
         resolved_unique = unique_id or (existing_metadata.unique_id if existing_metadata else None)
+        if not resolved_unique:
+            resolved_unique = generate_unique_email_id(
+                resolved_workflow,
+                resolved_supplier,
+            )
 
         comment, tracking_meta = build_tracking_comment(
             workflow_id=resolved_workflow,
@@ -524,6 +585,10 @@ class EmailDispatchService:
 
         base_body = (cleaned_body or text).strip()
         annotated_body = ensure_tracking_prefix(base_body, comment)
+        annotated_body = embed_unique_id_in_email_body(
+            annotated_body,
+            tracking_meta.unique_id,
+        )
 
         metadata: Dict[str, Any] = {
             "workflow_id": tracking_meta.workflow_id,
