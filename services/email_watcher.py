@@ -4979,12 +4979,39 @@ class SESEmailWatcher:
                 return
             visited.add(id(entry))
 
+            def _inherit_field(source: Dict[str, object], field: str) -> None:
+                if entry.get(field) in (None, ""):
+                    candidate = source.get(field)
+                    if candidate not in (None, ""):
+                        entry[field] = candidate
+
+            for container_key in ("draft", "dispatch"):
+                candidate = entry.get(container_key)
+                if isinstance(candidate, dict):
+                    _inherit_field(candidate, "supplier_id")
+                    _inherit_field(candidate, "recipients")
+                    nested = candidate.get("draft") if isinstance(candidate.get("draft"), dict) else None
+                    if isinstance(nested, dict):
+                        _inherit_field(nested, "supplier_id")
+                        _inherit_field(nested, "recipients")
+
+            if "draft" in entry and not entry.get("dispatches") and not entry.get("drafts"):
+                # Pure metadata container; rely on nested draft entries instead
+                return
+
             def _has_signal(value: object) -> bool:
                 if value in (None, "", False, 0):
                     return False
                 if isinstance(value, (list, tuple, set, dict)):
                     return bool(value)
                 return True
+
+            has_recipient_or_id = any(
+                entry.get(key) not in (None, "")
+                for key in ("recipients", "draft_record_id", "id", "message_id", "dispatch_message_id")
+            )
+            if entry.get("supplier_id") not in (None, "") and not has_recipient_or_id:
+                return
 
             if not any(
                 _has_signal(entry.get(key))
@@ -5220,6 +5247,9 @@ class SESEmailWatcher:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    sent_counts: List[int] = []
+                    needs_fallback = False
+
                     if expectation.draft_ids:
                         cur.execute(
                             """
@@ -5229,21 +5259,66 @@ class SESEmailWatcher:
                             """,
                             (list(expectation.draft_ids),),
                         )
+                        row = cur.fetchone()
+                        id_count = int(row[0]) if row else 0
+                        sent_counts.append(id_count)
+                        if expectation.action_id and (
+                            len(expectation.draft_ids) < expectation.draft_count
+                            or id_count < expectation.draft_count
+                        ):
+                            needs_fallback = True
                     elif expectation.action_id:
+                        needs_fallback = True
+                    else:
+                        return None
+
+                    if expectation.action_id and needs_fallback:
+                        action_id = expectation.action_id
+                        try:
+                            fallback_params = (
+                                json.dumps({"action_id": action_id}),
+                                json.dumps({"draft_action_id": action_id}),
+                                json.dumps({"email_action_id": action_id}),
+                                json.dumps({"action_id": action_id}),
+                                json.dumps({"draft_action_id": action_id}),
+                                json.dumps({"email_action_id": action_id}),
+                                json.dumps({"action_id": action_id}),
+                            )
+                        except Exception:
+                            fallback_params = (
+                                json.dumps({"action_id": str(action_id)}),
+                                json.dumps({"draft_action_id": str(action_id)}),
+                                json.dumps({"email_action_id": str(action_id)}),
+                                json.dumps({"action_id": str(action_id)}),
+                                json.dumps({"draft_action_id": str(action_id)}),
+                                json.dumps({"email_action_id": str(action_id)}),
+                                json.dumps({"action_id": str(action_id)}),
+                            )
+
                         cur.execute(
                             """
                             SELECT COUNT(*)
                             FROM proc.draft_rfq_emails
-                            WHERE sent = TRUE AND payload::jsonb ->> 'action_id' = %s
+                            WHERE sent = TRUE
+                              AND (
+                                payload::jsonb @> %s::jsonb
+                                OR payload::jsonb @> %s::jsonb
+                                OR payload::jsonb @> %s::jsonb
+                                OR payload::jsonb -> 'metadata' @> %s::jsonb
+                                OR payload::jsonb -> 'metadata' @> %s::jsonb
+                                OR payload::jsonb -> 'metadata' @> %s::jsonb
+                                OR payload::jsonb -> 'dispatch_metadata' @> %s::jsonb
+                              )
                             """,
-                            (expectation.action_id,),
+                            fallback_params,
                         )
-                    else:
-                        return None
-                    row = cur.fetchone()
-                    if not row:
+                        row = cur.fetchone()
+                        sent_counts.append(int(row[0]) if row else 0)
+
+                    if not sent_counts:
                         return 0
-                    return int(row[0])
+
+                    return max(sent_counts)
         except Exception:
             logger.exception(
                 "Failed to count sent drafts for action=%s",
