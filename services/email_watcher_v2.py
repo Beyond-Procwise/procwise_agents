@@ -90,12 +90,14 @@ def _imap_client(
     *,
     port: int = 993,
     use_ssl: bool = True,
+    login: Optional[str] = None,
 ) -> imaplib.IMAP4:
     if use_ssl:
         client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port)
     else:  # pragma: no cover - plain IMAP only used in limited environments
         client = imaplib.IMAP4(host, port)
-    client.login(username, password)
+    login_name = login or username
+    client.login(login_name, password)
     return client
 
 
@@ -194,8 +196,11 @@ def _default_fetcher(
     password: str,
     mailbox: str,
     since: datetime,
+    port: int = 993,
+    use_ssl: bool = True,
+    login: Optional[str] = None,
 ) -> List[EmailResponse]:
-    client = _imap_client(host, username, password)
+    client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
         since_str = since.strftime("%d-%b-%Y")
@@ -269,6 +274,9 @@ class EmailWatcherV2:
         imap_host: Optional[str] = None,
         imap_username: Optional[str] = None,
         imap_password: Optional[str] = None,
+        imap_port: Optional[int] = None,
+        imap_use_ssl: Optional[bool] = None,
+        imap_login: Optional[str] = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -283,6 +291,9 @@ class EmailWatcherV2:
         self._imap_host = imap_host
         self._imap_username = imap_username
         self._imap_password = imap_password
+        self._imap_port = imap_port
+        self._imap_use_ssl = imap_use_ssl
+        self._imap_login = imap_login
         self._sleep = sleep
         self._now = now
         self._trackers: Dict[str, WorkflowTracker] = {}
@@ -398,6 +409,9 @@ class EmailWatcherV2:
             password=self._imap_password,
             mailbox=self._mailbox,
             since=since,
+            port=self._imap_port or 993,
+            use_ssl=True if self._imap_use_ssl is None else self._imap_use_ssl,
+            login=self._imap_login,
         )
 
     def _match_responses(self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]) -> None:
