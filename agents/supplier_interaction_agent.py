@@ -618,13 +618,67 @@ class SupplierInteractionAgent(BaseAgent):
 
         orchestrator = getattr(self.agent_nick, "orchestrator", None)
 
-        watcher_result = run_email_watcher_for_workflow(
-            workflow_id=workflow_key,
-            run_id=run_identifier,
-            wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
-            agent_registry=None,
-            orchestrator=orchestrator,
+        poll_seconds = (
+            self._coerce_int(poll_interval, default=0)
+            if poll_interval is not None
+            else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
         )
+        if poll_seconds is None:
+            poll_seconds = 60
+        try:
+            poll_seconds = int(poll_seconds)
+        except Exception:
+            poll_seconds = 60
+        if poll_seconds <= 0:
+            poll_seconds = 60
+
+        try:
+            timeout_seconds = int(timeout) if timeout is not None else 0
+        except Exception:
+            timeout_seconds = 0
+        if timeout_seconds < 0:
+            timeout_seconds = 0
+
+        deadline = time.time() + timeout_seconds
+        watcher_result: Dict[str, Any] = {}
+
+        while True:
+            watcher_result = run_email_watcher_for_workflow(
+                workflow_id=workflow_key,
+                run_id=run_identifier,
+                wait_seconds_after_last_dispatch=max(90, timeout_seconds or 90),
+                agent_registry=None,
+                orchestrator=orchestrator,
+            )
+
+            status = str(watcher_result.get("status") or "").lower()
+            if status == "processed":
+                break
+            if status == "failed":
+                logger.error(
+                    "Email watcher failed for workflow=%s run=%s: %s",
+                    workflow_key,
+                    run_identifier,
+                    watcher_result.get("error"),
+                )
+                return None
+
+            now = time.time()
+            if now >= deadline:
+                break
+
+            remaining = deadline - now
+            sleep_for = min(poll_seconds, remaining)
+            if sleep_for <= 0:
+                break
+
+            logger.debug(
+                "Email watcher pending for workflow=%s (status=%s); sleeping %.1fs",
+                workflow_key,
+                status or "unknown",
+                sleep_for,
+            )
+            time.sleep(sleep_for)
 
         if watcher_result.get("status") != "processed":
             logger.info(
@@ -691,13 +745,68 @@ class SupplierInteractionAgent(BaseAgent):
             return [None] * len(drafts)
 
         orchestrator = getattr(self.agent_nick, "orchestrator", None)
-        watcher_result = run_email_watcher_for_workflow(
-            workflow_id=workflow_id,
-            run_id=run_identifier,
-            wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
-            agent_registry=None,
-            orchestrator=orchestrator,
+
+        poll_seconds = (
+            self._coerce_int(poll_interval, default=0)
+            if poll_interval is not None
+            else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
         )
+        if poll_seconds is None:
+            poll_seconds = 60
+        try:
+            poll_seconds = int(poll_seconds)
+        except Exception:
+            poll_seconds = 60
+        if poll_seconds <= 0:
+            poll_seconds = 60
+
+        try:
+            timeout_seconds = int(timeout) if timeout is not None else 0
+        except Exception:
+            timeout_seconds = 0
+        if timeout_seconds < 0:
+            timeout_seconds = 0
+
+        deadline = time.time() + timeout_seconds
+        watcher_result: Dict[str, Any] = {}
+
+        while True:
+            watcher_result = run_email_watcher_for_workflow(
+                workflow_id=workflow_id,
+                run_id=run_identifier,
+                wait_seconds_after_last_dispatch=max(90, timeout_seconds or 90),
+                agent_registry=None,
+                orchestrator=orchestrator,
+            )
+
+            status = str(watcher_result.get("status") or "").lower()
+            if status == "processed":
+                break
+            if status == "failed":
+                logger.error(
+                    "Aggregated email watcher failed for workflow=%s run=%s: %s",
+                    workflow_id,
+                    run_identifier,
+                    watcher_result.get("error"),
+                )
+                return [None] * len(drafts)
+
+            now = time.time()
+            if now >= deadline:
+                break
+
+            remaining = deadline - now
+            sleep_for = min(poll_seconds, remaining)
+            if sleep_for <= 0:
+                break
+
+            logger.debug(
+                "Aggregated email watcher pending for workflow=%s (status=%s); sleeping %.1fs",
+                workflow_id,
+                status or "unknown",
+                sleep_for,
+            )
+            time.sleep(sleep_for)
 
         if watcher_result.get("status") != "processed":
             logger.info(
