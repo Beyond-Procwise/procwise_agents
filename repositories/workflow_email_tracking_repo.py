@@ -86,6 +86,35 @@ def init_schema() -> None:
         cur.close()
 
 
+def load_active_workflow_ids() -> List[str]:
+    """Return workflow identifiers with dispatched emails awaiting responses."""
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if isinstance(conn, sqlite3.Connection):
+            query = (
+                "SELECT DISTINCT workflow_id "
+                "FROM workflow_email_tracking "
+                "WHERE dispatched_at IS NOT NULL "
+                "AND (responded_at IS NULL OR matched = 0)"
+            )
+            cur.execute(query)
+            rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        else:
+            query = (
+                "SELECT DISTINCT workflow_id "
+                "FROM proc.workflow_email_tracking "
+                "WHERE dispatched_at IS NOT NULL "
+                "AND (responded_at IS NULL OR matched = FALSE)"
+            )
+            cur.execute(query)
+            rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        cur.close()
+        return rows
+
+
 def record_dispatches(
     *,
     workflow_id: str,

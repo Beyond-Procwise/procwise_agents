@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import imaplib
 from typing import Any, Dict, List, Optional
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
@@ -107,6 +108,20 @@ def run_email_watcher_for_workflow(
         or _setting("imap_username", "imap_user", "imap_login")
     )
     imap_password = _env("IMAP_PASSWORD") or _setting("imap_password")
+    imap_domain = _env("IMAP_DOMAIN") or _setting("imap_domain")
+    imap_login = _env("IMAP_LOGIN") or _setting("imap_login")
+    if not imap_login and imap_domain and imap_username and "@" not in imap_username:
+        imap_login = f"{imap_username}@{imap_domain}"
+    try:
+        imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
+    except Exception:
+        imap_port = None
+    imap_use_ssl_raw = _env("IMAP_USE_SSL") or _setting("imap_use_ssl")
+    imap_use_ssl: Optional[bool]
+    if imap_use_ssl_raw is None:
+        imap_use_ssl = None
+    else:
+        imap_use_ssl = str(imap_use_ssl_raw).strip().lower() not in {"0", "false", "no"}
     mailbox = (
         mailbox_name
         or _env("IMAP_MAILBOX")
@@ -167,9 +182,28 @@ def run_email_watcher_for_workflow(
         imap_host=imap_host,
         imap_username=imap_username,
         imap_password=imap_password,
+        imap_port=imap_port,
+        imap_use_ssl=imap_use_ssl,
+        imap_login=imap_login,
     )
-
-    result = watcher.wait_and_collect_responses(workflow_key)
+    try:
+        result = watcher.wait_and_collect_responses(workflow_key)
+    except imaplib.IMAP4.error as exc:
+        logger.error(
+            "IMAP authentication failed for host=%s user=%s: %s",
+            imap_host,
+            imap_login or imap_username,
+            exc,
+        )
+        return {
+            "status": "failed",
+            "reason": "IMAP authentication failed",
+            "workflow_id": workflow_key,
+            "expected": len(dispatch_rows),
+            "found": 0,
+            "rows": [],
+            "matched_unique_ids": [],
+        }
     expected = result.get("dispatched_count", 0)
     responded = result.get("responded_count", 0)
     matched = result.get("matched_responses", {}) or {}
