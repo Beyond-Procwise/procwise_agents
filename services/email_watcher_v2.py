@@ -414,7 +414,10 @@ class EmailWatcherV2:
             login=self._imap_login,
         )
 
-    def _match_responses(self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]) -> None:
+    def _match_responses(
+        self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
+    ) -> List[str]:
+        matched: List[str] = []
         for email in responses:
             matched_id: Optional[str] = None
             best_score = 0.0
@@ -455,6 +458,8 @@ class EmailWatcherV2:
                         match_confidence=float(best_score),
                     )
                 )
+                matched.append(matched_id)
+        return matched
 
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
@@ -483,7 +488,9 @@ class EmailWatcherV2:
         since = tracker.last_dispatched_at or (self._now() - timedelta(hours=4))
         while attempts < self.max_poll_attempts and not tracker.all_responded:
             responses = self._fetch_emails(since)
-            self._match_responses(tracker, responses)
+            matched_ids = self._match_responses(tracker, responses)
+            if matched_ids:
+                self._process_agents(tracker)
             if tracker.all_responded:
                 break
             attempts += 1
@@ -498,8 +505,7 @@ class EmailWatcherV2:
             "matched_responses": tracker.matched_responses,
         }
 
-        if complete:
-            self._process_agents(tracker)
+        self._process_agents(tracker)
 
         return result
 
