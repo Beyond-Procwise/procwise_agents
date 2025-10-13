@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import secrets
+import string
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 
 _TRACKING_PATTERN = re.compile(r"<!--\s*PROCWISE:(\{.*?\})\s*-->", re.IGNORECASE | re.DOTALL)
+_SIMPLE_UID_PATTERN = re.compile(r"<!--\s*PROCWISE:UID=([A-Za-z0-9-]+)\s*-->", re.IGNORECASE)
+_HIDDEN_SPAN_PATTERN = re.compile(
+    r"<span\s+style=\"display:?none;?\">\s*PROCWISE:UID=([A-Za-z0-9-]+)\s*</span>",
+    re.IGNORECASE,
+)
+
+_UID_PREFIX = "UID-"
+_UID_ALPHABET = string.ascii_uppercase + string.digits
+_DEFAULT_UID_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -128,4 +141,82 @@ def strip_tracking_comment(body: str) -> Tuple[Optional[EmailTrackingMetadata], 
     metadata = extract_tracking_metadata(match.group(0))
     remainder = body[match.end() :].lstrip("\n")
     return metadata, remainder
+
+
+def _canonicalise_identifier(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def generate_unique_email_id(workflow_id: str, supplier_id: Optional[str] = None) -> str:
+    """Create a deterministic-looking unique identifier for outbound emails.
+
+    The identifier is always prefixed with ``UID-`` followed by an uppercase
+    alphanumeric token.  A small amount of workflow and supplier entropy is
+    mixed in to avoid obvious sequential patterns while remaining opaque to
+    external recipients.
+    """
+
+    workflow = _canonicalise_identifier(workflow_id)
+    if not workflow:
+        raise ValueError("workflow_id is required to generate a unique email id")
+
+    supplier = _canonicalise_identifier(supplier_id) or "anon"
+    random_bits = secrets.token_hex(16)
+    digest_source = f"{workflow}|{supplier}|{random_bits}|{datetime.utcnow().isoformat()}"
+    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+
+    token = "".join(ch for ch in digest.upper() if ch in _UID_ALPHABET)
+    if len(token) < _DEFAULT_UID_LENGTH:
+        token += "".join(secrets.choice(_UID_ALPHABET) for _ in range(_DEFAULT_UID_LENGTH - len(token)))
+    return f"{_UID_PREFIX}{token[:_DEFAULT_UID_LENGTH]}"
+
+
+def embed_unique_id_in_email_body(body: Optional[str], unique_id: str) -> str:
+    """Embed ``unique_id`` in ``body`` using a hidden HTML comment.
+
+    Existing ProcWise tracking comments are preserved.  When a JSON tracking
+    comment is already present we simply prepend the new UID marker to ensure
+    EmailWatcher V2 can recover the identifier without breaking compatibility
+    with earlier tooling.
+    """
+
+    identifier = _canonicalise_identifier(unique_id)
+    if not identifier:
+        raise ValueError("unique_id is required to embed in the email body")
+
+    comment = f"<!-- PROCWISE:UID={identifier} -->"
+    text = body or ""
+
+    if _SIMPLE_UID_PATTERN.search(text):
+        # Already embedded with the new style marker.
+        return text
+
+    cleaned = text.strip()
+    if cleaned.startswith("<!--") and _TRACKING_PATTERN.search(cleaned):
+        # Legacy JSON marker present – prefix the new comment to maintain
+        # backwards compatibility.
+        return f"{comment}\n{text}" if text else comment
+
+    return f"{comment}\n{text}" if text else comment
+
+
+def extract_unique_id_from_body(body: Optional[str]) -> Optional[str]:
+    """Extract a previously embedded unique identifier from ``body``."""
+
+    if not body:
+        return None
+
+    match = _SIMPLE_UID_PATTERN.search(body)
+    if match:
+        return match.group(1).strip()
+
+    span_match = _HIDDEN_SPAN_PATTERN.search(body)
+    if span_match:
+        return span_match.group(1).strip()
+
+    metadata = extract_tracking_metadata(body)
+    return metadata.unique_id if metadata else None
 
