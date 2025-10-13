@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
+from repositories import supplier_response_repo, workflow_email_tracking_repo
 from utils.gpu import configure_gpu
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -99,21 +100,24 @@ class SupplierInteractionAgent(BaseAgent):
 
     @staticmethod
     def _response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-        body = row.get("body_text") or ""
-        subject = row.get("subject") or ""
+        body = row.get("body_text") or row.get("response_body") or ""
+        subject = row.get("subject") or row.get("response_subject") or ""
         supplier_id = row.get("supplier_id")
         workflow_id = row.get("workflow_id")
         unique_id = row.get("unique_id")
+        message_id = row.get("message_id") or row.get("response_message_id")
+        from_addr = row.get("from_addr") or row.get("response_from")
+        received_at = row.get("received_at") or row.get("response_date")
         response = {
             "workflow_id": workflow_id,
             "unique_id": unique_id,
             "supplier_id": supplier_id,
             "message": body,
             "subject": subject,
-            "message_id": row.get("message_id"),
+            "message_id": message_id,
             "mailbox": row.get("mailbox"),
             "imap_uid": row.get("imap_uid"),
-            "received_at": row.get("received_at"),
+            "received_at": received_at,
             "supplier_status": AgentStatus.SUCCESS.value,
             "supplier_output": {
                 "response_text": body,
@@ -123,16 +127,167 @@ class SupplierInteractionAgent(BaseAgent):
             },
         }
         headers = {
-            "from": row.get("from_addr"),
+            "from": from_addr,
             "to": (row.get("to_addrs") or "").split(","),
             "subject": subject,
-            "message_id": row.get("message_id"),
+            "message_id": message_id,
             "workflow_id": workflow_id,
             "unique_id": unique_id,
             "supplier_id": supplier_id,
         }
         response["email_headers"] = headers
         return response
+
+    @staticmethod
+    def _serialise_pending_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        return {
+            "workflow_id": row.get("workflow_id"),
+            "unique_id": row.get("unique_id"),
+            "supplier_id": row.get("supplier_id"),
+            "supplier_email": row.get("supplier_email"),
+            "body_text": row.get("response_body") or "",
+            "subject": row.get("response_subject"),
+            "message_id": row.get("response_message_id"),
+            "from_addr": row.get("response_from"),
+            "received_at": row.get("response_date"),
+            "mailbox": row.get("mailbox"),
+            "imap_uid": row.get("imap_uid"),
+            "match_confidence": row.get("match_confidence"),
+        }
+
+    def _load_dispatch_metadata(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            workflow_email_tracking_repo.init_schema()
+            rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
+        except Exception:
+            logger.exception("Failed to load dispatch metadata for workflow=%s", workflow_id)
+            return None
+
+        if not rows:
+            logger.info("No dispatch records stored for workflow=%s", workflow_id)
+            return None
+
+        pending = [
+            row.unique_id
+            for row in rows
+            if row.dispatched_at is None or not row.message_id
+        ]
+        if pending:
+            logger.debug(
+                "Dispatch metadata incomplete for workflow=%s (pending unique_ids=%s)",
+                workflow_id,
+                pending,
+            )
+            return None
+
+        last_dispatched = max(
+            (row.dispatched_at for row in rows if row.dispatched_at),
+            default=None,
+        )
+        if last_dispatched is None:
+            logger.debug("Unable to determine dispatch timestamp for workflow=%s", workflow_id)
+            return None
+
+        return {
+            "rows": rows,
+            "last_dispatched_at": last_dispatched,
+            "unique_ids": [row.unique_id for row in rows if row.unique_id],
+        }
+
+    def _poll_supplier_response_rows(
+        self,
+        workflow_id: str,
+        *,
+        poll_seconds: int,
+        deadline: Optional[float],
+        attempt_limit: Optional[int],
+        supplier_filter: Optional[Set[str]] = None,
+        unique_filter: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        metadata = self._load_dispatch_metadata(workflow_id)
+        if metadata is None:
+            return []
+
+        try:
+            supplier_response_repo.init_schema()
+        except Exception:
+            logger.exception("Failed to initialise supplier response schema for workflow=%s", workflow_id)
+            return []
+
+        last_dispatched_at = metadata["last_dispatched_at"]
+        now = time.time()
+        wait_until = last_dispatched_at.timestamp() + 90.0
+        if wait_until > now:
+            wait_duration = wait_until - now
+            if deadline is not None and now + wait_duration > deadline:
+                wait_duration = max(0.0, deadline - now)
+            if wait_duration > 0:
+                logger.info(
+                    "Waiting %.1fs after dispatch before polling supplier responses for workflow=%s",
+                    wait_duration,
+                    workflow_id,
+                )
+                time.sleep(wait_duration)
+
+        attempts = 0
+        collected: List[Dict[str, Any]] = []
+
+        while True:
+            pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+            serialised = [
+                self._serialise_pending_row(row)
+                for row in pending_rows
+                if isinstance(row, dict)
+            ]
+
+            if supplier_filter:
+                normalised_filter = {
+                    self._coerce_text(value) for value in supplier_filter if value
+                }
+                serialised = [
+                    row
+                    for row in serialised
+                    if self._coerce_text(row.get("supplier_id")) in normalised_filter
+                ]
+
+            if unique_filter:
+                normalised_unique = {
+                    self._coerce_text(value) for value in unique_filter if value
+                }
+                serialised = [
+                    row
+                    for row in serialised
+                    if self._coerce_text(row.get("unique_id")) in normalised_unique
+                ]
+
+            if serialised:
+                collected = serialised
+                break
+
+            attempts += 1
+            if attempt_limit and attempts >= attempt_limit:
+                break
+
+            now = time.time()
+            if deadline is not None and now >= deadline:
+                break
+
+            remaining = None if deadline is None else max(0.0, deadline - now)
+            sleep_for = poll_seconds if remaining is None else min(poll_seconds, remaining)
+            if sleep_for <= 0:
+                break
+
+            logger.debug(
+                "Supplier responses pending for workflow=%s; sleeping %.1fs (attempt=%s)",
+                workflow_id,
+                sleep_for,
+                attempts,
+            )
+            time.sleep(sleep_for)
+
+        return collected
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Process a single supplier email or poll the mailbox."""
@@ -610,14 +765,6 @@ class SupplierInteractionAgent(BaseAgent):
         if not run_identifier:
             run_identifier = self._coerce_text(draft_action_id) or self._coerce_text(action_id)
 
-        try:
-            from services.email_watcher_imap import run_email_watcher_for_workflow
-        except Exception:  # pragma: no cover - runtime environments may exclude IMAP watcher
-            logger.exception("IMAP email watcher unavailable while awaiting supplier response")
-            return None
-
-        orchestrator = getattr(self.agent_nick, "orchestrator", None)
-
         poll_seconds = (
             self._coerce_int(poll_interval, default=0)
             if poll_interval is not None
@@ -639,73 +786,28 @@ class SupplierInteractionAgent(BaseAgent):
         if timeout_seconds < 0:
             timeout_seconds = 0
 
-        deadline = time.time() + timeout_seconds
+        now = time.time()
+        deadline = now + timeout_seconds if timeout_seconds else now
         attempt_limit: Optional[int] = None
         if max_attempts is not None:
             try:
                 attempt_limit = max(1, int(max_attempts))
             except Exception:
                 attempt_limit = None
-        watcher_result: Dict[str, Any] = {}
-        attempts = 0
+        target_supplier = self._coerce_text(supplier_id)
+        supplier_filter: Optional[Set[str]] = None
+        if target_supplier:
+            supplier_filter = {target_supplier}
 
-        while True:
-            watcher_result = run_email_watcher_for_workflow(
-                workflow_id=workflow_key,
-                run_id=run_identifier,
-                wait_seconds_after_last_dispatch=max(90, timeout_seconds or 90),
-                agent_registry=None,
-                orchestrator=orchestrator,
-            )
+        responses = self._poll_supplier_response_rows(
+            workflow_key,
+            poll_seconds=poll_seconds,
+            deadline=deadline,
+            attempt_limit=attempt_limit,
+            supplier_filter=supplier_filter,
+        )
 
-            status = str(watcher_result.get("status") or "").lower()
-            attempts += 1
-            if status == "processed":
-                break
-            if status == "failed":
-                logger.error(
-                    "Email watcher failed for workflow=%s run=%s: %s",
-                    workflow_key,
-                    run_identifier,
-                    watcher_result.get("error"),
-                )
-                return None
-
-            if attempt_limit and attempts >= attempt_limit:
-                logger.info(
-                    "Email watcher reached attempt limit for workflow=%s run=%s",
-                    workflow_key,
-                    run_identifier,
-                )
-                break
-
-            now = time.time()
-            if now >= deadline:
-                break
-
-            remaining = deadline - now
-            sleep_for = min(poll_seconds, remaining)
-            if sleep_for <= 0:
-                break
-
-            logger.debug(
-                "Email watcher pending for workflow=%s (status=%s); sleeping %.1fs",
-                workflow_key,
-                status or "unknown",
-                sleep_for,
-            )
-            time.sleep(sleep_for)
-
-        if watcher_result.get("status") != "processed":
-            logger.info(
-                "Email watcher has not completed for workflow=%s (status=%s)",
-                workflow_key,
-                watcher_result.get("status"),
-            )
-            return None
-
-        rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
-        if not rows:
+        if not responses:
             logger.info(
                 "No supplier responses stored for workflow=%s run_id=%s",
                 workflow_key,
@@ -713,16 +815,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return None
 
-        target_supplier = self._coerce_text(supplier_id)
-        if target_supplier:
-            filtered = [
-                row
-                for row in rows
-                if self._coerce_text(row.get("supplier_id")) == target_supplier
-            ]
-            rows = filtered or rows
-
-        return self._response_from_row(rows[0]) if rows else None
+        return self._response_from_row(responses[0]) if responses else None
 
 
     def wait_for_multiple_responses(
@@ -754,14 +847,6 @@ class SupplierInteractionAgent(BaseAgent):
         run_ids = {ctx.get("run_id") for ctx in contexts if ctx.get("run_id")}
         run_identifier = run_ids.pop() if len(run_ids) == 1 else None
 
-        try:
-            from services.email_watcher_imap import run_email_watcher_for_workflow
-        except Exception:  # pragma: no cover - optional dependency
-            logger.exception("IMAP email watcher unavailable for aggregated wait")
-            return [None] * len(drafts)
-
-        orchestrator = getattr(self.agent_nick, "orchestrator", None)
-
         poll_seconds = (
             self._coerce_int(poll_interval, default=0)
             if poll_interval is not None
@@ -783,59 +868,25 @@ class SupplierInteractionAgent(BaseAgent):
         if timeout_seconds < 0:
             timeout_seconds = 0
 
-        deadline = time.time() + timeout_seconds
-        watcher_result: Dict[str, Any] = {}
+        deadline = time.time() + timeout_seconds if timeout_seconds else time.time()
 
-        while True:
-            watcher_result = run_email_watcher_for_workflow(
-                workflow_id=workflow_id,
-                run_id=run_identifier,
-                wait_seconds_after_last_dispatch=max(90, timeout_seconds or 90),
-                agent_registry=None,
-                orchestrator=orchestrator,
-            )
+        responses = self._poll_supplier_response_rows(
+            workflow_id,
+            poll_seconds=poll_seconds,
+            deadline=deadline,
+            attempt_limit=None,
+        )
 
-            status = str(watcher_result.get("status") or "").lower()
-            if status == "processed":
-                break
-            if status == "failed":
-                logger.error(
-                    "Aggregated email watcher failed for workflow=%s run=%s: %s",
-                    workflow_id,
-                    run_identifier,
-                    watcher_result.get("error"),
-                )
-                return [None] * len(drafts)
-
-            now = time.time()
-            if now >= deadline:
-                break
-
-            remaining = deadline - now
-            sleep_for = min(poll_seconds, remaining)
-            if sleep_for <= 0:
-                break
-
-            logger.debug(
-                "Aggregated email watcher pending for workflow=%s (status=%s); sleeping %.1fs",
-                workflow_id,
-                status or "unknown",
-                sleep_for,
-            )
-            time.sleep(sleep_for)
-
-        if watcher_result.get("status") != "processed":
+        if not responses:
             logger.info(
-                "Aggregated watcher not ready for workflow=%s (status=%s)",
+                "Aggregated watcher not ready for workflow=%s (no responses stored)",
                 workflow_id,
-                watcher_result.get("status"),
             )
             return [None] * len(drafts)
 
-        rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
         response_map = {
             row.get("unique_id"): self._response_from_row(row)
-            for row in rows
+            for row in responses
             if row.get("unique_id")
         }
 
@@ -843,7 +894,7 @@ class SupplierInteractionAgent(BaseAgent):
         for draft, ctx in zip(drafts, contexts):
             response = response_map.get(ctx.get("unique_id"))
             if response is None and ctx.get("supplier_id"):
-                for row in rows:
+                for row in responses:
                     if self._coerce_text(row.get("supplier_id")) == ctx.get("supplier_id"):
                         response = self._response_from_row(row)
                         break
