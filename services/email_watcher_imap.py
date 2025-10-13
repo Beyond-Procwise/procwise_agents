@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import imaplib
 from typing import Any, Dict, List, Optional
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
@@ -101,12 +102,63 @@ def run_email_watcher_for_workflow(
         }
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
+    imap_user = _env("IMAP_USER")
     imap_username = (
         _env("IMAP_USERNAME")
-        or _env("IMAP_USER")
         or _setting("imap_username", "imap_user", "imap_login")
+        or (imap_user.split("@")[0] if imap_user and "@" in imap_user else None)
     )
     imap_password = _env("IMAP_PASSWORD") or _setting("imap_password")
+    imap_domain = _env("IMAP_DOMAIN") or _setting("imap_domain")
+    imap_login = _env("IMAP_LOGIN") or _setting("imap_login")
+
+    def _normalise_domain(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        domain = value.strip()
+        if "@" in domain:
+            # When a full email is provided as the "domain" value, keep only the domain portion.
+            domain = domain.split("@", 1)[-1]
+        return domain or None
+
+    def _pick_login() -> Optional[str]:
+        if imap_login:
+            return imap_login.strip()
+        if imap_user:
+            candidate = imap_user.strip()
+            if candidate:
+                return candidate
+        username = (imap_username or "").strip()
+        if not username:
+            return None
+        if "@" in username:
+            return username
+        domain = _normalise_domain(imap_domain)
+        if domain:
+            return f"{username}@{domain}"
+        return username
+
+    imap_login = _pick_login()
+    try:
+        imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
+    except Exception:
+        imap_port = None
+    imap_use_ssl_raw = (
+        _env("IMAP_USE_SSL")
+        or _env("IMAP_ENCRYPTION")
+        or _setting("imap_use_ssl", "imap_encryption")
+    )
+    imap_use_ssl: Optional[bool]
+    if imap_use_ssl_raw is None:
+        imap_use_ssl = None
+    else:
+        raw_value = str(imap_use_ssl_raw).strip().lower()
+        if raw_value in {"0", "false", "no", "none", "off"}:
+            imap_use_ssl = False
+        elif raw_value in {"ssl", "imaps", "true", "1", "yes", "on"}:
+            imap_use_ssl = True
+        else:
+            imap_use_ssl = True
     mailbox = (
         mailbox_name
         or _env("IMAP_MAILBOX")
@@ -167,9 +219,28 @@ def run_email_watcher_for_workflow(
         imap_host=imap_host,
         imap_username=imap_username,
         imap_password=imap_password,
+        imap_port=imap_port,
+        imap_use_ssl=imap_use_ssl,
+        imap_login=imap_login,
     )
-
-    result = watcher.wait_and_collect_responses(workflow_key)
+    try:
+        result = watcher.wait_and_collect_responses(workflow_key)
+    except imaplib.IMAP4.error as exc:
+        logger.error(
+            "IMAP authentication failed for host=%s user=%s: %s",
+            imap_host,
+            imap_login or imap_username,
+            exc,
+        )
+        return {
+            "status": "failed",
+            "reason": "IMAP authentication failed",
+            "workflow_id": workflow_key,
+            "expected": len(dispatch_rows),
+            "found": 0,
+            "rows": [],
+            "matched_unique_ids": [],
+        }
     expected = result.get("dispatched_count", 0)
     responded = result.get("responded_count", 0)
     matched = result.get("matched_responses", {}) or {}

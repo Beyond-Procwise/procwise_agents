@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.model_training_endpoint import ModelTrainingEndpoint
+from services.email_watcher_service import EmailWatcherService
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
@@ -81,13 +82,24 @@ async def lifespan(app: FastAPI):
             training_endpoint=app.state.model_training_endpoint,
         )
         app.state.rag_pipeline = RAGPipeline(agent_nick)
+        email_watcher_service = EmailWatcherService()
+        email_watcher_service.start()
+        app.state.email_watcher_service = email_watcher_service
         logger.info("System initialized successfully.")
     except Exception as e:
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
         app.state.orchestrator = None; app.state.rag_pipeline = None
+        app.state.email_watcher_service = None
     yield
     if hasattr(app.state, "agent_nick"):
         app.state.agent_nick = None
+    if hasattr(app.state, "email_watcher_service") and getattr(app.state, "email_watcher_service", None):
+        try:
+            app.state.email_watcher_service.stop()
+        except Exception:
+            logger.exception("Failed to stop EmailWatcherService cleanly")
+        finally:
+            app.state.email_watcher_service = None
     if hasattr(app.state, "model_training_endpoint"):
         app.state.model_training_endpoint = None
     logger.info("API shutting down.")
