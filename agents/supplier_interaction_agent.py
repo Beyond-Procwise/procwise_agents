@@ -196,6 +196,41 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
+    def _await_dispatch_metadata(
+        self,
+        workflow_id: str,
+        *,
+        poll_seconds: int,
+        deadline: Optional[float],
+    ) -> Optional[Dict[str, Any]]:
+        """Wait for dispatch tracking rows to be fully populated."""
+
+        interval = poll_seconds if poll_seconds and poll_seconds > 0 else 5
+        interval = max(1, interval)
+        logged_wait = False
+
+        while True:
+            metadata = self._load_dispatch_metadata(workflow_id)
+            if metadata is not None:
+                return metadata
+
+            now = time.time()
+            if deadline is not None and now >= deadline:
+                return None
+
+            if not logged_wait:
+                logger.info(
+                    "Awaiting dispatch completion for workflow=%s before polling responses",
+                    workflow_id,
+                )
+                logged_wait = True
+
+            remaining = None if deadline is None else max(0.0, deadline - now)
+            sleep_for = interval if remaining is None else min(interval, remaining)
+            if sleep_for <= 0:
+                return None
+            time.sleep(sleep_for)
+
     def _poll_supplier_response_rows(
         self,
         workflow_id: str,
@@ -206,7 +241,11 @@ class SupplierInteractionAgent(BaseAgent):
         supplier_filter: Optional[Set[str]] = None,
         unique_filter: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
-        metadata = self._load_dispatch_metadata(workflow_id)
+        metadata = self._await_dispatch_metadata(
+            workflow_id,
+            poll_seconds=poll_seconds,
+            deadline=deadline,
+        )
         if metadata is None:
             return []
 
@@ -231,8 +270,54 @@ class SupplierInteractionAgent(BaseAgent):
                 )
                 time.sleep(wait_duration)
 
+        dispatch_rows = metadata.get("rows") or []
+        dispatch_index: Dict[str, Dict[str, Optional[str]]] = {}
+        for row in dispatch_rows:
+            unique_value = self._coerce_text(getattr(row, "unique_id", None))
+            supplier_value = self._coerce_text(getattr(row, "supplier_id", None))
+            if unique_value:
+                dispatch_index[unique_value] = {"supplier_id": supplier_value}
+
+        normalised_unique_filter: Optional[Set[str]] = None
+        if unique_filter:
+            normalised_unique_filter = {
+                self._coerce_text(value)
+                for value in unique_filter
+                if self._coerce_text(value)
+            }
+
+        normalised_supplier_filter: Optional[Set[str]] = None
+        if supplier_filter:
+            normalised_supplier_filter = {
+                self._coerce_text(value)
+                for value in supplier_filter
+                if self._coerce_text(value)
+            }
+
+        expected_unique_ids: Set[str] = set(dispatch_index.keys())
+        if normalised_supplier_filter:
+            expected_unique_ids = {
+                uid
+                for uid in expected_unique_ids
+                if dispatch_index.get(uid, {}).get("supplier_id") in normalised_supplier_filter
+            }
+        if normalised_unique_filter is not None:
+            expected_unique_ids &= normalised_unique_filter
+
+        expected_suppliers: Set[str] = {
+            dispatch_index[uid]["supplier_id"]
+            for uid in expected_unique_ids
+            if dispatch_index.get(uid, {}).get("supplier_id")
+        }
+        if not expected_unique_ids and normalised_supplier_filter:
+            expected_suppliers = set(normalised_supplier_filter)
+
         attempts = 0
-        collected: List[Dict[str, Any]] = []
+        collected_by_unique: Dict[str, Dict[str, Any]] = {}
+        collected_by_supplier: Dict[str, Dict[str, Any]] = {}
+        other_rows: List[Dict[str, Any]] = []
+        other_signatures: Set[Tuple[Tuple[str, Any], ...]] = set()
+        collected: Optional[List[Dict[str, Any]]] = None
 
         while True:
             pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
@@ -242,27 +327,45 @@ class SupplierInteractionAgent(BaseAgent):
                 if isinstance(row, dict)
             ]
 
-            if supplier_filter:
-                normalised_filter = {
-                    self._coerce_text(value) for value in supplier_filter if value
-                }
+            if normalised_supplier_filter is not None:
                 serialised = [
                     row
                     for row in serialised
-                    if self._coerce_text(row.get("supplier_id")) in normalised_filter
+                    if self._coerce_text(row.get("supplier_id")) in normalised_supplier_filter
                 ]
 
-            if unique_filter:
-                normalised_unique = {
-                    self._coerce_text(value) for value in unique_filter if value
-                }
+            if normalised_unique_filter is not None:
                 serialised = [
                     row
                     for row in serialised
-                    if self._coerce_text(row.get("unique_id")) in normalised_unique
+                    if self._coerce_text(row.get("unique_id")) in normalised_unique_filter
                 ]
 
             if serialised:
+                for row in serialised:
+                    unique_id = self._coerce_text(row.get("unique_id"))
+                    supplier_id = self._coerce_text(row.get("supplier_id"))
+                    if unique_id:
+                        collected_by_unique[unique_id] = row
+                    if supplier_id:
+                        collected_by_supplier[supplier_id] = row
+                    if not unique_id and not supplier_id:
+                        signature = tuple(sorted(row.items()))
+                        if signature not in other_signatures:
+                            other_signatures.add(signature)
+                            other_rows.append(row)
+
+            unique_complete = bool(expected_unique_ids) and expected_unique_ids.issubset(
+                collected_by_unique.keys()
+            )
+            supplier_complete = bool(expected_suppliers) and expected_suppliers.issubset(
+                collected_by_supplier.keys()
+            )
+
+            if unique_complete or supplier_complete:
+                break
+
+            if not expected_unique_ids and not expected_suppliers and serialised:
                 collected = serialised
                 break
 
@@ -287,7 +390,52 @@ class SupplierInteractionAgent(BaseAgent):
             )
             time.sleep(sleep_for)
 
-        return collected
+        if collected is not None:
+            return collected
+
+        ordered_results: List[Dict[str, Any]] = []
+        if expected_unique_ids:
+            ordered_unique_ids = [
+                self._coerce_text(uid)
+                for uid in metadata.get("unique_ids", [])
+                if self._coerce_text(uid) in expected_unique_ids
+            ]
+            for uid in ordered_unique_ids:
+                row = collected_by_unique.get(uid)
+                if row and row not in ordered_results:
+                    ordered_results.append(row)
+            for uid, row in collected_by_unique.items():
+                if uid not in ordered_unique_ids and row not in ordered_results:
+                    ordered_results.append(row)
+            for supplier_id in expected_suppliers:
+                row = collected_by_supplier.get(supplier_id)
+                if row and row not in ordered_results:
+                    ordered_results.append(row)
+        elif expected_suppliers:
+            ordered_suppliers = []
+            for row in dispatch_rows:
+                supplier_id = self._coerce_text(getattr(row, "supplier_id", None))
+                if supplier_id and supplier_id in expected_suppliers:
+                    ordered_suppliers.append(supplier_id)
+            for supplier_id in ordered_suppliers:
+                row = collected_by_supplier.get(supplier_id)
+                if row and row not in ordered_results:
+                    ordered_results.append(row)
+            for supplier_id, row in collected_by_supplier.items():
+                if row not in ordered_results:
+                    ordered_results.append(row)
+
+        if not ordered_results:
+            ordered_results.extend(collected_by_unique.values())
+            for row in collected_by_supplier.values():
+                if row not in ordered_results:
+                    ordered_results.append(row)
+
+        for row in other_rows:
+            if row not in ordered_results:
+                ordered_results.append(row)
+
+        return ordered_results
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Process a single supplier email or poll the mailbox."""
@@ -794,6 +942,17 @@ class SupplierInteractionAgent(BaseAgent):
                 attempt_limit = max(1, int(max_attempts))
             except Exception:
                 attempt_limit = None
+        if attempt_limit is None:
+            setting_attempts = getattr(
+                getattr(self.agent_nick, "settings", None),
+                "email_response_max_attempts",
+                None,
+            )
+            if setting_attempts is not None:
+                try:
+                    attempt_limit = max(1, int(setting_attempts))
+                except Exception:
+                    attempt_limit = None
         target_supplier = self._coerce_text(supplier_id)
         supplier_filter: Optional[Set[str]] = None
         if target_supplier:
