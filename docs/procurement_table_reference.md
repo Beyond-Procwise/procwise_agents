@@ -376,6 +376,42 @@ id bigint NOT NULL DEFAULT nextval('proc.draft_rfq_emails_id_seq'::regclass),
     CONSTRAINT draft_rfq_emails_pkey PRIMARY KEY (id)
 ```
 
+### `proc.workflow_email_tracking`
+```
+workflow_id text NOT NULL,
+    unique_id text NOT NULL,
+    supplier_id text,
+    supplier_email text,
+    message_id text,
+    subject text,
+    dispatched_at timestamp with time zone NOT NULL,
+    responded_at timestamp with time zone,
+    response_message_id text,
+    matched boolean DEFAULT false,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT workflow_email_tracking_pk PRIMARY KEY (workflow_id, unique_id)
+```
+
+### `proc.supplier_response`
+```
+id serial PRIMARY KEY,
+    workflow_id text NOT NULL,
+    unique_id text NOT NULL,
+    supplier_id text,
+    supplier_email text,
+    response_message_id text,
+    response_subject text,
+    response_body text,
+    response_from text,
+    response_date timestamp with time zone,
+    original_message_id text,
+    original_subject text,
+    match_confidence numeric(3,2),
+    created_at timestamp with time zone DEFAULT now(),
+    processed boolean DEFAULT false,
+    CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id)
+```
+
 ### `proc.rfq_targets`
 ```
 rfq_id text NOT NULL,

@@ -640,7 +640,14 @@ class SupplierInteractionAgent(BaseAgent):
             timeout_seconds = 0
 
         deadline = time.time() + timeout_seconds
+        attempt_limit: Optional[int] = None
+        if max_attempts is not None:
+            try:
+                attempt_limit = max(1, int(max_attempts))
+            except Exception:
+                attempt_limit = None
         watcher_result: Dict[str, Any] = {}
+        attempts = 0
 
         while True:
             watcher_result = run_email_watcher_for_workflow(
@@ -652,6 +659,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
             status = str(watcher_result.get("status") or "").lower()
+            attempts += 1
             if status == "processed":
                 break
             if status == "failed":
@@ -662,6 +670,14 @@ class SupplierInteractionAgent(BaseAgent):
                     watcher_result.get("error"),
                 )
                 return None
+
+            if attempt_limit and attempts >= attempt_limit:
+                logger.info(
+                    "Email watcher reached attempt limit for workflow=%s run=%s",
+                    workflow_key,
+                    run_identifier,
+                )
+                break
 
             now = time.time()
             if now >= deadline:

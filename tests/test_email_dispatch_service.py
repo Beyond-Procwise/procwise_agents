@@ -12,7 +12,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
-from utils.email_markers import extract_rfq_id, extract_run_id, split_hidden_marker
+from repositories import workflow_email_tracking_repo
+from utils.email_tracking import extract_tracking_metadata, extract_unique_id_from_body
 
 
 class InMemoryDraftStore:
@@ -95,7 +96,13 @@ class DummyCursor:
                 supplier_name,
                 rfq_value,
                 payload_json,
-                sent_bool,
+                workflow_id,
+                run_id,
+                unique_id,
+                mailbox,
+                dispatch_run_id,
+                dispatched_toggle,
+                sent_toggle,
                 draft_id,
             ) = params
             updates = {
@@ -105,13 +112,24 @@ class DummyCursor:
                 "recipient_email": recipient,
                 "contact_level": contact_level,
                 "payload": payload_json,
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "unique_id": unique_id,
+                "mailbox": mailbox,
+                "dispatch_run_id": dispatch_run_id,
             }
             updates["supplier_id"] = supplier_id
             updates["supplier_name"] = supplier_name
             updates["rfq_id"] = rfq_value
-            if sent_bool:
+            if sent_toggle:
                 updates["sent_on"] = "now"
             self.store.update(draft_id, **updates)
+        elif normalized.startswith("CREATE TABLE IF NOT EXISTS proc.email_dispatch_chains"):
+            return
+        elif normalized.startswith("ALTER TABLE proc.email_dispatch_chains"):
+            return
+        elif normalized.startswith("INSERT INTO proc.email_dispatch_chains"):
+            return
         elif normalized.startswith("SELECT process_output FROM proc.action"):
             action_id = params[0]
             payload = self.action_store.get(action_id)
@@ -167,23 +185,25 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "contact_level": 1,
         "sent_status": False,
         "action_id": "action-1",
+        "workflow_id": "wf-test-1",
     }
     draft_id = store.add(
-        {
-            "rfq_id": "RFQ-UNIT",
-            "supplier_id": "S1",
-            "supplier_name": "Acme",
-            "subject": draft_payload["subject"],
-            "body": draft_payload["body"],
-            "sent": False,
-            "recipient_email": None,
-            "contact_level": 0,
-            "thread_index": 1,
-            "sender": "sender@example.com",
-            "payload": json.dumps(draft_payload),
-            "sent_on": None,
-        }
-    )
+            {
+                "rfq_id": "RFQ-UNIT",
+                "supplier_id": "S1",
+                "supplier_name": "Acme",
+                "subject": draft_payload["subject"],
+                "body": draft_payload["body"],
+                "sent": False,
+                "recipient_email": None,
+                "contact_level": 0,
+                "thread_index": 1,
+                "sender": "sender@example.com",
+                "payload": json.dumps(draft_payload),
+                "sent_on": None,
+                "workflow_id": "wf-test-1",
+            }
+        )
 
     action_store = InMemoryActionStore()
     action_store.update(
@@ -231,6 +251,9 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
     assert sent_args["headers"]["X-Procwise-RFQ-ID"] == "RFQ-UNIT"
+    unique_id = extract_unique_id_from_body(result["body"])
+    assert unique_id
+    assert sent_args["headers"]["X-Procwise-Unique-Id"] == unique_id
     assert result["draft"]["dispatch_metadata"]["rfq_id"] == "RFQ-UNIT"
     assert recorded_thread == {
         "message_id": "<message-id-1>",
@@ -238,9 +261,11 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "supplier_id": "S1",
         "recipients": ["buyer@example.com"],
     }
-    body_comment, body_visible = split_hidden_marker(result["body"])
-    assert body_comment and extract_rfq_id(body_comment) == "RFQ-UNIT"
-    assert "RFQ-UNIT" not in body_visible
+    metadata = extract_tracking_metadata(result["body"])
+    assert metadata is not None
+    assert metadata.unique_id == unique_id
+    assert metadata.workflow_id == result["draft"]["dispatch_metadata"].get("workflow_id")
+    assert metadata.run_id == result["draft"]["dispatch_metadata"].get("run_id")
     assert result["draft"]["dispatch_metadata"].get("dispatch_token")
     assert result["draft"]["dispatch_metadata"].get("run_id")
     assert (
@@ -248,8 +273,8 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         == result["draft"]["dispatch_metadata"].get("run_id")
     )
     assert result["draft"].get("dispatch_run_id") == result["draft"]["dispatch_metadata"]["run_id"]
-    comment_run_id = extract_run_id(body_comment)
-    assert comment_run_id == result["draft"]["dispatch_metadata"]["run_id"]
+    visible_body = result["body"].split("-->", 2)[-1]
+    assert "RFQ-UNIT" not in visible_body
     assert store.rows[draft_id]["sent"] is True
     assert store.rows[draft_id]["recipient_email"] == "buyer@example.com"
     assert json.loads(store.rows[draft_id]["payload"])["sent_status"] is True
@@ -258,7 +283,21 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert updated_action["sent_status"] == "True"
     assert sent_args["recipients"] == ["buyer@example.com"]
     assert sent_args["sender"] == "sender@example.com"
-    sent_comment, sent_visible = split_hidden_marker(sent_args["body"])
-    assert sent_comment and extract_rfq_id(sent_comment) == "RFQ-UNIT"
-    assert extract_run_id(sent_comment) == result["draft"]["dispatch_metadata"]["run_id"]
-    assert "RFQ-UNIT" not in sent_visible
+    sent_unique_id = extract_unique_id_from_body(sent_args["body"])
+    assert sent_unique_id == unique_id
+    sent_metadata = extract_tracking_metadata(sent_args["body"])
+    assert sent_metadata is not None
+    assert sent_metadata.unique_id == unique_id
+    assert sent_metadata.workflow_id == metadata.workflow_id
+    assert sent_metadata.run_id == metadata.run_id
+    visible_sent = sent_args["body"].split("-->", 2)[-1]
+    assert "RFQ-UNIT" not in visible_sent
+
+    workflow_email_tracking_repo.init_schema()
+    stored_rows = workflow_email_tracking_repo.load_workflow_rows(
+        workflow_id=metadata.workflow_id,
+    )
+    assert any(
+        row.unique_id == unique_id and row.message_id == "<message-id-1>"
+        for row in stored_rows
+    )
