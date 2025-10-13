@@ -574,85 +574,85 @@ class SupplierInteractionAgent(BaseAgent):
         return processed
 
 
-def wait_for_response(
-    self,
-    *,
-    watcher=None,
-    timeout: int = 300,
-    poll_interval: Optional[int] = None,
-    limit: int = 1,
-    rfq_id: Optional[str] = None,
-    supplier_id: Optional[str] = None,
-    subject_hint: Optional[str] = None,
-    from_address: Optional[str] = None,
-    max_attempts: Optional[int] = None,
-    enable_negotiation: bool = True,
-    draft_action_id: Optional[str] = None,
-    workflow_id: Optional[str] = None,
-    dispatch_run_id: Optional[str] = None,
-    action_id: Optional[str] = None,
-    email_action_id: Optional[str] = None,
-    suppliers: Optional[Sequence[str]] = None,
-    expected_replies: Optional[int] = None,
-) -> Optional[Dict]:
-    """Await supplier replies using the workflow-aware IMAP watcher."""
+    def wait_for_response(
+        self,
+        *,
+        watcher=None,
+        timeout: int = 300,
+        poll_interval: Optional[int] = None,
+        limit: int = 1,
+        rfq_id: Optional[str] = None,
+        supplier_id: Optional[str] = None,
+        subject_hint: Optional[str] = None,
+        from_address: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        enable_negotiation: bool = True,
+        draft_action_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        dispatch_run_id: Optional[str] = None,
+        action_id: Optional[str] = None,
+        email_action_id: Optional[str] = None,
+        suppliers: Optional[Sequence[str]] = None,
+        expected_replies: Optional[int] = None,
+    ) -> Optional[Dict]:
+        """Await supplier replies using the workflow-aware IMAP watcher."""
 
-    workflow_key = self._coerce_text(workflow_id)
-    if not workflow_key:
-        logger.error(
-            "wait_for_response requires workflow_id; received rfq_id=%s supplier=%s",
-            rfq_id,
-            supplier_id,
+        workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key:
+            logger.error(
+                "wait_for_response requires workflow_id; received rfq_id=%s supplier=%s",
+                rfq_id,
+                supplier_id,
+            )
+            return None
+
+        run_identifier = self._coerce_text(dispatch_run_id)
+        if not run_identifier:
+            run_identifier = self._coerce_text(draft_action_id) or self._coerce_text(action_id)
+
+        try:
+            from services.email_watcher_imap import run_email_watcher_for_workflow
+        except Exception:  # pragma: no cover - runtime environments may exclude IMAP watcher
+            logger.exception("IMAP email watcher unavailable while awaiting supplier response")
+            return None
+
+        orchestrator = getattr(self.agent_nick, "orchestrator", None)
+
+        watcher_result = run_email_watcher_for_workflow(
+            workflow_id=workflow_key,
+            run_id=run_identifier,
+            wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
+            agent_registry=None,
+            orchestrator=orchestrator,
         )
-        return None
 
-    run_identifier = self._coerce_text(dispatch_run_id)
-    if not run_identifier:
-        run_identifier = self._coerce_text(draft_action_id) or self._coerce_text(action_id)
+        if watcher_result.get("status") != "processed":
+            logger.info(
+                "Email watcher has not completed for workflow=%s (status=%s)",
+                workflow_key,
+                watcher_result.get("status"),
+            )
+            return None
 
-    try:
-        from services.email_watcher_imap import run_email_watcher_for_workflow
-    except Exception:  # pragma: no cover - runtime environments may exclude IMAP watcher
-        logger.exception("IMAP email watcher unavailable while awaiting supplier response")
-        return None
+        rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
+        if not rows:
+            logger.info(
+                "No supplier responses stored for workflow=%s run_id=%s",
+                workflow_key,
+                run_identifier,
+            )
+            return None
 
-    orchestrator = getattr(self.agent_nick, "orchestrator", None)
+        target_supplier = self._coerce_text(supplier_id)
+        if target_supplier:
+            filtered = [
+                row
+                for row in rows
+                if self._coerce_text(row.get("supplier_id")) == target_supplier
+            ]
+            rows = filtered or rows
 
-    watcher_result = run_email_watcher_for_workflow(
-        workflow_id=workflow_key,
-        run_id=run_identifier,
-        wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
-        agent_registry=None,
-        orchestrator=orchestrator,
-    )
-
-    if watcher_result.get("status") != "processed":
-        logger.info(
-            "Email watcher has not completed for workflow=%s (status=%s)",
-            workflow_key,
-            watcher_result.get("status"),
-        )
-        return None
-
-    rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
-    if not rows:
-        logger.info(
-            "No supplier responses stored for workflow=%s run_id=%s",
-            workflow_key,
-            run_identifier,
-        )
-        return None
-
-    target_supplier = self._coerce_text(supplier_id)
-    if target_supplier:
-        filtered = [
-            row
-            for row in rows
-            if self._coerce_text(row.get("supplier_id")) == target_supplier
-        ]
-        rows = filtered or rows
-
-    return self._response_from_row(rows[0]) if rows else None
+        return self._response_from_row(rows[0]) if rows else None
 
 
     def wait_for_multiple_responses(
