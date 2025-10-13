@@ -236,6 +236,85 @@ def test_build_dispatch_expectation_from_dispatch_entries():
     assert expectation.supplier_count == 3
 
 
+def test_count_sent_drafts_falls_back_to_action_id(monkeypatch):
+    nick = DummyNick()
+    watcher = _make_watcher(nick)
+
+    expectation = watcher._DispatchExpectation(
+        action_id="action-123",
+        workflow_id="wf-123",
+        draft_ids=(501,),
+        draft_count=4,
+        supplier_count=4,
+        run_identifiers=("run-1",),
+    )
+
+    class StubCursor:
+        def __init__(self):
+            self.calls: List[Tuple[str, Tuple[object, ...]]] = []
+            self._results = [1, 4]
+            self._index = -1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params=None):
+            params_tuple: Tuple[object, ...]
+            if params is None:
+                params_tuple = ()
+            elif isinstance(params, tuple):
+                params_tuple = params
+            else:
+                params_tuple = (params,)
+            self.calls.append((statement.strip(), params_tuple))
+            self._index += 1
+
+        def fetchone(self):
+            if 0 <= self._index < len(self._results):
+                return (self._results[self._index],)
+            return (None,)
+
+    class StubConn:
+        def __init__(self, cursor: StubCursor):
+            self._cursor = cursor
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return self._cursor
+
+    stub_cursor = StubCursor()
+    stub_conn = StubConn(stub_cursor)
+
+    def fake_get_conn():
+        # Reset for each invocation to allow reuse if needed
+        stub_cursor._index = -1
+        return stub_conn
+
+    monkeypatch.setattr(nick, "get_db_connection", fake_get_conn)
+
+    count = watcher._count_sent_drafts(expectation)
+
+    assert count == 4
+    # Ensure both the id-based and action-based queries were executed
+    assert len(stub_cursor.calls) == 2
+    assert "id = ANY" in stub_cursor.calls[0][0]
+    assert "payload::jsonb @>" in stub_cursor.calls[1][0]
+    fallback_params = stub_cursor.calls[1][1]
+    assert len(fallback_params) == 7
+    decoded = [json.loads(value) for value in fallback_params]
+    assert {"action_id": expectation.action_id} in decoded
+    assert {"draft_action_id": expectation.action_id} in decoded
+    assert {"email_action_id": expectation.action_id} in decoded
+
+
 def test_extract_dispatch_entries_respects_unique_run_ids():
     nick = DummyNick()
     watcher = _make_watcher(nick)
@@ -2308,6 +2387,7 @@ def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
         def __init__(self, owner):
             super().__init__(owner)
             self._result: List[Tuple] = []
+            self._last_id_count: Optional[int] = None
 
         def execute(self, statement, params=None):
             normalized = " ".join(statement.split()).lower()
@@ -2322,16 +2402,16 @@ def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
                     self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
                 )
                 self._owner.sent_count_calls += 1
+                self._last_id_count = count
                 self._result = [(count,)]
-            elif normalized.startswith(
-                "select count(*) from proc.draft_rfq_emails where sent = true and payload::jsonb ->> 'action_id'"
+            elif (
+                "select count(*) from proc.draft_rfq_emails" in normalized
+                and "where sent = true" in normalized
+                and "payload::jsonb" in normalized
             ):
-                index = min(self._owner.sent_count_index, len(self._owner.sent_count_sequence) - 1)
-                count = self._owner.sent_count_sequence[index]
-                self._owner.sent_count_index = min(
-                    self._owner.sent_count_index + 1, len(self._owner.sent_count_sequence) - 1
-                )
+                count = self._last_id_count if self._last_id_count is not None else 0
                 self._owner.sent_count_calls += 1
+                self._owner.last_fallback_params = params
                 self._result = [(count,)]
             else:
                 super().execute(statement, params)
@@ -2397,6 +2477,65 @@ def test_poll_once_waits_for_sent_dispatch_count(monkeypatch):
     watcher.poll_once(match_filters={"action_id": nick.action_id})
     assert fake_clock["sleeps"] == []
     assert nick.sent_count_calls == previous_calls
+
+
+def test_count_sent_drafts_matches_alternate_action_keys():
+    class DispatchCursor(DummyNick._DummyCursor):
+        def __init__(self, owner):
+            super().__init__(owner)
+            self._result: List[Tuple] = []
+
+        def execute(self, statement, params=None):
+            normalized = " ".join(statement.split()).lower()
+            if (
+                "select count(*) from proc.draft_rfq_emails" in normalized
+                and "where sent = true" in normalized
+                and "payload::jsonb" in normalized
+            ):
+                self._owner.last_fallback_params = params
+                self._result = [(self._owner.expected_count,)]
+            elif "id = any" in normalized and "where sent = true" in normalized:
+                self._result = [(0,)]
+            else:
+                super().execute(statement, params)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+    class DispatchConnection(DummyNick._DummyConn):
+        def cursor(self):
+            return DispatchCursor(self._owner)
+
+    class DispatchNick(DummyNick):
+        def __init__(self):
+            super().__init__()
+            self.action_id = "action-alt-001"
+            self.expected_count = 5
+            self.last_fallback_params: Optional[Tuple] = None
+
+        def get_db_connection(self):
+            return DispatchConnection(self)
+
+    nick = DispatchNick()
+    watcher = _make_watcher(nick, loader=lambda limit=None: [])
+    watcher.bucket = None
+
+    expectation = watcher._DispatchExpectation(
+        action_id=nick.action_id,
+        workflow_id=None,
+        draft_ids=(101, 102),
+        draft_count=6,
+        supplier_count=2,
+    )
+
+    result = watcher._count_sent_drafts(expectation)
+
+    assert result == nick.expected_count
+    assert nick.last_fallback_params is not None
+    decoded_params = [json.loads(value) for value in nick.last_fallback_params]
+    assert {"action_id": nick.action_id} in decoded_params
+    assert {"draft_action_id": nick.action_id} in decoded_params
+    assert {"email_action_id": nick.action_id} in decoded_params
 
 
 def test_wait_for_dispatch_completion_adds_post_dispatch_delay(monkeypatch):
