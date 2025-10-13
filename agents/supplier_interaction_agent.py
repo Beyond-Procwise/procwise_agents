@@ -235,7 +235,10 @@ class SupplierInteractionAgent(BaseAgent):
         collected: List[Dict[str, Any]] = []
 
         while True:
-            pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+            pending_rows = supplier_response_repo.fetch_pending(
+                workflow_id=workflow_id,
+                include_processed=True,
+            )
             serialised = [
                 self._serialise_pending_row(row)
                 for row in pending_rows
