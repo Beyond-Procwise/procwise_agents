@@ -41,6 +41,99 @@ class SupplierInteractionAgent(BaseAgent):
     # aligned regardless of the original casing.
     RFQ_PATTERN = re.compile(r"RFQ-\d{8}-[A-Za-z0-9]{8}", re.IGNORECASE)
 
+    @staticmethod
+    def _draft_tracking_context(draft: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+        context: Dict[str, Optional[str]] = {
+            "workflow_id": None,
+            "run_id": None,
+            "unique_id": None,
+            "supplier_id": None,
+        }
+        if not isinstance(draft, dict):
+            return context
+
+        context["workflow_id"] = SupplierInteractionAgent._coerce_text(
+            draft.get("workflow_id")
+        )
+        context["run_id"] = SupplierInteractionAgent._coerce_text(
+            draft.get("dispatch_run_id") or draft.get("run_id")
+        )
+        context["unique_id"] = SupplierInteractionAgent._coerce_text(
+            draft.get("unique_id")
+        )
+        context["supplier_id"] = SupplierInteractionAgent._coerce_text(
+            draft.get("supplier_id")
+        )
+
+        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+        if metadata:
+            context.setdefault("workflow_id", None)
+            if not context["workflow_id"]:
+                context["workflow_id"] = SupplierInteractionAgent._coerce_text(
+                    metadata.get("workflow_id") or metadata.get("process_workflow_id")
+                )
+            if not context["run_id"]:
+                context["run_id"] = SupplierInteractionAgent._coerce_text(
+                    metadata.get("dispatch_run_id") or metadata.get("run_id")
+                )
+            if not context["unique_id"]:
+                context["unique_id"] = SupplierInteractionAgent._coerce_text(
+                    metadata.get("unique_id")
+                )
+            if not context["supplier_id"]:
+                context["supplier_id"] = SupplierInteractionAgent._coerce_text(
+                    metadata.get("supplier_id")
+                )
+
+        return context
+
+    @staticmethod
+    def _coerce_text(value: Optional[Any]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    @staticmethod
+    def _response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        body = row.get("body_text") or ""
+        subject = row.get("subject") or ""
+        supplier_id = row.get("supplier_id")
+        workflow_id = row.get("workflow_id")
+        unique_id = row.get("unique_id")
+        response = {
+            "workflow_id": workflow_id,
+            "unique_id": unique_id,
+            "supplier_id": supplier_id,
+            "message": body,
+            "subject": subject,
+            "message_id": row.get("message_id"),
+            "mailbox": row.get("mailbox"),
+            "imap_uid": row.get("imap_uid"),
+            "received_at": row.get("received_at"),
+            "supplier_status": AgentStatus.SUCCESS.value,
+            "supplier_output": {
+                "response_text": body,
+                "supplier_id": supplier_id,
+                "workflow_id": workflow_id,
+                "unique_id": unique_id,
+            },
+        }
+        headers = {
+            "from": row.get("from_addr"),
+            "to": (row.get("to_addrs") or "").split(","),
+            "subject": subject,
+            "message_id": row.get("message_id"),
+            "workflow_id": workflow_id,
+            "unique_id": unique_id,
+            "supplier_id": supplier_id,
+        }
+        response["email_headers"] = headers
+        return response
+
     def run(self, context: AgentContext) -> AgentOutput:
         """Process a single supplier email or poll the mailbox."""
         action = context.input_data.get("action")
@@ -480,315 +573,87 @@ class SupplierInteractionAgent(BaseAgent):
 
         return processed
 
-    def wait_for_response(
-        self,
-        *,
-        watcher=None,
-        timeout: int = 300,
-        poll_interval: Optional[int] = None,
-        limit: int = 1,
-        rfq_id: Optional[str] = None,
-        supplier_id: Optional[str] = None,
-        subject_hint: Optional[str] = None,
-        from_address: Optional[str] = None,
-        max_attempts: Optional[int] = None,
-        enable_negotiation: bool = True,
-        draft_action_id: Optional[str] = None,
-        workflow_id: Optional[str] = None,
-        dispatch_run_id: Optional[str] = None,
-        action_id: Optional[str] = None,
-        email_action_id: Optional[str] = None,
-        suppliers: Optional[Sequence[str]] = None,
-        expected_replies: Optional[int] = None,
-    ) -> Optional[Dict]:
-        """Wait for an inbound supplier email and return the processed result.
 
-        When ``enable_negotiation`` is ``True`` the underlying SES watcher is
-        initialised with a negotiation agent reference so counter rounds can be
-        triggered automatically as part of the polling loop.  NegotiationAgent
-        itself disables the flag while awaiting responses to avoid recursive
-        execution.
-        """
+def wait_for_response(
+    self,
+    *,
+    watcher=None,
+    timeout: int = 300,
+    poll_interval: Optional[int] = None,
+    limit: int = 1,
+    rfq_id: Optional[str] = None,
+    supplier_id: Optional[str] = None,
+    subject_hint: Optional[str] = None,
+    from_address: Optional[str] = None,
+    max_attempts: Optional[int] = None,
+    enable_negotiation: bool = True,
+    draft_action_id: Optional[str] = None,
+    workflow_id: Optional[str] = None,
+    dispatch_run_id: Optional[str] = None,
+    action_id: Optional[str] = None,
+    email_action_id: Optional[str] = None,
+    suppliers: Optional[Sequence[str]] = None,
+    expected_replies: Optional[int] = None,
+) -> Optional[Dict]:
+    """Await supplier replies using the workflow-aware IMAP watcher."""
 
-        deadline = time.time() + max(timeout, 0)
-
-        attempt_cap_value = max_attempts
-        if attempt_cap_value is None:
-            legacy_setting = getattr(
-                self.agent_nick.settings, "email_response_max_attempts", None
-            )
-            if legacy_setting is not None:
-                logger.debug(
-                    "Ignoring legacy email_response_max_attempts=%s in favour of timeout-based S3 polling",
-                    legacy_setting,
-                )
-            attempt_cap = None
-        else:
-            attempt_cap = self._coerce_int(attempt_cap_value, default=0)
-            if attempt_cap <= 0:
-                attempt_cap = None
-        attempts_made = 0
-
-        if (
-            watcher is None
-            and not getattr(self.agent_nick, "dispatch_service_started", False)
-        ):
-            logger.debug(
-                "Email watcher initialisation deferred until dispatch service starts; waiting up to %ss",
-                timeout,
-            )
-            while time.time() <= deadline:
-                if getattr(self.agent_nick, "dispatch_service_started", False):
-                    break
-                remaining = max(0.0, deadline - time.time())
-                if remaining <= 0:
-                    break
-                time.sleep(min(1.0, remaining))
-            if not getattr(self.agent_nick, "dispatch_service_started", False):
-                logger.warning(
-                    "Dispatch service did not start before timeout while waiting for supplier response (rfq_id=%s, supplier=%s)",
-                    rfq_id,
-                    supplier_id,
-                )
-                return None
-
-        active_watcher = watcher
-        if active_watcher is None:
-            try:
-                from services.email_watcher import SESEmailWatcher
-            except Exception:  # pragma: no cover - optional import
-                SESEmailWatcher = None
-
-            if SESEmailWatcher is None:
-                return None
-
-            watcher_needs_refresh = False
-            if self._email_watcher is None:
-                watcher_needs_refresh = True
-            else:
-                current_flag = getattr(self._email_watcher, "enable_negotiation", True)
-                if bool(current_flag) != bool(enable_negotiation):
-                    watcher_needs_refresh = True
-
-            if watcher_needs_refresh:
-                negotiation_agent = None
-                if enable_negotiation:
-                    negotiation_agent = self._get_negotiation_agent()
-
-                poll_setting = getattr(
-                    self.agent_nick.settings, "email_response_poll_seconds", 60
-                )
-                if poll_interval is not None:
-                    response_poll_seconds = self._coerce_int(
-                        poll_interval, default=poll_setting
-                    )
-                else:
-                    response_poll_seconds = poll_setting
-
-                self._email_watcher = SESEmailWatcher(
-                    self.agent_nick,
-                    supplier_agent=self,
-                    negotiation_agent=negotiation_agent,
-                    enable_negotiation=enable_negotiation,
-                    response_poll_seconds=response_poll_seconds,
-                )
-            active_watcher = self._email_watcher
-
-        result: Optional[Dict] = None
-        supplier_normalised = self._normalise_identifier(supplier_id)
-        run_normalised = self._normalise_identifier(dispatch_run_id)
-        subject_norm = str(subject_hint or "").strip().lower()
-        sender_normalised = self._normalise_identifier(from_address)
-
-        supplier_candidates: Optional[Set[str]] = None
-        if suppliers:
-            candidate_set: Set[str] = set()
-            for supplier in suppliers:
-                normalised = self._normalise_identifier(supplier)
-                if normalised:
-                    candidate_set.add(normalised)
-            if candidate_set:
-                supplier_candidates = candidate_set
-
-        expected_count: Optional[int]
-        if expected_replies is not None:
-            expected_count = self._coerce_int(expected_replies, default=0)
-            if expected_count <= 0:
-                expected_count = None
-        else:
-            if supplier_candidates is not None:
-                expected_count = len(supplier_candidates)
-            elif supplier_normalised:
-                expected_count = 1
-            else:
-                expected_count = None
-
-        aggregated_mode = bool(expected_count and not supplier_normalised)
-        responses_map: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
-
-        match_filters = self._build_workflow_filters(
-            workflow_id=workflow_id,
-            action_id=action_id,
-            draft_action_id=draft_action_id,
-            email_action_id=email_action_id,
+    workflow_key = self._coerce_text(workflow_id)
+    if not workflow_key:
+        logger.error(
+            "wait_for_response requires workflow_id; received rfq_id=%s supplier=%s",
+            rfq_id,
+            supplier_id,
         )
+        return None
 
-        if (
-            aggregated_mode
-            and match_filters.get("workflow_id")
-        ):
-            match_filters = {"workflow_id": match_filters["workflow_id"]}
+    run_identifier = self._coerce_text(dispatch_run_id)
+    if not run_identifier:
+        run_identifier = self._coerce_text(draft_action_id) or self._coerce_text(action_id)
 
-        while time.time() <= deadline:
-            if attempt_cap is not None and attempts_made >= attempt_cap:
-                logger.info(
-                    "Reached maximum email poll attempts (%s) while waiting for RFQ %s",
-                    attempt_cap,
-                    rfq_id,
-                )
-                break
-            attempts_made += 1
-            try:
-                poll_kwargs: Dict[str, object] = {
-                    "limit": None,
-                    "match_filters": match_filters or {},
-                }
-                if expected_count:
-                    poll_kwargs["expected_replies"] = expected_count
-                if poll_interval is not None:
-                    poll_kwargs["poll_interval"] = poll_interval
-                batch = active_watcher.poll_once(**poll_kwargs)
-            except Exception:  # pragma: no cover - best effort
-                logger.exception("wait_for_response poll failed")
-                batch = []
-            if batch:
-                expected_fulfilled = False
-                for candidate in batch:
-                    if supplier_normalised and self._normalise_identifier(
-                        candidate.get("supplier_id")
-                    ) != supplier_normalised:
-                        continue
-                    if run_normalised:
-                        candidate_run = self._normalise_identifier(
-                            candidate.get("dispatch_run_id") or candidate.get("run_id")
-                        )
-                        if candidate_run != run_normalised:
-                            continue
-                    if subject_norm:
-                        subj = str(candidate.get("subject") or "").lower()
-                        if subject_norm not in subj:
-                            continue
-                    if sender_normalised:
-                        sender = self._normalise_identifier(candidate.get("from_address"))
-                        if sender and sender != sender_normalised:
-                            continue
-                    status_value = str(candidate.get("supplier_status") or "").lower()
-                    payload_ready = candidate.get("supplier_output")
-                    if status_value in {"processing", "pending"} and not payload_ready:
-                        logger.debug(
-                            "Supplier response still processing for RFQ %s (supplier=%s); status=%s",
-                            candidate.get("rfq_id") or rfq_id,
-                            candidate.get("supplier_id") or supplier_id,
-                            status_value,
-                        )
-                        continue
-                    if status_value == AgentStatus.FAILED.value:
-                        error_detail = candidate.get("error") or "unknown_error"
-                        logger.error(
-                            "Supplier response poll detected failure for RFQ %s (supplier=%s): %s",
-                            candidate.get("rfq_id") or rfq_id,
-                            candidate.get("supplier_id") or supplier_id,
-                            error_detail,
-                        )
-                        if aggregated_mode:
-                            response_key = (
-                                self._normalise_identifier(candidate.get("rfq_id")),
-                                self._normalise_identifier(candidate.get("supplier_id")),
-                            )
-                            if any(response_key):
-                                responses_map[response_key] = candidate
-                                if expected_count and len(responses_map) >= expected_count:
-                                    expected_fulfilled = True
-                            if expected_fulfilled:
-                                break
-                            continue
-                        result = candidate
-                        break
-                    if not payload_ready:
-                        logger.debug(
-                            "Supplier response for RFQ %s matched filters but has no payload yet; continuing to wait",
-                            candidate.get("rfq_id") or rfq_id,
-                        )
-                        continue
-                    if aggregated_mode:
-                        response_key = (
-                            self._normalise_identifier(candidate.get("rfq_id")),
-                            self._normalise_identifier(candidate.get("supplier_id")),
-                        )
-                        if any(response_key):
-                            responses_map[response_key] = candidate
-                            if expected_count and len(responses_map) >= expected_count:
-                                expected_fulfilled = True
-                        if expected_fulfilled:
-                            break
-                        continue
-                    result = candidate
-                    break
+    try:
+        from services.email_watcher_imap import run_email_watcher_for_workflow
+    except Exception:  # pragma: no cover - runtime environments may exclude IMAP watcher
+        logger.exception("IMAP email watcher unavailable while awaiting supplier response")
+        return None
 
+    orchestrator = getattr(self.agent_nick, "orchestrator", None)
 
-                if result is not None:
-                    break
-                if aggregated_mode and expected_count and len(responses_map) >= expected_count:
-                    expected_fulfilled = True
-                if expected_fulfilled:
-                    break
-            interval_value = poll_interval or getattr(
-                self.agent_nick.settings, "email_response_poll_seconds", 60
-            )
-            if interval_value <= 0:
-                break
-            time.sleep(
-                min(max(1, interval_value), max(0, deadline - time.time()))
-            )
+    watcher_result = run_email_watcher_for_workflow(
+        workflow_id=workflow_key,
+        run_id=run_identifier,
+        wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
+        agent_registry=None,
+        orchestrator=orchestrator,
+    )
 
-        if aggregated_mode:
-            received = len(responses_map)
-            if expected_count and received < expected_count:
-                if attempt_cap is not None and attempts_made >= attempt_cap:
-                    logger.warning(
-                        "Stopped waiting for supplier responses (workflow_id=%s) after %s attempt(s); received %s of %s",
-                        workflow_id,
-                        attempts_made,
-                        received,
-                        expected_count,
-                    )
-                else:
-                    logger.warning(
-                        "Timed out waiting for supplier responses (workflow_id=%s) after %ss; received %s of %s",
-                        workflow_id,
-                        timeout,
-                        received,
-                        expected_count,
-                    )
-            return {"responses": list(responses_map.values()), "received": received}
+    if watcher_result.get("status") != "processed":
+        logger.info(
+            "Email watcher has not completed for workflow=%s (status=%s)",
+            workflow_key,
+            watcher_result.get("status"),
+        )
+        return None
 
-        if result is None:
-            if attempt_cap is not None and attempts_made >= attempt_cap:
-                logger.warning(
-                    "Stopped waiting for supplier response (rfq_id=%s, supplier=%s) after %s attempt(s)",
-                    rfq_id,
-                    supplier_id,
-                    attempts_made,
-                )
-            else:
-                logger.warning(
-                    "Timed out waiting for supplier response (rfq_id=%s, supplier=%s) after %ss",
-                    rfq_id,
-                    supplier_id,
-                    timeout,
-                )
+    rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
+    if not rows:
+        logger.info(
+            "No supplier responses stored for workflow=%s run_id=%s",
+            workflow_key,
+            run_identifier,
+        )
+        return None
 
-        return result
+    target_supplier = self._coerce_text(supplier_id)
+    if target_supplier:
+        filtered = [
+            row
+            for row in rows
+            if self._coerce_text(row.get("supplier_id")) == target_supplier
+        ]
+        rows = filtered or rows
+
+    return self._response_from_row(rows[0]) if rows else None
+
 
     def wait_for_multiple_responses(
         self,
@@ -799,277 +664,65 @@ class SupplierInteractionAgent(BaseAgent):
         limit: int = 1,
         enable_negotiation: bool = True,
     ) -> List[Optional[Dict]]:
-        """Poll the shared watcher until every expected supplier responds."""
+        """Collect all supplier responses for the provided drafts."""
 
         if not drafts:
             return []
 
-        safe_interval = poll_interval
-        if safe_interval is not None:
-            try:
-                safe_interval = max(1, int(safe_interval))
-            except Exception:
-                safe_interval = None
+        contexts = [self._draft_tracking_context(draft) for draft in drafts]
+        workflow_ids = {
+            ctx["workflow_id"] for ctx in contexts if ctx.get("workflow_id")
+        }
+        if len(workflow_ids) != 1:
+            logger.error(
+                "Cannot aggregate responses without a single workflow_id; contexts=%s",
+                contexts,
+            )
+            return [None] * len(drafts)
 
-        deadline = time.time() + max(timeout, 0)
-
-        results: List[Optional[Dict]] = [None] * len(drafts)
-        contexts: List[Optional[Dict[str, Any]]] = [None] * len(drafts)
+        workflow_id = workflow_ids.pop()
+        run_ids = {ctx.get("run_id") for ctx in contexts if ctx.get("run_id")}
+        run_identifier = run_ids.pop() if len(run_ids) == 1 else None
 
         try:
-            from services.email_watcher import SESEmailWatcher
+            from services.email_watcher_imap import run_email_watcher_for_workflow
         except Exception:  # pragma: no cover - optional dependency
-            logger.exception("Unable to initialise email watcher for aggregated polling")
-            return results
+            logger.exception("IMAP email watcher unavailable for aggregated wait")
+            return [None] * len(drafts)
 
-        negotiation_agent = self._get_negotiation_agent() if enable_negotiation else None
-
-        poll_setting = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
-        if safe_interval is not None:
-            response_interval = self._coerce_int(safe_interval, default=poll_setting)
-        else:
-            response_interval = poll_setting
-
-        watcher_instance = SESEmailWatcher(
-            self.agent_nick,
-            supplier_agent=self,
-            negotiation_agent=negotiation_agent,
-            enable_negotiation=enable_negotiation,
-            response_poll_seconds=response_interval,
+        orchestrator = getattr(self.agent_nick, "orchestrator", None)
+        watcher_result = run_email_watcher_for_workflow(
+            workflow_id=workflow_id,
+            run_id=run_identifier,
+            wait_seconds_after_last_dispatch=max(90, int(timeout) if timeout else 90),
+            agent_registry=None,
+            orchestrator=orchestrator,
         )
 
-        GroupDict = Dict[str, Any]
-        groups: Dict[Tuple[str, str], GroupDict] = {}
-        _MISMATCH = object()
-
-        def _resolve_group_key(context: Dict[str, Any], index: int) -> Tuple[str, str]:
-            for key in ("workflow_id", "draft_action_id", "action_id", "email_action_id"):
-                value = context.get(key)
-                if isinstance(value, str) and value.strip():
-                    return (key, value.strip())
-            return ("fallback", str(index))
-
-        for idx, draft in enumerate(drafts):
-            context = self._prepare_watch_context(draft)
-            contexts[idx] = context
-            if not context:
-                continue
-            group_key = _resolve_group_key(context, idx)
-            group = groups.setdefault(
-                group_key,
-                {
-                    "filters": {},
-                    "filter_candidates": {
-                        "workflow_id": context.get("workflow_id"),
-                        "action_id": context.get("action_id"),
-                        "draft_action_id": context.get("draft_action_id"),
-                        "email_action_id": context.get("email_action_id"),
-                    },
-                    "pending": set(),
-                    "contexts": {},
-                    "by_dispatch": {},
-                    "by_supplier_rfq": {},
-                    "by_supplier": {},
-                    "by_rfq": {},
-                    "by_action": {},
-                },
+        if watcher_result.get("status") != "processed":
+            logger.info(
+                "Aggregated watcher not ready for workflow=%s (status=%s)",
+                workflow_id,
+                watcher_result.get("status"),
             )
-            if group is not None:
-                candidates = group.setdefault("filter_candidates", {})
-            else:
-                candidates = {}
-            for key in ("workflow_id", "action_id", "draft_action_id", "email_action_id"):
-                existing = candidates.get(key)
-                candidate_value = context.get(key)
-                if existing is _MISMATCH:
-                    continue
-                if existing is None:
-                    if candidate_value is not None:
-                        candidates[key] = candidate_value
-                    continue
-                if candidate_value is None or candidate_value == existing:
-                    continue
-                candidates[key] = _MISMATCH
+            return [None] * len(drafts)
 
-            def _candidate_or_none(value: object) -> Optional[str]:
-                if value is _MISMATCH:
-                    return None
-                return value  # type: ignore[return-value]
+        rows: List[Dict[str, Any]] = watcher_result.get("rows") or []
+        response_map = {
+            row.get("unique_id"): self._response_from_row(row)
+            for row in rows
+            if row.get("unique_id")
+        }
 
-            group["filters"] = self._build_workflow_filters(
-                workflow_id=_candidate_or_none(group["filter_candidates"].get("workflow_id")),
-                action_id=_candidate_or_none(group["filter_candidates"].get("action_id")),
-                draft_action_id=_candidate_or_none(group["filter_candidates"].get("draft_action_id")),
-                email_action_id=_candidate_or_none(group["filter_candidates"].get("email_action_id")),
-            )
-            group["pending"].add(idx)
-            group["contexts"][idx] = context
-            dispatch_key = context.get("dispatch_normalised")
-            if dispatch_key:
-                group["by_dispatch"][dispatch_key] = idx
-            supplier_key = context.get("supplier_normalised")
-            rfq_key = context.get("rfq_normalised")
-            if supplier_key and rfq_key:
-                group["by_supplier_rfq"][(supplier_key, rfq_key)] = idx
-            if supplier_key:
-                group["by_supplier"][supplier_key] = idx
-            if rfq_key:
-                group["by_rfq"][rfq_key] = idx
-            for token in (
-                context.get("draft_action_id"),
-                context.get("action_id"),
-                context.get("email_action_id"),
-            ):
-                normalised = self._normalise_identifier(token)
-                if normalised:
-                    group["by_action"][normalised] = idx
-
-        if not groups:
-            return results
-
-        for group in groups.values():
-            if len(group["pending"]) > 1:
-                workflow_value = group["filters"].get("workflow_id")
-                group["filters"] = {"workflow_id": workflow_value} if workflow_value else {}
-
-        def _candidate_action_tokens(candidate: Dict[str, Any]) -> List[str]:
-            tokens: List[str] = []
-            metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else None
-            for container in (candidate, metadata):
-                if not isinstance(container, dict):
-                    continue
-                for key in ("draft_action_id", "action_id", "email_action_id"):
-                    value = container.get(key)
-                    normalised = self._normalise_identifier(value)
-                    if normalised:
-                        tokens.append(normalised)
-            return tokens
-
-        def _candidate_ready(candidate: Dict[str, Any]) -> bool:
-            status_value = str(candidate.get("supplier_status") or "").lower()
-            payload_ready = candidate.get("supplier_output")
-            if status_value == AgentStatus.FAILED.value:
-                return True
-            if status_value in {"processing", "pending"} and not payload_ready:
-                return False
-            if payload_ready:
-                return True
-            if candidate.get("error"):
-                return True
-            return False
-
-        def _matches_context(idx: int, candidate: Dict[str, Any]) -> bool:
-            context = contexts[idx]
-            if not context:
-                return False
-            dispatch_norm = self._normalise_identifier(
-                candidate.get("dispatch_run_id") or candidate.get("run_id")
-            )
-            if context.get("dispatch_normalised") and dispatch_norm:
-                if dispatch_norm != context["dispatch_normalised"]:
-                    return False
-            supplier_norm = self._normalise_identifier(candidate.get("supplier_id"))
-            if context.get("supplier_normalised") and supplier_norm:
-                if supplier_norm != context["supplier_normalised"]:
-                    return False
-            rfq_norm = self._normalise_identifier(candidate.get("rfq_id"))
-            if context.get("rfq_normalised") and rfq_norm:
-                if rfq_norm != context["rfq_normalised"]:
-                    return False
-            subject_norm = str(candidate.get("subject") or "").lower()
-            if context.get("subject_normalised"):
-                if context["subject_normalised"] not in subject_norm:
-                    return False
-            sender_norm = self._normalise_identifier(candidate.get("from_address"))
-            if context.get("from_normalised") and sender_norm:
-                if sender_norm != context["from_normalised"]:
-                    return False
-            return True
-
-        def _locate_index(group: GroupDict, candidate: Dict[str, Any]) -> Optional[int]:
-            dispatch_norm = self._normalise_identifier(
-                candidate.get("dispatch_run_id") or candidate.get("run_id")
-            )
-            if dispatch_norm and dispatch_norm in group["by_dispatch"]:
-                idx = group["by_dispatch"][dispatch_norm]
-                if idx in group["pending"] and _matches_context(idx, candidate):
-                    return idx
-            for token in _candidate_action_tokens(candidate):
-                idx = group["by_action"].get(token)
-                if idx in group["pending"] and _matches_context(idx, candidate):
-                    return idx
-            supplier_norm = self._normalise_identifier(candidate.get("supplier_id"))
-            rfq_norm = self._normalise_identifier(candidate.get("rfq_id"))
-            if supplier_norm and rfq_norm:
-                idx = group["by_supplier_rfq"].get((supplier_norm, rfq_norm))
-                if idx in group["pending"] and _matches_context(idx, candidate):
-                    return idx
-            if supplier_norm:
-                idx = group["by_supplier"].get(supplier_norm)
-                if idx in group["pending"] and _matches_context(idx, candidate):
-                    return idx
-            if rfq_norm:
-                idx = group["by_rfq"].get(rfq_norm)
-                if idx in group["pending"] and _matches_context(idx, candidate):
-                    return idx
-            return None
-
-        seen_messages: Set[str] = set()
-
-        def _pending_total() -> int:
-            return sum(len(group["pending"]) for group in groups.values())
-
-        while time.time() <= deadline and _pending_total() > 0:
-            cycle_matched = False
-            for group in groups.values():
-                if not group["pending"]:
-                    continue
-                poll_kwargs: Dict[str, object] = {"limit": None}
-                pending_total = len(group["pending"])
-                if pending_total > 0:
-                    poll_kwargs["expected_replies"] = pending_total
-                if group["filters"]:
-                    poll_kwargs["match_filters"] = group["filters"]
-                try:
-                    batch = watcher_instance.poll_once(**poll_kwargs)
-                except Exception:  # pragma: no cover - defensive network/runtime
-                    logger.exception("Aggregated wait_for_multiple_responses poll failed")
-                    batch = []
-                for candidate in batch:
-                    message_id = str(candidate.get("message_id") or candidate.get("id") or "")
-                    if message_id:
-                        if message_id in seen_messages:
-                            continue
-                        seen_messages.add(message_id)
-                    target_index = _locate_index(group, candidate)
-                    if target_index is None:
-                        continue
-                    if not _candidate_ready(candidate):
-                        continue
-                    results[target_index] = candidate
-                    group["pending"].discard(target_index)
-                    cycle_matched = True
-            if _pending_total() == 0:
-                break
-            if cycle_matched:
-                continue
-            interval_value = safe_interval or poll_setting
-            if interval_value <= 0:
-                break
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            time.sleep(min(interval_value, max(0, remaining)))
-
-        if any(result is None for result in results):
-            self._await_outstanding_dispatch_responses(
-                drafts,
-                results,
-                deadline=deadline,
-                poll_interval=safe_interval,
-                limit=limit,
-                enable_negotiation=enable_negotiation,
-            )
+        results: List[Optional[Dict]] = []
+        for draft, ctx in zip(drafts, contexts):
+            response = response_map.get(ctx.get("unique_id"))
+            if response is None and ctx.get("supplier_id"):
+                for row in rows:
+                    if self._coerce_text(row.get("supplier_id")) == ctx.get("supplier_id"):
+                        response = self._response_from_row(row)
+                        break
+            results.append(response)
 
         return results
 

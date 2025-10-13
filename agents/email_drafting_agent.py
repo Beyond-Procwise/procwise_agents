@@ -2796,6 +2796,31 @@ class EmailDraftingAgent(BaseAgent):
         try:
             with self.agent_nick.get_db_connection() as conn:
                 self._ensure_table_exists(conn)
+
+                workflow_id = draft.get("workflow_id")
+                if not workflow_id and isinstance(draft.get("metadata"), dict):
+                    workflow_id = draft["metadata"].get("workflow_id")
+                if not workflow_id:
+                    workflow_id = uuid.uuid4().hex
+                draft["workflow_id"] = workflow_id
+
+                unique_id = draft.get("unique_id")
+                if not unique_id:
+                    unique_id = uuid.uuid4().hex
+                draft["unique_id"] = unique_id
+
+                run_id = draft.get("run_id")
+                if not run_id and isinstance(draft.get("metadata"), dict):
+                    run_id = draft["metadata"].get("run_id")
+                if run_id:
+                    draft["run_id"] = run_id
+
+                mailbox_hint = draft.get("mailbox")
+                if not mailbox_hint and isinstance(draft.get("metadata"), dict):
+                    mailbox_hint = draft["metadata"].get("mailbox")
+                if mailbox_hint:
+                    draft["mailbox"] = mailbox_hint
+
                 thread_index = draft.get("thread_index")
                 if not isinstance(thread_index, int) or thread_index < 1:
                     thread_index = self._next_thread_index(conn, draft["rfq_id"])
@@ -2826,8 +2851,9 @@ class EmailDraftingAgent(BaseAgent):
                         """
                         INSERT INTO proc.draft_rfq_emails
                         (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent,
-                         recipient_email, contact_level, thread_index, sender, payload)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+                         recipient_email, contact_level, thread_index, sender, payload,
+                         workflow_id, run_id, unique_id, mailbox)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
@@ -2842,6 +2868,10 @@ class EmailDraftingAgent(BaseAgent):
                             thread_index,
                             draft.get("sender"),
                             payload,
+                            workflow_id,
+                            run_id,
+                            unique_id,
+                            mailbox_hint,
                         ),
                     )
                     row = cur.fetchone()
@@ -2973,6 +3003,24 @@ class EmailDraftingAgent(BaseAgent):
                 )
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS workflow_id TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS run_id TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS unique_id TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS mailbox TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS dispatch_run_id TEXT"
                 )
 
 
