@@ -145,9 +145,12 @@ class Orchestrator:
         workflow_id = str(uuid.uuid4())
         logger.info(f"Starting workflow {workflow_name} with ID {workflow_id}")
 
+        context: Optional[AgentContext] = None
+        enriched_input: Dict[str, Any] = {}
+
         try:
             # Create initial context
-            enriched_input: Dict[str, Any] = {**(input_data or {})}
+            enriched_input = {**(input_data or {})}
             self._ensure_workflow_metadata(enriched_input, workflow_name)
             manifest = self.manifest_service.build_manifest(workflow_name)
             if isinstance(enriched_input, dict):
@@ -207,6 +210,18 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Workflow {workflow_id} failed: {e}")
+            if context is None:
+                fallback_input: Dict[str, Any] = {}
+                if isinstance(enriched_input, dict):
+                    fallback_input = dict(enriched_input)
+                elif isinstance(input_data, dict):
+                    fallback_input = dict(input_data)
+                context = AgentContext(
+                    workflow_id=workflow_id,
+                    agent_id=workflow_name,
+                    user_id=user_id or self.settings.script_user,
+                    input_data=fallback_input,
+                )
             self._publish_workflow_complete(
                 workflow_name=workflow_name,
                 workflow_id=workflow_id,
@@ -214,7 +229,6 @@ class Orchestrator:
                 result={"error": str(e)},
                 status="failed",
             )
-            self._trigger_automatic_training(workflow_name)
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
     @staticmethod
