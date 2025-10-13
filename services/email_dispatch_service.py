@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from utils.email_markers import attach_hidden_marker, extract_marker_token, split_hidden_marker
+from utils.email_tracking import build_tracking_comment, ensure_tracking_prefix, strip_tracking_comment
 from utils.gpu import configure_gpu
 
 from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
@@ -24,9 +23,6 @@ from .email_thread_store import (
 configure_gpu()
 
 logger = logging.getLogger(__name__)
-
-_RFQ_ID_PATTERN = re.compile(r"RFQ-ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
-
 
 _DEFAULT_THREAD_TABLE = DEFAULT_THREAD_TABLE
 
@@ -110,7 +106,9 @@ class EmailDispatchService:
                 rfq_id,
                 supplier_id=draft.get("supplier_id"),
                 dispatch_token=dispatch_run_id,
-                run_id=dispatch_run_id,
+                run_id=draft.get("run_id") or dispatch_run_id,
+                workflow_id=draft.get("workflow_id"),
+                unique_id=draft.get("unique_id"),
             )
             backend_metadata["run_id"] = dispatch_run_id
 
@@ -128,16 +126,28 @@ class EmailDispatchService:
                     "dispatch_run_id": dispatch_run_id,
                 }
             )
+            dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
+            dispatch_payload.setdefault("unique_id", backend_metadata.get("unique_id"))
+            if backend_metadata.get("run_id"):
+                dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
+            if backend_metadata.get("supplier_id"):
+                dispatch_payload.setdefault("supplier_id", backend_metadata.get("supplier_id"))
             dispatch_payload.setdefault("metadata", {})
             if isinstance(dispatch_payload["metadata"], dict):
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
-            headers = {"X-Procwise-RFQ-ID": rfq_id}
+            headers = {
+                "X-Procwise-RFQ-ID": rfq_id,
+                "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
+                "X-Procwise-Unique-Id": backend_metadata.get("unique_id"),
+            }
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
                 headers["X-Procwise-Mailbox"] = mailbox_header
+            if backend_metadata.get("supplier_id"):
+                headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
 
             send_result = self.email_service.send_email(
                 subject,
@@ -225,7 +235,8 @@ class EmailDispatchService:
             cur.execute(
                 """
                 SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       recipient_email, contact_level, thread_index, payload, sender, sent_on
+                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
                 FROM proc.draft_rfq_emails
                 WHERE rfq_id = %s
                 ORDER BY sent ASC, thread_index DESC, id DESC
@@ -250,6 +261,12 @@ class EmailDispatchService:
             payload,
             sender,
             sent_on,
+            workflow_id,
+            run_id,
+            unique_id,
+            mailbox,
+            dispatch_run_id,
+            dispatched_at,
         ) = row
 
         hydrated: Dict[str, Any]
@@ -274,6 +291,12 @@ class EmailDispatchService:
             "thread_index": thread_index,
             "sender": sender,
             "recipients": hydrated.get("recipients") or ([recipient_email] if recipient_email else []),
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "unique_id": unique_id,
+            "mailbox": mailbox,
+            "dispatch_run_id": dispatch_run_id,
+            "dispatched_at": dispatched_at,
         }
         for key, value in defaults.items():
             hydrated.setdefault(key, value)
@@ -311,6 +334,11 @@ class EmailDispatchService:
         supplier_id = payload.get("supplier_id") or row[2]
         supplier_name = payload.get("supplier_name") or row[3]
         rfq_value = payload.get("rfq_id") or row[1]
+        workflow_id = payload.get("workflow_id") or row[13]
+        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or row[14]
+        unique_id = payload.get("unique_id") or row[15] or uuid.uuid4().hex
+        mailbox = payload.get("mailbox") or row[16]
+        dispatch_run_id = payload.get("dispatch_run_id") or row[17]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -325,6 +353,12 @@ class EmailDispatchService:
                     supplier_name = %s,
                     rfq_id = %s,
                     payload = %s,
+                    workflow_id = %s,
+                    run_id = %s,
+                    unique_id = %s,
+                    mailbox = %s,
+                    dispatch_run_id = %s,
+                    dispatched_at = CASE WHEN %s THEN NOW() ELSE dispatched_at END,
                     sent_on = CASE WHEN %s THEN NOW() ELSE sent_on END,
                     updated_on = NOW()
                 WHERE id = %s
@@ -339,6 +373,12 @@ class EmailDispatchService:
                     supplier_name,
                     rfq_value,
                     payload_json,
+                    workflow_id,
+                    run_id,
+                    unique_id,
+                    mailbox,
+                    dispatch_run_id,
+                    bool(sent),
                     bool(sent),
                     draft_id,
                 ),
@@ -459,29 +499,44 @@ class EmailDispatchService:
         supplier_id: Optional[str] = None,
         dispatch_token: Optional[str] = None,
         run_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        unique_id: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         text = body or ""
-        comment, remainder = split_hidden_marker(text)
-        cleaned = remainder or ""
-        if cleaned and rfq_id:
-            cleaned = re.sub(r"(?i)\bRFQ[-\s:]*[A-Z0-9]{2,}[^\s]*", "", cleaned)
-            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        existing_metadata, cleaned_body = strip_tracking_comment(text)
 
-        marker_token = dispatch_token or extract_marker_token(comment)
-        annotated_body, marker_token = attach_hidden_marker(
-            cleaned.strip(),
-            rfq_id=rfq_id,
-            supplier_id=supplier_id,
-            token=marker_token,
-            run_id=run_id or marker_token,
+        resolved_workflow = workflow_id or (existing_metadata.workflow_id if existing_metadata else None)
+        if not resolved_workflow:
+            raise ValueError("workflow_id is required to annotate outbound supplier emails")
+
+        resolved_supplier = supplier_id or (existing_metadata.supplier_id if existing_metadata else None)
+        resolved_token = dispatch_token or (existing_metadata.token if existing_metadata else None)
+        resolved_run = run_id or (existing_metadata.run_id if existing_metadata else None)
+        resolved_unique = unique_id or (existing_metadata.unique_id if existing_metadata else None)
+
+        comment, tracking_meta = build_tracking_comment(
+            workflow_id=resolved_workflow,
+            unique_id=resolved_unique,
+            supplier_id=resolved_supplier,
+            token=resolved_token,
+            run_id=resolved_run,
         )
 
-        metadata: Dict[str, Any] = {"rfq_id": rfq_id}
-        if marker_token:
-            metadata["dispatch_token"] = marker_token
-            metadata.setdefault("run_id", marker_token)
-        elif run_id:
-            metadata["run_id"] = run_id
+        base_body = (cleaned_body or text).strip()
+        annotated_body = ensure_tracking_prefix(base_body, comment)
+
+        metadata: Dict[str, Any] = {
+            "workflow_id": tracking_meta.workflow_id,
+            "unique_id": tracking_meta.unique_id,
+        }
+        if tracking_meta.supplier_id:
+            metadata["supplier_id"] = tracking_meta.supplier_id
+        if tracking_meta.token:
+            metadata["dispatch_token"] = tracking_meta.token
+        if tracking_meta.run_id:
+            metadata["run_id"] = tracking_meta.run_id
+        if rfq_id:
+            metadata["rfq_id"] = rfq_id
         return annotated_body, metadata
 
     @staticmethod
