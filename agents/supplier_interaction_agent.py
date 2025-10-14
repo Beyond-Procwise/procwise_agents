@@ -202,57 +202,19 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
-    def _await_dispatch_metadata(
-        self,
-        workflow_id: str,
-        *,
-        poll_seconds: int,
-        deadline: Optional[float],
-    ) -> Optional[Dict[str, Any]]:
-        """Wait for dispatch tracking rows to be fully populated."""
-
-        interval = poll_seconds if poll_seconds and poll_seconds > 0 else 5
-        interval = max(1, interval)
-        logged_wait = False
-
-        while True:
-            metadata = self._load_dispatch_metadata(workflow_id)
-            if metadata is not None:
-                return metadata
-
-            now = time.time()
-            if deadline is not None and now >= deadline:
-                return None
-
-            if not logged_wait:
-                logger.info(
-                    "Awaiting dispatch completion for workflow=%s before polling responses",
-                    workflow_id,
-                )
-                logged_wait = True
-
-            remaining = None if deadline is None else max(0.0, deadline - now)
-            sleep_for = interval if remaining is None else min(interval, remaining)
-            if sleep_for <= 0:
-                return None
-            time.sleep(sleep_for)
-
     def _poll_supplier_response_rows(
         self,
         workflow_id: str,
         *,
-        poll_seconds: int,
-        deadline: Optional[float],
-        attempt_limit: Optional[int],
         supplier_filter: Optional[Set[str]] = None,
         unique_filter: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
-        metadata = self._await_dispatch_metadata(
-            workflow_id,
-            poll_seconds=poll_seconds,
-            deadline=deadline,
-        )
+        metadata = self._load_dispatch_metadata(workflow_id)
         if metadata is None:
+            logger.debug(
+                "Dispatch metadata unavailable for workflow=%s; skipping response poll",
+                workflow_id,
+            )
             return []
 
         try:
@@ -260,21 +222,6 @@ class SupplierInteractionAgent(BaseAgent):
         except Exception:
             logger.exception("Failed to initialise supplier response schema for workflow=%s", workflow_id)
             return []
-
-        last_dispatched_at = metadata["last_dispatched_at"]
-        now = time.time()
-        wait_until = last_dispatched_at.timestamp() + 90.0
-        if wait_until > now:
-            wait_duration = wait_until - now
-            if deadline is not None and now + wait_duration > deadline:
-                wait_duration = max(0.0, deadline - now)
-            if wait_duration > 0:
-                logger.info(
-                    "Waiting %.1fs after dispatch before polling supplier responses for workflow=%s",
-                    wait_duration,
-                    workflow_id,
-                )
-                time.sleep(wait_duration)
 
         dispatch_rows = metadata.get("rows") or []
         dispatch_index: Dict[str, Dict[str, Optional[str]]] = {}
@@ -309,95 +256,67 @@ class SupplierInteractionAgent(BaseAgent):
             }
         if normalised_unique_filter is not None:
             expected_unique_ids &= normalised_unique_filter
+        if normalised_unique_filter is not None and not expected_unique_ids:
+            expected_unique_ids = set(normalised_unique_filter)
 
         expected_suppliers: Set[str] = {
             dispatch_index[uid]["supplier_id"]
             for uid in expected_unique_ids
             if dispatch_index.get(uid, {}).get("supplier_id")
         }
-        if not expected_unique_ids and normalised_supplier_filter:
+        if not expected_suppliers and normalised_supplier_filter:
             expected_suppliers = set(normalised_supplier_filter)
 
-        attempts = 0
+        pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+        serialised = [
+            self._serialise_pending_row(row)
+            for row in pending_rows
+            if isinstance(row, dict)
+        ]
+
+        if normalised_supplier_filter is not None:
+            serialised = [
+                row
+                for row in serialised
+                if self._coerce_text(row.get("supplier_id")) in normalised_supplier_filter
+            ]
+
+        if normalised_unique_filter is not None:
+            serialised = [
+                row
+                for row in serialised
+                if self._coerce_text(row.get("unique_id")) in normalised_unique_filter
+            ]
+
+        if not serialised:
+            return []
+
         collected_by_unique: Dict[str, Dict[str, Any]] = {}
         collected_by_supplier: Dict[str, Dict[str, Any]] = {}
         other_rows: List[Dict[str, Any]] = []
-        other_signatures: Set[Tuple[Tuple[str, Any], ...]] = set()
-        collected: Optional[List[Dict[str, Any]]] = None
 
-        while True:
-            pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
-            serialised = [
-                self._serialise_pending_row(row)
-                for row in pending_rows
-                if isinstance(row, dict)
-            ]
+        for row in serialised:
+            unique_id = self._coerce_text(row.get("unique_id"))
+            supplier_id = self._coerce_text(row.get("supplier_id"))
+            if unique_id:
+                if not expected_unique_ids or unique_id in expected_unique_ids:
+                    collected_by_unique[unique_id] = row
+                else:
+                    other_rows.append(row)
+            elif supplier_id:
+                if not expected_suppliers or supplier_id in expected_suppliers:
+                    collected_by_supplier[supplier_id] = row
+                else:
+                    other_rows.append(row)
+            else:
+                other_rows.append(row)
 
-            if normalised_supplier_filter is not None:
-                serialised = [
-                    row
-                    for row in serialised
-                    if self._coerce_text(row.get("supplier_id")) in normalised_supplier_filter
-                ]
-
-            if normalised_unique_filter is not None:
-                serialised = [
-                    row
-                    for row in serialised
-                    if self._coerce_text(row.get("unique_id")) in normalised_unique_filter
-                ]
-
-            if serialised:
-                for row in serialised:
-                    unique_id = self._coerce_text(row.get("unique_id"))
-                    supplier_id = self._coerce_text(row.get("supplier_id"))
-                    if unique_id:
-                        collected_by_unique[unique_id] = row
-                    if supplier_id:
-                        collected_by_supplier[supplier_id] = row
-                    if not unique_id and not supplier_id:
-                        signature = tuple(sorted(row.items()))
-                        if signature not in other_signatures:
-                            other_signatures.add(signature)
-                            other_rows.append(row)
-
-            unique_complete = bool(expected_unique_ids) and expected_unique_ids.issubset(
-                collected_by_unique.keys()
-            )
-            supplier_complete = bool(expected_suppliers) and expected_suppliers.issubset(
-                collected_by_supplier.keys()
-            )
-
-            if unique_complete or supplier_complete:
-                break
-
-            if not expected_unique_ids and not expected_suppliers and serialised:
-                collected = serialised
-                break
-
-            attempts += 1
-            if attempt_limit and attempts >= attempt_limit:
-                break
-
-            now = time.time()
-            if deadline is not None and now >= deadline:
-                break
-
-            remaining = None if deadline is None else max(0.0, deadline - now)
-            sleep_for = poll_seconds if remaining is None else min(poll_seconds, remaining)
-            if sleep_for <= 0:
-                break
-
-            logger.debug(
-                "Supplier responses pending for workflow=%s; sleeping %.1fs (attempt=%s)",
-                workflow_id,
-                sleep_for,
-                attempts,
-            )
-            time.sleep(sleep_for)
-
-        if collected is not None:
-            return collected
+        if expected_unique_ids:
+            if set(collected_by_unique.keys()) != expected_unique_ids:
+                return []
+        elif expected_suppliers:
+            if set(collected_by_supplier.keys()) != expected_suppliers:
+                return []
 
         ordered_results: List[Dict[str, Any]] = []
         if expected_unique_ids:
@@ -410,11 +329,8 @@ class SupplierInteractionAgent(BaseAgent):
                 row = collected_by_unique.get(uid)
                 if row and row not in ordered_results:
                     ordered_results.append(row)
-            for uid, row in collected_by_unique.items():
-                if uid not in ordered_unique_ids and row not in ordered_results:
-                    ordered_results.append(row)
-            for supplier_id in expected_suppliers:
-                row = collected_by_supplier.get(supplier_id)
+            for uid in expected_unique_ids:
+                row = collected_by_unique.get(uid)
                 if row and row not in ordered_results:
                     ordered_results.append(row)
         elif expected_suppliers:
@@ -427,8 +343,9 @@ class SupplierInteractionAgent(BaseAgent):
                 row = collected_by_supplier.get(supplier_id)
                 if row and row not in ordered_results:
                     ordered_results.append(row)
-            for supplier_id, row in collected_by_supplier.items():
-                if row not in ordered_results:
+            for supplier_id in expected_suppliers:
+                row = collected_by_supplier.get(supplier_id)
+                if row and row not in ordered_results:
                     ordered_results.append(row)
 
         if not ordered_results:
@@ -640,6 +557,7 @@ class SupplierInteractionAgent(BaseAgent):
                     dispatch_run_id=dispatch_run_id,
                     action_id=action_hint,
                     email_action_id=email_action_hint,
+                    unique_id=unique_id,
                 )
 
             if not wait_result:
@@ -932,10 +850,57 @@ class SupplierInteractionAgent(BaseAgent):
         email_action_id: Optional[str] = None,
         suppliers: Optional[Sequence[str]] = None,
         expected_replies: Optional[int] = None,
+        unique_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """Await supplier replies using the workflow-aware IMAP watcher."""
 
+        unique_key = self._coerce_text(unique_id)
         workflow_key = self._coerce_text(workflow_id)
+
+        canonical_workflow = None
+        if unique_key:
+            try:
+                canonical_workflow = workflow_email_tracking_repo.lookup_workflow_for_unique(
+                    unique_id=unique_key
+                )
+            except Exception:  # pragma: no cover - defensive alignment
+                logger.exception(
+                    "Failed to resolve canonical workflow for unique_id=%s", unique_key
+                )
+
+        if canonical_workflow:
+            canonical_key = self._coerce_text(canonical_workflow)
+            if canonical_key:
+                if workflow_key and canonical_key != workflow_key:
+                    logger.info(
+                        "Realigning wait_for_response workflow_id from %s to %s using dispatch mapping",
+                        workflow_key,
+                        canonical_key,
+                    )
+                workflow_key = canonical_key
+
+        if unique_key:
+            existing_workflow = None
+            try:
+                existing_workflow = supplier_response_repo.lookup_workflow_for_unique(
+                    unique_id=unique_key
+                )
+            except Exception:  # pragma: no cover - defensive alignment
+                logger.exception(
+                    "Failed to inspect stored workflow for unique_id=%s", unique_key
+                )
+            if existing_workflow:
+                existing_key = self._coerce_text(existing_workflow)
+                if existing_key:
+                    if workflow_key and existing_key != workflow_key:
+                        logger.info(
+                            "Using previously stored workflow_id=%s for unique_id=%s instead of %s",
+                            existing_key,
+                            unique_key,
+                            workflow_key,
+                        )
+                    workflow_key = existing_key
+
         if not workflow_key:
             logger.error(
                 "wait_for_response requires workflow_id; supplier=%s",
@@ -943,68 +908,23 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return None
 
-        run_identifier = self._coerce_text(dispatch_run_id)
-        if not run_identifier:
-            run_identifier = self._coerce_text(draft_action_id) or self._coerce_text(action_id)
-
-        poll_seconds = (
-            self._coerce_int(poll_interval, default=0)
-            if poll_interval is not None
-            else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
-        )
-        if poll_seconds is None:
-            poll_seconds = 60
-        try:
-            poll_seconds = int(poll_seconds)
-        except Exception:
-            poll_seconds = 60
-        if poll_seconds <= 0:
-            poll_seconds = 60
-
-        try:
-            timeout_seconds = int(timeout) if timeout is not None else 0
-        except Exception:
-            timeout_seconds = 0
-        if timeout_seconds < 0:
-            timeout_seconds = 0
-
-        now = time.time()
-        deadline = now + timeout_seconds if timeout_seconds else now
-        attempt_limit: Optional[int] = None
-        if max_attempts is not None:
-            try:
-                attempt_limit = max(1, int(max_attempts))
-            except Exception:
-                attempt_limit = None
-        if attempt_limit is None:
-            setting_attempts = getattr(
-                getattr(self.agent_nick, "settings", None),
-                "email_response_max_attempts",
-                None,
-            )
-            if setting_attempts is not None:
-                try:
-                    attempt_limit = max(1, int(setting_attempts))
-                except Exception:
-                    attempt_limit = None
         target_supplier = self._coerce_text(supplier_id)
         supplier_filter: Optional[Set[str]] = None
         if target_supplier:
             supplier_filter = {target_supplier}
 
+        unique_filter: Optional[Set[str]] = {unique_key} if unique_key else None
+
         responses = self._poll_supplier_response_rows(
             workflow_key,
-            poll_seconds=poll_seconds,
-            deadline=deadline,
-            attempt_limit=attempt_limit,
             supplier_filter=supplier_filter,
+            unique_filter=unique_filter,
         )
 
         if not responses:
             logger.info(
-                "No supplier responses stored for workflow=%s run_id=%s",
+                "No supplier responses stored for workflow=%s",
                 workflow_key,
-                run_identifier,
             )
             return None
 
@@ -1029,51 +949,86 @@ class SupplierInteractionAgent(BaseAgent):
         workflow_ids = {
             ctx["workflow_id"] for ctx in contexts if ctx.get("workflow_id")
         }
-        if len(workflow_ids) != 1:
+        unique_ids: Set[str] = {
+            self._coerce_text(ctx.get("unique_id"))
+            for ctx in contexts
+            if self._coerce_text(ctx.get("unique_id"))
+        }
+
+        workflow_key: Optional[str] = None
+        if workflow_ids:
+            if len(workflow_ids) == 1:
+                workflow_key = workflow_ids.pop()
+            else:
+                logger.error(
+                    "Cannot aggregate responses without a single workflow_id; contexts=%s",
+                    contexts,
+                )
+                return [None] * len(drafts)
+
+        canonical_candidates: Set[str] = set()
+        for unique_value in unique_ids:
+            try:
+                candidate = workflow_email_tracking_repo.lookup_workflow_for_unique(
+                    unique_id=unique_value
+                )
+            except Exception:  # pragma: no cover - defensive alignment
+                logger.exception(
+                    "Failed to resolve canonical workflow for unique_id=%s during aggregation",
+                    unique_value,
+                )
+                continue
+            coerced = self._coerce_text(candidate)
+            if coerced:
+                canonical_candidates.add(coerced)
+
+        if canonical_candidates:
+            if workflow_key and workflow_key not in canonical_candidates:
+                if len(canonical_candidates) == 1:
+                    canonical_choice = next(iter(canonical_candidates))
+                    logger.info(
+                        "Realigning aggregated workflow_id from %s to %s using dispatch mapping",
+                        workflow_key,
+                        canonical_choice,
+                    )
+                    workflow_key = canonical_choice
+                else:
+                    logger.error(
+                        "Conflicting workflow_ids %s for unique_ids=%s",
+                        sorted(canonical_candidates),
+                        sorted(unique_ids),
+                    )
+                    return [None] * len(drafts)
+            elif not workflow_key:
+                if len(canonical_candidates) == 1:
+                    workflow_key = canonical_candidates.pop()
+                else:
+                    logger.error(
+                        "Unable to determine workflow_id from unique_ids=%s (candidates=%s)",
+                        sorted(unique_ids),
+                        sorted(canonical_candidates),
+                    )
+                    return [None] * len(drafts)
+
+        if not workflow_key:
             logger.error(
-                "Cannot aggregate responses without a single workflow_id; contexts=%s",
+                "Cannot aggregate responses without a workflow_id; contexts=%s unique_ids=%s",
                 contexts,
+                sorted(unique_ids),
             )
             return [None] * len(drafts)
 
-        workflow_id = workflow_ids.pop()
-        run_ids = {ctx.get("run_id") for ctx in contexts if ctx.get("run_id")}
-        run_identifier = run_ids.pop() if len(run_ids) == 1 else None
-
-        poll_seconds = (
-            self._coerce_int(poll_interval, default=0)
-            if poll_interval is not None
-            else getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
-        )
-        if poll_seconds is None:
-            poll_seconds = 60
-        try:
-            poll_seconds = int(poll_seconds)
-        except Exception:
-            poll_seconds = 60
-        if poll_seconds <= 0:
-            poll_seconds = 60
-
-        try:
-            timeout_seconds = int(timeout) if timeout is not None else 0
-        except Exception:
-            timeout_seconds = 0
-        if timeout_seconds < 0:
-            timeout_seconds = 0
-
-        deadline = time.time() + timeout_seconds if timeout_seconds else time.time()
+        unique_filter = unique_ids or None
 
         responses = self._poll_supplier_response_rows(
-            workflow_id,
-            poll_seconds=poll_seconds,
-            deadline=deadline,
-            attempt_limit=None,
+            workflow_key,
+            unique_filter=unique_filter,
         )
 
         if not responses:
             logger.info(
                 "Aggregated watcher not ready for workflow=%s (no responses stored)",
-                workflow_id,
+                workflow_key,
             )
             return [None] * len(drafts)
 
@@ -1113,6 +1068,8 @@ class SupplierInteractionAgent(BaseAgent):
                 recipient_hint = recipients_field
 
         metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else None
+        tracking_context = self._draft_tracking_context(draft)
+        unique_hint = tracking_context.get("unique_id")
 
         def _from_sources(keys: Tuple[str, ...]) -> Optional[str]:
             for container in (draft, metadata):
@@ -1178,6 +1135,7 @@ class SupplierInteractionAgent(BaseAgent):
             "email_action_id": email_action_id,
             "workflow_id": workflow_hint,
             "dispatch_run_id": dispatch_run_id,
+            "unique_id": unique_hint,
             "supplier_normalised": self._normalise_identifier(supplier_id),
             "rfq_normalised": self._normalise_identifier(rfq_id),
             "dispatch_normalised": self._normalise_identifier(dispatch_run_id),
@@ -1252,6 +1210,7 @@ class SupplierInteractionAgent(BaseAgent):
                     workflow_id=context["workflow_id"],
                     action_id=context["action_id"],
                     email_action_id=context["email_action_id"],
+                    unique_id=context.get("unique_id"),
                 )
                 if result is not None:
                     results[idx] = result
@@ -1828,6 +1787,7 @@ class SupplierInteractionAgent(BaseAgent):
         rfq_id: Optional[str] = None,
         message_id: Optional[str] = None,
         from_address: Optional[str] = None,
+        received_at: Optional[datetime] = None,
     ) -> None:
         unique_key = self._coerce_text(unique_id) or self._coerce_text(message_id)
         if not unique_key:
@@ -1942,6 +1902,31 @@ class SupplierInteractionAgent(BaseAgent):
             except Exception:
                 lead_value = None
 
+        dispatch_row = None
+        try:
+            dispatch_row = workflow_email_tracking_repo.lookup_dispatch_row(
+                workflow_id=workflow_key, unique_id=unique_key
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to load dispatch details for workflow=%s unique_id=%s",
+                workflow_key,
+                unique_key,
+            )
+
+        received_time = received_at or datetime.now(timezone.utc)
+        response_time_value: Optional[Decimal] = None
+        if dispatch_row and dispatch_row.dispatched_at and received_time:
+            try:
+                delta_seconds = (received_time - dispatch_row.dispatched_at).total_seconds()
+                if delta_seconds >= 0:
+                    response_time_value = Decimal(str(delta_seconds))
+            except Exception:
+                response_time_value = None
+
+        original_message_id = dispatch_row.message_id if dispatch_row else None
+        original_subject = dispatch_row.subject if dispatch_row else None
+
         try:
             supplier_response_repo.init_schema()
         except Exception:  # pragma: no cover - best effort
@@ -1956,10 +1941,13 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_id=resolved_supplier,
                     supplier_email=supplier_email,
                     response_text=text,
-                    received_time=datetime.now(timezone.utc),
+                    received_time=received_time,
+                    response_time=response_time_value,
                     response_message_id=message_id,
                     response_subject=None,
                     response_from=from_address,
+                    original_message_id=original_message_id,
+                    original_subject=original_subject,
                     price=price_value,
                     lead_time=lead_value,
                     processed=False,
