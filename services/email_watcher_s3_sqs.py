@@ -335,11 +335,15 @@ def extract_rfq_ids(text: str) -> Set[str]:
     return {m.group(0) for m in RFQ_ID_RE.finditer(text or "")}
 
 def body_tag_extract(body_text: str, body_html: str) -> Optional[str]:
-    # Look for hidden tag <!-- PROCWISE:RFQ_ID=... -->
-    m = re.search(r"PROCWISE:RFQ_ID=([A-Za-z0-9\-]+)", body_html or "", re.IGNORECASE)
+    # Look for hidden tag <!-- PROCWISE:UID=... --> (legacy RFQ_ID supported)
+    m = re.search(
+        r"PROCWISE:(?:UID|RFQ_ID)=([A-Za-z0-9\-]+)", body_html or "", re.IGNORECASE
+    )
     if m:
         return m.group(1)
-    m = re.search(r"PROCWISE:RFQ_ID=([A-Za-z0-9\-]+)", body_text or "", re.IGNORECASE)
+    m = re.search(
+        r"PROCWISE:(?:UID|RFQ_ID)=([A-Za-z0-9\-]+)", body_text or "", re.IGNORECASE
+    )
     if m:
         return m.group(1)
     return None

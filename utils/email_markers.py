@@ -7,7 +7,7 @@ import uuid
 from typing import Optional, Tuple
 
 _MARKER_DETECTION = re.compile(
-    r"(?:PROCWISE:RFQ_ID|RFQ-ID)\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE
+    r"(?:PROCWISE:(?:UID|RFQ_ID)|RFQ-ID)\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE
 )
 _TOKEN_DETECTION = re.compile(r"TOKEN\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _RUN_ID_DETECTION = re.compile(r"RUN_ID\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
@@ -33,10 +33,13 @@ def split_hidden_marker(body: str) -> Tuple[Optional[str], str]:
 
 
 def extract_rfq_id(comment: Optional[str]) -> Optional[str]:
-    """Return the RFQ identifier embedded in ``comment`` if present."""
+    """Return the unique identifier embedded in ``comment`` if present."""
 
     if not comment:
         return None
+    uid_match = re.search(r"PROCWISE:UID\s*[:=]\s*([A-Za-z0-9_-]+)", comment, re.IGNORECASE)
+    if uid_match:
+        return uid_match.group(1).strip()
     match = _MARKER_DETECTION.search(comment)
     if match:
         return match.group(1).strip()
@@ -58,7 +61,7 @@ def ensure_hidden_marker(
     token: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Return a hidden marker comment for ``rfq_id`` and its tracking token."""
+    """Return a hidden marker comment for ``rfq_id``/unique_id and its tracking token."""
 
     if not rfq_id:
         return comment if comment else None, token
@@ -77,7 +80,7 @@ def ensure_hidden_marker(
     run_identifier = run_id or existing_run_id or marker_token
     supplier_segment = _normalise_supplier(supplier_id)
 
-    segments = [f"PROCWISE:RFQ_ID={rfq_id}"]
+    segments = [f"PROCWISE:UID={rfq_id}"]
     if supplier_segment:
         segments.append(f"SUPPLIER={supplier_segment}")
     segments.append(f"TOKEN={marker_token}")
