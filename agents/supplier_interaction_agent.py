@@ -286,13 +286,48 @@ class SupplierInteractionAgent(BaseAgent):
         start = time.monotonic()
         deadline = start + total_timeout if total_timeout > 0 else None
 
-        metadata = self._load_dispatch_metadata(workflow_id)
-        if metadata is None:
-            logger.info(
-                "Skipping supplier response wait; dispatch metadata not ready for workflow=%s",
-                workflow_id,
-            )
-            return []
+        if poll_interval is not None:
+            try:
+                interval = float(poll_interval)
+            except Exception:
+                interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+            else:
+                if interval <= 0:
+                    interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+        else:
+            interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+
+        if interval < 0:
+            interval = 0.0
+
+        metadata: Optional[Dict[str, Any]] = None
+        while True:
+            metadata = self._load_dispatch_metadata(workflow_id)
+            if metadata is not None:
+                break
+
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info(
+                    "Timed out waiting for dispatch metadata for workflow=%s",
+                    workflow_id,
+                )
+                return []
+
+            if interval <= 0:
+                time.sleep(0)
+                continue
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.info(
+                        "Timed out waiting for dispatch metadata for workflow=%s",
+                        workflow_id,
+                    )
+                    return []
+                time.sleep(min(interval, max(remaining, 0)))
+            else:
+                time.sleep(interval)
 
         dispatch_rows: List[Any] = list(metadata.get("rows") or [])
 
@@ -302,8 +337,6 @@ class SupplierInteractionAgent(BaseAgent):
                 "No dispatched emails recorded for workflow=%s; nothing to await", workflow_id
             )
             return []
-
-        interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
 
         while True:
             response_total = supplier_response_repo.count_pending(

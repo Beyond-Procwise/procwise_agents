@@ -184,6 +184,105 @@ def test_supplier_interaction_wait_for_response(monkeypatch):
     assert fetch_calls == ["wf-001"]
 
 
+def test_waits_for_dispatch_metadata_before_polling(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    metadata = {
+        "rows": [
+            SimpleNamespace(
+                workflow_id="wf-await",
+                unique_id="uid-await",
+                supplier_id="S1",
+                dispatched_at=datetime.fromtimestamp(0),
+                message_id="msg-await",
+            )
+        ],
+        "last_dispatched_at": datetime.fromtimestamp(0),
+        "unique_ids": ["uid-await"],
+    }
+
+    metadata_sequence = [None, metadata]
+    load_calls: List[str] = []
+
+    def fake_load(workflow_id: str):
+        load_calls.append(workflow_id)
+        if metadata_sequence:
+            return metadata_sequence.pop(0)
+        return metadata
+
+    fetch_calls: List[str] = []
+
+    def fake_fetch(*, workflow_id, **_kwargs):
+        fetch_calls.append(workflow_id)
+        return [
+            {
+                "workflow_id": workflow_id,
+                "unique_id": "uid-await",
+                "supplier_id": "S1",
+                "response_text": "Appreciate the opportunity",
+                "subject": "Re: Quote",
+                "message_id": "msg-await",
+                "from_addr": "supplier@example.com",
+                "received_time": datetime.fromtimestamp(0),
+            }
+        ]
+
+    count_calls: List[str] = []
+
+    def fake_count(*, workflow_id, **_kwargs):
+        # Metadata sequence should be exhausted once polling begins
+        assert not metadata_sequence
+        count_calls.append(workflow_id)
+        return 1
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_load)
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
+        fake_fetch,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.lookup_workflow_for_unique",
+        lambda **_: "wf-await",
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_process_responses_concurrently",
+        lambda rows: list(rows),
+    )
+
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", fake_sleep)
+
+    responses = agent._await_supplier_response_rows(
+        "wf-await",
+        timeout=2,
+        poll_interval=0,
+    )
+
+    assert responses
+    assert load_calls == ["wf-await", "wf-await"]
+    assert count_calls == ["wf-await"]
+    assert fetch_calls == ["wf-await"]
+    assert sleep_calls  # ensure loop yielded while waiting for metadata
+
+
 def test_wait_for_response_realigns_workflow_from_unique(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
@@ -328,6 +427,13 @@ def test_wait_for_response_requires_ready_dispatch_metadata(monkeypatch):
         lambda **_: None,
     )
 
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", fake_sleep)
+
     result = agent.wait_for_response(
         timeout=5,
         poll_interval=0,
@@ -337,9 +443,11 @@ def test_wait_for_response_requires_ready_dispatch_metadata(monkeypatch):
         unique_id="uid-slow",
     )
 
-    assert result is None
-    assert fetch_calls == []
-    assert metadata_calls == ["wf-slow"]
+    assert result is not None
+    assert result["supplier_id"] == "SUP-SLOW"
+    assert fetch_calls == ["wf-slow"]
+    assert metadata_calls == ["wf-slow", "wf-slow", "wf-slow"]
+    assert sleep_calls  # ensures we waited for metadata
 
 
 def test_wait_for_response_requires_available_payload(monkeypatch):
