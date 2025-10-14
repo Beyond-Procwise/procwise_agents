@@ -762,6 +762,44 @@ def test_store_response_skips_without_unique_id(monkeypatch, caplog):
     assert "unique_id" in caplog.text
 
 
+def test_store_response_falls_back_to_rfq_identifier(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
+    monkeypatch.setattr(
+        supplier_response_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
+
+    monkeypatch.setattr(agent, "_resolve_supplier_id", lambda *_, **__: "SUP-FALLBACK")
+
+    captured: Dict[str, SupplierResponseRow] = {}
+
+    def fake_insert(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
+
+    agent._store_response(
+        None,
+        None,
+        "Mailbox response",
+        {"price": None, "lead_time": None},
+        unique_id=None,
+        rfq_id="RFQ-EMAIL-123",
+        message_id=None,
+    )
+
+    assert "row" in captured
+    stored = captured["row"]
+    assert stored.workflow_id == "RFQ-EMAIL-123"
+    assert stored.unique_id == "RFQ-EMAIL-123"
+    assert stored.supplier_id == "SUP-FALLBACK"
+
+
 def test_store_response_aligns_workflow_with_dispatch(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)

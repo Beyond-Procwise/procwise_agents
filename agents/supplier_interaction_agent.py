@@ -1830,6 +1830,13 @@ class SupplierInteractionAgent(BaseAgent):
         from_address: Optional[str] = None,
     ) -> None:
         unique_key = self._coerce_text(unique_id) or self._coerce_text(message_id)
+        if not unique_key and not self._coerce_text(workflow_id) and rfq_id:
+            unique_key = self._coerce_text(rfq_id)
+            if unique_key:
+                logger.debug(
+                    "Falling back to rfq_id=%s as unique identifier for supplier response",
+                    unique_key,
+                )
         if not unique_key:
             logger.error(
                 "Failed to store supplier response because unique_id could not be resolved (workflow=%s)",
@@ -1838,6 +1845,13 @@ class SupplierInteractionAgent(BaseAgent):
             return
 
         workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key and rfq_id:
+            workflow_key = self._coerce_text(rfq_id)
+            if workflow_key:
+                logger.debug(
+                    "Falling back to rfq_id=%s as workflow identifier for supplier response",
+                    workflow_key,
+                )
 
         canonical_workflow = None
         try:
