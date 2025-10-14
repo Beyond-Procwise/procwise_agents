@@ -23,6 +23,7 @@ from services.process_routing_service import ProcessRoutingService
 from services.backend_scheduler import BackendScheduler
 from services.event_bus import get_event_bus, workflow_scope
 from services.agent_manifest import AgentManifestService
+from services.supplier_response_workflow import SupplierResponseWorkflow
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,8 @@ class Orchestrator:
                 result = self._execute_quote_workflow(context)
             elif workflow_name == "opportunity_mining":
                 result = self._execute_opportunity_workflow(context)
+            elif workflow_name == "supplier_interaction":
+                result = self._execute_supplier_interaction_workflow(context)
             else:
                 result = self._execute_generic_workflow(workflow_name, context)
 
@@ -1629,6 +1632,141 @@ class Orchestrator:
             logger.info("SupplierRankingAgent skipped due to empty candidate list")
 
         return results
+
+    def _execute_supplier_interaction_workflow(self, context: AgentContext) -> Dict:
+        """Coordinate drafting, dispatch waits, and supplier processing."""
+
+        payload = dict(context.input_data or {})
+        draft_payload = payload.get("draft_payload")
+        supplier_payload = payload.get("supplier_input")
+
+        if not isinstance(draft_payload, dict):
+            result = self._execute_agent("supplier_interaction", context)
+            return result.data if result else {}
+
+        dispatch_timeout_raw = payload.get("dispatch_timeout_seconds")
+        dispatch_poll_raw = payload.get("dispatch_poll_interval")
+        response_timeout_raw = payload.get("response_timeout_seconds")
+        response_poll_raw = payload.get("response_poll_interval")
+
+        def _positive(value, fallback):
+            try:
+                num = float(value)
+            except Exception:
+                return fallback
+            if num <= 0:
+                return fallback
+            return num
+
+        dispatch_timeout = int(_positive(dispatch_timeout_raw, 300))
+        dispatch_poll = max(0, int(_positive(dispatch_poll_raw, getattr(self.settings, "email_response_poll_seconds", 60))))
+        response_timeout = int(_positive(response_timeout_raw, getattr(self.settings, "email_response_timeout_seconds", 900)))
+        response_poll = max(0, int(_positive(response_poll_raw, getattr(self.settings, "email_response_poll_seconds", 60))))
+
+        email_ctx = self._create_child_context(context, "email_drafting", dict(draft_payload))
+        for key in (
+            "draft_payload",
+            "supplier_input",
+            "dispatch_timeout_seconds",
+            "dispatch_poll_interval",
+            "response_timeout_seconds",
+            "response_poll_interval",
+        ):
+            email_ctx.input_data.pop(key, None)
+
+        email_result = self._execute_agent("email_drafting", email_ctx)
+        email_data = email_result.data if email_result else {}
+        email_drafts = self._extract_drafts(email_result)
+
+        workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
+        unique_ids = [draft.get("unique_id") for draft in email_drafts]
+
+        coordinator = SupplierResponseWorkflow()
+        readiness = coordinator.ensure_ready(
+            workflow_id=workflow_hint,
+            unique_ids=unique_ids,
+            dispatch_timeout=dispatch_timeout,
+            dispatch_poll_interval=dispatch_poll,
+            response_timeout=response_timeout,
+            response_poll_interval=response_poll,
+        )
+
+        supplier_input: Dict[str, Any] = {}
+        if email_result and email_result.pass_fields:
+            supplier_input.update(dict(email_result.pass_fields))
+        if isinstance(supplier_payload, dict):
+            supplier_input.update(supplier_payload)
+        supplier_input.setdefault("drafts", email_drafts)
+        supplier_input.setdefault("await_response", True)
+        if len([uid for uid in unique_ids if uid]) > 1:
+            supplier_input.setdefault("await_all_responses", True)
+        supplier_input.setdefault("workflow_id", workflow_hint)
+        supplier_input.setdefault("response_timeout", response_timeout)
+        supplier_input.setdefault("response_poll_interval", response_poll)
+
+        supplier_ctx = self._create_child_context(context, "supplier_interaction", supplier_input)
+        for key in (
+            "draft_payload",
+            "supplier_input",
+            "dispatch_timeout_seconds",
+            "dispatch_poll_interval",
+            "response_timeout_seconds",
+            "response_poll_interval",
+        ):
+            supplier_ctx.input_data.pop(key, None)
+
+        supplier_result = self._execute_agent("supplier_interaction", supplier_ctx)
+
+        results: Dict[str, Any] = {
+            "email_drafting": email_data,
+            "dispatch_monitor": readiness.get("dispatch"),
+            "response_monitor": readiness.get("responses"),
+            "supplier_interaction": supplier_result.data if supplier_result else {},
+        }
+
+        if supplier_result and supplier_result.next_agents:
+            results["next_agents"] = list(supplier_result.next_agents)
+        if supplier_result and supplier_result.pass_fields:
+            results["supplier_pass_fields"] = dict(supplier_result.pass_fields)
+        return results
+
+    @staticmethod
+    def _extract_drafts(result: Optional[Any]) -> List[Dict[str, Any]]:
+        drafts: List[Dict[str, Any]] = []
+        if not result:
+            return drafts
+
+        for source in (getattr(result, "pass_fields", None), getattr(result, "data", None)):
+            if not isinstance(source, dict):
+                continue
+            entries = source.get("drafts")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    drafts.append(dict(entry))
+        return drafts
+
+    @staticmethod
+    def _select_workflow_identifier(drafts: List[Dict[str, Any]], default: Optional[str]) -> Optional[str]:
+        candidates: List[str] = []
+        for draft in drafts:
+            for key in ("workflow_id", "metadata"):
+                value = draft.get(key)
+                if key == "metadata" and isinstance(value, dict):
+                    value = value.get("workflow_id") or value.get("process_workflow_id")
+                if value in (None, ""):
+                    continue
+                try:
+                    text = str(value).strip()
+                except Exception:
+                    continue
+                if text:
+                    candidates.append(text)
+                    break
+        if candidates:
+            return candidates[0]
+        return default
 
     def _execute_generic_workflow(
         self, workflow_name: str, context: AgentContext
