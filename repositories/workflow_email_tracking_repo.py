@@ -215,6 +215,56 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
         return rows
 
 
+def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[WorkflowDispatchRow]:
+    if not workflow_id or not unique_id:
+        return None
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "dispatched_at, responded_at, response_message_id, matched, thread_headers "
+            "FROM proc.workflow_email_tracking "
+            "WHERE workflow_id=%s AND unique_id=%s "
+            "ORDER BY dispatched_at DESC NULLS LAST "
+            "LIMIT 1"
+        )
+        cur.execute(q, (workflow_id, unique_id))
+        record = cur.fetchone()
+        cur.close()
+
+    if not record:
+        return None
+
+    cols = (
+        "workflow_id",
+        "unique_id",
+        "supplier_id",
+        "supplier_email",
+        "message_id",
+        "subject",
+        "dispatched_at",
+        "responded_at",
+        "response_message_id",
+        "matched",
+        "thread_headers",
+    )
+    data = dict(zip(cols, record))
+    return WorkflowDispatchRow(
+        workflow_id=data["workflow_id"],
+        unique_id=data["unique_id"],
+        supplier_id=data.get("supplier_id"),
+        supplier_email=data.get("supplier_email"),
+        message_id=data.get("message_id"),
+        subject=data.get("subject"),
+        dispatched_at=_normalise_dt(data.get("dispatched_at")),
+        responded_at=_normalise_dt(data.get("responded_at")) if data.get("responded_at") else None,
+        response_message_id=data.get("response_message_id"),
+        matched=bool(data.get("matched")),
+        thread_headers=_parse_thread_headers(data.get("thread_headers")),
+    )
+
+
 def load_workflow_unique_ids(*, workflow_id: str) -> List[str]:
     """Return unique identifiers associated with the workflow's dispatches."""
 

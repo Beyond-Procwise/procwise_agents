@@ -407,6 +407,7 @@ id serial PRIMARY KEY,
     original_message_id text,
     original_subject text,
     match_confidence numeric(3,2),
+    response_time numeric(18,6),
     created_at timestamp with time zone DEFAULT now(),
     processed boolean DEFAULT false,
     CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id)
