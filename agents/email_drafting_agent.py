@@ -563,7 +563,10 @@ class EmailDraftingAgent(BaseAgent):
             subject = self._clean_subject_text(None, DEFAULT_NEGOTIATION_SUBJECT)
 
         thread_headers = decision_data.get("thread")
-        headers: Dict[str, Any] = {"X-Procwise-RFQ-ID": rfq_id_output}
+        headers: Dict[str, Any] = {
+            "X-Procwise-RFQ-ID": rfq_id_output,
+            "X-Procwise-Unique-Id": rfq_id_output,
+        }
         if isinstance(thread_headers, dict):
             message_id = thread_headers.get("message_id")
             if message_id:
@@ -737,7 +740,10 @@ class EmailDraftingAgent(BaseAgent):
             "contact_level": 1 if receiver else 0,
             "sent_status": False,
             "metadata": metadata,
-            "headers": {"X-Procwise-RFQ-ID": rfq_id_value},
+            "headers": {
+                "X-Procwise-RFQ-ID": rfq_id_value,
+                "X-Procwise-Unique-Id": rfq_id_value,
+            },
         }
 
         return draft
@@ -2108,6 +2114,7 @@ class EmailDraftingAgent(BaseAgent):
                 data["decision"] = decision_payload
         if isinstance(decision_payload, dict) and decision_payload:
             draft = self.from_decision(decision_payload)
+            draft = self._apply_workflow_context(draft, context)
             self._store_draft(draft)
             source_snapshot = {**decision_payload, "intent": "NEGOTIATION_COUNTER"}
             self._record_learning_events(context, [draft], source_snapshot)
@@ -2140,6 +2147,7 @@ class EmailDraftingAgent(BaseAgent):
                 prompt_text = decision_log
         if prompt_text:
             draft = self.from_prompt(prompt_text, context=data)
+            draft = self._apply_workflow_context(draft, context)
             self._store_draft(draft)
             self._record_learning_events(context, [draft], data)
             output_data = {
@@ -2443,6 +2451,7 @@ class EmailDraftingAgent(BaseAgent):
             if marker_token:
                 metadata["dispatch_token"] = marker_token
             draft["metadata"] = metadata
+            draft = self._apply_workflow_context(draft, context)
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
@@ -2488,6 +2497,7 @@ class EmailDraftingAgent(BaseAgent):
             if default_action_id:
                 manual_draft["action_id"] = default_action_id
             manual_draft.setdefault("thread_index", 1)
+            manual_draft = self._apply_workflow_context(manual_draft, context)
             drafts.append(manual_draft)
             self._store_draft(manual_draft)
 
@@ -2790,6 +2800,28 @@ class EmailDraftingAgent(BaseAgent):
         except Exception:  # pragma: no cover - defensive sync
             logger.exception("failed to synchronise draft action metadata")
         return result
+
+    def _apply_workflow_context(
+        self, draft: Dict[str, Any], context: AgentContext
+    ) -> Dict[str, Any]:
+        """Ensure drafts inherit the workflow identifier from ``context``."""
+
+        if not isinstance(draft, dict):
+            return draft
+
+        workflow_id = getattr(context, "workflow_id", None)
+        if not workflow_id:
+            return draft
+
+        draft.setdefault("workflow_id", workflow_id)
+
+        metadata = draft.get("metadata")
+        if metadata is None:
+            draft["metadata"] = {"workflow_id": workflow_id}
+        elif isinstance(metadata, dict):
+            metadata.setdefault("workflow_id", workflow_id)
+
+        return draft
 
     def _store_draft(self, draft: dict) -> None:
         """Persist email draft to ``proc.draft_rfq_emails``."""
