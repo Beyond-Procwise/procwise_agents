@@ -4,13 +4,15 @@ import re
 import imaplib
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from email import message_from_bytes
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
 from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -511,6 +513,10 @@ class SupplierInteractionAgent(BaseAgent):
 
         supplier_id = input_data.get("supplier_id")
         rfq_id = input_data.get("rfq_id")
+        workflow_id = self._coerce_text(
+            input_data.get("workflow_id") or getattr(context, "workflow_id", None)
+        )
+        unique_id = self._coerce_text(input_data.get("unique_id"))
         draft_match = self._select_draft(drafts, supplier_id=supplier_id, rfq_id=rfq_id)
         if not supplier_id and draft_match:
             supplier_id = draft_match.get("supplier_id")
@@ -521,6 +527,14 @@ class SupplierInteractionAgent(BaseAgent):
             candidates = input_data.get("supplier_candidates", [])
             supplier_id = candidates[0] if candidates else None
 
+        draft_context = self._draft_tracking_context(draft_match)
+        if not workflow_id:
+            workflow_id = draft_context.get("workflow_id")
+        if not unique_id:
+            unique_id = draft_context.get("unique_id")
+        if not supplier_id:
+            supplier_id = draft_context.get("supplier_id") or supplier_id
+
         await_flag = input_data.get("await_response")
         should_wait = not body and (await_flag is True or (await_flag is None and bool(drafts)))
 
@@ -529,19 +543,17 @@ class SupplierInteractionAgent(BaseAgent):
         target_override: Optional[float] = None
 
         if should_wait:
-            if not rfq_id:
+            if not workflow_id:
                 logger.error(
-                    "Awaiting supplier response requires an RFQ identifier; subject=%s",
+                    "Awaiting supplier response requires workflow_id; subject=%s",
                     subject,
                 )
-                rfq_id = self._extract_rfq_id(subject)
-            if not rfq_id:
                 return self._with_plan(
                     context,
                     AgentOutput(
                         status=AgentStatus.FAILED,
                         data={},
-                        error="rfq_id required to await supplier response",
+                        error="workflow_id required to await supplier response",
                     ),
                 )
 
@@ -613,6 +625,8 @@ class SupplierInteractionAgent(BaseAgent):
                             email_action_hint = context_hint.get("email_action_id")
                 if workflow_hint is None:
                     workflow_hint = getattr(context, "workflow_id", None)
+                if not workflow_hint:
+                    workflow_hint = workflow_id
                 wait_result = self.wait_for_response(
                     timeout=timeout,
                     poll_interval=poll_interval,
@@ -631,13 +645,14 @@ class SupplierInteractionAgent(BaseAgent):
             if not wait_result:
                 if await_all and parallel_results and any(result is None for result in parallel_results):
                     logger.error(
-                        "Supplier responses missing for one or more RFQs while awaiting all responses; rfq_id=%s supplier=%s",
+                        "Supplier responses missing for workflow=%s (rfq_id=%s supplier=%s)",
+                        workflow_id,
                         rfq_id,
                         supplier_id,
                     )
                 logger.error(
-                    "Supplier response not received for RFQ %s (supplier=%s) before timeout=%ss",
-                    rfq_id,
+                    "Supplier response not received for workflow %s (supplier=%s) before timeout=%ss",
+                    workflow_id,
                     supplier_id,
                     timeout,
                 )
@@ -654,7 +669,8 @@ class SupplierInteractionAgent(BaseAgent):
             if supplier_status and supplier_status != AgentStatus.SUCCESS.value:
                 error_detail = wait_result.get("error") or "supplier response processing failed"
                 logger.error(
-                    "Supplier response for RFQ %s (supplier=%s) returned status=%s; error=%s",
+                    "Supplier response for workflow=%s rfq=%s (supplier=%s) returned status=%s; error=%s",
+                    wait_result.get("workflow_id") or workflow_id,
                     wait_result.get("rfq_id") or rfq_id,
                     wait_result.get("supplier_id") or supplier_id,
                     supplier_status,
@@ -672,6 +688,8 @@ class SupplierInteractionAgent(BaseAgent):
             subject = str(wait_result.get("subject") or subject)
             supplier_id = wait_result.get("supplier_id") or supplier_id
             rfq_id = wait_result.get("rfq_id") or rfq_id
+            workflow_id = self._coerce_text(wait_result.get("workflow_id")) or workflow_id
+            unique_id = self._coerce_text(wait_result.get("unique_id")) or unique_id
             message_id = wait_result.get("message_id") or message_id
 
             supplier_payload = wait_result.get("supplier_output")
@@ -695,7 +713,8 @@ class SupplierInteractionAgent(BaseAgent):
 
         if not body:
             logger.error(
-                "Supplier interaction failed because no message body was available (rfq_id=%s, supplier=%s)",
+                "Supplier interaction failed because no message body was available (workflow=%s rfq_id=%s, supplier=%s)",
+                workflow_id,
                 rfq_id,
                 supplier_id,
             )
@@ -714,6 +733,14 @@ class SupplierInteractionAgent(BaseAgent):
             draft_match = self._select_draft(drafts, supplier_id=supplier_id, rfq_id=rfq_id)
             if draft_match and not supplier_id:
                 supplier_id = draft_match.get("supplier_id")
+            if draft_match and not unique_id:
+                unique_candidate = self._draft_tracking_context(draft_match).get("unique_id")
+                if unique_candidate:
+                    unique_id = unique_candidate
+            if draft_match and not workflow_id:
+                workflow_candidate = self._draft_tracking_context(draft_match).get("workflow_id")
+                if workflow_candidate:
+                    workflow_id = workflow_candidate
 
         parsed = (
             {
@@ -742,10 +769,12 @@ class SupplierInteractionAgent(BaseAgent):
             related_docs = [h.payload for h in context_hits]
 
         self._store_response(
-            rfq_id,
+            workflow_id,
             supplier_id,
             parsed.get("response_text") or body,
             parsed,
+            unique_id=unique_id,
+            rfq_id=rfq_id,
             message_id=message_id,
             from_address=from_address,
         )
@@ -806,10 +835,12 @@ class SupplierInteractionAgent(BaseAgent):
                             supplier_id=None,
                         )
                         self._store_response(
-                            rfq_id,
+                            None,
                             None,
                             text,
                             parsed_payload,
+                            unique_id=None,
+                            rfq_id=rfq_id,
                             message_id=msg.get('message-id'),
                             from_address=msg.get('from'),
                         )
@@ -1305,8 +1336,10 @@ class SupplierInteractionAgent(BaseAgent):
 
     def _persist_parallel_result(self, result: Dict[str, Any]) -> None:
         rfq_id = result.get("rfq_id")
+        workflow_id = result.get("workflow_id")
+        unique_id = result.get("unique_id")
         supplier_id = result.get("supplier_id")
-        if not rfq_id:
+        if not workflow_id:
             return
 
         subject = result.get("subject")
@@ -1336,11 +1369,13 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
         self._store_response(
-            rfq_id,
+            workflow_id,
             supplier_id,
             message_body,
             parsed,
+            unique_id=unique_id,
             message_id=result.get("message_id"),
+            rfq_id=rfq_id,
             from_address=result.get("from_address"),
         )
 
@@ -1506,6 +1541,15 @@ class SupplierInteractionAgent(BaseAgent):
                 return None
             return float(value)
         except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_decimal(value: Any) -> Optional[Decimal]:
+        if value in (None, ""):
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
             return None
 
     @staticmethod
@@ -1775,53 +1819,130 @@ class SupplierInteractionAgent(BaseAgent):
 
     def _store_response(
         self,
-        rfq_id: Optional[str],
+        workflow_id: Optional[str],
         supplier_id: Optional[str],
         text: str,
         parsed: Dict,
         *,
+        unique_id: Optional[str] = None,
+        rfq_id: Optional[str] = None,
         message_id: Optional[str] = None,
         from_address: Optional[str] = None,
     ) -> None:
-        if not rfq_id:
-            return
-
-        resolved_supplier = self._resolve_supplier_id(
-            rfq_id,
-            supplier_id,
-            message_id=message_id,
-            from_address=from_address,
-        )
-        if not resolved_supplier:
+        unique_key = self._coerce_text(unique_id) or self._coerce_text(message_id)
+        if not unique_key:
             logger.error(
-                "failed to store supplier response because supplier_id could not be resolved (rfq_id=%s, message_id=%s)",
-                rfq_id,
-                message_id,
+                "Failed to store supplier response because unique_id could not be resolved (workflow=%s)",
+                workflow_id,
             )
             return
 
+        workflow_key = self._coerce_text(workflow_id)
+
+        canonical_workflow = None
         try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO proc.supplier_responses
-                            (rfq_id, supplier_id, response_text, price, lead_time, submitted_at)
-                        VALUES (%s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (rfq_id, supplier_id) DO UPDATE
-                            SET response_text = EXCLUDED.response_text,
-                                price = EXCLUDED.price,
-                                lead_time = EXCLUDED.lead_time,
-                                submitted_at = NOW()
-                        """,
-                        (
-                            rfq_id,
-                            resolved_supplier,
-                            text,
-                            parsed.get("price"),
-                            parsed.get("lead_time"),
-                        ),
-                    )
-                conn.commit()
+            canonical_workflow = workflow_email_tracking_repo.lookup_workflow_for_unique(
+                unique_id=unique_key
+            )
         except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to store supplier response")
+            logger.exception(
+                "Failed to resolve canonical workflow for unique_id=%s from dispatch tracking",
+                unique_key,
+            )
+
+        if canonical_workflow:
+            canonical_coerced = self._coerce_text(canonical_workflow)
+            if canonical_coerced:
+                if workflow_key and canonical_coerced != workflow_key:
+                    logger.warning(
+                        "Workflow mismatch detected for unique_id=%s; using dispatch workflow_id=%s instead of %s",
+                        unique_key,
+                        canonical_coerced,
+                        workflow_key,
+                    )
+                workflow_key = canonical_coerced
+
+        existing_workflow = None
+        try:
+            existing_workflow = supplier_response_repo.lookup_workflow_for_unique(unique_id=unique_key)
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to inspect stored workflow for unique_id=%s",
+                unique_key,
+            )
+
+        if existing_workflow:
+            existing_coerced = self._coerce_text(existing_workflow)
+            if existing_coerced:
+                if workflow_key and existing_coerced != workflow_key:
+                    logger.warning(
+                        "Workflow mismatch detected for unique_id=%s; aligning to stored workflow_id=%s instead of %s",
+                        unique_key,
+                        existing_coerced,
+                        workflow_key,
+                    )
+                workflow_key = existing_coerced
+
+        if not workflow_key:
+            logger.debug(
+                "Skipping supplier response persistence because workflow_id was not provided",
+            )
+            return
+
+        resolved_supplier = supplier_id
+        if not resolved_supplier and rfq_id:
+            resolved_supplier = self._resolve_supplier_id(
+                rfq_id,
+                supplier_id,
+                message_id=message_id,
+                from_address=from_address,
+            )
+        if not resolved_supplier:
+            logger.error(
+                "Failed to store supplier response because supplier_id could not be resolved (workflow=%s, rfq_id=%s)",
+                workflow_key,
+                rfq_id,
+            )
+            return
+
+        supplier_email = None
+        if isinstance(from_address, str) and from_address.strip():
+            supplier_email = from_address.strip()
+
+        price_value = self._coerce_decimal(parsed.get("price"))
+        lead_value = None
+        if parsed.get("lead_time") is not None:
+            try:
+                lead_value = int(str(parsed.get("lead_time")))
+            except Exception:
+                lead_value = None
+
+        try:
+            supplier_response_repo.init_schema()
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("Failed to initialise supplier_response schema")
+            return
+
+        try:
+            supplier_response_repo.insert_response(
+                SupplierResponseRow(
+                    workflow_id=workflow_key,
+                    unique_id=unique_key,
+                    supplier_id=resolved_supplier,
+                    supplier_email=supplier_email,
+                    response_text=text,
+                    received_time=datetime.now(timezone.utc),
+                    response_message_id=message_id,
+                    response_subject=None,
+                    response_from=from_address,
+                    price=price_value,
+                    lead_time=lead_value,
+                    processed=False,
+                )
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to persist supplier response for workflow=%s unique_id=%s",
+                workflow_key,
+                unique_key,
+            )

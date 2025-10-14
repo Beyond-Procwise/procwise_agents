@@ -231,6 +231,28 @@ def reset_workflow(*, workflow_id: str) -> None:
         cur.close()
 
 
+def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
+    if not unique_id:
+        return None
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id "
+            "FROM proc.supplier_response "
+            "WHERE unique_id=%s "
+            "ORDER BY created_at DESC "
+            "LIMIT 1"
+        )
+        cur.execute(q, (unique_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        workflow_id = row[0]
+        return workflow_id or None
+
+
 def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(row)
     payload.setdefault("response_body", payload.get("response_text"))
