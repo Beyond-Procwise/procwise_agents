@@ -331,6 +331,7 @@ class SupplierInteractionAgent(BaseAgent):
         timeout: Optional[int] = None,
         poll_interval: Optional[int] = None,
         dispatch_summary: Optional[Dict[str, Any]] = None,
+        include_processed: bool = True,
     ) -> List[Dict[str, Any]]:
         try:
             total_timeout = float(timeout) if timeout is not None else 0.0
@@ -413,7 +414,7 @@ class SupplierInteractionAgent(BaseAgent):
         while True:
             response_total = supplier_response_repo.count_pending(
                 workflow_id=workflow_id,
-                include_processed=True,
+                include_processed=include_processed,
             )
 
             if response_total >= dispatch_total:
@@ -422,6 +423,7 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_filter=supplier_filter,
                     unique_filter=unique_filter,
                     metadata=metadata,
+                    include_processed=include_processed,
                 )
                 if rows:
                     if response_total > dispatch_total:
@@ -452,6 +454,133 @@ class SupplierInteractionAgent(BaseAgent):
         )
         return []
 
+    def _await_full_response_batch(
+        self,
+        workflow_id: str,
+        *,
+        timeout: Optional[int],
+        poll_interval: Optional[int],
+    ) -> Dict[str, Any]:
+        workflow_key = self._coerce_text(workflow_id)
+        result: Dict[str, Any] = {
+            "ready": False,
+            "expected_count": 0,
+            "collected_count": 0,
+            "responses": [],
+            "unique_ids": [],
+        }
+
+        if not workflow_key:
+            return result
+
+        try:
+            total_timeout = float(timeout) if timeout is not None else 0.0
+        except Exception:
+            total_timeout = 0.0
+
+        if total_timeout < 0:
+            total_timeout = 0.0
+
+        start = time.monotonic()
+        deadline = start + total_timeout if total_timeout > 0 else None
+
+        if poll_interval is not None:
+            try:
+                interval = float(poll_interval)
+            except Exception:
+                interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+            else:
+                if interval <= 0:
+                    interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+        else:
+            interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+
+        if interval < 0:
+            interval = 0.0
+
+        metadata: Optional[Dict[str, Any]] = None
+        while True:
+            metadata = self._load_dispatch_metadata(workflow_key)
+            if metadata is not None:
+                break
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return result
+
+            if interval > 0:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return result
+                    time.sleep(min(interval, remaining))
+                else:
+                    time.sleep(interval)
+            else:
+                time.sleep(0)
+
+        dispatch_rows: List[Any] = list(metadata.get("rows") or [])
+        expected_count = len(dispatch_rows)
+        result["expected_count"] = expected_count
+        result["unique_ids"] = [
+            self._coerce_text(getattr(row, "unique_id", None))
+            for row in dispatch_rows
+            if self._coerce_text(getattr(row, "unique_id", None))
+        ]
+
+        if expected_count <= 0:
+            logger.info(
+                "No dispatched emails recorded for workflow=%s while awaiting batch responses",
+                workflow_key,
+            )
+            return result
+
+        response_total = 0
+        while True:
+            response_total = supplier_response_repo.count_pending(
+                workflow_id=workflow_key,
+                include_processed=False,
+            )
+
+            if response_total >= expected_count:
+                rows = self._poll_supplier_response_rows(
+                    workflow_key,
+                    metadata=metadata,
+                    include_processed=False,
+                )
+                if rows:
+                    responses = self._process_responses_concurrently(rows)
+                    unique_ids = [
+                        self._coerce_text(response.get("unique_id"))
+                        for response in responses
+                        if self._coerce_text(response.get("unique_id"))
+                    ]
+                    result.update(
+                        {
+                            "ready": True,
+                            "responses": responses,
+                            "collected_count": len(responses),
+                            "unique_ids": unique_ids or result["unique_ids"],
+                        }
+                    )
+                    return result
+
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+            if interval > 0:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(interval, remaining))
+                else:
+                    time.sleep(interval)
+            else:
+                time.sleep(0)
+
+        result["collected_count"] = response_total
+        return result
+
     def _poll_supplier_response_rows(
         self,
         workflow_id: str,
@@ -459,6 +588,7 @@ class SupplierInteractionAgent(BaseAgent):
         supplier_filter: Optional[Set[str]] = None,
         unique_filter: Optional[Set[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        include_processed: bool = True,
     ) -> List[Dict[str, Any]]:
         if metadata is None:
             metadata = self._load_dispatch_metadata(workflow_id)
@@ -491,7 +621,7 @@ class SupplierInteractionAgent(BaseAgent):
 
         pending_rows = supplier_response_repo.fetch_pending(
             workflow_id=workflow_id,
-            include_processed=True,
+            include_processed=include_processed,
         )
         serialised = [
             self._serialise_pending_row(row)
@@ -647,6 +777,72 @@ class SupplierInteractionAgent(BaseAgent):
                     status=AgentStatus.SUCCESS,
                     data=payload,
                     pass_fields=payload,
+                ),
+            )
+
+        if action == "await_workflow_batch":
+            workflow_key = self._coerce_text(
+                context.input_data.get("workflow_id") or getattr(context, "workflow_id", None)
+            )
+            if not workflow_key:
+                payload = {
+                    "workflow_id": None,
+                    "batch_ready": False,
+                    "expected_responses": 0,
+                    "collected_responses": 0,
+                    "supplier_responses": [],
+                    "unique_ids": [],
+                }
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data=payload,
+                        pass_fields=payload,
+                        error="workflow_id required to await batch responses",
+                    ),
+                )
+
+            poll_default = getattr(
+                self.agent_nick.settings, "email_response_poll_seconds", self.WORKFLOW_POLL_INTERVAL_SECONDS
+            )
+            timeout_default = getattr(
+                self.agent_nick.settings, "email_response_timeout_seconds", 900
+            )
+
+            poll_interval = self._coerce_int(
+                context.input_data.get("response_poll_interval") or poll_default,
+                default=self.WORKFLOW_POLL_INTERVAL_SECONDS,
+            )
+            timeout = self._coerce_int(
+                context.input_data.get("response_timeout") or timeout_default,
+                default=900,
+            )
+
+            summary = self._await_full_response_batch(
+                workflow_key,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+
+            payload = {
+                "workflow_id": workflow_key,
+                "batch_ready": summary.get("ready", False),
+                "expected_responses": summary.get("expected_count", 0),
+                "collected_responses": summary.get("collected_count", 0),
+                "supplier_responses": summary.get("responses", []),
+                "unique_ids": summary.get("unique_ids", []),
+            }
+
+            next_agents = ["NegotiationAgent"] if payload["batch_ready"] and payload["supplier_responses"] else []
+
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=payload,
+                    pass_fields=payload,
+                    next_agents=next_agents,
                 ),
             )
 

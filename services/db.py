@@ -92,6 +92,7 @@ class _FakeCursor:
                 match_confidence,
                 price,
                 lead_time,
+                response_time,
                 received_time,
                 processed,
             ) = params
@@ -114,6 +115,7 @@ class _FakeCursor:
                     "match_confidence": match_confidence,
                     "price": price,
                     "lead_time": lead_time,
+                    "response_time": response_time,
                     "received_time": received_time,
                     "processed": processed,
                 },

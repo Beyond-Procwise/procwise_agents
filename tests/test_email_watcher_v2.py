@@ -27,6 +27,22 @@ class StubSupplierAgent:
 
     def execute(self, context):
         self.contexts.append(context)
+        action = context.input_data.get("action") if isinstance(context.input_data, dict) else None
+        if action == "await_workflow_batch":
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={
+                    "batch_ready": True,
+                    "expected_responses": 1,
+                    "collected_responses": 1,
+                    "supplier_responses": [
+                        {
+                            "unique_id": context.input_data.get("workflow_id"),
+                        }
+                    ],
+                },
+                next_agents=[],
+            )
         return AgentOutput(status=AgentStatus.SUCCESS, data={}, next_agents=[])
 
 
@@ -128,7 +144,14 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert supplier_agent.contexts, "Supplier agent should be invoked"
     assert fetcher.calls >= 1
 
-    context = supplier_agent.contexts[0]
+    message_contexts = [
+        ctx
+        for ctx in supplier_agent.contexts
+        if isinstance(getattr(ctx, "input_data", None), dict)
+        and "email_headers" in ctx.input_data
+    ]
+    assert message_contexts, "Supplier agent should process email context"
+    context = message_contexts[0]
     headers = context.input_data["email_headers"]
     assert headers["unique_id"] == unique_id
     assert headers["received_time"] is not None
