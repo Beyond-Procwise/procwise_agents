@@ -269,8 +269,7 @@ def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
             "SELECT workflow_id "
             "FROM proc.supplier_response "
             "WHERE unique_id=%s "
-            "ORDER BY id DESC "
-            "LIMIT 1"
+            "ORDER BY unique_id DESC "
         )
         cur.execute(q, (unique_id,))
         row = cur.fetchone()
