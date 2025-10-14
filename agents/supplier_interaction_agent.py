@@ -30,6 +30,8 @@ class SupplierInteractionAgent(BaseAgent):
         "Return structured responses or trigger downstream negotiation actions.",
     )
 
+    WORKFLOW_POLL_INTERVAL_SECONDS = 30
+
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self.device = configure_gpu()
@@ -163,6 +165,67 @@ class SupplierInteractionAgent(BaseAgent):
             "lead_time": row.get("lead_time"),
         }
 
+    def _prepare_response_expectations(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        supplier_filter: Optional[Set[str]] = None,
+        unique_filter: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        dispatch_rows = metadata.get("rows") or []
+        dispatch_index: Dict[str, Dict[str, Optional[str]]] = {}
+        for row in dispatch_rows:
+            unique_value = self._coerce_text(getattr(row, "unique_id", None))
+            supplier_value = self._coerce_text(getattr(row, "supplier_id", None))
+            if unique_value:
+                dispatch_index[unique_value] = {"supplier_id": supplier_value}
+
+        normalised_unique_filter: Optional[Set[str]] = None
+        if unique_filter:
+            normalised_unique_filter = {
+                self._coerce_text(value)
+                for value in unique_filter
+                if self._coerce_text(value)
+            }
+
+        normalised_supplier_filter: Optional[Set[str]] = None
+        if supplier_filter:
+            normalised_supplier_filter = {
+                self._coerce_text(value)
+                for value in supplier_filter
+                if self._coerce_text(value)
+            }
+
+        expected_unique_ids: Set[str] = set(dispatch_index.keys())
+        if normalised_supplier_filter:
+            expected_unique_ids = {
+                uid
+                for uid in expected_unique_ids
+                if dispatch_index.get(uid, {}).get("supplier_id") in normalised_supplier_filter
+            }
+
+        if normalised_unique_filter is not None:
+            expected_unique_ids &= normalised_unique_filter
+            if not expected_unique_ids and normalised_unique_filter:
+                expected_unique_ids = set(normalised_unique_filter)
+
+        expected_suppliers: Set[str] = {
+            dispatch_index[uid]["supplier_id"]
+            for uid in expected_unique_ids
+            if dispatch_index.get(uid, {}).get("supplier_id")
+        }
+        if not expected_suppliers and normalised_supplier_filter:
+            expected_suppliers = set(normalised_supplier_filter)
+
+        return {
+            "dispatch_rows": dispatch_rows,
+            "dispatch_index": dispatch_index,
+            "normalised_unique_filter": normalised_unique_filter,
+            "normalised_supplier_filter": normalised_supplier_filter,
+            "expected_unique_ids": expected_unique_ids,
+            "expected_suppliers": expected_suppliers,
+        }
+
     def _load_dispatch_metadata(self, workflow_id: str) -> Optional[Dict[str, Any]]:
         try:
             workflow_email_tracking_repo.init_schema()
@@ -280,17 +343,55 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return []
 
-        interval = self._resolve_poll_interval(poll_interval)
+        expectations = self._prepare_response_expectations(
+            metadata,
+            supplier_filter=supplier_filter,
+            unique_filter=unique_filter,
+        )
+        expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
+        expected_suppliers: Set[str] = expectations["expected_suppliers"]
+        dispatch_rows: List[Any] = expectations["dispatch_rows"]
+
+        expected_total = len(expected_unique_ids)
+        if expected_total == 0 and expected_suppliers:
+            expected_total = len(expected_suppliers)
+        if expected_total == 0:
+            expected_total = len(dispatch_rows)
+
+        if expected_total <= 0:
+            logger.info(
+                "No dispatched emails recorded for workflow=%s; nothing to await", workflow_id
+            )
+            return []
+
+        if poll_interval is None:
+            interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
+        else:
+            interval = self._resolve_poll_interval(poll_interval)
 
         while True:
-            rows = self._poll_supplier_response_rows(
-                workflow_id,
-                supplier_filter=supplier_filter,
-                unique_filter=unique_filter,
-                metadata=metadata,
+            response_total = supplier_response_repo.count_pending(
+                workflow_id=workflow_id,
+                unique_ids=list(expected_unique_ids) if expected_unique_ids else None,
+                supplier_ids=list(expected_suppliers) if expected_suppliers else None,
             )
-            if rows:
-                return rows
+
+            if expected_total > 0 and response_total >= expected_total:
+                rows = self._poll_supplier_response_rows(
+                    workflow_id,
+                    supplier_filter=supplier_filter,
+                    unique_filter=unique_filter,
+                    metadata=metadata,
+                )
+                if rows:
+                    if response_total > expected_total:
+                        logger.debug(
+                            "Response count %s exceeds expected %s for workflow=%s; proceeding",
+                            response_total,
+                            expected_total,
+                            workflow_id,
+                        )
+                    return rows
 
             if deadline is not None and time.monotonic() >= deadline:
                 break
@@ -298,6 +399,28 @@ class SupplierInteractionAgent(BaseAgent):
             refreshed = self._load_dispatch_metadata(workflow_id)
             if refreshed:
                 metadata = refreshed
+                expectations = self._prepare_response_expectations(
+                    metadata,
+                    supplier_filter=supplier_filter,
+                    unique_filter=unique_filter,
+                )
+                expected_unique_ids = expectations["expected_unique_ids"]
+                expected_suppliers = expectations["expected_suppliers"]
+                dispatch_rows = expectations["dispatch_rows"]
+                expected_total = len(expected_unique_ids)
+                if expected_total == 0 and expected_suppliers:
+                    expected_total = len(expected_suppliers)
+                if expected_total == 0:
+                    expected_total = len(dispatch_rows)
+                if expected_total <= 0:
+                    logger.info(
+                        "Dispatch metadata for workflow=%s contained no targets; stopping wait",
+                        workflow_id,
+                    )
+                    return []
+
+            if deadline is not None and time.monotonic() >= deadline:
+                break
 
             if interval > 0:
                 if deadline is not None:
@@ -338,49 +461,19 @@ class SupplierInteractionAgent(BaseAgent):
             logger.exception("Failed to initialise supplier response schema for workflow=%s", workflow_id)
             return []
 
-        dispatch_rows = metadata.get("rows") or []
-        dispatch_index: Dict[str, Dict[str, Optional[str]]] = {}
-        for row in dispatch_rows:
-            unique_value = self._coerce_text(getattr(row, "unique_id", None))
-            supplier_value = self._coerce_text(getattr(row, "supplier_id", None))
-            if unique_value:
-                dispatch_index[unique_value] = {"supplier_id": supplier_value}
-
-        normalised_unique_filter: Optional[Set[str]] = None
-        if unique_filter:
-            normalised_unique_filter = {
-                self._coerce_text(value)
-                for value in unique_filter
-                if self._coerce_text(value)
-            }
-
-        normalised_supplier_filter: Optional[Set[str]] = None
-        if supplier_filter:
-            normalised_supplier_filter = {
-                self._coerce_text(value)
-                for value in supplier_filter
-                if self._coerce_text(value)
-            }
-
-        expected_unique_ids: Set[str] = set(dispatch_index.keys())
-        if normalised_supplier_filter:
-            expected_unique_ids = {
-                uid
-                for uid in expected_unique_ids
-                if dispatch_index.get(uid, {}).get("supplier_id") in normalised_supplier_filter
-            }
-        if normalised_unique_filter is not None:
-            expected_unique_ids &= normalised_unique_filter
-        if normalised_unique_filter is not None and not expected_unique_ids:
-            expected_unique_ids = set(normalised_unique_filter)
-
-        expected_suppliers: Set[str] = {
-            dispatch_index[uid]["supplier_id"]
-            for uid in expected_unique_ids
-            if dispatch_index.get(uid, {}).get("supplier_id")
-        }
-        if not expected_suppliers and normalised_supplier_filter:
-            expected_suppliers = set(normalised_supplier_filter)
+        expectations = self._prepare_response_expectations(
+            metadata,
+            supplier_filter=supplier_filter,
+            unique_filter=unique_filter,
+        )
+        dispatch_rows = expectations["dispatch_rows"]
+        dispatch_index: Dict[str, Dict[str, Optional[str]]] = expectations[
+            "dispatch_index"
+        ]
+        normalised_unique_filter = expectations["normalised_unique_filter"]
+        normalised_supplier_filter = expectations["normalised_supplier_filter"]
+        expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
+        expected_suppliers: Set[str] = expectations["expected_suppliers"]
 
         pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
         serialised = [
@@ -1137,11 +1230,17 @@ class SupplierInteractionAgent(BaseAgent):
 
         unique_filter = unique_ids or None
 
+        batch_poll_interval = (
+            poll_interval
+            if poll_interval is not None
+            else self.WORKFLOW_POLL_INTERVAL_SECONDS
+        )
+
         responses = self._await_supplier_response_rows(
             workflow_key,
             unique_filter=unique_filter,
             timeout=timeout,
-            poll_interval=poll_interval,
+            poll_interval=batch_poll_interval,
         )
 
         if not responses:
