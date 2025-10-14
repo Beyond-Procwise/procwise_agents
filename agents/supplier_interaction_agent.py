@@ -202,14 +202,129 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
+    def _resolve_poll_interval(self, poll_interval: Optional[int]) -> float:
+        poll_setting = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
+        candidate: Optional[Any] = poll_interval if poll_interval is not None else poll_setting
+        try:
+            interval = float(candidate)
+        except Exception:
+            try:
+                interval = float(poll_setting)
+            except Exception:
+                interval = 5.0
+        if interval < 0:
+            interval = 0.0
+        return interval
+
+    def _await_dispatch_metadata(
+        self,
+        workflow_id: str,
+        *,
+        deadline: Optional[float],
+        poll_interval: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        metadata = self._load_dispatch_metadata(workflow_id)
+        if metadata is not None:
+            return metadata
+
+        interval = self._resolve_poll_interval(poll_interval)
+
+        while deadline is None or time.monotonic() < deadline:
+            if interval > 0:
+                sleep_window = interval
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sleep_window = min(interval, remaining)
+                time.sleep(sleep_window)
+            else:
+                time.sleep(0)
+
+            metadata = self._load_dispatch_metadata(workflow_id)
+            if metadata is not None:
+                return metadata
+
+        logger.debug(
+            "Dispatch metadata unavailable before deadline for workflow=%s", workflow_id
+        )
+        return None
+
+    def _await_supplier_response_rows(
+        self,
+        workflow_id: str,
+        *,
+        supplier_filter: Optional[Set[str]] = None,
+        unique_filter: Optional[Set[str]] = None,
+        timeout: Optional[int] = None,
+        poll_interval: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            total_timeout = float(timeout) if timeout is not None else 0.0
+        except Exception:
+            total_timeout = 0.0
+
+        if total_timeout < 0:
+            total_timeout = 0.0
+
+        start = time.monotonic()
+        deadline = start + total_timeout if total_timeout > 0 else None
+
+        metadata = self._await_dispatch_metadata(
+            workflow_id, deadline=deadline, poll_interval=poll_interval
+        )
+        if metadata is None:
+            logger.info(
+                "Skipping supplier response wait; dispatch metadata not ready for workflow=%s",
+                workflow_id,
+            )
+            return []
+
+        interval = self._resolve_poll_interval(poll_interval)
+
+        while True:
+            rows = self._poll_supplier_response_rows(
+                workflow_id,
+                supplier_filter=supplier_filter,
+                unique_filter=unique_filter,
+                metadata=metadata,
+            )
+            if rows:
+                return rows
+
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+            refreshed = self._load_dispatch_metadata(workflow_id)
+            if refreshed:
+                metadata = refreshed
+
+            if interval > 0:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(interval, remaining))
+                else:
+                    time.sleep(interval)
+            else:
+                time.sleep(0)
+
+        logger.info(
+            "Timed out waiting for supplier responses for workflow=%s", workflow_id
+        )
+        return []
+
     def _poll_supplier_response_rows(
         self,
         workflow_id: str,
         *,
         supplier_filter: Optional[Set[str]] = None,
         unique_filter: Optional[Set[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        metadata = self._load_dispatch_metadata(workflow_id)
+        if metadata is None:
+            metadata = self._load_dispatch_metadata(workflow_id)
         if metadata is None:
             logger.debug(
                 "Dispatch metadata unavailable for workflow=%s; skipping response poll",
@@ -915,10 +1030,12 @@ class SupplierInteractionAgent(BaseAgent):
 
         unique_filter: Optional[Set[str]] = {unique_key} if unique_key else None
 
-        responses = self._poll_supplier_response_rows(
+        responses = self._await_supplier_response_rows(
             workflow_key,
             supplier_filter=supplier_filter,
             unique_filter=unique_filter,
+            timeout=timeout,
+            poll_interval=poll_interval,
         )
 
         if not responses:
@@ -1020,9 +1137,11 @@ class SupplierInteractionAgent(BaseAgent):
 
         unique_filter = unique_ids or None
 
-        responses = self._poll_supplier_response_rows(
+        responses = self._await_supplier_response_rows(
             workflow_key,
             unique_filter=unique_filter,
+            timeout=timeout,
+            poll_interval=poll_interval,
         )
 
         if not responses:
