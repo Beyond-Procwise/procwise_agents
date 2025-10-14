@@ -1840,6 +1840,7 @@ class SupplierInteractionAgent(BaseAgent):
         workflow_key = self._coerce_text(workflow_id)
 
         canonical_workflow = None
+        canonical_resolved = False
         try:
             canonical_workflow = workflow_email_tracking_repo.lookup_workflow_for_unique(
                 unique_id=unique_key
@@ -1853,6 +1854,7 @@ class SupplierInteractionAgent(BaseAgent):
         if canonical_workflow:
             canonical_coerced = self._coerce_text(canonical_workflow)
             if canonical_coerced:
+                canonical_resolved = True
                 if workflow_key and canonical_coerced != workflow_key:
                     logger.warning(
                         "Workflow mismatch detected for unique_id=%s; using dispatch workflow_id=%s instead of %s",
@@ -1874,14 +1876,23 @@ class SupplierInteractionAgent(BaseAgent):
         if existing_workflow:
             existing_coerced = self._coerce_text(existing_workflow)
             if existing_coerced:
-                if workflow_key and existing_coerced != workflow_key:
-                    logger.warning(
-                        "Workflow mismatch detected for unique_id=%s; aligning to stored workflow_id=%s instead of %s",
-                        unique_key,
-                        existing_coerced,
-                        workflow_key,
-                    )
-                workflow_key = existing_coerced
+                if canonical_resolved:
+                    if existing_coerced != workflow_key:
+                        logger.warning(
+                            "Workflow mismatch detected for unique_id=%s; retaining dispatch workflow_id=%s instead of stored %s",
+                            unique_key,
+                            workflow_key,
+                            existing_coerced,
+                        )
+                else:
+                    if workflow_key and existing_coerced != workflow_key:
+                        logger.warning(
+                            "Workflow mismatch detected for unique_id=%s; aligning to stored workflow_id=%s instead of %s",
+                            unique_key,
+                            existing_coerced,
+                            workflow_key,
+                        )
+                    workflow_key = existing_coerced
 
         if not workflow_key:
             logger.debug(
