@@ -2793,6 +2793,7 @@ class NegotiationAgent(BaseAgent):
                     draft_action_id=draft_action_id,
                     workflow_id=workflow_hint,
                     dispatch_run_id=dispatch_run_id,
+                    unique_id=target.get("unique_id"),
                 )
             ]
         except Exception:  # pragma: no cover - defensive
