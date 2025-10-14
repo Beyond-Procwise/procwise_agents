@@ -120,7 +120,7 @@ def test_supplier_interaction_wait_for_response(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         return [
             {
@@ -210,7 +210,7 @@ def test_wait_for_response_realigns_workflow_from_unique(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         return [
             {
@@ -262,7 +262,7 @@ def test_wait_for_response_realigns_workflow_from_unique(monkeypatch):
     assert awaited.get("workflow_id") == "wf-canonical"
 
 
-def test_wait_for_response_waits_for_dispatch_metadata(monkeypatch):
+def test_wait_for_response_requires_ready_dispatch_metadata(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
@@ -291,7 +291,7 @@ def test_wait_for_response_waits_for_dispatch_metadata(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         return [
             {
@@ -337,10 +337,9 @@ def test_wait_for_response_waits_for_dispatch_metadata(monkeypatch):
         unique_id="uid-slow",
     )
 
-    assert result is not None
-    assert result["unique_id"] == "uid-slow"
-    assert len(fetch_calls) == 1
-    assert len(metadata_calls) >= 3
+    assert result is None
+    assert fetch_calls == []
+    assert metadata_calls == ["wf-slow"]
 
 
 def test_wait_for_response_requires_available_payload(monkeypatch):
@@ -381,7 +380,7 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         batch = pending_batches[0]
         if len(pending_batches) > 1:
@@ -417,8 +416,15 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
         lambda **_: None,
     )
 
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", fake_sleep)
+
     result = agent.wait_for_response(
-        timeout=5,
+        timeout=90,
         poll_interval=0,
         rfq_id="RFQ-20240101-abcd1234",
         supplier_id="S1",
@@ -432,6 +438,7 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
     assert result["supplier_status"] == "success"
     assert result["supplier_output"]["response_text"] == "Pricing ready"
     assert len(fetch_calls) >= 2
+    assert sleep_calls and sleep_calls[0] == pytest.approx(30.0)
 
 
 def test_supplier_interaction_waits_using_drafts():
@@ -513,7 +520,7 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         return [
             {
@@ -660,7 +667,7 @@ def test_wait_for_multiple_responses_waits_until_complete(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         batch = pending_batches[0]
         if len(pending_batches) > 1:
@@ -684,6 +691,14 @@ def test_wait_for_multiple_responses_waits_until_complete(monkeypatch):
         return current
 
     agent._load_dispatch_metadata = lambda *_args, **_kwargs: metadata  # type: ignore[assignment]
+
+    sleep_calls: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", fake_sleep)
+
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
@@ -722,7 +737,7 @@ def test_wait_for_multiple_responses_waits_until_complete(monkeypatch):
 
     results = agent.wait_for_multiple_responses(
         drafts,
-        timeout=5,
+        timeout=90,
         poll_interval=0,
         limit=1,
     )
@@ -730,6 +745,7 @@ def test_wait_for_multiple_responses_waits_until_complete(monkeypatch):
     assert all(result is not None for result in results)
     assert {result["unique_id"] for result in results if result} == {"uid-1", "uid-2"}
     assert len(fetch_calls) >= 2
+    assert sleep_calls and sleep_calls[0] == pytest.approx(30.0)
 
 
 def test_wait_for_multiple_responses_uses_canonical_workflow(monkeypatch):
@@ -790,7 +806,7 @@ def test_wait_for_multiple_responses_uses_canonical_workflow(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         return pending_rows
 
@@ -905,7 +921,7 @@ def test_poll_collects_only_when_all_responses_present(monkeypatch):
 
     fetch_calls: List[str] = []
 
-    def fake_fetch_pending(*, workflow_id):
+    def fake_fetch_pending(*, workflow_id, **_kwargs):
         fetch_calls.append(workflow_id)
         assert workflow_id == "wf-bulk"
         batch = pending_batches[0]

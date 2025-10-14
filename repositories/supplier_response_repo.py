@@ -224,14 +224,18 @@ def count_pending(
     workflow_id: str,
     unique_ids: Optional[Sequence[str]] = None,
     supplier_ids: Optional[Sequence[str]] = None,
+    include_processed: bool = False,
 ) -> int:
     ids = [uid for uid in (unique_ids or []) if uid]
     supplier_filter = [sid for sid in (supplier_ids or []) if sid]
 
     with get_conn() as conn:
         cur = conn.cursor()
-        filters = ["workflow_id=%s", "COALESCE(processed, FALSE)=FALSE"]
+        filters = ["workflow_id=%s"]
         params: List[Any] = [workflow_id]
+
+        if not include_processed:
+            filters.append("COALESCE(processed, FALSE)=FALSE")
 
         if ids:
             filters.append("unique_id = ANY(%s)")
@@ -257,17 +261,25 @@ def count_pending(
             return 0
 
 
-def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
+def fetch_pending(
+    *, workflow_id: str, include_processed: bool = False
+) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
+        filters = ["workflow_id=%s"]
+        params: List[Any] = [workflow_id]
+
+        if not include_processed:
+            filters.append("COALESCE(processed, FALSE)=FALSE")
+
         q = (
             "SELECT workflow_id, supplier_id, supplier_email, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
             "original_subject, match_confidence, price, lead_time, received_time, processed "
             "FROM proc.supplier_response "
-            "WHERE workflow_id=%s AND COALESCE(processed, FALSE)=FALSE"
+            f"WHERE {' AND '.join(filters)}"
         )
-        cur.execute(q, (workflow_id,))
+        cur.execute(q, tuple(params))
         cols = [c.name for c in cur.description]
         rows = [dict(zip(cols, rec)) for rec in cur.fetchall()]
         cur.close()

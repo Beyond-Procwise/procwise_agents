@@ -4,6 +4,7 @@ import re
 import imaplib
 import time
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email import message_from_bytes
@@ -265,54 +266,6 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
-    def _resolve_poll_interval(self, poll_interval: Optional[int]) -> float:
-        poll_setting = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
-        candidate: Optional[Any] = poll_interval if poll_interval is not None else poll_setting
-        try:
-            interval = float(candidate)
-        except Exception:
-            try:
-                interval = float(poll_setting)
-            except Exception:
-                interval = 5.0
-        if interval < 0:
-            interval = 0.0
-        return interval
-
-    def _await_dispatch_metadata(
-        self,
-        workflow_id: str,
-        *,
-        deadline: Optional[float],
-        poll_interval: Optional[int],
-    ) -> Optional[Dict[str, Any]]:
-        metadata = self._load_dispatch_metadata(workflow_id)
-        if metadata is not None:
-            return metadata
-
-        interval = self._resolve_poll_interval(poll_interval)
-
-        while deadline is None or time.monotonic() < deadline:
-            if interval > 0:
-                sleep_window = interval
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    sleep_window = min(interval, remaining)
-                time.sleep(sleep_window)
-            else:
-                time.sleep(0)
-
-            metadata = self._load_dispatch_metadata(workflow_id)
-            if metadata is not None:
-                return metadata
-
-        logger.debug(
-            "Dispatch metadata unavailable before deadline for workflow=%s", workflow_id
-        )
-        return None
-
     def _await_supplier_response_rows(
         self,
         workflow_id: str,
@@ -333,9 +286,7 @@ class SupplierInteractionAgent(BaseAgent):
         start = time.monotonic()
         deadline = start + total_timeout if total_timeout > 0 else None
 
-        metadata = self._await_dispatch_metadata(
-            workflow_id, deadline=deadline, poll_interval=poll_interval
-        )
+        metadata = self._load_dispatch_metadata(workflow_id)
         if metadata is None:
             logger.info(
                 "Skipping supplier response wait; dispatch metadata not ready for workflow=%s",
@@ -343,40 +294,24 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return []
 
-        expectations = self._prepare_response_expectations(
-            metadata,
-            supplier_filter=supplier_filter,
-            unique_filter=unique_filter,
-        )
-        expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
-        expected_suppliers: Set[str] = expectations["expected_suppliers"]
-        dispatch_rows: List[Any] = expectations["dispatch_rows"]
+        dispatch_rows: List[Any] = list(metadata.get("rows") or [])
 
-        expected_total = len(expected_unique_ids)
-        if expected_total == 0 and expected_suppliers:
-            expected_total = len(expected_suppliers)
-        if expected_total == 0:
-            expected_total = len(dispatch_rows)
-
-        if expected_total <= 0:
+        dispatch_total = len(dispatch_rows)
+        if dispatch_total <= 0:
             logger.info(
                 "No dispatched emails recorded for workflow=%s; nothing to await", workflow_id
             )
             return []
 
-        if poll_interval is None:
-            interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
-        else:
-            interval = self._resolve_poll_interval(poll_interval)
+        interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
 
         while True:
             response_total = supplier_response_repo.count_pending(
                 workflow_id=workflow_id,
-                unique_ids=list(expected_unique_ids) if expected_unique_ids else None,
-                supplier_ids=list(expected_suppliers) if expected_suppliers else None,
+                include_processed=True,
             )
 
-            if expected_total > 0 and response_total >= expected_total:
+            if response_total >= dispatch_total:
                 rows = self._poll_supplier_response_rows(
                     workflow_id,
                     supplier_filter=supplier_filter,
@@ -384,40 +319,14 @@ class SupplierInteractionAgent(BaseAgent):
                     metadata=metadata,
                 )
                 if rows:
-                    if response_total > expected_total:
+                    if response_total > dispatch_total:
                         logger.debug(
-                            "Response count %s exceeds expected %s for workflow=%s; proceeding",
+                            "Response count %s exceeds dispatched total %s for workflow=%s; proceeding",
                             response_total,
-                            expected_total,
+                            dispatch_total,
                             workflow_id,
                         )
-                    return rows
-
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-
-            refreshed = self._load_dispatch_metadata(workflow_id)
-            if refreshed:
-                metadata = refreshed
-                expectations = self._prepare_response_expectations(
-                    metadata,
-                    supplier_filter=supplier_filter,
-                    unique_filter=unique_filter,
-                )
-                expected_unique_ids = expectations["expected_unique_ids"]
-                expected_suppliers = expectations["expected_suppliers"]
-                dispatch_rows = expectations["dispatch_rows"]
-                expected_total = len(expected_unique_ids)
-                if expected_total == 0 and expected_suppliers:
-                    expected_total = len(expected_suppliers)
-                if expected_total == 0:
-                    expected_total = len(dispatch_rows)
-                if expected_total <= 0:
-                    logger.info(
-                        "Dispatch metadata for workflow=%s contained no targets; stopping wait",
-                        workflow_id,
-                    )
-                    return []
+                    return self._process_responses_concurrently(rows)
 
             if deadline is not None and time.monotonic() >= deadline:
                 break
@@ -431,7 +340,7 @@ class SupplierInteractionAgent(BaseAgent):
                 else:
                     time.sleep(interval)
             else:
-                time.sleep(0)
+                break
 
         logger.info(
             "Timed out waiting for supplier responses for workflow=%s", workflow_id
@@ -475,7 +384,10 @@ class SupplierInteractionAgent(BaseAgent):
         expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
         expected_suppliers: Set[str] = expectations["expected_suppliers"]
 
-        pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+        pending_rows = supplier_response_repo.fetch_pending(
+            workflow_id=workflow_id,
+            include_processed=True,
+        )
         serialised = [
             self._serialise_pending_row(row)
             for row in pending_rows
@@ -567,6 +479,19 @@ class SupplierInteractionAgent(BaseAgent):
                 ordered_results.append(row)
 
         return ordered_results
+
+    def _process_responses_concurrently(
+        self, rows: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not rows:
+            return []
+
+        max_workers = os.cpu_count() or 1
+        max_workers = max(1, min(len(rows), max_workers))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(self._response_from_row, row) for row in rows]
+            return [future.result() for future in futures]
 
     def run(self, context: AgentContext) -> AgentOutput:
         """Process a single supplier email or poll the mailbox."""
@@ -1138,7 +1063,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return None
 
-        return self._response_from_row(responses[0]) if responses else None
+        return responses[0] if responses else None
 
 
     def wait_for_multiple_responses(
@@ -1251,7 +1176,7 @@ class SupplierInteractionAgent(BaseAgent):
             return [None] * len(drafts)
 
         response_map = {
-            row.get("unique_id"): self._response_from_row(row)
+            row.get("unique_id"): row
             for row in responses
             if row.get("unique_id")
         }
@@ -1262,7 +1187,7 @@ class SupplierInteractionAgent(BaseAgent):
             if response is None and ctx.get("supplier_id"):
                 for row in responses:
                     if self._coerce_text(row.get("supplier_id")) == ctx.get("supplier_id"):
-                        response = self._response_from_row(row)
+                        response = row
                         break
             results.append(response)
 
