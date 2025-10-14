@@ -5,6 +5,7 @@ import sys
 import threading
 from collections import deque
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
+from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.supplier_response_repo import SupplierResponseRow
 
 
 class DummyCursor:
@@ -554,6 +557,8 @@ def test_await_all_responses_processes_parallel_results(monkeypatch):
     parallel_payloads = [
         {
             "rfq_id": "RFQ-20240101-AAA11111",
+            "workflow_id": "wf-parallel",
+            "unique_id": "draft-1",
             "supplier_id": "SUP-1",
             "subject": "Re: RFQ-20240101-AAA11111",
             "supplier_output": {
@@ -564,6 +569,8 @@ def test_await_all_responses_processes_parallel_results(monkeypatch):
         },
         {
             "rfq_id": "RFQ-20240101-BBB22222",
+            "workflow_id": "wf-parallel",
+            "unique_id": "draft-2",
             "supplier_id": "SUP-2",
             "subject": "Re: RFQ-20240101-BBB22222",
             "supplier_output": {
@@ -612,10 +619,12 @@ def test_await_all_responses_processes_parallel_results(monkeypatch):
 
     stored: List[Dict[str, Any]] = []
 
-    def fake_store(rfq_id, supplier_id, message, parsed, **kwargs):
+    def fake_store(workflow_id, supplier_id, message, parsed, *, unique_id=None, rfq_id=None, **kwargs):
         stored.append(
             {
+                "workflow_id": workflow_id,
                 "rfq_id": rfq_id,
+                "unique_id": unique_id,
                 "supplier_id": supplier_id,
                 "message": message,
                 "parsed": parsed,
@@ -680,158 +689,154 @@ def test_parse_response_uses_llm_when_available(monkeypatch):
     assert parsed["context_summary"].startswith("Supplier will expedite")
 
 
-def test_store_response_resolves_supplier_from_db(monkeypatch):
+def test_store_response_persists_workflow_records(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
-    results = deque([None, None, ("SUP-DB",)])
-    statements: List[str] = []
-    inserts: List[tuple] = []
-    connections: List[object] = []
+    captured: Dict[str, SupplierResponseRow] = {}
 
-    class CursorStub:
-        def __init__(self, owner):
-            self.owner = owner
-            self._result = None
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
+    monkeypatch.setattr(
+        supplier_response_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
 
-        def __enter__(self):
-            return self
+    def fake_insert(row):
+        captured["row"] = row
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def execute(self, statement, params=None):
-            normalized = " ".join(statement.strip().split())
-            statements.append(normalized)
-            if "INSERT INTO proc.supplier_responses" in normalized:
-                inserts.append(params)
-                self._result = None
-                return
-            try:
-                self._result = results.popleft()
-            except IndexError:
-                self._result = None
-
-        def fetchone(self):
-            return self._result
-
-        def fetchall(self):
-            return []
-
-    class ConnectionStub:
-        def __init__(self):
-            self.commits = 0
-            self.rollbacks = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def cursor(self):
-            return CursorStub(self)
-
-        def commit(self):
-            self.commits += 1
-
-        def rollback(self):
-            self.rollbacks += 1
-
-    def connection_factory():
-        conn = ConnectionStub()
-        connections.append(conn)
-        return conn
-
-    agent.agent_nick.get_db_connection = connection_factory  # type: ignore[assignment]
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
 
     agent._store_response(
-        "RFQ-20240101-ABCD1234",
-        None,
-        "Thank you",
-        {"price": 1200.0, "lead_time": "5"},
-        message_id="message-1",
+        "wf-123",
+        "SUP-123",
+        "Appreciate the opportunity",
+        {"price": "1200.00", "lead_time": "5"},
+        unique_id="line-001",
+        rfq_id="RFQ-20240101-ABCD1234",
+        message_id="msg-1",
         from_address="supplier@example.com",
     )
 
-    assert inserts, "expected supplier response insert"
-    assert inserts[0][1] == "SUP-DB"
-    assert any("proc.negotiation_sessions" in stmt for stmt in statements)
-    assert connections and connections[-1].commits == 1
+    assert "row" in captured
+    stored = captured["row"]
+    assert stored.workflow_id == "wf-123"
+    assert stored.unique_id == "line-001"
+    assert stored.supplier_id == "SUP-123"
+    assert stored.price == Decimal("1200.00")
+    assert stored.lead_time == 5
+    assert stored.response_message_id == "msg-1"
 
 
-def test_store_response_skips_when_supplier_unresolved(monkeypatch, caplog):
+def test_store_response_skips_without_unique_id(monkeypatch, caplog):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
-    results = deque([None, None, None, None, None, None])
-    statements: List[str] = []
-    inserts: List[tuple] = []
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
+    monkeypatch.setattr(
+        supplier_response_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
 
-    class CursorStub:
-        def __init__(self, owner):
-            self.owner = owner
-            self._result = None
+    called = []
 
-        def __enter__(self):
-            return self
+    def fake_insert(row):
+        called.append(row)
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def execute(self, statement, params=None):
-            normalized = " ".join(statement.strip().split())
-            statements.append(normalized)
-            if "INSERT INTO proc.supplier_responses" in normalized:
-                inserts.append(params)
-                self._result = None
-                return
-            try:
-                self._result = results.popleft()
-            except IndexError:
-                self._result = None
-
-        def fetchone(self):
-            return self._result
-
-        def fetchall(self):
-            return []
-
-    class ConnectionStub:
-        def __init__(self):
-            self.commits = 0
-            self.rollbacks = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def cursor(self):
-            return CursorStub(self)
-
-        def commit(self):
-            self.commits += 1
-
-        def rollback(self):
-            self.rollbacks += 1
-
-    def connection_factory():
-        return ConnectionStub()
-
-    agent.agent_nick.get_db_connection = connection_factory  # type: ignore[assignment]
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
 
     with caplog.at_level(logging.ERROR):
         agent._store_response(
-            "RFQ-20240101-ABCD1234",
-            None,
-            "No supplier id",
+            "wf-123",
+            "SUP-123",
+            "Missing ids",
             {"price": None, "lead_time": None},
-            message_id="message-2",
-            from_address="unknown@example.com",
+            unique_id=None,
+            rfq_id="RFQ-20240101-ABCD1234",
         )
 
-    assert not inserts
-    assert "could not be resolved" in caplog.text
-    assert any("proc.draft_rfq_emails" in stmt for stmt in statements)
+    assert not called
+    assert "unique_id" in caplog.text
+
+
+def test_store_response_aligns_workflow_with_dispatch(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+
+    canonical_workflow = "wf-dispatch"
+
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: canonical_workflow,
+    )
+
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+
+    captured: Dict[str, SupplierResponseRow] = {}
+
+    def fake_insert(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
+
+    agent._store_response(
+        "wf-orig",
+        "SUP-999",
+        "Response body",
+        {"price": "4100.00", "lead_time": 12},
+        unique_id="uniq-1",
+        message_id="msg-123",
+    )
+
+    assert "row" in captured
+    assert captured["row"].workflow_id == canonical_workflow
+
+
+def test_store_response_aligns_workflow_with_existing_record(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+
+    stored_workflow = "wf-existing"
+
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: stored_workflow,
+    )
+
+    captured: Dict[str, SupplierResponseRow] = {}
+
+    def fake_insert(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
+
+    agent._store_response(
+        "wf-mismatch",
+        "SUP-888",
+        "Response body",
+        {"price": "5250.00", "lead_time": 20},
+        unique_id="uniq-2",
+        message_id="msg-789",
+    )
+
+    assert "row" in captured
+    assert captured["row"].workflow_id == stored_workflow

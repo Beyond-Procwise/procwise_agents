@@ -241,3 +241,27 @@ def reset_workflow(*, workflow_id: str) -> None:
         cur = conn.cursor()
         cur.execute("DELETE FROM proc.workflow_email_tracking WHERE workflow_id=%s", (workflow_id,))
         cur.close()
+
+
+def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
+    if not unique_id:
+        return None
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id "
+            "FROM proc.workflow_email_tracking "
+            "WHERE unique_id=%s "
+            "ORDER BY dispatched_at DESC NULLS LAST "
+            "LIMIT 1"
+        )
+        cur.execute(q, (unique_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        workflow_id = row[0]
+        return workflow_id or None

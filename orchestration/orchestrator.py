@@ -539,7 +539,7 @@ class Orchestrator:
     def _workflow_completed_successfully(self, result: Any) -> bool:
         """Return ``True`` when the workflow outcome represents a success."""
 
-        status_flag = None
+        success = False
         if isinstance(result, dict):
             status_flag = self._normalise_status_flag(result.get("status"))
             if status_flag is False:
@@ -551,14 +551,18 @@ class Orchestrator:
             ctx = result.get("ctx")
             if isinstance(ctx, dict) and self._has_error_payload(ctx.get("errors")):
                 return False
+            if status_flag is True:
+                success = True
         elif hasattr(result, "status"):
             status_flag = self._normalise_status_flag(getattr(result, "status"))
             if status_flag is False:
                 return False
             if self._has_error_payload(getattr(result, "error", None)):
                 return False
+            if status_flag is True:
+                success = True
 
-        return status_flag is not False
+        return success
 
     @staticmethod
     def _has_error_payload(payload: Any) -> bool:
