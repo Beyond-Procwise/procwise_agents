@@ -588,18 +588,24 @@ class EmailWatcherV2:
                     "SupplierInteractionAgent batch wait failed for workflow %s",
                     tracker.workflow_id,
                 )
-                return
+                wait_result = None
 
-            if not (
+            wait_success = (
                 isinstance(wait_result, AgentOutput)
                 and wait_result.status == AgentStatus.SUCCESS
-                and wait_result.data.get("batch_ready")
-            ):
+            )
+            batch_ready = bool(wait_result.data.get("batch_ready")) if wait_success else False
+
+            if not wait_success:
                 logger.debug(
-                    "Supplier responses not ready for workflow %s; deferring negotiation",
+                    "Supplier responses wait failed for workflow %s; processing available responses",
                     tracker.workflow_id,
                 )
-                return
+            elif not batch_ready:
+                logger.info(
+                    "Timed out waiting for full supplier batch for workflow %s; processing available responses",
+                    tracker.workflow_id,
+                )
 
             pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
             if not pending_rows:
