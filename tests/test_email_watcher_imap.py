@@ -31,6 +31,7 @@ def _sample_row(message_id: str | None = "msg-123") -> WorkflowDispatchRow:
         responded_at=None,
         response_message_id=None,
         matched=False,
+        thread_headers={"message_id": [message_id] if message_id else []},
     )
 
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from services.db import get_conn
 
@@ -23,9 +25,13 @@ CREATE TABLE IF NOT EXISTS proc.workflow_email_tracking (
     responded_at TIMESTAMPTZ,
     response_message_id TEXT,
     matched BOOLEAN DEFAULT FALSE,
+    thread_headers JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (workflow_id, unique_id)
 );
+
+ALTER TABLE proc.workflow_email_tracking
+    ADD COLUMN IF NOT EXISTS thread_headers JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf
 ON proc.workflow_email_tracking (workflow_id);
@@ -43,6 +49,7 @@ class WorkflowDispatchRow:
     responded_at: Optional[datetime]
     response_message_id: Optional[str]
     matched: bool
+    thread_headers: Optional[Dict[str, Sequence[str]]] = None
 
 
 def _normalise_dt(value: Optional[datetime]) -> Optional[datetime]:
@@ -58,6 +65,39 @@ def init_schema() -> None:
         cur = conn.cursor()
         cur.execute(DDL_PG)
         cur.close()
+
+
+def _parse_thread_headers(value: Optional[object]) -> Optional[Dict[str, Sequence[str]]]:
+    if value in (None, "", b"", {}):
+        return None
+    raw = value
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode()
+        except Exception:
+            raw = bytes(raw).decode("utf-8", "ignore")
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+
+    result: Dict[str, Sequence[str]] = {}
+    for key, items in payload.items():
+        if items in (None, ""):
+            continue
+        if isinstance(items, (list, tuple, set)):
+            values = tuple(str(item).strip("<> ") for item in items if str(item).strip())
+        else:
+            text = str(items).strip()
+            values = (text,) if text else tuple()
+        if values:
+            result[str(key)] = values
+    return result or None
 
 
 def load_active_workflow_ids() -> List[str]:
@@ -79,6 +119,25 @@ def load_active_workflow_ids() -> List[str]:
         return rows
 
 
+def _serialise_thread_headers(headers: Optional[Dict[str, Sequence[str]]]) -> Optional[str]:
+    if not headers:
+        return None
+    serialised: Dict[str, List[str]] = {}
+    for key, value in headers.items():
+        if value in (None, ""):
+            continue
+        if isinstance(value, (list, tuple, set)):
+            entries = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            text = str(value).strip()
+            entries = [text] if text else []
+        if entries:
+            serialised[str(key)] = entries
+    if not serialised:
+        return None
+    return json.dumps(serialised)
+
+
 def record_dispatches(
     *,
     workflow_id: str,
@@ -93,14 +152,15 @@ def record_dispatches(
         q = (
             "INSERT INTO proc.workflow_email_tracking "
             "(workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
-            "dispatched_at, responded_at, response_message_id, matched) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "dispatched_at, responded_at, response_message_id, matched, thread_headers) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (workflow_id, unique_id) DO UPDATE SET "
             "supplier_id=EXCLUDED.supplier_id, "
             "supplier_email=EXCLUDED.supplier_email, "
             "message_id=EXCLUDED.message_id, "
             "subject=EXCLUDED.subject, "
-            "dispatched_at=EXCLUDED.dispatched_at"
+            "dispatched_at=EXCLUDED.dispatched_at, "
+            "thread_headers=EXCLUDED.thread_headers"
         )
         params = [
             (
@@ -114,6 +174,7 @@ def record_dispatches(
                 _normalise_dt(row.responded_at),
                 row.response_message_id,
                 row.matched,
+                _serialise_thread_headers(row.thread_headers),
             )
             for row in rows
         ]
@@ -126,7 +187,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
         cur = conn.cursor()
         q = (
             "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
-            "dispatched_at, responded_at, response_message_id, matched "
+            "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking WHERE workflow_id=%s"
         )
         cur.execute(q, (workflow_id,))
@@ -148,6 +209,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
                     responded_at=_normalise_dt(data.get("responded_at")) if data.get("responded_at") else None,
                     response_message_id=data.get("response_message_id"),
                     matched=bool(data.get("matched")),
+                    thread_headers=_parse_thread_headers(data.get("thread_headers")),
                 )
             )
         return rows
