@@ -1828,6 +1828,7 @@ class SupplierInteractionAgent(BaseAgent):
         rfq_id: Optional[str] = None,
         message_id: Optional[str] = None,
         from_address: Optional[str] = None,
+        received_at: Optional[datetime] = None,
     ) -> None:
         unique_key = self._coerce_text(unique_id) or self._coerce_text(message_id)
         if not unique_key:
@@ -1942,6 +1943,31 @@ class SupplierInteractionAgent(BaseAgent):
             except Exception:
                 lead_value = None
 
+        dispatch_row = None
+        try:
+            dispatch_row = workflow_email_tracking_repo.lookup_dispatch_row(
+                workflow_id=workflow_key, unique_id=unique_key
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to load dispatch details for workflow=%s unique_id=%s",
+                workflow_key,
+                unique_key,
+            )
+
+        received_time = received_at or datetime.now(timezone.utc)
+        response_time_value: Optional[Decimal] = None
+        if dispatch_row and dispatch_row.dispatched_at and received_time:
+            try:
+                delta_seconds = (received_time - dispatch_row.dispatched_at).total_seconds()
+                if delta_seconds >= 0:
+                    response_time_value = Decimal(str(delta_seconds))
+            except Exception:
+                response_time_value = None
+
+        original_message_id = dispatch_row.message_id if dispatch_row else None
+        original_subject = dispatch_row.subject if dispatch_row else None
+
         try:
             supplier_response_repo.init_schema()
         except Exception:  # pragma: no cover - best effort
@@ -1956,10 +1982,13 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_id=resolved_supplier,
                     supplier_email=supplier_email,
                     response_text=text,
-                    received_time=datetime.now(timezone.utc),
+                    received_time=received_time,
+                    response_time=response_time_value,
                     response_message_id=message_id,
                     response_subject=None,
                     response_from=from_address,
+                    original_message_id=original_message_id,
+                    original_subject=original_subject,
                     price=price_value,
                     lead_time=lead_value,
                     processed=False,

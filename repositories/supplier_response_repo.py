@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS proc.supplier_response (
     match_confidence NUMERIC(4, 2),
     price NUMERIC(18, 4),
     lead_time INTEGER,
+    response_time NUMERIC(18, 6),
     received_time TIMESTAMPTZ,
     processed BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -47,6 +48,7 @@ class SupplierResponseRow:
     supplier_id: Optional[str]
     response_text: str
     received_time: datetime
+    response_time: Optional[Decimal] = None
     price: Optional[Decimal] = None
     lead_time: Optional[int] = None
     supplier_email: Optional[str] = None
@@ -108,6 +110,7 @@ def init_schema() -> None:
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_message_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_subject", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "match_confidence", "NUMERIC(4, 2)")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "response_time", "NUMERIC(18, 6)")
         _ensure_postgres_column(cur, "proc", "supplier_response", "processed", "BOOLEAN DEFAULT FALSE")
         cur.close()
 
@@ -117,6 +120,7 @@ def insert_response(row: SupplierResponseRow) -> None:
     received_time = _normalise_dt(row.received_time)
     price_value = _serialise_decimal(row.price)
     match_confidence = _serialise_decimal(row.match_confidence)
+    response_time = _serialise_decimal(row.response_time)
     supplier_email = row.supplier_email or None
     response_message_id = row.response_message_id or None
     response_subject = row.response_subject or None
@@ -132,8 +136,8 @@ def insert_response(row: SupplierResponseRow) -> None:
             "INSERT INTO proc.supplier_response "
             "(workflow_id, supplier_id, supplier_email, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
-            "original_subject, match_confidence, price, lead_time, received_time, processed) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "original_subject, match_confidence, price, lead_time, response_time, received_time, processed) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
             "supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_response.supplier_id), "
             "supplier_email=COALESCE(EXCLUDED.supplier_email, proc.supplier_response.supplier_email), "
@@ -148,6 +152,7 @@ def insert_response(row: SupplierResponseRow) -> None:
             "match_confidence=COALESCE(EXCLUDED.match_confidence, proc.supplier_response.match_confidence), "
             "price=COALESCE(EXCLUDED.price, proc.supplier_response.price), "
             "lead_time=COALESCE(EXCLUDED.lead_time, proc.supplier_response.lead_time), "
+            "response_time=COALESCE(EXCLUDED.response_time, proc.supplier_response.response_time), "
             "received_time=COALESCE(EXCLUDED.received_time, proc.supplier_response.received_time), "
             "processed=EXCLUDED.processed"
         )
@@ -169,6 +174,7 @@ def insert_response(row: SupplierResponseRow) -> None:
                 match_confidence,
                 price_value,
                 row.lead_time,
+                response_time,
                 received_time,
                 processed,
             ),
@@ -281,6 +287,7 @@ def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault("subject", payload.get("response_subject"))
     payload.setdefault("from_addr", payload.get("response_from"))
     payload.setdefault("message_id", payload.get("response_message_id"))
+    payload.setdefault("response_time", payload.get("response_time"))
     payload.setdefault("received_time", payload.get("response_date") or payload.get("received_time"))
     payload.setdefault("processed", _coerce_bool(payload.get("processed")))
     return payload

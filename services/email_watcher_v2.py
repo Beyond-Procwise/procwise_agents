@@ -475,6 +475,14 @@ class EmailWatcherV2:
                     or best_dispatch.supplier_email
                 )
                 supplier_id = email.supplier_id or best_dispatch.supplier_id
+                response_time: Optional[Decimal] = None
+                if best_dispatch.dispatched_at and email.received_at:
+                    try:
+                        delta_seconds = (email.received_at - best_dispatch.dispatched_at).total_seconds()
+                        if delta_seconds >= 0:
+                            response_time = Decimal(str(delta_seconds))
+                    except Exception:  # pragma: no cover - defensive conversion
+                        response_time = None
                 response_row = SupplierResponseRow(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
@@ -482,6 +490,7 @@ class EmailWatcherV2:
                     supplier_email=supplier_email,
                     response_text=email.body,
                     received_time=email.received_at,
+                    response_time=response_time,
                     response_message_id=email.message_id,
                     response_subject=email.subject,
                     response_from=email.from_address,

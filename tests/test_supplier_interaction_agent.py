@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
@@ -699,6 +699,16 @@ def test_store_response_persists_workflow_records(monkeypatch):
     monkeypatch.setattr(
         workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
     )
+    dispatch_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_row",
+        lambda **_: SimpleNamespace(
+            dispatched_at=dispatch_ts,
+            message_id="orig-msg",
+            subject="Original subject",
+        ),
+    )
     monkeypatch.setattr(
         supplier_response_repo, "lookup_workflow_for_unique", lambda **_: None
     )
@@ -708,6 +718,7 @@ def test_store_response_persists_workflow_records(monkeypatch):
 
     monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
 
+    received_ts = dispatch_ts + timedelta(minutes=15)
     agent._store_response(
         "wf-123",
         "SUP-123",
@@ -717,6 +728,7 @@ def test_store_response_persists_workflow_records(monkeypatch):
         rfq_id="RFQ-20240101-ABCD1234",
         message_id="msg-1",
         from_address="supplier@example.com",
+        received_at=received_ts,
     )
 
     assert "row" in captured
@@ -727,6 +739,8 @@ def test_store_response_persists_workflow_records(monkeypatch):
     assert stored.price == Decimal("1200.00")
     assert stored.lead_time == 5
     assert stored.response_message_id == "msg-1"
+    assert stored.original_message_id == "orig-msg"
+    assert stored.response_time == Decimal("900")
 
 
 def test_store_response_skips_without_unique_id(monkeypatch, caplog):
@@ -736,6 +750,11 @@ def test_store_response_skips_without_unique_id(monkeypatch, caplog):
     monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
     monkeypatch.setattr(
         workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
+    )
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_row",
+        lambda **_: None,
     )
     monkeypatch.setattr(
         supplier_response_repo, "lookup_workflow_for_unique", lambda **_: None
@@ -774,6 +793,11 @@ def test_store_response_aligns_workflow_with_dispatch(monkeypatch):
         workflow_email_tracking_repo,
         "lookup_workflow_for_unique",
         lambda **_: canonical_workflow,
+    )
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_row",
+        lambda **_: None,
     )
 
     monkeypatch.setattr(
@@ -815,6 +839,11 @@ def test_store_response_aligns_workflow_with_existing_record(monkeypatch):
         "lookup_workflow_for_unique",
         lambda **_: None,
     )
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_row",
+        lambda **_: None,
+    )
 
     monkeypatch.setattr(
         supplier_response_repo,
@@ -850,6 +879,11 @@ def test_store_response_realigns_existing_unique_ids(monkeypatch):
     monkeypatch.setattr(
         workflow_email_tracking_repo,
         "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_row",
         lambda **_: None,
     )
     monkeypatch.setattr(
