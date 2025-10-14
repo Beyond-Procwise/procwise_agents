@@ -6,7 +6,7 @@ import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from types import SimpleNamespace
 
 import pytest
@@ -963,6 +963,116 @@ def test_poll_collects_only_when_all_responses_present(monkeypatch):
     assert metadata_calls == ["wf-bulk", "wf-bulk", "wf-bulk"]
     assert {row["unique_id"] for row in complete} == {"uid-1", "uid-2"}
     assert [row["unique_id"] for row in complete] == ["uid-1", "uid-2"]
+
+
+def test_await_responses_respects_unique_filter(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+    agent.WORKFLOW_POLL_INTERVAL_SECONDS = 0
+
+    base_time = datetime.fromtimestamp(0)
+    dispatch_rows = [
+        SimpleNamespace(
+            unique_id="uid-1",
+            supplier_id="SUP-1",
+            dispatched_at=base_time,
+            message_id="m1",
+        ),
+        SimpleNamespace(
+            unique_id="uid-2",
+            supplier_id="SUP-2",
+            dispatched_at=base_time,
+            message_id="m2",
+        ),
+        SimpleNamespace(
+            unique_id="uid-3",
+            supplier_id="SUP-3",
+            dispatched_at=base_time,
+            message_id="m3",
+        ),
+    ]
+
+    metadata = {
+        "rows": dispatch_rows,
+        "last_dispatched_at": base_time,
+        "unique_ids": [row.unique_id for row in dispatch_rows],
+    }
+
+    metadata_calls: List[str] = []
+
+    def fake_metadata(workflow_id):
+        assert workflow_id == "wf-subset"
+        metadata_calls.append(workflow_id)
+        return metadata
+
+    agent._load_dispatch_metadata = fake_metadata  # type: ignore[assignment]
+
+    pending_response = {
+        "workflow_id": "wf-subset",
+        "unique_id": "uid-2",
+        "supplier_id": "SUP-2",
+        "response_text": "Quote 2",
+        "subject": "Re: Quote-20240101-BBB22222",
+        "message_id": "m2",
+        "from_addr": "two@example.com",
+        "received_time": datetime.fromtimestamp(25),
+    }
+
+    count_calls: List[Dict[str, Any]] = []
+    fetch_calls: List[str] = []
+
+    def fake_count_pending(
+        *,
+        workflow_id: str,
+        unique_ids: Optional[Sequence[str]] = None,
+        supplier_ids: Optional[Sequence[str]] = None,
+        include_processed: bool,
+    ) -> int:
+        count_calls.append(
+            {
+                "workflow_id": workflow_id,
+                "unique_ids": tuple(unique_ids or ()),
+                "supplier_ids": tuple(supplier_ids or ()),
+                "include_processed": include_processed,
+            }
+        )
+        assert workflow_id == "wf-subset"
+        assert include_processed is True
+        assert supplier_ids in (None, (), [])
+        assert unique_ids is not None
+        assert set(unique_ids) == {"uid-2"}
+        return 1
+
+    def fake_fetch_pending(*, workflow_id: str, **_kwargs):
+        fetch_calls.append(workflow_id)
+        assert workflow_id == "wf-subset"
+        return [pending_response]
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
+        fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
+        lambda: None,
+    )
+
+    results = agent._await_supplier_response_rows(
+        "wf-subset",
+        unique_filter={"uid-2"},
+        timeout=1,
+        poll_interval=0,
+    )
+
+    assert len(results) == 1
+    assert results[0]["unique_id"] == "uid-2"
+    assert len(count_calls) == 1
+    assert len(fetch_calls) == 1
+    assert metadata_calls == ["wf-subset"]
 
 
 def test_await_all_responses_processes_parallel_results(monkeypatch):
