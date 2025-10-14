@@ -373,7 +373,7 @@ class SupplierInteractionAgent(BaseAgent):
                 else:
                     time.sleep(interval)
             else:
-                time.sleep(0)
+                break
 
         logger.info(
             "Timed out waiting for supplier responses for workflow=%s", workflow_id
