@@ -338,13 +338,44 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return []
 
-        while True:
-            response_total = supplier_response_repo.count_pending(
-                workflow_id=workflow_id,
-                include_processed=True,
+        await_total: Optional[int] = None
+        if supplier_filter or unique_filter:
+            expectations = self._prepare_response_expectations(
+                metadata,
+                supplier_filter=supplier_filter,
+                unique_filter=unique_filter,
             )
+            expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
+            expected_suppliers: Set[str] = expectations["expected_suppliers"]
+            normalised_unique_filter: Optional[Set[str]] = expectations[
+                "normalised_unique_filter"
+            ]
+            normalised_supplier_filter: Optional[Set[str]] = expectations[
+                "normalised_supplier_filter"
+            ]
 
-            if response_total >= dispatch_total:
+            if expected_unique_ids:
+                await_total = len(expected_unique_ids)
+            elif expected_suppliers:
+                await_total = len(expected_suppliers)
+            elif normalised_unique_filter:
+                await_total = len(normalised_unique_filter)
+            elif normalised_supplier_filter:
+                await_total = len(normalised_supplier_filter)
+            else:
+                await_total = 0
+        else:
+            await_total = dispatch_total
+
+        if await_total is not None and await_total <= 0:
+            logger.info(
+                "No dispatched emails matched the supplied filters for workflow=%s; nothing to await",
+                workflow_id,
+            )
+            return []
+
+        while True:
+            if await_total is None:
                 rows = self._poll_supplier_response_rows(
                     workflow_id,
                     supplier_filter=supplier_filter,
@@ -352,14 +383,29 @@ class SupplierInteractionAgent(BaseAgent):
                     metadata=metadata,
                 )
                 if rows:
-                    if response_total > dispatch_total:
-                        logger.debug(
-                            "Response count %s exceeds dispatched total %s for workflow=%s; proceeding",
-                            response_total,
-                            dispatch_total,
-                            workflow_id,
-                        )
                     return self._process_responses_concurrently(rows)
+            else:
+                response_total = supplier_response_repo.count_pending(
+                    workflow_id=workflow_id,
+                    include_processed=True,
+                )
+
+                if response_total >= await_total:
+                    rows = self._poll_supplier_response_rows(
+                        workflow_id,
+                        supplier_filter=supplier_filter,
+                        unique_filter=unique_filter,
+                        metadata=metadata,
+                    )
+                    if rows:
+                        if response_total > await_total:
+                            logger.debug(
+                                "Response count %s exceeds dispatched total %s for workflow=%s; proceeding",
+                                response_total,
+                                await_total,
+                                workflow_id,
+                            )
+                        return self._process_responses_concurrently(rows)
 
             if deadline is not None and time.monotonic() >= deadline:
                 break
