@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -64,6 +65,24 @@ def _prepare_scheduler(monkeypatch, nick, endpoint=None):
             lambda self: endpoint,
         )
     return backend_scheduler.BackendScheduler(nick, training_endpoint=endpoint)
+
+
+def _spawn_scheduler(monkeypatch, settings):
+    backend_scheduler.BackendScheduler._instance = None
+    monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: None)
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_init_relationship_scheduler",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "start",
+        lambda self: None,
+    )
+    monkeypatch.setattr(backend_scheduler, "EmailWatcherService", DummyEmailWatcher)
+    nick = SimpleNamespace(settings=settings)
+    return backend_scheduler.BackendScheduler(nick)
 
 
 def test_submit_once_executes_and_removes_job(monkeypatch):
@@ -172,6 +191,64 @@ def test_resolve_training_endpoint_creates_instance(monkeypatch):
     from services.model_training_endpoint import ModelTrainingEndpoint
 
     assert isinstance(endpoint, ModelTrainingEndpoint)
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
+
+def test_training_scheduler_skips_job_when_setting_missing(monkeypatch):
+    scheduler = _spawn_scheduler(monkeypatch, SimpleNamespace())
+
+    job_name = backend_scheduler.BackendScheduler.TRAINING_JOB_NAME
+    assert job_name not in scheduler._jobs
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
+
+def test_training_scheduler_registers_job_when_enabled(monkeypatch):
+    scheduler = _spawn_scheduler(
+        monkeypatch, SimpleNamespace(enable_training_scheduler=True)
+    )
+
+    job_name = backend_scheduler.BackendScheduler.TRAINING_JOB_NAME
+    assert job_name in scheduler._jobs
+    assert scheduler._jobs[job_name].interval == timedelta(hours=6)
+
+    scheduler.stop()
+    backend_scheduler.BackendScheduler._instance = None
+
+
+def test_training_scheduler_reconfigures_on_ensure(monkeypatch):
+    backend_scheduler.BackendScheduler._instance = None
+    monkeypatch.setattr(backend_scheduler, "configure_gpu", lambda: None)
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "_init_relationship_scheduler",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        backend_scheduler.BackendScheduler,
+        "start",
+        lambda self: None,
+    )
+    monkeypatch.setattr(backend_scheduler, "EmailWatcherService", DummyEmailWatcher)
+
+    scheduler = backend_scheduler.BackendScheduler.ensure(
+        SimpleNamespace(settings=SimpleNamespace())
+    )
+    job_name = backend_scheduler.BackendScheduler.TRAINING_JOB_NAME
+    assert job_name not in scheduler._jobs
+
+    scheduler = backend_scheduler.BackendScheduler.ensure(
+        SimpleNamespace(settings=SimpleNamespace(enable_training_scheduler=True))
+    )
+    assert job_name in scheduler._jobs
+
+    scheduler = backend_scheduler.BackendScheduler.ensure(
+        SimpleNamespace(settings=SimpleNamespace(enable_training_scheduler=False))
+    )
+    assert job_name not in scheduler._jobs
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None

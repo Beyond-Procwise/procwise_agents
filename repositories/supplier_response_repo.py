@@ -191,6 +191,28 @@ def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
         cur.close()
 
 
+def align_workflow_assignments(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
+    """Ensure the provided unique identifiers are attached to the workflow."""
+
+    identifiers: List[str] = []
+    for uid in unique_ids:
+        if uid in (None, ""):
+            continue
+        identifiers.append(str(uid))
+    if not identifiers:
+        return
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "UPDATE proc.supplier_response "
+            "SET workflow_id=%s "
+            "WHERE unique_id = ANY(%s) AND workflow_id <> %s"
+        )
+        cur.execute(q, (workflow_id, identifiers, workflow_id))
+        cur.close()
+
+
 def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
@@ -229,6 +251,28 @@ def reset_workflow(*, workflow_id: str) -> None:
         cur = conn.cursor()
         cur.execute("DELETE FROM proc.supplier_response WHERE workflow_id=%s", (workflow_id,))
         cur.close()
+
+
+def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
+    if not unique_id:
+        return None
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id "
+            "FROM proc.supplier_response "
+            "WHERE unique_id=%s "
+            "ORDER BY created_at DESC "
+            "LIMIT 1"
+        )
+        cur.execute(q, (unique_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        workflow_id = row[0]
+        return workflow_id or None
 
 
 def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:

@@ -215,6 +215,22 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
         return rows
 
 
+def load_workflow_unique_ids(*, workflow_id: str) -> List[str]:
+    """Return unique identifiers associated with the workflow's dispatches."""
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT unique_id FROM proc.workflow_email_tracking WHERE workflow_id=%s",
+            (workflow_id,),
+        )
+        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        cur.close()
+        return rows
+
+
 def mark_response(
     *,
     workflow_id: str,
@@ -241,3 +257,27 @@ def reset_workflow(*, workflow_id: str) -> None:
         cur = conn.cursor()
         cur.execute("DELETE FROM proc.workflow_email_tracking WHERE workflow_id=%s", (workflow_id,))
         cur.close()
+
+
+def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
+    if not unique_id:
+        return None
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id "
+            "FROM proc.workflow_email_tracking "
+            "WHERE unique_id=%s "
+            "ORDER BY dispatched_at DESC NULLS LAST "
+            "LIMIT 1"
+        )
+        cur.execute(q, (unique_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        workflow_id = row[0]
+        return workflow_id or None

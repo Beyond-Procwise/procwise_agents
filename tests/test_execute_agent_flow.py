@@ -17,6 +17,23 @@ class EchoAgent:
         return AgentOutput(status=AgentStatus.SUCCESS, data={"result": context.input_data.get("number")})
 
 
+class ExplodingTrainingEndpoint:
+    def __init__(self):
+        self.called = False
+
+    def configure_capture(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("Training endpoint should not be touched during workflow execution")
+
+    def get_service(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("Training endpoint should not be touched during workflow execution")
+
+    def __getattr__(self, _name):
+        self.called = True
+        raise AssertionError("Training endpoint should not be touched during workflow execution")
+
+
 def test_json_flow_executes_steps_with_context_mapping():
     agent = EchoAgent()
     nick = SimpleNamespace(
@@ -712,17 +729,12 @@ def test_execute_workflow_never_initialises_training_service():
         )
 
         orchestrator = Orchestrator(nick)
-        called = False
-
-        def fake_training():
-            nonlocal called
-            called = True
-
-        orchestrator._get_model_training_service = fake_training
+        endpoint = ExplodingTrainingEndpoint()
+        orchestrator.model_training_endpoint = endpoint
 
         orchestrator.execute_workflow("generic", {})
 
-        assert called is False
+        assert endpoint.called is False
 
 
 def test_execute_legacy_flow_injects_workflow_metadata():
@@ -989,7 +1001,7 @@ def test_json_flow_uses_flow_level_workflow_hint():
     assert captured["input"]["workflow"] == "price_variance_check"
 
 
-def test_execute_workflow_skips_training_for_failed_result(monkeypatch):
+def test_execute_workflow_does_not_trigger_training_for_failed_result(monkeypatch):
     class AllowAllPolicy:
         def validate_workflow(self, *_, **__):
             return {"allowed": True}
@@ -1008,25 +1020,20 @@ def test_execute_workflow_skips_training_for_failed_result(monkeypatch):
     )
 
     orchestrator = Orchestrator(nick)
-    orchestrator.model_training_endpoint = object()
-
-    called = {"value": False}
-
-    def fake_trigger(self, workflow_name: str) -> None:
-        called["value"] = True
+    endpoint = ExplodingTrainingEndpoint()
+    orchestrator.model_training_endpoint = endpoint
 
     def fake_generic(self, workflow_name: str, context: AgentContext) -> Dict[str, Any]:
         return {"status": 0, "ctx": {"errors": {"step": "boom"}}}
 
-    monkeypatch.setattr(Orchestrator, "_trigger_automatic_training", fake_trigger)
     monkeypatch.setattr(Orchestrator, "_execute_generic_workflow", fake_generic)
 
     orchestrator.execute_workflow("generic", {})
 
-    assert called["value"] is False
+    assert endpoint.called is False
 
 
-def test_execute_workflow_triggers_training_after_success(monkeypatch):
+def test_execute_workflow_does_not_trigger_training_for_success(monkeypatch):
     class AllowAllPolicy:
         def validate_workflow(self, *_, **__):
             return {"allowed": True}
@@ -1045,20 +1052,15 @@ def test_execute_workflow_triggers_training_after_success(monkeypatch):
     )
 
     orchestrator = Orchestrator(nick)
-    orchestrator.model_training_endpoint = object()
-
-    called = {"value": False}
-
-    def fake_trigger(self, workflow_name: str) -> None:
-        called["value"] = True
+    endpoint = ExplodingTrainingEndpoint()
+    orchestrator.model_training_endpoint = endpoint
 
     def fake_generic(self, workflow_name: str, context: AgentContext) -> Dict[str, Any]:
         return {"status": 100, "ctx": {"errors": {}}}
 
-    monkeypatch.setattr(Orchestrator, "_trigger_automatic_training", fake_trigger)
     monkeypatch.setattr(Orchestrator, "_execute_generic_workflow", fake_generic)
 
     orchestrator.execute_workflow("generic", {})
 
-    assert called["value"] is True
+    assert endpoint.called is False
 
