@@ -561,6 +561,50 @@ class EmailWatcherV2:
         if not self.supplier_agent:
             processed_ids = [row.get("unique_id") for row in pending_rows if row.get("unique_id")]
         else:
+            poll_setting = getattr(
+                getattr(self.supplier_agent, "agent_nick", None),
+                "settings",
+                None,
+            )
+            poll_interval = getattr(poll_setting, "email_response_poll_seconds", 60)
+            timeout_setting = getattr(poll_setting, "email_response_timeout_seconds", 900)
+
+            wait_context = AgentContext(
+                workflow_id=tracker.workflow_id,
+                agent_id="EmailWatcherV2",
+                user_id="system",
+                input_data={
+                    "action": "await_workflow_batch",
+                    "workflow_id": tracker.workflow_id,
+                    "response_poll_interval": poll_interval,
+                    "response_timeout": timeout_setting,
+                },
+            )
+
+            try:
+                wait_result: AgentOutput = self.supplier_agent.execute(wait_context)
+            except Exception:
+                logger.exception(
+                    "SupplierInteractionAgent batch wait failed for workflow %s",
+                    tracker.workflow_id,
+                )
+                return
+
+            if not (
+                isinstance(wait_result, AgentOutput)
+                and wait_result.status == AgentStatus.SUCCESS
+                and wait_result.data.get("batch_ready")
+            ):
+                logger.debug(
+                    "Supplier responses not ready for workflow %s; deferring negotiation",
+                    tracker.workflow_id,
+                )
+                return
+
+            pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
+            if not pending_rows:
+                return
+
             for row in pending_rows:
                 matched_response = tracker.matched_responses.get(row.get("unique_id"))
                 context = AgentContext(

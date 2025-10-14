@@ -1485,3 +1485,110 @@ def test_store_response_realigns_existing_unique_ids(monkeypatch):
     assert align_calls["workflow_id"] == "wf-canonical"
     assert set(align_calls["unique_ids"]) == {"uniq-alpha", "uniq-beta", "uniq-gamma"}
     assert captured["row"].workflow_id == "wf-canonical"
+
+
+def test_run_await_workflow_batch(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    metadata = {
+        "rows": [
+            SimpleNamespace(
+                workflow_id="wf-batch",
+                unique_id="uid-1",
+                supplier_id="SUP-1",
+                dispatched_at=datetime.fromtimestamp(0),
+                message_id="m1",
+            ),
+            SimpleNamespace(
+                workflow_id="wf-batch",
+                unique_id="uid-2",
+                supplier_id="SUP-2",
+                dispatched_at=datetime.fromtimestamp(0),
+                message_id="m2",
+            ),
+        ],
+        "last_dispatched_at": datetime.fromtimestamp(0),
+        "unique_ids": ["uid-1", "uid-2"],
+    }
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
+        lambda: None,
+    )
+
+    count_sequence = deque([1, 2])
+
+    def fake_count_pending(*, workflow_id, include_processed=False, **_kwargs):
+        assert include_processed is False
+        if count_sequence:
+            return count_sequence.popleft()
+        return 2
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count_pending,
+    )
+
+    def fake_fetch_pending(*, workflow_id, include_processed=False):
+        assert include_processed is False
+        return [
+            {
+                "workflow_id": workflow_id,
+                "unique_id": "uid-1",
+                "supplier_id": "SUP-1",
+                "response_text": "Quote A",
+                "subject": "Re: RFQ-1",
+                "message_id": "m1",
+                "from_addr": "one@example.com",
+                "received_time": datetime.fromtimestamp(0),
+            },
+            {
+                "workflow_id": workflow_id,
+                "unique_id": "uid-2",
+                "supplier_id": "SUP-2",
+                "response_text": "Quote B",
+                "subject": "Re: RFQ-2",
+                "message_id": "m2",
+                "from_addr": "two@example.com",
+                "received_time": datetime.fromtimestamp(1),
+            },
+        ]
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
+        fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.lookup_workflow_for_unique",
+        lambda **_: "wf-batch",
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.lookup_workflow_for_unique",
+        lambda **_: "wf-batch",
+    )
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
+
+    context = AgentContext(
+        workflow_id="wf-batch",
+        agent_id="supplier_interaction",
+        user_id="tester",
+        input_data={
+            "action": "await_workflow_batch",
+            "workflow_id": "wf-batch",
+            "response_poll_interval": 1,
+            "response_timeout": 5,
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["batch_ready"] is True
+    assert output.data["expected_responses"] == 2
+    assert output.data["collected_responses"] == 2
+    assert {resp.get("unique_id") for resp in output.data["supplier_responses"]} == {
+        "uid-1",
+        "uid-2",
+    }
