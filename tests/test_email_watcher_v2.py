@@ -10,6 +10,8 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agents.base_agent import AgentOutput, AgentStatus
+from decimal import Decimal
+
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2
 from utils.email_tracking import (
@@ -134,3 +136,106 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
 
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []
+
+    stored = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(stored) == 1
+    record = stored[0]
+    assert record["processed"] is True
+    assert "Thanks for the opportunity" in record["response_text"]
+    assert record["response_message_id"] == "<reply-001>"
+    assert (
+        str(record.get("original_message_id", ""))
+        .replace("<", "")
+        .replace(">", "")
+        == str(original_message_id).replace("<", "").replace(">", "")
+    )
+    confidence = record.get("match_confidence")
+    if confidence is not None:
+        assert Decimal(str(confidence)) >= Decimal("0.50")
+
+
+def test_email_watcher_v2_persists_thread_headers_between_instances():
+    workflow_id = "wf-restart"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    now = datetime.now(timezone.utc)
+    original_subject = "RFQ 1234"
+    original_message_id = "msg-root"
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=lambda since: [],
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": "uid-123",
+                "supplier_id": "sup-1",
+                "supplier_email": "supplier@example.com",
+                "message_id": original_message_id,
+                "subject": original_subject,
+                "dispatched_at": now,
+                "thread_headers": {
+                    "references": ["thread-1", original_message_id],
+                    "in_reply_to": [original_message_id],
+                },
+            }
+        ],
+    )
+
+    stored_rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
+    assert stored_rows[0].thread_headers
+    assert original_message_id in stored_rows[0].thread_headers.get("in_reply_to", ())
+
+    responses = [
+        EmailResponse(
+            unique_id=None,
+            supplier_id="sup-1",
+            supplier_email="supplier@example.com",
+            from_address="supplier@example.com",
+            message_id="reply-1",
+            subject=f"Re: {original_subject}",
+            body="Hello",
+            received_at=now + timedelta(minutes=10),
+            in_reply_to=(original_message_id,),
+            references=("thread-1",),
+        )
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    restart_watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    result = restart_watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["responded_count"] == 1
+    assert result["matched_responses"]
+    matched = next(iter(result["matched_responses"].values()))
+    assert matched.message_id == "reply-1"

@@ -79,11 +79,21 @@ class _FakeCursor:
             (
                 workflow_id,
                 supplier_id,
+                supplier_email,
                 unique_id,
                 response_text,
+                response_body,
+                response_message_id,
+                response_subject,
+                response_from,
+                response_date,
+                original_message_id,
+                original_subject,
+                match_confidence,
                 price,
                 lead_time,
                 received_time,
+                processed,
             ) = params
             self._store.upsert_supplier_response(
                 workflow_id,
@@ -91,37 +101,61 @@ class _FakeCursor:
                 {
                     "workflow_id": workflow_id,
                     "supplier_id": supplier_id,
+                    "supplier_email": supplier_email,
                     "unique_id": unique_id,
                     "response_text": response_text,
+                    "response_body": response_body,
+                    "response_message_id": response_message_id,
+                    "response_subject": response_subject,
+                    "response_from": response_from,
+                    "response_date": response_date,
+                    "original_message_id": original_message_id,
+                    "original_subject": original_subject,
+                    "match_confidence": match_confidence,
                     "price": price,
                     "lead_time": lead_time,
                     "received_time": received_time,
+                    "processed": processed,
                 },
             )
             return
 
+        if upper_stmt.startswith("UPDATE PROC.SUPPLIER_RESPONSE SET PROCESSED"):
+            workflow_id, ids = params
+            self._store.mark_supplier_responses_processed(workflow_id, list(ids))
+            return
+
         if upper_stmt.startswith("DELETE FROM PROC.SUPPLIER_RESPONSE"):
-            if "UNIQUE_ID = ANY" in upper_stmt:
-                workflow_id, ids = params
-                self._store.delete_supplier_responses(workflow_id, list(ids))
-            else:
-                (workflow_id,) = params
-                self._store.delete_supplier_responses(workflow_id, None)
+            (workflow_id,) = params
+            self._store.delete_supplier_responses(workflow_id, None)
             return
 
         if upper_stmt.startswith("SELECT WORKFLOW_ID, SUPPLIER_ID") and (
             "FROM PROC.SUPPLIER_RESPONSE" in upper_stmt
         ):
             (workflow_id,) = params
-            rows = self._store.fetch_supplier_responses(workflow_id)
+            pending_only = "COALESCE(PROCESSED" in upper_stmt
+            rows = self._store.fetch_supplier_responses(
+                workflow_id, pending_only=pending_only
+            )
             columns = [
                 "workflow_id",
                 "supplier_id",
+                "supplier_email",
                 "unique_id",
                 "response_text",
+                "response_body",
+                "response_message_id",
+                "response_subject",
+                "response_from",
+                "response_date",
+                "original_message_id",
+                "original_subject",
+                "match_confidence",
                 "price",
                 "lead_time",
                 "received_time",
+                "processed",
             ]
             self.description = [
                 _ColumnDescriptor(col) for col in columns
@@ -145,6 +179,7 @@ class _FakeCursor:
                 responded_at,
                 response_message_id,
                 matched,
+                thread_headers,
             ) = params
             self._store.upsert_workflow_tracking(
                 workflow_id,
@@ -160,6 +195,7 @@ class _FakeCursor:
                     "responded_at": responded_at,
                     "response_message_id": response_message_id,
                     "matched": matched,
+                    "thread_headers": thread_headers,
                 },
             )
             return
@@ -186,6 +222,7 @@ class _FakeCursor:
                 "responded_at",
                 "response_message_id",
                 "matched",
+                "thread_headers",
             ]
             self.description = [
                 _ColumnDescriptor(col) for col in columns
@@ -231,11 +268,21 @@ class _FakePostgresStore:
             "proc.supplier_response": {
                 "workflow_id",
                 "supplier_id",
+                "supplier_email",
                 "unique_id",
                 "response_text",
+                "response_body",
+                "response_message_id",
+                "response_subject",
+                "response_from",
+                "response_date",
+                "original_message_id",
+                "original_subject",
+                "match_confidence",
                 "price",
                 "lead_time",
                 "received_time",
+                "processed",
             },
             "proc.workflow_email_tracking": {
                 "workflow_id",
@@ -249,6 +296,7 @@ class _FakePostgresStore:
                 "response_message_id",
                 "matched",
                 "created_at",
+                "thread_headers",
             },
         }
         return column in columns.get(full_table, set())
@@ -265,6 +313,18 @@ class _FakePostgresStore:
                 return
         table.append(dict(row))
 
+    def mark_supplier_responses_processed(
+        self, workflow_id: str, unique_ids: Optional[List[str]]
+    ) -> None:
+        self.ensure_tables()
+        table = self.supplier_response  # type: ignore[attr-defined]
+        ids = set(unique_ids or [])
+        for row in table:
+            if row["workflow_id"] != workflow_id:
+                continue
+            if unique_ids is None or row["unique_id"] in ids:
+                row["processed"] = True
+
     def delete_supplier_responses(
         self, workflow_id: str, unique_ids: Optional[List[str]]
     ) -> None:
@@ -275,19 +335,28 @@ class _FakePostgresStore:
                 row for row in table if row["workflow_id"] != workflow_id
             ]
         else:
+            ids = set(unique_ids)
             self.supplier_response = [
                 row
                 for row in table
                 if not (
-                    row["workflow_id"] == workflow_id
-                    and row["unique_id"] in set(unique_ids)
+                    row["workflow_id"] == workflow_id and row["unique_id"] in ids
                 )
             ]
 
-    def fetch_supplier_responses(self, workflow_id: str) -> List[Dict[str, Any]]:
+    def fetch_supplier_responses(
+        self, workflow_id: str, *, pending_only: bool
+    ) -> List[Dict[str, Any]]:
         self.ensure_tables()
         table = self.supplier_response  # type: ignore[attr-defined]
-        return [row.copy() for row in table if row["workflow_id"] == workflow_id]
+        results = []
+        for row in table:
+            if row["workflow_id"] != workflow_id:
+                continue
+            if pending_only and row.get("processed"):
+                continue
+            results.append(row.copy())
+        return results
 
     # -- workflow tracking operations ------------------------------------
     def upsert_workflow_tracking(
