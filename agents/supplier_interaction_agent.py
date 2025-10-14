@@ -368,15 +368,27 @@ class SupplierInteractionAgent(BaseAgent):
 
         metadata: Optional[Dict[str, Any]] = None
         attempts = 0
-        max_attempts = 5 if interval > 0 else 1
-        while attempts < max_attempts:
+        max_attempts_without_deadline = 5 if interval > 0 else 1
+        while True:
             metadata = self._load_dispatch_metadata(workflow_id)
             if metadata is not None:
                 break
-            attempts += 1
-            if attempts >= max_attempts:
-                break
-            sleep_window = min(interval, 1.0) if interval > 0 else 0
+
+            now = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - now
+                if remaining <= 0:
+                    break
+                if interval > 0:
+                    sleep_window = min(interval, remaining, 1.0)
+                else:
+                    sleep_window = max(0.0, min(remaining, 1.0))
+            else:
+                attempts += 1
+                if attempts >= max_attempts_without_deadline:
+                    break
+                sleep_window = min(interval, 1.0) if interval > 0 else 0
+
             if sleep_window > 0:
                 time.sleep(sleep_window)
             else:
