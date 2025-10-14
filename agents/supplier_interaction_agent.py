@@ -1889,6 +1889,31 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return
 
+        unique_candidates: Set[str] = {unique_key}
+        try:
+            workflow_unique_ids = workflow_email_tracking_repo.load_workflow_unique_ids(
+                workflow_id=workflow_key
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to load workflow dispatch identifiers for workflow=%s", workflow_key
+            )
+            workflow_unique_ids = []
+
+        for candidate in workflow_unique_ids:
+            coerced = self._coerce_text(candidate)
+            if coerced:
+                unique_candidates.add(coerced)
+
+        try:
+            supplier_response_repo.align_workflow_assignments(
+                workflow_id=workflow_key, unique_ids=unique_candidates
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to realign supplier responses for workflow=%s", workflow_key
+            )
+
         resolved_supplier = supplier_id
         if not resolved_supplier and rfq_id:
             resolved_supplier = self._resolve_supplier_id(

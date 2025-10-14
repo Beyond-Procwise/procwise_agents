@@ -141,6 +141,9 @@ class Settings(BaseSettings):
 
     # Learning and optimization
     enable_learning: bool = Field(default=False, env="ENABLE_LEARNING")
+    enable_training_scheduler: bool = Field(
+        default=False, env="ENABLE_TRAINING_SCHEDULER"
+    )
     verbose_agent_debug: bool = Field(
         default=False, env="VERBOSE_AGENT_DEBUG"
     )

@@ -191,6 +191,28 @@ def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
         cur.close()
 
 
+def align_workflow_assignments(*, workflow_id: str, unique_ids: Iterable[str]) -> None:
+    """Ensure the provided unique identifiers are attached to the workflow."""
+
+    identifiers: List[str] = []
+    for uid in unique_ids:
+        if uid in (None, ""):
+            continue
+        identifiers.append(str(uid))
+    if not identifiers:
+        return
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "UPDATE proc.supplier_response "
+            "SET workflow_id=%s "
+            "WHERE unique_id = ANY(%s) AND workflow_id <> %s"
+        )
+        cur.execute(q, (workflow_id, identifiers, workflow_id))
+        cur.close()
+
+
 def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()

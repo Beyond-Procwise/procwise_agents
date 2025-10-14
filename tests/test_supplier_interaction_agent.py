@@ -840,3 +840,59 @@ def test_store_response_aligns_workflow_with_existing_record(monkeypatch):
 
     assert "row" in captured
     assert captured["row"].workflow_id == stored_workflow
+
+
+def test_store_response_realigns_existing_unique_ids(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+
+    dispatched_ids = ["uniq-alpha", "uniq-beta", None, "  "]
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "load_workflow_unique_ids",
+        lambda **_: dispatched_ids,
+    )
+
+    align_calls: Dict[str, Any] = {}
+
+    def fake_align(*, workflow_id: str, unique_ids):
+        align_calls["workflow_id"] = workflow_id
+        align_calls["unique_ids"] = list(unique_ids)
+
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "align_workflow_assignments",
+        fake_align,
+    )
+
+    captured: Dict[str, SupplierResponseRow] = {}
+
+    def fake_insert(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
+
+    agent._store_response(
+        "wf-canonical",
+        "SUP-007",
+        "Body",
+        {"price": None, "lead_time": None},
+        unique_id="uniq-gamma",
+        message_id="msg-999",
+    )
+
+    assert align_calls["workflow_id"] == "wf-canonical"
+    assert set(align_calls["unique_ids"]) == {"uniq-alpha", "uniq-beta", "uniq-gamma"}
+    assert captured["row"].workflow_id == "wf-canonical"

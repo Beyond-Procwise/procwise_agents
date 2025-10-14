@@ -42,6 +42,7 @@ class BackendScheduler:
     _instance: Optional["BackendScheduler"] = None
     _instance_lock = threading.Lock()
     _poll_seconds: float = 60.0
+    TRAINING_JOB_NAME = "context-training-dispatch"
 
     def __init__(
         self,
@@ -89,11 +90,13 @@ class BackendScheduler:
         if self.agent_nick is agent_nick:
             if training_endpoint is not None:
                 self._training_endpoint = training_endpoint
+            self._sync_training_job()
             return
         self.agent_nick = agent_nick
         self._relationship_scheduler = self._init_relationship_scheduler()
         if training_endpoint is not None:
             self._training_endpoint = training_endpoint
+        self._sync_training_job()
 
     def start(self) -> None:
         with self._lock:
@@ -159,13 +162,28 @@ class BackendScheduler:
         )
 
     def _register_default_jobs(self) -> None:
-        training_delay = timedelta(minutes=15)
-        self.register_job(
-            "context-training-dispatch",
-            self._run_model_training,
-            interval=timedelta(hours=6),
-            initial_delay=training_delay,
-        )
+        self._sync_training_job()
+
+    def _training_scheduler_enabled(self) -> bool:
+        settings = getattr(self.agent_nick, "settings", None)
+        return bool(getattr(settings, "enable_training_scheduler", False))
+
+    def _sync_training_job(self) -> None:
+        should_schedule = self._training_scheduler_enabled()
+        has_job = self.TRAINING_JOB_NAME in self._jobs
+
+        if should_schedule and not has_job:
+            logger.info("Training scheduler enabled; registering automatic dispatch job")
+            training_delay = timedelta(minutes=15)
+            self.register_job(
+                self.TRAINING_JOB_NAME,
+                self._run_model_training,
+                interval=timedelta(hours=6),
+                initial_delay=training_delay,
+            )
+        elif not should_schedule and has_job:
+            logger.info("Training scheduler disabled; removing automatic dispatch job")
+            self._deregister_job(self.TRAINING_JOB_NAME)
 
     def _ensure_email_watcher_service(self) -> EmailWatcherService:
         with self._email_watcher_lock:

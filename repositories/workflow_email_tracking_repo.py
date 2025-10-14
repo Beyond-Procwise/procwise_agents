@@ -215,6 +215,22 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
         return rows
 
 
+def load_workflow_unique_ids(*, workflow_id: str) -> List[str]:
+    """Return unique identifiers associated with the workflow's dispatches."""
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT unique_id FROM proc.workflow_email_tracking WHERE workflow_id=%s",
+            (workflow_id,),
+        )
+        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        cur.close()
+        return rows
+
+
 def mark_response(
     *,
     workflow_id: str,
