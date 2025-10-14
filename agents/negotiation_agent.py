@@ -3,7 +3,9 @@ import logging
 import math
 import os
 import re
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -70,6 +72,33 @@ MAX_VOLUME_LIMIT = float(os.getenv("NEG_MAX_VOLUME_LIMIT", "1000"))
 MAX_TERM_DAYS = int(os.getenv("NEG_MAX_TERM_DAYS", "120"))
 
 DEFAULT_NEGOTIATION_MESSAGE_TEMPLATE = "{header}\n{details}{context_sections}"
+
+BATCH_INPUT_KEYS = ("negotiation_batch", "supplier_responses_batch", "batch_responses")
+BATCH_SHARED_KEYS = (
+    "shared_context",
+    "shared_payload",
+    "batch_defaults",
+    "shared_fields",
+    "defaults",
+)
+BATCH_EXCLUDE_KEYS = {
+    "negotiation_batch",
+    "supplier_responses_batch",
+    "batch_responses",
+    "shared_context",
+    "shared_payload",
+    "batch_defaults",
+    "shared_fields",
+    "defaults",
+    "batch_metadata",
+    "batch_results",
+    "batch_summary",
+    "agentic_plan",
+    "pass_fields",
+    "results",
+    "drafts",
+    "supplier_responses",
+}
 
 
 @dataclass
@@ -242,9 +271,268 @@ class NegotiationAgent(BaseAgent):
         self._supplier_agent: Optional["SupplierInteractionAgent"] = None
         self._state_schema_checked = False
         self._playbook_cache: Optional[Dict[str, Any]] = None
+        self._state_lock = threading.RLock()
+        self._email_agent_lock = threading.Lock()
+        self._supplier_agent_lock = threading.Lock()
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
+
+        batch_entries, shared_context = self._extract_batch_inputs(context.input_data)
+        if batch_entries:
+            return self._run_batch_negotiations(context, batch_entries, shared_context)
+
+        return self._run_single_negotiation(context)
+
+    def _extract_batch_inputs(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return [], {}
+
+        batch: List[Dict[str, Any]] = []
+        for key in BATCH_INPUT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                batch = [entry for entry in value if isinstance(entry, dict)]
+                if batch:
+                    break
+
+        if not batch:
+            return [], {}
+
+        shared: Dict[str, Any] = {}
+        for key in BATCH_SHARED_KEYS:
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                shared.update(candidate)
+
+        return batch, shared
+
+    def _coerce_batch_defaults(
+        self, base_payload: Dict[str, Any], shared_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        defaults: Dict[str, Any] = {}
+        if isinstance(base_payload, dict):
+            for key, value in base_payload.items():
+                if key in BATCH_EXCLUDE_KEYS:
+                    continue
+                defaults[key] = value
+        if isinstance(shared_context, dict):
+            defaults.update(shared_context)
+        return defaults
+
+    def _prepare_batch_payload(
+        self, defaults: Dict[str, Any], entry: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if isinstance(defaults, dict):
+            payload.update(defaults)
+        payload.update(entry)
+        for key in BATCH_EXCLUDE_KEYS:
+            payload.pop(key, None)
+        supplier_id = payload.get("supplier_id") or payload.get("supplier")
+        if supplier_id is not None:
+            payload.setdefault("supplier_id", supplier_id)
+            payload.setdefault("supplier", supplier_id)
+        return payload
+
+    def _execute_batch_entry(
+        self, parent_context: AgentContext, payload: Dict[str, Any]
+    ) -> AgentOutput:
+        workflow_id = payload.get("workflow_id") or parent_context.workflow_id or "negotiation-batch"
+        user_id = payload.get("user_id") or parent_context.user_id or "system"
+        sub_context = AgentContext(
+            workflow_id=str(workflow_id),
+            agent_id=parent_context.agent_id,
+            user_id=str(user_id),
+            input_data=dict(payload),
+            parent_agent=parent_context.agent_id,
+            routing_history=list(parent_context.routing_history),
+        )
+        return self.execute(sub_context)
+
+    def _run_batch_negotiations(
+        self,
+        context: AgentContext,
+        batch_entries: List[Dict[str, Any]],
+        shared_context: Dict[str, Any],
+    ) -> AgentOutput:
+        defaults = self._coerce_batch_defaults(context.input_data, shared_context)
+        prepared_entries = [
+            self._prepare_batch_payload(defaults, entry) for entry in batch_entries if isinstance(entry, dict)
+        ]
+
+        if not prepared_entries:
+            empty_data = {
+                "negotiation_batch": True,
+                "results": [],
+                "drafts": [],
+                "successful_suppliers": [],
+                "failed_suppliers": [],
+            }
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=empty_data,
+                    pass_fields={"negotiation_batch": True, "batch_results": []},
+                ),
+            )
+
+        if len(prepared_entries) == 1:
+            try:
+                return self._execute_batch_entry(context, prepared_entries[0])
+            except Exception as exc:  # pragma: no cover - propagate as failure
+                logger.exception("NegotiationAgent batch execution failed", exc_info=True)
+                return self._with_plan(
+                    context,
+                    AgentOutput(
+                        status=AgentStatus.FAILED,
+                        data={
+                            "negotiation_batch": True,
+                            "results": [
+                                {
+                                    "supplier_id": prepared_entries[0].get("supplier_id"),
+                                    "rfq_id": prepared_entries[0].get("rfq_id"),
+                                    "status": AgentStatus.FAILED.value,
+                                    "error": str(exc),
+                                }
+                            ],
+                        },
+                        error=str(exc),
+                    ),
+                )
+
+        try:
+            configured_workers = getattr(self.agent_nick.settings, "negotiation_parallel_workers", None)
+            if configured_workers is not None:
+                try:
+                    max_workers = max(1, int(configured_workers))
+                except Exception:
+                    max_workers = None
+            else:
+                max_workers = None
+        except Exception:
+            max_workers = None
+
+        if not max_workers:
+            cpu_default = os.cpu_count() or 4
+            max_workers = min(len(prepared_entries), max(1, cpu_default))
+
+        futures: List[Tuple[Dict[str, Any], Any]] = []
+        aggregated_results: List[Dict[str, Any]] = []
+        drafts: List[Dict[str, Any]] = []
+        failed_records: List[Dict[str, Any]] = []
+        success_ids: List[str] = []
+        supplier_map: Dict[str, Dict[str, Any]] = {}
+        next_agents: Set[str] = set()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for payload in prepared_entries:
+                futures.append((payload, executor.submit(self._execute_batch_entry, context, payload)))
+
+            for payload, future in futures:
+                supplier_id = payload.get("supplier_id") or payload.get("supplier")
+                rfq_id = payload.get("rfq_id")
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive aggregation
+                    error_message = str(exc)
+                    record = {
+                        "supplier_id": supplier_id,
+                        "rfq_id": rfq_id,
+                        "status": AgentStatus.FAILED.value,
+                        "error": error_message,
+                    }
+                    aggregated_results.append(record)
+                    failed_records.append(record)
+                    continue
+
+                record = {
+                    "supplier_id": result.data.get("supplier")
+                    or supplier_id
+                    or payload.get("supplier_id"),
+                    "rfq_id": result.data.get("rfq_id") or rfq_id,
+                    "status": result.status.value,
+                    "output": result.data,
+                    "pass_fields": result.pass_fields,
+                    "next_agents": list(result.next_agents),
+                }
+                if result.error:
+                    record["error"] = result.error
+                if result.action_id:
+                    record["action_id"] = result.action_id
+
+                aggregated_results.append(record)
+
+                supplier_key = record.get("supplier_id")
+                if supplier_key:
+                    supplier_map[str(supplier_key)] = record
+
+                if result.status == AgentStatus.SUCCESS:
+                    if supplier_key:
+                        success_ids.append(str(supplier_key))
+                    result_drafts = result.data.get("drafts")
+                    if isinstance(result_drafts, list):
+                        for draft in result_drafts:
+                            if isinstance(draft, dict):
+                                drafts.append(draft)
+                    next_agents.update(result.next_agents)
+                else:
+                    failed_records.append(
+                        {
+                            "supplier_id": supplier_key,
+                            "rfq_id": record.get("rfq_id"),
+                            "status": record.get("status"),
+                            "error": record.get("error"),
+                        }
+                    )
+
+        any_success = any(record["status"] == AgentStatus.SUCCESS.value for record in aggregated_results)
+        any_failure = any(record["status"] != AgentStatus.SUCCESS.value for record in aggregated_results)
+
+        overall_status = AgentStatus.SUCCESS
+        error_text = None
+        if any_failure and not any_success:
+            overall_status = AgentStatus.FAILED
+            error_text = "All negotiation rounds failed"
+
+        if success_ids:
+            try:
+                success_ids = list(dict.fromkeys(success_ids))
+            except Exception:
+                success_ids = [sid for sid in success_ids if sid]
+
+        data = {
+            "negotiation_batch": True,
+            "results": aggregated_results,
+            "drafts": drafts,
+            "successful_suppliers": success_ids,
+            "failed_suppliers": failed_records,
+            "results_by_supplier": supplier_map,
+            "batch_size": len(aggregated_results),
+        }
+
+        pass_fields = {
+            "negotiation_batch": True,
+            "batch_results": aggregated_results,
+        }
+        if drafts:
+            pass_fields["drafts"] = drafts
+
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=overall_status,
+                data=data,
+                pass_fields=pass_fields,
+                next_agents=sorted(next_agents),
+                error=error_text,
+            ),
+        )
+
+    def _run_single_negotiation(self, context: AgentContext) -> AgentOutput:
 
         supplier = context.input_data.get("supplier") or context.input_data.get("supplier_id")
         rfq_id = context.input_data.get("rfq_id")
@@ -870,7 +1158,7 @@ class NegotiationAgent(BaseAgent):
         cache_key: Optional[Tuple[str, str]] = None
         if rfq_id and supplier:
             cache_key = (str(rfq_id), str(supplier))
-        cached_state = self._state_cache.get(cache_key) if cache_key else None
+        cached_state = self._get_cached_state(cache_key)
         public_state = self._public_state(cached_state or state)
         data = {
             "supplier": supplier,
@@ -1432,6 +1720,15 @@ class NegotiationAgent(BaseAgent):
             "awaiting_response": bool(state.get("awaiting_response", False)),
         }
 
+    def _get_cached_state(
+        self, cache_key: Optional[Tuple[str, str]]
+    ) -> Optional[Dict[str, Any]]:
+        if not cache_key:
+            return None
+        with self._state_lock:
+            cached = self._state_cache.get(cache_key)
+            return dict(cached) if isinstance(cached, dict) else None
+
     def _ensure_state_schema(self) -> None:
         if getattr(self, "_state_schema_checked", False):
             return
@@ -1487,8 +1784,9 @@ class NegotiationAgent(BaseAgent):
             return self._default_state(), False
         self._ensure_state_schema()
         key = (str(rfq_id), str(supplier))
-        if key in self._state_cache:
-            return dict(self._state_cache[key]), True
+        with self._state_lock:
+            if key in self._state_cache:
+                return dict(self._state_cache[key]), True
 
         state = self._default_state()
         exists = False
@@ -1533,14 +1831,16 @@ class NegotiationAgent(BaseAgent):
                         exists = True
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load negotiation session state")
-        self._state_cache[key] = dict(state)
+        with self._state_lock:
+            self._state_cache[key] = dict(state)
         return dict(state), exists
 
     def _save_session_state(self, rfq_id: Optional[str], supplier: Optional[str], state: Dict[str, Any]) -> None:
         if not rfq_id or not supplier:
             return
         key = (str(rfq_id), str(supplier))
-        self._state_cache[key] = dict(state)
+        with self._state_lock:
+            self._state_cache[key] = dict(state)
         self._ensure_state_schema()
         try:
             with self.agent_nick.get_db_connection() as conn:
@@ -2806,9 +3106,11 @@ class NegotiationAgent(BaseAgent):
 
     def _get_supplier_agent(self) -> "SupplierInteractionAgent":
         if self._supplier_agent is None:
-            from agents.supplier_interaction_agent import SupplierInteractionAgent
+            with self._supplier_agent_lock:
+                if self._supplier_agent is None:
+                    from agents.supplier_interaction_agent import SupplierInteractionAgent
 
-            self._supplier_agent = SupplierInteractionAgent(self.agent_nick)
+                    self._supplier_agent = SupplierInteractionAgent(self.agent_nick)
         return self._supplier_agent
 
     def _build_stop_message(self, status: str, reason: str, round_no: int) -> str:
@@ -3537,7 +3839,10 @@ class NegotiationAgent(BaseAgent):
     ) -> Optional[AgentOutput]:
         try:
             if self._email_agent is None:
-                self._email_agent = EmailDraftingAgent(self.agent_nick)
+                with self._email_agent_lock:
+                    if self._email_agent is None:
+                        self._email_agent = EmailDraftingAgent(self.agent_nick)
+            email_agent = self._email_agent
             email_context = AgentContext(
                 workflow_id=parent_context.workflow_id,
                 agent_id="EmailDraftingAgent",
@@ -3546,7 +3851,7 @@ class NegotiationAgent(BaseAgent):
                 parent_agent=parent_context.agent_id,
                 routing_history=list(parent_context.routing_history),
             )
-            return self._email_agent.execute(email_context)
+            return email_agent.execute(email_context) if email_agent else None
         except Exception:
             logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
             return None
