@@ -369,6 +369,14 @@ class SupplierInteractionAgent(BaseAgent):
         else:
             interval = self._resolve_poll_interval(poll_interval)
 
+        try:
+            supplier_response_repo.init_schema()
+        except Exception:
+            logger.exception(
+                "Failed to initialise supplier response schema for workflow=%s", workflow_id
+            )
+            return []
+
         while True:
             response_total = supplier_response_repo.count_pending(
                 workflow_id=workflow_id,
