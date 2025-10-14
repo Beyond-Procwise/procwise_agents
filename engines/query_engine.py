@@ -362,7 +362,7 @@ class QueryEngine(BaseEngine):
                 LEFT JOIN inv ON inv.supplier_id = s.supplier_id
                 """
             with self._pandas_reader() as reader:
-                params = [candidate_list] if candidate_list else None
+                params = (candidate_list,) if candidate_list else None
                 try:
                     df = read_sql_compat(sql, reader, params=params)
                 except TypeError:
