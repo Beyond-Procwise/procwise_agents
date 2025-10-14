@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email import message_from_bytes
+from email.message import Message
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
@@ -90,6 +91,30 @@ class SupplierInteractionAgent(BaseAgent):
 
         return context
 
+    def _extract_thread_message_ids(self, msg: Message) -> List[str]:
+        identifiers: List[str] = []
+        if msg is None:
+            return identifiers
+
+        for header in ("In-Reply-To", "References"):
+            for entry in msg.get_all(header, []):
+                if not entry:
+                    continue
+                fragments = re.findall(r"<[^>]+>", str(entry))
+                if fragments:
+                    for fragment in fragments:
+                        normalised = self._normalise_message_id(fragment)
+                        if normalised and normalised not in identifiers:
+                            identifiers.append(normalised)
+                    continue
+
+                for fragment in str(entry).split():
+                    normalised = self._normalise_message_id(fragment)
+                    if normalised and normalised not in identifiers:
+                        identifiers.append(normalised)
+
+        return identifiers
+
     @staticmethod
     def _coerce_text(value: Optional[Any]) -> Optional[str]:
         if value in (None, ""):
@@ -99,6 +124,13 @@ class SupplierInteractionAgent(BaseAgent):
         except Exception:
             return None
         return text or None
+
+    @staticmethod
+    def _normalise_message_id(value: Optional[Any]) -> Optional[str]:
+        text = SupplierInteractionAgent._coerce_text(value)
+        if text is None:
+            return None
+        return text.strip("<> ") or None
 
     @staticmethod
     def _response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -827,6 +859,7 @@ class SupplierInteractionAgent(BaseAgent):
                     body = msg.get_payload(decode=True) or b''
                     text = body.decode(errors='ignore')
                     rfq_id = self._extract_rfq_id(subject + " " + text)
+                    thread_ids = self._extract_thread_message_ids(msg)
                     if rfq_id:
                         parsed_payload = self._parse_response(
                             text,
@@ -843,6 +876,8 @@ class SupplierInteractionAgent(BaseAgent):
                             rfq_id=rfq_id,
                             message_id=msg.get('message-id'),
                             from_address=msg.get('from'),
+                            original_message_id=msg.get('in-reply-to'),
+                            thread_ids=thread_ids,
                         )
                         processed += 1
         except Exception:  # pragma: no cover - best effort
@@ -1828,16 +1863,62 @@ class SupplierInteractionAgent(BaseAgent):
         rfq_id: Optional[str] = None,
         message_id: Optional[str] = None,
         from_address: Optional[str] = None,
+        original_message_id: Optional[str] = None,
+        thread_ids: Optional[Sequence[str]] = None,
     ) -> None:
-        unique_key = self._coerce_text(unique_id) or self._coerce_text(message_id)
+        message_key = self._normalise_message_id(message_id)
+        unique_key = self._coerce_text(unique_id)
+
+        thread_candidates: List[str] = []
+        if thread_ids:
+            for candidate in thread_ids:
+                normalised = self._normalise_message_id(candidate)
+                if normalised and normalised not in thread_candidates:
+                    thread_candidates.append(normalised)
+
+        original_reference = self._normalise_message_id(original_message_id)
+        if original_reference:
+            if original_reference not in thread_candidates:
+                thread_candidates.insert(0, original_reference)
+        elif thread_candidates:
+            original_reference = thread_candidates[0]
+
+        dispatch_row = None
+        if thread_candidates:
+            try:
+                dispatch_row = workflow_email_tracking_repo.lookup_dispatch_by_message_ids(
+                    message_ids=thread_candidates
+                )
+            except Exception:  # pragma: no cover - best effort
+                logger.exception(
+                    "Failed to resolve dispatch context from thread identifiers (candidates=%s)",
+                    thread_candidates,
+                )
+
+        dispatch_supplier_id = None
+        dispatch_supplier_email = None
+        dispatch_workflow = None
+        if dispatch_row:
+            dispatch_supplier_id = self._coerce_text(dispatch_row.supplier_id)
+            dispatch_supplier_email = self._coerce_text(dispatch_row.supplier_email)
+            dispatch_workflow = self._coerce_text(dispatch_row.workflow_id)
+            dispatch_unique = self._coerce_text(dispatch_row.unique_id)
+            if dispatch_unique and not unique_key:
+                unique_key = dispatch_unique
+
+        if not unique_key:
+            unique_key = message_key
+
         if not unique_key:
             logger.error(
                 "Failed to store supplier response because unique_id could not be resolved (workflow=%s)",
-                workflow_id,
+                self._coerce_text(workflow_id),
             )
             return
 
         workflow_key = self._coerce_text(workflow_id)
+        if dispatch_workflow and not workflow_key:
+            workflow_key = dispatch_workflow
 
         canonical_workflow = None
         try:
@@ -1889,12 +1970,12 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return
 
-        resolved_supplier = supplier_id
+        resolved_supplier = supplier_id or dispatch_supplier_id
         if not resolved_supplier and rfq_id:
             resolved_supplier = self._resolve_supplier_id(
                 rfq_id,
                 supplier_id,
-                message_id=message_id,
+                message_id=message_key,
                 from_address=from_address,
             )
         if not resolved_supplier:
@@ -1905,9 +1986,9 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return
 
-        supplier_email = None
-        if isinstance(from_address, str) and from_address.strip():
-            supplier_email = from_address.strip()
+        from_coerced = self._coerce_text(from_address)
+        supplier_email = from_coerced or dispatch_supplier_email
+        response_from = from_coerced or dispatch_supplier_email
 
         price_value = self._coerce_decimal(parsed.get("price"))
         lead_value = None
@@ -1932,9 +2013,10 @@ class SupplierInteractionAgent(BaseAgent):
                     supplier_email=supplier_email,
                     response_text=text,
                     received_time=datetime.now(timezone.utc),
-                    response_message_id=message_id,
+                    response_message_id=message_key,
                     response_subject=None,
-                    response_from=from_address,
+                    response_from=response_from,
+                    original_message_id=original_reference,
                     price=price_value,
                     lead_time=lead_value,
                     processed=False,

@@ -16,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from repositories.supplier_response_repo import SupplierResponseRow
 
 
@@ -697,6 +698,9 @@ def test_store_response_persists_workflow_records(monkeypatch):
 
     monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
     monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_dispatch_by_message_ids", lambda **_: None
+    )
+    monkeypatch.setattr(
         workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
     )
     monkeypatch.setattr(
@@ -735,6 +739,9 @@ def test_store_response_skips_without_unique_id(monkeypatch, caplog):
 
     monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
     monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_dispatch_by_message_ids", lambda **_: None
+    )
+    monkeypatch.setattr(
         workflow_email_tracking_repo, "lookup_workflow_for_unique", lambda **_: None
     )
     monkeypatch.setattr(
@@ -762,11 +769,79 @@ def test_store_response_skips_without_unique_id(monkeypatch, caplog):
     assert "unique_id" in caplog.text
 
 
+def test_store_response_uses_dispatch_thread_identifiers(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    dispatch_row = WorkflowDispatchRow(
+        workflow_id="wf-thread",
+        unique_id="uniq-thread",
+        supplier_id="SUP-THREAD",
+        supplier_email="dispatch@example.com",
+        message_id="dispatch-msg",
+        subject="",
+        dispatched_at=datetime.now(),
+        responded_at=None,
+        response_message_id=None,
+        matched=False,
+        thread_headers=None,
+    )
+
+    monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_dispatch_by_message_ids",
+        lambda **_: dispatch_row,
+    )
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: "wf-thread",
+    )
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: None,
+    )
+
+    captured: Dict[str, SupplierResponseRow] = {}
+
+    def fake_insert(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", fake_insert)
+
+    agent._store_response(
+        None,
+        None,
+        "Mailbox response",
+        {"price": None, "lead_time": None},
+        unique_id=None,
+        rfq_id="RFQ-EMAIL-123",
+        message_id=" supplier-message ",
+        from_address=None,
+        original_message_id=" <dispatch-msg> ",
+        thread_ids=["<dispatch-msg>", "<other-id>"]
+    )
+
+    assert "row" in captured
+    stored = captured["row"]
+    assert stored.workflow_id == "wf-thread"
+    assert stored.unique_id == "uniq-thread"
+    assert stored.supplier_id == "SUP-THREAD"
+    assert stored.supplier_email == "dispatch@example.com"
+    assert stored.response_message_id == "supplier-message"
+    assert stored.original_message_id == "dispatch-msg"
+
+
 def test_store_response_aligns_workflow_with_dispatch(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
     monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_dispatch_by_message_ids", lambda **_: None
+    )
 
     canonical_workflow = "wf-dispatch"
 
@@ -807,6 +882,9 @@ def test_store_response_aligns_workflow_with_existing_record(monkeypatch):
     agent = SupplierInteractionAgent(nick)
 
     monkeypatch.setattr(supplier_response_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        workflow_email_tracking_repo, "lookup_dispatch_by_message_ids", lambda **_: None
+    )
 
     stored_workflow = "wf-existing"
 
