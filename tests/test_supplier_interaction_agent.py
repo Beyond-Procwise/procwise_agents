@@ -77,6 +77,33 @@ class DummyNick:
         return DummyConn()
 
 
+@pytest.fixture(autouse=True)
+def stub_response_coordinator(monkeypatch):
+    class StubCoordinator:
+        def await_dispatch_completion(
+            self,
+            *,
+            workflow_id,
+            unique_ids,
+            timeout=None,
+            poll_interval=None,
+            wait_for_all=True,
+        ):
+            filtered = [uid for uid in unique_ids if uid]
+            expected = len(filtered)
+            return {
+                "workflow_id": workflow_id,
+                "expected_dispatches": expected,
+                "completed_dispatches": expected,
+                "complete": True,
+            }
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.SupplierResponseWorkflow",
+        lambda: StubCoordinator(),
+    )
+
+
 def test_supplier_interaction_agent():
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)

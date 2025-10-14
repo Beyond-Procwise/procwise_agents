@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
+from services.supplier_response_workflow import SupplierResponseWorkflow
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
@@ -39,6 +40,7 @@ class SupplierInteractionAgent(BaseAgent):
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         self._email_watcher = None
         self._negotiation_agent = None
+        self._response_coordinator = SupplierResponseWorkflow()
 
     # Suppliers occasionally include upper-case letters or non-hex characters
     # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
@@ -166,6 +168,60 @@ class SupplierInteractionAgent(BaseAgent):
             "lead_time": row.get("lead_time"),
         }
 
+    def _await_dispatch_ready(
+        self,
+        *,
+        workflow_id: Optional[str],
+        unique_ids: Sequence[Optional[str]],
+        timeout: Optional[int],
+        poll_interval: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        if not workflow_id:
+            return None
+
+        candidates: List[str] = []
+        for value in unique_ids:
+            text = self._coerce_text(value)
+            if text and text not in candidates:
+                candidates.append(text)
+
+        if not candidates:
+            return None
+
+        coordinator = getattr(self, "_response_coordinator", None)
+        if coordinator is None:
+            coordinator = SupplierResponseWorkflow()
+            self._response_coordinator = coordinator
+
+        try:
+            summary = coordinator.await_dispatch_completion(
+                workflow_id=workflow_id,
+                unique_ids=candidates,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                wait_for_all=True,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to await dispatch completion for workflow=%s", workflow_id
+            )
+            return None
+
+        if not summary.get("complete"):
+            logger.warning(
+                "Dispatch metadata incomplete for workflow=%s (completed=%s/%s)",
+                workflow_id,
+                summary.get("completed_dispatches"),
+                summary.get("expected_dispatches"),
+            )
+        else:
+            logger.debug(
+                "Dispatch ready for workflow=%s covering %s unique IDs",
+                workflow_id,
+                summary.get("expected_dispatches"),
+            )
+        return summary
+
     def _prepare_response_expectations(
         self,
         metadata: Dict[str, Any],
@@ -274,6 +330,7 @@ class SupplierInteractionAgent(BaseAgent):
         unique_filter: Optional[Set[str]] = None,
         timeout: Optional[int] = None,
         poll_interval: Optional[int] = None,
+        dispatch_summary: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         try:
             total_timeout = float(timeout) if timeout is not None else 0.0
@@ -300,34 +357,49 @@ class SupplierInteractionAgent(BaseAgent):
         if interval < 0:
             interval = 0.0
 
+        if dispatch_summary is None:
+            expected_unique_ids = list(unique_filter or [])
+            self._await_dispatch_ready(
+                workflow_id=workflow_id,
+                unique_ids=expected_unique_ids,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+
         metadata: Optional[Dict[str, Any]] = None
+        attempts = 0
+        max_attempts_without_deadline = 5 if interval > 0 else 1
         while True:
             metadata = self._load_dispatch_metadata(workflow_id)
             if metadata is not None:
                 break
 
-            if deadline is not None and time.monotonic() >= deadline:
-                logger.info(
-                    "Timed out waiting for dispatch metadata for workflow=%s",
-                    workflow_id,
-                )
-                return []
-
-            if interval <= 0:
-                time.sleep(0)
-                continue
-
+            now = time.monotonic()
             if deadline is not None:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
-                    logger.info(
-                        "Timed out waiting for dispatch metadata for workflow=%s",
-                        workflow_id,
-                    )
-                    return []
-                time.sleep(min(interval, max(remaining, 0)))
+                    break
+                if interval > 0:
+                    sleep_window = min(interval, remaining, 1.0)
+                else:
+                    sleep_window = max(0.0, min(remaining, 1.0))
             else:
-                time.sleep(interval)
+                attempts += 1
+                if attempts >= max_attempts_without_deadline:
+                    break
+                sleep_window = min(interval, 1.0) if interval > 0 else 0
+
+            if sleep_window > 0:
+                time.sleep(sleep_window)
+            else:
+                time.sleep(0)
+
+        if metadata is None:
+            logger.info(
+                "Dispatch metadata unavailable after activation for workflow=%s",
+                workflow_id,
+            )
+            return []
 
         dispatch_rows: List[Any] = list(metadata.get("rows") or [])
 
@@ -1081,12 +1153,30 @@ class SupplierInteractionAgent(BaseAgent):
 
         unique_filter: Optional[Set[str]] = {unique_key} if unique_key else None
 
+        dispatch_unique_ids: List[Optional[str]] = []
+        if unique_filter:
+            dispatch_unique_ids.extend(unique_filter)
+        elif draft_match:
+            dispatch_unique_ids.append(draft_context.get("unique_id"))
+        elif watch_candidates:
+            for candidate in watch_candidates:
+                if isinstance(candidate, dict):
+                    dispatch_unique_ids.append(candidate.get("unique_id"))
+
+        dispatch_summary = self._await_dispatch_ready(
+            workflow_id=workflow_key,
+            unique_ids=dispatch_unique_ids,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
         responses = self._await_supplier_response_rows(
             workflow_key,
             supplier_filter=supplier_filter,
             unique_filter=unique_filter,
             timeout=timeout,
             poll_interval=poll_interval,
+            dispatch_summary=dispatch_summary,
         )
 
         if not responses:
@@ -1194,11 +1284,19 @@ class SupplierInteractionAgent(BaseAgent):
             else self.WORKFLOW_POLL_INTERVAL_SECONDS
         )
 
+        dispatch_summary = self._await_dispatch_ready(
+            workflow_id=workflow_key,
+            unique_ids=list(unique_ids),
+            timeout=timeout,
+            poll_interval=batch_poll_interval,
+        )
+
         responses = self._await_supplier_response_rows(
             workflow_key,
             unique_filter=unique_filter,
             timeout=timeout,
             poll_interval=batch_poll_interval,
+            dispatch_summary=dispatch_summary,
         )
 
         if not responses:
