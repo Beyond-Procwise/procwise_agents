@@ -25,6 +25,8 @@ class SupplierResponseWorkflow:
         self._workflow_repo = workflow_repo
         self._response_repo = response_repo
         self._sleep = sleep_fn
+        self._workflow_initialised = False
+        self._response_initialised = False
 
     @staticmethod
     def _normalise_ids(values: Iterable[Optional[str]]) -> List[str]:
@@ -53,8 +55,9 @@ class SupplierResponseWorkflow:
         unique_ids: Sequence[Optional[str]],
         timeout: Optional[int] = None,
         poll_interval: Optional[int] = None,
+        wait_for_all: bool = True,
     ) -> Dict[str, object]:
-        """Wait until all tracked dispatches have recorded message IDs."""
+        """Wait until tracked dispatches have recorded message IDs."""
 
         expected_ids = self._normalise_ids(unique_ids)
         expected_total = len(expected_ids)
@@ -68,12 +71,15 @@ class SupplierResponseWorkflow:
                 "unique_ids": expected_ids,
             }
 
-        try:
-            self._workflow_repo.init_schema()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                "Failed to initialise workflow email tracking schema before dispatch wait",
-            )
+        if not self._workflow_initialised:
+            try:
+                self._workflow_repo.init_schema()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Failed to initialise workflow email tracking schema before dispatch wait",
+                )
+            else:
+                self._workflow_initialised = True
 
         poll_seconds = max(0.0, float(poll_interval or 0))
         deadline = None
@@ -106,6 +112,9 @@ class SupplierResponseWorkflow:
             if len(completed) >= expected_total:
                 break
 
+            if not wait_for_all:
+                break
+
             if deadline is not None and time.monotonic() >= deadline:
                 break
 
@@ -124,7 +133,7 @@ class SupplierResponseWorkflow:
             "unique_ids": expected_ids,
         }
 
-    def await_response_population(
+    def await_first_dispatch(
         self,
         *,
         workflow_id: Optional[str],
@@ -132,7 +141,89 @@ class SupplierResponseWorkflow:
         timeout: Optional[int] = None,
         poll_interval: Optional[int] = None,
     ) -> Dict[str, object]:
-        """Poll ``proc.supplier_response`` until all expected responses exist."""
+        """Block until the first dispatch for the workflow is recorded."""
+
+        expected_ids = self._normalise_ids(unique_ids)
+        if not workflow_id or not expected_ids:
+            return {
+                "workflow_id": workflow_id,
+                "activated": True,
+                "first_unique_id": None,
+                "wait_seconds": 0.0,
+                "unique_ids": expected_ids,
+            }
+
+        if not self._workflow_initialised:
+            try:
+                self._workflow_repo.init_schema()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Failed to initialise workflow email tracking schema before activation wait",
+                )
+            else:
+                self._workflow_initialised = True
+
+        poll_seconds = max(0.0, float(poll_interval or 0))
+        deadline = None
+        if timeout is not None:
+            try:
+                deadline = time.monotonic() + max(0, int(timeout))
+            except Exception:
+                deadline = time.monotonic() + max(0, float(timeout or 0))
+        start = time.monotonic()
+
+        first_unique: Optional[str] = None
+        activated = False
+
+        while True:
+            try:
+                rows = self._workflow_repo.load_workflow_rows(workflow_id=workflow_id)
+            except Exception:
+                logger.exception(
+                    "Failed to load dispatch metadata for workflow=%s", workflow_id
+                )
+                rows = []
+
+            for row in rows:
+                unique_id = str(getattr(row, "unique_id", "")).strip()
+                if unique_id and unique_id in expected_ids:
+                    if getattr(row, "dispatched_at", None) is not None and getattr(
+                        row, "message_id", None
+                    ):
+                        first_unique = unique_id
+                        activated = True
+                        break
+
+            if activated:
+                break
+
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+            if poll_seconds > 0:
+                self._sleep(poll_seconds)
+            else:
+                self._sleep(0)
+
+        elapsed = time.monotonic() - start
+        return {
+            "workflow_id": workflow_id,
+            "activated": activated,
+            "first_unique_id": first_unique,
+            "wait_seconds": elapsed,
+            "unique_ids": expected_ids,
+        }
+
+    def await_response_population(
+        self,
+        *,
+        workflow_id: Optional[str],
+        unique_ids: Sequence[Optional[str]],
+        timeout: Optional[int] = None,
+        poll_interval: Optional[int] = None,
+        wait_for_all: bool = True,
+    ) -> Dict[str, object]:
+        """Poll ``proc.supplier_response`` until expected responses exist."""
 
         expected_ids = self._normalise_ids(unique_ids)
         expected_total = len(expected_ids)
@@ -146,12 +237,15 @@ class SupplierResponseWorkflow:
                 "unique_ids": expected_ids,
             }
 
-        try:
-            self._response_repo.init_schema()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                "Failed to initialise supplier response schema before polling",
-            )
+        if not self._response_initialised:
+            try:
+                self._response_repo.init_schema()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Failed to initialise supplier response schema before polling",
+                )
+            else:
+                self._response_initialised = True
 
         poll_seconds = max(0.0, float(poll_interval or 0))
         deadline = None
@@ -180,6 +274,9 @@ class SupplierResponseWorkflow:
             completed &= set(expected_ids)
 
             if len(completed) >= expected_total:
+                break
+
+            if not wait_for_all:
                 break
 
             if deadline is not None and time.monotonic() >= deadline:
@@ -212,33 +309,35 @@ class SupplierResponseWorkflow:
     ) -> Dict[str, Dict[str, object]]:
         """Ensure dispatch and responses are ready for processing."""
 
-        dispatch_info = self.await_dispatch_completion(
+        activation_info = self.await_first_dispatch(
             workflow_id=workflow_id,
             unique_ids=unique_ids,
             timeout=dispatch_timeout,
             poll_interval=dispatch_poll_interval,
         )
-        if not dispatch_info.get("complete", False):
+        if not activation_info.get("activated", False):
             raise TimeoutError(
-                f"Dispatch metadata incomplete for workflow {workflow_id}; "
-                f"expected {dispatch_info['expected_dispatches']} dispatched emails, "
-                f"found {dispatch_info['completed_dispatches']}"
+                f"Timed out waiting for initial dispatch for workflow {workflow_id}"
             )
+
+        dispatch_info = self.await_dispatch_completion(
+            workflow_id=workflow_id,
+            unique_ids=unique_ids,
+            timeout=dispatch_timeout,
+            poll_interval=dispatch_poll_interval,
+            wait_for_all=False,
+        )
 
         response_info = self.await_response_population(
             workflow_id=workflow_id,
             unique_ids=unique_ids,
             timeout=response_timeout,
             poll_interval=response_poll_interval,
+            wait_for_all=False,
         )
-        if not response_info.get("complete", False):
-            raise TimeoutError(
-                f"Supplier responses incomplete for workflow {workflow_id}; "
-                f"expected {response_info['expected_responses']} responses, "
-                f"found {response_info['completed_responses']}"
-            )
 
         return {
+            "activation": activation_info,
             "dispatch": dispatch_info,
             "responses": response_info,
         }

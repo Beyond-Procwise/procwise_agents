@@ -15,6 +15,7 @@ class DummyWorkflowRepo:
         self._batches = deque(batches)
         self.init_called = 0
         self.load_calls = []
+        self._last = []
 
     def init_schema(self):
         self.init_called += 1
@@ -22,8 +23,9 @@ class DummyWorkflowRepo:
     def load_workflow_rows(self, workflow_id):
         self.load_calls.append(workflow_id)
         if self._batches:
-            return self._batches.popleft()
-        return []
+            self._last = self._batches.popleft()
+            return self._last
+        return list(self._last)
 
 
 class DummyResponseRepo:
@@ -85,10 +87,17 @@ def test_workflow_waits_for_dispatch_and_responses():
         response_poll_interval=2,
     )
 
-    assert summary["dispatch"]["complete"] is True
-    assert summary["dispatch"]["completed_dispatches"] == 2
-    assert summary["responses"]["complete"] is True
-    assert summary["responses"]["completed_responses"] == 2
+    activation = summary["activation"]
+    assert activation["activated"] is True
+    assert activation["first_unique_id"] in {"uid-1", "uid-2"}
+
+    dispatch = summary["dispatch"]
+    assert dispatch["completed_dispatches"] == 2
+    assert dispatch["complete"] is True
+
+    responses = summary["responses"]
+    assert responses["completed_responses"] == 1
+    assert responses["complete"] is False
     assert workflow_repo.init_called == 1
     assert response_repo.init_called == 1
     # First loop sleeps twice (once for dispatch, once for responses)
@@ -118,9 +127,12 @@ def test_workflow_raises_when_dispatch_incomplete():
         )
 
 
-def test_workflow_raises_when_responses_incomplete():
+def test_workflow_snapshot_returns_partial_response_progress():
     dispatch_batches = [
-        [SimpleNamespace(unique_id="uid-1", dispatched_at=1, message_id="m1")],
+        [
+            SimpleNamespace(unique_id="uid-1", dispatched_at=1, message_id="m1"),
+            SimpleNamespace(unique_id="uid-2", dispatched_at=1, message_id="m2"),
+        ]
     ]
     response_batches = [[{"unique_id": "uid-1"}]]
 
@@ -130,12 +142,15 @@ def test_workflow_raises_when_responses_incomplete():
         sleep_fn=lambda *_: None,
     )
 
-    with pytest.raises(TimeoutError):
-        helper.ensure_ready(
-            workflow_id="wf-no-responses",
-            unique_ids=["uid-1", "uid-2"],
-            dispatch_timeout=0,
-            dispatch_poll_interval=0,
-            response_timeout=0,
-            response_poll_interval=0,
-        )
+    summary = helper.ensure_ready(
+        workflow_id="wf-no-responses",
+        unique_ids=["uid-1", "uid-2"],
+        dispatch_timeout=0,
+        dispatch_poll_interval=0,
+        response_timeout=0,
+        response_poll_interval=0,
+    )
+
+    assert summary["activation"]["activated"] is True
+    assert summary["dispatch"]["complete"] is True
+    assert summary["responses"]["complete"] is False

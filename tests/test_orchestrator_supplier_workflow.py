@@ -69,8 +69,9 @@ class StubCoordinator:
             }
         )
         return {
+            "activation": {"activated": True, "first_unique_id": "uid-1"},
             "dispatch": {"complete": True, "completed_dispatches": 2},
-            "responses": {"complete": True, "completed_responses": 2},
+            "responses": {"complete": False, "completed_responses": 1},
         }
 
 
@@ -181,6 +182,7 @@ def test_supplier_workflow_coordinates_agents(monkeypatch):
     assert supplier_input.get("await_all_responses") is True
     assert len(supplier_input.get("drafts", [])) == 2
     assert sorted(set(coordinator.calls[0]["unique_ids"])) == ["uid-1", "uid-2"]
+    assert result["activation_monitor"]["activated"] is True
     assert result["dispatch_monitor"]["complete"] is True
-    assert result["response_monitor"]["complete"] is True
+    assert result["response_monitor"]["complete"] is False
     assert result["supplier_interaction"]["processed"] is True

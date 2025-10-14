@@ -1717,10 +1717,17 @@ class Orchestrator:
 
         supplier_result = self._execute_agent("supplier_interaction", supplier_ctx)
 
+        activation_summary = readiness.get("activation", {}) if readiness else {}
+        if activation_summary and not activation_summary.get("activated", False):
+            logger.warning(
+                "Supplier interaction activation incomplete for workflow=%s", workflow_hint
+            )
+
         results: Dict[str, Any] = {
             "email_drafting": email_data,
             "dispatch_monitor": readiness.get("dispatch"),
             "response_monitor": readiness.get("responses"),
+            "activation_monitor": activation_summary,
             "supplier_interaction": supplier_result.data if supplier_result else {},
         }
 
