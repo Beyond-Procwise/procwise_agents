@@ -303,15 +303,32 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return []
 
+        expectations = self._prepare_response_expectations(
+            metadata,
+            supplier_filter=supplier_filter,
+            unique_filter=unique_filter,
+        )
+        expected_unique_ids: Set[str] = expectations["expected_unique_ids"]
+        expected_suppliers: Set[str] = expectations["expected_suppliers"]
+
+        expected_response_total = dispatch_total
+        count_kwargs: Dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "include_processed": True,
+        }
+        if expected_unique_ids:
+            expected_response_total = len(expected_unique_ids)
+            count_kwargs["unique_ids"] = sorted(expected_unique_ids)
+        elif expected_suppliers:
+            expected_response_total = len(expected_suppliers)
+            count_kwargs["supplier_ids"] = sorted(expected_suppliers)
+
         interval = float(self.WORKFLOW_POLL_INTERVAL_SECONDS)
 
         while True:
-            response_total = supplier_response_repo.count_pending(
-                workflow_id=workflow_id,
-                include_processed=True,
-            )
+            response_total = supplier_response_repo.count_pending(**count_kwargs)
 
-            if response_total >= dispatch_total:
+            if response_total >= expected_response_total:
                 rows = self._poll_supplier_response_rows(
                     workflow_id,
                     supplier_filter=supplier_filter,
@@ -319,11 +336,11 @@ class SupplierInteractionAgent(BaseAgent):
                     metadata=metadata,
                 )
                 if rows:
-                    if response_total > dispatch_total:
+                    if response_total > expected_response_total:
                         logger.debug(
-                            "Response count %s exceeds dispatched total %s for workflow=%s; proceeding",
+                            "Response count %s exceeds expected threshold %s for workflow=%s; proceeding",
                             response_total,
-                            dispatch_total,
+                            expected_response_total,
                             workflow_id,
                         )
                     return self._process_responses_concurrently(rows)
