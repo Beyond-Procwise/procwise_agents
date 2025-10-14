@@ -265,3 +265,57 @@ def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
             return None
         workflow_id = row[0]
         return workflow_id or None
+
+
+def lookup_dispatch_by_message_ids(*, message_ids: Sequence[str]) -> Optional[WorkflowDispatchRow]:
+    if not message_ids:
+        return None
+
+    normalised: List[str] = []
+    for candidate in message_ids:
+        try:
+            text = str(candidate).strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        text = text.strip("<> ")
+        if text and text not in normalised:
+            normalised.append(text)
+
+    if not normalised:
+        return None
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "dispatched_at, responded_at, response_message_id, matched, thread_headers "
+            "FROM proc.workflow_email_tracking "
+            "WHERE message_id = ANY(%s) "
+            "ORDER BY dispatched_at DESC NULLS LAST "
+            "LIMIT 1"
+        )
+        cur.execute(q, (normalised,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return None
+        cols = [c.name for c in cur.description]
+        cur.close()
+        data = dict(zip(cols, row))
+        return WorkflowDispatchRow(
+            workflow_id=data["workflow_id"],
+            unique_id=data["unique_id"],
+            supplier_id=data.get("supplier_id"),
+            supplier_email=data.get("supplier_email"),
+            message_id=data.get("message_id"),
+            subject=data.get("subject"),
+            dispatched_at=_normalise_dt(data.get("dispatched_at")) or datetime.now(timezone.utc),
+            responded_at=_normalise_dt(data.get("responded_at")),
+            response_message_id=data.get("response_message_id"),
+            matched=bool(data.get("matched")),
+            thread_headers=_parse_thread_headers(data.get("thread_headers")),
+        )
