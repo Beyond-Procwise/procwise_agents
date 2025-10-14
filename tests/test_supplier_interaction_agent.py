@@ -141,6 +141,22 @@ def test_supplier_interaction_wait_for_response(monkeypatch):
         fake_fetch_pending,
     )
     monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 2,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 2,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 1,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 1,
+    )
+    monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
         lambda: None,
     )
@@ -213,6 +229,10 @@ def test_wait_for_response_realigns_workflow_from_unique(monkeypatch):
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 1,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
@@ -292,6 +312,10 @@ def test_wait_for_response_waits_for_dispatch_metadata(monkeypatch):
         fake_fetch_pending,
     )
     monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 2,
+    )
+    monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
         lambda: None,
     )
@@ -364,10 +388,21 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
             pending_batches.popleft()
         return batch
 
+    count_sequence = deque([0, 1])
+
+    def fake_count_pending(**_kwargs):
+        if count_sequence:
+            return count_sequence.popleft()
+        return 1
+
     monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count_pending,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
@@ -509,6 +544,10 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
         fake_fetch_pending,
     )
     monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 2,
+    )
+    monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
         lambda: None,
     )
@@ -628,10 +667,30 @@ def test_wait_for_multiple_responses_waits_until_complete(monkeypatch):
             pending_batches.popleft()
         return batch
 
+    count_sequence = deque([1, 2])
+
+    def fake_count_pending(*, workflow_id, unique_ids=None, **_kwargs):
+        if count_sequence:
+            current = count_sequence.popleft()
+        else:
+            batch = pending_batches[0]
+            if unique_ids:
+                target = set(unique_ids)
+                return len([row for row in batch if row.get("unique_id") in target])
+            return len(batch)
+
+        if unique_ids:
+            return min(current, len(unique_ids))
+        return current
+
     agent._load_dispatch_metadata = lambda *_args, **_kwargs: metadata  # type: ignore[assignment]
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count_pending,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
@@ -738,6 +797,10 @@ def test_wait_for_multiple_responses_uses_canonical_workflow(monkeypatch):
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        lambda **_: 2,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
@@ -850,9 +913,21 @@ def test_poll_collects_only_when_all_responses_present(monkeypatch):
             pending_batches.popleft()
         return batch
 
+    def fake_count_pending(*, workflow_id, unique_ids=None, **_kwargs):
+        assert workflow_id == "wf-bulk"
+        batch = pending_batches[0]
+        if unique_ids:
+            targets = set(unique_ids)
+            return len([row for row in batch if row.get("unique_id") in targets])
+        return len(batch)
+
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
+        fake_count_pending,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",

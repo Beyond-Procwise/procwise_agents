@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from services.db import get_conn
 
@@ -217,6 +217,44 @@ def align_workflow_assignments(*, workflow_id: str, unique_ids: Iterable[str]) -
         )
         cur.execute(q, (workflow_id, identifiers, workflow_id))
         cur.close()
+
+
+def count_pending(
+    *,
+    workflow_id: str,
+    unique_ids: Optional[Sequence[str]] = None,
+    supplier_ids: Optional[Sequence[str]] = None,
+) -> int:
+    ids = [uid for uid in (unique_ids or []) if uid]
+    supplier_filter = [sid for sid in (supplier_ids or []) if sid]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        filters = ["workflow_id=%s", "COALESCE(processed, FALSE)=FALSE"]
+        params: List[Any] = [workflow_id]
+
+        if ids:
+            filters.append("unique_id = ANY(%s)")
+            params.append(ids)
+
+        if supplier_filter:
+            filters.append("supplier_id = ANY(%s)")
+            params.append(supplier_filter)
+
+        q = (
+            "SELECT COUNT(*) FROM proc.supplier_response "
+            f"WHERE {' AND '.join(filters)}"
+        )
+        cur.execute(q, tuple(params))
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            return 0
+        try:
+            return int(row[0])
+        except Exception:
+            return 0
 
 
 def fetch_pending(*, workflow_id: str) -> List[Dict[str, Any]]:
