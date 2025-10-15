@@ -173,6 +173,7 @@ class EmailDispatchService:
 
             sent = send_result.success
             message_id = send_result.message_id
+            unique_id = backend_metadata.get("unique_id")
 
             self._update_draft_status(
                 conn,
@@ -195,6 +196,14 @@ class EmailDispatchService:
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
                 dispatch_payload["message_id"] = message_id
+                logger.info(
+                    "Dispatched supplier email workflow=%s unique_id=%s rfq_id=%s supplier=%s message_id=%s",
+                    backend_metadata.get("workflow_id"),
+                    unique_id,
+                    rfq_id,
+                    draft.get("supplier_id"),
+                    message_id,
+                )
                 try:
                     self._record_thread_mapping(
                         conn,
@@ -459,10 +468,15 @@ class EmailDispatchService:
         sent: bool,
     ) -> None:
         action_id = self._extract_action_id(payload)
+        unique_id = payload.get("unique_id")
+        metadata = payload.get("dispatch_metadata")
+        if not unique_id and isinstance(metadata, dict):
+            unique_id = metadata.get("unique_id")
         if not action_id:
             logger.debug(
-                "No action identifier found in dispatch payload for RFQ %s; skipping sent_status update",
+                "No action identifier found for dispatch (rfq=%s unique_id=%s); skipping sent_status update",
                 rfq_id,
+                unique_id,
             )
             return
 
@@ -496,9 +510,10 @@ class EmailDispatchService:
                 )
         except Exception:  # pragma: no cover - defensive logging
             logger.exception(
-                "Failed to update sent_status for action %s and RFQ %s",
+                "Failed to update sent_status for action %s (rfq=%s unique_id=%s)",
                 action_id,
                 rfq_id,
+                unique_id,
             )
 
     # ------------------------------------------------------------------

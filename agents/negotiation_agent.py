@@ -1223,11 +1223,17 @@ class NegotiationAgent(BaseAgent):
                     watch_payload=supplier_watch_fields,
                     state=state,
                 )
+                watch_unique_ids = [
+                    self._coerce_text(entry.get("unique_id"))
+                    for entry in supplier_watch_fields.get("drafts", [])
+                    if isinstance(entry, dict) and self._coerce_text(entry.get("unique_id"))
+                ]
                 if wait_results is None:
                     logger.error(
-                        "Supplier responses not received before timeout for rfq_id=%s supplier=%s",
+                        "Supplier responses not received before timeout (rfq_id=%s supplier=%s unique_ids=%s)",
                         rfq_id,
                         supplier,
+                        watch_unique_ids or None,
                     )
                     error_payload = {
                         "supplier": supplier,
@@ -1235,6 +1241,7 @@ class NegotiationAgent(BaseAgent):
                         "round": round_no,
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
+                        "unique_ids": watch_unique_ids,
                     }
                     return self._with_plan(
                         context,
@@ -1247,9 +1254,10 @@ class NegotiationAgent(BaseAgent):
                 supplier_responses = [res for res in wait_results if isinstance(res, dict)]
                 if not supplier_responses:
                     logger.error(
-                        "No supplier responses received while waiting for rfq_id=%s supplier=%s",
+                        "No supplier responses received while waiting (rfq_id=%s supplier=%s unique_ids=%s)",
                         rfq_id,
                         supplier,
+                        watch_unique_ids or None,
                     )
                     error_payload = {
                         "supplier": supplier,
@@ -1257,6 +1265,7 @@ class NegotiationAgent(BaseAgent):
                         "round": round_no,
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
+                        "unique_ids": watch_unique_ids,
                     }
                     return self._with_plan(
                         context,
@@ -3038,6 +3047,13 @@ class NegotiationAgent(BaseAgent):
             return None
 
         await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
+        tracked_unique_ids = sorted(
+            {
+                self._coerce_text(entry.get("unique_id"))
+                for entry in draft_entries
+                if self._coerce_text(entry.get("unique_id"))
+            }
+        )
 
         try:
             if await_all:

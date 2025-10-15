@@ -24,7 +24,11 @@ from repositories import workflow_email_tracking_repo as tracking_repo
 from repositories import supplier_response_repo
 from repositories.supplier_response_repo import SupplierResponseRow
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from utils.email_tracking import extract_tracking_metadata, extract_unique_id_from_body
+from utils.email_tracking import (
+    extract_tracking_metadata,
+    extract_unique_id_from_body,
+    extract_unique_id_from_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +156,22 @@ def _parse_email(raw: bytes) -> EmailResponse:
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
     body = _extract_plain_text(message)
-    unique_id = extract_unique_id_from_body(body)
+    header_map = {
+        key: message.get_all(key, failobj=[])
+        for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
+    }
+    unique_id = extract_unique_id_from_headers(header_map)
+    if not unique_id:
+        fallback_header = message.get("X-Procwise-Unique-Id")
+        if fallback_header:
+            unique_id = str(fallback_header).strip()
+    body_unique = extract_unique_id_from_body(body)
+    if body_unique and not unique_id:
+        unique_id = body_unique
     metadata = extract_tracking_metadata(body)
+    supplier_id = metadata.supplier_id if metadata else None
     if metadata and not unique_id:
         unique_id = metadata.unique_id
-    supplier_id = metadata.supplier_id if metadata else None
 
     date_header = message.get("Date")
     try:

@@ -17,12 +17,19 @@ def restore_env(monkeypatch):
     yield
 
 
+@pytest.fixture
+def fixed_unique_id(monkeypatch):
+    token = "UID-1234567890ABCD"
+    monkeypatch.setattr(module, "generate_unique_email_id", lambda *_, **__: token)
+    return token
+
+
 def _visible_body(body: str) -> str:
     _comment, remainder = split_hidden_marker(body)
     return remainder or ""
 
 
-def test_from_decision_formats_payload(monkeypatch):
+def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
     calls = []
 
     def fake_chat(model, system, user, **kwargs):
@@ -59,7 +66,8 @@ def test_from_decision_formats_payload(monkeypatch):
 
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
     comment, remainder = split_hidden_marker(result["body"])
-    assert comment and extract_rfq_id(comment) == result["rfq_id"]
+    assert comment and extract_rfq_id(comment) == result["unique_id"]
+    assert "RFQ_ID" not in comment
     assert remainder.strip() == result["text"].strip()
     assert result["metadata"].get("dispatch_token")
     assert "Please confirm if 44.8 GBP is workable." in result["text"]
@@ -73,7 +81,9 @@ def test_from_decision_formats_payload(monkeypatch):
     assert result["sender"]
     assert result["sent_status"] is False
     assert calls[0]["payload"]["rfq_id"] == "RFQ-20250930-RFQ00001"
-    assert result["headers"]["X-Procwise-Unique-Id"] == result["rfq_id"]
+    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert result["metadata"]["unique_id"] == fixed_unique_id
+    assert result["unique_id"] == fixed_unique_id
 
 
 def test_from_decision_subject_fallback(monkeypatch):
@@ -94,7 +104,7 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
-def test_from_decision_generates_unique_rfq_id(monkeypatch):
+def test_from_decision_generates_unique_rfq_id(monkeypatch, fixed_unique_id):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
     monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-UN1QUEID")
@@ -106,7 +116,9 @@ def test_from_decision_generates_unique_rfq_id(monkeypatch):
 
     assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
     assert result["headers"]["X-Procwise-RFQ-ID"] == "RFQ-20250930-UN1QUEID"
-    assert result["headers"]["X-Procwise-Unique-Id"] == "RFQ-20250930-UN1QUEID"
+    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert result["metadata"]["unique_id"] == fixed_unique_id
+    assert result["unique_id"] == fixed_unique_id
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 

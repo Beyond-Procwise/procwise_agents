@@ -26,6 +26,7 @@ from jinja2 import Template
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from utils.email_markers import attach_hidden_marker, extract_rfq_id, split_hidden_marker
+from utils.email_tracking import generate_unique_email_id
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 
@@ -551,10 +552,18 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
+        unique_id = self._resolve_unique_id(
+            workflow_id=decision_data.get("workflow_id") or decision_data.get("workflow_ref"),
+            rfq_id=rfq_id_output,
+            supplier_id=supplier_id,
+            existing=decision_data.get("unique_id"),
+        )
+
         annotated_body, marker_token = attach_hidden_marker(
             plain_text or "",
             rfq_id=rfq_id_output,
             supplier_id=supplier_id,
+            unique_id=unique_id,
         )
 
         if subject_line:
@@ -565,7 +574,7 @@ class EmailDraftingAgent(BaseAgent):
         thread_headers = decision_data.get("thread")
         headers: Dict[str, Any] = {
             "X-Procwise-RFQ-ID": rfq_id_output,
-            "X-Procwise-Unique-Id": rfq_id_output,
+            "X-Procwise-Unique-Id": unique_id,
         }
         if isinstance(thread_headers, dict):
             message_id = thread_headers.get("message_id")
@@ -590,6 +599,7 @@ class EmailDraftingAgent(BaseAgent):
         }
         if marker_token:
             metadata["dispatch_token"] = marker_token
+        metadata["unique_id"] = unique_id
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
         draft = {
@@ -609,6 +619,7 @@ class EmailDraftingAgent(BaseAgent):
             "sent_status": False,
             "metadata": metadata,
             "headers": headers,
+            "unique_id": unique_id,
         }
 
         thread_index = decision_data.get("thread_index")
@@ -702,10 +713,17 @@ class EmailDraftingAgent(BaseAgent):
             plain_text = self._clean_body_text(plain_text)
 
         supplier_id = context.get("supplier_id")
+        unique_id = self._resolve_unique_id(
+            workflow_id=context.get("workflow_id") if isinstance(context, dict) else None,
+            rfq_id=rfq_id_value,
+            supplier_id=supplier_id,
+            existing=context.get("unique_id") if isinstance(context, dict) else None,
+        )
         annotated_body, marker_token = attach_hidden_marker(
             plain_text or "",
             rfq_id=rfq_id_value,
             supplier_id=supplier_id,
+            unique_id=unique_id,
         )
 
         counter_price = context.get("counter_price")
@@ -725,6 +743,7 @@ class EmailDraftingAgent(BaseAgent):
             metadata["counter_price"] = counter_price
         if marker_token:
             metadata["dispatch_token"] = marker_token
+        metadata["unique_id"] = unique_id
 
         draft = {
             "rfq_id": rfq_id_value,
@@ -742,8 +761,9 @@ class EmailDraftingAgent(BaseAgent):
             "metadata": metadata,
             "headers": {
                 "X-Procwise-RFQ-ID": rfq_id_value,
-                "X-Procwise-Unique-Id": rfq_id_value,
+                "X-Procwise-Unique-Id": unique_id,
             },
+            "unique_id": unique_id,
         }
 
         return draft
@@ -946,10 +966,18 @@ class EmailDraftingAgent(BaseAgent):
 
         body_content = self._sanitise_generated_body(email_text)
         body = self._clean_body_text(body_content)
+        workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
+        unique_id = self._resolve_unique_id(
+            workflow_id=workflow_hint,
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            existing=data.get("unique_id"),
+        )
         body, marker_token = attach_hidden_marker(
             body,
             rfq_id=rfq_id,
             supplier_id=supplier_id,
+            unique_id=unique_id,
         )
 
         subject_base = data.get("subject") or DEFAULT_NEGOTIATION_SUBJECT
@@ -975,6 +1003,7 @@ class EmailDraftingAgent(BaseAgent):
 
         if marker_token:
             metadata["dispatch_token"] = marker_token
+        metadata["unique_id"] = unique_id
 
         draft = {
             "supplier_id": supplier_id,
@@ -988,7 +1017,14 @@ class EmailDraftingAgent(BaseAgent):
             "receiver": receiver,
             "contact_level": contact_level,
             "metadata": metadata,
+            "unique_id": unique_id,
         }
+
+        headers = {
+            "X-Procwise-RFQ-ID": rfq_id,
+            "X-Procwise-Unique-Id": unique_id,
+        }
+        draft["headers"] = headers
 
         negotiation_extra = {
             "negotiation_message": negotiation_message,
@@ -2793,6 +2829,37 @@ class EmailDraftingAgent(BaseAgent):
             normalised.append(candidate)
         return normalised
 
+    @staticmethod
+    def _normalise_tracking_value(value: Optional[Any]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    def _resolve_unique_id(
+        self,
+        *,
+        workflow_id: Optional[Any],
+        rfq_id: Optional[Any],
+        supplier_id: Optional[Any],
+        existing: Optional[Any] = None,
+    ) -> str:
+        existing_value = self._normalise_tracking_value(existing)
+        if existing_value:
+            return existing_value
+
+        workflow_hint = self._normalise_tracking_value(workflow_id)
+        if not workflow_hint:
+            workflow_hint = self._normalise_tracking_value(rfq_id)
+        if not workflow_hint:
+            workflow_hint = f"WF-{uuid.uuid4().hex}"
+
+        supplier_hint = self._normalise_tracking_value(supplier_id)
+        return generate_unique_email_id(workflow_hint, supplier_hint)
+
     def execute(self, context: AgentContext) -> AgentOutput:
         result = super().execute(context)
         try:
@@ -2830,28 +2897,60 @@ class EmailDraftingAgent(BaseAgent):
                 self._ensure_table_exists(conn)
 
                 workflow_id = draft.get("workflow_id")
-                if not workflow_id and isinstance(draft.get("metadata"), dict):
-                    workflow_id = draft["metadata"].get("workflow_id")
+                metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+                if not workflow_id:
+                    workflow_id = metadata.get("workflow_id")
                 if not workflow_id:
                     workflow_id = uuid.uuid4().hex
                 draft["workflow_id"] = workflow_id
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                draft["metadata"] = metadata
 
-                unique_id = draft.get("unique_id")
-                if not unique_id:
-                    unique_id = uuid.uuid4().hex
+                unique_id = self._resolve_unique_id(
+                    workflow_id=workflow_id,
+                    rfq_id=draft.get("rfq_id"),
+                    supplier_id=draft.get("supplier_id"),
+                    existing=draft.get("unique_id") or metadata.get("unique_id"),
+                )
                 draft["unique_id"] = unique_id
+                metadata.setdefault("unique_id", unique_id)
 
                 run_id = draft.get("run_id")
-                if not run_id and isinstance(draft.get("metadata"), dict):
-                    run_id = draft["metadata"].get("run_id")
+                if not run_id:
+                    run_id = metadata.get("run_id")
                 if run_id:
                     draft["run_id"] = run_id
+                    metadata.setdefault("run_id", run_id)
+
+                body_text = draft.get("body") or ""
+                marker_token = metadata.get("dispatch_token")
+                body_text, marker_token = attach_hidden_marker(
+                    body_text,
+                    rfq_id=draft.get("rfq_id"),
+                    supplier_id=draft.get("supplier_id"),
+                    token=marker_token,
+                    run_id=run_id,
+                    unique_id=unique_id,
+                )
+                draft["body"] = body_text
+                if marker_token:
+                    metadata["dispatch_token"] = marker_token
 
                 mailbox_hint = draft.get("mailbox")
-                if not mailbox_hint and isinstance(draft.get("metadata"), dict):
-                    mailbox_hint = draft["metadata"].get("mailbox")
+                if not mailbox_hint:
+                    mailbox_hint = metadata.get("mailbox")
                 if mailbox_hint:
                     draft["mailbox"] = mailbox_hint
+                    metadata.setdefault("mailbox", mailbox_hint)
+
+                headers = draft.get("headers") if isinstance(draft.get("headers"), dict) else {}
+                headers["X-Procwise-RFQ-ID"] = draft.get("rfq_id")
+                headers["X-Procwise-Unique-Id"] = unique_id
+                headers.setdefault("X-Procwise-Workflow-Id", workflow_id)
+                if mailbox_hint:
+                    headers.setdefault("X-Procwise-Mailbox", mailbox_hint)
+                draft["headers"] = headers
 
                 thread_index = draft.get("thread_index")
                 if not isinstance(thread_index, int) or thread_index < 1:
