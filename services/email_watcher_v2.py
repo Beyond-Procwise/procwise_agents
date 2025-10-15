@@ -609,70 +609,70 @@ class EmailWatcherV2:
                 isinstance(wait_result, AgentOutput)
                 and wait_result.status == AgentStatus.SUCCESS
             )
-            batch_ready = bool(wait_result.data.get("batch_ready")) if wait_success else False
-
             if not wait_success:
                 logger.debug(
-                    "Supplier responses wait failed for workflow %s; processing available responses",
+                    "Supplier responses wait failed for workflow %s; deferring negotiation",
                     tracker.workflow_id,
                 )
-            elif not batch_ready:
-                logger.info(
-                    "Timed out waiting for full supplier batch for workflow %s; processing available responses",
-                    tracker.workflow_id,
-                )
-
-            pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
-            if not pending_rows:
                 return
 
-            for row in pending_rows:
-                matched_response = tracker.matched_responses.get(row.get("unique_id"))
-                context = AgentContext(
-                    workflow_id=tracker.workflow_id,
-                    agent_id="EmailWatcherV2",
-                    user_id="system",
-                    input_data={
-                        "message": row.get("response_text", ""),
-                        "email_headers": {
-                            "message_id": matched_response.message_id if matched_response else None,
-                            "subject": matched_response.subject if matched_response else None,
-                            "from": matched_response.from_address if matched_response else None,
-                            "workflow_id": tracker.workflow_id,
-                            "unique_id": row.get("unique_id"),
-                            "supplier_id": row.get("supplier_id"),
-                            "price": row.get("price"),
-                            "lead_time": row.get("lead_time"),
-                            "received_time": row.get("received_time"),
-                        },
-                    },
+            batch_ready = bool(wait_result.data.get("batch_ready"))
+            if not batch_ready:
+                logger.info(
+                    "Supplier batch not complete for workflow %s; waiting for remaining responses",
+                    tracker.workflow_id,
                 )
+                return
+
+            responses = wait_result.data.get("supplier_responses") or []
+            expected = wait_result.data.get("expected_responses") or 0
+            collected = wait_result.data.get("collected_responses") or len(responses)
+            if expected and collected != expected:
+                logger.warning(
+                    "Supplier batch size mismatch for workflow %s (expected=%s collected=%s)",
+                    tracker.workflow_id,
+                    expected,
+                    collected,
+                )
+                return
+
+            processed_ids = [
+                uid
+                for uid in wait_result.data.get("unique_ids", [])
+                if isinstance(uid, str) and uid
+            ]
+            if not processed_ids:
+                processed_ids = [
+                    response.get("unique_id")
+                    for response in responses
+                    if isinstance(response, dict) and response.get("unique_id")
+                ]
+
+            negotiation_payload = dict(wait_result.data)
+            negotiation_payload.setdefault("supplier_responses", responses)
+            negotiation_payload.setdefault("supplier_responses_batch", responses)
+            negotiation_payload.setdefault("supplier_responses_count", len(responses))
+            negotiation_payload.setdefault("negotiation_batch", True)
+            negotiation_payload.setdefault(
+                "batch_metadata",
+                {
+                    "expected": expected,
+                    "collected": collected,
+                    "ready": True,
+                },
+            )
+
+            if self.negotiation_agent is not None:
                 try:
-                    output: AgentOutput = self.supplier_agent.execute(context)
+                    neg_context = AgentContext(
+                        workflow_id=tracker.workflow_id,
+                        agent_id="NegotiationAgent",
+                        user_id="system",
+                        input_data=negotiation_payload,
+                    )
+                    self.negotiation_agent.execute(neg_context)
                 except Exception:
-                    logger.exception("SupplierInteractionAgent failed for workflow %s", tracker.workflow_id)
-                    continue
-
-                processed_ids.append(row.get("unique_id"))
-
-                if (
-                    output
-                    and isinstance(output, AgentOutput)
-                    and output.status == AgentStatus.SUCCESS
-                    and output.next_agents
-                    and "NegotiationAgent" in output.next_agents
-                    and self.negotiation_agent is not None
-                ):
-                    try:
-                        neg_context = AgentContext(
-                            workflow_id=tracker.workflow_id,
-                            agent_id="NegotiationAgent",
-                            user_id="system",
-                            input_data=output.data,
-                        )
-                        self.negotiation_agent.execute(neg_context)
-                    except Exception:
-                        logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
+                    logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
 
         if processed_ids:
             supplier_response_repo.delete_responses(

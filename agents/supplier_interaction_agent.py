@@ -774,25 +774,33 @@ class SupplierInteractionAgent(BaseAgent):
 
             if rows:
                 responses = self._process_responses_concurrently(rows)
+                collected_count = len(responses)
+                result["collected_count"] = collected_count
+
+                expected_total = result.get("expected_count", 0)
                 unique_ids = [
                     self._coerce_text(response.get("unique_id"))
                     for response in responses
                     if self._coerce_text(response.get("unique_id"))
                 ]
-                result.update(
-                    {
-                        "ready": True,
-                        "responses": responses,
-                        "collected_count": len(responses),
-                        "unique_ids": unique_ids or result["unique_ids"],
-                    }
-                )
-                return result
 
-            logger.debug(
-                "Response poll returned no rows for workflow=%s despite completion",
-                workflow_key,
-            )
+                if expected_total and collected_count != expected_total:
+                    logger.debug(
+                        "Supplier batch incomplete for workflow=%s (received=%s/%s)",
+                        workflow_key,
+                        collected_count,
+                        expected_total,
+                    )
+                else:
+                    result.update(
+                        {
+                            "ready": True,
+                            "responses": responses,
+                            "collected_count": collected_count,
+                            "unique_ids": unique_ids or result["unique_ids"],
+                        }
+                    )
+                    return result
 
             if deadline is not None and time.monotonic() >= deadline:
                 break
@@ -1058,16 +1066,32 @@ class SupplierInteractionAgent(BaseAgent):
                 poll_interval=poll_interval,
             )
 
+            expected_total = summary.get("expected_count", 0)
+            collected_total = summary.get("collected_count", 0)
+            summary_ready = bool(summary.get("ready"))
+            responses = summary.get("responses", []) if summary_ready else []
+            batch_ready = summary_ready and (
+                not expected_total or collected_total == expected_total
+            )
+
             payload = {
                 "workflow_id": workflow_key,
-                "batch_ready": summary.get("ready", False),
-                "expected_responses": summary.get("expected_count", 0),
-                "collected_responses": summary.get("collected_count", 0),
-                "supplier_responses": summary.get("responses", []),
+                "batch_ready": batch_ready,
+                "expected_responses": expected_total,
+                "collected_responses": collected_total,
+                "supplier_responses": responses,
+                "supplier_responses_count": len(responses),
                 "unique_ids": summary.get("unique_ids", []),
+                "batch_metadata": {
+                    "expected": expected_total,
+                    "collected": collected_total,
+                    "ready": batch_ready,
+                },
+                "negotiation_batch": batch_ready,
+                "supplier_responses_batch": responses,
             }
 
-            next_agents = ["NegotiationAgent"] if payload["batch_ready"] and payload["supplier_responses"] else []
+            next_agents = ["NegotiationAgent"] if batch_ready and responses else []
 
             return self._with_plan(
                 context,
