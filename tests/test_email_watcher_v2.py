@@ -29,19 +29,34 @@ class StubSupplierAgent:
         self.contexts.append(context)
         action = context.input_data.get("action") if isinstance(context.input_data, dict) else None
         if action == "await_workflow_batch":
+            workflow_id = context.input_data.get("workflow_id")
+            pending = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+            first_row = pending[0] if pending else {}
+            unique_id = first_row.get("unique_id") or workflow_id
+            response = {
+                "unique_id": unique_id,
+                "workflow_id": workflow_id,
+                "supplier_id": first_row.get("supplier_id"),
+            }
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={
+                    "workflow_id": workflow_id,
                     "batch_ready": True,
                     "expected_responses": 1,
                     "collected_responses": 1,
-                    "supplier_responses": [
-                        {
-                            "unique_id": context.input_data.get("workflow_id"),
-                        }
-                    ],
+                    "supplier_responses": [response],
+                    "supplier_responses_batch": [response],
+                    "supplier_responses_count": 1,
+                    "unique_ids": [unique_id],
+                    "batch_metadata": {
+                        "expected": 1,
+                        "collected": 1,
+                        "ready": True,
+                    },
+                    "negotiation_batch": True,
                 },
-                next_agents=[],
+                next_agents=["NegotiationAgent"],
             )
         return AgentOutput(status=AgentStatus.SUCCESS, data={}, next_agents=[])
 
@@ -144,18 +159,19 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert supplier_agent.contexts, "Supplier agent should be invoked"
     assert fetcher.calls >= 1
 
-    message_contexts = [
+    await_contexts = [
         ctx
         for ctx in supplier_agent.contexts
         if isinstance(getattr(ctx, "input_data", None), dict)
-        and "email_headers" in ctx.input_data
+        and ctx.input_data.get("action") == "await_workflow_batch"
     ]
-    assert message_contexts, "Supplier agent should process email context"
-    context = message_contexts[0]
-    headers = context.input_data["email_headers"]
-    assert headers["unique_id"] == unique_id
-    assert headers["received_time"] is not None
-    assert "Thanks for the opportunity" in context.input_data["message"]
+    assert len(await_contexts) >= 1
+
+    assert negotiation_agent.contexts, "Negotiation agent should be invoked"
+    neg_context = negotiation_agent.contexts[0]
+    assert neg_context.input_data.get("negotiation_batch") is True
+    assert neg_context.input_data.get("supplier_responses_count") == 1
+    assert neg_context.input_data.get("supplier_responses")[0]["unique_id"] == unique_id
 
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []

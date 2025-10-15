@@ -408,17 +408,35 @@ class NegotiationAgent(BaseAgent):
             configured_workers = getattr(self.agent_nick.settings, "negotiation_parallel_workers", None)
             if configured_workers is not None:
                 try:
-                    max_workers = max(1, int(configured_workers))
+                    configured_workers = int(configured_workers)
                 except Exception:
-                    max_workers = None
-            else:
-                max_workers = None
+                    configured_workers = None
+            max_workers = configured_workers if configured_workers and configured_workers > 0 else None
         except Exception:
             max_workers = None
 
-        if not max_workers:
+        if max_workers is None:
             cpu_default = os.cpu_count() or 4
-            max_workers = min(len(prepared_entries), max(1, cpu_default))
+            max_workers = max(1, cpu_default)
+
+        unique_suppliers: Set[str] = set()
+        for entry in prepared_entries:
+            supplier_id = entry.get("supplier_id") or entry.get("supplier")
+            if supplier_id is None:
+                continue
+            try:
+                supplier_key = str(supplier_id).strip()
+            except Exception:
+                continue
+            if supplier_key:
+                unique_suppliers.add(supplier_key)
+
+        desired_workers = max(1, len(unique_suppliers)) if unique_suppliers else len(prepared_entries)
+        if desired_workers <= 0:
+            desired_workers = len(prepared_entries)
+
+        max_workers = max(desired_workers, max_workers)
+        max_workers = min(max_workers, len(prepared_entries))
 
         futures: List[Tuple[Dict[str, Any], Any]] = []
         aggregated_results: List[Dict[str, Any]] = []

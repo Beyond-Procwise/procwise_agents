@@ -1826,6 +1826,9 @@ def test_run_await_workflow_batch(monkeypatch):
     assert output.data["batch_ready"] is True
     assert output.data["expected_responses"] == 2
     assert output.data["collected_responses"] == 2
+    assert output.data["supplier_responses_count"] == 2
+    assert output.data["negotiation_batch"] is True
+    assert output.next_agents == ["NegotiationAgent"]
     assert {resp.get("unique_id") for resp in output.data["supplier_responses"]} == {
         "uid-1",
         "uid-2",
