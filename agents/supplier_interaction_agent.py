@@ -192,6 +192,7 @@ class SupplierInteractionAgent(BaseAgent):
         timeout: Optional[int],
         poll_interval: Optional[int],
         expected_total: Optional[int] = None,
+        after_dispatched_at: Optional[datetime] = None,
     ) -> Tuple[List[str], float]:
         start = time.monotonic()
         collected: List[str] = []
@@ -233,7 +234,7 @@ class SupplierInteractionAgent(BaseAgent):
         while True:
             try:
                 workflow_email_tracking_repo.init_schema()
-                unique_rows = workflow_email_tracking_repo.load_workflow_unique_ids(
+                unique_rows = workflow_email_tracking_repo.load_workflow_rows(
                     workflow_id=workflow_id
                 )
             except Exception:  # pragma: no cover - defensive logging
@@ -242,7 +243,15 @@ class SupplierInteractionAgent(BaseAgent):
                 )
                 unique_rows = []
 
-            for value in unique_rows:
+            for row in unique_rows:
+                dispatched_at = getattr(row, "dispatched_at", None)
+                message_id = getattr(row, "message_id", None)
+                if not dispatched_at or not message_id:
+                    continue
+                if after_dispatched_at is not None and dispatched_at <= after_dispatched_at:
+                    continue
+
+                value = getattr(row, "unique_id", None)
                 text = self._coerce_text(value)
                 if text and text not in seen:
                     seen.add(text)
@@ -275,6 +284,7 @@ class SupplierInteractionAgent(BaseAgent):
         timeout: Optional[int],
         poll_interval: Optional[int],
         expected_total: Optional[int] = None,
+        after_dispatched_at: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         if not workflow_id:
             return None
@@ -287,6 +297,7 @@ class SupplierInteractionAgent(BaseAgent):
             timeout=timeout,
             poll_interval=poll_interval,
             expected_total=expected_total,
+            after_dispatched_at=after_dispatched_at,
         )
 
         coordinator = getattr(self, "_response_coordinator", None)
@@ -667,11 +678,17 @@ class SupplierInteractionAgent(BaseAgent):
         deadline = start + total_timeout if total_timeout > 0 else None
         interval = self._normalise_poll_interval(poll_interval)
 
+        initial_metadata = self._load_dispatch_metadata(workflow_key)
+        initial_dispatched_at = None
+        if initial_metadata:
+            initial_dispatched_at = initial_metadata.get("last_dispatched_at")
+
         dispatch_summary = self._await_dispatch_ready(
             workflow_id=workflow_key,
             unique_ids=[],
             timeout=timeout,
             poll_interval=poll_interval,
+            after_dispatched_at=initial_dispatched_at,
         )
 
         if not dispatch_summary or not dispatch_summary.get("complete"):
@@ -688,7 +705,17 @@ class SupplierInteractionAgent(BaseAgent):
         while True:
             metadata = self._load_dispatch_metadata(workflow_key)
             if metadata is not None:
-                break
+                if initial_dispatched_at is not None:
+                    latest_dispatched_at = metadata.get("last_dispatched_at")
+                    if latest_dispatched_at is None or latest_dispatched_at <= initial_dispatched_at:
+                        logger.debug(
+                            "Ignoring dispatch metadata for workflow=%s at %s (awaiting newer batch)",
+                            workflow_key,
+                            latest_dispatched_at,
+                        )
+                        metadata = None
+                if metadata is not None:
+                    break
 
             if deadline is not None and time.monotonic() >= deadline:
                 return result
@@ -705,13 +732,25 @@ class SupplierInteractionAgent(BaseAgent):
                 time.sleep(0)
 
         dispatch_rows: List[Any] = list(metadata.get("rows") or [])
-        expected_count = len(dispatch_rows)
-        result["expected_count"] = expected_count
+        last_dispatched_at = metadata.get("last_dispatched_at")
+        if last_dispatched_at is not None:
+            batch_rows = [
+                row
+                for row in dispatch_rows
+                if getattr(row, "dispatched_at", None) == last_dispatched_at
+            ]
+            if not batch_rows:
+                batch_rows = dispatch_rows
+        else:
+            batch_rows = dispatch_rows
+
         result["unique_ids"] = [
             self._coerce_text(getattr(row, "unique_id", None))
-            for row in dispatch_rows
+            for row in batch_rows
             if self._coerce_text(getattr(row, "unique_id", None))
         ]
+        expected_count = len(result["unique_ids"])
+        result["expected_count"] = expected_count
 
         if expected_count <= 0:
             logger.info(
@@ -765,11 +804,22 @@ class SupplierInteractionAgent(BaseAgent):
         attempts = 0
         max_attempts_without_deadline = 3 if interval > 0 else 1
 
+        summary_unique_ids = [
+            self._coerce_text(uid)
+            for uid in response_summary.get("unique_ids", [])
+            if self._coerce_text(uid)
+        ]
+        if summary_unique_ids:
+            result["unique_ids"] = summary_unique_ids
+            result["expected_count"] = len(summary_unique_ids)
+        unique_filter = {uid for uid in result["unique_ids"] if uid}
+
         while True:
             rows = self._poll_supplier_response_rows(
                 workflow_key,
                 metadata=metadata,
                 include_processed=False,
+                unique_filter=unique_filter or None,
             )
 
             if rows:
