@@ -199,7 +199,14 @@ def test_supplier_interaction_wait_for_response(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
@@ -421,20 +428,47 @@ def test_collect_workflow_unique_ids_merges_repo(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
-    sequence = [[], ["uid-seed", "uid-extra"]]
+    sequence = [
+        [],
+        [
+            SimpleNamespace(
+                unique_id="uid-seed",
+                dispatched_at=datetime.fromtimestamp(10),
+                message_id="msg-seed",
+            ),
+            SimpleNamespace(
+                unique_id="uid-extra",
+                dispatched_at=datetime.fromtimestamp(11),
+                message_id="msg-extra",
+            ),
+        ],
+    ]
 
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.workflow_email_tracking_repo.init_schema",
         lambda: None,
     )
 
-    def fake_load_unique_ids(*, workflow_id):
+    def fake_load_workflow_rows(*, workflow_id):
         assert workflow_id == "wf-extra"
-        return sequence.pop(0) if sequence else ["uid-seed", "uid-extra"]
+        if sequence:
+            return sequence.pop(0)
+        return [
+            SimpleNamespace(
+                unique_id="uid-seed",
+                dispatched_at=datetime.fromtimestamp(10),
+                message_id="msg-seed",
+            ),
+            SimpleNamespace(
+                unique_id="uid-extra",
+                dispatched_at=datetime.fromtimestamp(11),
+                message_id="msg-extra",
+            ),
+        ]
 
     monkeypatch.setattr(
-        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_unique_ids",
-        fake_load_unique_ids,
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_rows",
+        fake_load_workflow_rows,
     )
 
     sleep_calls: List[float] = []
@@ -603,7 +637,14 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
             return count_sequence.popleft()
         return 1
 
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
@@ -754,7 +795,14 @@ def test_wait_for_multiple_responses_aggregates_by_workflow(monkeypatch):
             },
         ]
 
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
@@ -892,8 +940,19 @@ def test_wait_for_multiple_responses_realigns_mixed_workflows(monkeypatch):
         lambda: None,
     )
     monkeypatch.setattr(
-        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_unique_ids",
-        lambda **_: ["uid-1", "uid-2"],
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_rows",
+        lambda **_: [
+            SimpleNamespace(
+                unique_id="uid-1",
+                dispatched_at=datetime.fromtimestamp(100),
+                message_id="msg-1",
+            ),
+            SimpleNamespace(
+                unique_id="uid-2",
+                dispatched_at=datetime.fromtimestamp(100),
+                message_id="msg-2",
+            ),
+        ],
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.workflow_email_tracking_repo.lookup_workflow_for_unique",
@@ -1870,7 +1929,15 @@ def test_await_full_response_batch_requires_complete_population(monkeypatch):
         }
 
     monkeypatch.setattr(agent, "_await_dispatch_ready", fake_dispatch_ready)
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
 
     poll_calls: List[Dict[str, Any]] = []
 
@@ -1879,6 +1946,7 @@ def test_await_full_response_batch_requires_complete_population(monkeypatch):
         return []
 
     monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_: None)
 
     class DummyCoordinator:
         def __init__(self):
@@ -1943,7 +2011,15 @@ def test_await_full_response_batch_returns_responses_when_ready(monkeypatch):
         "completed_dispatches": 2,
         "complete": True,
     })
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
 
     responses = [
         {
@@ -1976,6 +2052,8 @@ def test_await_full_response_batch_returns_responses_when_ready(monkeypatch):
 
     monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
     monkeypatch.setattr(agent, "_process_responses_concurrently", lambda rows: list(rows))
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_: None)
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_: None)
 
     class DummyCoordinator:
         def __init__(self):
@@ -2060,7 +2138,15 @@ def test_await_full_response_batch_ignores_prior_responses(monkeypatch):
         "completed_dispatches": 2,
         "complete": True,
     })
-    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+
+    metadata_sequence = deque([None, metadata])
+
+    def fake_metadata(*_args, **_kwargs):
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
 
     responses = [
         {
@@ -2093,6 +2179,7 @@ def test_await_full_response_batch_ignores_prior_responses(monkeypatch):
 
     monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
     monkeypatch.setattr(agent, "_process_responses_concurrently", lambda rows: list(rows))
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_: None)
 
     class DummyCoordinator:
         def __init__(self):
@@ -2126,5 +2213,139 @@ def test_await_full_response_batch_ignores_prior_responses(monkeypatch):
         "uid-new-2",
     }
     assert poll_calls and poll_calls[0]["unique_filter"] == {"uid-new-1", "uid-new-2"}
+
+
+def test_await_full_response_batch_waits_for_new_dispatch(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    earlier = datetime.fromtimestamp(50)
+    latest = datetime.fromtimestamp(100)
+
+    old_rows = [
+        SimpleNamespace(
+            unique_id="uid-old-1",
+            supplier_id="SUP-OLD1",
+            dispatched_at=earlier,
+            message_id="old-1",
+        )
+    ]
+    new_rows = [
+        SimpleNamespace(
+            unique_id="uid-new-1",
+            supplier_id="SUP-NEW1",
+            dispatched_at=latest,
+            message_id="new-1",
+        ),
+        SimpleNamespace(
+            unique_id="uid-new-2",
+            supplier_id="SUP-NEW2",
+            dispatched_at=latest,
+            message_id="new-2",
+        ),
+    ]
+
+    metadata_old = {
+        "rows": list(old_rows),
+        "last_dispatched_at": earlier,
+        "unique_ids": [row.unique_id for row in old_rows],
+    }
+    metadata_new = {
+        "rows": list(old_rows) + list(new_rows),
+        "last_dispatched_at": latest,
+        "unique_ids": [row.unique_id for row in old_rows + new_rows],
+    }
+
+    metadata_calls: List[str] = []
+    metadata_sequence = deque([metadata_old, metadata_old, None, metadata_new])
+
+    def fake_metadata(workflow_id: str) -> Optional[Dict[str, Any]]:
+        metadata_calls.append(workflow_id)
+        if metadata_sequence:
+            return metadata_sequence.popleft()
+        return metadata_new
+
+    dispatch_calls: List[Dict[str, Any]] = []
+
+    def fake_dispatch_ready(**kwargs):
+        dispatch_calls.append(kwargs)
+        assert kwargs.get("after_dispatched_at") == earlier
+        return {
+            "workflow_id": kwargs["workflow_id"],
+            "unique_ids": ["uid-new-1", "uid-new-2"],
+            "expected_dispatches": 2,
+            "completed_dispatches": 2,
+            "complete": True,
+        }
+
+    responses = [
+        {
+            "workflow_id": "wf-refresh",
+            "unique_id": "uid-new-1",
+            "supplier_id": "SUP-NEW1",
+            "response_text": "Quote 1",
+            "subject": "Re: RFQ-1",
+            "message_id": "msg-1",
+            "from_addr": "one@example.com",
+            "received_time": datetime.fromtimestamp(101),
+        },
+        {
+            "workflow_id": "wf-refresh",
+            "unique_id": "uid-new-2",
+            "supplier_id": "SUP-NEW2",
+            "response_text": "Quote 2",
+            "subject": "Re: RFQ-2",
+            "message_id": "msg-2",
+            "from_addr": "two@example.com",
+            "received_time": datetime.fromtimestamp(102),
+        },
+    ]
+
+    poll_calls: List[Dict[str, Any]] = []
+
+    def fake_poll(*args, **kwargs):
+        poll_calls.append(dict(kwargs))
+        return list(responses)
+
+    class DummyCoordinator:
+        def __init__(self):
+            self.response_calls: List[Dict[str, Any]] = []
+
+        def await_response_population(self, **kwargs):
+            self.response_calls.append(kwargs)
+            assert set(kwargs["unique_ids"]) == {"uid-new-1", "uid-new-2"}
+            return {
+                "workflow_id": kwargs["workflow_id"],
+                "expected_responses": 2,
+                "completed_responses": 2,
+                "complete": True,
+                "unique_ids": list(kwargs["unique_ids"]),
+            }
+
+    coordinator = DummyCoordinator()
+    agent._response_coordinator = coordinator  # type: ignore[assignment]
+
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", fake_metadata)
+    monkeypatch.setattr(agent, "_await_dispatch_ready", fake_dispatch_ready)
+    monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
+    monkeypatch.setattr(agent, "_process_responses_concurrently", lambda rows: list(rows))
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_: None)
+
+    result = agent._await_full_response_batch(
+        "wf-refresh",
+        timeout=5,
+        poll_interval=1,
+    )
+
+    assert result["ready"] is True
+    assert result["expected_count"] == 2
+    assert result["collected_count"] == 2
+    assert {resp.get("unique_id") for resp in result["responses"]} == {
+        "uid-new-1",
+        "uid-new-2",
+    }
+    assert poll_calls and poll_calls[0]["unique_filter"] == {"uid-new-1", "uid-new-2"}
+    assert metadata_calls and metadata_calls[0] == "wf-refresh"
+    assert dispatch_calls and dispatch_calls[0]["after_dispatched_at"] == earlier
 
 
