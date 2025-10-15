@@ -1679,6 +1679,7 @@ class Orchestrator:
         email_drafts = self._extract_drafts(email_result)
 
         workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
+        email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
         coordinator = SupplierResponseWorkflow()
@@ -1753,6 +1754,67 @@ class Orchestrator:
                 if isinstance(entry, dict):
                     drafts.append(dict(entry))
         return drafts
+
+    @staticmethod
+    def _filter_drafts_for_workflow(
+        drafts: List[Dict[str, Any]], workflow_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        if not workflow_id:
+            return drafts
+
+        filtered: List[Dict[str, Any]] = []
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+
+            matches = Orchestrator._draft_workflow_candidates(draft)
+            if matches and workflow_id not in matches:
+                continue
+
+            adjusted = dict(draft)
+            if not matches:
+                adjusted.setdefault("workflow_id", workflow_id)
+                metadata = adjusted.get("metadata")
+                if metadata is None:
+                    adjusted["metadata"] = {"workflow_id": workflow_id}
+                elif isinstance(metadata, dict):
+                    metadata.setdefault("workflow_id", workflow_id)
+            filtered.append(adjusted)
+
+        return filtered
+
+    @staticmethod
+    def _draft_workflow_candidates(draft: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+
+        def _collect(value: Any) -> None:
+            if value in (None, ""):
+                return
+            try:
+                text = str(value).strip()
+            except Exception:
+                return
+            if text:
+                candidates.append(text)
+
+        for key in ("workflow_id", "workflowId"):
+            _collect(draft.get(key))
+
+        metadata = draft.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("workflow_id", "process_workflow_id"):
+                _collect(metadata.get(key))
+            context_meta = metadata.get("context")
+            if isinstance(context_meta, dict):
+                for key in ("workflow_id", "workflowId", "process_workflow_id"):
+                    _collect(context_meta.get(key))
+
+        workflow_section = draft.get("workflow")
+        if isinstance(workflow_section, dict):
+            for key in ("workflow_id", "workflowId", "id"):
+                _collect(workflow_section.get(key))
+
+        return candidates
 
     @staticmethod
     def _select_workflow_identifier(drafts: List[Dict[str, Any]], default: Optional[str]) -> Optional[str]:
