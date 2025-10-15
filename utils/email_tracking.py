@@ -10,7 +10,7 @@ import string
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 _TRACKING_PATTERN = re.compile(r"<!--\s*PROCWISE:(\{.*?\})\s*-->", re.IGNORECASE | re.DOTALL)
@@ -219,4 +219,33 @@ def extract_unique_id_from_body(body: Optional[str]) -> Optional[str]:
 
     metadata = extract_tracking_metadata(body)
     return metadata.unique_id if metadata else None
+
+
+def extract_unique_id_from_headers(headers: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Return the canonical unique identifier from email ``headers`` if present."""
+
+    if not headers:
+        return None
+
+    candidate_keys = (
+        "X-Procwise-Unique-Id",
+        "X-Procwise-Unique-ID",
+        "X-Procwise-Uid",
+    )
+
+    for key in candidate_keys:
+        value = headers.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    return text
+        else:
+            text = str(value).strip()
+            if text:
+                return text
+
+    return None
 

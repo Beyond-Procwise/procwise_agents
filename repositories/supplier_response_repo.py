@@ -39,6 +39,9 @@ ON proc.supplier_response (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_supplier_response_supplier
 ON proc.supplier_response (supplier_id);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_response_unique
+ON proc.supplier_response (unique_id);
 """
 
 @dataclass
