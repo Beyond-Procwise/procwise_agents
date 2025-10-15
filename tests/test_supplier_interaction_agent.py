@@ -2006,3 +2006,125 @@ def test_await_full_response_batch_returns_responses_when_ready(monkeypatch):
     assert {resp.get("unique_id") for resp in result["responses"]} == {"uid-1", "uid-2"}
     assert coordinator.response_calls and coordinator.response_calls[0]["wait_for_all"] is True
     assert poll_calls and poll_calls[0]["include_processed"] is False
+
+
+def test_await_full_response_batch_ignores_prior_responses(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    earlier = datetime.fromtimestamp(0)
+    latest = datetime.fromtimestamp(10)
+
+    dispatch_rows = [
+        SimpleNamespace(
+            unique_id="uid-old-1",
+            supplier_id="SUP-OLD1",
+            dispatched_at=earlier,
+            message_id="old-1",
+        ),
+        SimpleNamespace(
+            unique_id="uid-old-2",
+            supplier_id="SUP-OLD2",
+            dispatched_at=earlier,
+            message_id="old-2",
+        ),
+        SimpleNamespace(
+            unique_id="uid-new-1",
+            supplier_id="SUP-NEW1",
+            dispatched_at=latest,
+            message_id="new-1",
+        ),
+        SimpleNamespace(
+            unique_id="uid-new-2",
+            supplier_id="SUP-NEW2",
+            dispatched_at=latest,
+            message_id="new-2",
+        ),
+    ]
+
+    metadata = {
+        "rows": dispatch_rows,
+        "last_dispatched_at": latest,
+        "unique_ids": [
+            "uid-old-1",
+            "uid-old-2",
+            "uid-new-1",
+            "uid-new-2",
+        ],
+    }
+
+    monkeypatch.setattr(agent, "_await_dispatch_ready", lambda **_: {
+        "workflow_id": "wf-bulk",
+        "unique_ids": ["uid-new-1", "uid-new-2"],
+        "expected_dispatches": 2,
+        "completed_dispatches": 2,
+        "complete": True,
+    })
+    monkeypatch.setattr(agent, "_load_dispatch_metadata", lambda *_args, **_kwargs: metadata)
+
+    responses = [
+        {
+            "workflow_id": "wf-bulk",
+            "unique_id": "uid-new-1",
+            "supplier_id": "SUP-NEW1",
+            "response_text": "Quote 1",
+            "subject": "Re: RFQ-1",
+            "message_id": "m1",
+            "from_addr": "one@example.com",
+            "received_time": datetime.fromtimestamp(1),
+        },
+        {
+            "workflow_id": "wf-bulk",
+            "unique_id": "uid-new-2",
+            "supplier_id": "SUP-NEW2",
+            "response_text": "Quote 2",
+            "subject": "Re: RFQ-2",
+            "message_id": "m2",
+            "from_addr": "two@example.com",
+            "received_time": datetime.fromtimestamp(2),
+        },
+    ]
+
+    poll_calls: List[Dict[str, Any]] = []
+
+    def fake_poll(*args, **kwargs):
+        poll_calls.append(dict(kwargs))
+        return responses
+
+    monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
+    monkeypatch.setattr(agent, "_process_responses_concurrently", lambda rows: list(rows))
+
+    class DummyCoordinator:
+        def __init__(self):
+            self.response_calls: List[Dict[str, Any]] = []
+
+        def await_response_population(self, **kwargs):
+            self.response_calls.append(kwargs)
+            assert set(kwargs["unique_ids"]) == {"uid-new-1", "uid-new-2"}
+            return {
+                "workflow_id": kwargs["workflow_id"],
+                "expected_responses": 2,
+                "completed_responses": 2,
+                "complete": True,
+                "unique_ids": list(kwargs["unique_ids"]),
+            }
+
+    coordinator = DummyCoordinator()
+    agent._response_coordinator = coordinator  # type: ignore[assignment]
+
+    result = agent._await_full_response_batch(
+        "wf-bulk",
+        timeout=5,
+        poll_interval=1,
+    )
+
+    assert result["ready"] is True
+    assert result["expected_count"] == 2
+    assert result["collected_count"] == 2
+    assert {resp.get("unique_id") for resp in result["responses"]} == {
+        "uid-new-1",
+        "uid-new-2",
+    }
+    assert poll_calls and poll_calls[0]["unique_filter"] == {"uid-new-1", "uid-new-2"}
+
+

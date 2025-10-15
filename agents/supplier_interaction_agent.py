@@ -705,13 +705,25 @@ class SupplierInteractionAgent(BaseAgent):
                 time.sleep(0)
 
         dispatch_rows: List[Any] = list(metadata.get("rows") or [])
-        expected_count = len(dispatch_rows)
-        result["expected_count"] = expected_count
+        last_dispatched_at = metadata.get("last_dispatched_at")
+        if last_dispatched_at is not None:
+            batch_rows = [
+                row
+                for row in dispatch_rows
+                if getattr(row, "dispatched_at", None) == last_dispatched_at
+            ]
+            if not batch_rows:
+                batch_rows = dispatch_rows
+        else:
+            batch_rows = dispatch_rows
+
         result["unique_ids"] = [
             self._coerce_text(getattr(row, "unique_id", None))
-            for row in dispatch_rows
+            for row in batch_rows
             if self._coerce_text(getattr(row, "unique_id", None))
         ]
+        expected_count = len(result["unique_ids"])
+        result["expected_count"] = expected_count
 
         if expected_count <= 0:
             logger.info(
@@ -765,11 +777,22 @@ class SupplierInteractionAgent(BaseAgent):
         attempts = 0
         max_attempts_without_deadline = 3 if interval > 0 else 1
 
+        summary_unique_ids = [
+            self._coerce_text(uid)
+            for uid in response_summary.get("unique_ids", [])
+            if self._coerce_text(uid)
+        ]
+        if summary_unique_ids:
+            result["unique_ids"] = summary_unique_ids
+            result["expected_count"] = len(summary_unique_ids)
+        unique_filter = {uid for uid in result["unique_ids"] if uid}
+
         while True:
             rows = self._poll_supplier_response_rows(
                 workflow_key,
                 metadata=metadata,
                 include_processed=False,
+                unique_filter=unique_filter or None,
             )
 
             if rows:
