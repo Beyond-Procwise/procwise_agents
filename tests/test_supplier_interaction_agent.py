@@ -15,7 +15,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
-from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories import (
+    draft_rfq_emails_repo,
+    supplier_response_repo,
+    workflow_email_tracking_repo,
+)
 from repositories.supplier_response_repo import SupplierResponseRow
 
 
@@ -138,6 +142,18 @@ def stub_response_coordinator(monkeypatch):
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.SupplierResponseWorkflow",
         lambda: StubCoordinator(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def reduce_response_gate_interval(monkeypatch):
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.SupplierInteractionAgent.RESPONSE_GATE_POLL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.SupplierInteractionAgent.WORKFLOW_POLL_INTERVAL_SECONDS",
+        0.01,
     )
 
 
@@ -1729,6 +1745,40 @@ def test_run_await_workflow_batch(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
+    def fake_expected_unique_ids_and_last_dispatch(*, workflow_id, run_id=None):
+        assert workflow_id == "wf-batch"
+        return {"uid-1", "uid-2"}, {"uid-1": "SUP-1", "uid-2": "SUP-2"}, datetime.fromtimestamp(0)
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch",
+        fake_expected_unique_ids_and_last_dispatch,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.init_schema",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_rows",
+        lambda *, workflow_id: [
+            SimpleNamespace(
+                workflow_id=workflow_id,
+                unique_id="uid-1",
+                supplier_id="SUP-1",
+                message_id="m1",
+                subject="RFQ-1",
+                dispatched_at=datetime.fromtimestamp(0),
+            ),
+            SimpleNamespace(
+                workflow_id=workflow_id,
+                unique_id="uid-2",
+                supplier_id="SUP-2",
+                message_id="m2",
+                subject="RFQ-2",
+                dispatched_at=datetime.fromtimestamp(0),
+            ),
+        ],
+    )
+
     metadata = {
         "rows": [
             SimpleNamespace(
@@ -1754,19 +1804,6 @@ def test_run_await_workflow_batch(monkeypatch):
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
         lambda: None,
-    )
-
-    count_sequence = deque([1, 2])
-
-    def fake_count_pending(*, workflow_id, include_processed=False, **_kwargs):
-        assert include_processed is False
-        if count_sequence:
-            return count_sequence.popleft()
-        return 2
-
-    monkeypatch.setattr(
-        "agents.supplier_interaction_agent.supplier_response_repo.count_pending",
-        fake_count_pending,
     )
 
     def fake_fetch_pending(*, workflow_id, include_processed=False):
@@ -1833,6 +1870,74 @@ def test_run_await_workflow_batch(monkeypatch):
         "uid-1",
         "uid-2",
     }
+
+
+def test_dispatch_gate_requires_all_expected(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch",
+        lambda **_: ({"uid-1", "uid-2"}, {"uid-1": "SUP-1"}, datetime.fromtimestamp(0)),
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.init_schema",
+        lambda: None,
+    )
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.workflow_email_tracking_repo.load_workflow_rows",
+        lambda *, workflow_id: [
+            SimpleNamespace(
+                workflow_id=workflow_id,
+                unique_id="uid-1",
+                supplier_id="SUP-1",
+                message_id="m1",
+                dispatched_at=datetime.fromtimestamp(0),
+            )
+        ],
+    )
+    monkeypatch.setattr("agents.supplier_interaction_agent.time.sleep", lambda *_args, **_kwargs: None)
+
+    summary = agent._await_dispatch_gate("wf-batch", timeout=0, poll_interval=0)
+
+    assert summary["complete"] is False
+    assert summary["expected_count"] == 2
+    assert summary["unique_ids"] == ["uid-1", "uid-2"]
+
+
+def test_response_gate_requires_all_responses(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.init_schema", lambda: None
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
+        lambda **_: [
+            {
+                "workflow_id": "wf-batch",
+                "unique_id": "uid-1",
+                "supplier_id": "SUP-1",
+                "response_text": "Quote",
+                "subject": "Re: RFQ",
+                "message_id": "m1",
+                "from_addr": "one@example.com",
+                "received_time": datetime.fromtimestamp(0),
+            }
+        ],
+    )
+
+    summary = agent._await_response_gate(
+        "wf-batch",
+        expected_unique_ids=["uid-1", "uid-2"],
+        expected_count=2,
+        timeout=0,
+    )
+
+    assert summary["complete"] is False
+    assert summary["collected_count"] == 1
 
 
 def test_await_full_response_batch_requires_complete_population(monkeypatch):

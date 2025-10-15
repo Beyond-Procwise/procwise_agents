@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
 from services.supplier_response_workflow import SupplierResponseWorkflow
-from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories import (
+    draft_rfq_emails_repo,
+    supplier_response_repo,
+    workflow_email_tracking_repo,
+)
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
 
@@ -33,6 +37,7 @@ class SupplierInteractionAgent(BaseAgent):
     )
 
     WORKFLOW_POLL_INTERVAL_SECONDS = 30
+    RESPONSE_GATE_POLL_SECONDS = 30
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
@@ -636,6 +641,239 @@ class SupplierInteractionAgent(BaseAgent):
 
         return []
 
+    def _expected_dispatch_context(
+        self, workflow_id: str
+    ) -> Dict[str, Any]:
+        """Resolve workflow dispatch expectations from draft storage."""
+
+        expected_ids: Set[str] = set()
+        supplier_index: Dict[str, Optional[str]] = {}
+        last_dispatched_at: Optional[datetime] = None
+
+        try:
+            draft_ids, supplier_map, last_dt = (
+                draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
+                    workflow_id=workflow_id
+                )
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Failed to load draft expectations for workflow=%s", workflow_id,
+                exc_info=True,
+            )
+            draft_ids, supplier_map, last_dt = set(), {}, None
+
+        for uid in draft_ids:
+            text = self._coerce_text(uid)
+            if text:
+                expected_ids.add(text)
+
+        for uid, supplier in supplier_map.items():
+            key = self._coerce_text(uid)
+            if not key:
+                continue
+            supplier_index[key] = self._coerce_text(supplier)
+
+        if last_dt:
+            last_dispatched_at = last_dt
+
+        return {
+            "expected_unique_ids": expected_ids,
+            "supplier_index": supplier_index,
+            "last_dispatched_at": last_dispatched_at,
+            "expected_count": len(expected_ids),
+        }
+
+    def _await_dispatch_gate(
+        self,
+        workflow_id: str,
+        *,
+        timeout: Optional[int],
+        poll_interval: Optional[int],
+    ) -> Dict[str, Any]:
+        """Ensure all expected supplier dispatches have been sent."""
+
+        workflow_key = self._coerce_text(workflow_id)
+        summary: Dict[str, Any] = {
+            "complete": False,
+            "expected_count": 0,
+            "unique_ids": [],
+            "rows": [],
+        }
+
+        if not workflow_key:
+            return summary
+
+        try:
+            total_timeout = float(timeout) if timeout is not None else 0.0
+        except Exception:
+            total_timeout = 0.0
+
+        if total_timeout < 0:
+            total_timeout = 0.0
+
+        interval = self._normalise_poll_interval(poll_interval)
+        if interval <= 0:
+            interval = 1.0
+
+        start = time.monotonic()
+        deadline = start + total_timeout if total_timeout > 0 else None
+
+        while True:
+            expectations = self._expected_dispatch_context(workflow_key)
+            expected_ids: Set[str] = expectations.get("expected_unique_ids", set())
+
+            try:
+                workflow_email_tracking_repo.init_schema()
+                rows = workflow_email_tracking_repo.load_workflow_rows(
+                    workflow_id=workflow_key
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Failed to load dispatch metadata while gating workflow=%s",
+                    workflow_key,
+                )
+                rows = []
+
+            dispatched_rows = [
+                row
+                for row in rows
+                if getattr(row, "message_id", None)
+                and getattr(row, "dispatched_at", None)
+            ]
+            dispatched_ids = {
+                self._coerce_text(getattr(row, "unique_id", None))
+                for row in dispatched_rows
+                if self._coerce_text(getattr(row, "unique_id", None))
+            }
+
+            if not expected_ids and dispatched_ids:
+                expected_ids = set(dispatched_ids)
+
+            expected_total = max(len(expected_ids), expectations.get("expected_count", 0))
+
+            summary.update(
+                {
+                    "expected_count": expected_total,
+                    "unique_ids": sorted(expected_ids),
+                    "rows": dispatched_rows,
+                }
+            )
+
+            if expected_total == 0 and not dispatched_rows:
+                logger.debug(
+                    "No dispatch expectations recorded for workflow=%s", workflow_key
+                )
+                if deadline is not None and time.monotonic() >= deadline:
+                    return summary
+            elif expected_ids.issubset(dispatched_ids) and len(dispatched_ids) >= expected_total:
+                summary["complete"] = True
+                return summary
+
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info(
+                    "Dispatch gate timed out for workflow=%s after %.1fs", workflow_key, time.monotonic() - start
+                )
+                return summary
+
+            time.sleep(min(interval, 5.0))
+
+    def _await_response_gate(
+        self,
+        workflow_id: str,
+        *,
+        expected_unique_ids: Sequence[str],
+        expected_count: int,
+        timeout: Optional[int],
+    ) -> Dict[str, Any]:
+        """Wait for all supplier responses corresponding to dispatches."""
+
+        workflow_key = self._coerce_text(workflow_id)
+        gate_summary: Dict[str, Any] = {
+            "complete": False,
+            "responses": [],
+            "collected_count": 0,
+        }
+
+        if not workflow_key:
+            return gate_summary
+
+        expected_set: Set[str] = {
+            self._coerce_text(uid)
+            for uid in expected_unique_ids
+            if self._coerce_text(uid)
+        }
+
+        if expected_count <= 0 and not expected_set:
+            gate_summary["complete"] = True
+            gate_summary["responses"] = []
+            return gate_summary
+
+        try:
+            total_timeout = float(timeout) if timeout is not None else 0.0
+        except Exception:
+            total_timeout = 0.0
+
+        if total_timeout < 0:
+            total_timeout = 0.0
+
+        start = time.monotonic()
+        deadline = start + total_timeout if total_timeout > 0 else None
+
+        interval = max(float(self.RESPONSE_GATE_POLL_SECONDS), 1.0)
+
+        supplier_response_repo.init_schema()
+
+        while True:
+            pending_rows = supplier_response_repo.fetch_pending(
+                workflow_id=workflow_key, include_processed=False
+            )
+            pending_ids = {
+                self._coerce_text(row.get("unique_id"))
+                for row in pending_rows
+                if self._coerce_text(row.get("unique_id"))
+            }
+
+            if expected_count > 0:
+                ready = expected_set.issubset(pending_ids) and len(pending_ids) >= expected_count
+            else:
+                ready = bool(pending_ids)
+
+            if ready:
+                responses = self._process_responses_concurrently(pending_rows)
+                gate_summary.update(
+                    {
+                        "complete": True,
+                        "responses": responses,
+                        "collected_count": len(responses),
+                    }
+                )
+                return gate_summary
+
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info(
+                    "Response gate timed out for workflow=%s after %.1fs",
+                    workflow_key,
+                    time.monotonic() - start,
+                )
+                gate_summary["responses"] = self._process_responses_concurrently(
+                    pending_rows
+                )
+                gate_summary["collected_count"] = len(gate_summary["responses"])
+                return gate_summary
+
+            if deadline is None:
+                time.sleep(interval)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    gate_summary["responses"] = self._process_responses_concurrently(
+                        pending_rows
+                    )
+                    gate_summary["collected_count"] = len(gate_summary["responses"])
+                    return gate_summary
+                time.sleep(min(interval, remaining))
+
     def _await_full_response_batch(
         self,
         workflow_id: str,
@@ -655,171 +893,51 @@ class SupplierInteractionAgent(BaseAgent):
         if not workflow_key:
             return result
 
-        try:
-            total_timeout = float(timeout) if timeout is not None else 0.0
-        except Exception:
-            total_timeout = 0.0
-
-        if total_timeout < 0:
-            total_timeout = 0.0
-
-        start = time.monotonic()
-        deadline = start + total_timeout if total_timeout > 0 else None
-        interval = self._normalise_poll_interval(poll_interval)
-
-        dispatch_summary = self._await_dispatch_ready(
-            workflow_id=workflow_key,
-            unique_ids=[],
-            timeout=timeout,
-            poll_interval=poll_interval,
+        dispatch_state = self._await_dispatch_gate(
+            workflow_key, timeout=timeout, poll_interval=poll_interval
         )
 
-        if not dispatch_summary or not dispatch_summary.get("complete"):
+        result["expected_count"] = dispatch_state.get("expected_count", 0)
+        result["unique_ids"] = list(dispatch_state.get("unique_ids", []))
+
+        if not dispatch_state.get("complete"):
             logger.info(
-                "Dispatch phase incomplete while awaiting batch responses for workflow=%s",
+                "Dispatch verification gate incomplete for workflow=%s",
                 workflow_key,
             )
-            if dispatch_summary:
-                result["expected_count"] = dispatch_summary.get("expected_dispatches", 0)
-                result["unique_ids"] = list(dispatch_summary.get("unique_ids", []))
             return result
 
-        metadata: Optional[Dict[str, Any]] = None
-        while True:
-            metadata = self._load_dispatch_metadata(workflow_key)
-            if metadata is not None:
-                break
+        response_state = self._await_response_gate(
+            workflow_key,
+            expected_unique_ids=result["unique_ids"],
+            expected_count=result["expected_count"],
+            timeout=timeout,
+        )
 
-            if deadline is not None and time.monotonic() >= deadline:
-                return result
+        result["collected_count"] = response_state.get("collected_count", 0)
 
-            if interval > 0:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return result
-                    time.sleep(min(interval, remaining, 1.0))
-                else:
-                    time.sleep(min(interval, 1.0))
-            else:
-                time.sleep(0)
-
-        dispatch_rows: List[Any] = list(metadata.get("rows") or [])
-        expected_count = len(dispatch_rows)
-        result["expected_count"] = expected_count
-        result["unique_ids"] = [
-            self._coerce_text(getattr(row, "unique_id", None))
-            for row in dispatch_rows
-            if self._coerce_text(getattr(row, "unique_id", None))
-        ]
-
-        if expected_count <= 0:
+        if not response_state.get("complete"):
             logger.info(
-                "No dispatched emails recorded for workflow=%s while awaiting batch responses",
+                "Response aggregation gate incomplete for workflow=%s",
                 workflow_key,
             )
             return result
 
-        coordinator = getattr(self, "_response_coordinator", None)
-        if coordinator is None:
-            coordinator = SupplierResponseWorkflow()
-            self._response_coordinator = coordinator
-
-        remaining_timeout: Optional[int]
-        if deadline is None:
-            remaining_timeout = timeout if isinstance(timeout, int) else None
-        else:
-            remaining = max(0.0, deadline - time.monotonic())
-            remaining_timeout = int(remaining) if remaining > 0 else 0
-
-        poll_value: Optional[int]
-        if interval <= 0:
-            poll_value = None
-        else:
-            poll_value = max(1, int(round(interval)))
-
-        try:
-            response_summary = coordinator.await_response_population(
-                workflow_id=workflow_key,
-                unique_ids=result["unique_ids"],
-                timeout=remaining_timeout,
-                poll_interval=poll_value,
-                wait_for_all=True,
-            )
-        except Exception:  # pragma: no cover - defensive logging
-            logger.exception(
-                "Failed to await supplier responses for workflow=%s", workflow_key
-            )
-            return result
-
-        if not response_summary.get("complete"):
-            result["collected_count"] = response_summary.get("completed_responses", 0)
-            logger.info(
-                "Supplier responses incomplete while awaiting batch for workflow=%s (received=%s/%s)",
-                workflow_key,
-                response_summary.get("completed_responses"),
-                response_summary.get("expected_responses"),
-            )
-            return result
-
-        attempts = 0
-        max_attempts_without_deadline = 3 if interval > 0 else 1
-
-        while True:
-            rows = self._poll_supplier_response_rows(
-                workflow_key,
-                metadata=metadata,
-                include_processed=False,
-            )
-
-            if rows:
-                responses = self._process_responses_concurrently(rows)
-                collected_count = len(responses)
-                result["collected_count"] = collected_count
-
-                expected_total = result.get("expected_count", 0)
-                unique_ids = [
+        responses = response_state.get("responses", [])
+        result.update(
+            {
+                "ready": True,
+                "responses": responses,
+                "collected_count": len(responses),
+                "unique_ids": [
                     self._coerce_text(response.get("unique_id"))
                     for response in responses
                     if self._coerce_text(response.get("unique_id"))
                 ]
+                or result["unique_ids"],
+            }
+        )
 
-                if expected_total and collected_count != expected_total:
-                    logger.debug(
-                        "Supplier batch incomplete for workflow=%s (received=%s/%s)",
-                        workflow_key,
-                        collected_count,
-                        expected_total,
-                    )
-                else:
-                    result.update(
-                        {
-                            "ready": True,
-                            "responses": responses,
-                            "collected_count": collected_count,
-                            "unique_ids": unique_ids or result["unique_ids"],
-                        }
-                    )
-                    return result
-
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-
-            if interval > 0:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(interval, remaining, 1.0))
-                else:
-                    attempts += 1
-                    if attempts >= max_attempts_without_deadline:
-                        break
-                    time.sleep(min(interval, 1.0))
-            else:
-                break
-
-        result["collected_count"] = response_summary.get("completed_responses", 0)
         return result
 
     def _poll_supplier_response_rows(
