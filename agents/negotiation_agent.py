@@ -275,6 +275,11 @@ class NegotiationAgent(BaseAgent):
         self._email_agent_lock = threading.Lock()
         self._supplier_agent_lock = threading.Lock()
 
+        # Feature flag for enhanced negotiation message composition
+        self._use_enhanced_messages = (
+            os.getenv("NEG_USE_ENHANCED_MESSAGES", "false").lower() == "true"
+        )
+
     def _resolve_session_id(self, context: AgentContext) -> Optional[str]:
         """Derive the canonical negotiation session identifier."""
 
@@ -323,6 +328,10 @@ class NegotiationAgent(BaseAgent):
             candidate = self._coerce_text(payload.get(key))
             if candidate:
                 return candidate
+
+        rfq_candidate = self._coerce_text(payload.get("rfq_id"))
+        if rfq_candidate:
+            return rfq_candidate
 
         return self._coerce_text(getattr(context, "workflow_id", None))
 
@@ -2168,9 +2177,40 @@ class NegotiationAgent(BaseAgent):
         plays: List[Dict[str, Any]],
         playbook_context: Dict[str, Any],
     ) -> str:
-        """Playbook recommendations are now integrated naturally; return summary as-is."""
+        """Append structured playbook recommendations to the negotiation summary."""
 
-        return summary
+        if not plays:
+            return summary
+
+        lines: List[str] = [summary.rstrip()]
+
+        recommendation_lines: List[str] = []
+        lever_hints: List[str] = []
+        for play in plays[:4]:
+            if not isinstance(play, dict):
+                continue
+            lever = str(play.get("lever", "")).strip()
+            description = str(play.get("play", "")).strip()
+            if description:
+                if lever:
+                    recommendation_lines.append(f"- {lever}: {description}")
+                else:
+                    recommendation_lines.append(f"- {description}")
+            if lever:
+                lookup_key = lever.strip().title()
+                hint = TRADE_OFF_HINTS.get(lookup_key)
+                if hint:
+                    lever_hints.append(f"- {lookup_key}: {hint}")
+
+        if recommendation_lines:
+            lines.append("\nRecommended plays:")
+            lines.extend(recommendation_lines)
+
+        if lever_hints:
+            lines.append("\nTrade-off considerations:")
+            lines.extend(lever_hints[:3])
+
+        return "\n".join(lines)
 
     def _compose_negotiation_message(
         self,
@@ -3135,7 +3175,101 @@ class NegotiationAgent(BaseAgent):
         procurement_summary: Optional[Dict[str, Any]] = None,
         rag_snippets: Optional[List[str]] = None,
     ) -> str:
-        rfq_text = session_reference or "RFQ"
+        """Build negotiation message using skilled negotiation techniques."""
+
+        positions = self._build_positions_from_decision(
+            decision, price, target_price, round_no
+        )
+
+        if self._use_enhanced_messages and hasattr(
+            self, "_compose_negotiation_message"
+        ):
+            try:
+                return self._compose_negotiation_message(
+                    context=context,
+                    decision=decision,
+                    positions=positions,
+                    round_no=round_no,
+                    currency=currency,
+                    supplier=supplier,
+                    supplier_message=supplier_message,
+                    signals=signals or {},
+                    zopa=zopa or {},
+                    playbook_context=playbook_context,
+                    procurement_summary=procurement_summary,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Enhanced message composer failed: %s, using fallback",
+                    exc,
+                    exc_info=True,
+                )
+
+        return self._build_summary_fallback(
+            context=context,
+            rfq_id=session_reference,
+            decision=decision,
+            price=price,
+            target_price=target_price,
+            currency=currency,
+            round_no=round_no,
+            supplier=supplier,
+            supplier_snippets=supplier_snippets,
+            supplier_message=supplier_message,
+            playbook_context=playbook_context,
+            signals=signals,
+            zopa=zopa,
+            procurement_summary=procurement_summary,
+            rag_snippets=rag_snippets,
+        )
+
+    def _build_positions_from_decision(
+        self,
+        decision: Dict[str, Any],
+        price: Optional[float],
+        target_price: Optional[float],
+        round_no: int,
+    ) -> NegotiationPositions:
+        """Build NegotiationPositions object from decision data."""
+
+        positions_dict = decision.get("positions", {})
+        if isinstance(positions_dict, dict):
+            history = positions_dict.get("history", [])
+        else:
+            history = []
+
+        return NegotiationPositions(
+            start=decision.get("start_position") or positions_dict.get("start"),
+            desired=decision.get("desired_position")
+            or positions_dict.get("desired")
+            or target_price,
+            no_deal=decision.get("no_deal_position") or positions_dict.get("no_deal"),
+            supplier_offer=price,
+            history=history if isinstance(history, list) else [],
+        )
+
+    def _build_summary_fallback(
+        self,
+        context: AgentContext,
+        rfq_id: Optional[str],
+        decision: Dict[str, Any],
+        price: Optional[float],
+        target_price: Optional[float],
+        currency: Optional[str],
+        round_no: int,
+        *,
+        supplier: Optional[str] = None,
+        supplier_snippets: Optional[List[str]] = None,
+        supplier_message: Optional[str] = None,
+        playbook_context: Optional[Dict[str, Any]] = None,
+        signals: Optional[Dict[str, Any]] = None,
+        zopa: Optional[Dict[str, Any]] = None,
+        procurement_summary: Optional[Dict[str, Any]] = None,
+        rag_snippets: Optional[List[str]] = None,
+    ) -> str:
+        """Fallback basic summary builder (original implementation)."""
+
+        rfq_text = rfq_id or "RFQ"
         strategy = decision.get("strategy")
         lines: List[str] = []
         header = f"Round {round_no} plan for {rfq_text}"
@@ -3222,18 +3356,179 @@ class NegotiationAgent(BaseAgent):
         if asks:
             lines.append("- Key asks: " + "; ".join(str(item) for item in asks if item))
 
-        return self._compose_negotiation_message(
-            context=context,
-            decision=decision,
-            positions=positions,
-            round_no=round_no,
-            currency=currency,
-            supplier=supplier,
-            supplier_message=supplier_message,
-            signals=signals or {},
-            zopa=zopa or {},
-            playbook_context=playbook_context,
-            procurement_summary=procurement_summary,
+        return "\n".join(lines)
+
+    def _compose_negotiation_message(
+        self,
+        *,
+        context: AgentContext,
+        decision: Dict[str, Any],
+        positions: NegotiationPositions,
+        round_no: int,
+        currency: Optional[str],
+        supplier: Optional[str],
+        supplier_message: Optional[str],
+        signals: Dict[str, Any],
+        zopa: Dict[str, Any],
+        playbook_context: Optional[Dict[str, Any]],
+        procurement_summary: Optional[Dict[str, Any]],
+    ) -> str:
+        """Compose a human-like, strategically crafted negotiation message."""
+
+        counter_price = decision.get("counter_price")
+        current_offer = positions.supplier_offer
+        target_price = positions.desired
+        strategy = decision.get("strategy", "counter")
+
+        sections: List[str] = []
+
+        opening = self._craft_opening_simple(round_no, supplier_message, signals)
+        if opening:
+            sections.append(opening)
+
+        if round_no > 1 and supplier_message:
+            acknowledgment = self._craft_acknowledgment_simple(
+                current_offer, signals, currency
+            )
+            if acknowledgment:
+                sections.append(acknowledgment)
+
+        position = self._craft_position_simple(
+            counter_price, current_offer, target_price, currency, round_no
+        )
+        if position:
+            sections.append(position)
+
+        if playbook_context and playbook_context.get("plays"):
+            value_prop = self._craft_value_proposition_simple(playbook_context, round_no)
+            if value_prop:
+                sections.append(value_prop)
+
+        asks_section = self._craft_asks_simple(decision)
+        if asks_section:
+            sections.append(asks_section)
+
+        closing = self._craft_closing_simple(round_no, strategy)
+        if closing:
+            sections.append(closing)
+
+        return "\n\n".join(sections)
+
+    def _craft_opening_simple(
+        self, round_no: int, supplier_message: Optional[str], signals: Dict[str, Any]
+    ) -> str:
+        """Craft a simple opening."""
+        if round_no > 1 and supplier_message:
+            return (
+                "Thank you for your response. I've reviewed your proposal and would like to discuss "
+                "how we can align on the details."
+            )
+        return (
+            "Thank you for your proposal. I'd like to discuss the terms to ensure we can reach an "
+            "agreement that works for both parties."
+        )
+
+    def _craft_acknowledgment_simple(
+        self, current_offer: Optional[float], signals: Dict[str, Any], currency: Optional[str]
+    ) -> str:
+        """Craft simple acknowledgment."""
+        if signals.get("capacity_tight"):
+            return (
+                "I understand the capacity constraints you mentioned, and we're mindful of the current "
+                "market dynamics."
+            )
+        if current_offer:
+            offer_text = self._format_currency(current_offer, currency)
+            return (
+                f"Your quoted price of {offer_text} reflects the quality you provide, which we value."
+            )
+        return ""
+
+    def _craft_position_simple(
+        self,
+        counter_price: Optional[float],
+        current_offer: Optional[float],
+        target_price: Optional[float],
+        currency: Optional[str],
+        round_no: int,
+    ) -> str:
+        """Craft simple position statement."""
+        if counter_price is None:
+            return "Before we proceed, could you provide more details on the cost breakdown?"
+
+        counter_text = self._format_currency(counter_price, currency)
+
+        if round_no == 1:
+            return (
+                f"To align with our project budget, I'd like to propose we structure this around {counter_text}."
+            )
+        if round_no == 2:
+            return (
+                f"As we work toward agreement, I believe {counter_text} represents a fair position that reflects both the value "
+                "and our budget constraints."
+            )
+        return (
+            f"To help us reach closure, I'm proposing {counter_text} as our target. This represents our best position given the "
+            "business case."
+        )
+
+    def _craft_value_proposition_simple(
+        self, playbook_context: Dict[str, Any], round_no: int
+    ) -> str:
+        """Craft simple value proposition from playbook."""
+        plays = playbook_context.get("plays", [])[:2]
+
+        if not plays:
+            return ""
+
+        statements: List[str] = []
+        for play in plays:
+            if not isinstance(play, dict):
+                continue
+
+            description = play.get("play", "")
+            lowered = description.lower()
+            if "volume" in lowered or "tier" in lowered:
+                statements.append(
+                    "We'd like to explore volume commitments that could unlock better pricing for both sides."
+                )
+            elif "payment" in lowered and "early" in lowered:
+                statements.append(
+                    "We can offer accelerated payment terms if that helps with pricing flexibility."
+                )
+            elif "warranty" in lowered:
+                statements.append(
+                    "Extended warranty coverage would strengthen the business case on our side."
+                )
+
+        return " ".join(statements[:2]) if statements else ""
+
+    def _craft_asks_simple(self, decision: Dict[str, Any]) -> str:
+        """Craft simple asks section."""
+        asks = decision.get("asks", [])
+        if not asks:
+            return ""
+
+        asks_list = [f"• {ask}" for ask in asks[:4] if ask]
+        if not asks_list:
+            return ""
+
+        return "To help structure the best outcome:\n" + "\n".join(asks_list)
+
+    def _craft_closing_simple(self, round_no: int, strategy: str) -> str:
+        """Craft simple closing."""
+        if strategy == "accept":
+            return (
+                "If we can align on these final points, I'm ready to move forward. Looking forward to your thoughts."
+            )
+
+        if round_no >= 3:
+            return (
+                "I'm hopeful we can find common ground. Please let me know your thoughts, and I'm happy to discuss further if needed."
+            )
+
+        return (
+            "I'd welcome your feedback on this proposal. Happy to discuss any questions you might have."
         )
 
     def _get_prompt_template(self, context: AgentContext) -> str:
