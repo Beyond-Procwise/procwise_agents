@@ -290,6 +290,20 @@ class NegotiationAgent(BaseAgent):
         if not isinstance(payload, dict):
             return [], {}
 
+        responses = payload.get("supplier_responses")
+        if isinstance(responses, list):
+            response_batch = [entry for entry in responses if isinstance(entry, dict)]
+        else:
+            response_batch = []
+
+        if response_batch:
+            shared: Dict[str, Any] = {"negotiation_batch": True}
+            for key in BATCH_SHARED_KEYS:
+                candidate = payload.get(key)
+                if isinstance(candidate, dict):
+                    shared.update(candidate)
+            return response_batch, shared
+
         batch: List[Dict[str, Any]] = []
         for key in BATCH_INPUT_KEYS:
             value = payload.get(key)
