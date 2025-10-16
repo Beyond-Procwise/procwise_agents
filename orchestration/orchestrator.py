@@ -1677,6 +1677,14 @@ class Orchestrator:
         email_result = self._execute_agent("email_drafting", email_ctx)
         email_data = email_result.data if email_result else {}
         email_drafts = self._extract_drafts(email_result)
+        drafted_email_count = len([draft for draft in email_drafts if isinstance(draft, dict)])
+        tracked_unique_ids = [
+            str(draft.get("unique_id")).strip()
+            for draft in email_drafts
+            if isinstance(draft, dict)
+            and draft.get("unique_id") not in (None, "")
+        ]
+        tracked_unique_ids = [uid for uid in tracked_unique_ids if uid]
 
         workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
         email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
@@ -1698,12 +1706,20 @@ class Orchestrator:
         if isinstance(supplier_payload, dict):
             supplier_input.update(supplier_payload)
         supplier_input["drafts"] = email_drafts
+        expected_email_count = len(tracked_unique_ids) or drafted_email_count
+        supplier_input.setdefault("expected_email_count", expected_email_count)
+        if tracked_unique_ids:
+            supplier_input.setdefault("expected_unique_ids", tracked_unique_ids)
         supplier_input.setdefault("await_response", True)
         if len([uid for uid in unique_ids if uid]) > 1:
             supplier_input.setdefault("await_all_responses", True)
         supplier_input.setdefault("workflow_id", workflow_hint)
         supplier_input.setdefault("response_timeout", response_timeout)
+        supplier_input.setdefault("response_timeout_seconds", response_timeout)
         supplier_input.setdefault("response_poll_interval", response_poll)
+        supplier_input.setdefault("dispatch_timeout", dispatch_timeout)
+        supplier_input.setdefault("dispatch_timeout_seconds", dispatch_timeout)
+        supplier_input.setdefault("dispatch_poll_interval", dispatch_poll)
 
         supplier_ctx = self._create_child_context(context, "supplier_interaction", supplier_input)
         for key in (
@@ -1718,6 +1734,33 @@ class Orchestrator:
 
         supplier_result = self._execute_agent("supplier_interaction", supplier_ctx)
 
+        negotiation_result = None
+        if (
+            supplier_result
+            and supplier_result.status == AgentStatus.SUCCESS
+            and "negotiation" in self.agents
+        ):
+            negotiation_payload: Dict[str, Any] = {}
+            if supplier_result.pass_fields:
+                negotiation_payload.update(dict(supplier_result.pass_fields))
+            if supplier_result.data:
+                negotiation_payload.setdefault("negotiation_batch", True)
+                negotiation_payload.update(dict(supplier_result.data))
+
+            responses = negotiation_payload.get("supplier_responses")
+            if isinstance(responses, list) and responses:
+                negotiation_ctx = self._create_child_context(
+                    context, "negotiation", negotiation_payload
+                )
+                negotiation_result = self._execute_agent("negotiation", negotiation_ctx)
+
+        if supplier_result and supplier_result.status != AgentStatus.SUCCESS:
+            logger.warning(
+                "SupplierInteractionAgent returned non-success status %s for workflow=%s",
+                supplier_result.status,
+                workflow_hint,
+            )
+
         activation_summary = readiness.get("activation", {}) if readiness else {}
         if activation_summary and not activation_summary.get("activated", False):
             logger.warning(
@@ -1730,12 +1773,28 @@ class Orchestrator:
             "response_monitor": readiness.get("responses"),
             "activation_monitor": activation_summary,
             "supplier_interaction": supplier_result.data if supplier_result else {},
+            "expected_email_count": expected_email_count,
+            "tracked_unique_ids": tracked_unique_ids,
+            "supplier_interaction_status": (
+                supplier_result.status.value if supplier_result else None
+            ),
         }
 
         if supplier_result and supplier_result.next_agents:
             results["next_agents"] = list(supplier_result.next_agents)
         if supplier_result and supplier_result.pass_fields:
             results["supplier_pass_fields"] = dict(supplier_result.pass_fields)
+        if negotiation_result:
+            results["negotiation"] = negotiation_result.data if negotiation_result else {}
+            if negotiation_result and negotiation_result.pass_fields:
+                results["negotiation_pass_fields"] = dict(negotiation_result.pass_fields)
+            if negotiation_result and negotiation_result.status:
+                results["negotiation_status"] = negotiation_result.status.value
+            if negotiation_result and negotiation_result.next_agents:
+                existing = results.setdefault("next_agents", [])
+                for agent_name in negotiation_result.next_agents:
+                    if agent_name not in existing:
+                        existing.append(agent_name)
         return results
 
     @staticmethod
