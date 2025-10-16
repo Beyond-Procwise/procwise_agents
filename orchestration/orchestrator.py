@@ -1677,6 +1677,9 @@ class Orchestrator:
         email_result = self._execute_agent("email_drafting", email_ctx)
         email_data = email_result.data if email_result else {}
         email_drafts = self._extract_drafts(email_result)
+
+        workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
+        email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         drafted_email_count = len([draft for draft in email_drafts if isinstance(draft, dict)])
         tracked_unique_ids = [
             str(draft.get("unique_id")).strip()
@@ -1685,9 +1688,6 @@ class Orchestrator:
             and draft.get("unique_id") not in (None, "")
         ]
         tracked_unique_ids = [uid for uid in tracked_unique_ids if uid]
-
-        workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
-        email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
         coordinator = SupplierResponseWorkflow()
