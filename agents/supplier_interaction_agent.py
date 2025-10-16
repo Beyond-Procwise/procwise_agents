@@ -1699,6 +1699,10 @@ class SupplierInteractionAgent(BaseAgent):
         responses = response_summary.get("responses", [])
         response_count = len(responses)
 
+        response_complete = response_summary.get("complete", False)
+        collected_total = response_summary.get("collected_responses", 0)
+        all_responses_received = response_complete and (collected_total >= expected_count)
+
         payload = {
             "workflow_id": workflow_id,
             "expected_dispatch_count": expected_count,
@@ -1708,9 +1712,9 @@ class SupplierInteractionAgent(BaseAgent):
             "supplier_responses": responses,
             "supplier_responses_batch": responses,
             "supplier_responses_count": response_count,
-            "batch_ready": True,
-            "negotiation_batch": bool(responses),
-            "all_responses_received": True,
+            "batch_ready": all_responses_received,
+            "negotiation_batch": all_responses_received,
+            "all_responses_received": all_responses_received,
             "expected_unique_ids": observed_unique_ids or expected_unique_ids,
         }
 
@@ -1718,7 +1722,7 @@ class SupplierInteractionAgent(BaseAgent):
         if thread_headers:
             payload["thread_headers"] = thread_headers
 
-        next_agents = ["NegotiationAgent"] if responses else []
+        next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
         return self._with_plan(
             context,
             AgentOutput(
