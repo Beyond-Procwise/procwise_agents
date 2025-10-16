@@ -1726,7 +1726,7 @@ class SupplierInteractionAgent(BaseAgent):
         if isinstance(unique_ids, list) and len(unique_ids) == 1:
             payload.setdefault("session_reference", unique_ids[0])
 
-        next_agents = ["NegotiationAgent"] if responses else []
+        next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
         return self._with_plan(
             context,
             AgentOutput(
