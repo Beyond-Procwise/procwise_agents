@@ -61,6 +61,11 @@ class Settings(BaseSettings):
         default=10, env="SES_INBOUND_QUEUE_MAX_MESSAGES"
     )
 
+    redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
+    redis_response_ttl_seconds: int = Field(
+        default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
+    )
+
     ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
     ses_secret_role_arn: Optional[str] = Field(
