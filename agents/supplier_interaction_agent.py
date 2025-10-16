@@ -1518,6 +1518,7 @@ class SupplierInteractionAgent(BaseAgent):
         expected_count: int,
         poll_interval: Optional[float],
         expected_unique_ids: Sequence[str],
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         self._ensure_dispatch_tracking_schema()
         expected_ids = [self._coerce_text(uid) for uid in expected_unique_ids if self._coerce_text(uid)]
@@ -1540,14 +1541,34 @@ class SupplierInteractionAgent(BaseAgent):
         interval = poll_interval or self.WORKFLOW_POLL_INTERVAL_SECONDS
         interval = max(1.0, float(interval))
 
+        deadline = None
+        if timeout is not None and timeout > 0:
+            try:
+                deadline = time.monotonic() + float(timeout)
+            except Exception:
+                deadline = time.monotonic() + float(timeout or 0)
+
         last_logged = -1
 
+        ordered: Dict[str, Any] = {}
+        thread_headers: Dict[str, Any] = {}
+
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "Dispatch gate timed out for workflow=%s after %.1fs (completed=%s/%s)",
+                    workflow_id,
+                    time.monotonic() - start,
+                    len(ordered),
+                    required,
+                )
+                break
+
             rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
             dispatch_rows = [row for row in rows if getattr(row, "dispatched_at", None)]
 
-            ordered: Dict[str, Any] = {}
-            thread_headers: Dict[str, Any] = {}
+            ordered = {}
+            thread_headers = {}
             for row in dispatch_rows:
                 unique_id = self._coerce_text(getattr(row, "unique_id", None))
                 if expected_set and unique_id not in expected_set:
@@ -1559,10 +1580,14 @@ class SupplierInteractionAgent(BaseAgent):
                         thread_headers[unique_id] = headers
 
             completed = len(ordered)
-            if completed >= required:
+            all_expected_present = True
+            if expected_set:
+                all_expected_present = expected_set.issubset(ordered.keys())
+
+            if all_expected_present and completed >= required:
                 serialised_rows = [self._serialise_dispatch_row(row) for row in ordered.values()]
                 logger.info(
-                    "SupplierInteractionAgent dispatch verification gate complete for workflow=%s dispatched=%s/%s",
+                    "SupplierInteractionAgent dispatch verification gate complete for workflow=%s dispatched=%s/%s (all expected IDs present)",
                     workflow_id,
                     completed,
                     required,
@@ -1579,15 +1604,37 @@ class SupplierInteractionAgent(BaseAgent):
                 }
 
             if completed != last_logged:
-                logger.info(
-                    "Waiting for dispatch (%s/%s) workflow=%s",
-                    completed,
-                    required,
-                    workflow_id,
-                )
+                if expected_set:
+                    missing_ids = expected_set - set(ordered.keys())
+                    logger.info(
+                        "Waiting for dispatch (%s/%s) workflow=%s (missing: %s)",
+                        completed,
+                        required,
+                        workflow_id,
+                        list(missing_ids)[:5] if missing_ids else "none",
+                    )
+                else:
+                    logger.info(
+                        "Waiting for dispatch (%s/%s) workflow=%s",
+                        completed,
+                        required,
+                        workflow_id,
+                    )
                 last_logged = completed
 
             time.sleep(interval)
+
+        serialised_rows = [self._serialise_dispatch_row(row) for row in ordered.values()]
+        return {
+            "workflow_id": workflow_id,
+            "expected_dispatches": required,
+            "completed_dispatches": len(ordered),
+            "unique_ids": list(ordered.keys()),
+            "dispatch_rows": serialised_rows,
+            "thread_headers": thread_headers,
+            "complete": False,
+            "wait_seconds": time.monotonic() - start,
+        }
 
     def _blocking_response_gate(
         self,
@@ -1596,6 +1643,7 @@ class SupplierInteractionAgent(BaseAgent):
         expected_count: int,
         poll_interval: Optional[float],
         expected_unique_ids: Sequence[str],
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         self._ensure_response_schema()
         expected_ids = [self._coerce_text(uid) for uid in expected_unique_ids if self._coerce_text(uid)]
@@ -1616,11 +1664,31 @@ class SupplierInteractionAgent(BaseAgent):
 
         interval = poll_interval or self.RESPONSE_GATE_POLL_SECONDS
         interval = max(1.0, float(interval))
+
+        deadline = None
+        if timeout is not None and timeout > 0:
+            try:
+                deadline = time.monotonic() + float(timeout)
+            except Exception:
+                deadline = time.monotonic() + float(timeout or 0)
+
         last_logged = -1
 
+        ordered: Dict[str, Dict[str, Any]] = {}
+
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "Response gate timed out for workflow=%s after %.1fs (collected=%s/%s)",
+                    workflow_id,
+                    time.monotonic() - start,
+                    len(ordered),
+                    required,
+                )
+                break
+
             rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
-            ordered: Dict[str, Dict[str, Any]] = {}
+            ordered = {}
             for row in rows:
                 unique_id = self._coerce_text(row.get("unique_id"))
                 if expected_set and unique_id not in expected_set:
@@ -1630,10 +1698,14 @@ class SupplierInteractionAgent(BaseAgent):
                 ordered.setdefault(unique_id, row)
 
             completed = len(ordered)
-            if completed >= required:
+            all_expected_present = True
+            if expected_set:
+                all_expected_present = expected_set.issubset(ordered.keys())
+
+            if all_expected_present and completed >= required:
                 responses = [self._response_from_row(row) for row in ordered.values()]
                 logger.info(
-                    "SupplierInteractionAgent response aggregation gate complete for workflow=%s responses=%s/%s",
+                    "SupplierInteractionAgent response aggregation gate complete for workflow=%s responses=%s/%s (all expected IDs present)",
                     workflow_id,
                     completed,
                     required,
@@ -1649,15 +1721,36 @@ class SupplierInteractionAgent(BaseAgent):
                 }
 
             if completed != last_logged:
-                logger.info(
-                    "Waiting for responses (%s/%s) workflow=%s",
-                    completed,
-                    required,
-                    workflow_id,
-                )
+                if expected_set:
+                    missing_ids = expected_set - set(ordered.keys())
+                    logger.info(
+                        "Waiting for responses (%s/%s) workflow=%s (missing: %s)",
+                        completed,
+                        required,
+                        workflow_id,
+                        list(missing_ids)[:5] if missing_ids else "none",
+                    )
+                else:
+                    logger.info(
+                        "Waiting for responses (%s/%s) workflow=%s",
+                        completed,
+                        required,
+                        workflow_id,
+                    )
                 last_logged = completed
 
             time.sleep(interval)
+
+        responses = [self._response_from_row(row) for row in ordered.values()]
+        return {
+            "workflow_id": workflow_id,
+            "expected_responses": required,
+            "collected_responses": len(ordered),
+            "responses": responses,
+            "unique_ids": list(ordered.keys()),
+            "complete": False,
+            "wait_seconds": time.monotonic() - start,
+        }
 
     def _run_stateful_gate(
         self,
@@ -1681,12 +1774,54 @@ class SupplierInteractionAgent(BaseAgent):
         if expected_unique_ids and expected_count <= 0:
             expected_count = len(expected_unique_ids)
 
+        dispatch_timeout = self._coerce_int(
+            context.input_data.get("dispatch_timeout"),
+            default=600,
+        )
+        response_timeout = self._coerce_int(
+            context.input_data.get("response_timeout"),
+            default=3600,
+        )
+
         dispatch_summary = self._blocking_dispatch_gate(
             workflow_id=workflow_id,
             expected_count=expected_count,
             poll_interval=dispatch_poll,
             expected_unique_ids=expected_unique_ids,
+            timeout=dispatch_timeout,
         )
+
+        if not dispatch_summary.get("complete"):
+            logger.error(
+                "Dispatch gate incomplete for workflow=%s (dispatched=%s/%s)",
+                workflow_id,
+                dispatch_summary.get("completed_dispatches", 0),
+                expected_count,
+            )
+            payload = {
+                "workflow_id": workflow_id,
+                "expected_dispatch_count": expected_count,
+                "expected_email_count": expected_count,
+                "dispatch_verification": dispatch_summary,
+                "response_aggregation": None,
+                "supplier_responses": [],
+                "supplier_responses_batch": [],
+                "supplier_responses_count": 0,
+                "batch_ready": False,
+                "negotiation_batch": False,
+                "all_responses_received": False,
+                "expected_unique_ids": expected_unique_ids,
+                "error_details": "Not all emails were dispatched successfully",
+            }
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data=payload,
+                    pass_fields=payload,
+                    error="dispatch_incomplete",
+                ),
+            )
 
         observed_unique_ids = dispatch_summary.get("unique_ids") or []
         response_summary = self._blocking_response_gate(
@@ -1694,6 +1829,7 @@ class SupplierInteractionAgent(BaseAgent):
             expected_count=expected_count,
             poll_interval=response_poll,
             expected_unique_ids=observed_unique_ids or expected_unique_ids,
+            timeout=response_timeout,
         )
 
         responses = response_summary.get("responses", [])
@@ -1702,6 +1838,23 @@ class SupplierInteractionAgent(BaseAgent):
         response_complete = response_summary.get("complete", False)
         collected_total = response_summary.get("collected_responses", 0)
         all_responses_received = response_complete and (collected_total >= expected_count)
+
+        if expected_unique_ids or observed_unique_ids:
+            expected_ids_set = set(expected_unique_ids) if expected_unique_ids else set(observed_unique_ids)
+            received_ids_set = {
+                self._coerce_text(resp.get("unique_id"))
+                for resp in responses
+                if self._coerce_text(resp.get("unique_id"))
+            }
+
+            missing_ids = expected_ids_set - received_ids_set
+            if missing_ids:
+                all_responses_received = False
+                logger.error(
+                    "Missing responses for unique_ids=%s in workflow=%s",
+                    list(missing_ids),
+                    workflow_id,
+                )
 
         payload = {
             "workflow_id": workflow_id,
@@ -1722,7 +1875,34 @@ class SupplierInteractionAgent(BaseAgent):
         if thread_headers:
             payload["thread_headers"] = thread_headers
 
+        if not all_responses_received:
+            logger.warning(
+                "Response collection incomplete for workflow=%s (received=%s/%s, complete=%s)",
+                workflow_id,
+                response_count,
+                expected_count,
+                response_complete,
+            )
+            payload["error_details"] = f"Only received {response_count}/{expected_count} responses"
+
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data=payload,
+                    pass_fields=payload,
+                    error="incomplete_responses",
+                ),
+            )
+
         next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
+        logger.info(
+            "All supplier responses received for workflow=%s (count=%s/%s)",
+            workflow_id,
+            response_count,
+            expected_count,
+        )
+
         return self._with_plan(
             context,
             AgentOutput(
