@@ -1594,6 +1594,7 @@ class NegotiationAgent(BaseAgent):
             return decision
 
         supplier_floor = zopa.get("supplier_floor")
+        buyer_max = zopa.get("buyer_max")
         entry = zopa.get("entry_counter")
         if not price_locked and price and target_price and entry:
             if current_round == 1:
