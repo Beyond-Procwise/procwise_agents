@@ -701,17 +701,49 @@ class SupplierInteractionAgent(BaseAgent):
                 result["unique_ids"] = list(dispatch_summary.get("unique_ids", []))
             return result
 
+        summary_unique_ids = [
+            self._coerce_text(uid)
+            for uid in dispatch_summary.get("unique_ids", [])
+            if self._coerce_text(uid)
+        ]
+        if summary_unique_ids:
+            result["unique_ids"] = list(summary_unique_ids)
+            result["expected_count"] = len(summary_unique_ids)
+
+        target_dispatched_at = dispatch_summary.get("last_dispatched_at")
+        if target_dispatched_at is None and initial_dispatched_at is not None:
+            target_dispatched_at = initial_dispatched_at
+
+        target_unique_ids: Optional[Set[str]]
+        if summary_unique_ids:
+            target_unique_ids = set(summary_unique_ids)
+        else:
+            target_unique_ids = None
+
         metadata: Optional[Dict[str, Any]] = None
         while True:
             metadata = self._load_dispatch_metadata(workflow_key)
             if metadata is not None:
-                if initial_dispatched_at is not None:
+                if target_dispatched_at is not None:
                     latest_dispatched_at = metadata.get("last_dispatched_at")
-                    if latest_dispatched_at is None or latest_dispatched_at <= initial_dispatched_at:
+                    if latest_dispatched_at is None or latest_dispatched_at < target_dispatched_at:
                         logger.debug(
-                            "Ignoring dispatch metadata for workflow=%s at %s (awaiting newer batch)",
+                            "Ignoring dispatch metadata for workflow=%s at %s (awaiting dispatched_at >= %s)",
                             workflow_key,
                             latest_dispatched_at,
+                            target_dispatched_at,
+                        )
+                        metadata = None
+                if metadata is not None and target_unique_ids:
+                    available_unique_ids = {
+                        self._coerce_text(getattr(row, "unique_id", None))
+                        for row in metadata.get("rows") or []
+                        if self._coerce_text(getattr(row, "unique_id", None))
+                    }
+                    if not target_unique_ids.issubset(available_unique_ids):
+                        logger.debug(
+                            "Dispatch metadata for workflow=%s missing expected unique_ids; waiting for update",
+                            workflow_key,
                         )
                         metadata = None
                 if metadata is not None:
@@ -744,12 +776,16 @@ class SupplierInteractionAgent(BaseAgent):
         else:
             batch_rows = dispatch_rows
 
-        result["unique_ids"] = [
+        batch_unique_ids = [
             self._coerce_text(getattr(row, "unique_id", None))
             for row in batch_rows
             if self._coerce_text(getattr(row, "unique_id", None))
         ]
-        expected_count = len(result["unique_ids"])
+        if target_unique_ids:
+            batch_unique_ids = [uid for uid in batch_unique_ids if uid in target_unique_ids]
+
+        result["unique_ids"] = batch_unique_ids
+        expected_count = len(batch_unique_ids)
         result["expected_count"] = expected_count
 
         if expected_count <= 0:
