@@ -568,6 +568,10 @@ class NegotiationAgent(BaseAgent):
 
         supplier = context.input_data.get("supplier") or context.input_data.get("supplier_id")
         rfq_id = context.input_data.get("rfq_id")
+        workflow_id = (
+            context.input_data.get("workflow_id")
+            or getattr(context, "workflow_id", None)
+        )
         raw_round = context.input_data.get("round", 1)
 
         price_raw = (
@@ -1240,10 +1244,11 @@ class NegotiationAgent(BaseAgent):
 
         supplier_watch_fields = self._build_supplier_watch_fields(
             context=context,
-            rfq_id=rfq_id,
+            workflow_id=workflow_id,
             supplier=supplier,
             drafts=draft_records,
             state=state,
+            rfq_id=rfq_id,
         )
         supplier_responses: List[Dict[str, Any]] = []
         if supplier_watch_fields:
@@ -1262,14 +1267,14 @@ class NegotiationAgent(BaseAgent):
                 ]
                 if wait_results is None:
                     logger.error(
-                        "Supplier responses not received before timeout (rfq_id=%s supplier=%s unique_ids=%s)",
-                        rfq_id,
+                        "Supplier responses not received before timeout (workflow_id=%s supplier=%s unique_ids=%s)",
+                        workflow_id,
                         supplier,
                         watch_unique_ids or None,
                     )
                     error_payload = {
                         "supplier": supplier,
-                        "rfq_id": rfq_id,
+                        "workflow_id": workflow_id,
                         "round": round_no,
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
@@ -1286,14 +1291,14 @@ class NegotiationAgent(BaseAgent):
                 supplier_responses = [res for res in wait_results if isinstance(res, dict)]
                 if not supplier_responses:
                     logger.error(
-                        "No supplier responses received while waiting (rfq_id=%s supplier=%s unique_ids=%s)",
-                        rfq_id,
+                        "No supplier responses received while waiting (workflow_id=%s supplier=%s unique_ids=%s)",
+                        workflow_id,
                         supplier,
                         watch_unique_ids or None,
                     )
                     error_payload = {
                         "supplier": supplier,
-                        "rfq_id": rfq_id,
+                        "workflow_id": workflow_id,
                         "round": round_no,
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
@@ -2954,12 +2959,13 @@ class NegotiationAgent(BaseAgent):
         self,
         *,
         context: AgentContext,
-        rfq_id: Optional[str],
+        workflow_id: Optional[str],
         supplier: Optional[str],
         drafts: List[Dict[str, Any]],
         state: Dict[str, Any],
+        rfq_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        if not rfq_id or not supplier:
+        if not workflow_id:
             return None
 
         candidate_drafts: List[Dict[str, Any]] = []
@@ -2975,11 +2981,14 @@ class NegotiationAgent(BaseAgent):
                     candidate_drafts.append(dict(entry))
 
         if not candidate_drafts:
-            candidate_drafts.append({"rfq_id": rfq_id, "supplier_id": supplier})
+            fallback_entry = {"workflow_id": workflow_id}
+            if supplier:
+                fallback_entry["supplier_id"] = supplier
+            candidate_drafts.append(fallback_entry)
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
 
-        workflow_hint = getattr(context, "workflow_id", None)
+        workflow_hint = workflow_id or getattr(context, "workflow_id", None)
         if workflow_hint:
             for draft in candidate_drafts:
                 if isinstance(draft, dict) and not draft.get("workflow_id"):
@@ -2990,7 +2999,6 @@ class NegotiationAgent(BaseAgent):
             "message": "",
             "body": "",
             "drafts": candidate_drafts,
-            "rfq_id": rfq_id,
             "supplier_id": supplier,
             "response_poll_interval": poll_interval,
             "workflow_id": workflow_hint,
@@ -3067,11 +3075,16 @@ class NegotiationAgent(BaseAgent):
                 draft_entries.append(dict(draft))
 
         if not draft_entries:
-            fallback_entry = {
-                "rfq_id": watch_payload.get("rfq_id"),
-                "supplier_id": watch_payload.get("supplier_id"),
-            }
-            if fallback_entry.get("rfq_id") or fallback_entry.get("supplier_id"):
+            fallback_entry = {}
+            workflow_hint = watch_payload.get("workflow_id") or getattr(
+                context, "workflow_id", None
+            )
+            if workflow_hint:
+                fallback_entry["workflow_id"] = workflow_hint
+            supplier_hint = watch_payload.get("supplier_id") or watch_payload.get("supplier")
+            if supplier_hint:
+                fallback_entry["supplier_id"] = supplier_hint
+            if fallback_entry:
                 draft_entries.append(fallback_entry)
 
         if not draft_entries:
@@ -3085,6 +3098,10 @@ class NegotiationAgent(BaseAgent):
                 for entry in draft_entries
                 if self._coerce_text(entry.get("unique_id"))
             }
+        )
+
+        workflow_hint = self._coerce_text(
+            watch_payload.get("workflow_id") or getattr(context, "workflow_id", None)
         )
 
         try:
@@ -3112,7 +3129,7 @@ class NegotiationAgent(BaseAgent):
                 if isinstance(candidate, str) and candidate.strip():
                     draft_action_id = candidate.strip()
                     break
-            workflow_hint = target.get("workflow_id") or watch_payload.get("workflow_id")
+            workflow_hint = workflow_hint or target.get("workflow_id")
             if not workflow_hint and isinstance(target.get("metadata"), dict):
                 meta_workflow = target["metadata"].get("workflow_id") or target["metadata"].get("process_workflow_id")
                 if isinstance(meta_workflow, str) and meta_workflow.strip():
@@ -3128,12 +3145,18 @@ class NegotiationAgent(BaseAgent):
                 if isinstance(meta_run, str) and meta_run.strip():
                     dispatch_run_id = meta_run.strip()
 
+            if not workflow_hint:
+                logger.warning(
+                    "Cannot await supplier response without workflow_id for supplier=%s",
+                    target.get("supplier_id"),
+                )
+                return None
+
             return [
                 supplier_agent.wait_for_response(
                     timeout=timeout,
                     poll_interval=poll_interval,
                     limit=batch_limit,
-                    rfq_id=target.get("rfq_id"),
                     supplier_id=target.get("supplier_id"),
                     subject_hint=target.get("subject"),
                     from_address=recipient_hint,
@@ -3146,8 +3169,8 @@ class NegotiationAgent(BaseAgent):
             ]
         except Exception:  # pragma: no cover - defensive
             logger.exception(
-                "Failed while waiting for supplier responses (rfq_id=%s, supplier=%s)",
-                watch_payload.get("rfq_id"),
+                "Failed while waiting for supplier responses (workflow_id=%s, supplier=%s)",
+                workflow_hint,
                 watch_payload.get("supplier_id"),
             )
             return None
