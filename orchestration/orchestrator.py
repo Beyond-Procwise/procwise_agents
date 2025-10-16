@@ -1747,6 +1747,14 @@ class Orchestrator:
                 negotiation_payload.setdefault("negotiation_batch", True)
                 negotiation_payload.update(dict(supplier_result.data))
 
+            thread_headers_payload: Optional[Dict[str, Any]] = None
+            if isinstance(supplier_result.data, dict):
+                thread_headers_payload = supplier_result.data.get("thread_headers")
+            if not thread_headers_payload and isinstance(supplier_result.pass_fields, dict):
+                thread_headers_payload = supplier_result.pass_fields.get("thread_headers")
+            if thread_headers_payload:
+                negotiation_payload["thread_headers"] = thread_headers_payload
+
             responses = negotiation_payload.get("supplier_responses")
             if isinstance(responses, list) and responses:
                 negotiation_ctx = self._create_child_context(
