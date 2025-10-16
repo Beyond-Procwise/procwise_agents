@@ -1613,13 +1613,32 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return None
 
+        preload_rows: List[Dict[str, Any]] = []
         try:
-            preload_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+            preload_rows = supplier_response_repo.fetch_pending(
+                workflow_id=workflow_id, include_processed=False
+            )
+        except TypeError:
+            try:
+                preload_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+            except Exception:
+                logger.exception(
+                    "Failed to preload supplier responses for workflow=%s", workflow_id
+                )
+                preload_rows = []
         except Exception:
             logger.exception(
                 "Failed to preload supplier responses for workflow=%s", workflow_id
             )
             preload_rows = []
+        if not preload_rows:
+            try:
+                preload_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+            except Exception:
+                logger.exception(
+                    "Failed to preload supplier responses for workflow=%s", workflow_id
+                )
+                preload_rows = []
 
         for row in preload_rows:
             if not isinstance(row, dict):
@@ -1637,7 +1656,6 @@ class SupplierInteractionAgent(BaseAgent):
                 )
 
         wait_timeout = None if timeout is None else max(0.0, float(timeout))
-        state_result = None
         try:
             state_result = coordinator.await_completion(workflow_id, wait_timeout)
         except Exception:
@@ -1645,13 +1663,6 @@ class SupplierInteractionAgent(BaseAgent):
                 "Supplier response coordinator wait failed for workflow=%s", workflow_id
             )
             return None
-        finally:
-            try:
-                coordinator.clear(workflow_id)
-            except Exception:
-                logger.exception(
-                    "Failed to clear response coordinator state for workflow=%s", workflow_id
-                )
 
         if state_result is None:
             return None
@@ -1674,14 +1685,40 @@ class SupplierInteractionAgent(BaseAgent):
             if self._coerce_text(uid)
         ]
 
+        pending_rows: List[Dict[str, Any]] = []
+        fetch_kwargs = {"workflow_id": workflow_id}
         try:
-            all_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+            pending_rows = supplier_response_repo.fetch_pending(
+                include_processed=False, **fetch_kwargs
+            )
+        except TypeError:
+            try:
+                pending_rows = supplier_response_repo.fetch_pending(**fetch_kwargs)
+            except Exception:
+                logger.exception(
+                    "Failed to load pending supplier responses for workflow=%s", workflow_id
+                )
+                pending_rows = []
         except Exception:
             logger.exception(
-                "Failed to load supplier responses for workflow=%s during aggregation",
-                workflow_id,
+                "Failed to load pending supplier responses for workflow=%s", workflow_id
             )
-            all_rows = []
+            pending_rows = []
+
+        all_rows: List[Dict[str, Any]] = [row for row in pending_rows if isinstance(row, dict)]
+        if not all_rows:
+            try:
+                all_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+            except Exception:
+                logger.exception(
+                    "Failed to load supplier responses for workflow=%s during aggregation",
+                    workflow_id,
+                )
+                all_rows = []
+            else:
+                if not isinstance(all_rows, list):
+                    all_rows = list(all_rows or [])
+                all_rows = [row for row in all_rows if isinstance(row, dict)]
 
         response_map: Dict[str, Dict[str, Any]] = {}
         for row in all_rows:

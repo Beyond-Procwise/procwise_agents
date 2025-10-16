@@ -67,11 +67,14 @@ class _WorkflowEntry:
         self.expected_count: int = 0
         self.collected: Set[str] = set()
         self.event = threading.Event()
+        self.waiters: int = 0
+        self.pending_clear: bool = False
 
     def reset(self, expected_ids: Sequence[str], expected_count: int) -> None:
         self.expected_unique_ids = [uid for uid in expected_ids if uid]
         self.expected_count = max(expected_count, len(self.expected_unique_ids))
         self.collected.intersection_update(self.expected_unique_ids)
+        self.pending_clear = False
         if not self.expected_unique_ids:
             self.event.set()
         elif self.is_complete:
@@ -147,20 +150,33 @@ class InMemoryResponseCoordinator(BaseResponseCoordinator):
         key = str(workflow_id)
         with self._lock:
             entry = self._entries.setdefault(key, _WorkflowEntry())
+            entry.waiters += 1
             state = entry.to_state(key)
             if entry.is_complete:
                 state.status = "complete"
+                entry.waiters = max(0, entry.waiters - 1)
+                if entry.waiters == 0 and (entry.pending_clear or entry.is_complete):
+                    self._entries.pop(key, None)
                 return state
 
         wait_timeout = None if timeout is None else max(0.0, float(timeout))
         completed = entry.event.wait(wait_timeout)
         with self._lock:
             state = entry.to_state(key, status="complete" if completed else "timeout")
+            entry.waiters = max(0, entry.waiters - 1)
+            if entry.waiters == 0 and (entry.pending_clear or entry.is_complete):
+                self._entries.pop(key, None)
         return state
 
     def clear(self, workflow_id: str) -> None:
         key = str(workflow_id)
         with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return
+            if entry.waiters > 0:
+                entry.pending_clear = True
+                return
             self._entries.pop(key, None)
 
 
