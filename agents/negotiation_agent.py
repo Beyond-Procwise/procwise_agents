@@ -1350,7 +1350,8 @@ class NegotiationAgent(BaseAgent):
         if supplier_watch_fields:
             pass_fields.update(supplier_watch_fields)
             await_response = bool(supplier_watch_fields.get("await_response"))
-            if await_response and not next_agents:
+            awaiting_email_drafting = "EmailDraftingAgent" in next_agents
+            if await_response and not awaiting_email_drafting:
                 wait_results = self._await_supplier_responses(
                     context=context,
                     watch_payload=supplier_watch_fields,
@@ -1467,7 +1468,7 @@ class NegotiationAgent(BaseAgent):
                     bool(new_responses) or supplier_reply_registered,
                 )
             else:
-                if "SupplierInteractionAgent" not in next_agents:
+                if await_response and "SupplierInteractionAgent" not in next_agents:
                     next_agents.append("SupplierInteractionAgent")
         if supplier_responses:
             data["supplier_responses"] = supplier_responses
@@ -3955,6 +3956,16 @@ class NegotiationAgent(BaseAgent):
             return None
 
         candidate_drafts: List[Dict[str, Any]] = []
+        observed_unique_ids: List[str] = []
+        unique_id_set: Set[str] = set()
+
+        def _record_unique_id(raw_value: Any) -> Optional[str]:
+            text = self._coerce_text(raw_value)
+            if text and text not in unique_id_set:
+                unique_id_set.add(text)
+                observed_unique_ids.append(text)
+            return text
+
         for source in (drafts, context.input_data.get("drafts")):
             if not source:
                 continue
@@ -3964,7 +3975,36 @@ class NegotiationAgent(BaseAgent):
                 continue
             for entry in source:
                 if isinstance(entry, dict):
-                    candidate_drafts.append(dict(entry))
+                    draft_copy = dict(entry)
+                    metadata = (
+                        draft_copy.get("metadata")
+                        if isinstance(draft_copy.get("metadata"), dict)
+                        else {}
+                    )
+                    unique_value = _record_unique_id(draft_copy.get("unique_id"))
+                    if not unique_value:
+                        for key in (
+                            "dispatch_run_id",
+                            "run_id",
+                            "email_action_id",
+                            "action_id",
+                            "draft_id",
+                        ):
+                            unique_value = _record_unique_id(
+                                draft_copy.get(key) or metadata.get(key)
+                            )
+                            if unique_value:
+                                break
+                    if not unique_value and metadata:
+                        for key in ("unique_id", "message_id", "id"):
+                            unique_value = _record_unique_id(metadata.get(key))
+                            if unique_value:
+                                break
+                    if not unique_value and session_reference:
+                        unique_value = _record_unique_id(session_reference)
+                    if unique_value:
+                        draft_copy.setdefault("unique_id", unique_value)
+                    candidate_drafts.append(draft_copy)
 
         if not candidate_drafts:
             fallback_entry = {"workflow_id": workflow_id}
@@ -3988,6 +4028,8 @@ class NegotiationAgent(BaseAgent):
                     draft.setdefault("unique_id", session_reference)
                     draft.setdefault("rfq_id", session_reference)
 
+        expected_count = max(len(candidate_drafts), len(observed_unique_ids)) or 1
+
         watch_payload: Dict[str, Any] = {
             "await_response": True,
             "message": "",
@@ -3996,12 +4038,18 @@ class NegotiationAgent(BaseAgent):
             "supplier_id": supplier,
             "response_poll_interval": poll_interval,
             "workflow_id": workflow_hint,
+            "expected_dispatch_count": expected_count,
+            "expected_email_count": expected_count,
         }
 
         if session_reference:
             watch_payload.setdefault("session_reference", session_reference)
             watch_payload.setdefault("unique_id", session_reference)
             watch_payload.setdefault("rfq_id", session_reference)
+
+        if observed_unique_ids:
+            watch_payload["unique_ids"] = list(observed_unique_ids)
+            watch_payload["expected_unique_ids"] = list(observed_unique_ids)
 
         batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
         if batch_limit:
@@ -4021,7 +4069,7 @@ class NegotiationAgent(BaseAgent):
             except Exception:  # pragma: no cover - defensive
                 logger.debug("Invalid email_response_timeout_seconds=%s", timeout_setting)
 
-        if len(watch_payload["drafts"]) > 1:
+        if len(watch_payload["drafts"]) > 1 or expected_count > 1:
             watch_payload["await_all_responses"] = True
 
         reply_count = state.get("supplier_reply_count")
@@ -4054,6 +4102,26 @@ class NegotiationAgent(BaseAgent):
             logger.exception("Unable to initialise supplier interaction agent for wait")
             return None
 
+        expected_dispatch = self._positive_int(
+            watch_payload.get("expected_dispatch_count"), fallback=0
+        )
+        expected_email_count = self._positive_int(
+            watch_payload.get("expected_email_count"), fallback=0
+        )
+        unique_expectations = [
+            self._coerce_text(value)
+            for value in self._ensure_list(
+                watch_payload.get("expected_unique_ids")
+                or watch_payload.get("unique_ids")
+            )
+            if self._coerce_text(value)
+        ]
+        expected_total = max(
+            expected_dispatch,
+            expected_email_count,
+            len(unique_expectations),
+        )
+
         timeout_default = getattr(
             self.agent_nick.settings, "email_response_timeout_seconds", 900
         )
@@ -4067,11 +4135,28 @@ class NegotiationAgent(BaseAgent):
         timeout = self._positive_int(timeout_raw, fallback=timeout_default)
         poll_interval = self._positive_int(poll_raw, fallback=poll_default)
         batch_limit = self._positive_int(batch_raw, fallback=batch_default)
+        if expected_total and batch_limit < expected_total:
+            batch_limit = expected_total
 
         draft_entries: List[Dict[str, Any]] = []
         for draft in watch_payload.get("drafts", []):
             if isinstance(draft, dict):
-                draft_entries.append(dict(draft))
+                draft_copy = dict(draft)
+                draft_unique = self._coerce_text(draft_copy.get("unique_id"))
+                if not draft_unique and unique_expectations:
+                    for candidate in unique_expectations:
+                        if not candidate:
+                            continue
+                        if any(
+                            self._coerce_text(entry.get("unique_id")) == candidate
+                            for entry in draft_entries
+                        ):
+                            continue
+                        draft_unique = candidate
+                        break
+                if draft_unique:
+                    draft_copy.setdefault("unique_id", draft_unique)
+                draft_entries.append(draft_copy)
 
         if not draft_entries:
             fallback_entry = {}
@@ -4090,7 +4175,11 @@ class NegotiationAgent(BaseAgent):
             logger.warning("No draft context available while awaiting supplier response")
             return None
 
-        await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
+        await_all = bool(
+            watch_payload.get("await_all_responses")
+            or expected_total > 1
+            or len(draft_entries) > 1
+        )
         tracked_unique_ids = sorted(
             {
                 self._coerce_text(entry.get("unique_id"))
@@ -4098,6 +4187,12 @@ class NegotiationAgent(BaseAgent):
                 if self._coerce_text(entry.get("unique_id"))
             }
         )
+        if unique_expectations and not tracked_unique_ids:
+            tracked_unique_ids = sorted({value for value in unique_expectations if value})
+        if expected_total and expected_total < len(draft_entries):
+            expected_total = len(draft_entries)
+        elif not expected_total:
+            expected_total = len(draft_entries)
 
         workflow_hint = self._coerce_text(
             watch_payload.get("workflow_id") or getattr(context, "workflow_id", None)
@@ -4105,13 +4200,42 @@ class NegotiationAgent(BaseAgent):
 
         try:
             if await_all:
-                return supplier_agent.wait_for_multiple_responses(
+                results = supplier_agent.wait_for_multiple_responses(
                     draft_entries,
                     timeout=timeout,
                     poll_interval=poll_interval,
                     limit=batch_limit,
                     enable_negotiation=False,
                 )
+                valid_results = [res for res in results if isinstance(res, dict)]
+                if expected_total and len(valid_results) < expected_total:
+                    logger.warning(
+                        "Awaited %s supplier responses but only received %s (workflow_id=%s unique_ids=%s)",
+                        expected_total,
+                        len(valid_results),
+                        workflow_hint,
+                        tracked_unique_ids or unique_expectations or None,
+                    )
+                    return None
+                if unique_expectations:
+                    observed = {
+                        self._coerce_text(res.get("unique_id"))
+                        for res in valid_results
+                        if self._coerce_text(res.get("unique_id"))
+                    }
+                    missing = [
+                        value
+                        for value in unique_expectations
+                        if value and value not in observed
+                    ]
+                    if missing:
+                        logger.warning(
+                            "Missing supplier responses for unique_ids=%s (workflow_id=%s)",
+                            missing,
+                            workflow_hint,
+                        )
+                        return None
+                return results
 
             target = draft_entries[0]
             recipient_hint = target.get("receiver") or target.get("recipient_email")
