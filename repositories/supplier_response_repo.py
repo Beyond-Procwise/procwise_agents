@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from services.db import get_conn
+from services.supplier_response_coordinator import notify_response_received
+
+logger = logging.getLogger(__name__)
 
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
@@ -183,6 +187,15 @@ def insert_response(row: SupplierResponseRow) -> None:
             ),
         )
         cur.close()
+
+    try:
+        notify_response_received(workflow_id=row.workflow_id, unique_id=row.unique_id)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "Failed to broadcast response event for workflow=%s unique_id=%s",
+            row.workflow_id,
+            row.unique_id,
+        )
 
 
 def delete_responses(*, workflow_id: str, unique_ids: Iterable[str]) -> None:

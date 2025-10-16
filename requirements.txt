@@ -20,3 +20,4 @@ easyocr
 jinja2
 faiss-cpu
 rank-bm25
+redis

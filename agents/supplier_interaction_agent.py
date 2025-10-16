@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
+from services.supplier_response_coordinator import get_supplier_response_coordinator
 from services.supplier_response_workflow import SupplierResponseWorkflow
 from repositories import (
     draft_rfq_emails_repo,
@@ -1397,6 +1398,66 @@ class SupplierInteractionAgent(BaseAgent):
         expected_unique_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         expected_ids = list(expected_unique_ids or [])
+        normalised_ids = [
+            self._coerce_text(uid) for uid in expected_ids if self._coerce_text(uid)
+        ]
+        expected_ids = list(dict.fromkeys(normalised_ids)) if normalised_ids else []
+
+        explicit_count = expected_count if isinstance(expected_count, int) else None
+        count_hint = explicit_count if explicit_count is not None else 0
+        if expected_ids:
+            count_hint = max(len(expected_ids), count_hint)
+
+        if expected_ids and count_hint <= 0:
+            count_hint = len(expected_ids)
+
+        if explicit_count is not None and explicit_count <= 0 and not expected_ids:
+            return {
+                "workflow_id": workflow_id,
+                "expected_responses": 0,
+                "expected_count": 0,
+                "collected_responses": 0,
+                "completed_responses": 0,
+                "collected_count": 0,
+                "complete": True,
+                "wait_seconds": 0.0,
+                "responses": [],
+                "unique_ids": [],
+                "collected_unique_ids": [],
+                "expected_unique_ids": [],
+                "pending_unique_ids": [],
+                "timed_out": False,
+            }
+
+        self._ensure_response_schema()
+
+        event_summary = self._await_response_gate_event_driven(
+            workflow_id=workflow_id,
+            expected_ids=expected_ids,
+            expected_count=count_hint,
+            timeout=timeout,
+        )
+        if event_summary is not None:
+            return event_summary
+
+        return self._await_response_gate_polling(
+            workflow_id,
+            expected_count=expected_count,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            expected_unique_ids=expected_unique_ids,
+        )
+
+    def _await_response_gate_polling(
+        self,
+        workflow_id: str,
+        *,
+        expected_count: Optional[int] = None,
+        poll_interval: Optional[float] = None,
+        timeout: Optional[int] = None,
+        expected_unique_ids: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        expected_ids = list(expected_unique_ids or [])
         normalised_ids = [self._coerce_text(uid) for uid in expected_ids if self._coerce_text(uid)]
         expected_ids = list(dict.fromkeys(normalised_ids)) if normalised_ids else []
 
@@ -1513,6 +1574,159 @@ class SupplierInteractionAgent(BaseAgent):
             "expected_unique_ids": expected_ids,
             "pending_unique_ids": pending,
             "timed_out": bool(not complete and deadline is not None),
+        }
+
+    def _await_response_gate_event_driven(
+        self,
+        *,
+        workflow_id: str,
+        expected_ids: Sequence[str],
+        expected_count: int,
+        timeout: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        normalised = [self._coerce_text(uid) for uid in expected_ids if self._coerce_text(uid)]
+        expected_list = list(dict.fromkeys(normalised)) if normalised else []
+        if not expected_list:
+            return None
+
+        try:
+            coordinator = get_supplier_response_coordinator()
+        except Exception:
+            logger.exception(
+                "Failed to initialise supplier response coordinator; falling back to polling"
+            )
+            return None
+
+        if not coordinator:
+            return None
+
+        expected_set = {uid for uid in expected_list if uid}
+        if not expected_set:
+            return None
+
+        start = time.monotonic()
+        try:
+            coordinator.register_expected_responses(
+                workflow_id,
+                expected_list,
+                max(expected_count, len(expected_list)),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to register expected responses for workflow=%s", workflow_id
+            )
+            return None
+
+        try:
+            preload_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+        except Exception:
+            logger.exception(
+                "Failed to preload supplier responses for workflow=%s", workflow_id
+            )
+            preload_rows = []
+
+        for row in preload_rows:
+            if not isinstance(row, dict):
+                continue
+            unique_id = self._coerce_text(row.get("unique_id"))
+            if not unique_id or unique_id not in expected_set:
+                continue
+            try:
+                coordinator.record_response(workflow_id, unique_id)
+            except Exception:
+                logger.exception(
+                    "Failed to seed response coordinator for workflow=%s unique_id=%s",
+                    workflow_id,
+                    unique_id,
+                )
+
+        wait_timeout = None if timeout is None else max(0.0, float(timeout))
+        state_result = None
+        try:
+            state_result = coordinator.await_completion(workflow_id, wait_timeout)
+        except Exception:
+            logger.exception(
+                "Supplier response coordinator wait failed for workflow=%s", workflow_id
+            )
+            return None
+        finally:
+            try:
+                coordinator.clear(workflow_id)
+            except Exception:
+                logger.exception(
+                    "Failed to clear response coordinator state for workflow=%s", workflow_id
+                )
+
+        if state_result is None:
+            return None
+
+        state_data = (
+            state_result.as_dict()
+            if hasattr(state_result, "as_dict")
+            else dict(state_result or {})
+        )
+
+        status = state_data.get("status") or "pending"
+        collected_state = [
+            self._coerce_text(uid)
+            for uid in state_data.get("collected_unique_ids", [])
+            if self._coerce_text(uid)
+        ]
+        pending_state = [
+            self._coerce_text(uid)
+            for uid in state_data.get("pending_unique_ids", [])
+            if self._coerce_text(uid)
+        ]
+
+        try:
+            all_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+        except Exception:
+            logger.exception(
+                "Failed to load supplier responses for workflow=%s during aggregation",
+                workflow_id,
+            )
+            all_rows = []
+
+        response_map: Dict[str, Dict[str, Any]] = {}
+        for row in all_rows:
+            if not isinstance(row, dict):
+                continue
+            unique_id = self._coerce_text(row.get("unique_id"))
+            if not unique_id:
+                continue
+            if expected_set and unique_id not in expected_set:
+                continue
+            response_map.setdefault(unique_id, dict(row))
+
+        collected_ids: List[str] = [uid for uid in expected_list if uid in response_map]
+        if not collected_ids:
+            collected_ids = [uid for uid in collected_state if uid in response_map]
+        if not collected_ids:
+            collected_ids = list(response_map.keys())
+
+        pending_ids = [uid for uid in expected_list if uid not in collected_ids]
+        if not pending_ids and pending_state:
+            pending_ids = pending_state
+
+        elapsed = time.monotonic() - start
+        expected_total = max(expected_count, len(expected_list))
+        responses = [response_map[uid] for uid in collected_ids if uid in response_map]
+        complete = bool(not pending_ids and status == "complete")
+        return {
+            "workflow_id": workflow_id,
+            "expected_responses": expected_total,
+            "expected_count": expected_total,
+            "collected_responses": len(responses),
+            "completed_responses": len(responses),
+            "collected_count": len(responses),
+            "complete": complete,
+            "wait_seconds": elapsed,
+            "responses": responses,
+            "unique_ids": list(expected_list),
+            "collected_unique_ids": collected_ids,
+            "expected_unique_ids": list(expected_list),
+            "pending_unique_ids": pending_ids,
+            "timed_out": status == "timeout",
         }
 
     def _blocking_dispatch_gate(
