@@ -288,13 +288,43 @@ class NegotiationAgent(BaseAgent):
                 return text
 
         payload = context.input_data if isinstance(context.input_data, dict) else {}
-        for key in ("workflow_id", "session_id", "process_id", "rfq_id"):
+        for key in ("workflow_id", "session_id", "process_id"):
             candidate = payload.get(key)
             text = self._coerce_text(candidate)
             if text:
                 return text
 
+        responses = payload.get("supplier_responses")
+        if isinstance(responses, list):
+            for entry in responses:
+                if not isinstance(entry, dict):
+                    continue
+                uid = self._coerce_text(entry.get("unique_id"))
+                if uid:
+                    return uid
+
         return None
+
+    def _resolve_session_reference(self, context: AgentContext) -> Optional[str]:
+        """Resolve a display/reference token for downstream compatibility."""
+
+        payload = context.input_data if isinstance(context.input_data, dict) else {}
+        responses = payload.get("supplier_responses")
+        if isinstance(responses, list):
+            for entry in responses:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("session_reference", "unique_id", "workflow_id", "session_id", "process_id"):
+                    candidate = self._coerce_text(entry.get(key))
+                    if candidate:
+                        return candidate
+
+        for key in ("session_reference", "unique_id"):
+            candidate = self._coerce_text(payload.get(key))
+            if candidate:
+                return candidate
+
+        return self._coerce_text(getattr(context, "workflow_id", None))
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -429,7 +459,8 @@ class NegotiationAgent(BaseAgent):
                             "results": [
                                 {
                                     "supplier_id": prepared_entries[0].get("supplier_id"),
-                                    "rfq_id": prepared_entries[0].get("rfq_id"),
+                                    "session_reference": prepared_entries[0].get("session_reference")
+                                    or prepared_entries[0].get("rfq_id"),
                                     "status": AgentStatus.FAILED.value,
                                     "error": str(exc),
                                 }
@@ -487,14 +518,20 @@ class NegotiationAgent(BaseAgent):
 
             for payload, future in futures:
                 supplier_id = payload.get("supplier_id") or payload.get("supplier")
-                rfq_id = payload.get("rfq_id")
+                session_reference = (
+                    payload.get("session_reference")
+                    or payload.get("unique_id")
+                    or payload.get("rfq_id")
+                )
                 try:
                     result = future.result()
                 except Exception as exc:  # pragma: no cover - defensive aggregation
                     error_message = str(exc)
                     record = {
                         "supplier_id": supplier_id,
-                        "rfq_id": rfq_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "status": AgentStatus.FAILED.value,
                         "error": error_message,
                     }
@@ -502,11 +539,18 @@ class NegotiationAgent(BaseAgent):
                     failed_records.append(record)
                     continue
 
+                record_reference = (
+                    result.data.get("session_reference")
+                    or result.data.get("unique_id")
+                    or session_reference
+                )
                 record = {
                     "supplier_id": result.data.get("supplier")
                     or supplier_id
                     or payload.get("supplier_id"),
-                    "rfq_id": result.data.get("rfq_id") or rfq_id,
+                    "session_reference": record_reference,
+                    "unique_id": record_reference,
+                    "rfq_id": record_reference,
                     "status": result.status.value,
                     "output": result.data,
                     "pass_fields": result.pass_fields,
@@ -589,13 +633,17 @@ class NegotiationAgent(BaseAgent):
 
         supplier = context.input_data.get("supplier") or context.input_data.get("supplier_id")
         session_id = self._resolve_session_id(context)
-        rfq_id = session_id
+        session_reference = self._resolve_session_reference(context)
+        if not session_reference:
+            session_reference = session_id
         workflow_id = session_id or (
             context.input_data.get("workflow_id")
             or getattr(context, "workflow_id", None)
         )
         if session_id and isinstance(context.input_data, dict):
             context.input_data.setdefault("workflow_id", session_id)
+        if session_reference and isinstance(context.input_data, dict):
+            context.input_data.setdefault("session_reference", session_reference)
         raw_round = context.input_data.get("round", 1)
 
         price_raw = (
@@ -871,7 +919,13 @@ class NegotiationAgent(BaseAgent):
             except ZeroDivisionError:
                 savings_score = 0.0
 
-        decision_log = self._build_decision_log(supplier, session_id, price, target_price, decision)
+        decision_log = self._build_decision_log(
+            supplier,
+            session_reference,
+            price,
+            target_price,
+            decision,
+        )
 
         draft_records: List[Dict[str, Any]] = []
 
@@ -901,7 +955,9 @@ class NegotiationAgent(BaseAgent):
             )
             data = {
                 "supplier": supplier,
-                "rfq_id": rfq_id,
+                "session_reference": session_reference,
+                "unique_id": session_reference,
+                "rfq_id": session_reference,
                 "round": round_no,
                 "counter_proposals": counter_options,
                 "decision": decision,
@@ -945,10 +1001,11 @@ class NegotiationAgent(BaseAgent):
             if awaiting_now:
                 watch_fields = self._build_supplier_watch_fields(
                     context=context,
-                    rfq_id=rfq_id,
+                    session_reference=session_reference,
                     supplier=supplier,
                     drafts=draft_records,
                     state=state,
+                    workflow_id=session_id,
                 )
                 if watch_fields:
                     pass_fields.update(watch_fields)
@@ -992,12 +1049,12 @@ class NegotiationAgent(BaseAgent):
         rag_snippets = self._collect_vector_snippets(
             context=context,
             supplier_name=supplier_name or supplier_identifier,
-            rfq_id=rfq_id,
+            rfq_id=session_reference,
         )
 
         negotiation_message = self._build_summary(
             context,
-            rfq_id,
+            session_reference,
             decision,
             price,
             target_price,
@@ -1030,7 +1087,9 @@ class NegotiationAgent(BaseAgent):
 
         draft_payload = {
             "intent": "NEGOTIATION_COUNTER",
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "supplier_id": supplier,
             "current_offer": price_raw,
             "current_offer_numeric": price,
@@ -1110,7 +1169,9 @@ class NegotiationAgent(BaseAgent):
             subject_seed = self._format_negotiation_subject(state)
 
         draft_stub = {
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "supplier_id": supplier,
             "intent": "NEGOTIATION_COUNTER",
             "metadata": draft_metadata,
@@ -1148,7 +1209,7 @@ class NegotiationAgent(BaseAgent):
 
         email_output: Optional[AgentOutput] = None
         fallback_payload: Optional[Dict[str, Any]] = None
-        if email_payload and supplier and rfq_id:
+        if email_payload and supplier and session_reference:
             email_output = self._invoke_email_drafting_agent(context, email_payload)
             fallback_payload = dict(email_payload)
         if email_output and email_output.status == AgentStatus.SUCCESS:
@@ -1222,7 +1283,9 @@ class NegotiationAgent(BaseAgent):
         public_state = self._public_state(cached_state or state)
         data = {
             "supplier": supplier,
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "round": round_no,
             "counter_proposals": counter_options,
             "decision": decision,
@@ -1272,7 +1335,7 @@ class NegotiationAgent(BaseAgent):
             supplier=supplier,
             drafts=draft_records,
             state=state,
-            rfq_id=rfq_id,
+            session_reference=session_reference,
         )
         supplier_responses: List[Dict[str, Any]] = []
         if supplier_watch_fields:
@@ -1299,6 +1362,9 @@ class NegotiationAgent(BaseAgent):
                     error_payload = {
                         "supplier": supplier,
                         "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
@@ -1323,6 +1389,9 @@ class NegotiationAgent(BaseAgent):
                     error_payload = {
                         "supplier": supplier,
                         "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
@@ -1400,8 +1469,9 @@ class NegotiationAgent(BaseAgent):
             merge_payload.setdefault("intent", "NEGOTIATION_COUNTER")
             merge_payload.setdefault("decision", decision)
             merge_payload["session_state"] = public_state
-            if rfq_id is not None:
-                merge_payload.setdefault("rfq_id", rfq_id)
+            if session_reference is not None:
+                merge_payload.setdefault("session_reference", session_reference)
+                merge_payload.setdefault("rfq_id", session_reference)
             if supplier is not None:
                 merge_payload.setdefault("supplier_id", supplier)
             supplier_name = context.input_data.get("supplier_name")
@@ -1440,7 +1510,10 @@ class NegotiationAgent(BaseAgent):
 
             pass_fields.update(merge_payload)
         logger.info(
-            "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
+            "NegotiationAgent prepared counter round %s for supplier=%s session_reference=%s",
+            round_no,
+            supplier,
+            session_reference,
         )
 
         return self._with_plan(
@@ -3046,7 +3119,7 @@ class NegotiationAgent(BaseAgent):
     def _build_summary(
         self,
         context: AgentContext,
-        rfq_id: Optional[str],
+        session_reference: Optional[str],
         decision: Dict[str, Any],
         price: Optional[float],
         target_price: Optional[float],
@@ -3062,14 +3135,92 @@ class NegotiationAgent(BaseAgent):
         procurement_summary: Optional[Dict[str, Any]] = None,
         rag_snippets: Optional[List[str]] = None,
     ) -> str:
-        # Use the new human-like message composer
-        positions = NegotiationPositions(
-            start=decision.get("start_position"),
-            desired=decision.get("desired_position"),
-            no_deal=decision.get("no_deal_position"),
-            supplier_offer=price,
-            history=decision.get("positions", {}).get("history", []),
-        )
+        rfq_text = session_reference or "RFQ"
+        strategy = decision.get("strategy")
+        lines: List[str] = []
+        header = f"Round {round_no} plan for {rfq_text}"
+        if strategy:
+            header += f": {strategy}"
+        lines.append(header)
+
+        if round_no >= 3:
+            lines.append(
+                "- Closing round: request the supplier's best and final quote and confirm readiness to award"
+            )
+
+        descriptor: Optional[str] = None
+        supplier_type: Optional[str] = None
+        negotiation_style: Optional[str] = None
+        lever_priorities: List[str] = []
+        if playbook_context:
+            descriptor_candidate = playbook_context.get("descriptor")
+            descriptor = str(descriptor_candidate).strip() if descriptor_candidate else None
+            supplier_candidate = playbook_context.get("supplier_type")
+            supplier_type = str(supplier_candidate).strip() if supplier_candidate else None
+            style_candidate = playbook_context.get("style")
+            negotiation_style = (
+                str(style_candidate).strip() if isinstance(style_candidate, str) else None
+            )
+            lever_values = playbook_context.get("lever_priorities")
+            if isinstance(lever_values, (list, tuple)):
+                lever_priorities = [
+                    str(value).strip()
+                    for value in lever_values
+                    if isinstance(value, str) and value.strip()
+                ]
+
+        if supplier_type or descriptor:
+            descriptor_parts: List[str] = []
+            if supplier_type:
+                descriptor_parts.append(f"Supplier category: {supplier_type}")
+            if descriptor:
+                descriptor_parts.append(descriptor)
+            if descriptor_parts:
+                lines.append("- " + " — ".join(descriptor_parts))
+
+        if negotiation_style:
+            if lever_priorities:
+                lever_text = ", ".join(lever_priorities[:3])
+            else:
+                lever_text = "balanced levers"
+            lines.append(
+                f"- Negotiation style: {negotiation_style}; focus levers: {lever_text}"
+            )
+
+        counter_price = decision.get("counter_price")
+        formatted_offer: Optional[str] = None
+        if price is not None:
+            formatted_offer = self._format_currency(price, currency)
+
+        if counter_price is not None:
+            counter_text = self._format_currency(counter_price, currency)
+            if formatted_offer:
+                lines.append(
+                    f"- Counter at {counter_text} against supplier offer {formatted_offer}"
+                )
+            else:
+                lines.append(f"- Counter target: {counter_text}")
+        elif formatted_offer:
+            lines.append(f"- Seek clarification before accepting {formatted_offer}")
+
+        if target_price is not None and price is not None:
+            target_text = self._format_currency(target_price, currency)
+            delta = price - target_price
+            try:
+                delta_text = self._format_currency(delta, currency)
+            except Exception:
+                delta_text = f"{delta:0.2f}"
+            lines.append(
+                f"- Target {target_text} vs offer {formatted_offer} (gap {delta_text})"
+            )
+
+        lead_time = decision.get("lead_time_request")
+        if lead_time:
+            lines.append(f"- Lead time ask: {lead_time}")
+
+        asks = decision.get("asks") or []
+        if asks:
+            lines.append("- Key asks: " + "; ".join(str(item) for item in asks if item))
 
         return self._compose_negotiation_message(
             context=context,
@@ -3499,7 +3650,7 @@ class NegotiationAgent(BaseAgent):
         supplier: Optional[str],
         drafts: List[Dict[str, Any]],
         state: Dict[str, Any],
-        rfq_id: Optional[str] = None,
+        session_reference: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         if not workflow_id:
             return None
@@ -3520,6 +3671,10 @@ class NegotiationAgent(BaseAgent):
             fallback_entry = {"workflow_id": workflow_id}
             if supplier:
                 fallback_entry["supplier_id"] = supplier
+            if session_reference:
+                fallback_entry["session_reference"] = session_reference
+                fallback_entry.setdefault("unique_id", session_reference)
+                fallback_entry.setdefault("rfq_id", session_reference)
             candidate_drafts.append(fallback_entry)
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
@@ -3529,6 +3684,10 @@ class NegotiationAgent(BaseAgent):
             for draft in candidate_drafts:
                 if isinstance(draft, dict) and not draft.get("workflow_id"):
                     draft["workflow_id"] = workflow_hint
+                if isinstance(draft, dict) and session_reference:
+                    draft.setdefault("session_reference", session_reference)
+                    draft.setdefault("unique_id", session_reference)
+                    draft.setdefault("rfq_id", session_reference)
 
         watch_payload: Dict[str, Any] = {
             "await_response": True,
@@ -3539,6 +3698,11 @@ class NegotiationAgent(BaseAgent):
             "response_poll_interval": poll_interval,
             "workflow_id": workflow_hint,
         }
+
+        if session_reference:
+            watch_payload.setdefault("session_reference", session_reference)
+            watch_payload.setdefault("unique_id", session_reference)
+            watch_payload.setdefault("rfq_id", session_reference)
 
         batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
         if batch_limit:
@@ -3749,13 +3913,17 @@ class NegotiationAgent(BaseAgent):
     def _record_learning_snapshot(
         self,
         context: AgentContext,
-        session_id: Optional[str],
-        supplier: Optional[str],
-        decision: Dict[str, Any],
-        state: Dict[str, Any],
-        awaiting_response: bool,
-        supplier_reply_registered: bool,
+        session_id: Optional[str] = None,
+        supplier: Optional[str] = None,
+        decision: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
+        awaiting_response: bool = False,
+        supplier_reply_registered: bool = False,
+        *,
+        rfq_id: Optional[str] = None,
     ) -> None:
+        if session_id is None and rfq_id is not None:
+            session_id = rfq_id
         logger.debug(
             "Negotiation learning capture skipped (session_id=%s, supplier=%s)",
             session_id,
@@ -3839,14 +4007,14 @@ class NegotiationAgent(BaseAgent):
     def _build_decision_log(
         self,
         supplier: Optional[str],
-        rfq_id: Optional[str],
+        session_reference: Optional[str],
         price: Optional[float],
         target_price: Optional[float],
         decision: Dict[str, Any],
     ) -> str:
         base = (
             f"Strategy={decision.get('strategy')} counter={decision.get('counter_price')}"
-            f" target={target_price} current={price} supplier={supplier} rfq={rfq_id}."
+            f" target={target_price} current={price} supplier={supplier} reference={session_reference}."
         )
         plays = decision.get("play_recommendations") or []
         if plays:

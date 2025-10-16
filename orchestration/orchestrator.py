@@ -1758,6 +1758,11 @@ class Orchestrator:
                 negotiation_payload.setdefault("negotiation_batch", True)
                 negotiation_payload.update(dict(supplier_result.data))
 
+            if isinstance(supplier_result.data, dict):
+                primary_reference = supplier_result.data.get("session_reference")
+                if primary_reference:
+                    negotiation_payload.setdefault("session_reference", primary_reference)
+
             thread_headers_payload: Optional[Dict[str, Any]] = None
             if isinstance(supplier_result.data, dict):
                 thread_headers_payload = supplier_result.data.get("thread_headers")

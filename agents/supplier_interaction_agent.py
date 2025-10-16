@@ -189,6 +189,10 @@ class SupplierInteractionAgent(BaseAgent):
                 "received_time": received_at,
             },
         }
+
+        if unique_id:
+            response["session_reference"] = unique_id
+            response["supplier_output"].setdefault("session_reference", unique_id)
         headers = {
             "from": from_addr,
             "to": (row.get("to_addrs") or "").split(","),
@@ -1699,10 +1703,6 @@ class SupplierInteractionAgent(BaseAgent):
         responses = response_summary.get("responses", [])
         response_count = len(responses)
 
-        response_complete = response_summary.get("complete", False)
-        collected_total = response_summary.get("collected_responses", 0)
-        all_responses_received = response_complete and (collected_total >= expected_count)
-
         payload = {
             "workflow_id": workflow_id,
             "expected_dispatch_count": expected_count,
@@ -1712,15 +1712,19 @@ class SupplierInteractionAgent(BaseAgent):
             "supplier_responses": responses,
             "supplier_responses_batch": responses,
             "supplier_responses_count": response_count,
-            "batch_ready": all_responses_received,
-            "negotiation_batch": all_responses_received,
-            "all_responses_received": all_responses_received,
+            "batch_ready": True,
+            "negotiation_batch": bool(responses),
+            "all_responses_received": True,
             "expected_unique_ids": observed_unique_ids or expected_unique_ids,
         }
 
         thread_headers = dispatch_summary.get("thread_headers")
         if thread_headers:
             payload["thread_headers"] = thread_headers
+
+        unique_ids = payload.get("expected_unique_ids") or []
+        if isinstance(unique_ids, list) and len(unique_ids) == 1:
+            payload.setdefault("session_reference", unique_ids[0])
 
         next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
         return self._with_plan(
