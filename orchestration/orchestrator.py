@@ -1707,6 +1707,8 @@ class Orchestrator:
             supplier_input.update(supplier_payload)
         supplier_input["drafts"] = email_drafts
         expected_email_count = len(tracked_unique_ids) or drafted_email_count
+        supplier_input.setdefault("expected_dispatch_count", expected_email_count)
+        # Retain legacy key for agents that still inspect the historical field.
         supplier_input.setdefault("expected_email_count", expected_email_count)
         if tracked_unique_ids:
             supplier_input.setdefault("expected_unique_ids", tracked_unique_ids)
@@ -1732,7 +1734,16 @@ class Orchestrator:
         ):
             supplier_ctx.input_data.pop(key, None)
 
+        logger.info(
+            "Waiting for SupplierInteractionAgent to complete... workflow=%s",
+            workflow_hint,
+        )
         supplier_result = self._execute_agent("supplier_interaction", supplier_ctx)
+        logger.info(
+            "SupplierInteractionAgent completed for workflow=%s with status=%s",
+            workflow_hint,
+            getattr(supplier_result, "status", None),
+        )
 
         negotiation_result = None
         if (
