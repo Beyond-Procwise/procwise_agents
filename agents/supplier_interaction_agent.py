@@ -1319,7 +1319,9 @@ class SupplierInteractionAgent(BaseAgent):
 
             dispatch_map = current
             if expected_set:
-                if expected_set.issubset(dispatch_map.keys()):
+                if expected_set.issubset(dispatch_map.keys()) and (
+                    not count_hint or len(dispatch_map) >= count_hint
+                ):
                     complete = True
                     break
             else:
@@ -1334,16 +1336,19 @@ class SupplierInteractionAgent(BaseAgent):
                         expected_ids = [uid for uid in expected_ids if uid]
                         expected_set = {uid for uid in expected_ids if uid}
                         if expected_set:
-                            count_hint = max(count_hint, len(expected_set))
+                            count_hint = max(count_hint, len(expected_set), context_expectations.get("expected_count", 0))
                             if expected_set.issubset(dispatch_map.keys()):
                                 complete = True
                                 break
                 if not expected_set and dispatch_map:
-                    expected_ids = list(dispatch_map.keys())
-                    expected_set = set(expected_ids)
-                    count_hint = max(count_hint, len(expected_set))
-                    complete = True
-                    break
+                    inferred_ids = [uid for uid in dispatch_map.keys() if uid]
+                    if inferred_ids:
+                        expected_ids = inferred_ids
+                        expected_set = set(inferred_ids)
+                        count_hint = max(count_hint, len(expected_set))
+                        if not count_hint or len(dispatch_map) >= count_hint:
+                            complete = True
+                            break
                 if count_hint and len(dispatch_map) >= count_hint:
                     complete = True
                     break
