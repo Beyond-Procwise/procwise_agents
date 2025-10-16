@@ -188,6 +188,73 @@ def test_supplier_workflow_coordinates_agents(monkeypatch):
     assert result["supplier_interaction"]["processed"] is True
 
 
+def test_supplier_workflow_realigns_draft_workflow_ids(monkeypatch):
+    class DivergentEmailAgent:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, context):
+            self.calls.append(context.input_data)
+            drafts = [
+                {
+                    "supplier_id": "S1",
+                    "workflow_id": "legacy-1",
+                    "unique_id": "uid-1",
+                    "metadata": {"workflow_id": "legacy-1"},
+                },
+                {
+                    "supplier_id": "S2",
+                    "unique_id": "uid-2",
+                    "metadata": {
+                        "workflow_id": "legacy-2",
+                        "context": {"workflow_id": "legacy-2"},
+                    },
+                },
+            ]
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"drafts": drafts},
+                pass_fields={"drafts": drafts},
+            )
+
+    email_agent = DivergentEmailAgent()
+    supplier_agent = StubSupplierAgent()
+    coordinator = StubCoordinator()
+
+    monkeypatch.setattr(
+        patch_dependencies, "coordinator", coordinator, raising=False
+    )
+
+    nick = StubNick(email_agent, supplier_agent)
+    orchestrator = Orchestrator(nick)
+
+    response = orchestrator.execute_workflow(
+        "supplier_interaction",
+        {"draft_payload": {"subject": "RFQ"}},
+    )
+
+    result = response.get("result", {})
+    supplier_input = supplier_agent.calls[0]
+    draft_workflow_ids = {
+        draft.get("workflow_id") for draft in supplier_input.get("drafts", [])
+    }
+    assert len(draft_workflow_ids) == 1
+    canonical_workflow_id = next(iter(draft_workflow_ids))
+    assert canonical_workflow_id not in {"legacy-1", "legacy-2"}
+
+    for draft in supplier_input.get("drafts", []):
+        metadata = draft.get("metadata") or {}
+        assert draft.get("workflow_id") == canonical_workflow_id
+        assert metadata.get("workflow_id") == canonical_workflow_id
+        context_meta = metadata.get("context") or {}
+        assert context_meta.get("workflow_id") == canonical_workflow_id
+
+    coordinator_call = coordinator.calls[0]
+    assert coordinator_call["workflow_id"] == canonical_workflow_id
+    assert sorted(coordinator_call["unique_ids"]) == ["uid-1", "uid-2"]
+    assert result["supplier_interaction"]["processed"] is True
+
+
 def test_filter_drafts_for_workflow_respects_workflow_id():
     drafts = [
         {"workflow_id": "wf-keep", "unique_id": "uid-1"},
@@ -201,9 +268,29 @@ def test_filter_drafts_for_workflow_respects_workflow_id():
 
     filtered = Orchestrator._filter_drafts_for_workflow(drafts, "wf-keep")
 
-    assert len(filtered) == 2
+    assert len(filtered) == 4
     for draft in filtered:
         workflow_value = draft.get("workflow_id")
         if not workflow_value and isinstance(draft.get("metadata"), dict):
             workflow_value = draft["metadata"].get("workflow_id")
         assert workflow_value == "wf-keep"
+
+
+def test_filter_drafts_realigns_conflicting_workflow_ids():
+    drafts = [
+        {"workflow_id": "wf-a", "unique_id": "a1"},
+        {
+            "unique_id": "a2",
+            "metadata": {"workflow_id": "wf-b", "context": {"workflow_id": "wf-b"}},
+        },
+    ]
+
+    filtered = Orchestrator._filter_drafts_for_workflow(drafts, "wf-parent")
+
+    assert len(filtered) == 2
+    for draft in filtered:
+        assert draft.get("workflow_id") == "wf-parent"
+        metadata = draft.get("metadata") or {}
+        assert metadata.get("workflow_id") == "wf-parent"
+        context_meta = metadata.get("context") or {}
+        assert context_meta.get("workflow_id") == "wf-parent"
