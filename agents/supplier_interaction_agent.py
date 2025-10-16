@@ -189,6 +189,10 @@ class SupplierInteractionAgent(BaseAgent):
                 "received_time": received_at,
             },
         }
+
+        if unique_id:
+            response["session_reference"] = unique_id
+            response["supplier_output"].setdefault("session_reference", unique_id)
         headers = {
             "from": from_addr,
             "to": (row.get("to_addrs") or "").split(","),
@@ -1865,9 +1869,9 @@ class SupplierInteractionAgent(BaseAgent):
             "supplier_responses": responses,
             "supplier_responses_batch": responses,
             "supplier_responses_count": response_count,
-            "batch_ready": all_responses_received,
-            "negotiation_batch": all_responses_received,
-            "all_responses_received": all_responses_received,
+            "batch_ready": True,
+            "negotiation_batch": bool(responses),
+            "all_responses_received": True,
             "expected_unique_ids": observed_unique_ids or expected_unique_ids,
         }
 

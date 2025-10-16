@@ -288,13 +288,43 @@ class NegotiationAgent(BaseAgent):
                 return text
 
         payload = context.input_data if isinstance(context.input_data, dict) else {}
-        for key in ("workflow_id", "session_id", "process_id", "rfq_id"):
+        for key in ("workflow_id", "session_id", "process_id"):
             candidate = payload.get(key)
             text = self._coerce_text(candidate)
             if text:
                 return text
 
+        responses = payload.get("supplier_responses")
+        if isinstance(responses, list):
+            for entry in responses:
+                if not isinstance(entry, dict):
+                    continue
+                uid = self._coerce_text(entry.get("unique_id"))
+                if uid:
+                    return uid
+
         return None
+
+    def _resolve_session_reference(self, context: AgentContext) -> Optional[str]:
+        """Resolve a display/reference token for downstream compatibility."""
+
+        payload = context.input_data if isinstance(context.input_data, dict) else {}
+        responses = payload.get("supplier_responses")
+        if isinstance(responses, list):
+            for entry in responses:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("session_reference", "unique_id", "workflow_id", "session_id", "process_id"):
+                    candidate = self._coerce_text(entry.get(key))
+                    if candidate:
+                        return candidate
+
+        for key in ("session_reference", "unique_id"):
+            candidate = self._coerce_text(payload.get(key))
+            if candidate:
+                return candidate
+
+        return self._coerce_text(getattr(context, "workflow_id", None))
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -429,7 +459,8 @@ class NegotiationAgent(BaseAgent):
                             "results": [
                                 {
                                     "supplier_id": prepared_entries[0].get("supplier_id"),
-                                    "rfq_id": prepared_entries[0].get("rfq_id"),
+                                    "session_reference": prepared_entries[0].get("session_reference")
+                                    or prepared_entries[0].get("rfq_id"),
                                     "status": AgentStatus.FAILED.value,
                                     "error": str(exc),
                                 }
@@ -487,14 +518,20 @@ class NegotiationAgent(BaseAgent):
 
             for payload, future in futures:
                 supplier_id = payload.get("supplier_id") or payload.get("supplier")
-                rfq_id = payload.get("rfq_id")
+                session_reference = (
+                    payload.get("session_reference")
+                    or payload.get("unique_id")
+                    or payload.get("rfq_id")
+                )
                 try:
                     result = future.result()
                 except Exception as exc:  # pragma: no cover - defensive aggregation
                     error_message = str(exc)
                     record = {
                         "supplier_id": supplier_id,
-                        "rfq_id": rfq_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "status": AgentStatus.FAILED.value,
                         "error": error_message,
                     }
@@ -502,11 +539,18 @@ class NegotiationAgent(BaseAgent):
                     failed_records.append(record)
                     continue
 
+                record_reference = (
+                    result.data.get("session_reference")
+                    or result.data.get("unique_id")
+                    or session_reference
+                )
                 record = {
                     "supplier_id": result.data.get("supplier")
                     or supplier_id
                     or payload.get("supplier_id"),
-                    "rfq_id": result.data.get("rfq_id") or rfq_id,
+                    "session_reference": record_reference,
+                    "unique_id": record_reference,
+                    "rfq_id": record_reference,
                     "status": result.status.value,
                     "output": result.data,
                     "pass_fields": result.pass_fields,
@@ -589,13 +633,17 @@ class NegotiationAgent(BaseAgent):
 
         supplier = context.input_data.get("supplier") or context.input_data.get("supplier_id")
         session_id = self._resolve_session_id(context)
-        rfq_id = session_id
+        session_reference = self._resolve_session_reference(context)
+        if not session_reference:
+            session_reference = session_id
         workflow_id = session_id or (
             context.input_data.get("workflow_id")
             or getattr(context, "workflow_id", None)
         )
         if session_id and isinstance(context.input_data, dict):
             context.input_data.setdefault("workflow_id", session_id)
+        if session_reference and isinstance(context.input_data, dict):
+            context.input_data.setdefault("session_reference", session_reference)
         raw_round = context.input_data.get("round", 1)
 
         price_raw = (
@@ -871,7 +919,13 @@ class NegotiationAgent(BaseAgent):
             except ZeroDivisionError:
                 savings_score = 0.0
 
-        decision_log = self._build_decision_log(supplier, session_id, price, target_price, decision)
+        decision_log = self._build_decision_log(
+            supplier,
+            session_reference,
+            price,
+            target_price,
+            decision,
+        )
 
         draft_records: List[Dict[str, Any]] = []
 
@@ -901,7 +955,9 @@ class NegotiationAgent(BaseAgent):
             )
             data = {
                 "supplier": supplier,
-                "rfq_id": rfq_id,
+                "session_reference": session_reference,
+                "unique_id": session_reference,
+                "rfq_id": session_reference,
                 "round": round_no,
                 "counter_proposals": counter_options,
                 "decision": decision,
@@ -945,10 +1001,11 @@ class NegotiationAgent(BaseAgent):
             if awaiting_now:
                 watch_fields = self._build_supplier_watch_fields(
                     context=context,
-                    rfq_id=rfq_id,
+                    session_reference=session_reference,
                     supplier=supplier,
                     drafts=draft_records,
                     state=state,
+                    workflow_id=session_id,
                 )
                 if watch_fields:
                     pass_fields.update(watch_fields)
@@ -992,12 +1049,12 @@ class NegotiationAgent(BaseAgent):
         rag_snippets = self._collect_vector_snippets(
             context=context,
             supplier_name=supplier_name or supplier_identifier,
-            rfq_id=rfq_id,
+            rfq_id=session_reference,
         )
 
         negotiation_message = self._build_summary(
             context,
-            rfq_id,
+            session_reference,
             decision,
             price,
             target_price,
@@ -1030,7 +1087,9 @@ class NegotiationAgent(BaseAgent):
 
         draft_payload = {
             "intent": "NEGOTIATION_COUNTER",
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "supplier_id": supplier,
             "current_offer": price_raw,
             "current_offer_numeric": price,
@@ -1110,7 +1169,9 @@ class NegotiationAgent(BaseAgent):
             subject_seed = self._format_negotiation_subject(state)
 
         draft_stub = {
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "supplier_id": supplier,
             "intent": "NEGOTIATION_COUNTER",
             "metadata": draft_metadata,
@@ -1148,7 +1209,7 @@ class NegotiationAgent(BaseAgent):
 
         email_output: Optional[AgentOutput] = None
         fallback_payload: Optional[Dict[str, Any]] = None
-        if email_payload and supplier and rfq_id:
+        if email_payload and supplier and session_reference:
             email_output = self._invoke_email_drafting_agent(context, email_payload)
             fallback_payload = dict(email_payload)
         if email_output and email_output.status == AgentStatus.SUCCESS:
@@ -1222,7 +1283,9 @@ class NegotiationAgent(BaseAgent):
         public_state = self._public_state(cached_state or state)
         data = {
             "supplier": supplier,
-            "rfq_id": rfq_id,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "rfq_id": session_reference,
             "round": round_no,
             "counter_proposals": counter_options,
             "decision": decision,
@@ -1272,7 +1335,7 @@ class NegotiationAgent(BaseAgent):
             supplier=supplier,
             drafts=draft_records,
             state=state,
-            rfq_id=rfq_id,
+            session_reference=session_reference,
         )
         supplier_responses: List[Dict[str, Any]] = []
         if supplier_watch_fields:
@@ -1299,6 +1362,9 @@ class NegotiationAgent(BaseAgent):
                     error_payload = {
                         "supplier": supplier,
                         "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
@@ -1323,6 +1389,9 @@ class NegotiationAgent(BaseAgent):
                     error_payload = {
                         "supplier": supplier,
                         "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
@@ -1400,8 +1469,9 @@ class NegotiationAgent(BaseAgent):
             merge_payload.setdefault("intent", "NEGOTIATION_COUNTER")
             merge_payload.setdefault("decision", decision)
             merge_payload["session_state"] = public_state
-            if rfq_id is not None:
-                merge_payload.setdefault("rfq_id", rfq_id)
+            if session_reference is not None:
+                merge_payload.setdefault("session_reference", session_reference)
+                merge_payload.setdefault("rfq_id", session_reference)
             if supplier is not None:
                 merge_payload.setdefault("supplier_id", supplier)
             supplier_name = context.input_data.get("supplier_name")
@@ -1440,7 +1510,10 @@ class NegotiationAgent(BaseAgent):
 
             pass_fields.update(merge_payload)
         logger.info(
-            "NegotiationAgent prepared counter round %s for supplier=%s rfq_id=%s", round_no, supplier, rfq_id
+            "NegotiationAgent prepared counter round %s for supplier=%s session_reference=%s",
+            round_no,
+            supplier,
+            session_reference,
         )
 
         return self._with_plan(
@@ -1593,7 +1666,6 @@ class NegotiationAgent(BaseAgent):
                 decision["lead_time_request"] = "Split shipment or expedite slot if possible"
             return decision
 
-        buyer_max = zopa.get("buyer_max")
         supplier_floor = zopa.get("supplier_floor")
         entry = zopa.get("entry_counter")
         if not price_locked and price and target_price and entry:
@@ -2096,51 +2168,649 @@ class NegotiationAgent(BaseAgent):
         plays: List[Dict[str, Any]],
         playbook_context: Dict[str, Any],
     ) -> str:
-        lines: List[str] = [summary.strip()]
-        descriptor = playbook_context.get("descriptor")
-        style = playbook_context.get("style")
+        """Playbook recommendations are now integrated naturally; return summary as-is."""
+
+        return summary
+
+    def _compose_negotiation_message(
+        self,
+        *,
+        context: AgentContext,
+        decision: Dict[str, Any],
+        positions: NegotiationPositions,
+        round_no: int,
+        currency: Optional[str],
+        supplier: Optional[str],
+        supplier_message: Optional[str],
+        signals: Dict[str, Any],
+        zopa: Dict[str, Any],
+        playbook_context: Optional[Dict[str, Any]],
+        procurement_summary: Optional[Dict[str, Any]],
+    ) -> str:
+        """Compose a human-like, strategically crafted negotiation message."""
+
+        counter_price = decision.get("counter_price")
+        current_offer = positions.supplier_offer
+        target_price = positions.desired
+        strategy = decision.get("strategy", "counter")
+
+        # Determine negotiation tone based on round and context
+        tone = self._determine_negotiation_tone(round_no, signals, strategy)
+
+        # Build opening that establishes rapport
+        opening = self._craft_opening(round_no, supplier_message, signals, tone)
+
+        # Acknowledge supplier's position (reciprocity principle)
+        acknowledgment = self._craft_acknowledgment(
+            current_offer, supplier_message, signals, currency, round_no
+        )
+
+        # Present our position with reasoning (anchoring with justification)
+        position_statement = self._craft_position_statement(
+            counter_price=counter_price,
+            current_offer=current_offer,
+            target_price=target_price,
+            currency=currency,
+            round_no=round_no,
+            signals=signals,
+            zopa=zopa,
+            procurement_summary=procurement_summary,
+        )
+
+        # Weave in playbook recommendations naturally
+        value_proposition = self._craft_value_proposition(
+            playbook_context=playbook_context,
+            decision=decision,
+            round_no=round_no,
+            tone=tone,
+        )
+
+        # Create collaborative asks (frame as mutual benefit)
+        collaborative_asks = self._craft_collaborative_asks(
+            decision=decision,
+            round_no=round_no,
+            signals=signals,
+            tone=tone,
+        )
+
+        # Closing that maintains momentum
+        closing = self._craft_closing(round_no, strategy, tone)
+
+        # Assemble the complete message
+        message_parts = [
+            opening,
+            acknowledgment,
+            position_statement,
+            value_proposition,
+            collaborative_asks,
+            closing,
+        ]
+
+        return "\n\n".join(part for part in message_parts if part)
+
+    def _determine_negotiation_tone(
+        self, round_no: int, signals: Dict[str, Any], strategy: str
+    ) -> str:
+        """Determine the appropriate negotiation tone."""
+
+        if strategy in ("accept", "decline"):
+            return "decisive"
+
+        if signals.get("finality_hint"):
+            return "collaborative-firm"
+
+        if signals.get("capacity_tight"):
+            return "understanding-assertive"
+
+        if round_no == 1:
+            return "exploratory-confident"
+        elif round_no == 2:
+            return "focused-collaborative"
+        else:
+            return "closure-oriented"
+
+    def _craft_opening(
+        self,
+        round_no: int,
+        supplier_message: Optional[str],
+        signals: Dict[str, Any],
+        tone: str,
+    ) -> str:
+        """Craft a rapport-building opening."""
+
+        # Acknowledge their response if this isn't the first round
+        if round_no > 1 and supplier_message:
+            if signals.get("finality_hint"):
+                return (
+                    "Thank you for taking the time to provide such a detailed response. "
+                    "I appreciate your transparency about your position, and I'd like to explore "
+                    "whether there's a way we can structure this to work for both parties."
+                )
+            elif signals.get("capacity_tight"):
+                return (
+                    "I appreciate you sharing the challenges around capacity and lead times. "
+                    "Understanding your operational constraints helps us find creative solutions "
+                    "that work within those parameters."
+                )
+            else:
+                return (
+                    "Thank you for your continued engagement on this. I've reviewed your proposal "
+                    "and believe we're making good progress toward an agreement that benefits both sides."
+                )
+
+        # First round opening
+        if tone == "exploratory-confident":
+            return (
+                "Thank you for submitting your proposal. I've had a chance to review the details "
+                "and would like to discuss how we might align this with our project requirements "
+                "and budget parameters."
+            )
+
+        return "I'd like to continue our discussion on finding the right structure for this partnership."
+
+    def _craft_acknowledgment(
+        self,
+        current_offer: Optional[float],
+        supplier_message: Optional[str],
+        signals: Dict[str, Any],
+        currency: Optional[str],
+        round_no: int,
+    ) -> str:
+        """Acknowledge supplier's position (builds reciprocity)."""
+
+        if round_no == 1 or not supplier_message:
+            return ""
+
+        acknowledgments: List[str] = []
+
+        # Acknowledge specific points they raised
+        if signals.get("capacity_tight"):
+            acknowledgments.append(
+                "I understand the capacity constraints you mentioned, and we're certainly "
+                "mindful of the current market dynamics affecting lead times."
+            )
+
+        if signals.get("moq"):
+            moq_value = signals.get("moq")
+            acknowledgments.append(
+                f"Regarding your minimum order quantity of {moq_value} units, "
+                "we're confident our volumes can support that threshold."
+            )
+
+        if signals.get("payment_terms_hint"):
+            acknowledgments.append(
+                "Your flexibility on payment terms is noted and appreciated—"
+                "that's definitely an area where we can find mutual value."
+            )
+
+        if not acknowledgments and current_offer:
+            offer_text = self._format_currency(current_offer, currency)
+            acknowledgments.append(
+                f"Your quoted price of {offer_text} reflects the quality and service level "
+                "you bring, which we certainly value."
+            )
+
+        return " ".join(acknowledgments) if acknowledgments else ""
+
+    def _craft_position_statement(
+        self,
+        *,
+        counter_price: Optional[float],
+        current_offer: Optional[float],
+        target_price: Optional[float],
+        currency: Optional[str],
+        round_no: int,
+        signals: Dict[str, Any],
+        zopa: Dict[str, Any],
+        procurement_summary: Optional[Dict[str, Any]],
+    ) -> str:
+        """Present our position with strategic justification."""
+
+        if counter_price is None:
+            return (
+                "Before we can move forward, I'd like to better understand the cost drivers "
+                "behind your proposal. Could you provide a breakdown of the key components "
+                "affecting the pricing structure?"
+            )
+
+        counter_text = self._format_currency(counter_price, currency)
+        offer_text = self._format_currency(current_offer, currency) if current_offer else ""
+
+        # Build justification based on available data
+        justifications: List[str] = []
+
+        # Use market intelligence if available
+        supplier_floor = zopa.get("supplier_floor")
+
+        if supplier_floor and current_offer:
+            try:
+                market_gap_pct = (current_offer - supplier_floor) / supplier_floor
+                if market_gap_pct > 0.15:
+                    justifications.append(
+                        "Based on our market analysis and benchmarking across similar products, "
+                        "we're seeing a meaningful opportunity to optimize the pricing structure"
+                    )
+            except (TypeError, ZeroDivisionError):
+                pass
+
+        # Use procurement history if available
+        if procurement_summary and procurement_summary.get("metrics"):
+            metrics = procurement_summary["metrics"]
+            avg_value = metrics.get("average_transaction_value")
+            if avg_value and counter_price:
+                try:
+                    if abs(counter_price - avg_value) / avg_value < 0.20:
+                        avg_text = self._format_currency(avg_value, currency)
+                        justifications.append(
+                            f"Our historical spend on comparable items has averaged around {avg_text}, "
+                            "which helps frame our expectations for this engagement"
+                        )
+                except (TypeError, ZeroDivisionError):
+                    pass
+
+        # Frame based on round
+        if round_no == 1:
+            intro = (
+                f"To align with our project budget and market benchmarks, "
+                f"I'd like to propose we structure this around {counter_text}. "
+            )
+        elif round_no == 2:
+            gap_direction = "narrowing" if current_offer and counter_price and current_offer > counter_price else "refining"
+            intro = (
+                f"As we continue {gap_direction} the gap, I believe {counter_text} represents "
+                f"a fair midpoint that reflects both the value you're delivering and our budget realities. "
+            )
+        else:  # Round 3+
+            intro = (
+                f"To help us reach closure, I'm proposing {counter_text} as our target. "
+                f"This represents our best position given the total business case, "
+            )
+
+        # Add strongest justification
+        if justifications:
+            position = intro + justifications[0] + "."
+        else:
+            position = intro + "and I believe it sets us up for a successful long-term relationship."
+
+        # Add gap context if material
+        if current_offer and counter_price and target_price:
+            try:
+                movement_from_offer = ((current_offer - counter_price) / current_offer) * 100
+                if movement_from_offer > 8:
+                    position += (
+                        f" This represents a meaningful movement from your {offer_text} quote, "
+                        f"and demonstrates our commitment to finding common ground."
+                    )
+            except (TypeError, ZeroDivisionError):
+                pass
+
+        return position
+
+    def _craft_value_proposition(
+        self,
+        *,
+        playbook_context: Optional[Dict[str, Any]],
+        decision: Dict[str, Any],
+        round_no: int,
+        tone: str,
+    ) -> str:
+        """Weave playbook recommendations into natural value propositions."""
+
+        if not playbook_context or not playbook_context.get("plays"):
+            return self._craft_generic_value_proposition(decision, round_no)
+
+        plays = playbook_context["plays"][:3]  # Top 3 plays
         supplier_type = playbook_context.get("supplier_type")
-        lever_priorities = playbook_context.get("lever_priorities") or []
-        if descriptor or style or supplier_type:
-            lines.append("")
-        if descriptor:
-            lines.append(f"Playbook focus: {descriptor}")
-        if style or supplier_type or lever_priorities:
-            lever_text = ", ".join(lever_priorities[:3]) if lever_priorities else "balanced"
-            context_bits: List[str] = []
-            if supplier_type:
-                context_bits.append(f"Supplier type: {supplier_type}")
-            if style:
-                context_bits.append(f"Style: {style}")
-            context_bits.append(f"Lever focus: {lever_text}")
-            lines.append("; ".join(context_bits))
-        if plays:
-            lines.append("")
-            lines.append("Recommended plays from negotiation playbook:")
-            for idx, play in enumerate(plays[:3], 1):
-                if not isinstance(play, dict):
-                    continue
-                lever = play.get("lever")
-                description = play.get("play")
-                rationale = play.get("rationale")
-                trade_offs = play.get("trade_offs")
-                entry = f"{idx}. "
-                if lever:
-                    entry += f"[{lever}] "
-                if description:
-                    entry += str(description)
-                if rationale:
-                    entry += f" — Rationale: {rationale}"
-                if trade_offs:
-                    entry += f" Trade-off: {trade_offs}"
-                lines.append(entry)
-        examples = playbook_context.get("examples") or []
-        if examples:
-            lines.append("")
-            lines.append("Examples:")
-            for example in examples[:2]:
-                lines.append(f"- {example}")
-        return "\n".join(line for line in lines if line is not None)
+
+        value_statements: List[str] = []
+
+        # Group plays by lever for coherent messaging
+        plays_by_lever: Dict[str, List[Dict[str, Any]]] = {}
+        for play in plays:
+            lever = play.get("lever", "Other")
+            if lever not in plays_by_lever:
+                plays_by_lever[lever] = []
+            plays_by_lever[lever].append(play)
+
+        # Craft integrated value propositions
+        for lever, lever_plays in list(plays_by_lever.items())[:2]:  # Focus on top 2 levers
+            if lever == "Commercial":
+                value_statements.append(
+                    self._weave_commercial_play(lever_plays, round_no, tone)
+                )
+            elif lever == "Operational":
+                value_statements.append(
+                    self._weave_operational_play(lever_plays, round_no, tone)
+                )
+            elif lever == "Strategic":
+                value_statements.append(
+                    self._weave_strategic_play(lever_plays, round_no, tone)
+                )
+            elif lever == "Risk":
+                value_statements.append(
+                    self._weave_risk_play(lever_plays, round_no, tone)
+                )
+            elif lever == "Relational":
+                value_statements.append(
+                    self._weave_relational_play(lever_plays, round_no, tone)
+                )
+
+        if not value_statements:
+            return self._craft_generic_value_proposition(decision, round_no)
+
+        # Add context about partnership type
+        intro = ""
+        if supplier_type and round_no <= 2:
+            if supplier_type == "Strategic":
+                intro = "Given the strategic nature of this relationship, "
+            elif supplier_type == "Leverage":
+                intro = "To maximize the value of this partnership, "
+            elif supplier_type == "Bottleneck":
+                intro = "Understanding the critical nature of supply continuity, "
+
+        return intro + " ".join(value_statements)
+
+    def _weave_commercial_play(
+        self, plays: List[Dict[str, Any]], round_no: int, tone: str
+    ) -> str:
+        """Weave commercial plays into natural language."""
+
+        play_texts = [p.get("play", "") for p in plays]
+
+        # Volume-based plays
+        if any("volume" in p.lower() or "tier" in p.lower() for p in play_texts):
+            return (
+                "I'd like to explore how we can structure volume commitments to unlock "
+                "better unit economics for both sides. If we can commit to tier-based volumes—"
+                "say, 250 units initially with pathways to 500+—there may be room to optimize "
+                "the pricing structure while giving you better demand visibility."
+            )
+
+        # Early payment plays
+        if any("early payment" in p.lower() or "net-15" in p.lower() for p in play_texts):
+            return (
+                "One area where we can create immediate value is payment terms. "
+                "If we can accelerate payment to net-15, would that open up opportunities "
+                "for a 2-3% discount? This improves your cash flow while reducing our total cost."
+            )
+
+        # Bundling plays
+        if any("bundle" in p.lower() or "consolidate" in p.lower() for p in play_texts):
+            return (
+                "We're also looking at how we might consolidate spend across multiple categories "
+                "or adjacent products. If we can bundle this with other requirements coming through "
+                "our pipeline, there could be meaningful volume synergies that benefit both parties."
+            )
+
+        # Generic commercial
+        return (
+            "I believe there's room to structure the commercial terms in a way that creates "
+            "value for both organizations—whether through volume commitments, payment optimization, "
+            "or longer-term price stability."
+        )
+
+    def _weave_operational_play(
+        self, plays: List[Dict[str, Any]], round_no: int, tone: str
+    ) -> str:
+        """Weave operational plays into natural language."""
+
+        play_texts = [p.get("play", "") for p in plays]
+
+        # Delivery/lead time plays
+        if any("delivery" in p.lower() or "lead time" in p.lower() for p in play_texts):
+            return (
+                "On the operational side, delivery timing is critical for our project schedule. "
+                "If you can guarantee delivery within 2 weeks or offer split shipments "
+                "(perhaps 30% upfront, balance within 4 weeks), that would significantly de-risk "
+                "our production timeline and justify the investment."
+            )
+
+        # Planning/forecasting plays
+        if any("forecast" in p.lower() or "planning" in p.lower() for p in play_texts):
+            return (
+                "We're happy to share our demand forecasts and collaborate on supply planning "
+                "to give you better visibility. This integrated approach typically helps both sides "
+                "reduce buffer stock and improve fulfillment rates."
+            )
+
+        # SLA/service level plays
+        if any("sla" in p.lower() or "priority" in p.lower() for p in play_texts):
+            return (
+                "To ensure this partnership meets both our operational needs, I'd like to define "
+                "clear service levels around delivery performance and fulfillment rates. "
+                "Having those guardrails helps us plan effectively and holds both parties accountable."
+            )
+
+        # Generic operational
+        return (
+            "From an operational standpoint, we're looking for reliability and responsiveness "
+            "in fulfillment. If we can align on clear delivery commitments and planning cadences, "
+            "that creates a strong foundation for the partnership."
+        )
+
+    def _weave_strategic_play(
+        self, plays: List[Dict[str, Any]], round_no: int, tone: str
+    ) -> str:
+        """Weave strategic plays into natural language."""
+
+        play_texts = [p.get("play", "") for p in plays]
+
+        # Innovation/co-development plays
+        if any("innovation" in p.lower() or "co-develop" in p.lower() for p in play_texts):
+            return (
+                "Beyond the immediate transaction, I see potential for deeper collaboration "
+                "on product development and innovation. If we can align on a shared roadmap "
+                "for the next 12-24 months, there may be opportunities to co-invest in capabilities "
+                "that benefit both our organizations."
+            )
+
+        # ESG/sustainability plays
+        if any("esg" in p.lower() or "sustainab" in p.lower() for p in play_texts):
+            return (
+                "Sustainability is increasingly important to our stakeholders. "
+                "If we can incorporate ESG metrics and carbon reduction targets into our partnership, "
+                "that strengthens the strategic case and may unlock internal budget flexibility."
+            )
+
+        # Long-term commitment plays
+        if any("long-term" in p.lower() or "multi-year" in p.lower() for p in play_texts):
+            return (
+                "We're thinking about this as a multi-year partnership rather than a one-off transaction. "
+                "If you're open to a longer-term commitment with price stability mechanisms, "
+                "we can structure this in a way that gives you revenue predictability while securing "
+                "our supply chain."
+            )
+
+        # Generic strategic
+        return (
+            "Strategically, we're looking to build partnerships that go beyond transactional relationships. "
+            "If we can align on shared objectives and longer-term value creation, "
+            "that opens up different ways to structure the commercial terms."
+        )
+
+    def _weave_risk_play(
+        self, plays: List[Dict[str, Any]], round_no: int, tone: str
+    ) -> str:
+        """Weave risk plays into natural language."""
+
+        play_texts = [p.get("play", "") for p in plays]
+
+        # Warranty plays
+        if any("warranty" in p.lower() for p in play_texts):
+            return (
+                "Given the mission-critical nature of these components, warranty coverage is important. "
+                "If you can extend warranty to 2-3 years at no additional cost, "
+                "that reduces our total cost of ownership and makes the business case stronger."
+            )
+
+        # Service credit plays
+        if any("service credit" in p.lower() or "sla penalt" in p.lower() for p in play_texts):
+            return (
+                "To manage performance risk, I'd like to incorporate service-level agreements "
+                "with appropriate credits if delivery or quality targets aren't met. "
+                "This ensures we have recourse mechanisms without damaging the relationship."
+            )
+
+        # Dual-sourcing plays
+        if any("dual-sourc" in p.lower() or "alternative" in p.lower() for p in play_texts):
+            return (
+                "From a risk management perspective, we're evaluating dual-sourcing strategies "
+                "to protect against supply disruption. If you can offer competitive terms and strong SLAs, "
+                "you'd be well-positioned as our primary supplier with the volumes that come with that."
+            )
+
+        # Generic risk
+        return (
+            "We need to ensure appropriate risk mitigation through warranty coverage, "
+            "performance guarantees, and clear remediation processes. "
+            "Building these protections into the agreement benefits both parties."
+        )
+
+    def _weave_relational_play(
+        self, plays: List[Dict[str, Any]], round_no: int, tone: str
+    ) -> str:
+        """Weave relational plays into natural language."""
+
+        return (
+            "Looking beyond this specific engagement, we value suppliers who can grow with us "
+            "and become trusted partners. If this initial project goes well, there are "
+            "significant opportunities for expanded business across our organization. "
+            "That long-term potential should factor into how we structure the initial terms."
+        )
+
+    def _craft_generic_value_proposition(
+        self, decision: Dict[str, Any], round_no: int
+    ) -> str:
+        """Fallback value proposition when playbook unavailable."""
+
+        asks = decision.get("asks", [])
+        if not asks:
+            return ""
+
+        if round_no <= 2:
+            return (
+                "To make this work within our budget parameters, I'd like to explore "
+                "areas where we can create mutual value—whether through volume commitments, "
+                "payment terms optimization, or longer-term partnership structures."
+            )
+        else:
+            return (
+                "As we work toward closure, I believe there are still opportunities "
+                "to optimize the total package through creative structuring of terms, "
+                "payment schedules, and service commitments."
+            )
+
+    def _craft_collaborative_asks(
+        self,
+        *,
+        decision: Dict[str, Any],
+        round_no: int,
+        signals: Dict[str, Any],
+        tone: str,
+    ) -> str:
+        """Frame asks as collaborative opportunities."""
+
+        asks = decision.get("asks", [])
+        lead_time_request = decision.get("lead_time_request")
+
+        if not asks and not lead_time_request:
+            return ""
+
+        # Frame based on tone
+        if tone in ("decisive", "closure-oriented"):
+            intro = "To finalize this agreement, there are a few specific elements I'd like to confirm:"
+        else:
+            intro = "To help us structure the best possible outcome, I'd like to explore a few areas:"
+
+        formatted_asks: List[str] = []
+
+        # Convert asks into questions/proposals rather than demands
+        for ask in asks[:4]:  # Limit to top 4
+            ask_text = str(ask).strip()
+
+            # Rephrase common asks to be more collaborative
+            if "volume" in ask_text.lower() or "tier" in ask_text.lower():
+                formatted_asks.append(
+                    "• What volume thresholds would unlock better unit economics? "
+                    "We're confident we can hit meaningful tiers if the pricing justifies it."
+                )
+            elif "payment" in ask_text.lower() and ("early" in ask_text.lower() or "discount" in ask_text.lower()):
+                formatted_asks.append(
+                    "• Would accelerated payment (net-15) create value for you? "
+                    "We'd be happy to explore if that opens up pricing flexibility."
+                )
+            elif "lead time" in ask_text.lower() or "delivery" in ask_text.lower():
+                formatted_asks.append(
+                    "• Can you confirm the delivery timeline and whether there's flexibility "
+                    "for partial shipments if that helps manage both our schedules?"
+                )
+            elif "warranty" in ask_text.lower():
+                formatted_asks.append(
+                    "• What warranty coverage is included, and is there room to extend that "
+                    "as part of the overall package?"
+                )
+            elif "breakdown" in ask_text.lower() or "cost" in ask_text.lower():
+                formatted_asks.append(
+                    "• Would you be open to sharing a high-level cost breakdown? "
+                    "That transparency helps us justify the investment internally."
+                )
+            elif "alternative" in ask_text.lower() or "spec" in ask_text.lower():
+                formatted_asks.append(
+                    "• Are there alternative specifications or components that could reduce cost "
+                    "while still meeting our performance requirements?"
+                )
+            else:
+                # Generic reframe
+                formatted_asks.append(f"• {ask_text}")
+
+        # Add lead time if specified
+        if lead_time_request and not any("lead time" in fa.lower() for fa in formatted_asks):
+            formatted_asks.append(
+                f"• Regarding timing: {lead_time_request.lower()} would be ideal for our project schedule."
+            )
+
+        if not formatted_asks:
+            return ""
+
+        return intro + "\n\n" + "\n".join(formatted_asks)
+
+    def _craft_closing(self, round_no: int, strategy: str, tone: str) -> str:
+        """Create a closing that maintains momentum."""
+
+        if strategy == "accept":
+            return (
+                "If we can align on these final points, I'm ready to move forward quickly "
+                "and get the paperwork in motion. Looking forward to your thoughts."
+            )
+
+        if strategy == "decline":
+            return (
+                "I appreciate your engagement throughout this process. Given where we've landed, "
+                "I'll need to take this back to my team for further discussion. "
+                "I'll circle back if our parameters change."
+            )
+
+        if round_no >= 3:
+            return (
+                "I'm hopeful we can find common ground here. This represents our best position "
+                "given all the factors at play. I'd appreciate your thoughts on whether we can "
+                "make this work, and I'm happy to jump on a call if that would be helpful "
+                "to talk through any remaining sticking points."
+            )
+
+        if round_no == 2:
+            return (
+                "I believe we're getting close to something that works for both sides. "
+                "Let me know your thoughts on this structure, and we can refine from there. "
+                "Happy to discuss any concerns or questions you might have."
+            )
+
+        # Round 1 or default
+        return (
+            "I'd welcome your perspective on this proposal. If you have questions or "
+            "want to discuss any of these points in more detail, I'm happy to set up "
+            "a quick call. Looking forward to your response."
+        )
 
     def _load_playbook(self) -> Dict[str, Any]:
         if self._playbook_cache is not None:
@@ -2449,7 +3119,7 @@ class NegotiationAgent(BaseAgent):
     def _build_summary(
         self,
         context: AgentContext,
-        rfq_id: Optional[str],
+        session_reference: Optional[str],
         decision: Dict[str, Any],
         price: Optional[float],
         target_price: Optional[float],
@@ -2465,7 +3135,7 @@ class NegotiationAgent(BaseAgent):
         procurement_summary: Optional[Dict[str, Any]] = None,
         rag_snippets: Optional[List[str]] = None,
     ) -> str:
-        rfq_text = rfq_id or "RFQ"
+        rfq_text = session_reference or "RFQ"
         strategy = decision.get("strategy")
         lines: List[str] = []
         header = f"Round {round_no} plan for {rfq_text}"
@@ -2552,26 +3222,19 @@ class NegotiationAgent(BaseAgent):
         if asks:
             lines.append("- Key asks: " + "; ".join(str(item) for item in asks if item))
 
-        prompt_values = self._build_prompt_context(
+        return self._compose_negotiation_message(
             context=context,
-            header=header,
-            lines=lines,
             decision=decision,
-            price=price,
-            target_price=target_price,
-            currency=currency,
+            positions=positions,
             round_no=round_no,
+            currency=currency,
             supplier=supplier,
-            supplier_snippets=supplier_snippets or [],
             supplier_message=supplier_message,
+            signals=signals or {},
+            zopa=zopa or {},
             playbook_context=playbook_context,
-            signals=signals,
-            zopa=zopa,
             procurement_summary=procurement_summary,
-            rag_snippets=rag_snippets,
         )
-        template = self._get_prompt_template(context)
-        return self._apply_prompt_template(template, prompt_values, lines)
 
     def _get_prompt_template(self, context: AgentContext) -> str:
         template: Optional[str] = None
@@ -2987,7 +3650,7 @@ class NegotiationAgent(BaseAgent):
         supplier: Optional[str],
         drafts: List[Dict[str, Any]],
         state: Dict[str, Any],
-        rfq_id: Optional[str] = None,
+        session_reference: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         if not workflow_id:
             return None
@@ -3008,6 +3671,10 @@ class NegotiationAgent(BaseAgent):
             fallback_entry = {"workflow_id": workflow_id}
             if supplier:
                 fallback_entry["supplier_id"] = supplier
+            if session_reference:
+                fallback_entry["session_reference"] = session_reference
+                fallback_entry.setdefault("unique_id", session_reference)
+                fallback_entry.setdefault("rfq_id", session_reference)
             candidate_drafts.append(fallback_entry)
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
@@ -3017,6 +3684,10 @@ class NegotiationAgent(BaseAgent):
             for draft in candidate_drafts:
                 if isinstance(draft, dict) and not draft.get("workflow_id"):
                     draft["workflow_id"] = workflow_hint
+                if isinstance(draft, dict) and session_reference:
+                    draft.setdefault("session_reference", session_reference)
+                    draft.setdefault("unique_id", session_reference)
+                    draft.setdefault("rfq_id", session_reference)
 
         watch_payload: Dict[str, Any] = {
             "await_response": True,
@@ -3027,6 +3698,11 @@ class NegotiationAgent(BaseAgent):
             "response_poll_interval": poll_interval,
             "workflow_id": workflow_hint,
         }
+
+        if session_reference:
+            watch_payload.setdefault("session_reference", session_reference)
+            watch_payload.setdefault("unique_id", session_reference)
+            watch_payload.setdefault("rfq_id", session_reference)
 
         batch_limit = getattr(self.agent_nick.settings, "email_response_batch_limit", None)
         if batch_limit:
@@ -3237,13 +3913,17 @@ class NegotiationAgent(BaseAgent):
     def _record_learning_snapshot(
         self,
         context: AgentContext,
-        session_id: Optional[str],
-        supplier: Optional[str],
-        decision: Dict[str, Any],
-        state: Dict[str, Any],
-        awaiting_response: bool,
-        supplier_reply_registered: bool,
+        session_id: Optional[str] = None,
+        supplier: Optional[str] = None,
+        decision: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
+        awaiting_response: bool = False,
+        supplier_reply_registered: bool = False,
+        *,
+        rfq_id: Optional[str] = None,
     ) -> None:
+        if session_id is None and rfq_id is not None:
+            session_id = rfq_id
         logger.debug(
             "Negotiation learning capture skipped (session_id=%s, supplier=%s)",
             session_id,
@@ -3327,14 +4007,14 @@ class NegotiationAgent(BaseAgent):
     def _build_decision_log(
         self,
         supplier: Optional[str],
-        rfq_id: Optional[str],
+        session_reference: Optional[str],
         price: Optional[float],
         target_price: Optional[float],
         decision: Dict[str, Any],
     ) -> str:
         base = (
             f"Strategy={decision.get('strategy')} counter={decision.get('counter_price')}"
-            f" target={target_price} current={price} supplier={supplier} rfq={rfq_id}."
+            f" target={target_price} current={price} supplier={supplier} reference={session_reference}."
         )
         plays = decision.get("play_recommendations") or []
         if plays:
