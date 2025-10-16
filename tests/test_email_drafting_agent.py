@@ -86,6 +86,41 @@ def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
     assert result["unique_id"] == fixed_unique_id
 
 
+def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
+    def fail_chat(*args, **kwargs):  # pragma: no cover - should not be invoked
+        raise AssertionError("LLM compose should not be called when negotiation_message provided")
+
+    monkeypatch.setattr(module, "_chat", fail_chat)
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00002")
+
+    agent = EmailDraftingAgent()
+    negotiation_text = (
+        "Hello team,\n"
+        "Regarding RFQ-20240901-ABCD1234 we can move to revised terms.\n"
+        "Reference UID-XYZ987 for internal routing."
+    )
+    decision = {
+        "rfq_id": "RFQ-20240901-ABCD1234",
+        "supplier_id": "SUP-9",
+        "to": "reply@example.com",
+        "negotiation_message": negotiation_text,
+        "subject": "Re: Procurement Negotiation Update UID-XYZ987",
+        "thread": {"message_id": "<thread-2>", "references": ["<thread-1>"]},
+    }
+
+    result = agent.from_decision(decision)
+
+    assert result["subject"] == "Re: Procurement Negotiation Update"
+    visible_body = _visible_body(result["body"])
+    assert "RFQ-20240901-ABCD1234" not in visible_body
+    assert "UID-XYZ987" not in visible_body
+    assert "Hello team" in visible_body
+    assert result["headers"]["In-Reply-To"] == "<thread-2>"
+    assert result["headers"]["References"] == "<thread-1>"
+    assert result["unique_id"] == fixed_unique_id
+
+
 def test_from_decision_subject_fallback(monkeypatch):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")

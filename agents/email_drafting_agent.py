@@ -225,7 +225,9 @@ _RFQ_HEADER_CELL_STYLE = (
     "border: 1px solid #d0d0d0; padding: 6px; text-align: left; background-color: #f5f5f5;"
 )
 _RFQ_BODY_CELL_STYLE = "border: 1px solid #d0d0d0; padding: 6px; text-align: left;"
-_VISIBLE_RFQ_ID_PATTERN = re.compile(r"(?i)RFQ[\w\s:-]*\d[\w-]*")
+_VISIBLE_RFQ_ID_PATTERN = re.compile(
+    r"(?i)(RFQ[\w\s:-]*\d[\w-]*|UID-[A-Za-z0-9]+)"
+)
 
 DEFAULT_RFQ_SUBJECT = "Request for Quotation – Procurement Opportunity"
 DEFAULT_NEGOTIATION_SUBJECT = "Re: Procurement Negotiation Update"
@@ -497,53 +499,69 @@ class EmailDraftingAgent(BaseAgent):
             "strategy": decision_data.get("strategy"),
             "negotiation_message": negotiation_message,
         }
-        user_prompt = (
-            f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
-            "Write a professional negotiation counter email with an explicit Subject line. "
-            "Reference the RFQ ID provided, summarise the commercial position, list the key asks "
-            "as bullet points, and close with a clear call to action."
+        negotiation_body = (
+            negotiation_message.strip()
+            if isinstance(negotiation_message, str)
+            else ""
         )
+        use_negotiation_content = bool(negotiation_body)
 
-        model_name = getattr(
-            self.agent_nick.settings,
-            "negotiation_email_model",
-            DEFAULT_NEGOTIATION_MODEL,
-        )
-        try:
-            response_text = _chat(
-                model_name,
-                SYSTEM_COMPOSE,
-                user_prompt,
-                agent=self,
-                options={"temperature": 0.35, "top_p": 0.9},
+        subject_line = decision_data.get("subject") if use_negotiation_content else None
+        body_text = negotiation_body if use_negotiation_content else ""
+        fallback_text = negotiation_body if use_negotiation_content else ""
+
+        if not use_negotiation_content:
+            user_prompt = (
+                f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+                "Write a professional negotiation counter email with an explicit Subject line. "
+                "Reference the RFQ ID provided, summarise the commercial position, list the key asks "
+                "as bullet points, and close with a clear call to action."
             )
-        except Exception:  # pragma: no cover - defensive fallback
-            logger.exception("Failed to compose negotiation counter email")
-            response_text = ""
 
-        subject_line, body_text = self._split_subject_and_body(response_text)
-        fallback_text = self._build_negotiation_fallback(
-            rfq_id_output,
-            decision_data.get("counter_price"),
-            decision_data.get("target_price"),
-            decision_data.get("current_offer"),
-            decision_data.get("currency"),
-            asks,
-            lead_time_request,
-            negotiation_message,
-            decision_data.get("round"),
-            decision_data.get("line_items") or decision_data.get("pricing_table"),
-        )
-        if not body_text:
-            body_text = fallback_text
+            model_name = getattr(
+                self.agent_nick.settings,
+                "negotiation_email_model",
+                DEFAULT_NEGOTIATION_MODEL,
+            )
+            try:
+                response_text = _chat(
+                    model_name,
+                    SYSTEM_COMPOSE,
+                    user_prompt,
+                    agent=self,
+                    options={"temperature": 0.35, "top_p": 0.9},
+                )
+            except Exception:  # pragma: no cover - defensive fallback
+                logger.exception("Failed to compose negotiation counter email")
+                response_text = ""
 
-        html_body = self._render_html_from_text(body_text)
+            subject_line, body_text = self._split_subject_and_body(response_text)
+            fallback_text = self._build_negotiation_fallback(
+                rfq_id_output,
+                decision_data.get("counter_price"),
+                decision_data.get("target_price"),
+                decision_data.get("current_offer"),
+                decision_data.get("currency"),
+                asks,
+                lead_time_request,
+                negotiation_message,
+                decision_data.get("round"),
+                decision_data.get("line_items") or decision_data.get("pricing_table"),
+            )
+            if not body_text:
+                body_text = fallback_text
+
+        html_body = self._render_html_from_text(body_text or fallback_text or "")
         sanitised_html = self._sanitise_generated_body(html_body)
-        if not sanitised_html:
+        if not sanitised_html and fallback_text:
             sanitised_html = self._sanitise_generated_body(
                 self._render_html_from_text(fallback_text)
             )
-        plain_text = self._html_to_plain_text(sanitised_html) if sanitised_html else fallback_text
+        plain_text = (
+            self._html_to_plain_text(sanitised_html)
+            if sanitised_html
+            else (body_text or fallback_text)
+        )
         if not sanitised_html and plain_text:
             sanitised_html = self._render_html_from_text(plain_text)
 

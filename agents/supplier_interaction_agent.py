@@ -112,6 +112,52 @@ class SupplierInteractionAgent(BaseAgent):
             return None
         return text or None
 
+    def _normalise_thread_references(self, references: Optional[Any]) -> List[str]:
+        normalised: List[str] = []
+
+        def _append(value: Optional[Any]) -> None:
+            if value in (None, ""):
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _append(item)
+                return
+            try:
+                text = str(value).strip()
+            except Exception:
+                return
+            if not text:
+                return
+            matches = re.findall(r"<[^>]+>", text)
+            tokens = matches if matches else re.split(r"[\s,]+", text)
+            for token in tokens:
+                cleaned = token.strip()
+                if cleaned and cleaned not in normalised:
+                    normalised.append(cleaned)
+
+        _append(references)
+        return normalised
+
+    def _merge_thread_references(
+        self, existing: List[str], additions: List[str]
+    ) -> List[str]:
+        for ref in additions:
+            if ref and ref not in existing:
+                existing.append(ref)
+        return existing
+
+    def _build_thread_headers_payload(
+        self, message_id: Optional[Any], references: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        payload: Dict[str, Any] = {}
+        message_token = self._coerce_text(message_id)
+        if message_token:
+            payload["message_id"] = message_token
+        refs = [ref for ref in references if isinstance(ref, str) and ref.strip()]
+        if refs:
+            payload["references"] = refs
+        return payload or None
+
     @staticmethod
     def _response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         body = row.get("body_text") or row.get("response_text") or ""
@@ -1783,7 +1829,22 @@ class SupplierInteractionAgent(BaseAgent):
         subject = str(input_data.get("subject") or "")
         message_text = input_data.get("message")
         from_address = input_data.get("from_address")
-        message_id = input_data.get("message_id")
+        message_id = self._coerce_text(input_data.get("message_id"))
+        thread_headers_input = (
+            input_data.get("thread_headers") if isinstance(input_data.get("thread_headers"), dict) else None
+        )
+        references: List[str] = []
+        if thread_headers_input:
+            message_candidate = self._coerce_text(thread_headers_input.get("message_id"))
+            if message_candidate:
+                message_id = message_candidate
+            references = self._normalise_thread_references(
+                thread_headers_input.get("references")
+            )
+        additional_refs = self._normalise_thread_references(
+            input_data.get("references") or input_data.get("thread_references")
+        )
+        references = self._merge_thread_references(references, additional_refs)
         body = message_text if isinstance(message_text, str) else ""
         drafts: List[Dict[str, Any]] = [
             draft for draft in input_data.get("drafts", []) if isinstance(draft, dict)
@@ -1975,7 +2036,30 @@ class SupplierInteractionAgent(BaseAgent):
             rfq_id = wait_result.get("rfq_id") or rfq_id
             workflow_id = self._coerce_text(wait_result.get("workflow_id")) or workflow_id
             unique_id = self._coerce_text(wait_result.get("unique_id")) or unique_id
-            message_id = wait_result.get("message_id") or message_id
+            wait_message_id = self._coerce_text(wait_result.get("message_id"))
+            if wait_message_id:
+                message_id = wait_message_id
+
+            wait_thread_headers = (
+                wait_result.get("thread_headers")
+                if isinstance(wait_result.get("thread_headers"), dict)
+                else None
+            )
+            if wait_thread_headers:
+                header_message = self._coerce_text(wait_thread_headers.get("message_id"))
+                if header_message:
+                    message_id = header_message
+                references = self._merge_thread_references(
+                    references,
+                    self._normalise_thread_references(wait_thread_headers.get("references")),
+                )
+
+            references = self._merge_thread_references(
+                references,
+                self._normalise_thread_references(
+                    wait_result.get("references") or wait_result.get("thread_references")
+                ),
+            )
 
             supplier_payload = wait_result.get("supplier_output")
             if isinstance(supplier_payload, dict):
@@ -2076,6 +2160,9 @@ class SupplierInteractionAgent(BaseAgent):
             **parsed,
             "related_documents": related_docs,
         }
+        thread_headers_payload = self._build_thread_headers_payload(message_id, references)
+        if thread_headers_payload:
+            payload["thread_headers"] = thread_headers_payload
         if target is not None:
             payload["target_price"] = target
 
