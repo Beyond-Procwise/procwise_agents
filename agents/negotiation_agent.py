@@ -1058,7 +1058,7 @@ class NegotiationAgent(BaseAgent):
         rag_snippets = self._collect_vector_snippets(
             context=context,
             supplier_name=supplier_name or supplier_identifier,
-            rfq_id=session_reference,
+            workflow_reference=session_reference,
         )
 
         negotiation_message = self._build_summary(
@@ -3207,7 +3207,7 @@ class NegotiationAgent(BaseAgent):
 
         return self._build_summary_fallback(
             context=context,
-            rfq_id=session_reference,
+            session_reference=session_reference,
             decision=decision,
             price=price,
             target_price=target_price,
@@ -3251,7 +3251,7 @@ class NegotiationAgent(BaseAgent):
     def _build_summary_fallback(
         self,
         context: AgentContext,
-        rfq_id: Optional[str],
+        session_reference: Optional[str],
         decision: Dict[str, Any],
         price: Optional[float],
         target_price: Optional[float],
@@ -3269,10 +3269,14 @@ class NegotiationAgent(BaseAgent):
     ) -> str:
         """Fallback basic summary builder (original implementation)."""
 
-        rfq_text = rfq_id or "RFQ"
+        workflow_reference = session_reference or context.input_data.get("workflow_id")
+        if not workflow_reference:
+            workflow_reference = getattr(context, "workflow_id", None)
+        reference_text = str(workflow_reference).strip() if workflow_reference else "workflow"
+
         strategy = decision.get("strategy")
         lines: List[str] = []
-        header = f"Round {round_no} plan for {rfq_text}"
+        header = f"Round {round_no} plan for {reference_text}"
         if strategy:
             header += f": {strategy}"
         lines.append(header)
@@ -3870,7 +3874,7 @@ class NegotiationAgent(BaseAgent):
         *,
         context: AgentContext,
         supplier_name: Optional[str],
-        rfq_id: Optional[str],
+        workflow_reference: Optional[str],
     ) -> List[str]:
         query_tokens: List[str] = []
         if supplier_name:
@@ -3887,8 +3891,8 @@ class NegotiationAgent(BaseAgent):
         )
         if isinstance(description, str) and description.strip():
             query_tokens.append(description.strip())
-        if rfq_id:
-            query_tokens.append(str(rfq_id))
+        if workflow_reference:
+            query_tokens.append(str(workflow_reference))
 
         query = " ".join(query_tokens[:3]).strip()
         if not query:
