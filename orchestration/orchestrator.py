@@ -1697,7 +1697,7 @@ class Orchestrator:
             supplier_input.update(dict(email_result.pass_fields))
         if isinstance(supplier_payload, dict):
             supplier_input.update(supplier_payload)
-        supplier_input.setdefault("drafts", email_drafts)
+        supplier_input["drafts"] = email_drafts
         supplier_input.setdefault("await_response", True)
         if len([uid for uid in unique_ids if uid]) > 1:
             supplier_input.setdefault("await_all_responses", True)
@@ -1741,6 +1741,7 @@ class Orchestrator:
     @staticmethod
     def _extract_drafts(result: Optional[Any]) -> List[Dict[str, Any]]:
         drafts: List[Dict[str, Any]] = []
+        seen_tokens: Set[Tuple[Optional[str], Optional[str]]] = set()
         if not result:
             return drafts
 
@@ -1752,6 +1753,13 @@ class Orchestrator:
                 continue
             for entry in entries:
                 if isinstance(entry, dict):
+                    token = (
+                        entry.get("unique_id"),
+                        entry.get("supplier_id"),
+                    )
+                    if token in seen_tokens:
+                        continue
+                    seen_tokens.add(token)
                     drafts.append(dict(entry))
         return drafts
 
@@ -1768,20 +1776,61 @@ class Orchestrator:
                 continue
 
             matches = Orchestrator._draft_workflow_candidates(draft)
-            if matches and workflow_id not in matches:
-                continue
-
             adjusted = dict(draft)
-            if not matches:
-                adjusted.setdefault("workflow_id", workflow_id)
-                metadata = adjusted.get("metadata")
-                if metadata is None:
-                    adjusted["metadata"] = {"workflow_id": workflow_id}
-                elif isinstance(metadata, dict):
-                    metadata.setdefault("workflow_id", workflow_id)
+
+            if matches:
+                lowered_matches = {
+                    str(candidate).strip().lower()
+                    for candidate in matches
+                    if candidate not in (None, "")
+                }
+                if workflow_id.lower() not in lowered_matches:
+                    logger.warning(
+                        "Realigning draft workflow identifiers from %s to %s for unique_id=%s",
+                        sorted(matches),
+                        workflow_id,
+                        adjusted.get("unique_id"),
+                    )
+                Orchestrator._realign_draft_workflow_id(adjusted, workflow_id)
+            else:
+                Orchestrator._realign_draft_workflow_id(adjusted, workflow_id)
+
             filtered.append(adjusted)
 
         return filtered
+
+    @staticmethod
+    def _realign_draft_workflow_id(draft: Dict[str, Any], workflow_id: str) -> None:
+        """Ensure ``draft`` carries ``workflow_id`` consistently."""
+
+        if not isinstance(draft, dict) or not workflow_id:
+            return
+
+        draft["workflow_id"] = workflow_id
+
+        metadata = draft.get("metadata")
+        if metadata is None:
+            metadata = {
+                "workflow_id": workflow_id,
+                "context": {"workflow_id": workflow_id},
+            }
+            draft["metadata"] = metadata
+        elif isinstance(metadata, dict):
+            metadata["workflow_id"] = workflow_id
+            context_meta = metadata.get("context")
+            if isinstance(context_meta, dict):
+                context_meta["workflow_id"] = workflow_id
+            elif context_meta is None:
+                metadata["context"] = {"workflow_id": workflow_id}
+        else:
+            draft["metadata"] = {
+                "workflow_id": workflow_id,
+                "context": {"workflow_id": workflow_id},
+            }
+
+        workflow_section = draft.get("workflow")
+        if isinstance(workflow_section, dict):
+            workflow_section["workflow_id"] = workflow_id
 
     @staticmethod
     def _draft_workflow_candidates(draft: Dict[str, Any]) -> List[str]:
@@ -1833,9 +1882,32 @@ class Orchestrator:
                 if text:
                     candidates.append(text)
                     break
-        if candidates:
-            return candidates[0]
-        return default
+        unique_candidates: List[str] = []
+        lowered_seen: Set[str] = set()
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in lowered_seen:
+                continue
+            lowered_seen.add(lowered)
+            unique_candidates.append(candidate)
+
+        default_text = None
+        if default not in (None, ""):
+            try:
+                default_text = str(default).strip()
+            except Exception:
+                default_text = None
+
+        if unique_candidates:
+            if default_text:
+                lowered_default = default_text.lower()
+                if len(unique_candidates) > 1:
+                    return default_text
+                if unique_candidates[0].lower() != lowered_default:
+                    return default_text
+            return unique_candidates[0]
+
+        return default_text
 
     def _execute_generic_workflow(
         self, workflow_name: str, context: AgentContext
