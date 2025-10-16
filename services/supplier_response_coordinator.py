@@ -163,6 +163,8 @@ class InMemoryResponseCoordinator(BaseResponseCoordinator):
         completed = entry.event.wait(wait_timeout)
         with self._lock:
             state = entry.to_state(key, status="complete" if completed else "timeout")
+            if not completed and not entry.pending_clear and not entry.is_complete:
+                entry.pending_clear = True
             entry.waiters = max(0, entry.waiters - 1)
             if entry.waiters == 0 and (entry.pending_clear or entry.is_complete):
                 self._entries.pop(key, None)
