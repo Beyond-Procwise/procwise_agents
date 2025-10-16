@@ -146,14 +146,34 @@ class SupplierInteractionAgent(BaseAgent):
                 existing.append(ref)
         return existing
 
+    @staticmethod
+    def _ensure_bracketed_message_id(token: str) -> Optional[str]:
+        text = token.strip()
+        if not text:
+            return None
+        if text.startswith("<") and text.endswith(">"):
+            return text
+        inner = text.strip("<>").strip()
+        if not inner:
+            return None
+        return f"<{inner}>"
+
     def _build_thread_headers_payload(
         self, message_id: Optional[Any], references: List[str]
     ) -> Optional[Dict[str, Any]]:
         payload: Dict[str, Any] = {}
         message_token = self._coerce_text(message_id)
         if message_token:
-            payload["message_id"] = message_token
-        refs = [ref for ref in references if isinstance(ref, str) and ref.strip()]
+            bracketed = self._ensure_bracketed_message_id(message_token)
+            if bracketed:
+                payload["message_id"] = bracketed
+        refs = []
+        for ref in references:
+            if not isinstance(ref, str):
+                continue
+            bracketed = self._ensure_bracketed_message_id(ref)
+            if bracketed:
+                refs.append(bracketed)
         if refs:
             payload["references"] = refs
         return payload or None
