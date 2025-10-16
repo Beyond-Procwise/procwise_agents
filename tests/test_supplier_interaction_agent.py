@@ -81,6 +81,30 @@ class DummyNick:
         return DummyConn()
 
 
+def test_build_thread_headers_payload_readds_angle_brackets():
+    agent = SupplierInteractionAgent(DummyNick())
+
+    payload = agent._build_thread_headers_payload(
+        "message-123@example.com",
+        [
+            "reference-1@example.com",
+            "<reference-2@example.com>",
+            " reference-3@example.com> ",
+            "<reference-4@example.com",
+        ],
+    )
+
+    assert payload == {
+        "message_id": "<message-123@example.com>",
+        "references": [
+            "<reference-1@example.com>",
+            "<reference-2@example.com>",
+            "<reference-3@example.com>",
+            "<reference-4@example.com>",
+        ],
+    }
+
+
 @pytest.fixture(autouse=True)
 def stub_response_coordinator(monkeypatch):
     class StubCoordinator:
