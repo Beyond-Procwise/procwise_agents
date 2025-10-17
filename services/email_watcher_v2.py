@@ -284,6 +284,26 @@ def _default_fetcher(
             pass
 
 
+def _score_to_confidence(score: float) -> Decimal:
+    """Convert a floating point score into a quantised confidence value.
+
+    The score produced by the matcher is normalised into the range 0-1 so it can
+    be persisted as a numeric confidence value for downstream processing.  Any
+    unexpected inputs are treated defensively and clamped into range before
+    quantisation to two decimal places.
+    """
+
+    try:
+        if score != score:  # NaN check
+            score = 0.0
+    except Exception:  # pragma: no cover - defensive
+        score = 0.0
+
+    normalised = max(0.0, min(float(score), 1.0))
+    decimal_score = Decimal(str(normalised))
+    return decimal_score.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailResponse) -> float:
     score = 0.0
 
@@ -607,7 +627,8 @@ class EmailWatcherV2:
                     match_confidence=_score_to_confidence(best_score),
                     processed=False,
                 )
-                matched.append(matched_id)
+                supplier_response_repo.insert_response(response_row)
+                matched_rows.append(response_row)
             else:
                 logger.warning(
                     "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f)",
@@ -615,7 +636,7 @@ class EmailWatcherV2:
                     email.message_id,
                     best_score,
                 )
-        return matched
+        return matched_rows
 
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
@@ -714,14 +735,18 @@ class EmailWatcherV2:
                 input_data={**input_payload, "email_headers": headers},
             )
 
+            if self.supplier_agent is None:
+                logger.warning(
+                    "No SupplierInteractionAgent configured for workflow %s; skipping response processing",
+                    tracker.workflow_id,
+                )
+                continue
+
             try:
-                wait_result: AgentOutput = self.supplier_agent.execute(wait_context)
+                wait_result: AgentOutput = self.supplier_agent.execute(context)
             except Exception:
                 logger.exception("SupplierInteractionAgent failed for workflow %s", workflow_id)
                 continue
-
-            if unique_id:
-                processed_ids.append(unique_id)
 
             batch_ready = bool(wait_result.data.get("batch_ready"))
             if not batch_ready:
@@ -743,17 +768,20 @@ class EmailWatcherV2:
                 )
                 return
 
-            processed_ids = [
+            ids_from_agent = [
                 uid
                 for uid in wait_result.data.get("unique_ids", [])
                 if isinstance(uid, str) and uid
             ]
-            if not processed_ids:
-                processed_ids = [
+            if not ids_from_agent:
+                ids_from_agent = [
                     response.get("unique_id")
                     for response in responses
                     if isinstance(response, dict) and response.get("unique_id")
                 ]
+            if unique_id and unique_id not in ids_from_agent:
+                ids_from_agent.append(unique_id)
+            processed_ids.extend(ids_from_agent)
 
             negotiation_payload = dict(wait_result.data)
             negotiation_payload.setdefault("supplier_responses", responses)
@@ -780,6 +808,11 @@ class EmailWatcherV2:
                     self.negotiation_agent.execute(neg_context)
                 except Exception:
                     logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
+
+            if ids_from_agent:
+                supplier_response_repo.delete_responses(
+                    workflow_id=tracker.workflow_id, unique_ids=ids_from_agent
+                )
 
         if processed_ids:
             supplier_response_repo.delete_responses(
