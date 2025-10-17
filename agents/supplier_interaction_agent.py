@@ -3110,6 +3110,8 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return [None] * len(drafts)
 
+        original_unique_ids = list(unique_ids)
+
         canonical_workflow, validated_unique_ids = self._validate_workflow_consistency(
             workflow_key,
             unique_ids,
@@ -3131,6 +3133,14 @@ class SupplierInteractionAgent(BaseAgent):
 
         unique_ids = validated_unique_ids
         unique_id_set = set(validated_unique_ids)
+
+        if not unique_ids and original_unique_ids:
+            logger.warning(
+                "All unique_ids=%s were dropped during workflow validation for workflow=%s",
+                original_unique_ids,
+                workflow_key,
+            )
+            return [None] * len(drafts)
 
         logger.info(
             "Aggregating responses for workflow=%s with %s unique_ids: %s",
