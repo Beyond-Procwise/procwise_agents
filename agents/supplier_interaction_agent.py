@@ -1143,6 +1143,30 @@ class SupplierInteractionAgent(BaseAgent):
                 if self._coerce_text(row.get("unique_id")) in normalised_unique_filter
             ]
 
+        expected_count = len(expected_unique_ids) if expected_unique_ids else 0
+        if expected_count <= 0 and expected_suppliers:
+            expected_count = len(expected_suppliers)
+
+        if expected_count <= 0 and dispatch_rows:
+            filtered_dispatch_total = 0
+            for row in dispatch_rows:
+                unique_value = self._coerce_text(getattr(row, "unique_id", None))
+                supplier_value = self._coerce_text(getattr(row, "supplier_id", None))
+                if normalised_unique_filter is not None and unique_value:
+                    if unique_value not in normalised_unique_filter:
+                        continue
+                if normalised_supplier_filter is not None and supplier_value:
+                    if supplier_value not in normalised_supplier_filter:
+                        continue
+                if not unique_value and not supplier_value:
+                    continue
+                filtered_dispatch_total += 1
+            if filtered_dispatch_total > 0:
+                expected_count = filtered_dispatch_total
+
+        if expected_count and len(serialised) < expected_count:
+            return []
+
         if not serialised:
             return []
 
