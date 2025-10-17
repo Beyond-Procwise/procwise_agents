@@ -509,6 +509,7 @@ class EmailWatcherV2:
                 if score > best_score:
                     matched_id = unique_id
                     best_score = score
+                    best_dispatch = dispatch
             if (not matched_id or best_score < self.match_threshold) and email.supplier_id:
                 supplier_matches = [
                     uid
@@ -520,6 +521,7 @@ class EmailWatcherV2:
                 if len(supplier_matches) == 1:
                     matched_id = supplier_matches[0]
                     best_score = max(best_score, self.match_threshold)
+                    best_dispatch = tracker.email_records.get(matched_id)
             if (not matched_id or best_score < self.match_threshold) and email.rfq_id:
                 normalised_rfq = _normalise_identifier(email.rfq_id)
                 if normalised_rfq:
@@ -533,6 +535,7 @@ class EmailWatcherV2:
                     if len(rfq_candidates) == 1:
                         matched_id = rfq_candidates[0]
                         best_score = max(best_score, self.match_threshold)
+                        best_dispatch = tracker.email_records.get(matched_id)
 
             if not matched_id and len([
                 uid for uid in tracker.email_records.keys() if uid not in tracker.matched_responses
@@ -549,6 +552,7 @@ class EmailWatcherV2:
                     matched_id,
                 )
                 best_score = max(best_score, self.match_threshold)
+                best_dispatch = tracker.email_records.get(matched_id)
 
             if matched_id and best_score >= self.match_threshold:
                 logger.debug(
@@ -557,6 +561,15 @@ class EmailWatcherV2:
                     matched_id,
                     best_score,
                 )
+                if best_dispatch is None:
+                    best_dispatch = tracker.email_records.get(matched_id)
+                if best_dispatch is None:
+                    logger.warning(
+                        "Matched response for workflow=%s unique_id=%s but no dispatch record found",
+                        tracker.workflow_id,
+                        matched_id,
+                    )
+                    continue
                 tracker.record_response(matched_id, email)
                 tracking_repo.mark_response(
                     workflow_id=tracker.workflow_id,
