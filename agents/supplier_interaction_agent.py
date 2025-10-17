@@ -1916,11 +1916,16 @@ class SupplierInteractionAgent(BaseAgent):
                 ordered.setdefault(unique_id, row)
 
             completed = len(ordered)
-            all_expected_present = True
+            all_expected_present = False
             if expected_set:
-                all_expected_present = expected_set.issubset(ordered.keys())
+                ordered_keys = set(ordered.keys())
+                all_expected_present = expected_set.issubset(ordered_keys) and (
+                    len(ordered_keys) == len(expected_set)
+                )
+            else:
+                all_expected_present = completed >= required
 
-            if all_expected_present and completed >= required:
+            if all_expected_present and completed == required:
                 responses = [self._response_from_row(row) for row in ordered.values()]
                 logger.info(
                     "SupplierInteractionAgent response aggregation gate complete for workflow=%s responses=%s/%s (all expected IDs present)",
@@ -2055,7 +2060,11 @@ class SupplierInteractionAgent(BaseAgent):
 
         response_complete = response_summary.get("complete", False)
         collected_total = response_summary.get("collected_responses", 0)
-        all_responses_received = response_complete and (collected_total >= expected_count)
+        all_responses_received = (
+            response_complete
+            and (collected_total >= expected_count)
+            and (response_count >= expected_count)
+        )
 
         if expected_unique_ids or observed_unique_ids:
             expected_ids_set = set(expected_unique_ids) if expected_unique_ids else set(observed_unique_ids)
@@ -2073,6 +2082,13 @@ class SupplierInteractionAgent(BaseAgent):
                     list(missing_ids),
                     workflow_id,
                 )
+            extra_ids = received_ids_set - expected_ids_set
+            if extra_ids:
+                logger.warning(
+                    "Received unexpected response unique_ids=%s in workflow=%s",
+                    list(extra_ids),
+                    workflow_id,
+                )
 
         payload = {
             "workflow_id": workflow_id,
@@ -2085,7 +2101,7 @@ class SupplierInteractionAgent(BaseAgent):
             "supplier_responses_count": response_count,
             "batch_ready": True,
             "negotiation_batch": bool(responses),
-            "all_responses_received": True,
+            "all_responses_received": all_responses_received,
             "expected_unique_ids": observed_unique_ids or expected_unique_ids,
         }
 
@@ -2102,6 +2118,7 @@ class SupplierInteractionAgent(BaseAgent):
                 response_complete,
             )
             payload["error_details"] = f"Only received {response_count}/{expected_count} responses"
+            payload["all_responses_received"] = False
 
             return self._with_plan(
                 context,
@@ -2110,15 +2127,19 @@ class SupplierInteractionAgent(BaseAgent):
                     data=payload,
                     pass_fields=payload,
                     error="incomplete_responses",
+                    next_agents=[],
                 ),
             )
 
-        next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
+        next_agents: List[str] = []
+        if all_responses_received and len(responses) == expected_count:
+            next_agents = ["NegotiationAgent"]
         logger.info(
-            "All supplier responses received for workflow=%s (count=%s/%s)",
+            "All supplier responses received for workflow=%s (count=%s/%s), triggering=%s",
             workflow_id,
             response_count,
             expected_count,
+            next_agents,
         )
 
         return self._with_plan(
