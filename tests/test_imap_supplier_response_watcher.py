@@ -62,6 +62,7 @@ def _make_record(rfq_id, *, token, received=None, supplier="SI-1"):
         action_id="act-1",
         run_id=token,
         rfq_id=rfq_id,
+        hidden_identifier=rfq_id,
         supplier_id=supplier,
         message_id=f"<{rfq_id}-msg>",
         subject=f"RFQ {rfq_id}",

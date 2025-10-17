@@ -119,6 +119,22 @@ def extract_rfq_id(comment: Optional[str]) -> Optional[str]:
     return tracking
 
 
+def extract_hidden_identifier(comment: Optional[str]) -> Optional[str]:
+    """Return the hidden workflow identifier embedded in ``comment`` if present."""
+
+    metadata = _parse_marker_metadata(comment)
+    candidate = (
+        metadata.get("hidden_identifier")
+        or metadata.get("hidden")
+        or metadata.get("tracking")
+        or metadata.get("procwise:uid")
+    )
+    if not candidate:
+        return None
+    token = candidate.strip()
+    return token or None
+
+
 def ensure_hidden_marker(
     *,
     rfq_id: Optional[str],  # Deprecated
