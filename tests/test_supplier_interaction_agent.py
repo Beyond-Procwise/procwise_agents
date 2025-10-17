@@ -1354,6 +1354,98 @@ def test_poll_collects_only_when_all_responses_present(monkeypatch):
     assert [row["unique_id"] for row in complete] == ["uid-1", "uid-2"]
 
 
+def test_poll_requires_all_supplier_responses_without_unique_ids(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    metadata = {
+        "rows": [
+            SimpleNamespace(
+                workflow_id="wf-missing-uid",
+                unique_id=None,
+                supplier_id="SUP-1",
+                dispatched_at=datetime.fromtimestamp(10),
+                message_id="msg-1",
+            ),
+            SimpleNamespace(
+                workflow_id="wf-missing-uid",
+                unique_id=None,
+                supplier_id="SUP-2",
+                dispatched_at=datetime.fromtimestamp(12),
+                message_id="msg-2",
+            ),
+        ],
+        "last_dispatched_at": datetime.fromtimestamp(12),
+        "unique_ids": [],
+    }
+
+    metadata_calls: List[str] = []
+
+    def fake_load_metadata(workflow_id):
+        metadata_calls.append(workflow_id)
+        return metadata
+
+    monkeypatch.setattr(
+        agent,
+        "_load_dispatch_metadata",
+        fake_load_metadata,
+    )
+
+    pending_batches: deque = deque(
+        [
+            [
+                {
+                    "workflow_id": "wf-missing-uid",
+                    "unique_id": None,
+                    "supplier_id": "SUP-1",
+                    "response_text": "Quote 1",
+                    "message_id": "m1",
+                }
+            ],
+            [
+                {
+                    "workflow_id": "wf-missing-uid",
+                    "unique_id": None,
+                    "supplier_id": "SUP-1",
+                    "response_text": "Quote 1",
+                    "message_id": "m1",
+                },
+                {
+                    "workflow_id": "wf-missing-uid",
+                    "unique_id": None,
+                    "supplier_id": "SUP-2",
+                    "response_text": "Quote 2",
+                    "message_id": "m2",
+                },
+            ],
+        ]
+    )
+
+    def fake_fetch_pending(*, workflow_id, **_):
+        assert workflow_id == "wf-missing-uid"
+        batch = pending_batches[0]
+        if len(pending_batches) > 1:
+            pending_batches.popleft()
+        return batch
+
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
+        fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.init_schema",
+        lambda: None,
+    )
+
+    first = agent._poll_supplier_response_rows("wf-missing-uid")
+    assert first == []
+
+    second = agent._poll_supplier_response_rows("wf-missing-uid")
+    assert {row["supplier_id"] for row in second} == {"SUP-1", "SUP-2"}
+    assert [row["supplier_id"] for row in second] == ["SUP-1", "SUP-2"]
+    assert metadata_calls == ["wf-missing-uid", "wf-missing-uid"]
+
+
 def test_await_all_responses_processes_parallel_results(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
