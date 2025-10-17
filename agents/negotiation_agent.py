@@ -4254,10 +4254,12 @@ class NegotiationAgent(BaseAgent):
             logger.warning("No draft context available while awaiting supplier response")
             return None
 
+        workflow_hint = self._coerce_text(workflow_hint_raw)
+
         if draft_entries:
             logger.info(
                 "Awaiting supplier responses for workflow=%s with %s drafts",
-                workflow_hint_raw,
+                workflow_hint or workflow_hint_raw,
                 len(draft_entries),
             )
             for idx, entry in enumerate(draft_entries[:5]):
@@ -4280,14 +4282,47 @@ class NegotiationAgent(BaseAgent):
                     "CRITICAL: Multiple workflows in draft batch! workflows=%s",
                     sorted(draft_workflows),
                 )
-            elif len(draft_workflows) == 1 and workflow_hint_raw:
+            elif len(draft_workflows) == 1 and workflow_hint:
                 draft_workflow = draft_workflows.pop()
-                if draft_workflow != self._coerce_text(workflow_hint_raw):
+                if draft_workflow != workflow_hint:
                     logger.error(
                         "Workflow mismatch: context has %s but drafts have %s",
-                        workflow_hint_raw,
+                        workflow_hint,
                         draft_workflow,
                     )
+
+        if workflow_hint and draft_entries:
+            filtered_entries: List[Dict[str, Any]] = []
+            dropped_entries: List[Dict[str, Any]] = []
+            for entry in draft_entries:
+                entry_workflow = self._coerce_text(entry.get("workflow_id"))
+                if entry_workflow and entry_workflow != workflow_hint:
+                    dropped_entries.append(entry)
+                    continue
+                filtered_entries.append(entry)
+
+            if dropped_entries:
+                logger.warning(
+                    "Discarding %s drafts due to workflow mismatch with %s",
+                    len(dropped_entries),
+                    workflow_hint,
+                )
+                for idx, entry in enumerate(dropped_entries[:5]):
+                    logger.warning(
+                        "  Dropped draft %s: unique=%s supplier=%s workflow=%s",
+                        idx,
+                        entry.get("unique_id"),
+                        entry.get("supplier_id"),
+                        entry.get("workflow_id"),
+                    )
+            if filtered_entries:
+                draft_entries = filtered_entries
+            elif dropped_entries:
+                logger.error(
+                    "All provided drafts conflicted with workflow=%s; aborting await",
+                    workflow_hint,
+                )
+                return None
 
         await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
         tracked_unique_ids = sorted(
@@ -4303,10 +4338,6 @@ class NegotiationAgent(BaseAgent):
             expected_total = len(draft_entries)
         elif not expected_total:
             expected_total = len(draft_entries)
-
-        workflow_hint = self._coerce_text(
-            workflow_hint_raw
-        )
 
         try:
             if await_all:

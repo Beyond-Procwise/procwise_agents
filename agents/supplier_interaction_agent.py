@@ -124,6 +124,7 @@ class SupplierInteractionAgent(BaseAgent):
             logger.error("No workflow_id provided for validation")
             return canonical_workflow, normalised_unique_ids
 
+        dispatch_workflow_by_uid: Dict[str, str] = {}
         workflow_from_dispatch: Set[str] = set()
         for unique_id in normalised_unique_ids:
             try:
@@ -134,12 +135,14 @@ class SupplierInteractionAgent(BaseAgent):
                     coerced = self._coerce_text(dispatch_workflow)
                     if coerced:
                         workflow_from_dispatch.add(coerced)
+                        dispatch_workflow_by_uid[unique_id] = coerced
             except Exception:
                 logger.exception(
                     "Failed to lookup workflow for unique_id=%s during validation",
                     unique_id,
                 )
 
+        draft_workflow_by_uid: Dict[str, str] = {}
         workflow_from_drafts: Set[str] = set()
         try:
             for unique_id in normalised_unique_ids:
@@ -148,10 +151,15 @@ class SupplierInteractionAgent(BaseAgent):
                     coerced = self._coerce_text(draft["workflow_id"])
                     if coerced:
                         workflow_from_drafts.add(coerced)
+                        draft_workflow_by_uid[unique_id] = coerced
         except Exception:
             logger.exception("Failed to lookup drafts during workflow validation")
 
-        all_workflows = workflow_from_dispatch | workflow_from_drafts | {canonical_workflow}
+        all_workflows: Set[str] = set()
+        if canonical_workflow:
+            all_workflows.add(canonical_workflow)
+        all_workflows |= workflow_from_dispatch
+        all_workflows |= workflow_from_drafts
 
         if len(all_workflows) > 1:
             logger.error(
@@ -177,7 +185,31 @@ class SupplierInteractionAgent(BaseAgent):
             )
             canonical_workflow = discovered
 
-        return canonical_workflow, normalised_unique_ids
+        consistent_unique_ids: List[str] = []
+        dropped: List[Tuple[str, Set[str]]] = []
+        for uid in normalised_unique_ids:
+            dispatch_hint = dispatch_workflow_by_uid.get(uid)
+            draft_hint = draft_workflow_by_uid.get(uid)
+            observed = {
+                value
+                for value in (dispatch_hint, draft_hint)
+                if value
+            }
+            if observed and canonical_workflow and canonical_workflow not in observed:
+                dropped.append((uid, observed))
+                continue
+            consistent_unique_ids.append(uid)
+
+        if dropped:
+            for uid, observed in dropped:
+                logger.warning(
+                    "Omitting unique_id=%s from workflow=%s aggregation due to mismatched tracking=%s",
+                    uid,
+                    canonical_workflow,
+                    sorted(observed),
+                )
+
+        return canonical_workflow, consistent_unique_ids
 
     @staticmethod
     def _coerce_text(value: Optional[Any]) -> Optional[str]:
