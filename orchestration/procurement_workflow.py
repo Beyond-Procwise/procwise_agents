@@ -9,6 +9,15 @@ import asyncio
 import json
 
 
+STATUS_REQUEST_SEPARATOR = "::round::"
+
+
+def build_status_request_id(session_id: str, round_num: int) -> str:
+    """Create deterministic request identifiers per round for status tracking."""
+
+    return f"{session_id}{STATUS_REQUEST_SEPARATOR}{round_num}"
+
+
 @dataclass
 class EmailThread:
     """ONE thread per supplier, maintained throughout entire workflow"""
@@ -157,14 +166,23 @@ class WorkflowOrchestrator:
         """Initializes the tracking record for a new interaction round"""
 
         print(f"INITIALIZING response tracking for Round {round_num}...")
+        status_request_id = build_status_request_id(self.session_id, round_num)
         await self.db.execute(
             """
             INSERT INTO proc.supplier_interaction_status
-            (request_id, round_num, total_suppliers_contacted, expected_responses, is_complete)
-            VALUES (%s, %s, %s, %s, FALSE)
-            ON CONFLICT (request_id, round_num) DO NOTHING;
+            (request_id, total_suppliers_contacted, expected_responses, responses_received, is_complete, started_at, last_updated, completed_at)
+            VALUES (%s, %s, %s, 0, FALSE, NOW(), NOW(), NULL)
+            ON CONFLICT (request_id) DO UPDATE
+            SET
+                total_suppliers_contacted = EXCLUDED.total_suppliers_contacted,
+                expected_responses = EXCLUDED.expected_responses,
+                responses_received = 0,
+                is_complete = FALSE,
+                started_at = NOW(),
+                completed_at = NULL,
+                last_updated = NOW();
         """,
-            (self.session_id, round_num, expected_count, expected_count),
+            (status_request_id, expected_count, expected_count),
         )
 
     async def wait_for_responses(
@@ -180,14 +198,16 @@ class WorkflowOrchestrator:
             f"⏳ Waiting for {expected_count} {context} (Round {round_num})..."
         )
 
+        status_request_id = build_status_request_id(self.session_id, round_num)
+
         while elapsed < self.wait_timeout:
             status = await self.db.fetch_one(
                 """
                 SELECT is_complete, responses_received, expected_responses
                 FROM proc.supplier_interaction_status
-                WHERE request_id = %s AND round_num = %s
+                WHERE request_id = %s
             """,
-                (self.session_id, round_num),
+                (status_request_id,),
             )
 
             if status and status.get("is_complete"):
@@ -204,7 +224,18 @@ class WorkflowOrchestrator:
                     (self.session_id, round_num),
                 )
 
-                return {resp["supplier_id"]: resp for resp in all_responses}
+                responses_by_supplier = {
+                    resp["supplier_id"]: resp for resp in all_responses
+                }
+
+                recorded_count = len(responses_by_supplier)
+                if recorded_count != status["expected_responses"]:
+                    raise RuntimeError(
+                        "CRITICAL ERROR: Response count mismatch detected during wait. "
+                        f"Expected {status['expected_responses']}, got {recorded_count}."
+                    )
+
+                return responses_by_supplier
 
             if status:
                 print(
@@ -445,6 +476,29 @@ async def handle_supplier_response(
 
     try:
         async with db.transaction():
+            status_request_id = build_status_request_id(session_id, round_num)
+
+            status_row = await db.fetch_one(
+                """
+                SELECT responses_received, expected_responses
+                FROM proc.supplier_interaction_status
+                WHERE request_id = %s
+            """,
+                (status_request_id,),
+            )
+
+            if not status_row:
+                raise RuntimeError(
+                    "CRITICAL ERROR: Tracking record missing for supplier response. "
+                    f"Session={session_id}, round={round_num}"
+                )
+
+            if status_row["responses_received"] >= status_row["expected_responses"]:
+                raise RuntimeError(
+                    "CRITICAL ERROR: Response received after completion threshold. "
+                    f"Session={session_id}, round={round_num}"
+                )
+
             await db.execute(
                 """
                 INSERT INTO proc.supplier_response
@@ -474,17 +528,18 @@ async def handle_supplier_response(
                     completed_at = CASE
                         WHEN responses_received + 1 >= expected_responses
                         THEN NOW()
-                        ELSE NULL
+                        ELSE completed_at
                     END
-                WHERE request_id = %s AND round_num = %s
+                WHERE request_id = %s
             """,
-                (session_id, round_num),
+                (status_request_id,),
             )
 
         print(f"✓ Response from {supplier_id} for Round {round_num} recorded")
 
     except Exception as exc:  # pragma: no cover - placeholder for retry logic
         print(f"❌ CRITICAL ERROR recording response: {exc}")
+        raise
 
 
 class NegotiationAgent:
@@ -508,13 +563,14 @@ class NegotiationAgent:
 
         print(f"Running pre-check for Round {round_num} data before generating...")
 
+        status_request_id = build_status_request_id(session_id, round_num)
         status = await self.db.fetch_one(
             """
             SELECT is_complete, responses_received, expected_responses
             FROM proc.supplier_interaction_status
-            WHERE request_id = %s AND round_num = %s AND is_complete = TRUE
+            WHERE request_id = %s AND is_complete = TRUE
         """,
-            (session_id, round_num),
+            (status_request_id,),
         )
 
         if not status:
@@ -741,21 +797,21 @@ Provide structured evaluation.
 
 class MockDatabaseConnection(DatabaseConnection):
     def __init__(self) -> None:
-        self.status_table: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self.status_table: Dict[str, Dict[str, Any]] = {}
         self.response_table: List[Dict[str, Any]] = []
 
     async def execute(self, query: str, params: Tuple) -> None:
         if "INSERT INTO proc.supplier_interaction_status" in query:
-            key = (params[0], params[1])
-            if key not in self.status_table:
-                self.status_table[key] = {
-                    "request_id": params[0],
-                    "round_num": params[1],
-                    "total_suppliers_contacted": params[2],
-                    "expected_responses": params[3],
-                    "responses_received": 0,
-                    "is_complete": False,
-                }
+            key = params[0]
+            self.status_table[key] = {
+                "request_id": key,
+                "total_suppliers_contacted": params[1],
+                "expected_responses": params[2],
+                "responses_received": 0,
+                "is_complete": False,
+                "last_updated": datetime.now().isoformat(),
+                "completed_at": None,
+            }
         elif "INSERT INTO proc.supplier_response" in query:
             self.response_table.append(
                 {
@@ -766,18 +822,20 @@ class MockDatabaseConnection(DatabaseConnection):
                 }
             )
         elif "UPDATE proc.supplier_interaction_status" in query:
-            key = (params[0], params[1])
+            key = params[0]
             if key in self.status_table:
                 status = self.status_table[key]
                 status["responses_received"] += 1
+                status["last_updated"] = datetime.now().isoformat()
                 if status["responses_received"] >= status["expected_responses"]:
                     status["is_complete"] = True
+                    status["completed_at"] = datetime.now().isoformat()
 
     async def fetch_one(
         self, query: str, params: Tuple
     ) -> Optional[Dict[str, Any]]:
         if "FROM proc.supplier_interaction_status" in query:
-            key = (params[0], params[1])
+            key = params[0]
             return self.status_table.get(key)
         return None
 
@@ -885,6 +943,7 @@ async def validate_implementation() -> None:
 
 
 __all__ = [
+    "build_status_request_id",
     "EmailThread",
     "NegotiationSession",
     "DatabaseConnection",
