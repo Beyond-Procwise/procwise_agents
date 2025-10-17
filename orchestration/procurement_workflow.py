@@ -176,10 +176,6 @@ class WorkflowOrchestrator:
             SET
                 total_suppliers_contacted = EXCLUDED.total_suppliers_contacted,
                 expected_responses = EXCLUDED.expected_responses,
-                responses_received = 0,
-                is_complete = FALSE,
-                started_at = NOW(),
-                completed_at = NULL,
                 last_updated = NOW();
         """,
             (status_request_id, expected_count, expected_count),
