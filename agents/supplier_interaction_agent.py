@@ -103,6 +103,82 @@ class SupplierInteractionAgent(BaseAgent):
 
         return context
 
+    def _validate_workflow_consistency(
+        self,
+        workflow_id: str,
+        unique_ids: Sequence[str],
+    ) -> Tuple[str, List[str]]:
+        """
+        Validate and normalise workflow identifiers across dispatch tracking and drafts.
+        Returns a tuple of (canonical_workflow_id, unique_ids).
+        """
+
+        canonical_workflow = self._coerce_text(workflow_id)
+        normalised_unique_ids: List[str] = []
+        for uid in unique_ids:
+            coerced = self._coerce_text(uid)
+            if coerced:
+                normalised_unique_ids.append(coerced)
+
+        if not canonical_workflow:
+            logger.error("No workflow_id provided for validation")
+            return canonical_workflow, normalised_unique_ids
+
+        workflow_from_dispatch: Set[str] = set()
+        for unique_id in normalised_unique_ids:
+            try:
+                dispatch_workflow = workflow_email_tracking_repo.lookup_workflow_for_unique(
+                    unique_id=unique_id
+                )
+                if dispatch_workflow:
+                    coerced = self._coerce_text(dispatch_workflow)
+                    if coerced:
+                        workflow_from_dispatch.add(coerced)
+            except Exception:
+                logger.exception(
+                    "Failed to lookup workflow for unique_id=%s during validation",
+                    unique_id,
+                )
+
+        workflow_from_drafts: Set[str] = set()
+        try:
+            for unique_id in normalised_unique_ids:
+                draft = draft_rfq_emails_repo.load_by_unique_id(unique_id=unique_id)
+                if draft and draft.get("workflow_id"):
+                    coerced = self._coerce_text(draft["workflow_id"])
+                    if coerced:
+                        workflow_from_drafts.add(coerced)
+        except Exception:
+            logger.exception("Failed to lookup drafts during workflow validation")
+
+        all_workflows = workflow_from_dispatch | workflow_from_drafts | {canonical_workflow}
+
+        if len(all_workflows) > 1:
+            logger.error(
+                "CRITICAL: Multiple workflow IDs detected for same batch! workflows=%s unique_ids=%s. "
+                "Using provided workflow_id=%s",
+                sorted(all_workflows),
+                normalised_unique_ids[:5],
+                canonical_workflow,
+            )
+            for unique_id in normalised_unique_ids[:10]:
+                logger.error(
+                    "  unique_id=%s: dispatch=%s draft=%s",
+                    unique_id,
+                    workflow_from_dispatch,
+                    workflow_from_drafts,
+                )
+        elif len(all_workflows) == 1 and canonical_workflow not in all_workflows:
+            discovered = next(iter(all_workflows))
+            logger.warning(
+                "Correcting workflow_id from %s to %s based on dispatch/draft tracking",
+                canonical_workflow,
+                discovered,
+            )
+            canonical_workflow = discovered
+
+        return canonical_workflow, normalised_unique_ids
+
     @staticmethod
     def _coerce_text(value: Optional[Any]) -> Optional[str]:
         if value in (None, ""):
@@ -1067,6 +1143,30 @@ class SupplierInteractionAgent(BaseAgent):
                 if self._coerce_text(row.get("unique_id")) in normalised_unique_filter
             ]
 
+        expected_count = len(expected_unique_ids) if expected_unique_ids else 0
+        if expected_count <= 0 and expected_suppliers:
+            expected_count = len(expected_suppliers)
+
+        if expected_count <= 0 and dispatch_rows:
+            filtered_dispatch_total = 0
+            for row in dispatch_rows:
+                unique_value = self._coerce_text(getattr(row, "unique_id", None))
+                supplier_value = self._coerce_text(getattr(row, "supplier_id", None))
+                if normalised_unique_filter is not None and unique_value:
+                    if unique_value not in normalised_unique_filter:
+                        continue
+                if normalised_supplier_filter is not None and supplier_value:
+                    if supplier_value not in normalised_supplier_filter:
+                        continue
+                if not unique_value and not supplier_value:
+                    continue
+                filtered_dispatch_total += 1
+            if filtered_dispatch_total > 0:
+                expected_count = filtered_dispatch_total
+
+        if expected_count and len(serialised) < expected_count:
+            return []
+
         if not serialised:
             return []
 
@@ -1916,11 +2016,16 @@ class SupplierInteractionAgent(BaseAgent):
                 ordered.setdefault(unique_id, row)
 
             completed = len(ordered)
-            all_expected_present = True
+            all_expected_present = False
             if expected_set:
-                all_expected_present = expected_set.issubset(ordered.keys())
+                ordered_keys = set(ordered.keys())
+                all_expected_present = expected_set.issubset(ordered_keys) and (
+                    len(ordered_keys) == len(expected_set)
+                )
+            else:
+                all_expected_present = completed >= required
 
-            if all_expected_present and completed >= required:
+            if all_expected_present and completed == required:
                 responses = [self._response_from_row(row) for row in ordered.values()]
                 logger.info(
                     "SupplierInteractionAgent response aggregation gate complete for workflow=%s responses=%s/%s (all expected IDs present)",
@@ -2055,7 +2160,11 @@ class SupplierInteractionAgent(BaseAgent):
 
         response_complete = response_summary.get("complete", False)
         collected_total = response_summary.get("collected_responses", 0)
-        all_responses_received = response_complete and (collected_total >= expected_count)
+        all_responses_received = (
+            response_complete
+            and (collected_total >= expected_count)
+            and (response_count >= expected_count)
+        )
 
         if expected_unique_ids or observed_unique_ids:
             expected_ids_set = set(expected_unique_ids) if expected_unique_ids else set(observed_unique_ids)
@@ -2073,6 +2182,13 @@ class SupplierInteractionAgent(BaseAgent):
                     list(missing_ids),
                     workflow_id,
                 )
+            extra_ids = received_ids_set - expected_ids_set
+            if extra_ids:
+                logger.warning(
+                    "Received unexpected response unique_ids=%s in workflow=%s",
+                    list(extra_ids),
+                    workflow_id,
+                )
 
         payload = {
             "workflow_id": workflow_id,
@@ -2085,7 +2201,7 @@ class SupplierInteractionAgent(BaseAgent):
             "supplier_responses_count": response_count,
             "batch_ready": True,
             "negotiation_batch": bool(responses),
-            "all_responses_received": True,
+            "all_responses_received": all_responses_received,
             "expected_unique_ids": observed_unique_ids or expected_unique_ids,
         }
 
@@ -2102,6 +2218,7 @@ class SupplierInteractionAgent(BaseAgent):
                 response_complete,
             )
             payload["error_details"] = f"Only received {response_count}/{expected_count} responses"
+            payload["all_responses_received"] = False
 
             return self._with_plan(
                 context,
@@ -2110,15 +2227,19 @@ class SupplierInteractionAgent(BaseAgent):
                     data=payload,
                     pass_fields=payload,
                     error="incomplete_responses",
+                    next_agents=[],
                 ),
             )
 
-        next_agents = ["NegotiationAgent"] if all_responses_received and responses else []
+        next_agents: List[str] = []
+        if all_responses_received and len(responses) == expected_count:
+            next_agents = ["NegotiationAgent"]
         logger.info(
-            "All supplier responses received for workflow=%s (count=%s/%s)",
+            "All supplier responses received for workflow=%s (count=%s/%s), triggering=%s",
             workflow_id,
             response_count,
             expected_count,
+            next_agents,
         )
 
         return self._with_plan(
@@ -2931,67 +3052,60 @@ class SupplierInteractionAgent(BaseAgent):
                 unique_id_set.add(unique_value)
                 unique_ids.append(unique_value)
 
+        if not workflow_ids:
+            logger.error(
+                "Cannot aggregate responses without workflow_id; contexts=%s",
+                contexts,
+            )
+            return [None] * len(drafts)
+
         workflow_key: Optional[str] = None
-        canonical_candidates: Set[str] = set()
-        for unique_value in unique_ids:
-            try:
-                candidate = workflow_email_tracking_repo.lookup_workflow_for_unique(
-                    unique_id=unique_value
-                )
-            except Exception:  # pragma: no cover - defensive alignment
-                logger.exception(
-                    "Failed to resolve canonical workflow for unique_id=%s during aggregation",
-                    unique_value,
-                )
-                continue
-            coerced = self._coerce_text(candidate)
-            if coerced:
-                canonical_candidates.add(coerced)
-
-        lowered_workflow_map: Dict[str, str] = {
-            value.lower(): value for value in workflow_ids
-        }
-
-        if canonical_candidates:
-            lowered_canonical = {value.lower(): value for value in canonical_candidates}
-            overlap = lowered_canonical.keys() & lowered_workflow_map.keys()
-            if overlap:
-                choice_key = next(iter(overlap))
-                canonical_choice = lowered_canonical[choice_key]
-                if workflow_key and workflow_key != canonical_choice:
-                    logger.info(
-                        "Realigning aggregated workflow_id from %s to %s using dispatch mapping",
-                        workflow_key,
-                        canonical_choice,
-                    )
-                workflow_key = canonical_choice
-            elif len(canonical_candidates) == 1:
-                workflow_key = canonical_candidates.pop()
-            elif workflow_ids:
-                logger.error(
-                    "Conflicting workflow_ids %s for unique_ids=%s",
-                    sorted(canonical_candidates | workflow_ids),
-                    sorted(unique_id_set),
-                )
-                return [None] * len(drafts)
-
-        if workflow_key is None and workflow_ids:
-            if len(lowered_workflow_map) == 1:
-                workflow_key = next(iter(lowered_workflow_map.values()))
-            else:
-                logger.error(
-                    "Cannot aggregate responses without a single workflow_id; contexts=%s",
-                    contexts,
-                )
-                return [None] * len(drafts)
+        if len(workflow_ids) == 1:
+            workflow_key = next(iter(workflow_ids))
+        else:
+            workflow_counts: Dict[str, int] = {}
+            for ctx in contexts:
+                wid = self._coerce_text(ctx.get("workflow_id"))
+                if wid:
+                    workflow_counts[wid] = workflow_counts.get(wid, 0) + 1
+            if workflow_counts:
+                workflow_key = max(workflow_counts.items(), key=lambda item: item[1])[0]
 
         if not workflow_key:
             logger.error(
-                "Cannot aggregate responses without a workflow_id; contexts=%s unique_ids=%s",
-                contexts,
-                sorted(unique_id_set),
+                "Failed to determine workflow_id from drafts=%s",
+                len(drafts),
             )
             return [None] * len(drafts)
+
+        canonical_workflow, validated_unique_ids = self._validate_workflow_consistency(
+            workflow_key,
+            unique_ids,
+        )
+
+        if canonical_workflow and canonical_workflow != workflow_key:
+            logger.warning(
+                "Workflow corrected from %s to %s during response aggregation",
+                workflow_key,
+                canonical_workflow,
+            )
+            workflow_key = canonical_workflow
+        elif not canonical_workflow:
+            logger.error(
+                "Workflow validation returned no identifier for initial workflow=%s",
+                workflow_key,
+            )
+            return [None] * len(drafts)
+
+        unique_ids = validated_unique_ids
+        unique_id_set = set(validated_unique_ids)
+
+        logger.info(
+            "Aggregating responses for workflow=%s with %s unique_ids: %s",
+            workflow_key,
+            len(unique_ids),
+            unique_ids,
+        )
 
         unique_filter = set(unique_id_set) if unique_id_set else None
 
@@ -3815,49 +3929,104 @@ class SupplierInteractionAgent(BaseAgent):
 
         workflow_key = self._coerce_text(workflow_id)
 
-        canonical_workflow = None
+        canonical_workflow: Optional[str] = None
+        dispatch_workflow_raw: Optional[str] = None
         try:
-            canonical_workflow = workflow_email_tracking_repo.lookup_workflow_for_unique(
+            dispatch_workflow_raw = workflow_email_tracking_repo.lookup_workflow_for_unique(
                 unique_id=unique_key
             )
+            dispatch_workflow = self._coerce_text(dispatch_workflow_raw)
+            if dispatch_workflow:
+                canonical_workflow = dispatch_workflow
+                logger.info(
+                    "Found workflow=%s from dispatch tracking for unique=%s",
+                    dispatch_workflow,
+                    unique_key,
+                )
         except Exception:  # pragma: no cover - best effort
             logger.exception(
-                "Failed to resolve canonical workflow for unique_id=%s from dispatch tracking",
+                "Failed to resolve workflow from dispatch tracking for unique_id=%s",
                 unique_key,
             )
 
-        if canonical_workflow:
-            canonical_coerced = self._coerce_text(canonical_workflow)
-            if canonical_coerced:
-                if workflow_key and canonical_coerced != workflow_key:
-                    logger.warning(
-                        "Workflow mismatch detected for unique_id=%s; using dispatch workflow_id=%s instead of %s",
-                        unique_key,
-                        canonical_coerced,
-                        workflow_key,
-                    )
-                workflow_key = canonical_coerced
-
-        existing_workflow = None
+        draft_workflow: Optional[str] = None
         try:
-            existing_workflow = supplier_response_repo.lookup_workflow_for_unique(unique_id=unique_key)
+            draft = draft_rfq_emails_repo.load_by_unique_id(unique_id=unique_key)
+            if draft and draft.get("workflow_id"):
+                draft_workflow = self._coerce_text(draft["workflow_id"])
+                if draft_workflow:
+                    logger.info(
+                        "Found workflow=%s from draft tracking for unique=%s",
+                        draft_workflow,
+                        unique_key,
+                    )
+                    if not canonical_workflow:
+                        canonical_workflow = draft_workflow
         except Exception:  # pragma: no cover - best effort
             logger.exception(
-                "Failed to inspect stored workflow for unique_id=%s",
+                "Failed to resolve workflow from draft tracking for unique_id=%s",
                 unique_key,
             )
 
-        if existing_workflow:
-            existing_coerced = self._coerce_text(existing_workflow)
-            if existing_coerced:
-                if workflow_key and existing_coerced != workflow_key:
-                    logger.warning(
-                        "Workflow mismatch detected for unique_id=%s; aligning to stored workflow_id=%s instead of %s",
-                        unique_key,
+        existing_workflow_raw: Optional[str] = None
+        try:
+            existing_workflow_raw = supplier_response_repo.lookup_workflow_for_unique(
+                unique_id=unique_key
+            )
+            if existing_workflow_raw:
+                existing_coerced = self._coerce_text(existing_workflow_raw)
+                if existing_coerced:
+                    logger.info(
+                        "Found workflow=%s from existing supplier_response for unique=%s",
                         existing_coerced,
-                        workflow_key,
+                        unique_key,
                     )
-                workflow_key = existing_coerced
+                    if not canonical_workflow:
+                        canonical_workflow = existing_coerced
+        except Exception:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to lookup existing workflow for unique_id=%s",
+                unique_key,
+            )
+
+        dispatch_workflow = self._coerce_text(dispatch_workflow_raw)
+        existing_workflow = self._coerce_text(existing_workflow_raw)
+
+        all_workflows = {
+            value
+            for value in (
+                workflow_key,
+                canonical_workflow,
+                dispatch_workflow,
+                draft_workflow,
+                existing_workflow,
+            )
+            if self._coerce_text(value)
+        }
+
+        if len(all_workflows) > 1:
+            logger.error(
+                "CRITICAL: Workflow ID mismatch detected! provided=%s dispatch=%s draft=%s existing=%s unique=%s",
+                workflow_key,
+                dispatch_workflow,
+                draft_workflow,
+                existing_workflow,
+                unique_key,
+            )
+            if canonical_workflow:
+                logger.error(
+                    "Using workflow=%s from dispatch tracking as canonical",
+                    canonical_workflow,
+                )
+                workflow_key = canonical_workflow
+        elif canonical_workflow and workflow_key != canonical_workflow:
+            logger.warning(
+                "Correcting workflow from %s to %s for unique=%s",
+                workflow_key,
+                canonical_workflow,
+                unique_key,
+            )
+            workflow_key = canonical_workflow
 
         if not workflow_key:
             logger.debug(
@@ -3905,6 +4074,14 @@ class SupplierInteractionAgent(BaseAgent):
                 rfq_id,
             )
             return
+
+        logger.info(
+            "Storing supplier response: workflow=%s unique=%s supplier=%s rfq=%s",
+            workflow_key,
+            unique_key,
+            resolved_supplier,
+            rfq_id,
+        )
 
         supplier_email = None
         if isinstance(from_address, str) and from_address.strip():

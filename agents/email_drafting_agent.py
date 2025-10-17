@@ -3047,10 +3047,17 @@ class EmailDraftingAgent(BaseAgent):
                     workflow_id = f"WF-{uuid.uuid4().hex[:16]}"
 
                 draft["workflow_id"] = workflow_id
-                if not isinstance(metadata, dict):
-                    metadata = {}
+                metadata = dict(metadata)
+                metadata["workflow_id"] = workflow_id
                 draft["metadata"] = metadata
                 metadata.setdefault("workflow_id", workflow_id)
+
+                logger.info(
+                    "Storing draft with workflow_id=%s unique_id=%s supplier=%s",
+                    workflow_id,
+                    draft.get("unique_id"),
+                    draft.get("supplier_id"),
+                )
 
                 unique_id = self._resolve_unique_id(
                     workflow_id=workflow_id,
