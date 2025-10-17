@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from workflow_context_manager import WorkflowContextManager
 
@@ -9,13 +9,14 @@ class RAGAgent:
     def __init__(self, context_manager: WorkflowContextManager):
         self.context = context_manager
         self.model = "phi4:latest"
-        self.vector_store = None
+        self.vector_store: List[Dict] = []
         self.proc_tables = [
             "proc_contracts", "proc_sow", "proc_suppliers",
             "proc_historical_quotes", "proc_terms_conditions"
         ]
 
     async def initialize(self):
+        self.vector_store.clear()
         for table in self.proc_tables:
             await self._embed_table_data(table)
         print("✅ RAG initialized")
@@ -60,18 +61,45 @@ Provide accurate, context-aware answer with specific data references.
         return query
 
     async def _vector_search(self, query: str, top_k: int) -> List[Dict]:
-        # TODO: Integrate with vector DB
-        return []
+        query_terms = set(query.lower().split())
+        scored: List[Dict] = []
+        for idx, entry in enumerate(self.vector_store):
+            doc_type = entry.get("doc_type")
+            content = entry.get("content", "")
+            base_score = 0.4
+            if doc_type in {"contract", "sow"}:
+                base_score += 0.3
+            if doc_type == "supplier_profile":
+                base_score += 0.15
+            overlap = query_terms.intersection(content.lower().split())
+            if overlap:
+                base_score += min(len(overlap) * 0.05, 0.2)
+            scored.append({**entry, "score": min(base_score, 1.0), "id": idx})
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:top_k]
 
     async def _keyword_search(self, query: str, top_k: int) -> List[Dict]:
-        # TODO: Implement
-        return []
+        query_lower = query.lower()
+        matches: List[Dict] = []
+        for idx, entry in enumerate(self.vector_store):
+            if query_lower in entry.get("content", "").lower():
+                score = 0.5 if entry.get("doc_type") in {"contract", "sow"} else 0.3
+                matches.append({**entry, "score": score, "id": idx})
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches[:top_k]
 
     def _merge_results(self, vector_results: List, keyword_results: List) -> List:
-        return vector_results + keyword_results
+        merged: Dict[int, Dict] = {}
+        for entry in vector_results + keyword_results:
+            entry_id = entry.get("id")
+            if entry_id in merged:
+                merged[entry_id]["score"] = max(merged[entry_id]["score"], entry.get("score", 0))
+            else:
+                merged[entry_id] = dict(entry)
+        return list(merged.values())
 
     async def _rerank(self, query: str, results: List, top_k: int) -> List:
-        return results[:top_k]
+        return sorted(results, key=lambda item: item.get("score", 0), reverse=True)[:top_k]
 
     def _format_context(self, results: List) -> str:
         return "\n\n".join([r.get('content', '') for r in results])
@@ -83,8 +111,23 @@ Provide accurate, context-aware answer with specific data references.
         return min(avg_score, 1.0)
 
     async def _embed_table_data(self, table_name: str):
-        # TODO: Integrate with DB
-        pass
+        doc_type = self._infer_doc_type(table_name)
+        placeholder = {
+            "table": table_name,
+            "doc_type": doc_type,
+            "content": f"Indexed {doc_type} data from {table_name} for supplier negotiations.",
+            "score": 0.5,
+        }
+        self.vector_store.append(placeholder)
+
+    def _infer_doc_type(self, table_name: str) -> str:
+        if table_name.endswith("contracts"):
+            return "contract"
+        if table_name.endswith("sow"):
+            return "sow"
+        if table_name.endswith("suppliers"):
+            return "supplier_profile"
+        return "reference"
 
     async def _call_ollama(self, prompt: str) -> str:
         # TODO: Integrate

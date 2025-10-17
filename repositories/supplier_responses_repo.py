@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import sqlite3
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from services.db import get_conn
 
@@ -13,8 +13,9 @@ CREATE TABLE IF NOT EXISTS proc.supplier_responses (
     id BIGSERIAL PRIMARY KEY,
     workflow_id TEXT NOT NULL,
     run_id TEXT,
-    unique_id TEXT,           -- primary matcher
-    supplier_id TEXT,         -- secondary matcher
+    unique_id TEXT,           -- legacy matcher (to be retired)
+    supplier_id TEXT,         -- business identifier
+    hidden_identifier TEXT,   -- PROC-WF-XXXXXXXXXXXX correlation id
     message_id TEXT,
     mailbox TEXT,
     imap_uid TEXT,
@@ -34,11 +35,17 @@ CREATE TABLE IF NOT EXISTS proc.supplier_responses (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_supplier_responses_wf_uid
 ON proc.supplier_responses (workflow_id, unique_id);
 
+CREATE INDEX IF NOT EXISTS idx_supplier_responses_hidden_identifier
+ON proc.supplier_responses (hidden_identifier);
+
 CREATE INDEX IF NOT EXISTS idx_supplier_responses_wf
 ON proc.supplier_responses (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_supplier_responses_supplier
 ON proc.supplier_responses (supplier_id);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_responses_created_at
+ON proc.supplier_responses (created_at);
 """
 
 DDL_SQLITE = """
@@ -48,6 +55,7 @@ CREATE TABLE IF NOT EXISTS supplier_responses (
     run_id TEXT,
     unique_id TEXT,
     supplier_id TEXT,
+    hidden_identifier TEXT,
     message_id TEXT,
     mailbox TEXT,
     imap_uid TEXT,
@@ -65,6 +73,9 @@ CREATE TABLE IF NOT EXISTS supplier_responses (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_supplier_responses_wf_uid
 ON supplier_responses (workflow_id, unique_id);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_responses_hidden_identifier
+ON supplier_responses (hidden_identifier);
 
 CREATE INDEX IF NOT EXISTS idx_supplier_responses_wf
 ON supplier_responses (workflow_id);
@@ -91,6 +102,7 @@ def upsert_response(
     run_id: Optional[str],
     unique_id: Optional[str],
     supplier_id: Optional[str],
+    hidden_identifier: Optional[str],
     message_id: Optional[str],
     mailbox: Optional[str],
     imap_uid: Optional[str],
@@ -110,11 +122,12 @@ def upsert_response(
         if isinstance(conn, sqlite3.Connection):
             q = """
 INSERT INTO supplier_responses
-(workflow_id, run_id, unique_id, supplier_id, message_id, mailbox, imap_uid, from_addr, to_addrs, subject,
+(workflow_id, run_id, unique_id, supplier_id, hidden_identifier, message_id, mailbox, imap_uid, from_addr, to_addrs, subject,
  body_text, headers_json, received_at, created_at, processed_status, extra)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
 ON CONFLICT(workflow_id, unique_id) DO UPDATE SET
   supplier_id=COALESCE(excluded.supplier_id, supplier_responses.supplier_id),
+  hidden_identifier=COALESCE(excluded.hidden_identifier, supplier_responses.hidden_identifier),
   message_id=COALESCE(excluded.message_id, supplier_responses.message_id),
   mailbox=excluded.mailbox,
   imap_uid=excluded.imap_uid,
@@ -127,7 +140,7 @@ ON CONFLICT(workflow_id, unique_id) DO UPDATE SET
 """
             cur = conn.cursor()
             cur.execute(q, (
-                workflow_id, run_id, unique_id, supplier_id, message_id, mailbox, imap_uid, from_addr, to_serial,
+                workflow_id, run_id, unique_id, supplier_id, hidden_identifier, message_id, mailbox, imap_uid, from_addr, to_serial,
                 subject, body_text, headers_serial, received_at.isoformat(), _now_iso(), extra_serial
             ))
             conn.commit()
@@ -135,11 +148,12 @@ ON CONFLICT(workflow_id, unique_id) DO UPDATE SET
         else:
             q = """
 INSERT INTO proc.supplier_responses
-(workflow_id, run_id, unique_id, supplier_id, message_id, mailbox, imap_uid, from_addr, to_addrs, subject,
+(workflow_id, run_id, unique_id, supplier_id, hidden_identifier, message_id, mailbox, imap_uid, from_addr, to_addrs, subject,
  body_text, headers_json, received_at, processed_status, extra)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'pending', %s::jsonb)
 ON CONFLICT (workflow_id, unique_id) DO UPDATE SET
   supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_responses.supplier_id),
+  hidden_identifier=COALESCE(EXCLUDED.hidden_identifier, proc.supplier_responses.hidden_identifier),
   message_id=COALESCE(EXCLUDED.message_id, proc.supplier_responses.message_id),
   mailbox=EXCLUDED.mailbox,
   imap_uid=EXCLUDED.imap_uid,
@@ -152,7 +166,7 @@ ON CONFLICT (workflow_id, unique_id) DO UPDATE SET
 """
             cur = conn.cursor()
             cur.execute(q, (
-                workflow_id, run_id, unique_id, supplier_id, message_id, mailbox, imap_uid, from_addr, to_serial,
+                workflow_id, run_id, unique_id, supplier_id, hidden_identifier, message_id, mailbox, imap_uid, from_addr, to_serial,
                 subject, body_text, headers_serial, received_at, extra_serial
             ))
             cur.close()
@@ -188,6 +202,93 @@ ORDER BY received_at ASC
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
             cur.close()
             return rows
+
+
+def distinct_hidden_identifiers(
+    expected_hidden_identifiers: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    """Return the distinct hidden identifiers present in persistence."""
+
+    candidates = [hid for hid in (expected_hidden_identifiers or []) if hid]
+
+    with get_conn() as conn:
+        if isinstance(conn, sqlite3.Connection):
+            if candidates:
+                placeholders = ",".join(["?"] * len(candidates))
+                query = (
+                    f"SELECT DISTINCT hidden_identifier FROM supplier_responses "
+                    f"WHERE hidden_identifier IN ({placeholders})"
+                )
+                params: Iterable[Any] = tuple(candidates)
+            else:
+                query = (
+                    "SELECT DISTINCT hidden_identifier FROM supplier_responses "
+                    "WHERE hidden_identifier IS NOT NULL"
+                )
+                params = tuple()
+            cur = conn.cursor()
+            cur.execute(query, params)
+            values = {row[0] for row in cur.fetchall() if row[0]}
+            cur.close()
+            return values
+        else:
+            if candidates:
+                query = (
+                    "SELECT DISTINCT hidden_identifier FROM proc.supplier_responses "
+                    "WHERE hidden_identifier = ANY(%s)"
+                )
+                params = (list(candidates),)
+            else:
+                query = (
+                    "SELECT DISTINCT hidden_identifier FROM proc.supplier_responses "
+                    "WHERE hidden_identifier IS NOT NULL"
+                )
+                params = tuple()
+            cur = conn.cursor()
+            cur.execute(query, params)
+            values = {row[0] for row in cur.fetchall() if row[0]}
+            cur.close()
+            return values
+
+
+def fetch_latest_by_hidden_identifier(hidden_identifier: str) -> Optional[Dict[str, Any]]:
+    """Fetch the newest supplier response for the provided hidden identifier."""
+
+    if not hidden_identifier:
+        return None
+
+    with get_conn() as conn:
+        if isinstance(conn, sqlite3.Connection):
+            query = (
+                "SELECT * FROM supplier_responses "
+                "WHERE hidden_identifier = ? "
+                "ORDER BY received_at DESC LIMIT 1"
+            )
+            cur = conn.cursor()
+            cur.execute(query, (hidden_identifier,))
+            row = cur.fetchone()
+            if row is None:
+                cur.close()
+                return None
+            cols = [desc[0] for desc in cur.description]
+            cur.close()
+            return dict(zip(cols, row))
+        else:
+            query = (
+                "SELECT * FROM proc.supplier_responses "
+                "WHERE hidden_identifier = %s "
+                "ORDER BY received_at DESC LIMIT 1"
+            )
+            cur = conn.cursor()
+            cur.execute(query, (hidden_identifier,))
+            record = cur.fetchone()
+            if record is None:
+                cur.close()
+                return None
+            cols = [c.name for c in cur.description]
+            cur.close()
+            return dict(zip(cols, record))
+
 
 def mark_processed_by_ids(ids: Iterable[int]) -> None:
     ids = list(ids)
