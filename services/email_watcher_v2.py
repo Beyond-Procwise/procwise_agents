@@ -238,6 +238,14 @@ def _normalise_identifier(value: Optional[str]) -> Optional[str]:
     return text.upper() or None
 
 
+def _normalise_email_address(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    _, address = parseaddr(str(value))
+    address = address.strip().lower()
+    return address or None
+
+
 def _default_fetcher(
     *,
     host: str,
