@@ -4134,6 +4134,41 @@ class NegotiationAgent(BaseAgent):
                     draft.setdefault("unique_id", session_reference)
                     draft.setdefault("rfq_id", session_reference)
 
+        if candidate_drafts:
+            unique_id_set = set()
+            observed_unique_ids = []
+            for draft in candidate_drafts:
+                if not isinstance(draft, dict):
+                    continue
+                metadata = (
+                    draft.get("metadata")
+                    if isinstance(draft.get("metadata"), dict)
+                    else {}
+                )
+                unique_value = _record_unique_id(draft.get("unique_id"))
+                if not unique_value:
+                    for key in (
+                        "dispatch_run_id",
+                        "run_id",
+                        "email_action_id",
+                        "action_id",
+                        "draft_id",
+                    ):
+                        unique_value = _record_unique_id(
+                            draft.get(key) or metadata.get(key)
+                        )
+                        if unique_value:
+                            break
+                if not unique_value and metadata:
+                    for key in ("unique_id", "message_id", "id"):
+                        unique_value = _record_unique_id(metadata.get(key))
+                        if unique_value:
+                            break
+                if not unique_value and session_reference:
+                    unique_value = _record_unique_id(session_reference)
+                if unique_value:
+                    draft.setdefault("unique_id", unique_value)
+
         expected_count = max(len(candidate_drafts), len(observed_unique_ids)) or 1
 
         watch_payload: Dict[str, Any] = {
