@@ -4194,6 +4194,9 @@ class NegotiationAgent(BaseAgent):
         elif not expected_total:
             expected_total = len(draft_entries)
 
+        if expected_total and batch_limit < expected_total:
+            batch_limit = expected_total
+
         workflow_hint = self._coerce_text(
             watch_payload.get("workflow_id") or getattr(context, "workflow_id", None)
         )
