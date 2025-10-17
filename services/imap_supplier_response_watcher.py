@@ -57,6 +57,7 @@ from agents.base_agent import AgentContext
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from services.email_dispatch_chain_store import mark_response as mark_dispatch_response
 from utils.email_markers import (
+    extract_hidden_identifier,
     extract_marker_token,
     extract_rfq_id,
     extract_run_id,
@@ -72,6 +73,9 @@ DISPATCH_TABLE = "proc.email_dispatch_chains"
 _MANDATORY_WAIT_SECONDS = 90
 
 
+_HIDDEN_IDENTIFIER_PATTERN = re.compile(r"^PROC-WF-[A-Z0-9]{6,}$")
+
+
 @dataclasses.dataclass(frozen=True)
 class SupplierResponseRecord:
     """Representation of a supplier email pulled from IMAP."""
@@ -80,6 +84,7 @@ class SupplierResponseRecord:
     action_id: Optional[str]
     run_id: Optional[str]
     rfq_id: str
+    hidden_identifier: Optional[str]
     supplier_id: Optional[str]
     message_id: Optional[str]
     subject: str
@@ -91,6 +96,17 @@ class SupplierResponseRecord:
 
     def normalised_rfq(self) -> str:
         return (self.rfq_id or "").strip().upper()
+
+
+def _normalise_hidden_identifier(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    token = value.strip().upper()
+    if not token:
+        return None
+    if _HIDDEN_IDENTIFIER_PATTERN.match(token):
+        return token
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +253,7 @@ class DatabaseBackend:
                     action_id TEXT,
                     run_id TEXT,
                     rfq_id TEXT NOT NULL,
+                    hidden_identifier TEXT,
                     supplier_id TEXT,
                     message_id TEXT,
                     message_hash TEXT,
@@ -267,6 +284,9 @@ class DatabaseBackend:
                 f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS run_id TEXT"
             )
             cur.execute(
+                f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS hidden_identifier TEXT"
+            )
+            cur.execute(
                 f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS message_hash TEXT"
             )
             cur.execute(
@@ -289,6 +309,10 @@ class DatabaseBackend:
                 f"CREATE UNIQUE INDEX IF NOT EXISTS supplier_responses_rfq_supplier"
                 f" ON {TABLE_NAME}(rfq_id, supplier_id)"
             )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS supplier_responses_hidden_identifier"
+                f" ON {TABLE_NAME}(hidden_identifier)"
+            )
         self._conn.commit()
 
     def _ensure_sqlite_schema(self) -> None:
@@ -303,6 +327,7 @@ class DatabaseBackend:
                     action_id TEXT,
                     run_id TEXT,
                     rfq_id TEXT NOT NULL,
+                    hidden_identifier TEXT,
                     supplier_id TEXT,
                     message_id TEXT,
                     message_hash TEXT,
@@ -325,6 +350,7 @@ class DatabaseBackend:
             self._maybe_add_sqlite_column(table, "workflow_id TEXT")
             self._maybe_add_sqlite_column(table, "action_id TEXT")
             self._maybe_add_sqlite_column(table, "run_id TEXT")
+            self._maybe_add_sqlite_column(table, "hidden_identifier TEXT")
             self._maybe_add_sqlite_column(table, "message_hash TEXT")
             self._maybe_add_sqlite_column(table, "processed_at TEXT")
             self._maybe_add_sqlite_column(table, "dispatch_run_id TEXT")
@@ -337,6 +363,10 @@ class DatabaseBackend:
             self._conn.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS supplier_responses_rfq_supplier"
                 f" ON {table}(rfq_id, supplier_id)"
+            )
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS supplier_responses_hidden_identifier"
+                f" ON {table}(hidden_identifier)"
             )
 
     def _maybe_add_sqlite_column(self, table: str, definition: str) -> None:
@@ -364,16 +394,17 @@ class DatabaseBackend:
         if self.dialect == "postgres":
             query = f"""
                 INSERT INTO {TABLE_NAME} (
-                    workflow_id, action_id, run_id, rfq_id, supplier_id,
-                    message_id, message_hash, from_address, subject, body,
-                    raw_headers, mailbox, received_at, dispatch_run_id
+                    workflow_id, action_id, run_id, rfq_id, hidden_identifier,
+                    supplier_id, message_id, message_hash, from_address, subject,
+                    body, raw_headers, mailbox, received_at, dispatch_run_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (message_hash) DO UPDATE SET
                     workflow_id = EXCLUDED.workflow_id,
                     action_id = EXCLUDED.action_id,
                     run_id = EXCLUDED.run_id,
                     rfq_id = EXCLUDED.rfq_id,
+                    hidden_identifier = COALESCE(EXCLUDED.hidden_identifier, {TABLE_NAME}.hidden_identifier),
                     supplier_id = COALESCE(EXCLUDED.supplier_id, {TABLE_NAME}.supplier_id),
                     from_address = EXCLUDED.from_address,
                     subject = EXCLUDED.subject,
@@ -387,16 +418,17 @@ class DatabaseBackend:
         else:
             query = f"""
                 INSERT INTO "{TABLE_NAME}" (
-                    workflow_id, action_id, run_id, rfq_id, supplier_id,
-                    message_id, message_hash, from_address, subject, body,
-                    raw_headers, mailbox, received_at, dispatch_run_id
+                    workflow_id, action_id, run_id, rfq_id, hidden_identifier,
+                    supplier_id, message_id, message_hash, from_address, subject,
+                    body, raw_headers, mailbox, received_at, dispatch_run_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(message_hash) DO UPDATE SET
                     workflow_id = excluded.workflow_id,
                     action_id = excluded.action_id,
                     run_id = excluded.run_id,
                     rfq_id = excluded.rfq_id,
+                    hidden_identifier = COALESCE(excluded.hidden_identifier, hidden_identifier),
                     supplier_id = COALESCE(excluded.supplier_id, supplier_id),
                     from_address = excluded.from_address,
                     subject = excluded.subject,
@@ -414,6 +446,7 @@ class DatabaseBackend:
             record.action_id,
             record.run_id,
             record.rfq_id,
+            record.hidden_identifier,
             record.supplier_id,
             record.message_id,
             message_hash,
@@ -466,9 +499,9 @@ class DatabaseBackend:
             if self.dialect == "postgres":
                 cursor.execute(
                     f"""
-                    SELECT id, workflow_id, action_id, run_id, rfq_id, supplier_id,
-                           message_id, subject, body, from_address, received_at,
-                           mailbox, dispatch_run_id
+                    SELECT id, workflow_id, action_id, run_id, rfq_id, hidden_identifier,
+                           supplier_id, message_id, subject, body, from_address,
+                           received_at, mailbox, dispatch_run_id
                     FROM {TABLE_NAME}
                     WHERE (%s IS NULL OR workflow_id = %s)
                       AND (%s IS NULL OR dispatch_run_id = %s)
@@ -480,9 +513,9 @@ class DatabaseBackend:
             else:
                 cursor.execute(
                     f"""
-                    SELECT id, workflow_id, action_id, run_id, rfq_id, supplier_id,
-                           message_id, subject, body, from_address, received_at,
-                           mailbox, dispatch_run_id
+                    SELECT id, workflow_id, action_id, run_id, rfq_id, hidden_identifier,
+                           supplier_id, message_id, subject, body, from_address,
+                           received_at, mailbox, dispatch_run_id
                     FROM "{TABLE_NAME}"
                     WHERE (? IS NULL OR workflow_id = ?)
                       AND (? IS NULL OR dispatch_run_id = ?)
@@ -507,16 +540,17 @@ class DatabaseBackend:
                     "action_id": row[2],
                     "run_id": row[3],
                     "rfq_id": row[4],
-                    "supplier_id": row[5],
-                    "message_id": row[6],
-                    "subject": row[7],
-                    "body": row[8],
-                    "from_address": row[9],
-                    "received_at_raw": row[10],
-                    "mailbox": row[11],
-                    "dispatch_run_id": row[12],
+                    "hidden_identifier": row[5],
+                    "supplier_id": row[6],
+                    "message_id": row[7],
+                    "subject": row[8],
+                    "body": row[9],
+                    "from_address": row[10],
+                    "received_at_raw": row[11],
+                    "mailbox": row[12],
+                    "dispatch_run_id": row[13],
                 }
-                received_at_value = row[10]
+                received_at_value = row[11]
 
             token_value = record.get("dispatch_run_id") or record.get("run_id")
             supplier_value = record.get("supplier_id") or ""
@@ -889,6 +923,7 @@ def _extract_rfq_payload(
     body = _message_body(msg)
     comment, _ = split_hidden_marker(body)
     rfq_id = extract_rfq_id(comment)
+    hidden_identifier = extract_hidden_identifier(comment)
     run_identifier = extract_run_id(comment)
     token = extract_marker_token(comment)
     supplier = extract_supplier_id(comment)
@@ -904,6 +939,7 @@ def _extract_rfq_payload(
 
     if matched_dispatch:
         rfq_id = rfq_id or matched_dispatch.rfq_id
+        hidden_identifier = hidden_identifier or matched_dispatch.rfq_id
         supplier = supplier or matched_dispatch.supplier_id
         workflow_id = workflow_id or matched_dispatch.workflow_id
         action_id = action_id or matched_dispatch.action_id
@@ -927,6 +963,10 @@ def _extract_rfq_payload(
     if not rfq_clean:
         return None
 
+    if not hidden_identifier and rfq_clean:
+        hidden_identifier = rfq_clean
+    hidden_identifier = _normalise_hidden_identifier(hidden_identifier)
+
     if matched_dispatch:
         dispatch_workflow = matched_dispatch.workflow_id
         if dispatch_workflow and workflow_id:
@@ -944,6 +984,7 @@ def _extract_rfq_payload(
         action_id=action_id,
         run_id=run_identifier,
         rfq_id=rfq_clean,
+        hidden_identifier=hidden_identifier,
         supplier_id=supplier,
         message_id=message_id.strip() if isinstance(message_id, str) else message_id,
         subject=subject,
