@@ -329,10 +329,6 @@ class NegotiationAgent(BaseAgent):
             if candidate:
                 return candidate
 
-        rfq_candidate = self._coerce_text(payload.get("rfq_id"))
-        if rfq_candidate:
-            return rfq_candidate
-
         return self._coerce_text(getattr(context, "workflow_id", None))
 
     def run(self, context: AgentContext) -> AgentOutput:
@@ -509,7 +505,7 @@ class NegotiationAgent(BaseAgent):
                                 {
                                     "supplier_id": prepared_entries[0].get("supplier_id"),
                                     "session_reference": prepared_entries[0].get("session_reference")
-                                    or prepared_entries[0].get("rfq_id"),
+                                    or prepared_entries[0].get("unique_id"),
                                     "status": AgentStatus.FAILED.value,
                                     "error": str(exc),
                                 }
@@ -570,7 +566,6 @@ class NegotiationAgent(BaseAgent):
                 session_reference = (
                     payload.get("session_reference")
                     or payload.get("unique_id")
-                    or payload.get("rfq_id")
                 )
                 try:
                     result = future.result()
@@ -580,7 +575,6 @@ class NegotiationAgent(BaseAgent):
                         "supplier_id": supplier_id,
                         "session_reference": session_reference,
                         "unique_id": session_reference,
-                        "rfq_id": session_reference,
                         "status": AgentStatus.FAILED.value,
                         "error": error_message,
                     }
@@ -599,7 +593,6 @@ class NegotiationAgent(BaseAgent):
                     or payload.get("supplier_id"),
                     "session_reference": record_reference,
                     "unique_id": record_reference,
-                    "rfq_id": record_reference,
                     "status": result.status.value,
                     "output": result.data,
                     "pass_fields": result.pass_fields,
@@ -629,7 +622,7 @@ class NegotiationAgent(BaseAgent):
                     failed_records.append(
                         {
                             "supplier_id": supplier_key,
-                            "rfq_id": record.get("rfq_id"),
+                            "session_reference": record.get("session_reference"),
                             "status": record.get("status"),
                             "error": record.get("error"),
                         }
@@ -1006,7 +999,6 @@ class NegotiationAgent(BaseAgent):
                 "supplier": supplier,
                 "session_reference": session_reference,
                 "unique_id": session_reference,
-                "rfq_id": session_reference,
                 "round": round_no,
                 "counter_proposals": counter_options,
                 "decision": decision,
@@ -1138,7 +1130,6 @@ class NegotiationAgent(BaseAgent):
             "intent": "NEGOTIATION_COUNTER",
             "session_reference": session_reference,
             "unique_id": session_reference,
-            "rfq_id": session_reference,
             "supplier_id": supplier,
             "current_offer": price_raw,
             "current_offer_numeric": price,
@@ -1234,7 +1225,6 @@ class NegotiationAgent(BaseAgent):
         draft_stub = {
             "session_reference": session_reference,
             "unique_id": session_reference,
-            "rfq_id": session_reference,
             "supplier_id": supplier,
             "intent": "NEGOTIATION_COUNTER",
             "metadata": draft_metadata,
@@ -1353,7 +1343,6 @@ class NegotiationAgent(BaseAgent):
             "supplier": supplier,
             "session_reference": session_reference,
             "unique_id": session_reference,
-            "rfq_id": session_reference,
             "round": round_no,
             "counter_proposals": counter_options,
             "decision": decision,
@@ -1433,7 +1422,6 @@ class NegotiationAgent(BaseAgent):
                         "workflow_id": workflow_id,
                         "session_reference": session_reference,
                         "unique_id": session_reference,
-                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Supplier response not received before timeout.",
@@ -1478,7 +1466,6 @@ class NegotiationAgent(BaseAgent):
                         "workflow_id": workflow_id,
                         "session_reference": session_reference,
                         "unique_id": session_reference,
-                        "rfq_id": session_reference,
                         "round": round_no,
                         "decision": decision,
                         "message": "Missing supplier responses after wait.",
@@ -1558,7 +1545,6 @@ class NegotiationAgent(BaseAgent):
             merge_payload["session_state"] = public_state
             if session_reference is not None:
                 merge_payload.setdefault("session_reference", session_reference)
-                merge_payload.setdefault("rfq_id", session_reference)
             if supplier is not None:
                 merge_payload.setdefault("supplier_id", supplier)
             supplier_name = context.input_data.get("supplier_name")
@@ -2029,7 +2015,7 @@ class NegotiationAgent(BaseAgent):
                                last_supplier_msg_id, last_agent_msg_id, last_email_sent_at,
                                base_subject, initial_body
                           FROM proc.negotiation_session_state
-                         WHERE rfq_id = %s AND supplier_id = %s
+                         WHERE session_id = %s AND supplier_id = %s
                         """,
                         (session_id, supplier),
                     )
@@ -2078,7 +2064,7 @@ class NegotiationAgent(BaseAgent):
                     cur.execute(
                         """
                         INSERT INTO proc.negotiation_session_state (
-                            rfq_id,
+                            session_id,
                             supplier_id,
                             supplier_reply_count,
                             current_round,
@@ -2092,7 +2078,7 @@ class NegotiationAgent(BaseAgent):
                             updated_on
                         )
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (rfq_id, supplier_id) DO UPDATE SET
+                        ON CONFLICT (session_id, supplier_id) DO UPDATE SET
                             supplier_reply_count = EXCLUDED.supplier_reply_count,
                             current_round = EXCLUDED.current_round,
                             status = EXCLUDED.status,
@@ -3758,7 +3744,7 @@ class NegotiationAgent(BaseAgent):
             "summary_lines": details,
             "full_summary": full_summary,
             "context_sections": "".join(context_sections),
-            "rfq_id": str(rfq_reference or ""),
+            "session_reference": str(rfq_reference or ""),
             "round_number": str(round_no),
             "strategy": str(decision.get("strategy") or ""),
             "supplier_id": str(supplier_identifier),
@@ -4119,7 +4105,6 @@ class NegotiationAgent(BaseAgent):
             if session_reference:
                 fallback_entry["session_reference"] = session_reference
                 fallback_entry.setdefault("unique_id", session_reference)
-                fallback_entry.setdefault("rfq_id", session_reference)
             candidate_drafts.append(fallback_entry)
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
@@ -4132,7 +4117,6 @@ class NegotiationAgent(BaseAgent):
                 if isinstance(draft, dict) and session_reference:
                     draft.setdefault("session_reference", session_reference)
                     draft.setdefault("unique_id", session_reference)
-                    draft.setdefault("rfq_id", session_reference)
 
         if candidate_drafts:
             unique_id_set = set()
@@ -4186,7 +4170,6 @@ class NegotiationAgent(BaseAgent):
         if session_reference:
             watch_payload.setdefault("session_reference", session_reference)
             watch_payload.setdefault("unique_id", session_reference)
-            watch_payload.setdefault("rfq_id", session_reference)
 
         if observed_unique_ids:
             watch_payload["unique_ids"] = list(observed_unique_ids)
@@ -4528,7 +4511,7 @@ class NegotiationAgent(BaseAgent):
                     cur.execute(
                         """
                         INSERT INTO proc.negotiation_sessions
-                            (rfq_id, supplier_id, round, counter_offer, created_on)
+                            (session_id, supplier_id, round, counter_offer, created_on)
                         VALUES (%s, %s, %s, %s, NOW())
                         """,
                         (session_id, supplier, round_no, counter_price),
@@ -4546,11 +4529,7 @@ class NegotiationAgent(BaseAgent):
         state: Optional[Dict[str, Any]] = None,
         awaiting_response: bool = False,
         supplier_reply_registered: bool = False,
-        *,
-        rfq_id: Optional[str] = None,
     ) -> None:
-        if session_id is None and rfq_id is not None:
-            session_id = rfq_id
         logger.debug(
             "Negotiation learning capture skipped (session_id=%s, supplier=%s)",
             session_id,
