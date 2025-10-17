@@ -151,7 +151,6 @@ class EmailDispatchService:
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
             headers = {
-                "X-Procwise-RFQ-ID": rfq_id,
                 "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
                 "X-Procwise-Unique-Id": backend_metadata.get("unique_id"),
             }

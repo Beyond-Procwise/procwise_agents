@@ -225,13 +225,9 @@ _RFQ_HEADER_CELL_STYLE = (
     "border: 1px solid #d0d0d0; padding: 6px; text-align: left; background-color: #f5f5f5;"
 )
 _RFQ_BODY_CELL_STYLE = "border: 1px solid #d0d0d0; padding: 6px; text-align: left;"
-_VISIBLE_RFQ_ID_PATTERN = re.compile(
-    r"(?i)(RFQ[\w\s:-]*\d[\w-]*|UID-[A-Za-z0-9]+)"
-)
-
-DEFAULT_RFQ_SUBJECT = "Request for Quotation – Procurement Opportunity"
-DEFAULT_NEGOTIATION_SUBJECT = "Re: Procurement Negotiation Update"
-DEFAULT_FOLLOW_UP_SUBJECT = "Procurement Follow Up"
+DEFAULT_RFQ_SUBJECT = "Sourcing Request – Pricing Discussion"
+DEFAULT_NEGOTIATION_SUBJECT = "Re: Pricing Discussion"
+DEFAULT_FOLLOW_UP_SUBJECT = "Follow Up – Procurement Enquiry"
 
 
 def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
@@ -267,21 +263,28 @@ RFQ_TABLE_HEADER = _build_rfq_table_html([])
 
 
 NEGOTIATION_COUNTER_SYSTEM_PROMPT = (
-    "You are an elite procurement negotiator crafting decisive, relationship-aware "
-    "emails. Blend firmness with partnership, ground every request in the data "
-    "provided, and never invent figures. Keep replies under 160 words, use clear "
-    "paragraphs or short bullet points, and always reference the RFQ ID. Do not "
-    "discuss internal scorecards, evaluation formulas, or any analysis logic used to "
-    "assess suppliers."
+    "You are a senior procurement negotiator crafting professional, well-structured emails. "
+    "CRITICAL RULES:\n"
+    "• NEVER include internal identifiers (RFQ IDs, UIDs, workflow IDs, reference numbers)\n"
+    "• NEVER mention internal scoring, evaluation, or analysis processes\n"
+    "• Use natural language references like 'our recent discussion' or 'your quotation'\n"
+    "• Format with clear sections using **bold** headings\n"
+    "• Use bullet points (•) for lists\n"
+    "• Keep professional but warm tone\n"
+    "• Maximum 200 words\n"
+    "• Ensure proper paragraph spacing"
 )
 
 NEGOTIATION_COUNTER_USER_PROMPT = (
     "Context (JSON):\n{payload}\n\n"
-    "Draft a high-impact counter email that: (1) anchors the counter price or asks, "
-    "(2) justifies the request with business rationale, (3) offers alternate value "
-    "creation paths (tiered pricing, lead time flex, added terms), and (4) requests "
-    "confirmation within 2–3 business days. Maintain professional warmth and avoid "
-    "hyperbole."
+    "Draft a professional negotiation email with:\n"
+    "1. Personalized greeting without any reference numbers\n"
+    "2. Natural reference to previous communication (e.g., 'Thank you for your recent proposal')\n"
+    "3. **Pricing Position** section with clear figures\n"
+    "4. **Key Requirements** section with bullet-pointed asks\n"
+    "5. **Next Steps** with specific action and timeline\n"
+    "6. Professional closing\n\n"
+    "CRITICAL: Do NOT include RFQ IDs, UIDs, reference numbers, or any internal identifiers."
 )
 
 DEFAULT_NEGOTIATION_MODEL = "mistral"
@@ -309,41 +312,100 @@ class EmailDraftingAgent(BaseAgent):
     )
 
     @staticmethod
-    def _strip_rfq_identifier_tokens(text: Optional[str]) -> str:
+    def _strip_all_internal_identifiers(text: Optional[str]) -> str:
+        """Remove ALL internal identifiers from text."""
         if not isinstance(text, str):
             return ""
-        cleaned = _VISIBLE_RFQ_ID_PATTERN.sub("", text)
+
+        cleaned = re.sub(
+            r"(?i)\b(RFQ|rfq)[\s:-]*\d{8}[\s:-]*[A-Za-z0-9]{8}\b",
+            "",
+            text,
+        )
+
+        cleaned = re.sub(
+            r"(?i)\bRFQ[\s:-]*[A-Za-z0-9-]{3,}\b",
+            "",
+            cleaned,
+        )
+
+        cleaned = re.sub(r"(?i)\bRFQ\b", "", cleaned)
+
+        cleaned = re.sub(
+            r"(?i)\b(UID|uid)[\s:-]+[A-Za-z0-9-]{6,}\b",
+            "",
+            cleaned,
+        )
+
+        cleaned = re.sub(
+            r"(?i)\b(WF|workflow|wf)[\s:-]+[A-Za-z0-9-]{6,}\b",
+            "",
+            cleaned,
+        )
+
+        cleaned = re.sub(
+            r"(?i)\b(id|ref|reference)[\s:-]+[A-Za-z0-9-]{6,}\b",
+            "",
+            cleaned,
+        )
+
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
+
         return cleaned.strip()
+
+    @staticmethod
+    def _strip_rfq_identifier_tokens(text: Optional[str]) -> str:
+        """Legacy method - now calls comprehensive cleaner."""
+        return EmailDraftingAgent._strip_all_internal_identifiers(text)
 
     @classmethod
     def _clean_subject_text(cls, subject: Optional[str], fallback: str) -> str:
         prefix = ""
         candidate = subject.strip() if isinstance(subject, str) else ""
+
         if candidate:
             prefix_match = re.match(r"(?i)^(re|fw|fwd):\s*", candidate)
             if prefix_match:
                 prefix = prefix_match.group(0)
                 candidate = candidate[prefix_match.end():]
-            candidate = cls._strip_rfq_identifier_tokens(candidate)
+
+            raw_candidate = candidate
+            candidate = cls._strip_all_internal_identifiers(candidate)
             candidate = candidate.strip("-–: ")
+
+            if candidate and raw_candidate and candidate != raw_candidate:
+                if len(candidate.split()) <= 1:
+                    candidate = ""
+
             if candidate:
                 return f"{prefix}{candidate}".strip()
 
-        fallback_clean = cls._strip_rfq_identifier_tokens(fallback or "").strip("-–: ")
+        fallback_clean = cls._strip_all_internal_identifiers(fallback or "").strip("-–: ")
         if prefix and fallback_clean:
             fallback_without_prefix = re.sub(r"(?i)^(re|fw|fwd):\s*", "", fallback_clean)
             combined = f"{prefix}{fallback_without_prefix}".strip()
             return combined or prefix.strip()
+
         result = fallback_clean or prefix.strip()
-        return result if result else "Procurement Update"
+        return result if result else "Procurement Discussion"
 
     @staticmethod
     def _clean_body_text(body: Optional[str]) -> str:
+        """Clean body text by removing ALL internal identifiers."""
         if not isinstance(body, str):
             return ""
-        cleaned = _VISIBLE_RFQ_ID_PATTERN.sub("", body)
+
+        cleaned = EmailDraftingAgent._strip_all_internal_identifiers(body)
+
+        cleaned = re.sub(
+            r"(?i)^\s*(RFQ|UID|Ref|Reference|ID|Workflow)[\s:-]+[A-Za-z0-9-]+.*?$",
+            "",
+            cleaned,
+            flags=re.MULTILINE,
+        )
+
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
         return cleaned.strip()
 
     def __init__(self, agent_nick=None):
@@ -570,16 +632,17 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
+        workflow_hint = decision_data.get("workflow_id") or decision_data.get("workflow_ref")
+
         unique_id = self._resolve_unique_id(
-            workflow_id=decision_data.get("workflow_id") or decision_data.get("workflow_ref"),
-            rfq_id=rfq_id_output,
+            workflow_id=workflow_hint,
+            rfq_id=None,
             supplier_id=supplier_id,
             existing=decision_data.get("unique_id"),
         )
 
         annotated_body, marker_token = attach_hidden_marker(
             plain_text or "",
-            rfq_id=rfq_id_output,
             supplier_id=supplier_id,
             unique_id=unique_id,
         )
@@ -591,8 +654,8 @@ class EmailDraftingAgent(BaseAgent):
 
         thread_headers = decision_data.get("thread")
         headers: Dict[str, Any] = {
-            "X-Procwise-RFQ-ID": rfq_id_output,
             "X-Procwise-Unique-Id": unique_id,
+            "X-Procwise-Workflow-Id": workflow_hint,
         }
         if isinstance(thread_headers, dict):
             message_id = thread_headers.get("message_id")
@@ -601,6 +664,8 @@ class EmailDraftingAgent(BaseAgent):
             references = thread_headers.get("references")
             if isinstance(references, list) and references:
                 headers["References"] = " ".join(str(ref) for ref in references if ref)
+
+        headers = {k: v for k, v in headers.items() if v is not None}
 
         metadata = {
             "rfq_id": rfq_id_output,
@@ -618,6 +683,8 @@ class EmailDraftingAgent(BaseAgent):
         if marker_token:
             metadata["dispatch_token"] = marker_token
         metadata["unique_id"] = unique_id
+        if workflow_hint:
+            metadata["workflow_id"] = workflow_hint
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
         draft = {
@@ -731,15 +798,15 @@ class EmailDraftingAgent(BaseAgent):
             plain_text = self._clean_body_text(plain_text)
 
         supplier_id = context.get("supplier_id")
+        workflow_hint = context.get("workflow_id") if isinstance(context, dict) else None
         unique_id = self._resolve_unique_id(
-            workflow_id=context.get("workflow_id") if isinstance(context, dict) else None,
+            workflow_id=workflow_hint,
             rfq_id=rfq_id_value,
             supplier_id=supplier_id,
             existing=context.get("unique_id") if isinstance(context, dict) else None,
         )
         annotated_body, marker_token = attach_hidden_marker(
             plain_text or "",
-            rfq_id=rfq_id_value,
             supplier_id=supplier_id,
             unique_id=unique_id,
         )
@@ -762,6 +829,12 @@ class EmailDraftingAgent(BaseAgent):
         if marker_token:
             metadata["dispatch_token"] = marker_token
         metadata["unique_id"] = unique_id
+        if workflow_hint:
+            metadata["workflow_id"] = workflow_hint
+
+        headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
+        if workflow_hint:
+            headers["X-Procwise-Workflow-Id"] = workflow_hint
 
         draft = {
             "rfq_id": rfq_id_value,
@@ -777,10 +850,7 @@ class EmailDraftingAgent(BaseAgent):
             "contact_level": 1 if receiver else 0,
             "sent_status": False,
             "metadata": metadata,
-            "headers": {
-                "X-Procwise-RFQ-ID": rfq_id_value,
-                "X-Procwise-Unique-Id": unique_id,
-            },
+            "headers": headers,
             "unique_id": unique_id,
         }
 
@@ -987,13 +1057,12 @@ class EmailDraftingAgent(BaseAgent):
         workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
-            rfq_id=rfq_id,
+            rfq_id=None,
             supplier_id=supplier_id,
             existing=data.get("unique_id"),
         )
         body, marker_token = attach_hidden_marker(
             body,
-            rfq_id=rfq_id,
             supplier_id=supplier_id,
             unique_id=unique_id,
         )
@@ -1022,6 +1091,8 @@ class EmailDraftingAgent(BaseAgent):
         if marker_token:
             metadata["dispatch_token"] = marker_token
         metadata["unique_id"] = unique_id
+        if workflow_hint:
+            metadata["workflow_id"] = workflow_hint
 
         draft = {
             "supplier_id": supplier_id,
@@ -1039,9 +1110,10 @@ class EmailDraftingAgent(BaseAgent):
         }
 
         headers = {
-            "X-Procwise-RFQ-ID": rfq_id,
             "X-Procwise-Unique-Id": unique_id,
         }
+        if workflow_hint:
+            headers["X-Procwise-Workflow-Id"] = workflow_hint
         draft["headers"] = headers
 
         negotiation_extra = {
@@ -1172,79 +1244,131 @@ class EmailDraftingAgent(BaseAgent):
         counter_text = self._format_currency_value(counter_price, currency)
         target_text = self._format_currency_value(target_price, currency)
         offer_text = self._format_currency_value(current_offer, currency)
-        lines = ["Dear Procwise,"]
 
-        if round_no is None:
+        try:
+            round_value = int(round_no) if round_no is not None else None
+        except Exception:
+            round_value = None
+
+        if round_value is None:
             try:
-                round_no = int(self.agent_nick.settings.negotiation_round)
+                round_value = int(self.agent_nick.settings.negotiation_round)
             except Exception:
-                round_no = 1
-        if round_no <= 1:
-            intro = (
-                "Thank you for the RFQ update and for the competitive pricing you have shared "
-                "with us previously."
+                round_value = 1
+
+        lines: List[str] = []
+        lines.append("Dear Supplier Partner,")
+        lines.append("")
+
+        if round_value and round_value > 1:
+            lines.append(
+                "Thank you for your response to our recent enquiry. We have reviewed your latest proposal and would like to continue our discussion."
             )
-            lines.extend(["", intro])
-            if counter_text:
-                clause = f"If we can finalise this week, I am authorised to move to {counter_text}"
-                if offer_text:
-                    clause += f" against your current {offer_text}"
-                if target_text and target_text != counter_text:
-                    clause += f" (target {target_text})"
-                clause += "."
-                lines.append(clause)
-        elif round_no == 2:
-            lines.extend(
-                [
-                    "",
-                    "Our last position reflected the scope as we understood it."
-                    " To explore any further movement we would need to adjust a deal lever.",
-                ]
-            )
-            lever_options = [
-                "a longer commitment term",
-                "a higher consolidated volume",
-                "accelerated payment terms",
-            ]
-            lever = lever_options[0]
-            if asks:
-                lever = str(asks[0]).strip() or lever
-            lines.append(f"If we can secure {lever}, I can revisit the pricing immediately.")
         else:
-            lines.extend(
-                [
-                    "",
-                    "We have now exhausted our internal flexibility and the figures below represent the final position we can hold.",
-                ]
+            lines.append(
+                "Thank you for your quotation. We appreciate the competitive pricing you have provided and would like to explore the following points further."
             )
+        lines.append("")
 
-        if counter_text and round_no != 3:
-            lines.append(f"Our counter position stands at {counter_text}.")
-        elif target_text and not counter_text:
-            lines.append(f"Our pricing objective remains {target_text}.")
-        if lead_time_request:
-            lines.append(f"Lead time request: {lead_time_request}.")
-
-        asks_list = [str(item).strip() for item in asks if str(item).strip()]
-        if asks_list:
+        if round_value and round_value <= 1:
+            lines.append("**Pricing Discussion:**")
+            if offer_text and counter_text:
+                lines.append(f"• Your current offer: {offer_text}")
+                lines.append(f"• Our target position: {counter_text}")
+                if target_text and target_text != counter_text:
+                    lines.append(f"• Our budget ceiling: {target_text}")
+            elif counter_text:
+                lines.append(
+                    f"To align with our project budget, we would like to explore pricing around {counter_text}."
+                )
             lines.append("")
-            lines.append("Key considerations:")
-            lines.extend(f"- {item}" for item in asks_list)
+            lines.append(
+                "We believe this represents a fair market position and would enable us to proceed with the commitment you need."
+            )
+            lines.append("")
+        elif round_value == 2:
+            lines.append("**Revised Position:**")
+            lines.append("")
+            lines.append(
+                "We have reviewed our internal parameters and the current commercial landscape. To facilitate progression, we would need to adjust one of the following levers:"
+            )
+            lines.append("")
+
+            lever_options = [
+                "Extended contract term (12-24 months)",
+                "Consolidated volume commitment",
+                "Accelerated payment terms (Net-15 with early payment discount)",
+            ]
+
+            for option in lever_options[:2]:
+                lines.append(f"• {option}")
+            lines.append("")
+
+            if counter_text:
+                lines.append(f"Subject to alignment on the above, we can position at {counter_text}.")
+            lines.append("")
+        else:
+            lines.append("**Final Position:**")
+            lines.append("")
+            lines.append(
+                "We have now exhausted our internal flexibility. The figures below represent our final position:"
+            )
+            lines.append("")
+            if counter_text:
+                lines.append(f"• Unit price: {counter_text}")
+            if lead_time_request:
+                lines.append(f"• Lead time: {lead_time_request}")
+            lines.append("")
+
+        asks_list = [str(item).strip() for item in asks if str(item).strip()] if asks else []
+        if asks_list:
+            lines.append("**Key Requirements:**")
+            lines.append("")
+            for ask in asks_list:
+                formatted_ask = ask.strip()
+                if not formatted_ask.endswith((".", "?")):
+                    formatted_ask += "."
+                lines.append(f"• {formatted_ask}")
+            lines.append("")
+
+        if lead_time_request and round_value <= 2:
+            lines.append("**Delivery Requirements:**")
+            lines.append(f"• {lead_time_request}")
+            lines.append("")
 
         table_lines = self._render_negotiation_table(line_items)
         if table_lines:
-            lines.extend(["", *table_lines])
+            lines.append("**Commercial Structure:**")
+            lines.append("")
+            lines.extend(table_lines)
+            lines.append("")
 
         if negotiation_message:
-            lines.extend(["", negotiation_message])
+            lines.append("**Additional Context:**")
+            lines.append("")
+            lines.append(negotiation_message)
+            lines.append("")
+
+        if round_value and round_value >= 3:
+            lines.append("**Next Steps:**")
+            lines.append("")
+            lines.append(
+                "This represents our final position. Could you please confirm by close of business this week whether you can accommodate these terms? This will enable us to proceed with the award decision promptly."
+            )
+        else:
+            lines.append("**Action Required:**")
+            lines.append("")
+            lines.append(
+                "Could you please review the above and confirm your position by end of this week? This will help us maintain our project timeline and finalize the commercial terms."
+            )
 
         lines.append("")
-        lines.append(
-            "Could you confirm we can proceed this week so that we can lock in the pricing and availability?"
-        )
+        lines.append("We value our partnership and look forward to a mutually beneficial outcome.")
         lines.append("")
-        lines.append("Thank you,")
-        lines.append("Procwise Sourcing Team")
+        lines.append("Best regards,")
+        lines.append("Procurement Team")
+        lines.append("ProcWise")
+
         return "\n".join(lines)
 
     @staticmethod
@@ -2439,9 +2563,9 @@ class EmailDraftingAgent(BaseAgent):
             if negotiation_section_html and negotiation_section_html not in content:
                 content = f"{content}{negotiation_section_html}"
             body = self._clean_body_text(content)
+            workflow_hint = getattr(context, "workflow_id", None)
             body, marker_token = attach_hidden_marker(
                 body,
-                rfq_id=rfq_id,
                 supplier_id=supplier_id,
             )
             if subject_template_source:
@@ -2519,9 +2643,9 @@ class EmailDraftingAgent(BaseAgent):
             )
             manual_rfq_id = self._extract_rfq_id(manual_comment) or self._generate_rfq_id()
             manual_body_rendered = self._clean_body_text(manual_body_content)
+            workflow_hint = getattr(context, "workflow_id", None)
             manual_body_rendered, manual_marker_token = attach_hidden_marker(
                 manual_body_rendered,
-                rfq_id=manual_rfq_id,
                 supplier_id=None,
             )
             manual_subject_rendered = self._clean_subject_text(
@@ -2916,23 +3040,27 @@ class EmailDraftingAgent(BaseAgent):
 
                 workflow_id = draft.get("workflow_id")
                 metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+
                 if not workflow_id:
                     workflow_id = metadata.get("workflow_id")
                 if not workflow_id:
-                    workflow_id = uuid.uuid4().hex
+                    workflow_id = f"WF-{uuid.uuid4().hex[:16]}"
+
                 draft["workflow_id"] = workflow_id
                 if not isinstance(metadata, dict):
                     metadata = {}
                 draft["metadata"] = metadata
+                metadata.setdefault("workflow_id", workflow_id)
 
                 unique_id = self._resolve_unique_id(
                     workflow_id=workflow_id,
-                    rfq_id=draft.get("rfq_id"),
+                    rfq_id=None,
                     supplier_id=draft.get("supplier_id"),
                     existing=draft.get("unique_id") or metadata.get("unique_id"),
                 )
                 draft["unique_id"] = unique_id
                 metadata.setdefault("unique_id", unique_id)
+                draft.setdefault("rfq_id", unique_id)
 
                 run_id = draft.get("run_id")
                 if not run_id:
@@ -2942,10 +3070,11 @@ class EmailDraftingAgent(BaseAgent):
                     metadata.setdefault("run_id", run_id)
 
                 body_text = draft.get("body") or ""
+                body_text = self._clean_body_text(body_text)
+
                 marker_token = metadata.get("dispatch_token")
                 body_text, marker_token = attach_hidden_marker(
                     body_text,
-                    rfq_id=draft.get("rfq_id"),
                     supplier_id=draft.get("supplier_id"),
                     token=marker_token,
                     run_id=run_id,
@@ -2955,6 +3084,10 @@ class EmailDraftingAgent(BaseAgent):
                 if marker_token:
                     metadata["dispatch_token"] = marker_token
 
+                subject_input = draft.get("subject", "")
+                subject_clean = self._clean_subject_text(subject_input, DEFAULT_RFQ_SUBJECT)
+                draft["subject"] = subject_clean
+
                 mailbox_hint = draft.get("mailbox")
                 if not mailbox_hint:
                     mailbox_hint = metadata.get("mailbox")
@@ -2963,12 +3096,11 @@ class EmailDraftingAgent(BaseAgent):
                     metadata.setdefault("mailbox", mailbox_hint)
 
                 headers = draft.get("headers") if isinstance(draft.get("headers"), dict) else {}
-                headers["X-Procwise-RFQ-ID"] = draft.get("rfq_id")
                 headers["X-Procwise-Unique-Id"] = unique_id
                 headers.setdefault("X-Procwise-Workflow-Id", workflow_id)
                 if mailbox_hint:
                     headers.setdefault("X-Procwise-Mailbox", mailbox_hint)
-                draft["headers"] = headers
+                draft["headers"] = {k: v for k, v in headers.items() if v is not None}
 
                 thread_index = draft.get("thread_index")
                 if not isinstance(thread_index, int) or thread_index < 1:
@@ -2999,14 +3131,15 @@ class EmailDraftingAgent(BaseAgent):
                     cur.execute(
                         """
                         INSERT INTO proc.draft_rfq_emails
-                        (rfq_id, supplier_id, supplier_name, subject, body, created_on, sent,
+                        (rfq_id, unique_id, supplier_id, supplier_name, subject, body, created_on, sent,
                          recipient_email, contact_level, thread_index, sender, payload,
-                         workflow_id, run_id, unique_id, mailbox)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         workflow_id, run_id, mailbox)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
-                            draft["rfq_id"],
+                            draft.get("rfq_id") or unique_id,
+                            unique_id,
                             draft.get("supplier_id"),
                             draft.get("supplier_name"),
                             draft["subject"],
@@ -3019,7 +3152,6 @@ class EmailDraftingAgent(BaseAgent):
                             payload,
                             workflow_id,
                             run_id,
-                            unique_id,
                             mailbox_hint,
                         ),
                     )
