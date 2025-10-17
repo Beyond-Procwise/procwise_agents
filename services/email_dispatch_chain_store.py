@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Dict, Iterable, Optional, Sequence
+
+from repositories.workflow_email_tracking_repo import (
+    WorkflowDispatchRow,
+    init_schema as init_workflow_tracking_schema,
+    record_dispatches as workflow_record_dispatches,
+)
 
 try:  # pragma: no cover - psycopg2 may be optional
     from psycopg2.extras import Json
@@ -51,6 +58,69 @@ def _collect_message_ids(values: Iterable[str]) -> list[str]:
         seen.add(lowered)
         ordered.append(item)
     return ordered
+
+
+def record_dispatch(
+    *,
+    workflow_id: str,
+    unique_id: str,
+    supplier_id: Optional[str],
+    supplier_email: str,
+    message_id: str,
+    subject: str,
+    dispatched_at: datetime,
+    **kwargs,
+) -> None:
+    """Record dispatch metadata in workflow tracking."""
+
+    if not workflow_id:
+        logger.error(
+            "CRITICAL: Attempting to record dispatch without workflow_id! unique_id=%s supplier=%s. "
+            "This will break response tracking.",
+            unique_id,
+            supplier_id,
+        )
+        raise ValueError("workflow_id is required for dispatch tracking")
+
+    logger.info(
+        "Recording dispatch: workflow=%s unique=%s supplier=%s message_id=%s",
+        workflow_id,
+        unique_id,
+        supplier_id,
+        message_id,
+    )
+
+    try:
+        init_workflow_tracking_schema()
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("Failed to initialise workflow email tracking schema")
+        raise
+
+    try:
+        workflow_record_dispatches(
+            workflow_id=workflow_id,
+            dispatches=[
+                WorkflowDispatchRow(
+                    workflow_id=workflow_id,
+                    unique_id=unique_id,
+                    supplier_id=supplier_id,
+                    supplier_email=supplier_email,
+                    message_id=message_id,
+                    subject=subject,
+                    dispatched_at=dispatched_at,
+                    responded_at=None,
+                    response_message_id=None,
+                    matched=False,
+                )
+            ],
+        )
+    except Exception:
+        logger.exception(
+            "Failed to record dispatch for workflow=%s unique=%s",
+            workflow_id,
+            unique_id,
+        )
+        raise
 
 
 def ensure_chain_table(connection) -> None:

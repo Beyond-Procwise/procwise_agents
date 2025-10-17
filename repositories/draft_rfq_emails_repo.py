@@ -1,7 +1,8 @@
 from __future__ import annotations
 from datetime import datetime, timezone
+import logging
 import sqlite3
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from services.db import get_conn
 
@@ -26,6 +27,8 @@ ON proc.draft_rfq_emails (workflow_id, unique_id);
 CREATE INDEX IF NOT EXISTS idx_draft_rfq_emails_wf
 ON proc.draft_rfq_emails (workflow_id);
 """
+
+logger = logging.getLogger(__name__)
 
 DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS draft_rfq_emails (
@@ -108,3 +111,55 @@ def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[
         if last_dt is None or dt > last_dt:
             last_dt = dt
     return ids, map_uid_to_supplier, last_dt
+
+
+def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:
+    """Load the most recent draft record for the given unique_id."""
+
+    if not unique_id:
+        return None
+
+    try:
+        with get_conn() as conn:
+            if isinstance(conn, sqlite3.Connection):
+                query = (
+                    "SELECT id, NULL, supplier_id, NULL, NULL, NULL, dispatched_at, sent, NULL, NULL, "
+                    "workflow_id, run_id, unique_id, NULL FROM draft_rfq_emails "
+                    "WHERE unique_id = ? ORDER BY dispatched_at DESC LIMIT 1"
+                )
+                params = (unique_id,)
+            else:
+                query = (
+                    "SELECT id, rfq_id, supplier_id, supplier_name, subject, body, created_on, sent, sender, payload, "
+                    "workflow_id, run_id, unique_id, mailbox FROM proc.draft_rfq_emails "
+                    "WHERE unique_id = %s ORDER BY created_on DESC LIMIT 1"
+                )
+                params = (unique_id,)
+
+            cur = conn.cursor()
+            cur.execute(query, params)
+            row = cur.fetchone()
+            cur.close()
+    except Exception:
+        logger.exception("Failed to load draft by unique_id=%s", unique_id)
+        return None
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "rfq_id": row[1],
+        "supplier_id": row[2],
+        "supplier_name": row[3],
+        "subject": row[4],
+        "body": row[5],
+        "created_on": row[6],
+        "sent": row[7],
+        "sender": row[8],
+        "payload": row[9],
+        "workflow_id": row[10],
+        "run_id": row[11],
+        "unique_id": row[12],
+        "mailbox": row[13],
+    }
