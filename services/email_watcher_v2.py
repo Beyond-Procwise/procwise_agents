@@ -10,9 +10,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
+from email.utils import parseaddr
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
@@ -22,7 +24,11 @@ from repositories import workflow_email_tracking_repo as tracking_repo
 from repositories import supplier_response_repo
 from repositories.supplier_response_repo import SupplierResponseRow
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from utils.email_tracking import extract_tracking_metadata, extract_unique_id_from_body
+from utils.email_tracking import (
+    extract_tracking_metadata,
+    extract_unique_id_from_body,
+    extract_unique_id_from_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,11 +164,22 @@ def _parse_email(raw: bytes) -> EmailResponse:
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
     body = _extract_plain_text(message)
-    unique_id = extract_unique_id_from_body(body)
+    header_map = {
+        key: message.get_all(key, failobj=[])
+        for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
+    }
+    unique_id = extract_unique_id_from_headers(header_map)
+    if not unique_id:
+        fallback_header = message.get("X-Procwise-Unique-Id")
+        if fallback_header:
+            unique_id = str(fallback_header).strip()
+    body_unique = extract_unique_id_from_body(body)
+    if body_unique and not unique_id:
+        unique_id = body_unique
     metadata = extract_tracking_metadata(body)
+    supplier_id = metadata.supplier_id if metadata else None
     if metadata and not unique_id:
         unique_id = metadata.unique_id
-    supplier_id = metadata.supplier_id if metadata else None
 
     header_unique_id = (message.get("X-Procwise-Unique-Id") or "").strip()
     if header_unique_id and not unique_id:
@@ -362,6 +379,7 @@ class EmailWatcherV2:
                     supplier_email=row.supplier_email,
                     message_id=row.message_id,
                     subject=row.subject,
+                    thread_headers=row.thread_headers or {},
                     dispatched_at=row.dispatched_at,
                 )
                 for row in rows
@@ -438,6 +456,11 @@ class EmailWatcherV2:
                     responded_at=None,
                     response_message_id=None,
                     matched=False,
+                    thread_headers={
+                        key: list(value) for key, value in record.thread_headers.items()
+                    }
+                    if record.thread_headers
+                    else None,
                 )
             )
 
@@ -465,11 +488,12 @@ class EmailWatcherV2:
 
     def _match_responses(
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
-    ) -> List[str]:
-        matched: List[str] = []
+    ) -> List[SupplierResponseRow]:
+        matched_rows: List[SupplierResponseRow] = []
         for email in responses:
             matched_id: Optional[str] = None
             best_score = 0.0
+            best_dispatch: Optional[EmailDispatchRecord] = None
             for unique_id, dispatch in tracker.email_records.items():
                 if unique_id in tracker.matched_responses:
                     continue
@@ -532,21 +556,35 @@ class EmailWatcherV2:
                     responded_at=email.received_at,
                     response_message_id=email.message_id,
                 )
-                supplier_response_repo.insert_response(
-                    SupplierResponseRow(
-                        workflow_id=tracker.workflow_id,
-                        unique_id=matched_id,
-                        supplier_id=email.supplier_id,
-                        supplier_email=email.from_address,
-                        response_message_id=email.message_id,
-                        response_subject=email.subject,
-                        response_body=email.body,
-                        response_from=email.from_address,
-                        response_date=email.received_at,
-                        original_message_id=tracker.email_records[matched_id].message_id,
-                        original_subject=tracker.email_records[matched_id].subject,
-                        match_confidence=float(best_score),
-                    )
+                supplier_email = (
+                    email.supplier_email
+                    or _normalise_email_address(email.from_address)
+                    or best_dispatch.supplier_email
+                )
+                supplier_id = email.supplier_id or best_dispatch.supplier_id
+                response_time: Optional[Decimal] = None
+                if best_dispatch.dispatched_at and email.received_at:
+                    try:
+                        delta_seconds = (email.received_at - best_dispatch.dispatched_at).total_seconds()
+                        if delta_seconds >= 0:
+                            response_time = Decimal(str(delta_seconds))
+                    except Exception:  # pragma: no cover - defensive conversion
+                        response_time = None
+                response_row = SupplierResponseRow(
+                    workflow_id=tracker.workflow_id,
+                    unique_id=matched_id,
+                    supplier_id=supplier_id,
+                    supplier_email=supplier_email,
+                    response_text=email.body,
+                    received_time=email.received_at,
+                    response_time=response_time,
+                    response_message_id=email.message_id,
+                    response_subject=email.subject,
+                    response_from=email.from_address,
+                    original_message_id=best_dispatch.message_id,
+                    original_subject=best_dispatch.subject,
+                    match_confidence=_score_to_confidence(best_score),
+                    processed=False,
                 )
                 matched.append(matched_id)
             else:
@@ -585,8 +623,8 @@ class EmailWatcherV2:
         since = tracker.last_dispatched_at or (self._now() - timedelta(hours=4))
         while attempts < self.max_poll_attempts and not tracker.all_responded:
             responses = self._fetch_emails(since)
-            matched_ids = self._match_responses(tracker, responses)
-            if matched_ids:
+            matched_rows = self._match_responses(tracker, responses)
+            if matched_rows:
                 self._process_agents(tracker)
             if tracker.all_responded:
                 break
@@ -607,10 +645,10 @@ class EmailWatcherV2:
         return result
 
     def _process_agents(self, tracker: WorkflowTracker) -> None:
-        if not self.supplier_agent:
+        pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
+        if not pending_rows:
             return
 
-        pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
         processed_ids: List[str] = []
         for row in pending_rows:
             unique_id = row.get("unique_id")
@@ -654,8 +692,9 @@ class EmailWatcherV2:
                 user_id="system",
                 input_data={**input_payload, "email_headers": headers},
             )
+
             try:
-                output: AgentOutput = self.supplier_agent.execute(context)
+                wait_result: AgentOutput = self.supplier_agent.execute(wait_context)
             except Exception:
                 logger.exception("SupplierInteractionAgent failed for workflow %s", workflow_id)
                 continue
@@ -663,23 +702,65 @@ class EmailWatcherV2:
             if unique_id:
                 processed_ids.append(unique_id)
 
-            if (
-                output
-                and isinstance(output, AgentOutput)
-                and output.status == AgentStatus.SUCCESS
-                and output.next_agents
-                and "NegotiationAgent" in output.next_agents
-                and self.negotiation_agent is not None
-            ):
+            batch_ready = bool(wait_result.data.get("batch_ready"))
+            if not batch_ready:
+                logger.info(
+                    "Supplier batch not complete for workflow %s; waiting for remaining responses",
+                    tracker.workflow_id,
+                )
+                return
+
+            responses = wait_result.data.get("supplier_responses") or []
+            expected = wait_result.data.get("expected_responses") or 0
+            collected = wait_result.data.get("collected_responses") or len(responses)
+            if expected and collected != expected:
+                logger.warning(
+                    "Supplier batch size mismatch for workflow %s (expected=%s collected=%s)",
+                    tracker.workflow_id,
+                    expected,
+                    collected,
+                )
+                return
+
+            processed_ids = [
+                uid
+                for uid in wait_result.data.get("unique_ids", [])
+                if isinstance(uid, str) and uid
+            ]
+            if not processed_ids:
+                processed_ids = [
+                    response.get("unique_id")
+                    for response in responses
+                    if isinstance(response, dict) and response.get("unique_id")
+                ]
+
+            negotiation_payload = dict(wait_result.data)
+            negotiation_payload.setdefault("supplier_responses", responses)
+            negotiation_payload.setdefault("supplier_responses_batch", responses)
+            negotiation_payload.setdefault("supplier_responses_count", len(responses))
+            negotiation_payload.setdefault("negotiation_batch", True)
+            negotiation_payload.setdefault(
+                "batch_metadata",
+                {
+                    "expected": expected,
+                    "collected": collected,
+                    "ready": True,
+                },
+            )
+
+            if self.negotiation_agent is not None:
                 try:
                     neg_context = AgentContext(
                         workflow_id=tracker.workflow_id,
                         agent_id="NegotiationAgent",
                         user_id="system",
-                        input_data=output.data,
+                        input_data=negotiation_payload,
                     )
                     self.negotiation_agent.execute(neg_context)
                 except Exception:
                     logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
 
-        supplier_response_repo.mark_processed(workflow_id=tracker.workflow_id, unique_ids=processed_ids)
+        if processed_ids:
+            supplier_response_repo.delete_responses(
+                workflow_id=tracker.workflow_id, unique_ids=processed_ids
+            )

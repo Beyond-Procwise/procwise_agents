@@ -3,6 +3,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Optional
 
+from services.email_watcher_service import EmailWatcherService
+
 from services.model_training_endpoint import ModelTrainingEndpoint
 from utils.gpu import configure_gpu
 
@@ -40,6 +42,7 @@ class BackendScheduler:
     _instance: Optional["BackendScheduler"] = None
     _instance_lock = threading.Lock()
     _poll_seconds: float = 60.0
+    TRAINING_JOB_NAME = "context-training-dispatch"
 
     def __init__(
         self,
@@ -54,8 +57,11 @@ class BackendScheduler:
         self._thread: Optional[threading.Thread] = None
         self._relationship_scheduler = self._init_relationship_scheduler()
         self._training_endpoint = training_endpoint
+        self._email_watcher_service: Optional[EmailWatcherService] = None
+        self._email_watcher_lock = threading.Lock()
         self._register_default_jobs()
         self.start()
+        self._ensure_email_watcher_service()
 
     @classmethod
     def ensure(
@@ -84,11 +90,13 @@ class BackendScheduler:
         if self.agent_nick is agent_nick:
             if training_endpoint is not None:
                 self._training_endpoint = training_endpoint
+            self._sync_training_job()
             return
         self.agent_nick = agent_nick
         self._relationship_scheduler = self._init_relationship_scheduler()
         if training_endpoint is not None:
             self._training_endpoint = training_endpoint
+        self._sync_training_job()
 
     def start(self) -> None:
         with self._lock:
@@ -109,6 +117,13 @@ class BackendScheduler:
             thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=2)
+        with self._email_watcher_lock:
+            watcher = self._email_watcher_service
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("Failed to stop email watcher service")
 
     def register_job(
         self,
@@ -147,13 +162,48 @@ class BackendScheduler:
         )
 
     def _register_default_jobs(self) -> None:
-        training_delay = timedelta(minutes=15)
-        self.register_job(
-            "context-training-dispatch",
-            self._run_model_training,
-            interval=timedelta(hours=6),
-            initial_delay=training_delay,
-        )
+        self._sync_training_job()
+
+    def _training_scheduler_enabled(self) -> bool:
+        settings = getattr(self.agent_nick, "settings", None)
+        return bool(getattr(settings, "enable_training_scheduler", False))
+
+    def _sync_training_job(self) -> None:
+        should_schedule = self._training_scheduler_enabled()
+        has_job = self.TRAINING_JOB_NAME in self._jobs
+
+        if should_schedule and not has_job:
+            logger.info("Training scheduler enabled; registering automatic dispatch job")
+            training_delay = timedelta(minutes=15)
+            self.register_job(
+                self.TRAINING_JOB_NAME,
+                self._run_model_training,
+                interval=timedelta(hours=6),
+                initial_delay=training_delay,
+            )
+        elif not should_schedule and has_job:
+            logger.info("Training scheduler disabled; removing automatic dispatch job")
+            self._deregister_job(self.TRAINING_JOB_NAME)
+
+    def _ensure_email_watcher_service(self) -> EmailWatcherService:
+        with self._email_watcher_lock:
+            if self._email_watcher_service is None:
+                self._email_watcher_service = EmailWatcherService()
+            service = self._email_watcher_service
+        service.start()
+        return service
+
+    def notify_email_dispatch(self, workflow_id: str) -> None:
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return
+        service = self._ensure_email_watcher_service()
+        try:
+            service.notify_workflow(workflow_key)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to notify email watcher for workflow %s", workflow_key
+            )
 
     def _run_loop(self) -> None:
         while not self._stop_event.wait(self._poll_seconds):

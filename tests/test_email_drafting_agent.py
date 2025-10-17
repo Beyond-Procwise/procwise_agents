@@ -17,12 +17,19 @@ def restore_env(monkeypatch):
     yield
 
 
+@pytest.fixture
+def fixed_unique_id(monkeypatch):
+    token = "UID-1234567890ABCD"
+    monkeypatch.setattr(module, "generate_unique_email_id", lambda *_, **__: token)
+    return token
+
+
 def _visible_body(body: str) -> str:
     _comment, remainder = split_hidden_marker(body)
     return remainder or ""
 
 
-def test_from_decision_formats_payload(monkeypatch):
+def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
     calls = []
 
     def fake_chat(model, system, user, **kwargs):
@@ -59,7 +66,8 @@ def test_from_decision_formats_payload(monkeypatch):
 
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
     comment, remainder = split_hidden_marker(result["body"])
-    assert comment and extract_rfq_id(comment) == result["rfq_id"]
+    assert comment and extract_rfq_id(comment) == result["unique_id"]
+    assert "RFQ_ID" not in comment
     assert remainder.strip() == result["text"].strip()
     assert result["metadata"].get("dispatch_token")
     assert "Please confirm if 44.8 GBP is workable." in result["text"]
@@ -73,6 +81,44 @@ def test_from_decision_formats_payload(monkeypatch):
     assert result["sender"]
     assert result["sent_status"] is False
     assert calls[0]["payload"]["rfq_id"] == "RFQ-20250930-RFQ00001"
+    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert result["metadata"]["unique_id"] == fixed_unique_id
+    assert result["unique_id"] == fixed_unique_id
+
+
+def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
+    def fail_chat(*args, **kwargs):  # pragma: no cover - should not be invoked
+        raise AssertionError("LLM compose should not be called when negotiation_message provided")
+
+    monkeypatch.setattr(module, "_chat", fail_chat)
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00002")
+
+    agent = EmailDraftingAgent()
+    negotiation_text = (
+        "Hello team,\n"
+        "Regarding RFQ-20240901-ABCD1234 we can move to revised terms.\n"
+        "Reference UID-XYZ987 for internal routing."
+    )
+    decision = {
+        "rfq_id": "RFQ-20240901-ABCD1234",
+        "supplier_id": "SUP-9",
+        "to": "reply@example.com",
+        "negotiation_message": negotiation_text,
+        "subject": "Re: Pricing Discussion UID-XYZ987",
+        "thread": {"message_id": "<thread-2>", "references": ["<thread-1>"]},
+    }
+
+    result = agent.from_decision(decision)
+
+    assert result["subject"] == "Re: Pricing Discussion"
+    visible_body = _visible_body(result["body"])
+    assert "RFQ-20240901-ABCD1234" not in visible_body
+    assert "UID-XYZ987" not in visible_body
+    assert "Hello team" in visible_body
+    assert result["headers"]["In-Reply-To"] == "<thread-2>"
+    assert result["headers"]["References"] == "<thread-1>"
+    assert result["unique_id"] == fixed_unique_id
 
 
 def test_from_decision_subject_fallback(monkeypatch):
@@ -93,7 +139,7 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
-def test_from_decision_generates_unique_rfq_id(monkeypatch):
+def test_from_decision_generates_unique_rfq_id(monkeypatch, fixed_unique_id):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
     monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-UN1QUEID")
@@ -104,7 +150,11 @@ def test_from_decision_generates_unique_rfq_id(monkeypatch):
     result = agent.from_decision(decision)
 
     assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
-    assert result["headers"]["X-Procwise-RFQ-ID"] == "RFQ-20250930-UN1QUEID"
+    assert "X-Procwise-RFQ-ID" not in result["headers"]
+    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert "X-Procwise-Workflow-Id" not in result["headers"]
+    assert result["metadata"]["unique_id"] == fixed_unique_id
+    assert result["unique_id"] == fixed_unique_id
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
@@ -135,8 +185,8 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     result = agent.from_prompt("Please follow up on RFQ XYZ")
 
-    assert result["subject"] == "RFQ XYZ follow-up"
-    assert result["text"] == "Polished draft referencing RFQ XYZ"
+    assert result["subject"] == module.DEFAULT_FOLLOW_UP_SUBJECT
+    assert result["text"] == "Polished draft referencing"
     assert result["rfq_id"] == "RFQ-20250930-96F5YFY9"
 
 
@@ -462,6 +512,11 @@ def test_email_drafting_personalises_supplier_content(monkeypatch):
     first = drafts[0]
     second = drafts[1]
 
+    assert {draft.get("workflow_id") for draft in drafts} == {"wf-1"}
+    assert all(
+        draft.get("metadata", {}).get("workflow_id") == "wf-1" for draft in drafts
+    )
+
     assert "£250,000.00" not in _visible_body(first["body"])
     assert "Long-term frame agreement" not in _visible_body(first["body"])
     assert "£80,000.00" not in _visible_body(second["body"])
@@ -477,3 +532,94 @@ def test_email_drafting_personalises_supplier_content(monkeypatch):
     assert "New vendor onboarding" in second_internal.get("supplier_context_text", "")
 
     assert first_internal != second_internal
+
+
+def test_manual_draft_inherits_workflow_id(monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "_chat",
+        lambda *_, **__: "Subject: Hello\nBody",
+        raising=False,
+    )
+
+    def fake_prompt_engine(agent_nick, prompt_rows=None):
+        return SimpleNamespace(get_prompt=lambda *_, **__: None)
+
+    monkeypatch.setattr(module, "PromptEngine", fake_prompt_engine, raising=False)
+    monkeypatch.setattr("agents.base_agent.PromptEngine", fake_prompt_engine)
+    monkeypatch.setattr("agents.base_agent.configure_gpu", lambda *_, **__: "cpu")
+
+    class DummyCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def cursor(self):
+            return DummyCursor()
+
+        def commit(self):
+            pass
+
+    class DummyRouting:
+        def log_process(self, **kwargs):
+            return None
+
+        def log_run_detail(self, **kwargs):
+            return None
+
+        def log_action(self, **kwargs):
+            return None
+
+    agent_nick = SimpleNamespace(
+        settings=SimpleNamespace(
+            script_user="tester",
+            ses_default_sender="buyer@example.com",
+            ses_inbound_bucket=None,
+            ses_inbound_prefix=None,
+            ses_inbound_s3_uri=None,
+            s3_bucket_name=None,
+            email_response_poll_seconds=1,
+            email_inbound_initial_wait_seconds=0,
+        ),
+        process_routing_service=DummyRouting(),
+        agents={},
+        prompt_engine=fake_prompt_engine(None),
+    )
+
+    agent_nick.get_db_connection = lambda: DummyConn()
+
+    agent = EmailDraftingAgent(agent_nick=agent_nick)
+    agent._store_draft = lambda draft: None
+
+    context = _make_context(
+        {
+            "recipients": ["contact@example.com"],
+            "body": "Hello supplier",
+            "subject": "Follow up",
+        }
+    )
+
+    result = agent.run(context)
+    drafts = result.data["drafts"]
+    assert drafts
+    manual_draft = drafts[-1]
+    assert manual_draft.get("workflow_id") == "wf-1"
+    assert manual_draft.get("metadata", {}).get("workflow_id") == "wf-1"

@@ -24,6 +24,39 @@ class ProcessRoutingService:
 
     DEFAULT_LLM_MODEL = "gpt-oss"
 
+    STATUS_SUCCESS_TOKENS = {
+        "completed",
+        "complete",
+        "success",
+        "successful",
+        "succeeded",
+        "done",
+        "ok",
+        "okay",
+        "pass",
+        "passed",
+        "finished",
+        "resolved",
+        "true",
+        "yes",
+    }
+    STATUS_FAILURE_TOKENS = {
+        "failed",
+        "failure",
+        "error",
+        "errored",
+        "exception",
+        "timeout",
+        "timed_out",
+        "cancelled",
+        "canceled",
+        "aborted",
+        "rejected",
+        "denied",
+        "false",
+        "no",
+    }
+
     def __init__(self, agent_nick):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
@@ -145,6 +178,56 @@ class ProcessRoutingService:
             agents.append(agent)
         details["agents"] = agents
         return details
+
+    @classmethod
+    def classify_completion_status(
+        cls, status: Any
+    ) -> tuple[int, str, bool]:
+        """Normalise a terminal workflow status into numeric and textual forms.
+
+        The returned tuple is ``(numeric, label, recognised)`` where ``numeric`` is
+        ``1`` for a completed flow and ``-1`` for a failed flow, ``label`` is the
+        human-readable status string, and ``recognised`` indicates whether the
+        input matched a known success/failure token rather than being coerced via
+        a numeric fallback.
+        """
+        if isinstance(status, bool):
+            return (1 if status else -1, "completed" if status else "failed", True)
+
+        if isinstance(status, (np.integer, int)) and not isinstance(status, bool):
+            numeric = int(status)
+            return (1 if numeric > 0 else -1, "completed" if numeric > 0 else "failed", True)
+
+        if isinstance(status, Decimal):
+            if not status.is_finite():
+                return (-1, "failed", False)
+            numeric = float(status)
+            return (1 if numeric > 0 else -1, "completed" if numeric > 0 else "failed", True)
+
+        if isinstance(status, (float, np.floating)):
+            if math.isnan(status):
+                return (-1, "failed", False)
+            return (1 if status > 0 else -1, "completed" if status > 0 else "failed", True)
+
+        if isinstance(status, str):
+            token = status.strip().lower()
+            if not token:
+                return (-1, "failed", False)
+            if token in cls.STATUS_SUCCESS_TOKENS:
+                return (1, "completed", True)
+            if token in cls.STATUS_FAILURE_TOKENS:
+                return (-1, "failed", True)
+            try:
+                numeric = float(token)
+            except ValueError:
+                return (-1, "failed", False)
+            if math.isnan(numeric):
+                return (-1, "failed", False)
+            return (1 if numeric > 0 else -1, "completed" if numeric > 0 else "failed", True)
+
+        return (-1, "failed", False)
+
+
 
     @staticmethod
     def _coerce_identifier_list(value: Any) -> List[int]:
@@ -955,24 +1038,27 @@ class ProcessRoutingService:
     def update_process_status(
         self,
         process_id: int,
-        status: int,
+        status: Any,
         modified_by: Optional[str] = None,
         process_details: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update process status in ``proc.routing`` and keep ``process_details`` in sync.
 
-        Only ``1`` (success) and ``-1`` (failure) are valid. Any other value
-        is coerced to ``-1`` if negative or ``1`` if positive."""
-        if status not in (1, -1):
-            coerced = 1 if status > 0 else -1
+        ``status`` may be supplied as the numeric flag, a textual token such as
+        ``"completed"``/``"failed"`` or a percentage value emitted by the
+        orchestrator. Values are normalised to the terminal flags accepted by
+        ``proc.routing`` before persistence."""
+        numeric_status, status_text, recognised = self.classify_completion_status(status)
+        if not recognised:
             logger.warning(
-                "Updated process %s to invalid status %s - coercing to %s",
-                process_id, status, coerced,
+                "Updated process %s to unrecognised status %s - coercing to %s",
+                process_id,
+                status,
+                numeric_status,
             )
-            status = coerced
         # Ensure the ``process_details`` blob reflects the new status.
         details = process_details or self.get_process_details(process_id, raw=True) or {}
-        details["status"] = "completed" if status == 1 else "failed"
+        details["status"] = status_text
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -986,7 +1072,7 @@ class ProcessRoutingService:
                         WHERE process_id = %s
                         """,
                         (
-                            status,
+                            numeric_status,
                             self._safe_dumps(self.normalize_process_details(details)),
                             modified_by or self.settings.script_user,
                             process_id,
@@ -994,7 +1080,10 @@ class ProcessRoutingService:
                     )
                     conn.commit()
                     logger.info(
-                        "Updated process %s to status %s", process_id, status
+                        "Updated process %s to status %s (process_status=%s)",
+                        process_id,
+                        status_text,
+                        numeric_status,
                     )
         except Exception:  # pragma: no cover - defensive
             logger.exception(

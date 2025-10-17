@@ -11,6 +11,8 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agents.base_agent import AgentOutput, AgentStatus
+from decimal import Decimal
+
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from utils.email_tracking import (
@@ -26,6 +28,37 @@ class StubSupplierAgent:
 
     def execute(self, context):
         self.contexts.append(context)
+        action = context.input_data.get("action") if isinstance(context.input_data, dict) else None
+        if action == "await_workflow_batch":
+            workflow_id = context.input_data.get("workflow_id")
+            pending = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+            first_row = pending[0] if pending else {}
+            unique_id = first_row.get("unique_id") or workflow_id
+            response = {
+                "unique_id": unique_id,
+                "workflow_id": workflow_id,
+                "supplier_id": first_row.get("supplier_id"),
+            }
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={
+                    "workflow_id": workflow_id,
+                    "batch_ready": True,
+                    "expected_responses": 1,
+                    "collected_responses": 1,
+                    "supplier_responses": [response],
+                    "supplier_responses_batch": [response],
+                    "supplier_responses_count": 1,
+                    "unique_ids": [unique_id],
+                    "batch_metadata": {
+                        "expected": 1,
+                        "collected": 1,
+                        "ready": True,
+                    },
+                    "negotiation_batch": True,
+                },
+                next_agents=["NegotiationAgent"],
+            )
         return AgentOutput(status=AgentStatus.SUCCESS, data={}, next_agents=[])
 
 
@@ -65,7 +98,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
 
     now = datetime.now(timezone.utc)
     unique_id = generate_unique_email_id(workflow_id, "sup-1")
-    original_subject = "RFQ request"
+    original_subject = "Quote request"
     original_message_id = "<msg-001>"
 
     responses = [

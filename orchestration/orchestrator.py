@@ -23,6 +23,7 @@ from services.process_routing_service import ProcessRoutingService
 from services.backend_scheduler import BackendScheduler
 from services.event_bus import get_event_bus, workflow_scope
 from services.agent_manifest import AgentManifestService
+from services.supplier_response_workflow import SupplierResponseWorkflow
 from utils.gpu import configure_gpu
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,10 @@ class Orchestrator:
         "quote": "quote_evaluation",
         "comparison": "quote_comparison",
         "comparisons": "quote_comparison",
+        "supplierinteractionagent": "supplier_interaction",
     }
+
+    GATEKEEPER_AGENTS: Set[str] = {"supplier_interaction"}
 
     def __init__(self, agent_nick, *, training_endpoint=None):
         # Ensure GPU environment is initialised before any agent execution.
@@ -189,6 +193,8 @@ class Orchestrator:
                 result = self._execute_quote_workflow(context)
             elif workflow_name == "opportunity_mining":
                 result = self._execute_opportunity_workflow(context)
+            elif workflow_name == "supplier_interaction":
+                result = self._execute_supplier_interaction_workflow(context)
             else:
                 result = self._execute_generic_workflow(workflow_name, context)
 
@@ -199,7 +205,6 @@ class Orchestrator:
                 result=result,
                 status="completed",
             )
-            self._trigger_automatic_training(workflow_name)
 
             return {
                 "status": "completed",
@@ -496,38 +501,6 @@ class Orchestrator:
 
         self._policy_cache = dict(policies)
         return dict(policies)
-
-    def _get_model_training_service(self):
-        endpoint = getattr(self, "model_training_endpoint", None)
-        if endpoint is None:
-            return None
-
-        settings = getattr(self.agent_nick, "settings", None)
-        learning_enabled = bool(getattr(settings, "enable_learning", False))
-        try:
-            endpoint.configure_capture(learning_enabled)
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to synchronise workflow capture via training endpoint")
-        try:
-            return endpoint.get_service()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("Failed to resolve model training service from endpoint")
-            return None
-
-    def _trigger_automatic_training(self, workflow_name: str) -> None:
-        """Kick off background training using procurement datasets."""
-
-        if getattr(self, "model_training_endpoint", None) is None:
-            return
-
-        service = self._get_model_training_service()
-        if service is None:
-            return
-        try:
-            service.dispatch_training_and_refresh(force=False, limit=1)
-            logger.debug("Automatic training dispatch executed for %s", workflow_name)
-        except Exception:  # pragma: no cover - defensive execution
-            logger.exception("Automatic training dispatch failed for %s", workflow_name)
 
     @staticmethod
     def _resolve_agent_name(agent_type: str) -> str:
@@ -1663,6 +1636,365 @@ class Orchestrator:
 
         return results
 
+    def _execute_supplier_interaction_workflow(self, context: AgentContext) -> Dict:
+        """Coordinate drafting, dispatch waits, and supplier processing."""
+
+        payload = dict(context.input_data or {})
+        draft_payload = payload.get("draft_payload")
+        supplier_payload = payload.get("supplier_input")
+
+        if not isinstance(draft_payload, dict):
+            result = self._execute_agent("supplier_interaction", context)
+            return result.data if result else {}
+
+        dispatch_timeout_raw = payload.get("dispatch_timeout_seconds")
+        dispatch_poll_raw = payload.get("dispatch_poll_interval")
+        response_timeout_raw = payload.get("response_timeout_seconds")
+        response_poll_raw = payload.get("response_poll_interval")
+
+        def _positive(value, fallback):
+            try:
+                num = float(value)
+            except Exception:
+                return fallback
+            if num <= 0:
+                return fallback
+            return num
+
+        dispatch_timeout = int(_positive(dispatch_timeout_raw, 300))
+        dispatch_poll = max(0, int(_positive(dispatch_poll_raw, getattr(self.settings, "email_response_poll_seconds", 60))))
+        response_timeout = int(_positive(response_timeout_raw, getattr(self.settings, "email_response_timeout_seconds", 900)))
+        response_poll = max(0, int(_positive(response_poll_raw, getattr(self.settings, "email_response_poll_seconds", 60))))
+
+        email_ctx = self._create_child_context(context, "email_drafting", dict(draft_payload))
+        for key in (
+            "draft_payload",
+            "supplier_input",
+            "dispatch_timeout_seconds",
+            "dispatch_poll_interval",
+            "response_timeout_seconds",
+            "response_poll_interval",
+        ):
+            email_ctx.input_data.pop(key, None)
+
+        email_result = self._execute_agent("email_drafting", email_ctx)
+        email_data = email_result.data if email_result else {}
+        email_drafts = self._extract_drafts(email_result)
+        drafted_email_count = len([draft for draft in email_drafts if isinstance(draft, dict)])
+        tracked_unique_ids = [
+            str(draft.get("unique_id")).strip()
+            for draft in email_drafts
+            if isinstance(draft, dict)
+            and draft.get("unique_id") not in (None, "")
+        ]
+        tracked_unique_ids = [uid for uid in tracked_unique_ids if uid]
+
+        workflow_hint = self._select_workflow_identifier(email_drafts, context.workflow_id)
+        email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
+        unique_ids = [draft.get("unique_id") for draft in email_drafts]
+
+        coordinator = SupplierResponseWorkflow()
+        readiness = coordinator.ensure_ready(
+            workflow_id=workflow_hint,
+            unique_ids=unique_ids,
+            dispatch_timeout=dispatch_timeout,
+            dispatch_poll_interval=dispatch_poll,
+            response_timeout=response_timeout,
+            response_poll_interval=response_poll,
+        )
+
+        supplier_input: Dict[str, Any] = {}
+        if email_result and email_result.pass_fields:
+            supplier_input.update(dict(email_result.pass_fields))
+        if isinstance(supplier_payload, dict):
+            supplier_input.update(supplier_payload)
+        supplier_input["drafts"] = email_drafts
+        expected_email_count = len(tracked_unique_ids) or drafted_email_count
+        supplier_input.setdefault("expected_dispatch_count", expected_email_count)
+        # Retain legacy key for agents that still inspect the historical field.
+        supplier_input.setdefault("expected_email_count", expected_email_count)
+        if tracked_unique_ids:
+            supplier_input.setdefault("expected_unique_ids", tracked_unique_ids)
+        supplier_input.setdefault("await_response", True)
+        if len([uid for uid in unique_ids if uid]) > 1:
+            supplier_input.setdefault("await_all_responses", True)
+        supplier_input.setdefault("workflow_id", workflow_hint)
+        supplier_input.setdefault("response_timeout", response_timeout)
+        supplier_input.setdefault("response_timeout_seconds", response_timeout)
+        supplier_input.setdefault("response_poll_interval", response_poll)
+        supplier_input.setdefault("dispatch_timeout", dispatch_timeout)
+        supplier_input.setdefault("dispatch_timeout_seconds", dispatch_timeout)
+        supplier_input.setdefault("dispatch_poll_interval", dispatch_poll)
+
+        supplier_ctx = self._create_child_context(context, "supplier_interaction", supplier_input)
+        for key in (
+            "draft_payload",
+            "supplier_input",
+            "dispatch_timeout_seconds",
+            "dispatch_poll_interval",
+            "response_timeout_seconds",
+            "response_poll_interval",
+        ):
+            supplier_ctx.input_data.pop(key, None)
+
+        logger.info(
+            "Waiting for SupplierInteractionAgent to complete... workflow=%s",
+            workflow_hint,
+        )
+        supplier_result = self._execute_agent("supplier_interaction", supplier_ctx)
+        logger.info(
+            "SupplierInteractionAgent completed for workflow=%s with status=%s",
+            workflow_hint,
+            getattr(supplier_result, "status", None),
+        )
+
+        negotiation_result = None
+        if (
+            supplier_result
+            and supplier_result.status == AgentStatus.SUCCESS
+            and "negotiation" in self.agents
+        ):
+            negotiation_payload: Dict[str, Any] = {}
+            if supplier_result.pass_fields:
+                negotiation_payload.update(dict(supplier_result.pass_fields))
+            if supplier_result.data:
+                negotiation_payload.setdefault("negotiation_batch", True)
+                negotiation_payload.update(dict(supplier_result.data))
+
+            if isinstance(supplier_result.data, dict):
+                primary_reference = supplier_result.data.get("session_reference")
+                if primary_reference:
+                    negotiation_payload.setdefault("session_reference", primary_reference)
+
+            thread_headers_payload: Optional[Dict[str, Any]] = None
+            if isinstance(supplier_result.data, dict):
+                thread_headers_payload = supplier_result.data.get("thread_headers")
+            if not thread_headers_payload and isinstance(supplier_result.pass_fields, dict):
+                thread_headers_payload = supplier_result.pass_fields.get("thread_headers")
+            if thread_headers_payload:
+                negotiation_payload["thread_headers"] = thread_headers_payload
+
+            responses = negotiation_payload.get("supplier_responses")
+            if isinstance(responses, list) and responses:
+                negotiation_ctx = self._create_child_context(
+                    context, "negotiation", negotiation_payload
+                )
+                negotiation_result = self._execute_agent("negotiation", negotiation_ctx)
+
+        if supplier_result and supplier_result.status != AgentStatus.SUCCESS:
+            logger.warning(
+                "SupplierInteractionAgent returned non-success status %s for workflow=%s",
+                supplier_result.status,
+                workflow_hint,
+            )
+
+        activation_summary = readiness.get("activation", {}) if readiness else {}
+        if activation_summary and not activation_summary.get("activated", False):
+            logger.warning(
+                "Supplier interaction activation incomplete for workflow=%s", workflow_hint
+            )
+
+        results: Dict[str, Any] = {
+            "email_drafting": email_data,
+            "dispatch_monitor": readiness.get("dispatch"),
+            "response_monitor": readiness.get("responses"),
+            "activation_monitor": activation_summary,
+            "supplier_interaction": supplier_result.data if supplier_result else {},
+            "expected_email_count": expected_email_count,
+            "tracked_unique_ids": tracked_unique_ids,
+            "supplier_interaction_status": (
+                supplier_result.status.value if supplier_result else None
+            ),
+        }
+
+        if supplier_result and supplier_result.next_agents:
+            results["next_agents"] = list(supplier_result.next_agents)
+        if supplier_result and supplier_result.pass_fields:
+            results["supplier_pass_fields"] = dict(supplier_result.pass_fields)
+        if negotiation_result:
+            results["negotiation"] = negotiation_result.data if negotiation_result else {}
+            if negotiation_result and negotiation_result.pass_fields:
+                results["negotiation_pass_fields"] = dict(negotiation_result.pass_fields)
+            if negotiation_result and negotiation_result.status:
+                results["negotiation_status"] = negotiation_result.status.value
+            if negotiation_result and negotiation_result.next_agents:
+                existing = results.setdefault("next_agents", [])
+                for agent_name in negotiation_result.next_agents:
+                    if agent_name not in existing:
+                        existing.append(agent_name)
+        return results
+
+    @staticmethod
+    def _extract_drafts(result: Optional[Any]) -> List[Dict[str, Any]]:
+        drafts: List[Dict[str, Any]] = []
+        seen_tokens: Set[Tuple[Optional[str], Optional[str]]] = set()
+        if not result:
+            return drafts
+
+        for source in (getattr(result, "pass_fields", None), getattr(result, "data", None)):
+            if not isinstance(source, dict):
+                continue
+            entries = source.get("drafts")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    token = (
+                        entry.get("unique_id"),
+                        entry.get("supplier_id"),
+                    )
+                    if token in seen_tokens:
+                        continue
+                    seen_tokens.add(token)
+                    drafts.append(dict(entry))
+        return drafts
+
+    @staticmethod
+    def _filter_drafts_for_workflow(
+        drafts: List[Dict[str, Any]], workflow_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        if not workflow_id:
+            return drafts
+
+        filtered: List[Dict[str, Any]] = []
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+
+            matches = Orchestrator._draft_workflow_candidates(draft)
+            adjusted = dict(draft)
+
+            if matches:
+                lowered_matches = {
+                    str(candidate).strip().lower()
+                    for candidate in matches
+                    if candidate not in (None, "")
+                }
+                if workflow_id.lower() not in lowered_matches:
+                    logger.warning(
+                        "Realigning draft workflow identifiers from %s to %s for unique_id=%s",
+                        sorted(matches),
+                        workflow_id,
+                        adjusted.get("unique_id"),
+                    )
+                Orchestrator._realign_draft_workflow_id(adjusted, workflow_id)
+            else:
+                Orchestrator._realign_draft_workflow_id(adjusted, workflow_id)
+
+            filtered.append(adjusted)
+
+        return filtered
+
+    @staticmethod
+    def _realign_draft_workflow_id(draft: Dict[str, Any], workflow_id: str) -> None:
+        """Ensure ``draft`` carries ``workflow_id`` consistently."""
+
+        if not isinstance(draft, dict) or not workflow_id:
+            return
+
+        draft["workflow_id"] = workflow_id
+
+        metadata = draft.get("metadata")
+        if metadata is None:
+            metadata = {
+                "workflow_id": workflow_id,
+                "context": {"workflow_id": workflow_id},
+            }
+            draft["metadata"] = metadata
+        elif isinstance(metadata, dict):
+            metadata["workflow_id"] = workflow_id
+            context_meta = metadata.get("context")
+            if isinstance(context_meta, dict):
+                context_meta["workflow_id"] = workflow_id
+            elif context_meta is None:
+                metadata["context"] = {"workflow_id": workflow_id}
+        else:
+            draft["metadata"] = {
+                "workflow_id": workflow_id,
+                "context": {"workflow_id": workflow_id},
+            }
+
+        workflow_section = draft.get("workflow")
+        if isinstance(workflow_section, dict):
+            workflow_section["workflow_id"] = workflow_id
+
+    @staticmethod
+    def _draft_workflow_candidates(draft: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+
+        def _collect(value: Any) -> None:
+            if value in (None, ""):
+                return
+            try:
+                text = str(value).strip()
+            except Exception:
+                return
+            if text:
+                candidates.append(text)
+
+        for key in ("workflow_id", "workflowId"):
+            _collect(draft.get(key))
+
+        metadata = draft.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("workflow_id", "process_workflow_id"):
+                _collect(metadata.get(key))
+            context_meta = metadata.get("context")
+            if isinstance(context_meta, dict):
+                for key in ("workflow_id", "workflowId", "process_workflow_id"):
+                    _collect(context_meta.get(key))
+
+        workflow_section = draft.get("workflow")
+        if isinstance(workflow_section, dict):
+            for key in ("workflow_id", "workflowId", "id"):
+                _collect(workflow_section.get(key))
+
+        return candidates
+
+    @staticmethod
+    def _select_workflow_identifier(drafts: List[Dict[str, Any]], default: Optional[str]) -> Optional[str]:
+        candidates: List[str] = []
+        for draft in drafts:
+            for key in ("workflow_id", "metadata"):
+                value = draft.get(key)
+                if key == "metadata" and isinstance(value, dict):
+                    value = value.get("workflow_id") or value.get("process_workflow_id")
+                if value in (None, ""):
+                    continue
+                try:
+                    text = str(value).strip()
+                except Exception:
+                    continue
+                if text:
+                    candidates.append(text)
+                    break
+        unique_candidates: List[str] = []
+        lowered_seen: Set[str] = set()
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in lowered_seen:
+                continue
+            lowered_seen.add(lowered)
+            unique_candidates.append(candidate)
+
+        default_text = None
+        if default not in (None, ""):
+            try:
+                default_text = str(default).strip()
+            except Exception:
+                default_text = None
+
+        if unique_candidates:
+            if default_text:
+                lowered_default = default_text.lower()
+                if len(unique_candidates) > 1:
+                    return default_text
+                if unique_candidates[0].lower() != lowered_default:
+                    return default_text
+            return unique_candidates[0]
+
+        return default_text
+
     def _execute_generic_workflow(
         self, workflow_name: str, context: AgentContext
     ) -> Dict:
@@ -1749,29 +2081,73 @@ class Orchestrator:
         self, agents: List[str], context: AgentContext, pass_fields: Dict
     ) -> Dict:
         """Execute agents in parallel"""
-        results = {}
-        futures = {}
+        results: Dict[str, Any] = {}
+        futures: Dict[Any, str] = {}
 
+        gatekeepers: List[str] = []
+        normal_agents: List[str] = []
         for agent_name in agents:
-            if agent_name in self.agents:
-                child_context = self._create_child_context(
-                    context, agent_name, pass_fields
-                )
-                future = self.executor.submit(
-                    self._execute_agent, agent_name, child_context
-                )
-                futures[future] = agent_name
+            if agent_name not in self.agents:
+                continue
+            if self._is_gatekeeper_agent(agent_name):
+                gatekeepers.append(agent_name)
+            else:
+                normal_agents.append(agent_name)
+
+        for agent_name in gatekeepers:
+            child_context = self._create_child_context(
+                context, agent_name, pass_fields
+            )
+            workflow_hint = child_context.input_data.get("workflow") or child_context.workflow_id
+            logger.info(
+                "Waiting for %s to complete... workflow=%s",
+                agent_name,
+                workflow_hint,
+            )
+            result = self._execute_agent(agent_name, child_context)
+            logger.info(
+                "%s completed for workflow=%s with status=%s",
+                agent_name,
+                workflow_hint,
+                getattr(result, "status", None),
+            )
+            results[agent_name] = result.data if result else None
+            if result and result.pass_fields:
+                self._merge_pass_fields(pass_fields, result.pass_fields)
+
+        for agent_name in normal_agents:
+            child_context = self._create_child_context(
+                context, agent_name, pass_fields
+            )
+            future = self.executor.submit(
+                self._execute_agent, agent_name, child_context
+            )
+            futures[future] = agent_name
 
         for future in as_completed(futures):
             agent_name = futures[future]
             try:
-                result = future.result(timeout=30)
+                result = future.result()
                 results[agent_name] = result.data if result else None
-            except Exception as e:
-                logger.error(f"Parallel execution failed for {agent_name}: {e}")
-                results[agent_name] = {"error": str(e)}
+                if result and result.pass_fields:
+                    self._merge_pass_fields(pass_fields, result.pass_fields)
+            except Exception as exc:
+                logger.error(
+                    "Parallel execution failed for %s: %s",
+                    agent_name,
+                    exc,
+                )
+                results[agent_name] = {"error": str(exc)}
 
         return results
+
+    def _is_gatekeeper_agent(self, agent_name: str) -> bool:
+        try:
+            canonical = self._resolve_agent_name(str(agent_name))
+        except Exception:
+            canonical = str(agent_name).strip().lower()
+        mapped = self.AGENT_TOKEN_ALIASES.get(canonical.replace(" ", ""), canonical)
+        return mapped in self.GATEKEEPER_AGENTS
 
     def _execute_sequential_agents(
         self, agents: List[str], context: AgentContext, pass_fields: Dict

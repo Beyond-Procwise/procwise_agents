@@ -4,43 +4,62 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-_MARKER_DETECTION = re.compile(
-    r"(?:PROCWISE:RFQ_ID|RFQ-ID)\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE
+_MODERN_MARKER_PATTERN = re.compile(
+    r"<!--\s*PROCWISE_MARKER:(.*?)-->", re.IGNORECASE | re.DOTALL
 )
-_TOKEN_DETECTION = re.compile(r"TOKEN\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
-_RUN_ID_DETECTION = re.compile(r"RUN_ID\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
-_SUPPLIER_DETECTION = re.compile(
-    r"SUPPLIER\s*[:=]\s*([A-Za-z0-9_-]+)", re.IGNORECASE
+_LEGACY_MARKER_PATTERN = re.compile(
+    r"<!--\s*(?:PROCWISE:(?:UID|RFQ_ID)[^>]*|RFQ-ID[^>]*)-->",
+    re.IGNORECASE | re.DOTALL,
 )
-def split_hidden_marker(body: str) -> Tuple[Optional[str], str]:
-    """Split ``body`` into an optional hidden marker comment and the remainder."""
-
-    if not isinstance(body, str):
-        return None, ""
-
-    match = re.match(r"\s*(<!--.*?-->)", body, flags=re.DOTALL)
-    if not match:
-        return None, body
-
-    comment = match.group(1).strip()
-    if not _MARKER_DETECTION.search(comment):
-        return None, body
-
-    remainder = body[match.end() :].lstrip("\n")
-    return comment, remainder
+_LEGACY_KEY_VALUE = re.compile(
+    r"(PROCWISE:UID|RFQ_ID|RFQ-ID|UID|TOKEN|RUN_ID|RUN|SUPPLIER)\s*[:=]\s*([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 
 
-def extract_rfq_id(comment: Optional[str]) -> Optional[str]:
-    """Return the RFQ identifier embedded in ``comment`` if present."""
+def _locate_marker_comment(text: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    if not isinstance(text, str):
+        return None, None, None
+    modern = _MODERN_MARKER_PATTERN.search(text)
+    if modern:
+        return modern.group(0).strip(), modern.start(), modern.end()
+    legacy = _LEGACY_MARKER_PATTERN.search(text)
+    if legacy:
+        return legacy.group(0).strip(), legacy.start(), legacy.end()
+    return None, None, None
 
+
+def _parse_marker_metadata(comment: Optional[str]) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
     if not comment:
-        return None
-    match = _MARKER_DETECTION.search(comment)
-    if match:
-        return match.group(1).strip()
-    return None
+        return metadata
+
+    modern = _MODERN_MARKER_PATTERN.search(comment)
+    if modern:
+        payload = modern.group(1) or ""
+        for part in payload.split("|"):
+            if not part or ":" not in part:
+                continue
+            key, value = part.split(":", 1)
+            metadata[key.strip().lower()] = value.strip()
+        return metadata
+
+    for key, value in _LEGACY_KEY_VALUE.findall(comment):
+        key_lower = key.lower()
+        cleaned_value = value.strip()
+        if key_lower in {"procwise:uid", "rfq_id", "rfq-id", "uid"}:
+            metadata["tracking"] = cleaned_value
+        elif key_lower == "token":
+            metadata["token"] = cleaned_value
+        elif key_lower in {"run_id", "run"}:
+            metadata["run"] = cleaned_value
+        elif key_lower in {"workflow", "workflow_id"}:
+            metadata["workflow"] = cleaned_value
+        elif key_lower == "supplier":
+            metadata["supplier"] = cleaned_value
+    return metadata
 
 
 def _normalise_supplier(supplier_id: Optional[str]) -> str:
@@ -50,101 +69,144 @@ def _normalise_supplier(supplier_id: Optional[str]) -> str:
     return cleaned
 
 
+def _strip_visible_identifiers(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"(?i)\b(RFQ|rfq)[\s:-]*\d{8}[\s:-]*[A-Za-z0-9]{8}\b",
+        "",
+        text,
+    )
+    cleaned = re.sub(
+        r"(?i)\b(UID|uid)[\s:-]*[A-Za-z0-9-]{12,}\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?i)\b(workflow|WF)[\s:-]*[A-Za-z0-9-]{8,}\b",
+        "",
+        cleaned,
+    )
+    return cleaned
+
+
+def split_hidden_marker(body: str) -> Tuple[Optional[str], str]:
+    """Split ``body`` into an optional hidden marker comment and the remainder."""
+
+    if not isinstance(body, str):
+        return None, ""
+
+    comment, start, end = _locate_marker_comment(body)
+    if comment is None or start is None or end is None:
+        return None, body
+
+    remainder = f"{body[:start]}{body[end:]}"
+    remainder = remainder.rstrip()
+    remainder = re.sub(r"\n{3,}", "\n\n", remainder)
+    return comment, remainder
+
+
+def extract_rfq_id(comment: Optional[str]) -> Optional[str]:
+    """Return the unique identifier embedded in ``comment`` if present."""
+
+    metadata = _parse_marker_metadata(comment)
+    tracking = metadata.get("tracking") or metadata.get("procwise:uid")
+    return tracking
+
+
 def ensure_hidden_marker(
     *,
-    rfq_id: Optional[str],
+    rfq_id: Optional[str],  # Deprecated
     supplier_id: Optional[str] = None,
     comment: Optional[str] = None,
     token: Optional[str] = None,
     run_id: Optional[str] = None,
+    unique_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Return a hidden marker comment for ``rfq_id`` and its tracking token."""
+    """Return a hidden marker comment anchored on ``unique_id`` and its tracking token."""
 
-    if not rfq_id:
-        return comment if comment else None, token
-
-    existing_token = None
-    existing_run_id = None
-    if comment:
-        token_match = _TOKEN_DETECTION.search(comment)
-        if token_match:
-            existing_token = token_match.group(1).strip()
-        run_match = _RUN_ID_DETECTION.search(comment)
-        if run_match:
-            existing_run_id = run_match.group(1).strip()
-
-    marker_token = token or existing_token or uuid.uuid4().hex
-    run_identifier = run_id or existing_run_id or marker_token
-    supplier_segment = _normalise_supplier(supplier_id)
-
-    segments = [f"PROCWISE:RFQ_ID={rfq_id}"]
-    if supplier_segment:
-        segments.append(f"SUPPLIER={supplier_segment}")
-    segments.append(f"TOKEN={marker_token}")
-    if run_identifier:
-        segments.append(f"RUN_ID={run_identifier}")
-
-    return f"<!-- {';'.join(segments)} -->", marker_token
+    base_text = comment or ""
+    marked_body, marker_token = attach_hidden_marker(
+        base_text,
+        supplier_id=supplier_id,
+        unique_id=unique_id,
+        token=token,
+        run_id=run_id,
+    )
+    new_comment, _ = split_hidden_marker(marked_body)
+    return new_comment, marker_token
 
 
 def attach_hidden_marker(
     body: str,
     *,
-    rfq_id: Optional[str],
+    rfq_id: Optional[str] = None,  # Deprecated but kept for compatibility
     supplier_id: Optional[str] = None,
+    unique_id: Optional[str] = None,
     token: Optional[str] = None,
     run_id: Optional[str] = None,
-) -> Tuple[str, Optional[str]]:
-    """Ensure ``body`` includes an invisible comment identifying the RFQ."""
+) -> Tuple[str, str]:
+    """Attach hidden tracking marker ensuring it never appears to recipients."""
 
-    comment, remainder = split_hidden_marker(body)
-    updated_comment, marker_token = ensure_hidden_marker(
-        rfq_id=rfq_id,
-        supplier_id=supplier_id,
-        comment=comment,
-        token=token,
-        run_id=run_id,
-    )
+    base_text = body or ""
+    existing_comment, _, _ = _locate_marker_comment(base_text)
+    existing_metadata = _parse_marker_metadata(existing_comment)
 
-    if updated_comment:
-        if remainder:
-            combined = f"{updated_comment}\n{remainder}".strip()
-        else:
-            combined = updated_comment
-        return combined, marker_token
+    base_text = re.sub(r"<!--\s*PROCWISE_MARKER:.*?-->", "", base_text, flags=re.DOTALL | re.IGNORECASE)
 
-    return body, marker_token
+    tracking_id = unique_id or existing_metadata.get("tracking")
+    if not tracking_id:
+        tracking_id = f"UID-{uuid.uuid4().hex[:16].upper()}"
+
+    token_value = token or existing_metadata.get("token")
+    if not token_value:
+        token_value = uuid.uuid4().hex[:12].upper()
+
+    run_value = run_id or existing_metadata.get("run")
+
+    supplier_segment = _normalise_supplier(supplier_id) or existing_metadata.get("supplier", "")
+
+    metadata_parts = [f"TRACKING:{tracking_id}"]
+
+    if supplier_segment:
+        metadata_parts.append(f"SUPPLIER:{supplier_segment}")
+
+    if token_value:
+        metadata_parts.append(f"TOKEN:{token_value}")
+
+    if run_value:
+        metadata_parts.append(f"RUN:{run_value}")
+
+    metadata_string = "|".join(metadata_parts)
+    hidden_marker = f"<!-- PROCWISE_MARKER:{metadata_string} -->"
+
+    clean_body = _strip_visible_identifiers(base_text)
+    clean_body = clean_body.strip()
+
+    if clean_body:
+        marked_body = f"{clean_body}\n\n{hidden_marker}"
+    else:
+        marked_body = hidden_marker
+
+    return marked_body, token_value
 
 
 def extract_marker_token(comment: Optional[str]) -> Optional[str]:
     """Return the dispatch tracking token stored in ``comment`` if present."""
 
-    if not comment:
-        return None
-    match = _TOKEN_DETECTION.search(comment)
-    if match:
-        return match.group(1).strip()
-    return None
+    metadata = _parse_marker_metadata(comment)
+    return metadata.get("token")
 
 
 def extract_run_id(comment: Optional[str]) -> Optional[str]:
     """Return the dispatch run identifier embedded in ``comment`` if present."""
 
-    if not comment:
-        return None
-    match = _RUN_ID_DETECTION.search(comment)
-    if match:
-        return match.group(1).strip()
-    return None
+    metadata = _parse_marker_metadata(comment)
+    return metadata.get("run")
 
 
 def extract_supplier_id(comment: Optional[str]) -> Optional[str]:
     """Return the supplier identifier embedded in ``comment`` if present."""
 
-    if not comment:
-        return None
-    match = _SUPPLIER_DETECTION.search(comment)
-    if match:
-        return match.group(1).strip()
-    return None
-
+    metadata = _parse_marker_metadata(comment)
+    return metadata.get("supplier")

@@ -65,7 +65,7 @@ def _make_record(rfq_id, *, token, received=None, supplier="SI-1"):
         supplier_id=supplier,
         message_id=f"<{rfq_id}-msg>",
         subject=f"RFQ {rfq_id}",
-        body=f"<!-- PROCWISE:RFQ_ID={rfq_id};SUPPLIER={supplier};TOKEN={token};RUN_ID={token} -->",
+        body=f"<!-- PROCWISE:UID={rfq_id};SUPPLIER={supplier};TOKEN={token};RUN_ID={token} -->",
         from_address="supplier@example.com",
         received_at=received_at,
         headers={"In-Reply-To": "<draft-msg>"},

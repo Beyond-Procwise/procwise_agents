@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Optional
+import time
+from typing import Callable, Dict, List, Optional, Set
 
 from repositories import workflow_email_tracking_repo
 from services.email_watcher_imap import run_email_watcher_for_workflow
@@ -22,6 +23,7 @@ class EmailWatcherService:
         poll_interval_seconds: Optional[int] = None,
         post_dispatch_interval_seconds: Optional[int] = None,
         dispatch_wait_seconds: Optional[int] = None,
+        watcher_runner: Optional[Callable[..., Dict[str, object]]] = None,
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -43,8 +45,12 @@ class EmailWatcherService:
         self._poll_interval = poll_interval_seconds
         self._post_dispatch_interval = post_dispatch_interval_seconds
         self._dispatch_wait = dispatch_wait_seconds
+        self._runner: Callable[..., Dict[str, object]] = watcher_runner or run_email_watcher_for_workflow
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._forced_lock = threading.Lock()
+        self._forced_workflows: Set[str] = set()
 
     @staticmethod
     def _env_int(name: str, *, fallback: str) -> int:
@@ -60,6 +66,7 @@ class EmailWatcherService:
             return
 
         self._stop_event.clear()
+        self._wake_event.clear()
         self._thread = threading.Thread(target=self._run_loop, name="EmailWatcherService", daemon=True)
         self._thread.start()
         logger.info(
@@ -73,11 +80,42 @@ class EmailWatcherService:
         """Signal the watcher loop to stop and wait for the thread."""
 
         self._stop_event.set()
+        self._wake_event.set()
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=timeout)
         self._thread = None
         logger.info("EmailWatcherService stopped")
+
+    def notify_workflow(self, workflow_id: str) -> None:
+        """Wake the service to prioritise ``workflow_id`` in the next cycle."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return
+
+        with self._forced_lock:
+            self._forced_workflows.add(workflow_key)
+        self._wake_event.set()
+
+    def _consume_forced_workflows(self) -> List[str]:
+        with self._forced_lock:
+            items = list(self._forced_workflows)
+            self._forced_workflows.clear()
+        return items
+
+    def _wait_for_next_cycle(self, seconds: float) -> None:
+        if seconds <= 0:
+            seconds = 0
+        deadline = time.monotonic() + seconds
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            awakened = self._wake_event.wait(timeout=remaining)
+            if awakened:
+                self._wake_event.clear()
+                break
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -89,6 +127,14 @@ class EmailWatcherService:
                 logger.exception("Failed to load workflows for email watcher service")
                 workflow_ids = []
 
+            forced = self._consume_forced_workflows()
+            if forced:
+                seen = set(workflow_ids)
+                for workflow_id in forced:
+                    if workflow_id not in seen:
+                        workflow_ids.append(workflow_id)
+                        seen.add(workflow_id)
+
             for workflow_id in workflow_ids:
                 if self._stop_event.is_set():
                     break
@@ -97,7 +143,7 @@ class EmailWatcherService:
                     continue
 
                 try:
-                    result = run_email_watcher_for_workflow(
+                    result = self._runner(
                         workflow_id=workflow_id,
                         run_id=None,
                         wait_seconds_after_last_dispatch=self._dispatch_wait,
@@ -122,7 +168,8 @@ class EmailWatcherService:
             else:
                 sleep_seconds = self._post_dispatch_interval
 
-            if self._stop_event.wait(timeout=sleep_seconds):
+            self._wait_for_next_cycle(sleep_seconds)
+            if self._stop_event.is_set():
                 break
 
         logger.debug("EmailWatcherService loop terminated")

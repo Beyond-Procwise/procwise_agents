@@ -8,11 +8,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from repositories.workflow_email_tracking_repo import (
-    WorkflowDispatchRow,
-    init_schema as init_tracking_schema,
-    record_dispatches as record_workflow_dispatches,
-)
 from utils.email_tracking import (
     build_tracking_comment,
     embed_unique_id_in_email_body,
@@ -22,7 +17,12 @@ from utils.email_tracking import (
 )
 from utils.gpu import configure_gpu
 
-from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
+from services.backend_scheduler import BackendScheduler
+
+from .email_dispatch_chain_store import (
+    record_dispatch as record_workflow_dispatch,
+    register_dispatch as register_dispatch_chain,
+)
 from .email_service import EmailService
 from .email_thread_store import (
     DEFAULT_THREAD_TABLE,
@@ -149,7 +149,6 @@ class EmailDispatchService:
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
             headers = {
-                "X-Procwise-RFQ-ID": rfq_id,
                 "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
                 "X-Procwise-Unique-Id": backend_metadata.get("unique_id"),
             }
@@ -171,6 +170,7 @@ class EmailDispatchService:
 
             sent = send_result.success
             message_id = send_result.message_id
+            unique_id = backend_metadata.get("unique_id")
 
             self._update_draft_status(
                 conn,
@@ -193,6 +193,14 @@ class EmailDispatchService:
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
                 dispatch_payload["message_id"] = message_id
+                logger.info(
+                    "Dispatched supplier email workflow=%s unique_id=%s rfq_id=%s supplier=%s message_id=%s",
+                    backend_metadata.get("workflow_id"),
+                    unique_id,
+                    rfq_id,
+                    draft.get("supplier_id"),
+                    message_id,
+                )
                 try:
                     self._record_thread_mapping(
                         conn,
@@ -228,38 +236,39 @@ class EmailDispatchService:
                 unique_identifier = backend_metadata.get("unique_id")
                 if workflow_identifier and unique_identifier:
                     try:
-                        init_tracking_schema()
-                        record_workflow_dispatches(
+                        record_workflow_dispatch(
                             workflow_id=workflow_identifier,
-                            dispatches=[
-                                WorkflowDispatchRow(
-                                    workflow_id=workflow_identifier,
-                                    unique_id=unique_identifier,
-                                    supplier_id=str(
-                                        backend_metadata.get("supplier_id")
-                                        or draft.get("supplier_id")
-                                        or ""
-                                    )
-                                    or None,
-                                    supplier_email=(
-                                        recipient_list[0]
-                                        if recipient_list
-                                        else draft.get("receiver")
-                                    ),
-                                    message_id=message_id,
-                                    subject=subject,
-                                    dispatched_at=datetime.now(timezone.utc),
-                                    responded_at=None,
-                                    response_message_id=None,
-                                    matched=False,
-                                )
-                            ],
+                            unique_id=unique_identifier,
+                            supplier_id=str(
+                                backend_metadata.get("supplier_id")
+                                or draft.get("supplier_id")
+                                or ""
+                            )
+                            or None,
+                            supplier_email=(
+                                recipient_list[0]
+                                if recipient_list
+                                else draft.get("receiver")
+                            ),
+                            message_id=message_id,
+                            subject=subject,
+                            dispatched_at=datetime.now(timezone.utc),
                         )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
                             "Failed to record workflow email dispatch for workflow %s",
                             workflow_identifier,
                         )
+                    else:
+                        try:
+                            BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
+                                workflow_identifier
+                            )
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception(
+                                "Failed to trigger email watcher for workflow %s",
+                                workflow_identifier,
+                            )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
 
@@ -448,10 +457,15 @@ class EmailDispatchService:
         sent: bool,
     ) -> None:
         action_id = self._extract_action_id(payload)
+        unique_id = payload.get("unique_id")
+        metadata = payload.get("dispatch_metadata")
+        if not unique_id and isinstance(metadata, dict):
+            unique_id = metadata.get("unique_id")
         if not action_id:
             logger.debug(
-                "No action identifier found in dispatch payload for RFQ %s; skipping sent_status update",
+                "No action identifier found for dispatch (rfq=%s unique_id=%s); skipping sent_status update",
                 rfq_id,
+                unique_id,
             )
             return
 
@@ -485,9 +499,10 @@ class EmailDispatchService:
                 )
         except Exception:  # pragma: no cover - defensive logging
             logger.exception(
-                "Failed to update sent_status for action %s and RFQ %s",
+                "Failed to update sent_status for action %s (rfq=%s unique_id=%s)",
                 action_id,
                 rfq_id,
+                unique_id,
             )
 
     # ------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pytest
 
@@ -663,3 +663,121 @@ def test_learning_snapshot_ignores_training_endpoint():
 
     assert endpoint.calls == 0
     assert repo.calls == 0
+
+
+def test_negotiation_agent_runs_batch_in_parallel(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    processed: List[str] = []
+
+    def fake_single(self, context):
+        supplier_id = context.input_data.get("supplier_id")
+        processed.append(supplier_id)
+        assert context.input_data.get("target_price") == 800.0
+        assert "negotiation_batch" not in context.input_data
+        data = {
+            "supplier": supplier_id,
+            "rfq_id": context.input_data.get("rfq_id"),
+            "drafts": [
+                {
+                    "supplier_id": supplier_id,
+                    "rfq_id": context.input_data.get("rfq_id"),
+                    "intent": "NEGOTIATION_COUNTER",
+                    "body": f"Counter for {supplier_id}",
+                }
+            ],
+        }
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                pass_fields=dict(data),
+            ),
+        )
+
+    monkeypatch.setattr(NegotiationAgent, "_run_single_negotiation", fake_single)
+
+    context = AgentContext(
+        workflow_id="wf-batch",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={
+            "negotiation_batch": [
+                {"supplier_id": "S1", "rfq_id": "RFQ-1", "current_offer": 1000.0},
+                {"supplier_id": "S2", "rfq_id": "RFQ-2", "current_offer": 900.0},
+            ],
+            "shared_context": {"target_price": 800.0},
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["negotiation_batch"] is True
+    assert len(output.data["results"]) == 2
+    assert sorted(processed) == ["S1", "S2"]
+    assert len(output.data["drafts"]) == 2
+    assert output.data["results_by_supplier"]["S1"]["output"]["rfq_id"] == "RFQ-1"
+    assert output.data["successful_suppliers"] == ["S1", "S2"]
+    assert output.data["failed_suppliers"] == []
+    assert output.pass_fields["negotiation_batch"] is True
+    assert len(output.pass_fields["batch_results"]) == 2
+
+
+def test_negotiation_agent_batch_records_failures(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    def fake_single(self, context):
+        supplier_id = context.input_data.get("supplier_id")
+        if supplier_id == "S2":
+            raise RuntimeError("missing pricing")
+        data = {
+            "supplier": supplier_id,
+            "rfq_id": context.input_data.get("rfq_id"),
+            "drafts": [
+                {
+                    "supplier_id": supplier_id,
+                    "rfq_id": context.input_data.get("rfq_id"),
+                    "intent": "NEGOTIATION_COUNTER",
+                }
+            ],
+        }
+        return self._with_plan(
+            context,
+            AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                pass_fields=dict(data),
+            ),
+        )
+
+    monkeypatch.setattr(NegotiationAgent, "_run_single_negotiation", fake_single)
+
+    context = AgentContext(
+        workflow_id="wf-batch-failure",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={
+            "negotiation_batch": [
+                {"supplier_id": "S1", "rfq_id": "RFQ-1"},
+                {"supplier_id": "S2", "rfq_id": "RFQ-2"},
+            ],
+            "shared_context": {"target_price": 750.0},
+        },
+    )
+
+    output = agent.run(context)
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["negotiation_batch"] is True
+    assert output.data["batch_size"] == 2
+    assert len(output.data["results"]) == 2
+    failures = [record for record in output.data["results"] if record["status"] == AgentStatus.FAILED.value]
+    assert len(failures) == 1
+    assert failures[0]["supplier_id"] == "S2"
+    assert output.data["failed_suppliers"]
+    assert output.data["successful_suppliers"] == ["S1"]
+    assert len(output.data["drafts"]) == 1

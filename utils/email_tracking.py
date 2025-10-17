@@ -10,10 +10,13 @@ import string
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 _TRACKING_PATTERN = re.compile(r"<!--\s*PROCWISE:(\{.*?\})\s*-->", re.IGNORECASE | re.DOTALL)
+_MARKER_COMMENT_PATTERN = re.compile(
+    r"<!--\s*PROCWISE_MARKER:(.*?)-->", re.IGNORECASE | re.DOTALL
+)
 _SIMPLE_UID_PATTERN = re.compile(r"<!--\s*PROCWISE:UID=([A-Za-z0-9-]+)\s*-->", re.IGNORECASE)
 _HIDDEN_SPAN_PATTERN = re.compile(
     r"<span\s+style=\"display:?none;?\">\s*PROCWISE:UID=([A-Za-z0-9-]+)\s*</span>",
@@ -54,6 +57,16 @@ def _normalise_identifier(value: Optional[str]) -> Optional[str]:
         return None
     cleaned = str(value).strip()
     return cleaned or None
+
+
+def _parse_marker_payload(payload: str) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    for part in payload.split("|"):
+        if not part or ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        metadata[key.strip().lower()] = value.strip()
+    return metadata
 
 
 def build_tracking_comment(
@@ -104,6 +117,26 @@ def extract_tracking_metadata(text: Optional[str]) -> Optional[EmailTrackingMeta
 
     if not text:
         return None
+
+    marker_match = _MARKER_COMMENT_PATTERN.search(text)
+    if marker_match:
+        payload = marker_match.group(1) or ""
+        fields = _parse_marker_payload(payload)
+        workflow = _normalise_identifier(fields.get("workflow"))
+        unique = _normalise_identifier(fields.get("tracking") or fields.get("procwise:uid"))
+        if not unique:
+            return None
+        supplier = _normalise_identifier(fields.get("supplier"))
+        token = _normalise_identifier(fields.get("token"))
+        run_id = _normalise_identifier(fields.get("run"))
+        workflow_value = workflow or ""
+        return EmailTrackingMetadata(
+            workflow_id=workflow_value,
+            unique_id=unique,
+            supplier_id=supplier,
+            token=token,
+            run_id=run_id,
+        )
 
     match = _TRACKING_PATTERN.search(text)
     if not match:
@@ -219,4 +252,33 @@ def extract_unique_id_from_body(body: Optional[str]) -> Optional[str]:
 
     metadata = extract_tracking_metadata(body)
     return metadata.unique_id if metadata else None
+
+
+def extract_unique_id_from_headers(headers: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Return the canonical unique identifier from email ``headers`` if present."""
+
+    if not headers:
+        return None
+
+    candidate_keys = (
+        "X-Procwise-Unique-Id",
+        "X-Procwise-Unique-ID",
+        "X-Procwise-Uid",
+    )
+
+    for key in candidate_keys:
+        value = headers.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    return text
+        else:
+            text = str(value).strip()
+            if text:
+                return text
+
+    return None
 
