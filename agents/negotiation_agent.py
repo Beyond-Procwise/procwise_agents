@@ -8,7 +8,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, cast
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
@@ -4084,6 +4084,34 @@ class NegotiationAgent(BaseAgent):
                         draft_copy.setdefault("unique_id", unique_value)
                     candidate_drafts.append(draft_copy)
 
+        filtered_drafts: List[Dict[str, Any]] = []
+        dropped_due_to_missing_supplier: List[Dict[str, Any]] = []
+
+        for entry in candidate_drafts:
+            if not isinstance(entry, dict):
+                continue
+
+            supplier_hint: Optional[Any] = entry.get("supplier_id") or entry.get("supplier")
+            if not supplier_hint and isinstance(entry.get("metadata"), dict):
+                meta = cast(Dict[str, Any], entry["metadata"])
+                supplier_hint = meta.get("supplier_id") or meta.get("supplier")
+
+            supplier_text = self._coerce_text(supplier_hint)
+            if supplier_text:
+                filtered_drafts.append(entry)
+                continue
+
+            dropped_due_to_missing_supplier.append(entry)
+
+        if filtered_drafts:
+            candidate_drafts = filtered_drafts
+        elif dropped_due_to_missing_supplier:
+            logger.info(
+                "Ignoring %s draft(s) without supplier identifiers while preparing watch list",
+                len(dropped_due_to_missing_supplier),
+            )
+            candidate_drafts = []
+
         if not candidate_drafts:
             fallback_entry = {"workflow_id": workflow_id}
             if supplier:
@@ -4105,6 +4133,41 @@ class NegotiationAgent(BaseAgent):
                     draft.setdefault("session_reference", session_reference)
                     draft.setdefault("unique_id", session_reference)
                     draft.setdefault("rfq_id", session_reference)
+
+        if candidate_drafts:
+            unique_id_set = set()
+            observed_unique_ids = []
+            for draft in candidate_drafts:
+                if not isinstance(draft, dict):
+                    continue
+                metadata = (
+                    draft.get("metadata")
+                    if isinstance(draft.get("metadata"), dict)
+                    else {}
+                )
+                unique_value = _record_unique_id(draft.get("unique_id"))
+                if not unique_value:
+                    for key in (
+                        "dispatch_run_id",
+                        "run_id",
+                        "email_action_id",
+                        "action_id",
+                        "draft_id",
+                    ):
+                        unique_value = _record_unique_id(
+                            draft.get(key) or metadata.get(key)
+                        )
+                        if unique_value:
+                            break
+                if not unique_value and metadata:
+                    for key in ("unique_id", "message_id", "id"):
+                        unique_value = _record_unique_id(metadata.get(key))
+                        if unique_value:
+                            break
+                if not unique_value and session_reference:
+                    unique_value = _record_unique_id(session_reference)
+                if unique_value:
+                    draft.setdefault("unique_id", unique_value)
 
         expected_count = max(len(candidate_drafts), len(observed_unique_ids)) or 1
 
