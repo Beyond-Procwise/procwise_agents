@@ -2636,12 +2636,13 @@ class SupplierInteractionAgent(BaseAgent):
             from_address=from_address,
         )
 
-        # The stateless execution path should only parse and persist the response.
-        # Any downstream routing (e.g., to NegotiationAgent or QuoteEvaluationAgent)
-        # must be handled by the stateful workflow gate once all expected responses
-        # are collected. Triggering the next agent here would prematurely advance the
-        # workflow when only a single ad-hoc response is available.
-        next_agent = []
+        # Ensure downstream agents evaluate or negotiate with the parsed response,
+        # even when this path is invoked in a stateless context.
+        price = parsed.get("price")
+        if price is not None and target is not None and price > target:
+            next_agent = ["NegotiationAgent"]
+        else:
+            next_agent = ["QuoteEvaluationAgent"]
 
         payload = {
             "rfq_id": rfq_id,
