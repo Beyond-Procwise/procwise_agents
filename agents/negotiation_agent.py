@@ -4485,11 +4485,26 @@ class NegotiationAgent(BaseAgent):
             if filtered_entries:
                 draft_entries = filtered_entries
             elif dropped_entries:
-                logger.error(
-                    "All provided drafts conflicted with workflow=%s; aborting await",
-                    workflow_hint,
-                )
-                return None
+                adopted_workflows = {
+                    self._coerce_text(entry.get("workflow_id"))
+                    for entry in dropped_entries
+                    if self._coerce_text(entry.get("workflow_id"))
+                }
+                if len(adopted_workflows) == 1:
+                    adopted_workflow = adopted_workflows.pop()
+                    logger.warning(
+                        "Adopting draft workflow_id=%s in place of context workflow_id=%s",
+                        adopted_workflow,
+                        workflow_hint,
+                    )
+                    workflow_hint = adopted_workflow
+                    draft_entries = dropped_entries
+                else:
+                    logger.error(
+                        "All provided drafts conflicted with workflow=%s; aborting await",
+                        workflow_hint,
+                    )
+                    return None
 
         await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
         tracked_unique_ids = sorted(
