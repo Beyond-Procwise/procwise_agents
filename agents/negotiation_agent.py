@@ -4236,13 +4236,14 @@ class NegotiationAgent(BaseAgent):
                     draft_copy.setdefault("unique_id", draft_unique)
                 draft_entries.append(draft_copy)
 
+        workflow_hint_raw = watch_payload.get("workflow_id") or getattr(
+            context, "workflow_id", None
+        )
+
         if not draft_entries:
             fallback_entry = {}
-            workflow_hint = watch_payload.get("workflow_id") or getattr(
-                context, "workflow_id", None
-            )
-            if workflow_hint:
-                fallback_entry["workflow_id"] = workflow_hint
+            if workflow_hint_raw:
+                fallback_entry["workflow_id"] = workflow_hint_raw
             supplier_hint = watch_payload.get("supplier_id") or watch_payload.get("supplier")
             if supplier_hint:
                 fallback_entry["supplier_id"] = supplier_hint
@@ -4253,11 +4254,42 @@ class NegotiationAgent(BaseAgent):
             logger.warning("No draft context available while awaiting supplier response")
             return None
 
-        await_all = bool(
-            watch_payload.get("await_all_responses")
-            or expected_total > 1
-            or len(draft_entries) > 1
-        )
+        if draft_entries:
+            logger.info(
+                "Awaiting supplier responses for workflow=%s with %s drafts",
+                workflow_hint_raw,
+                len(draft_entries),
+            )
+            for idx, entry in enumerate(draft_entries[:5]):
+                logger.info(
+                    "  Draft %s: unique=%s supplier=%s workflow=%s",
+                    idx,
+                    entry.get("unique_id"),
+                    entry.get("supplier_id"),
+                    entry.get("workflow_id"),
+                )
+
+        if draft_entries and len(draft_entries) > 1:
+            draft_workflows = {
+                self._coerce_text(entry.get("workflow_id"))
+                for entry in draft_entries
+                if self._coerce_text(entry.get("workflow_id"))
+            }
+            if len(draft_workflows) > 1:
+                logger.error(
+                    "CRITICAL: Multiple workflows in draft batch! workflows=%s",
+                    sorted(draft_workflows),
+                )
+            elif len(draft_workflows) == 1 and workflow_hint_raw:
+                draft_workflow = draft_workflows.pop()
+                if draft_workflow != self._coerce_text(workflow_hint_raw):
+                    logger.error(
+                        "Workflow mismatch: context has %s but drafts have %s",
+                        workflow_hint_raw,
+                        draft_workflow,
+                    )
+
+        await_all = bool(watch_payload.get("await_all_responses") and len(draft_entries) > 1)
         tracked_unique_ids = sorted(
             {
                 self._coerce_text(entry.get("unique_id"))
@@ -4273,7 +4305,7 @@ class NegotiationAgent(BaseAgent):
             expected_total = len(draft_entries)
 
         workflow_hint = self._coerce_text(
-            watch_payload.get("workflow_id") or getattr(context, "workflow_id", None)
+            workflow_hint_raw
         )
 
         try:

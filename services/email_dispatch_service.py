@@ -8,11 +8,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from repositories.workflow_email_tracking_repo import (
-    WorkflowDispatchRow,
-    init_schema as init_tracking_schema,
-    record_dispatches as record_workflow_dispatches,
-)
 from utils.email_tracking import (
     build_tracking_comment,
     embed_unique_id_in_email_body,
@@ -24,7 +19,10 @@ from utils.gpu import configure_gpu
 
 from services.backend_scheduler import BackendScheduler
 
-from .email_dispatch_chain_store import register_dispatch as register_dispatch_chain
+from .email_dispatch_chain_store import (
+    record_dispatch as record_workflow_dispatch,
+    register_dispatch as register_dispatch_chain,
+)
 from .email_service import EmailService
 from .email_thread_store import (
     DEFAULT_THREAD_TABLE,
@@ -239,33 +237,30 @@ class EmailDispatchService:
                 unique_identifier = backend_metadata.get("unique_id")
                 if workflow_identifier and unique_identifier:
                     try:
-                        init_tracking_schema()
-                        record_workflow_dispatches(
+                        record_workflow_dispatch(
                             workflow_id=workflow_identifier,
-                            dispatches=[
-                                WorkflowDispatchRow(
-                                    workflow_id=workflow_identifier,
-                                    unique_id=unique_identifier,
-                                    supplier_id=str(
-                                        backend_metadata.get("supplier_id")
-                                        or draft.get("supplier_id")
-                                        or ""
-                                    )
-                                    or None,
-                                    supplier_email=(
-                                        recipient_list[0]
-                                        if recipient_list
-                                        else draft.get("receiver")
-                                    ),
-                                    message_id=message_id,
-                                    subject=subject,
-                                    dispatched_at=datetime.now(timezone.utc),
-                                    responded_at=None,
-                                    response_message_id=None,
-                                    matched=False,
-                                )
-                            ],
+                            unique_id=unique_identifier,
+                            supplier_id=str(
+                                backend_metadata.get("supplier_id")
+                                or draft.get("supplier_id")
+                                or ""
+                            )
+                            or None,
+                            supplier_email=(
+                                recipient_list[0]
+                                if recipient_list
+                                else draft.get("receiver")
+                            ),
+                            message_id=message_id,
+                            subject=subject,
+                            dispatched_at=datetime.now(timezone.utc),
                         )
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to record workflow email dispatch for workflow %s",
+                            workflow_identifier,
+                        )
+                    else:
                         try:
                             BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
                                 workflow_identifier
@@ -275,11 +270,6 @@ class EmailDispatchService:
                                 "Failed to trigger email watcher for workflow %s",
                                 workflow_identifier,
                             )
-                    except Exception:  # pragma: no cover - defensive logging
-                        logger.exception(
-                            "Failed to record workflow email dispatch for workflow %s",
-                            workflow_identifier,
-                        )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
 

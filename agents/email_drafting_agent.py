@@ -2915,15 +2915,26 @@ class EmailDraftingAgent(BaseAgent):
                 self._ensure_table_exists(conn)
 
                 workflow_id = draft.get("workflow_id")
-                metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+                metadata_source = draft.get("metadata")
+                metadata = metadata_source if isinstance(metadata_source, dict) else {}
                 if not workflow_id:
                     workflow_id = metadata.get("workflow_id")
                 if not workflow_id:
+                    logger.error(
+                        "Draft missing workflow_id - this will break response tracking"
+                    )
                     workflow_id = uuid.uuid4().hex
                 draft["workflow_id"] = workflow_id
-                if not isinstance(metadata, dict):
-                    metadata = {}
+                metadata = dict(metadata)
+                metadata["workflow_id"] = workflow_id
                 draft["metadata"] = metadata
+
+                logger.info(
+                    "Storing draft with workflow_id=%s unique_id=%s supplier=%s",
+                    workflow_id,
+                    draft.get("unique_id"),
+                    draft.get("supplier_id"),
+                )
 
                 unique_id = self._resolve_unique_id(
                     workflow_id=workflow_id,
