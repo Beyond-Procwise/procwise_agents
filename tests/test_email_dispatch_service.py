@@ -250,10 +250,15 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
-    assert sent_args["headers"]["X-Procwise-RFQ-ID"] == "RFQ-UNIT"
+    assert "X-Procwise-RFQ-ID" not in sent_args["headers"]
     unique_id = extract_unique_id_from_body(result["body"])
     assert unique_id
     assert sent_args["headers"]["X-Procwise-Unique-Id"] == unique_id
+    if sent_args["headers"].get("X-Procwise-Workflow-Id"):
+        assert (
+            sent_args["headers"]["X-Procwise-Workflow-Id"]
+            == result["draft"]["dispatch_metadata"].get("workflow_id")
+        )
     assert result["draft"]["dispatch_metadata"]["rfq_id"] == "RFQ-UNIT"
     assert recorded_thread == {
         "message_id": "<message-id-1>",

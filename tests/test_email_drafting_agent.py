@@ -105,13 +105,13 @@ def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
         "supplier_id": "SUP-9",
         "to": "reply@example.com",
         "negotiation_message": negotiation_text,
-        "subject": "Re: Procurement Negotiation Update UID-XYZ987",
+        "subject": "Re: Pricing Discussion UID-XYZ987",
         "thread": {"message_id": "<thread-2>", "references": ["<thread-1>"]},
     }
 
     result = agent.from_decision(decision)
 
-    assert result["subject"] == "Re: Procurement Negotiation Update"
+    assert result["subject"] == "Re: Pricing Discussion"
     visible_body = _visible_body(result["body"])
     assert "RFQ-20240901-ABCD1234" not in visible_body
     assert "UID-XYZ987" not in visible_body
@@ -150,8 +150,9 @@ def test_from_decision_generates_unique_rfq_id(monkeypatch, fixed_unique_id):
     result = agent.from_decision(decision)
 
     assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
-    assert result["headers"]["X-Procwise-RFQ-ID"] == "RFQ-20250930-UN1QUEID"
+    assert "X-Procwise-RFQ-ID" not in result["headers"]
     assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert "X-Procwise-Workflow-Id" not in result["headers"]
     assert result["metadata"]["unique_id"] == fixed_unique_id
     assert result["unique_id"] == fixed_unique_id
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
@@ -184,8 +185,8 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     result = agent.from_prompt("Please follow up on RFQ XYZ")
 
-    assert result["subject"] == "RFQ XYZ follow-up"
-    assert result["text"] == "Polished draft referencing RFQ XYZ"
+    assert result["subject"] == module.DEFAULT_FOLLOW_UP_SUBJECT
+    assert result["text"] == "Polished draft referencing"
     assert result["rfq_id"] == "RFQ-20250930-96F5YFY9"
 
 
