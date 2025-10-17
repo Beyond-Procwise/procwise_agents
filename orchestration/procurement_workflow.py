@@ -341,28 +341,23 @@ class WorkflowOrchestrator:
                 round_num=round_num, expected_count=len(suppliers)
             )
 
-            if round_num < 3:
-                print(f"\n⏳ Waiting for Round {round_num} responses...")
-                round_responses = await self.wait_for_responses(
-                    len(suppliers), f"Round {round_num} responses", round_num=round_num
+            print(f"\n⏳ Waiting for Round {round_num} responses...")
+            round_responses = await self.wait_for_responses(
+                len(suppliers), f"Round {round_num} responses", round_num=round_num
+            )
+
+            for supplier_id, response in round_responses.items():
+                thread = self.active_threads[supplier_id]
+                thread.add_message(
+                    f"supplier_response_round_{round_num}",
+                    response["response_data"].get("content", ""),
+                    f"SUPP-R{round_num}-{thread.supplier_unique_id}",
                 )
+                results[f"{supplier_id}_supplier_response_round_{round_num}"] = response
+                self.session.supplier_states[supplier_id]["responses_received"] = round_num
 
-                for supplier_id, response in round_responses.items():
-                    thread = self.active_threads[supplier_id]
-                    thread.add_message(
-                        f"supplier_response_round_{round_num}",
-                        response["response_data"].get("content", ""),
-                        f"SUPP-R{round_num}-{thread.supplier_unique_id}",
-                    )
-                    results[
-                        f"{supplier_id}_supplier_response_round_{round_num}"
-                    ] = response
-                    self.session.supplier_states[supplier_id][
-                        "responses_received"
-                    ] = round_num
-
-                latest_responses = round_responses
-                print(f"✅ All Round {round_num} responses collected\n")
+            latest_responses = round_responses
+            print(f"✅ All Round {round_num} responses collected\n")
 
         print("✅ All 3 negotiation rounds complete")
         return results
