@@ -143,8 +143,9 @@ class WorkflowOrchestrator:
 
             print(f"\n📤 Round {round_num} drafts ready for human review")
 
-            # Wait for responses before next round
-            if round_num < 3:
+            # Wait for responses before next round (or final evaluation)
+            is_final_round = round_num == 3
+            if not is_final_round:
                 print(f"\n⏳ Waiting for Round {round_num} responses...")
                 round_responses = await self.wait_for_responses(len(suppliers), f"Round {round_num} responses")
 
@@ -159,6 +160,22 @@ class WorkflowOrchestrator:
                     self.session.supplier_states[supplier_id]['responses_received'] = round_num
 
                 print(f"✅ All Round {round_num} responses collected\n")
+
+        # Ensure final round responses are captured before evaluation
+        print("\n⏳ Waiting for Round 3 responses...")
+        final_round_responses = await self.wait_for_responses(len(suppliers), "Round 3 responses")
+
+        for supplier_id, response in final_round_responses.items():
+            thread = self.active_threads[supplier_id]
+            thread.add_message(
+                "supplier_response_round_3",
+                response['content'],
+                f"SUPP-R3-{thread.supplier_unique_id}"
+            )
+            results[f"{supplier_id}_supplier_response_round_3"] = response
+            self.session.supplier_states[supplier_id]['responses_received'] = 3
+
+        print("✅ All Round 3 responses collected\n")
 
         print(f"✅ All 3 negotiation rounds complete")
         return results
