@@ -2638,7 +2638,7 @@ class SupplierInteractionAgent(BaseAgent):
 
         # Ensure downstream agents evaluate or negotiate with the parsed response,
         # even when this path is invoked in a stateless context.
-        price = parsed.get("price")
+        price = self._coerce_float(parsed.get("price"))
         if price is not None and target is not None and price > target:
             next_agent = ["NegotiationAgent"]
         else:
