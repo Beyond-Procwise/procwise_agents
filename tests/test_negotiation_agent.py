@@ -781,3 +781,69 @@ def test_negotiation_agent_batch_records_failures(monkeypatch):
     assert output.data["failed_suppliers"]
     assert output.data["successful_suppliers"] == ["S1"]
     assert len(output.data["drafts"]) == 1
+
+
+def test_negotiation_agent_adopts_workflow_from_drafts_when_mismatched(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    class StubSupplierAgent:
+        def __init__(self):
+            self.calls: List[Any] = []
+
+        def wait_for_multiple_responses(self, entries, **kwargs):
+            self.calls.append((entries, kwargs))
+            return [
+                {
+                    "unique_id": entry.get("unique_id"),
+                    "workflow_id": entry.get("workflow_id"),
+                }
+                for entry in entries
+            ]
+
+    stub_supplier_agent = StubSupplierAgent()
+    monkeypatch.setattr(agent, "_get_supplier_agent", lambda: stub_supplier_agent)
+
+    context = AgentContext(
+        workflow_id="context-workflow",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+
+    watch_payload = {
+        "await_response": True,
+        "await_all_responses": True,
+        "expected_dispatch_count": 3,
+        "drafts": [
+            {
+                "unique_id": "DRAFT-1",
+                "supplier_id": "S-1",
+                "workflow_id": "draft-workflow",
+            },
+            {
+                "unique_id": "DRAFT-2",
+                "supplier_id": "S-2",
+                "workflow_id": "draft-workflow",
+            },
+            {
+                "unique_id": "DRAFT-3",
+                "supplier_id": "S-3",
+                "workflow_id": "draft-workflow",
+            },
+        ],
+    }
+
+    results = agent._await_supplier_responses(
+        context=context,
+        watch_payload=watch_payload,
+        state={},
+    )
+
+    assert isinstance(results, list)
+    assert len(results) == 3
+    assert stub_supplier_agent.calls, "Supplier agent should have been invoked"
+    entries, kwargs = stub_supplier_agent.calls[0]
+    assert len(entries) == 3
+    assert all(entry.get("workflow_id") == "draft-workflow" for entry in entries)
+    assert kwargs["enable_negotiation"] is False
