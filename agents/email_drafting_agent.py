@@ -338,6 +338,12 @@ class EmailDraftingAgent(BaseAgent):
         )
 
         cleaned = re.sub(
+            r"(?i)\bPROC-WF-[A-F0-9]{6,}\b",
+            "",
+            cleaned,
+        )
+
+        cleaned = re.sub(
             r"(?i)\b(WF|workflow|wf)[\s:-]+[A-Za-z0-9-]{6,}\b",
             "",
             cleaned,
@@ -2994,8 +3000,6 @@ class EmailDraftingAgent(BaseAgent):
             return existing_value
 
         workflow_hint = self._normalise_tracking_value(workflow_id)
-        if not workflow_hint:
-            workflow_hint = self._normalise_tracking_value(rfq_id)
         if not workflow_hint:
             workflow_hint = f"WF-{uuid.uuid4().hex}"
 

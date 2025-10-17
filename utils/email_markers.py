@@ -83,6 +83,11 @@ def _strip_visible_identifiers(text: str) -> str:
         cleaned,
     )
     cleaned = re.sub(
+        r"(?i)\bPROC-WF-[A-F0-9]{6,}\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
         r"(?i)\b(workflow|WF)[\s:-]*[A-Za-z0-9-]{8,}\b",
         "",
         cleaned,
@@ -156,7 +161,7 @@ def attach_hidden_marker(
 
     tracking_id = unique_id or existing_metadata.get("tracking")
     if not tracking_id:
-        tracking_id = f"UID-{uuid.uuid4().hex[:16].upper()}"
+        tracking_id = f"PROC-WF-{uuid.uuid4().hex[:12].upper()}"
 
     token_value = token or existing_metadata.get("token")
     if not token_value:

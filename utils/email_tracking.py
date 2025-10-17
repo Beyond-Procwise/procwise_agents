@@ -23,9 +23,9 @@ _HIDDEN_SPAN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_UID_PREFIX = "UID-"
-_UID_ALPHABET = string.ascii_uppercase + string.digits
-_DEFAULT_UID_LENGTH = 16
+_UID_PREFIX = "PROC-WF-"
+_UID_ALPHABET = "0123456789ABCDEF"
+_DEFAULT_UID_LENGTH = 12
 
 
 @dataclass(frozen=True)
@@ -186,10 +186,10 @@ def _canonicalise_identifier(value: Optional[str]) -> Optional[str]:
 def generate_unique_email_id(workflow_id: str, supplier_id: Optional[str] = None) -> str:
     """Create a deterministic-looking unique identifier for outbound emails.
 
-    The identifier is always prefixed with ``UID-`` followed by an uppercase
-    alphanumeric token.  A small amount of workflow and supplier entropy is
-    mixed in to avoid obvious sequential patterns while remaining opaque to
-    external recipients.
+    The identifier is always prefixed with ``PROC-WF-`` followed by a
+    12-character uppercase hexadecimal token.  Workflow and supplier entropy
+    are folded into the hash input to avoid sequential identifiers while
+    keeping the value opaque to external recipients.
     """
 
     workflow = _canonicalise_identifier(workflow_id)
@@ -197,11 +197,11 @@ def generate_unique_email_id(workflow_id: str, supplier_id: Optional[str] = None
         raise ValueError("workflow_id is required to generate a unique email id")
 
     supplier = _canonicalise_identifier(supplier_id) or "anon"
-    random_bits = secrets.token_hex(16)
+    random_bits = secrets.token_hex(12)
     digest_source = f"{workflow}|{supplier}|{random_bits}|{datetime.utcnow().isoformat()}"
-    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest().upper()
 
-    token = "".join(ch for ch in digest.upper() if ch in _UID_ALPHABET)
+    token = "".join(ch for ch in digest if ch in _UID_ALPHABET)
     if len(token) < _DEFAULT_UID_LENGTH:
         token += "".join(secrets.choice(_UID_ALPHABET) for _ in range(_DEFAULT_UID_LENGTH - len(token)))
     return f"{_UID_PREFIX}{token[:_DEFAULT_UID_LENGTH]}"

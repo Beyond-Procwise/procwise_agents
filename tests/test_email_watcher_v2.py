@@ -75,12 +75,12 @@ def test_generate_unique_email_id_produces_prefixed_ids():
     workflow_id = "wf-test"
     supplier_id = "sup-001"
     ids = {generate_unique_email_id(workflow_id, supplier_id) for _ in range(20)}
-    assert all(uid.startswith("UID-") for uid in ids)
+    assert all(uid.startswith("PROC-WF-") for uid in ids)
     assert len(ids) == 20
 
 
 def test_embed_unique_id_is_recoverable():
-    uid = "UID-ABC1234567890"
+    uid = "PROC-WF-ABC123DEF456"
     body = embed_unique_id_in_email_body("Hello Supplier", uid)
     assert uid in body
     assert extract_unique_id_from_body(body) == uid
