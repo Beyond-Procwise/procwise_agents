@@ -63,7 +63,10 @@ class Orchestrator:
         "quote": "quote_evaluation",
         "comparison": "quote_comparison",
         "comparisons": "quote_comparison",
+        "supplierinteractionagent": "supplier_interaction",
     }
+
+    GATEKEEPER_AGENTS: Set[str] = {"supplier_interaction"}
 
     def __init__(self, agent_nick, *, training_endpoint=None):
         # Ensure GPU environment is initialised before any agent execution.
@@ -2078,29 +2081,73 @@ class Orchestrator:
         self, agents: List[str], context: AgentContext, pass_fields: Dict
     ) -> Dict:
         """Execute agents in parallel"""
-        results = {}
-        futures = {}
+        results: Dict[str, Any] = {}
+        futures: Dict[Any, str] = {}
 
+        gatekeepers: List[str] = []
+        normal_agents: List[str] = []
         for agent_name in agents:
-            if agent_name in self.agents:
-                child_context = self._create_child_context(
-                    context, agent_name, pass_fields
-                )
-                future = self.executor.submit(
-                    self._execute_agent, agent_name, child_context
-                )
-                futures[future] = agent_name
+            if agent_name not in self.agents:
+                continue
+            if self._is_gatekeeper_agent(agent_name):
+                gatekeepers.append(agent_name)
+            else:
+                normal_agents.append(agent_name)
+
+        for agent_name in gatekeepers:
+            child_context = self._create_child_context(
+                context, agent_name, pass_fields
+            )
+            workflow_hint = child_context.input_data.get("workflow") or child_context.workflow_id
+            logger.info(
+                "Waiting for %s to complete... workflow=%s",
+                agent_name,
+                workflow_hint,
+            )
+            result = self._execute_agent(agent_name, child_context)
+            logger.info(
+                "%s completed for workflow=%s with status=%s",
+                agent_name,
+                workflow_hint,
+                getattr(result, "status", None),
+            )
+            results[agent_name] = result.data if result else None
+            if result and result.pass_fields:
+                self._merge_pass_fields(pass_fields, result.pass_fields)
+
+        for agent_name in normal_agents:
+            child_context = self._create_child_context(
+                context, agent_name, pass_fields
+            )
+            future = self.executor.submit(
+                self._execute_agent, agent_name, child_context
+            )
+            futures[future] = agent_name
 
         for future in as_completed(futures):
             agent_name = futures[future]
             try:
-                result = future.result(timeout=30)
+                result = future.result()
                 results[agent_name] = result.data if result else None
-            except Exception as e:
-                logger.error(f"Parallel execution failed for {agent_name}: {e}")
-                results[agent_name] = {"error": str(e)}
+                if result and result.pass_fields:
+                    self._merge_pass_fields(pass_fields, result.pass_fields)
+            except Exception as exc:
+                logger.error(
+                    "Parallel execution failed for %s: %s",
+                    agent_name,
+                    exc,
+                )
+                results[agent_name] = {"error": str(exc)}
 
         return results
+
+    def _is_gatekeeper_agent(self, agent_name: str) -> bool:
+        try:
+            canonical = self._resolve_agent_name(str(agent_name))
+        except Exception:
+            canonical = str(agent_name).strip().lower()
+        mapped = self.AGENT_TOKEN_ALIASES.get(canonical.replace(" ", ""), canonical)
+        return mapped in self.GATEKEEPER_AGENTS
 
     def _execute_sequential_agents(
         self, agents: List[str], context: AgentContext, pass_fields: Dict
