@@ -651,6 +651,43 @@ def test_update_process_status_updates_process_details():
     assert stored["status"] == "completed"
 
 
+def test_update_process_status_accepts_textual_tokens():
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+
+    prs.update_process_status(5, "completed", process_details={"status": "saved", "agents": []})
+    first_params = conn.cursor_obj.params
+    assert first_params[0] == 1
+    stored = json.loads(first_params[1])
+    assert stored["status"] == "completed"
+
+    prs.update_process_status(6, "failed", process_details={"status": "saved", "agents": []})
+    second_params = conn.cursor_obj.params
+    assert second_params[0] == -1
+    stored_fail = json.loads(second_params[1])
+    assert stored_fail["status"] == "failed"
+
+
+def test_classify_completion_status_handles_tokens():
+    success_numeric = ProcessRoutingService.classify_completion_status(100)
+    assert success_numeric == (1, "completed", True)
+
+    success_text = ProcessRoutingService.classify_completion_status("success")
+    assert success_text == (1, "completed", True)
+
+    failure_text = ProcessRoutingService.classify_completion_status("error")
+    assert failure_text == (-1, "failed", True)
+
+    unknown = ProcessRoutingService.classify_completion_status("maybe")
+    assert unknown[0] == -1
+    assert unknown[1] == "failed"
+    assert unknown[2] is False
+
+
 def test_log_run_detail_keeps_agent_statuses():
     details = {
         "status": "",
