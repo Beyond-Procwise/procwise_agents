@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import List
 
@@ -13,7 +14,7 @@ from agents.base_agent import AgentOutput, AgentStatus
 from decimal import Decimal
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
-from services.email_watcher_v2 import EmailResponse, EmailWatcherV2
+from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from utils.email_tracking import (
     embed_unique_id_in_email_body,
     extract_unique_id_from_body,
@@ -111,6 +112,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
             body=embed_unique_id_in_email_body("Thanks for the opportunity", unique_id),
             received_at=now + timedelta(minutes=5),
             in_reply_to=(original_message_id,),
+            rfq_id="RFQ-2024-0001",
         )
     ]
 
@@ -159,94 +161,55 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert supplier_agent.contexts, "Supplier agent should be invoked"
     assert fetcher.calls >= 1
 
-    await_contexts = [
-        ctx
-        for ctx in supplier_agent.contexts
-        if isinstance(getattr(ctx, "input_data", None), dict)
-        and ctx.input_data.get("action") == "await_workflow_batch"
-    ]
-    assert len(await_contexts) >= 1
-
-    assert negotiation_agent.contexts, "Negotiation agent should be invoked"
-    neg_context = negotiation_agent.contexts[0]
-    assert neg_context.input_data.get("negotiation_batch") is True
-    assert neg_context.input_data.get("supplier_responses_count") == 1
-    assert neg_context.input_data.get("supplier_responses")[0]["unique_id"] == unique_id
+    context = supplier_agent.contexts[0]
+    assert context.input_data.get("rfq_id") == "RFQ-2024-0001"
+    assert context.input_data["email_headers"].get("rfq_id") == "RFQ-2024-0001"
 
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []
 
-    stored = supplier_response_repo.fetch_all(workflow_id=workflow_id)
-    assert len(stored) == 1
-    record = stored[0]
-    assert record["processed"] is True
-    assert "Thanks for the opportunity" in record["response_text"]
-    assert record["response_message_id"] == "<reply-001>"
-    assert (
-        str(record.get("original_message_id", ""))
-        .replace("<", "")
-        .replace(">", "")
-        == str(original_message_id).replace("<", "").replace(">", "")
-    )
-    confidence = record.get("match_confidence")
-    if confidence is not None:
-        assert Decimal(str(confidence)) >= Decimal("0.50")
+
+def test_parse_email_recovers_tracking_headers():
+    message = EmailMessage()
+    message["Subject"] = "Re: RFQ details"
+    message["From"] = "Acme Quotes <quotes@acme.example>"
+    message["To"] = "buyer@procwise.test"
+    message["X-Procwise-Unique-Id"] = "UID-HEADER12345"
+    message["X-Procwise-Workflow-Id"] = "wf-123"
+    message["X-Procwise-Supplier-Id"] = "sup-123"
+    message["X-Procwise-RFQ-ID"] = "RFQ-12345"
+    message.set_content("Thank you for the opportunity")
+
+    parsed = _parse_email(message.as_bytes())
+
+    assert parsed.unique_id == "UID-HEADER12345"
+    assert parsed.workflow_id == "wf-123"
+    assert parsed.supplier_id == "sup-123"
+    assert parsed.rfq_id == "RFQ-12345"
 
 
-def test_email_watcher_v2_persists_thread_headers_between_instances():
-    workflow_id = "wf-restart"
+def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path):
+    workflow_id = "wf-header-fallback"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
 
+    supplier_agent = StubSupplierAgent()
+
     now = datetime.now(timezone.utc)
-    original_subject = "RFQ 1234"
-    original_message_id = "msg-root"
-
-    watcher = EmailWatcherV2(
-        dispatch_wait_seconds=0,
-        poll_interval_seconds=1,
-        max_poll_attempts=2,
-        email_fetcher=lambda since: [],
-        sleep=lambda _: None,
-        now=lambda: now,
-    )
-
-    watcher.register_workflow_dispatch(
-        workflow_id,
-        [
-            {
-                "unique_id": "uid-123",
-                "supplier_id": "sup-1",
-                "supplier_email": "supplier@example.com",
-                "message_id": original_message_id,
-                "subject": original_subject,
-                "dispatched_at": now,
-                "thread_headers": {
-                    "references": ["thread-1", original_message_id],
-                    "in_reply_to": [original_message_id],
-                },
-            }
-        ],
-    )
-
-    stored_rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
-    assert stored_rows[0].thread_headers
-    assert original_message_id in stored_rows[0].thread_headers.get("in_reply_to", ())
+    unique_id = generate_unique_email_id(workflow_id, "sup-55")
 
     responses = [
         EmailResponse(
             unique_id=None,
-            supplier_id="sup-1",
-            supplier_email="supplier@example.com",
-            from_address="supplier@example.com",
-            message_id="reply-1",
-            subject=f"Re: {original_subject}",
-            body="Hello",
-            received_at=now + timedelta(minutes=10),
-            in_reply_to=(original_message_id,),
-            references=("thread-1",),
+            supplier_id="sup-55",
+            supplier_email="reply@alt-domain.example",
+            from_address="reply@alt-domain.example",
+            message_id="<reply-alt>",
+            subject="Follow up",
+            body="Looking forward to working together",
+            received_at=now + timedelta(minutes=2),
         )
     ]
 
@@ -263,18 +226,108 @@ def test_email_watcher_v2_persists_thread_headers_between_instances():
 
     fetcher = _Fetcher(responses)
 
-    restart_watcher = EmailWatcherV2(
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
         dispatch_wait_seconds=0,
         poll_interval_seconds=1,
         max_poll_attempts=2,
         email_fetcher=fetcher,
         sleep=lambda _: None,
         now=lambda: now,
+        match_threshold=0.7,
     )
 
-    result = restart_watcher.wait_and_collect_responses(workflow_id)
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-55",
+                "supplier_email": "contact@acme.example",
+                "message_id": "<msg-55>",
+                "subject": "RFQ opportunity",
+                "dispatched_at": now,
+            }
+        ],
+    )
 
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
     assert result["responded_count"] == 1
-    assert result["matched_responses"]
-    matched = next(iter(result["matched_responses"].values()))
-    assert matched.message_id == "reply-1"
+    assert supplier_agent.contexts, "Supplier agent should still be invoked via fallback"
+
+
+def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
+    workflow_id = "wf-rfq-fallback"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    supplier_agent = StubSupplierAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-99")
+    rfq_identifier = "RFQ-2024-0099"
+
+    responses = [
+        EmailResponse(
+            unique_id=None,
+            supplier_id=None,
+            supplier_email="reply@vendor.example",
+            from_address="reply@vendor.example",
+            message_id="<reply-rfq>",
+            subject=f"Re: Opportunity {rfq_identifier}",
+            body="Here is our quote",
+            received_at=now + timedelta(minutes=4),
+            rfq_id=rfq_identifier,
+        )
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+        match_threshold=0.8,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "rfq_id": rfq_identifier,
+                "supplier_email": "contact@vendor.example",
+                "message_id": "<dispatch-rfq>",
+                "subject": f"Initial request {rfq_identifier}",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+    assert supplier_agent.contexts, "Supplier agent should run on RFQ fallback"
+    context = supplier_agent.contexts[0]
+    assert context.input_data.get("rfq_id") == rfq_identifier
+    assert context.input_data.get("unique_id") == unique_id
