@@ -960,6 +960,57 @@ def test_wait_for_multiple_responses_realigns_mixed_workflows(monkeypatch):
         assert result["supplier_id"] == draft["supplier_id"]
 
 
+def test_wait_for_multiple_responses_short_circuits_when_all_unique_ids_dropped(
+    monkeypatch,
+):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    monkeypatch.setattr(
+        workflow_email_tracking_repo,
+        "lookup_workflow_for_unique",
+        lambda **_: "wf-other",
+    )
+    monkeypatch.setattr(
+        draft_rfq_emails_repo,
+        "load_by_unique_id",
+        lambda **_: {"workflow_id": "wf-other"},
+    )
+
+    def _fail_dispatch_ready(**_kwargs):
+        raise AssertionError("dispatch wait should not run when all unique_ids are dropped")
+
+    def _fail_response_rows(*_args, **_kwargs):
+        raise AssertionError("response fetch should not run when all unique_ids are dropped")
+
+    monkeypatch.setattr(agent, "_await_dispatch_ready", _fail_dispatch_ready)
+    monkeypatch.setattr(agent, "_await_supplier_response_rows", _fail_response_rows)
+
+    drafts = [
+        {
+            "rfq_id": "RFQ-mismatch-1",
+            "supplier_id": "SUP-1",
+            "unique_id": "uid-1",
+            "workflow_id": "wf-canonical",
+        },
+        {
+            "rfq_id": "RFQ-mismatch-2",
+            "supplier_id": "SUP-2",
+            "unique_id": "uid-2",
+            "workflow_id": "wf-canonical",
+        },
+    ]
+
+    results = agent.wait_for_multiple_responses(
+        drafts,
+        timeout=5,
+        poll_interval=1,
+        limit=1,
+    )
+
+    assert results == [None, None]
+
+
 def test_wait_for_multiple_responses_requires_dispatch_completion(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
