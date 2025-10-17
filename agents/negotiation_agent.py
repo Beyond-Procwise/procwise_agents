@@ -454,6 +454,46 @@ class NegotiationAgent(BaseAgent):
                 ),
             )
 
+        workflow_id = shared_context.get("workflow_id") or getattr(context, "workflow_id", None)
+        expected_total_raw = (
+            shared_context.get("expected_count")
+            or shared_context.get("expected_responses")
+            or shared_context.get("expected_email_count")
+        )
+        expected_total: Optional[int] = None
+        if expected_total_raw is not None:
+            try:
+                expected_total = int(expected_total_raw)
+            except Exception:
+                logger.debug(
+                    "Unable to coerce expected_total=%s for workflow_id=%s", expected_total_raw, workflow_id
+                )
+                expected_total = None
+        if expected_total is not None and expected_total > 0 and len(prepared_entries) < expected_total:
+            logger.error(
+                "Batch negotiation received incomplete entries for workflow=%s (got=%s, expected=%s)",
+                workflow_id,
+                len(prepared_entries),
+                expected_total,
+            )
+            error_payload = {
+                "negotiation_batch": True,
+                "workflow_id": workflow_id,
+                "expected_count": expected_total,
+                "received_count": len(prepared_entries),
+                "results": [],
+                "error": f"Incomplete batch: received {len(prepared_entries)}/{expected_total} entries",
+            }
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data=error_payload,
+                    pass_fields=error_payload,
+                    error="incomplete_batch",
+                ),
+            )
+
         if len(prepared_entries) == 1:
             try:
                 return self._execute_batch_entry(context, prepared_entries[0])
@@ -1138,11 +1178,25 @@ class NegotiationAgent(BaseAgent):
         if recipients:
             draft_payload.setdefault("recipients", recipients)
 
-        thread_headers = None
+        thread_headers: Optional[Any] = None
         if isinstance(context.input_data, dict):
-            thread_headers = context.input_data.get("thread_headers")
-        if thread_headers:
+            incoming_thread_headers = context.input_data.get("thread_headers")
+            if isinstance(incoming_thread_headers, dict):
+                thread_headers = dict(incoming_thread_headers)
+            else:
+                thread_headers = incoming_thread_headers
+        if not thread_headers:
+            cached_thread_headers = state.get("last_thread_headers")
+            if isinstance(cached_thread_headers, dict):
+                thread_headers = dict(cached_thread_headers)
+            else:
+                thread_headers = cached_thread_headers
+        if isinstance(thread_headers, dict) and thread_headers:
             draft_payload.setdefault("thread_headers", thread_headers)
+            state["last_thread_headers"] = dict(thread_headers)
+        elif thread_headers:
+            draft_payload.setdefault("thread_headers", thread_headers)
+            state["last_thread_headers"] = thread_headers
 
         draft_metadata = {
             "counter_price": decision.get("counter_price"),
@@ -1249,6 +1303,11 @@ class NegotiationAgent(BaseAgent):
                     state,
                     negotiation_message,
                 )
+        subject_candidate = email_subject or draft_payload.get("subject")
+        if subject_candidate and not state.get("base_subject"):
+            base_from_email = self._normalise_base_subject(subject_candidate)
+            if base_from_email:
+                state["base_subject"] = base_from_email
 
         if email_subject:
             base_from_email = self._normalise_base_subject(email_subject)
@@ -1387,6 +1446,24 @@ class NegotiationAgent(BaseAgent):
                             error="supplier response timeout",
                         ),
                     )
+                wait_thread_headers: Optional[Dict[str, Any]] = None
+                if isinstance(wait_results, dict):
+                    candidate_headers = wait_results.get("thread_headers")
+                    if isinstance(candidate_headers, dict) and candidate_headers:
+                        wait_thread_headers = dict(candidate_headers)
+                elif isinstance(wait_results, list):
+                    for candidate in wait_results:
+                        if not isinstance(candidate, dict):
+                            continue
+                        candidate_headers = candidate.get("thread_headers")
+                        if isinstance(candidate_headers, dict) and candidate_headers:
+                            wait_thread_headers = dict(candidate_headers)
+                            break
+                if wait_thread_headers:
+                    state["last_thread_headers"] = dict(wait_thread_headers)
+                    wait_message_id = self._coerce_text(wait_thread_headers.get("message_id"))
+                    if wait_message_id:
+                        message_id = wait_message_id
                 supplier_responses = [res for res in wait_results if isinstance(res, dict)]
                 if not supplier_responses:
                     logger.error(
@@ -1859,6 +1936,7 @@ class NegotiationAgent(BaseAgent):
             "last_email_sent_at": None,
             "base_subject": None,
             "initial_body": None,
+            "last_thread_headers": None,
             "positions": {},
             "last_counter_price": None,
         }
@@ -4894,6 +4972,12 @@ class NegotiationAgent(BaseAgent):
         )
         if not thread_headers:
             thread_headers = payload.get("thread_headers")
+        if not thread_headers:
+            cached_thread_headers = state.get("last_thread_headers")
+            if isinstance(cached_thread_headers, dict):
+                thread_headers = dict(cached_thread_headers)
+            else:
+                thread_headers = cached_thread_headers
         if thread_headers:
             payload.setdefault("thread_headers", thread_headers)
             decision_payload.setdefault("thread", thread_headers)
