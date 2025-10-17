@@ -1678,13 +1678,18 @@ class NegotiationAgent(BaseAgent):
         should_cost: Optional[float],
         signals: Dict[str, Any],
     ) -> Dict[str, Any]:
+        price_val = self._coerce_float(price)
+        target_val = self._coerce_float(target)
+
         buyer_max = None
-        if target is not None and price is not None:
-            buyer_max = min(target, price)
-        elif target is not None:
-            buyer_max = target
-        elif price is not None:
-            buyer_max = price
+        if target_val is not None and price_val is not None:
+            buyer_max = min(target_val, price_val)
+        elif target_val is not None:
+            buyer_max = target_val
+        elif price_val is not None:
+            buyer_max = price_val
+
+        buyer_max = self._validate_buyer_max(buyer_max)
 
         candidates: List[float] = []
         if should_cost is not None and should_cost > 0:
@@ -1739,13 +1744,18 @@ class NegotiationAgent(BaseAgent):
                 decision["lead_time_request"] = "Split shipment or expedite slot if possible"
             return decision
 
-        supplier_floor = zopa.get("supplier_floor")
-        entry = zopa.get("entry_counter")
+        buyer_max = self._validate_buyer_max(zopa.get("buyer_max"))
+        supplier_floor = self._coerce_float(zopa.get("supplier_floor"))
+        entry = self._coerce_float(zopa.get("entry_counter"))
         if not price_locked and price and target_price and entry:
             if current_round == 1:
                 decision["counter_price"] = min(entry, (price + target_price) / 2)
             else:
-                if buyer_max and supplier_floor and supplier_floor < buyer_max:
+                if (
+                    buyer_max is not None
+                    and supplier_floor is not None
+                    and supplier_floor < buyer_max
+                ):
                     midpoint = (buyer_max + supplier_floor) / 2
                     decision["counter_price"] = round(
                         min(decision.get("counter_price") or entry, midpoint), 2
@@ -1787,9 +1797,9 @@ class NegotiationAgent(BaseAgent):
 
         _ = policy, constraints  # reserved for future constraint-aware adjustments
 
-        buyer_max = zopa.get("buyer_max")
-        supplier_floor = zopa.get("supplier_floor")
-        entry = zopa.get("entry_counter")
+        buyer_max = self._validate_buyer_max(zopa.get("buyer_max"))
+        supplier_floor = self._coerce_float(zopa.get("supplier_floor"))
+        entry = self._coerce_float(zopa.get("entry_counter"))
 
         price_candidates: List[float] = []
         if target and price:
@@ -1811,9 +1821,9 @@ class NegotiationAgent(BaseAgent):
             if candidate is None:
                 continue
             value = candidate
-            if buyer_max and value > buyer_max:
+            if buyer_max is not None and value > buyer_max:
                 value = buyer_max
-            if supplier_floor and value < supplier_floor:
+            if supplier_floor is not None and value < supplier_floor:
                 value = supplier_floor
             sanitized.append(round(value, 2))
         price_candidates = sorted(set(sanitized))
@@ -5160,6 +5170,16 @@ class NegotiationAgent(BaseAgent):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _validate_buyer_max(self, value: Any) -> Optional[float]:
+        parsed = self._coerce_float(value)
+        if parsed is None:
+            return None
+        if not math.isfinite(parsed):
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
 
     def _positive_int(self, value: Any, *, fallback: int) -> int:
         try:
