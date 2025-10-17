@@ -677,6 +677,7 @@ class DocumentExtractor:
         lines = [line.rstrip("\n").replace("\u00a0", " ") for line in text.splitlines()]
         processed: List[str] = []
         for line in lines:
+            line = re.sub(r"\t+", "    ", line)
             if not scanned:
                 if re.search(r"\s{2,}\S", line):
                     cleaned_line = line.rstrip()
