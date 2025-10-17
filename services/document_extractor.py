@@ -23,17 +23,12 @@ from datetime import datetime
 import json
 import logging
 import re
-import textwrap
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-from services.ml_pipeline import DocumentUnderstandingModel
-from services.ocr_pipeline import OCRPreprocessor
 
 from utils.procurement_schema import (
     DOC_TYPE_TO_TABLE,
     PROCUREMENT_SCHEMAS,
-    extract_structured_content,
 )
 
 try:  # Optional dependency – only required for PDF handling in tests.
@@ -331,7 +326,13 @@ HEADER_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
         "total_contract_value": [("total", "value"), ("contract", "value")],
     },
     "Quote": {
-        "quote_id": [("quote", "number"), ("quotation", "number"), ("quote", "#"), ("quotation", "#")],
+        "quote_id": [
+            ("quote", "number"),
+            ("quotation", "number"),
+            ("quote", "#"),
+            ("quotation", "#"),
+            ("proposal", "number"),
+        ],
         "quote_date": [("quote", "date"), ("quotation", "date")],
         "validity_date": [("valid", "until"), ("valid", "date"), ("expiry", "date")],
         "total_amount": [("total", "amount"), ("quote", "total")],
@@ -366,141 +367,6 @@ LINE_KEYWORDS: Dict[str, Dict[str, List[Tuple[str, ...]]]] = {
         "line_amount": [("line", "total"), ("line", "amount"), ("amount",)],
     },
 }
-
-
-class _LocalModelExtractor:
-    """Thin wrapper around a local Ollama model for structured extraction."""
-
-    def __init__(
-        self,
-        preferred_models: Optional[Iterable[str]] = None,
-        *,
-        chat_options: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self._preferred_models = tuple(preferred_models or ("qwen3", "phi4"))
-        self._chat_options = chat_options or {}
-        self._ollama = None
-        self._model_name: Optional[str] = None
-
-        try:  # pragma: no cover - optional dependency
-            import ollama  # type: ignore
-
-            self._ollama = ollama
-        except Exception:
-            logger.debug("Ollama client not available for local extraction")
-            return
-
-        self._model_name = self._resolve_model_name()
-
-    def _resolve_model_name(self) -> Optional[str]:  # pragma: no cover - optional dependency
-        if not self._ollama:
-            return None
-
-        for model_name in self._preferred_models:
-            if not model_name:
-                continue
-            try:
-                self._ollama.show(model_name)
-            except Exception:
-                continue
-            return model_name
-        return None
-
-    def available(self) -> bool:
-        return bool(self._ollama and self._model_name)
-
-    def extract(
-        self,
-        text: str,
-        document_type: str,
-        *,
-        field_hints: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        if not self.available():
-            return None
-        if not text.strip():
-            return None
-
-        header_columns: List[str] = []
-        line_columns: List[str] = []
-        table_headers: List[List[str]] = []
-        if field_hints:
-            header_columns = sorted({str(col) for col in field_hints.get("header_fields", [])})
-            line_columns = sorted({str(col) for col in field_hints.get("line_item_fields", [])})
-            table_headers = [
-                [str(value) for value in headers]
-                for headers in field_hints.get("table_headers", [])
-            ]
-
-        prompt = textwrap.dedent(
-            f"""
-            You are a specialised procurement data extractor.
-            Determine the precise header fields and line items for a {document_type} document.
-            Use the observed fields to remain consistent with the document formatting.
-            Header columns already detected: {header_columns}.
-            Line item columns already detected: {line_columns}.
-            Table headers observed: {table_headers}.
-            If a column is absent from the text, omit it.
-            Represent amounts and dates exactly as they appear.
-
-            Return a JSON object with keys:
-              - document_type: canonical type name
-              - header: object of header fields
-              - line_items: list of objects
-              - tables: list of tables with "headers" and "rows" keys
-
-            Document text:
-            ---
-            {text}
-            ---
-            """
-        ).strip()
-
-        try:  # pragma: no cover - optional dependency
-            response = self._ollama.chat(
-                model=self._model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You convert procurement documents into structured JSON. "
-                            "Always respond with valid JSON only."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                options=self._chat_options,
-                format="json",
-            )
-        except Exception:
-            logger.warning("Local model extraction failed", exc_info=True)
-            return None
-
-        message = (response or {}).get("message", {})
-        content = message.get("content", "").strip()
-        if not content:
-            return None
-
-        payload = self._parse_json(content)
-        return payload
-
-    @staticmethod
-    def _parse_json(content: str) -> Optional[Dict[str, Any]]:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```json", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"^```", "", cleaned)
-            cleaned = cleaned.strip()
-            if cleaned.endswith("```"):
-                cleaned = cleaned[: -3].strip()
-        try:
-            parsed = json.loads(cleaned)
-        except Exception:
-            logger.warning("Unable to parse JSON returned by local model")
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        return parsed
 
 
 @dataclass
@@ -539,25 +405,16 @@ class DocumentExtractor:
         connection_factory: Callable[[], Any],
         reference_path: Optional[Path] = None,
         *,
-        llm_client: Optional[_LocalModelExtractor] = None,
+        llm_client: Optional[Any] = None,
         preferred_models: Optional[Iterable[str]] = None,
         chat_options: Optional[Dict[str, Any]] = None,
-        ocr_preprocessor: Optional[OCRPreprocessor] = None,
-        ml_model: Optional[DocumentUnderstandingModel] = None,
+        ocr_preprocessor: Optional[Any] = None,
+        ml_model: Optional[Any] = None,
     ) -> None:
         self._connection_factory = connection_factory
         self._ensured_tables: set[str] = set()
-        self._llm = llm_client or _LocalModelExtractor(
-            preferred_models=preferred_models,
-            chat_options=chat_options,
-        )
-        self._ocr = ocr_preprocessor or OCRPreprocessor()
-        self._ml_model = ml_model or DocumentUnderstandingModel(
-            header_lookup=SCHEMA_HEADER_LOOKUP,
-            line_lookup=SCHEMA_LINE_LOOKUP,
-            header_keywords=HEADER_KEYWORDS,
-            line_keywords=LINE_KEYWORDS,
-        )
+        self._llm = llm_client
+        _ = (reference_path, preferred_models, chat_options, ocr_preprocessor, ml_model)
         self._db_dialect = "generic"
         try:
             with closing(self._connection_factory()) as conn:
@@ -610,22 +467,17 @@ class DocumentExtractor:
             metadata_payload.get("ocr")
         )
 
-        ocr_override = self._ocr.extract(path, scanned=scanned)
-        if ocr_override:
-            text, detected_tables = ocr_override.text, ocr_override.tables
-        else:
-            text, detected_tables = self._extract_text_and_tables(
-                path,
-                ingestion_mode=ingestion_mode_value or None,
-                metadata=metadata_payload or None,
-            )
+        text, detected_tables = self._extract_text_and_tables(
+            path,
+            ingestion_mode=ingestion_mode_value or None,
+            metadata=metadata_payload or None,
+        )
 
-        text = self._ocr.preprocess_text(text, scanned=scanned)
-        schema_payload: Optional[Dict[str, Any]] = None
+        text = self._preprocess_text(text, scanned=scanned)
         if document_type:
             detected_type = document_type
         else:
-            detected_type, schema_payload = self._detect_document_type(text)
+            detected_type = self._detect_document_type(text)
         if detected_type not in RAW_TABLE_MAPPING:
             logger.warning(
                 "Document type '%s' not recognised; defaulting to Contract",
@@ -637,33 +489,6 @@ class DocumentExtractor:
         line_items, derived_tables = self._extract_line_items_from_text(
             text, detected_type
         )
-        header, line_items = self._apply_schema_guidance(
-            text,
-            detected_type,
-            header,
-            line_items,
-            schema_payload=schema_payload,
-        )
-
-        ml_payload = None
-        try:
-            ml_payload = self._ml_model.infer(text, detected_type, scanned=scanned)
-        except Exception:  # pragma: no cover - defensive safety net
-            logger.debug("ML document understanding model failed", exc_info=True)
-            ml_payload = None
-
-        if ml_payload:
-            header = self._merge_header_fields(
-                header, ml_payload.header, detected_type
-            )
-            line_items = self._merge_line_items(
-                line_items,
-                ml_payload.line_items,
-                document_type=detected_type,
-            )
-            for table in ml_payload.tables:
-                if isinstance(table, dict) and table.get("rows"):
-                    derived_tables.append(table)
 
         field_hints = self._build_field_hints(
             detected_type,
@@ -734,116 +559,74 @@ class DocumentExtractor:
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         return f"{stem or 'document'}-{timestamp}"
 
-    def _detect_document_type(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def _detect_document_type(self, text: str) -> str:
         lowered = text.lower()
         if not lowered.strip():
-            return "Contract", None
+            return "Contract"
 
+        normalised = re.sub(r"\s+", " ", lowered)
+
+        scores: Dict[str, int] = {}
+        for document_type, sequences in DOCUMENT_TYPE_KEYWORDS.items():
+            score = 0
+            for sequence in sequences:
+                if self._sequence_in_text(normalised, sequence):
+                    score += len(sequence)
+            scores[document_type] = score
+
+        priority = ["Invoice", "Purchase_Order", "Quote", "Contract"]
         best_type = "Contract"
-        best_score = float("-inf")
-        best_payload: Optional[Dict[str, Any]] = None
+        best_score = 0
+        best_hits = 0
 
-        for document_type in PROCUREMENT_STRUCTURE.keys():
-            payload: Optional[Dict[str, Any]] = None
-            schema_score = 0.0
-            if document_type in DOC_TYPE_TO_TABLE:
-                try:
-                    payload = extract_structured_content(text, document_type)
-                except Exception:
-                    payload = None
-                schema_score = self._schema_detection_score(document_type, payload)
-
-            keyword_score = self._keyword_detection_score(lowered, document_type)
-            total_score = schema_score + keyword_score
-
-            if total_score > best_score:
-                best_score = total_score
-                best_type = document_type
-                best_payload = payload
-
-        if best_score <= 0:
-            fallback = self._fallback_document_type(lowered)
-            if fallback:
-                return fallback, None
-            return "Contract", None
-
-        if best_score < 6 and best_type != "Contract":
-            return "Contract", None
-
-        return best_type, best_payload if isinstance(best_payload, dict) else None
-
-    def _schema_detection_score(
-        self,
-        document_type: str,
-        payload: Optional[Dict[str, Any]],
-    ) -> float:
-        if not isinstance(payload, dict):
-            return 0.0
-
-        structure = PROCUREMENT_STRUCTURE.get(document_type, {})
-        expected_headers = len(structure.get("header_fields", [])) or 1
-        expected_line_fields = len(structure.get("line_item_fields", [])) or 1
-
-        header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
-        header_hits = sum(1 for value in header.values() if str(value).strip())
-        header_score = 0.0
-        if header_hits:
-            header_score = (header_hits / expected_headers) * 3.0 + header_hits
-
-        line_items = (
-            payload.get("line_items")
-            if isinstance(payload.get("line_items"), list)
-            else []
-        )
-        unique_line_fields: set[str] = set()
-        populated_rows = 0
-        for item in line_items:
-            if not isinstance(item, dict):
-                continue
-            cleaned = {k: v for k, v in item.items() if str(v).strip()}
-            if cleaned:
-                populated_rows += 1
-                unique_line_fields.update(cleaned.keys())
-
-        line_field_score = 0.0
-        if unique_line_fields:
-            line_field_score = (
-                len(unique_line_fields) / expected_line_fields
-            ) * 2.0 + len(unique_line_fields) * 0.5
-        row_score = populated_rows * 0.5
-
-        return header_score + line_field_score + row_score
-
-    def _keyword_detection_score(self, lowered: str, document_type: str) -> float:
-        score = 0.0
-        for sequence in DOCUMENT_TYPE_KEYWORDS.get(document_type, []):
-            frequency = self._sequence_score(lowered, sequence)
-            if frequency:
-                score += (2.5 + 0.5 * (len(sequence) - 1)) * frequency
-
-        for mapping in (HEADER_KEYWORDS.get(document_type, {}), LINE_KEYWORDS.get(document_type, {})):
-            for sequences in mapping.values():
+        header_hits: Dict[str, int] = {}
+        for document_type in priority:
+            hits = 0
+            for sequences in HEADER_KEYWORDS.get(document_type, {}).values():
                 for sequence in sequences:
-                    frequency = self._sequence_score(lowered, sequence)
-                    if frequency:
-                        score += 0.75 * frequency
-        return score
+                    if self._sequence_in_text(normalised, sequence):
+                        hits += 1
+                        break
+            header_hits[document_type] = hits
 
-    def _fallback_document_type(self, lowered: str) -> Optional[str]:
-        for candidate in ("Invoice", "Purchase_Order", "Quote", "Contract"):
-            sequences = DOCUMENT_TYPE_KEYWORDS.get(candidate, [])
-            if any(self._sequence_score(lowered, sequence) for sequence in sequences):
-                return candidate
-        return None
+        for document_type in priority:
+            score = scores.get(document_type, 0)
+            hits = header_hits.get(document_type, 0)
+            if score > best_score:
+                best_type = document_type
+                best_score = score
+                best_hits = hits
+            elif score == best_score and score > 0:
+                if hits > best_hits:
+                    best_type = document_type
+                    best_hits = hits
+                elif hits == best_hits and priority.index(document_type) < priority.index(best_type):
+                    best_type = document_type
+
+        if best_score > 0:
+            return best_type
+
+        keyword_fallbacks = {
+            "Invoice": ("invoice", "due", "amount due"),
+            "Purchase_Order": ("purchase order", "po", "order date"),
+            "Quote": ("quote", "quotation", "proposal"),
+            "Contract": ("contract", "agreement", "service agreement"),
+        }
+        for document_type, tokens in keyword_fallbacks.items():
+            if any(self._sequence_in_text(normalised, (token,)) for token in tokens):
+                return document_type
+
+        return "Contract"
 
     @staticmethod
-    def _sequence_score(text: str, sequence: Tuple[str, ...]) -> float:
+    def _sequence_in_text(text: str, sequence: Tuple[str, ...]) -> bool:
         if not sequence:
-            return 0.0
-        counts = [text.count(token) for token in sequence if token]
-        if not counts or any(count == 0 for count in counts):
-            return 0.0
-        return float(min(counts))
+            return False
+        tokens = [token.strip() for token in sequence if token.strip()]
+        if not tokens:
+            return False
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(token) for token in tokens) + r"(?!\w)"
+        return re.search(pattern, text) is not None
 
     def _extract_text_and_tables(
         self,
@@ -886,6 +669,24 @@ class DocumentExtractor:
         except Exception:
             logger.exception("Unable to read document %s", path)
             return "", []
+
+    def _preprocess_text(self, text: str, *, scanned: bool) -> str:
+        if not text:
+            return ""
+
+        lines = [line.rstrip("\n").replace("\u00a0", " ") for line in text.splitlines()]
+        processed: List[str] = []
+        for line in lines:
+            if not scanned:
+                if re.search(r"\s{2,}\S", line):
+                    cleaned_line = line.rstrip()
+                else:
+                    cleaned_line = re.sub(r"\s{2,}", " ", line).strip()
+            else:
+                cleaned_line = line.strip()
+            if cleaned_line:
+                processed.append(cleaned_line)
+        return "\n".join(processed)
 
     def _invoke_local_model(
         self,
@@ -1383,47 +1184,6 @@ class DocumentExtractor:
             "quotation": "Quote",
         }
         return mapping.get(normalised)
-
-    def _apply_schema_guidance(
-        self,
-        text: str,
-        document_type: str,
-        header: Dict[str, Any],
-        line_items: List[Dict[str, Any]],
-        *,
-        schema_payload: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        if document_type not in DOC_TYPE_TO_TABLE:
-            return header, line_items
-
-        payload: Optional[Dict[str, Any]] = None
-        if schema_payload is not None:
-            payload = schema_payload
-        else:
-            try:
-                payload = extract_structured_content(text, document_type)
-            except Exception:
-                logger.debug(
-                    "Schema-guided extraction failed for document type %s",
-                    document_type,
-                    exc_info=True,
-                )
-                return header, line_items
-
-        schema_header = (
-            payload.get("header") if isinstance(payload, dict) else None
-        ) or {}
-        schema_lines = (
-            payload.get("line_items") if isinstance(payload, dict) else None
-        ) or []
-
-        merged_header = self._merge_header_fields(
-            header, schema_header, document_type
-        )
-        merged_lines = self._merge_line_items(
-            line_items, schema_lines, document_type=document_type
-        )
-        return merged_header, merged_lines
 
     def _merge_header_fields(
         self,
