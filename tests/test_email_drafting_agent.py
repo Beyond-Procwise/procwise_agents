@@ -19,7 +19,7 @@ def restore_env(monkeypatch):
 
 @pytest.fixture
 def fixed_unique_id(monkeypatch):
-    token = "UID-1234567890ABCD"
+    token = "PROC-WF-1A2B3C4D5E6F"
     monkeypatch.setattr(module, "generate_unique_email_id", lambda *_, **__: token)
     return token
 
@@ -98,14 +98,14 @@ def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
     negotiation_text = (
         "Hello team,\n"
         "Regarding RFQ-20240901-ABCD1234 we can move to revised terms.\n"
-        "Reference UID-XYZ987 for internal routing."
+        "Reference PROC-WF-ABC123DEF456 for internal routing."
     )
     decision = {
         "rfq_id": "RFQ-20240901-ABCD1234",
         "supplier_id": "SUP-9",
         "to": "reply@example.com",
         "negotiation_message": negotiation_text,
-        "subject": "Re: Pricing Discussion UID-XYZ987",
+        "subject": "Re: Pricing Discussion PROC-WF-ABC123DEF456",
         "thread": {"message_id": "<thread-2>", "references": ["<thread-1>"]},
     }
 
@@ -114,7 +114,7 @@ def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
     assert result["subject"] == "Re: Pricing Discussion"
     visible_body = _visible_body(result["body"])
     assert "RFQ-20240901-ABCD1234" not in visible_body
-    assert "UID-XYZ987" not in visible_body
+    assert "PROC-WF-ABC123DEF456" not in visible_body
     assert "Hello team" in visible_body
     assert result["headers"]["In-Reply-To"] == "<thread-2>"
     assert result["headers"]["References"] == "<thread-1>"
