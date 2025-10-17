@@ -84,9 +84,13 @@ def run_agents(
                 final = result.get("status")
             else:
                 final = 0
-            prs.update_process_status(process_id, 1 if final == 100 else -1)
+            numeric_status, status_label, _ = prs.classify_completion_status(final)
+            prs.update_process_status(process_id, numeric_status)
             logger.info(
-                "Completed process %s with final status %s", process_id, final
+                "Completed process %s with final status %s (mapped to %s)",
+                process_id,
+                final,
+                status_label,
             )
         except Exception as exc:
             logger.exception(
