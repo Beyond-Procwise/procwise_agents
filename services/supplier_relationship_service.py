@@ -483,51 +483,50 @@ class SupplierRelationshipService:
         target_id = str(supplier_id) if supplier_id else None
         target_name = self._normalise_key(supplier_name) if supplier_name else None
 
-        cache = self._fallback_cache
-        if cache is None:
-            cache_builder: Dict[str, Dict[str, List[Dict[str, Any]]]] = {"id": {}, "name": {}}
-            page_size = 256
-            next_offset = None
-            build_failed = False
+        page_size = max(limit, 50)
+        max_points_to_scan = max(2000, page_size * 40)
+        next_offset = None
+        scanned = 0
+        matches: List[Dict[str, Any]] = []
 
-            while True:
-                try:
-                    results, next_offset = self.client.scroll(
-                        collection_name=self.collection_name,
-                        scroll_filter=None,
-                        with_payload=True,
-                        with_vectors=False,
-                        limit=page_size,
-                        offset=next_offset,
-                    )
-                except Exception:
-                    logger.exception(
-                        "SupplierRelationshipService fallback scroll failed while building in-memory relationship cache"
-                    )
-                    build_failed = True
-                    break
+        while True:
+            try:
+                results, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=None,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=page_size,
+                    offset=next_offset,
+                )
+            except Exception:
+                logger.exception(
+                    "SupplierRelationshipService fallback scroll failed while loading supplier relationship"
+                )
+                break
 
                 if not results:
                     break
 
-                for payload in self._extract_payloads(results):
-                    document_type = payload.get("document_type")
-                    if document_type and document_type != "supplier_relationship":
-                        continue
-                    sid = str(payload.get("supplier_id") or "").strip()
-                    if sid:
-                        cache_builder.setdefault("id", {}).setdefault(sid, []).append(payload)
-                    normalised_name = payload.get("supplier_name_normalized") or self._normalise_key(
+            scanned += len(results)
+            for payload in self._extract_payloads(results):
+                document_type = payload.get("document_type")
+                if document_type and document_type != "supplier_relationship":
+                    continue
+
+                if target_id and str(payload.get("supplier_id")) != target_id:
+                    continue
+
+                if target_name:
+                    payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
                         payload.get("supplier_name")
                     )
-                    if normalised_name:
-                        cache_builder.setdefault("name", {}).setdefault(normalised_name, []).append(payload)
+                    if payload_name != target_name:
+                        continue
 
-                if next_offset is None:
-                    break
-
-            if build_failed:
-                return []
+                matches.append(payload)
+                if len(matches) >= limit:
+                    return matches
 
             cache = cache_builder
             self._fallback_cache = cache
@@ -553,7 +552,14 @@ class SupplierRelationshipService:
             seen.add(record_id)
             deduped.append(payload)
 
-        return deduped[:limit]
+            if scanned >= max_points_to_scan:
+                logger.warning(
+                    "SupplierRelationshipService fallback scan aborted after inspecting %s records without finding enough"
+                    " matches", scanned
+                )
+                break
+
+        return matches
 
     @staticmethod
     def _is_missing_index_error(exc: Exception) -> bool:
