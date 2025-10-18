@@ -2269,6 +2269,7 @@ class Orchestrator:
             task_profile=manifest.get("task", {}),
             policy_context=manifest.get("policies", []),
             knowledge_base=manifest.get("knowledge", {}),
+            process_id=parent_context.process_id,
         )
         child_context.apply_manifest(manifest)
         return child_context

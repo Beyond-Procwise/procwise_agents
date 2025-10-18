@@ -47,17 +47,45 @@ class DummyConn:
         pass
 
 
-def test_log_process_defaults_status_zero():
+def test_log_process_defaults_status_zero(monkeypatch):
     conn = DummyConn()
     agent = SimpleNamespace(
         get_db_connection=lambda: conn,
         settings=SimpleNamespace(script_user="tester"),
     )
     prs = ProcessRoutingService(agent)
+    monkeypatch.setattr(
+        ProcessRoutingService,
+        "_generate_workflow_id",
+        staticmethod(lambda: "wf-fixed"),
+    )
     pid = prs.log_process("foo", {"a": 1})
     assert pid == 42
     # process_status should default to 0 and not be None
-    assert conn.cursor_obj.params[5] == 0
+    assert conn.cursor_obj.params[6] == 0
+    assert conn.cursor_obj.params[1] == "wf-fixed"
+    stored_details = json.loads(conn.cursor_obj.params[2])
+    assert stored_details["workflow_id"] == "wf-fixed"
+
+
+def test_validate_workflow_id_success(monkeypatch):
+    agent = SimpleNamespace(
+        get_db_connection=lambda: None,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    monkeypatch.setattr(prs, "get_workflow_id", lambda process_id: "wf-1")
+    assert prs.validate_workflow_id(123, "wf-1") is True
+
+
+def test_validate_workflow_id_failure(monkeypatch):
+    agent = SimpleNamespace(
+        get_db_connection=lambda: None,
+        settings=SimpleNamespace(script_user="tester"),
+    )
+    prs = ProcessRoutingService(agent)
+    monkeypatch.setattr(prs, "get_workflow_id", lambda process_id: "wf-expected")
+    assert prs.validate_workflow_id(123, "wf-other") is False
 
 
 def test_convert_agents_to_flow_builds_tree():

@@ -375,6 +375,9 @@ def test_execute_logs_process_action_when_service_available(monkeypatch):
             self.logged["log_action"] = kwargs
             return "action-101"
 
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
+
     recorder = Recorder()
     agent_nick = SimpleNamespace(
         process_routing_service=recorder,
@@ -446,6 +449,12 @@ def test_email_drafting_personalises_supplier_content(monkeypatch):
 
         def log_action(self, **kwargs):
             return None
+
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
+
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
 
     agent_nick = SimpleNamespace(
         settings=SimpleNamespace(

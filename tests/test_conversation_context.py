@@ -87,6 +87,9 @@ class RecordingProcessRoutingService:
     def log_action(self, **kwargs):
         return "action-1"
 
+    def validate_workflow_id(self, *_args, **_kwargs):
+        return True
+
 
 class ContextAwareAgent(base_agent.BaseAgent):
     def __init__(self, nick, memory, writer):
