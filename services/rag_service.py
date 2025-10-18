@@ -1,7 +1,7 @@
+import json
 import logging
-import os
 import uuid
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
 
 import numpy as np
@@ -57,39 +57,79 @@ class RAGService:
         step = max_chars - overlap if max_chars > overlap else max_chars
         return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
 
-    def upsert_texts(self, texts: List[str], metadata: Optional[Dict] = None):
-        """Encode and upsert texts into Qdrant, FAISS and BM25."""
+    def upsert_payloads(
+        self,
+        payloads: List[Dict[str, Any]],
+        text_representation_key: str = "content",
+    ):
+        """Encode and upsert structured payloads into Qdrant, FAISS and BM25."""
+
+        if not payloads:
+            return
+
         points: List[models.PointStruct] = []
-        metadata = metadata or {}
-        for text in texts:
-            chunks = self._chunk_text(text)
+        texts_for_embedding: List[str] = []
+        payloads_for_storage: List[Dict[str, Any]] = []
+
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+
+            text_to_embed = payload.get(text_representation_key)
+            if not isinstance(text_to_embed, str) or not text_to_embed.strip():
+                try:
+                    text_to_embed = json.dumps(payload, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    text_to_embed = ""
+
+            chunks = self._chunk_text(text_to_embed)
             if not chunks:
                 continue
-            vectors = self.embedder.encode(
-                chunks, normalize_embeddings=True, show_progress_bar=False
+
+            record_id = payload.get("record_id") or str(uuid.uuid4())
+
+            for idx, chunk in enumerate(chunks):
+                chunk_payload = {**payload, "content": chunk, "chunk_id": idx, "record_id": record_id}
+                texts_for_embedding.append(chunk)
+                payloads_for_storage.append(chunk_payload)
+
+        if not texts_for_embedding:
+            return
+
+        vectors = self.embedder.encode(
+            texts_for_embedding, normalize_embeddings=True, show_progress_bar=False
+        )
+
+        new_vectors: List[np.ndarray] = []
+        for idx, (vector, payload) in enumerate(zip(vectors, payloads_for_storage)):
+            point_id = self._build_point_id(
+                payload.get("record_id", str(uuid.uuid4())), payload.get("chunk_id", idx)
             )
-            record_id = metadata.get("record_id", str(uuid.uuid4()))
-            for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
-                payload = {"content": chunk, "chunk_id": idx, **metadata}
-                point_id = self._build_point_id(record_id, idx)
-                vec = np.array(vector, dtype="float32")
-                points.append(
-                    models.PointStruct(id=point_id, vector=vec.tolist(), payload=payload)
-                )
+            vec = np.array(vector, dtype="float32")
+            points.append(
+                models.PointStruct(id=point_id, vector=vec.tolist(), payload=payload)
+            )
 
-                # --- Update local FAISS/BM25 indexes ---
-                self._doc_vectors.append(vec)
-                self._documents.append({"id": point_id, **payload})
-                self._bm25_corpus.append(chunk.lower().split())
+            # --- Update local FAISS/BM25 indexes ---
+            new_vectors.append(vec)
+            self._doc_vectors.append(vec)
+            self._documents.append({"id": point_id, **payload})
+            content_value = payload.get("content")
+            if isinstance(content_value, str):
+                self._bm25_corpus.append(content_value.lower().split())
+            else:
+                self._bm25_corpus.append([])
 
-        if self._doc_vectors:
-            dim = len(self._doc_vectors[0])
+        if new_vectors:
+            dim = len(new_vectors[0])
             if self._faiss_index is None:
                 index = faiss.IndexFlatIP(dim)
                 index = self._maybe_init_gpu_index(index)
                 self._faiss_index = index
-            self._faiss_index.add(np.vstack(self._doc_vectors))
-            self._bm25 = BM25Okapi(self._bm25_corpus)
+            stacked = np.vstack(new_vectors)
+            self._faiss_index.add(stacked)
+            if self._bm25_corpus:
+                self._bm25 = BM25Okapi(self._bm25_corpus)
 
         if points:
             self.client.upsert(
@@ -97,6 +137,16 @@ class RAGService:
                 points=points,
                 wait=True,
             )
+
+    def upsert_texts(self, texts: List[str], metadata: Optional[Dict] = None):
+        """Backward compatible wrapper around :meth:`upsert_payloads`."""
+
+        metadata = metadata or {}
+        payloads: List[Dict[str, Any]] = []
+        for text in texts:
+            payloads.append({**metadata, "content": text})
+
+        self.upsert_payloads(payloads, text_representation_key="content")
 
     def _build_point_id(self, record_id: str, chunk_idx: int) -> str:
         """Create a Qdrant-compatible point ID for the given record chunk."""
