@@ -45,7 +45,6 @@ def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
 
     monkeypatch.setattr(module, "_chat", fake_chat)
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00001")
 
     agent = EmailDraftingAgent()
     decision = {
@@ -80,7 +79,7 @@ def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
     assert result["contact_level"] == 1
     assert result["sender"]
     assert result["sent_status"] is False
-    assert calls[0]["payload"]["rfq_id"] == "RFQ-20250930-RFQ00001"
+    assert calls[0]["payload"]["unique_id"] == fixed_unique_id
     assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
     assert result["metadata"]["unique_id"] == fixed_unique_id
     assert result["unique_id"] == fixed_unique_id
@@ -92,7 +91,6 @@ def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
 
     monkeypatch.setattr(module, "_chat", fail_chat)
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00002")
 
     agent = EmailDraftingAgent()
     negotiation_text = (
@@ -121,14 +119,14 @@ def test_from_decision_uses_negotiation_message(monkeypatch, fixed_unique_id):
     assert result["unique_id"] == fixed_unique_id
 
 
-def test_from_decision_subject_fallback(monkeypatch):
+def test_from_decision_subject_fallback(monkeypatch, fixed_unique_id):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-RFQ00001")
     agent = EmailDraftingAgent()
     result = agent.from_decision({"rfq_id": "ABC"})
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
     assert result["text"] == "Body without explicit subject"
+    assert result["unique_id"] == fixed_unique_id
 
 
 def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
@@ -139,17 +137,16 @@ def test_subject_fallback_does_not_duplicate_rfq_prefix(monkeypatch):
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
-def test_from_decision_generates_unique_rfq_id(monkeypatch, fixed_unique_id):
+def test_from_decision_generates_unique_identifier(monkeypatch, fixed_unique_id):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-UN1QUEID")
 
     agent = EmailDraftingAgent()
-    decision = {"rfq_id": None, "supplier_id": "S-42"}
+    decision = {"supplier_id": "S-42"}
 
     result = agent.from_decision(decision)
 
-    assert result["rfq_id"] == "RFQ-20250930-UN1QUEID"
+    assert "rfq_id" not in result
     assert "X-Procwise-RFQ-ID" not in result["headers"]
     assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
     assert "X-Procwise-Workflow-Id" not in result["headers"]
@@ -158,16 +155,17 @@ def test_from_decision_generates_unique_rfq_id(monkeypatch, fixed_unique_id):
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
 
 
-def test_from_decision_normalises_lowercase_rfq_id(monkeypatch):
+def test_from_decision_strips_rfq_identifier(monkeypatch, fixed_unique_id):
     monkeypatch.setattr(module, "_chat", lambda *_, **__: "Body without explicit subject")
     agent = EmailDraftingAgent()
 
     result = agent.from_decision({"rfq_id": "rfq-20250930-abc12345"})
 
-    assert result["rfq_id"] == "RFQ-20250930-ABC12345"
+    assert result["unique_id"] == fixed_unique_id
+    assert "rfq_id" not in result
 
 
-def test_prompt_mode_with_polish(monkeypatch):
+def test_prompt_mode_with_polish(monkeypatch, fixed_unique_id):
     responses = iter([
         "Subject: RFQ XYZ follow-up\nInitial draft",  # compose
         "Subject: RFQ XYZ follow-up\nPolished draft referencing RFQ XYZ",  # polish
@@ -178,7 +176,6 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     monkeypatch.setattr(module, "_chat", fake_chat)
     monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
-    monkeypatch.setattr(module, "_generate_rfq_id", lambda: "RFQ-20250930-96F5YFY9")
 
     agent = EmailDraftingAgent()
     agent.polish_model = "gemma3"
@@ -187,12 +184,13 @@ def test_prompt_mode_with_polish(monkeypatch):
 
     assert result["subject"] == module.DEFAULT_FOLLOW_UP_SUBJECT
     assert result["text"] == "Polished draft referencing"
-    assert result["rfq_id"] == "RFQ-20250930-96F5YFY9"
+    assert result["unique_id"] == fixed_unique_id
+    assert "rfq_id" not in result
 
 
 def test_decision_context_to_public_json():
     ctx = DecisionContext(
-        rfq_id="R1",
+        unique_id="U1",
         supplier_id="S",
         supplier_name="Name",
         current_offer=12.3,
@@ -208,7 +206,7 @@ def test_decision_context_to_public_json():
         thread=ThreadHeaders(message_id="m"),
     )
     data = ctx.to_public_json()
-    assert data["rfq_id"] == "R1"
+    assert data["unique_id"] == "U1"
     assert data["asks"] == ["item"]
 
 
@@ -393,7 +391,16 @@ def test_execute_logs_process_action_when_service_available(monkeypatch):
     assert result.data["drafts"][0]["action_id"] == "action-101"
     assert recorder.logged["log_process"]["user_id"] == "tester"
     assert recorder.logged["log_action"]["status"] == "completed"
-    assert recorder.logged["log_action"]["process_output"]["drafts"]
+    logged_output = recorder.logged["log_action"]["process_output"]
+    assert logged_output["drafts"]
+    assert "rfq_id" not in logged_output
+    assert all("rfq_id" not in draft for draft in logged_output["drafts"])
+    assert all(
+        "rfq_id" not in (draft.get("metadata") or {})
+        for draft in logged_output["drafts"]
+        if isinstance(draft, dict)
+    )
+    assert all(draft.get("unique_id") for draft in logged_output["drafts"])
 
 
 def test_email_drafting_personalises_supplier_content(monkeypatch):

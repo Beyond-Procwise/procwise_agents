@@ -274,7 +274,7 @@ class BaseAgent:
         # process logging tables retain the authoritative payload while the
         # storage layer remains responsible for any serialisation required.
         logged_input = context.input_data
-        logged_output = result.data
+        logged_output = self._prepare_logged_output(result.data)
         process_id: Optional[int] = None
         action_id: Optional[str] = None
         if routing_service:
