@@ -21,7 +21,9 @@ class DummyNick:
         self.settings = SimpleNamespace(script_user="tester")
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: None,
+            log_run_detail=lambda **_: None,
             log_action=lambda **_: None,
+            validate_workflow_id=lambda *args, **kwargs: True,
         )
         self.ollama_options = lambda: {}
         self.pandas_connection = None

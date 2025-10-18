@@ -1,4 +1,5 @@
 import os
+import os
 import sys
 from types import SimpleNamespace
 
@@ -26,6 +27,9 @@ class DummyPRS:
 
     def log_run_detail(self, **kwargs):
         return kwargs.get("run_id", "r1")
+
+    def validate_workflow_id(self, *_args, **_kwargs):
+        return True
 
     def update_process_status(self, *args, **kwargs):
         pass

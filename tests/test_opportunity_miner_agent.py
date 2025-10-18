@@ -1691,6 +1691,7 @@ def test_registry_matches_numeric_policy_identifiers_without_catalog():
                 log_run_detail=lambda **kwargs: None,
                 log_action=lambda **kwargs: None,
                 update_process_status=lambda **kwargs: None,
+                validate_workflow_id=lambda *args, **kwargs: True,
             )
 
     agent = OpportunityMinerAgent(CataloglessNick())

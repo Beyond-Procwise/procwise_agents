@@ -126,6 +126,9 @@ def test_json_flow_injects_proc_agent_prompts_and_policies():
         def _load_agent_links(self):  # pragma: no cover - cache primed
             return {}, {}, {}
 
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
+
     nick = SimpleNamespace(
         settings=SimpleNamespace(script_user="tester", max_workers=1),
         agents={"opportunity_miner": CaptureAgent()},
@@ -493,6 +496,9 @@ def test_inject_agent_instructions_uses_agent_defaults():
         def _load_agent_links(self):  # pragma: no cover - not triggered
             return {}, {}, {}
 
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
+
     nick = SimpleNamespace(
         settings=SimpleNamespace(script_user="tester", max_workers=1, parallel_processing=False),
         agents={"opportunity_miner": DummyAgent()},
@@ -570,6 +576,9 @@ def test_supplier_ranking_flow_applies_agent_prompts_and_policies():
 
         def _load_agent_links(self):  # pragma: no cover - cache already primed
             return {}, {}, {}
+
+        def validate_workflow_id(self, *_args, **_kwargs):
+            return True
 
     class AllowAllPolicy:
         def validate_workflow(self, *_, **__):  # pragma: no cover - simple stub

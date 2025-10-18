@@ -48,6 +48,9 @@ class DummyPRS:
     def log_run_detail(self, **kwargs):
         return kwargs.get("run_id", "r1")
 
+    def validate_workflow_id(self, *_args, **_kwargs):
+        return True
+
     def convert_agents_to_flow(self, details):
         from services.process_routing_service import ProcessRoutingService
 

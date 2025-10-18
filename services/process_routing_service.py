@@ -24,6 +24,12 @@ class ProcessRoutingService:
 
     DEFAULT_LLM_MODEL = "gpt-oss"
 
+    @staticmethod
+    def _generate_workflow_id() -> str:
+        """Generate a unique workflow identifier."""
+
+        return str(uuid.uuid4())
+
     STATUS_SUCCESS_TOKENS = {
         "completed",
         "complete",
@@ -835,6 +841,7 @@ class ProcessRoutingService:
         user_name: Optional[str] = None,
         created_by: Optional[str] = None,
         process_status: Optional[int] = None,
+        workflow_id: Optional[str] = None,
     ) -> Optional[int]:
         """Insert a process routing record and return the new ``process_id``.
 
@@ -850,19 +857,38 @@ class ProcessRoutingService:
         # avoid ``NULL`` constraint violations.
         process_status = 0 if process_status is None else process_status
 
+        resolved_workflow_id = (workflow_id or "").strip()
+        if not resolved_workflow_id:
+            resolved_workflow_id = self._generate_workflow_id()
+            logger.info(
+                "Generated workflow_id %s for process %s",
+                resolved_workflow_id,
+                process_name,
+            )
+        else:
+            logger.info(
+                "Using provided workflow_id %s for process %s",
+                resolved_workflow_id,
+                process_name,
+            )
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
+                    normalised_details = self.normalize_process_details(process_details)
+                    if isinstance(normalised_details, dict):
+                        normalised_details.setdefault("workflow_id", resolved_workflow_id)
                     cursor.execute(
                         """
                         INSERT INTO proc.routing
-                            (process_name, process_details, created_by, user_id, user_name, process_status)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (process_name, workflow_id, process_details, created_by, user_id, user_name, process_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         RETURNING process_id
                         """,
                         (
                             process_name,
-                            self._safe_dumps(self.normalize_process_details(process_details)),
+                            resolved_workflow_id,
+                            self._safe_dumps(normalised_details),
                             created_by or self.settings.script_user,
                             user_id,
                             user_name,
@@ -872,12 +898,59 @@ class ProcessRoutingService:
                     process_id = cursor.fetchone()[0]
                     conn.commit()
                     logger.info(
-                        "Logged process %s with id %s", process_name, process_id
+                        "Logged process %s with id %s (workflow_id=%s)",
+                        process_name,
+                        process_id,
+                        resolved_workflow_id,
                     )
                     return process_id
         except Exception:
             logger.exception("Failed to log process %s", process_name)
             return None
+
+    def get_workflow_id(self, process_id: int) -> Optional[str]:
+        """Fetch the workflow identifier for a recorded process."""
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT workflow_id FROM proc.routing WHERE process_id = %s",
+                        (process_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        value = row[0]
+                        if isinstance(value, str):
+                            return value
+                        if value is not None:
+                            return str(value)
+        except Exception:
+            logger.exception(
+                "Failed to fetch workflow_id for process %s", process_id
+            )
+        return None
+
+    def validate_workflow_id(self, process_id: int, claimed_workflow_id: str) -> bool:
+        """Validate that ``claimed_workflow_id`` matches the stored record."""
+
+        actual = self.get_workflow_id(process_id)
+        if actual is None:
+            logger.error(
+                "Process %s has no stored workflow_id", process_id
+            )
+            return False
+
+        if actual != claimed_workflow_id:
+            logger.error(
+                "Workflow mismatch for process %s: expected %s, received %s",
+                process_id,
+                actual,
+                claimed_workflow_id,
+            )
+            return False
+
+        return True
 
     def get_process_details(self, process_id: int, raw: bool = False) -> Optional[Dict[str, Any]]:
         """Fetch the ``process_details`` blob for a given ``process_id``.

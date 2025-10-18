@@ -22,6 +22,9 @@ class DummyProcessRoutingService:
     def log_action(self, **_kwargs):
         return f"action-{self._counter}"
 
+    def validate_workflow_id(self, *_args, **_kwargs):
+        return True
+
 
 class DummyAgentNick:
     def __init__(self, connection_factory: Optional[Callable[[], object]] = None):

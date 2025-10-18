@@ -61,11 +61,46 @@ class AgentContext:
     task_profile: Dict[str, Any] = field(default_factory=dict)
     policy_context: List[Dict[str, Any]] = field(default_factory=list)
     knowledge_base: Dict[str, Any] = field(default_factory=dict)
+    process_id: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if not self.workflow_id:
+            raise ValueError("workflow_id is required for AgentContext")
+
+        if isinstance(self.input_data, dict):
+            self.input_data.setdefault("workflow_id", self.workflow_id)
+
         # track invocation time and update routing path
         self.timestamp = datetime.utcnow()
         self.routing_history.append(self.agent_id)
+
+    def create_child_context(
+        self,
+        agent_id: str,
+        input_data: Optional[Dict[str, Any]] = None,
+    ) -> "AgentContext":
+        """Create a child context that preserves workflow metadata."""
+
+        child_payload: Dict[str, Any] = {}
+        if isinstance(self.input_data, dict):
+            child_payload.update(self.input_data)
+        if isinstance(input_data, dict):
+            child_payload.update(input_data)
+
+        child_payload["workflow_id"] = self.workflow_id
+
+        return AgentContext(
+            workflow_id=self.workflow_id,
+            agent_id=agent_id,
+            user_id=self.user_id,
+            input_data=child_payload,
+            parent_agent=self.agent_id,
+            routing_history=self.routing_history.copy(),
+            task_profile=dict(self.task_profile),
+            policy_context=[dict(policy) for policy in self.policy_context],
+            knowledge_base=dict(self.knowledge_base),
+            process_id=self.process_id,
+        )
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -198,6 +233,22 @@ class BaseAgent:
         every agent invocation is captured in the database regardless of how it
         is triggered.
         """
+
+        routing_service = getattr(self.agent_nick, "process_routing_service", None)
+        if context.process_id and routing_service:
+            if not routing_service.validate_workflow_id(
+                context.process_id, context.workflow_id
+            ):
+                logger.error(
+                    "%s execution blocked due to workflow mismatch",
+                    self.__class__.__name__,
+                )
+                return AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={},
+                    error=f"Workflow ID mismatch for process {context.process_id}",
+                )
+
         logger.info("%s: starting", self.__class__.__name__)
         start_ts = datetime.utcnow()
         try:
@@ -223,38 +274,47 @@ class BaseAgent:
         # process logging tables retain the authoritative payload while the
         # storage layer remains responsible for any serialisation required.
         logged_input = context.input_data
-        logged_output = self._prepare_logged_output(result.data)
-        process_id = self.agent_nick.process_routing_service.log_process(
-            process_name=self.__class__.__name__,
-            process_details={"input": logged_input, "output": logged_output},
-            user_id=context.user_id,
-            user_name=self.agent_nick.settings.script_user,
-            process_status=0,
-        )
-        if process_id is not None:
-            run_id = self.agent_nick.process_routing_service.log_run_detail(
-                process_id=process_id,
-                process_status=status,
+        logged_output = result.data
+        process_id: Optional[int] = None
+        action_id: Optional[str] = None
+        if routing_service:
+            process_id = routing_service.log_process(
+                process_name=self.__class__.__name__,
                 process_details={"input": logged_input, "output": logged_output},
-                process_start_ts=start_ts,
-                process_end_ts=end_ts,
-                triggered_by=context.user_id,
+                user_id=context.user_id,
+                user_name=self.agent_nick.settings.script_user,
+                process_status=0,
+                workflow_id=context.workflow_id,
             )
-            action_id = self.agent_nick.process_routing_service.log_action(
-                process_id=process_id,
-                agent_type=self.__class__.__name__,
-                action_desc=logged_input,
-                process_output=logged_output,
-                status="completed" if result.status == AgentStatus.SUCCESS else "failed",
-                run_id=run_id,
-            )
-            result.action_id = action_id
-            result.data["action_id"] = action_id
-            drafts = result.data.get("drafts")
-            if isinstance(drafts, list):
-                for draft in drafts:
-                    if isinstance(draft, dict):
-                        draft["action_id"] = action_id
+            if process_id is not None:
+                context.process_id = process_id
+                run_id = routing_service.log_run_detail(
+                    process_id=process_id,
+                    process_status=status,
+                    process_details={"input": logged_input, "output": logged_output},
+                    process_start_ts=start_ts,
+                    process_end_ts=end_ts,
+                    triggered_by=context.user_id,
+                )
+                action_id = routing_service.log_action(
+                    process_id=process_id,
+                    agent_type=self.__class__.__name__,
+                    action_desc=logged_input,
+                    process_output=logged_output,
+                    status="completed"
+                    if result.status == AgentStatus.SUCCESS
+                    else "failed",
+                    run_id=run_id,
+                )
+                result.action_id = action_id
+                if isinstance(result.data, dict):
+                    result.data["action_id"] = action_id
+                    drafts = result.data.get("drafts")
+                    if isinstance(drafts, list):
+                        for draft in drafts:
+                            if isinstance(draft, dict):
+                                draft["action_id"] = action_id
+
         logger.info(
             "%s: completed with status %s", self.__class__.__name__, result.status.value
         )

@@ -29,6 +29,7 @@ class DummyNick:
             log_process=lambda **_: 1,
             log_run_detail=lambda **_: "run-1",
             log_action=lambda **_: "action-1",
+            validate_workflow_id=lambda *args, **kwargs: True,
         )
         self.ollama_options = lambda: {}
         self.qdrant_client = SimpleNamespace()
