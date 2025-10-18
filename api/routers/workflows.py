@@ -194,7 +194,7 @@ class EmailDraftPayload(BaseModel):
         default=None,
         description="Supplier reference associated with the draft.",
     )
-    recipients: Optional[List[EmailStr]] = Field(
+    recipients: Optional[List[str]] = Field(
         default=None,
         description="Explicit list of recipient email addresses to override the stored draft values.",
     )
@@ -289,7 +289,7 @@ class EmailDispatchRequest(BaseModel):
         default=None,
         description="Fallback RFQ identifier when unique_id is unavailable.",
     )
-    recipients: Optional[List[EmailStr]] = Field(
+    recipients: Optional[List[str]] = Field(
         default=None,
         description="Override recipient list for the dispatched email.",
     )
@@ -458,7 +458,83 @@ class EmailDispatchResponse(BaseModel):
     recipients: List[str]
     sender: str
     subject: str
+    body: Optional[str] = None
+    draft: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+def _merge_form_values(form_data) -> Dict[str, Any]:
+    """Flatten ``FormData`` into a standard dictionary preserving multi-values."""
+
+    flattened: Dict[str, Any] = {}
+    for key, value in getattr(form_data, "multi_items", lambda: [])():
+        if key in flattened:
+            existing = flattened[key]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                flattened[key] = [existing, value]
+        else:
+            flattened[key] = value
+
+    for key, value in list(flattened.items()):
+        if isinstance(value, list) and len(value) == 1:
+            flattened[key] = value[0]
+
+    return flattened
+
+
+def _maybe_parse_embedded_json(value: Any) -> Any:
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate[0] in ("{", "["):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                return value
+    return value
+
+
+def _deserialise_structured_fields(payload: Dict[str, Any]) -> None:
+    for key in ("draft", "drafts"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, list):
+            payload[key] = [_maybe_parse_embedded_json(item) for item in value]
+        else:
+            payload[key] = _maybe_parse_embedded_json(value)
+
+
+async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest:
+    """Load the dispatch request supporting both JSON and form submissions."""
+
+    body_bytes = await request.body()
+    raw_payload: Any
+
+    if not body_bytes:
+        raw_payload = {}
+    else:
+        try:
+            raw_payload = json.loads(body_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                form = await request.form()
+            except Exception:
+                raw_payload = {}
+            else:
+                raw_payload = _merge_form_values(form)
+
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+
+    _deserialise_structured_fields(raw_payload)
+
+    return EmailDispatchRequest.model_validate(raw_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -665,13 +741,13 @@ async def extract_documents(
 # ---------------------------------------------------------------------------
 @router.post("/email")
 async def send_email(
-    request: EmailDispatchRequest,
+    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
     orchestrator: Orchestrator = Depends(get_orchestrator),
     agent_nick=Depends(get_agent_nick),
 ):
     """Send a previously drafted RFQ email using the dispatch service."""
 
-    identifier = request.get_identifier()
+    identifier = dispatch_request.get_identifier()
     if not identifier:
         raise HTTPException(
             status_code=400,
@@ -682,7 +758,7 @@ async def send_email(
             },
         )
 
-    input_data = request.model_dump(exclude_none=True)
+    input_data = dispatch_request.model_dump(exclude_none=True)
 
     prs = orchestrator.agent_nick.process_routing_service
 
@@ -698,7 +774,7 @@ async def send_email(
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
 
-    action_reference = request.resolve_action_id()
+    action_reference = dispatch_request.resolve_action_id()
 
     action_id = prs.log_action(
         process_id=process_id,
@@ -714,10 +790,10 @@ async def send_email(
         result = await run_in_threadpool(
             dispatch_service.send_draft,
             identifier=identifier,
-            recipients=request.resolve_recipients(),
-            sender=request.resolve_sender(),
-            subject_override=request.resolve_subject(),
-            body_override=request.resolve_body(),
+            recipients=dispatch_request.resolve_recipients(),
+            sender=dispatch_request.resolve_sender(),
+            subject_override=dispatch_request.resolve_subject(),
+            body_override=dispatch_request.resolve_body(),
         )
 
         dispatch_timestamp = time.time()
@@ -732,33 +808,42 @@ async def send_email(
         elif raw_recipients:
             response_recipients = list(raw_recipients)
         else:
-            response_recipients = request.resolve_recipients() or []
+            response_recipients = dispatch_request.resolve_recipients() or []
 
-        response = EmailDispatchResponse(
+        response_data: Dict[str, Any] = dict(result)
+        response_data.update(
             success=bool(result.get("sent", False)),
             unique_id=result.get("unique_id", identifier),
             sent=bool(result.get("sent", False)),
             message_id=result.get("message_id"),
             recipients=[str(r) for r in response_recipients],
-            sender=str(result.get("sender") or request.resolve_sender() or ""),
-            subject=str(result.get("subject") or request.resolve_subject() or ""),
+            sender=str(result.get("sender") or dispatch_request.resolve_sender() or ""),
+            subject=str(result.get("subject") or dispatch_request.resolve_subject() or ""),
             error=result.get("error"),
         )
+
+        if response_data.get("body") is None:
+            response_data["body"] = dispatch_request.resolve_body()
+
+        response = EmailDispatchResponse(**response_data)
+
+        response_payload = response.model_dump()
+        status_label = "completed" if response.sent else "failed"
 
         prs.log_action(
             process_id=process_id,
             agent_type="email_dispatch",
             action_desc=input_data,
-            process_output=response.model_dump(),
-            status="completed" if response.sent else "failed",
+            process_output=response_payload,
+            status=status_label,
             action_id=action_id,
         )
 
         final_details = {
             "input": input_data,
             "agents": [],
-            "output": response.model_dump(),
-            "status": "completed" if response.sent else "failed",
+            "output": response_payload,
+            "status": status_label,
         }
         prs.update_process_details(process_id, final_details)
         prs.update_process_status(process_id, 1 if response.sent else -1)
@@ -795,7 +880,12 @@ async def send_email(
         prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return response
+    return {
+        **response_payload,
+        "status": status_label,
+        "result": response_payload,
+        "action_id": action_id,
+    }
 
 
 @router.post("/email/batch")
