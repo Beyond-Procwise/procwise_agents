@@ -65,6 +65,11 @@ def test_fetch_relationship_handles_missing_index(monkeypatch):
     ]
     assert client.calls >= 2
 
+    # Cached result should be returned without hitting Qdrant again
+    cached = service.fetch_relationship(supplier_id="S1")
+    assert cached == results
+    assert client.calls == 2
+
 
 def test_fetch_relationship_missing_index_without_match(monkeypatch):
     class DummyClient:
@@ -90,6 +95,63 @@ def test_fetch_relationship_missing_index_without_match(monkeypatch):
 
     assert results == []
     assert client.calls >= 2
+
+    # Negative cache should short-circuit subsequent lookups
+    client.calls = 0
+    cached = service.fetch_relationship(supplier_id="S1")
+    assert cached == []
+    assert client.calls == 0
+
+
+def test_fallback_scan_populates_cache(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.filtered_calls = 0
+            self.scan_calls = 0
+
+        def scroll(self, *_, **kwargs):
+            if kwargs.get("scroll_filter") is not None:
+                self.filtered_calls += 1
+                if self.filtered_calls <= 2:
+                    raise Exception("Bad request: Index required but not found for \"supplier_id\"")
+                raise AssertionError("Filtered scroll should not be called after cache warmup")
+
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                payload = {
+                    "supplier_id": "S9",
+                    "supplier_name": "Gamma Corp",
+                    "supplier_name_normalized": "gamma corp",
+                }
+                return [DummyPoint(payload)], None
+            return ([], None)
+
+        def get_collection(self, *_args, **_kwargs):
+            return types.SimpleNamespace(payload_schema={})
+
+        def create_payload_index(self, **_kwargs):
+            return None
+
+    client = DummyClient()
+    service = SupplierRelationshipService(DummyNick(client))
+
+    results = service.fetch_relationship(supplier_id="S9")
+    assert results == [
+        {
+            "supplier_id": "S9",
+            "supplier_name": "Gamma Corp",
+            "supplier_name_normalized": "gamma corp",
+        }
+    ]
+    assert client.scan_calls == 1
+
+    # Second request should use cached payload without touching Qdrant
+    client.filtered_calls = 0
+    client.scan_calls = 0
+    cached = service.fetch_relationship(supplier_id="S9")
+    assert cached == results
+    assert client.filtered_calls == 0
+    assert client.scan_calls == 0
 
 
 def test_service_creates_missing_payload_indexes(monkeypatch):

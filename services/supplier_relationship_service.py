@@ -1,4 +1,5 @@
 import logging
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from datetime import datetime, time, timedelta, timezone
 from http import HTTPStatus
@@ -23,6 +24,12 @@ class SupplierRelationshipService:
             self.rag_service = None
         self.collection_name = getattr(self.settings, "qdrant_collection_name", None)
         self.client = getattr(agent_nick, "qdrant_client", None)
+        cache_limit = getattr(self.settings, "relationship_cache_limit", None)
+        if not isinstance(cache_limit, int) or cache_limit <= 0:
+            cache_limit = 512
+        self._fallback_cache_limit = cache_limit
+        self._fallback_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._fallback_negative_cache: OrderedDict[str, None] = OrderedDict()
         self._ensure_payload_indexes()
 
     # ------------------------------------------------------------------
@@ -111,6 +118,10 @@ class SupplierRelationshipService:
         if not must:
             return []
 
+        cached_payloads = self._lookup_cached_relationship(supplier_id, supplier_name, limit)
+        if cached_payloads is not None:
+            return cached_payloads
+
         try:
             results, _ = self.client.scroll(
                 collection_name=self.collection_name,
@@ -122,17 +133,52 @@ class SupplierRelationshipService:
         except Exception as exc:
             if self._is_missing_index_error(exc):
                 logger.warning(
-                    "SupplierRelationshipService: missing Qdrant index detected. Falling back to in-memory filtering.",
+                    "SupplierRelationshipService: missing Qdrant index detected while loading supplier relationship. Attempting to create payload indexes before falling back.",
                     exc_info=True,
                 )
-                return self._fetch_relationship_without_index(
-                    supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
-                )
+                # Ensure indexes exist and retry once before resorting to a full collection scan.
+                self._ensure_payload_indexes()
+                cached_payloads = self._lookup_cached_relationship(supplier_id, supplier_name, limit)
+                if cached_payloads is not None:
+                    return cached_payloads
+                try:
+                    results, _ = self.client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=models.Filter(must=must),
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=limit,
+                    )
+                except Exception as retry_exc:
+                    if self._is_missing_index_error(retry_exc):
+                        logger.warning(
+                            "SupplierRelationshipService: payload indexes still missing after retry. Falling back to in-memory filtering.",
+                            exc_info=True,
+                        )
+                        matches = self._fetch_relationship_without_index(
+                            supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
+                        )
+                        if matches:
+                            for payload in matches:
+                                self._store_fallback_payload(payload)
+                        else:
+                            self._record_fallback_miss(supplier_id, supplier_name)
+                        return matches
+                    logger.exception("Failed to load supplier relationship from Qdrant")
+                    return []
+            else:
+                logger.exception("Failed to load supplier relationship from Qdrant")
+                return []
 
-            logger.exception("Failed to load supplier relationship from Qdrant")
-            return []
-
-        return self._extract_payloads(results or [])
+        payloads = self._filter_payloads(
+            self._extract_payloads(results or []), supplier_id, supplier_name
+        )
+        if payloads:
+            for payload in payloads:
+                self._store_fallback_payload(payload)
+        else:
+            self._record_fallback_miss(supplier_id, supplier_name)
+        return payloads
 
     def fetch_overview(self) -> Optional[Dict[str, Any]]:
         if not self.client or not self.collection_name or not hasattr(self.client, "scroll"):
@@ -461,12 +507,10 @@ class SupplierRelationshipService:
         if not self.client or not self.collection_name:
             return []
 
-        target_id = str(supplier_id) if supplier_id else None
-        target_name = self._normalise_key(supplier_name) if supplier_name else None
-
-        # Fetch a slightly larger page size to reduce the number of fall-back scans
         page_size = max(limit, 50)
+        max_points_to_scan = max(2000, page_size * 40)
         next_offset = None
+        scanned = 0
         matches: List[Dict[str, Any]] = []
 
         while True:
@@ -488,22 +532,34 @@ class SupplierRelationshipService:
             if not results:
                 break
 
+            scanned += len(results)
             for payload in self._extract_payloads(results):
-                if target_id and str(payload.get("supplier_id")) != target_id:
+                document_type = payload.get("document_type")
+                if document_type and document_type != "supplier_relationship":
                     continue
-                if target_name:
-                    payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
-                        payload.get("supplier_name")
-                    )
-                    if payload_name != target_name:
-                        continue
-                matches.append(payload)
+
+                filtered = self._filter_payloads([payload], supplier_id, supplier_name)
+                if not filtered:
+                    continue
+
+                match = filtered[0]
+                self._store_fallback_payload(match)
+                matches.append(match)
                 if len(matches) >= limit:
                     return matches
 
             if next_offset is None:
                 break
 
+            if scanned >= max_points_to_scan:
+                logger.warning(
+                    "SupplierRelationshipService fallback scan aborted after inspecting %s records without finding enough"
+                    " matches", scanned
+                )
+                break
+
+        if not matches:
+            self._record_fallback_miss(supplier_id, supplier_name)
         return matches
 
     @staticmethod
@@ -519,6 +575,127 @@ class SupplierRelationshipService:
             payload = getattr(point, "payload", None) or {}
             payloads.append(dict(payload))
         return payloads
+
+    def _filter_payloads(
+        self,
+        payloads: Sequence[Mapping[str, Any]],
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        if not payloads:
+            return []
+
+        target_id = str(supplier_id).strip() if supplier_id else None
+        target_name = self._normalise_key(supplier_name) if supplier_name else None
+
+        filtered: List[Dict[str, Any]] = []
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            sid_value = payload.get("supplier_id")
+            if target_id and str(sid_value).strip() != target_id:
+                continue
+            if target_name:
+                payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
+                    payload.get("supplier_name")
+                )
+                if payload_name != target_name:
+                    continue
+            filtered.append(dict(payload))
+        return filtered
+
+    def _lookup_cached_relationship(
+        self,
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+        limit: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        keys = self._cache_lookup_keys(supplier_id, supplier_name)
+        if not keys:
+            return None
+
+        hits: List[Dict[str, Any]] = []
+        seen_records: set[str] = set()
+        for key in keys:
+            if key in self._fallback_cache:
+                payload = self._fallback_cache[key]
+                self._fallback_cache.move_to_end(key)
+                record = payload.get("record_id") or self._record_id(
+                    payload.get("supplier_id"), payload.get("supplier_name")
+                )
+                if record not in seen_records:
+                    hits.append(dict(payload))
+                    seen_records.add(record)
+
+        if hits:
+            return hits[: max(1, limit)]
+
+        for key in keys:
+            if key in self._fallback_negative_cache:
+                self._fallback_negative_cache.move_to_end(key)
+                return []
+
+        return None
+
+    def _store_fallback_payload(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        cache_payload = dict(payload)
+        keys = []
+        supplier_id = cache_payload.get("supplier_id")
+        if supplier_id is not None:
+            key = f"id::{str(supplier_id).strip()}"
+            if key:
+                keys.append(key)
+        normalised = cache_payload.get("supplier_name_normalized") or self._normalise_key(
+            cache_payload.get("supplier_name")
+        )
+        if normalised:
+            keys.append(f"name::{normalised}")
+
+        if not keys:
+            return
+
+        for key in keys:
+            self._fallback_cache.pop(key, None)
+            self._fallback_cache[key] = cache_payload
+        self._trim_cache(self._fallback_cache, self._fallback_cache_limit)
+
+        for key in keys:
+            if key in self._fallback_negative_cache:
+                self._fallback_negative_cache.pop(key, None)
+
+    def _record_fallback_miss(
+        self, supplier_id: Optional[str], supplier_name: Optional[str]
+    ) -> None:
+        keys = self._cache_lookup_keys(supplier_id, supplier_name)
+        if not keys:
+            return
+        for key in keys:
+            self._fallback_negative_cache.pop(key, None)
+            self._fallback_negative_cache[key] = None
+        self._trim_cache(self._fallback_negative_cache, self._fallback_cache_limit)
+
+    def _cache_lookup_keys(
+        self, supplier_id: Optional[str], supplier_name: Optional[str]
+    ) -> List[str]:
+        keys: List[str] = []
+        if supplier_id:
+            sid = str(supplier_id).strip()
+            if sid:
+                keys.append(f"id::{sid}")
+        normalised = self._normalise_key(supplier_name) if supplier_name else None
+        if normalised:
+            keys.append(f"name::{normalised}")
+        return keys
+
+    @staticmethod
+    def _trim_cache(cache: "OrderedDict[str, Any]", limit: int) -> None:
+        if limit <= 0:
+            cache.clear()
+            return
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
 
 class SupplierRelationshipScheduler:
