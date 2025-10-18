@@ -1606,6 +1606,687 @@ class DataExtractionAgent(BaseAgent):
         logger.warning("Unsupported document type '%s' for %s", ext, object_key)
         return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
 
+    def _parse_header_improved(self, text: str, file_bytes: bytes | None = None) -> Dict[str, Any]:
+        """
+        Enhanced header extraction with better pattern matching and party identification.
+
+        Key improvements:
+        - Multiple patterns for each field (fallback strategy)
+        - Correct party identification based on document flow
+        - Bank details extraction
+        - Currency detection from symbols and codes
+        - Payment terms parsing
+
+        Returns:
+            Dict with extracted header fields
+        """
+
+        header: Dict[str, Any] = {}
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        inv_patterns = [
+            r"Invoice\s*(?:No\.?|Number|#)\s*[:\s]*([A-Z]{2,4}\d{4,})",
+            r"Tax\s*Invoice\s*(?:No\.?|Number)\s*[:\s]*([A-Z]{2,4}\d{4,})",
+            r"\b(INV[-\s]?\d{4,})\b",
+        ]
+        for pattern in inv_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                header["invoice_id"] = match.group(1).strip().upper()
+                break
+
+        po_patterns = [
+            r"(?:PO|Purchase\s*Order)\s*(?:No\.?|Number|#)\s*[:\s]*(PO\d{4,}|\d{4,})",
+            r"\b(PO[-\s]?\d{4,})\b",
+        ]
+        for pattern in po_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip().upper()
+                if not value.startswith("PO"):
+                    value = "PO" + value
+                header["po_id"] = value
+                break
+
+        quote_patterns = [
+            r"Quote\s*(?:No\.?|Number|#)\s*[:\s]*(QUT\d{4,}|\d{4,})",
+            r"\b(QUT[-\s]?\d{4,})\b",
+        ]
+        for pattern in quote_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip().upper()
+                if not value.startswith("QUT"):
+                    value = "QUT" + value
+                header["quote_id"] = value
+                break
+
+        date_patterns: Dict[str, List[str]] = {
+            "invoice_date": [
+                r"Invoice\s*Date\s*[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+                r"Invoice\s*Date\s*[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            ],
+            "due_date": [
+                r"Due\s*Date\s*[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+                r"Payment\s*Due\s*[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            ],
+            "order_date": [
+                r"(?:PO|Order)\s*Date\s*[:\s]*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            ],
+            "quote_date": [
+                r"Quote\s*Date\s*[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+            ],
+        }
+
+        for field, patterns in date_patterns.items():
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    try:
+                        from dateutil import parser as date_parser
+
+                        parsed = date_parser.parse(match.group(1), dayfirst=False)
+                        header[field] = parsed.strftime("%Y-%m-%d")
+                        break
+                    except Exception:
+                        continue
+
+        issuer: Optional[str] = None
+        for line in lines[:10]:
+            if re.search(r"(Invoice|Purchase|Quote|Bill|To:|Date|Number)", line, re.IGNORECASE):
+                continue
+            candidate_match = re.match(r"^([A-Z][A-Za-z\s&\.]{2,50})$", line.strip())
+            if candidate_match:
+                candidate = candidate_match.group(1).strip()
+                if not re.search(
+                    r"^(The|A|An|From|To|Address|Date|Number)$", candidate, re.IGNORECASE
+                ):
+                    issuer = candidate
+                    break
+
+        doc_type_hint: Optional[str] = None
+        text_lower = text[:500].lower()
+        if "invoice" in text_lower and "purchase" not in text_lower:
+            doc_type_hint = "Invoice"
+        elif "purchase" in text_lower or "po" in text_lower:
+            doc_type_hint = "Purchase_Order"
+        elif "quote" in text_lower or "quotation" in text_lower:
+            doc_type_hint = "Quote"
+
+        if issuer:
+            if doc_type_hint == "Invoice":
+                header["vendor_name"] = issuer
+                header["supplier_id"] = issuer
+            elif doc_type_hint == "Purchase_Order":
+                header["buyer_id"] = issuer
+
+        recipient_patterns = [
+            r"(?:Invoice|Bill)\s*To\s*[:\s]*\n\s*([A-Z][A-Za-z\s&\.]{2,50})",
+            r"Recipient\s*[:\s]*\n\s*([A-Z][A-Za-z\s&\.]{2,50})",
+            r"Customer\s*[:\s]*\n\s*([A-Z][A-Za-z\s&\.]{2,50})",
+        ]
+
+        for pattern in recipient_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                recipient = match.group(1).strip()
+                if doc_type_hint == "Invoice":
+                    header["buyer_id"] = recipient
+                elif doc_type_hint == "Purchase_Order":
+                    header["vendor_name"] = recipient
+                    header["supplier_id"] = recipient
+                break
+
+        if "£" in text or "GBP" in text.upper():
+            header["currency"] = "GBP"
+        elif "€" in text or "EUR" in text.upper():
+            header["currency"] = "EUR"
+        elif "$" in text or "USD" in text.upper():
+            header["currency"] = "USD"
+
+        amount_patterns: Dict[str, List[str]] = {
+            "invoice_amount": [
+                r"Subtotal\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+            ],
+            "tax_amount": [
+                r"Tax\s*\((\d{1,2})%\)\s*[£$€]?\s*([\d,]+\.?\d{0,2})",
+                r"(?:VAT|Tax|GST)\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+            ],
+            "invoice_total_incl_tax": [
+                r"Total\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+                r"(?:Grand|Invoice)\s*Total\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+                r"Amount\s*Due\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+            ],
+        }
+
+        for field, patterns in amount_patterns.items():
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    if field == "tax_amount" and len(match.groups()) == 2:
+                        try:
+                            header["tax_percent"] = float(match.group(1))
+                        except Exception:
+                            pass
+                        amount_str = match.group(2)
+                    else:
+                        amount_str = match.group(1)
+                    try:
+                        header[field] = float(amount_str.replace(",", ""))
+                        break
+                    except Exception:
+                        continue
+
+        bank_patterns = {
+            "account_number": r"Account\s*Number\s*[:\s]*(\d+)",
+            "sort_code": r"Sort\s*Code\s*[:\s]*([\d-]+)",
+            "iban": r"IBAN\s*[:\s]*([A-Z]{2}\d{2}[A-Z0-9]+)",
+            "swift": r"SWIFT[/\s]*BIC\s*[:\s]*([A-Z0-9]+)",
+        }
+
+        bank_details: Dict[str, Any] = {}
+        for field, pattern in bank_patterns.items():
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                bank_details[field] = match.group(1).strip()
+
+        if bank_details:
+            header["bank_details"] = bank_details
+
+        payment_terms_match = re.search(
+            r"Payment\s*(?:must\s*be\s*made\s*)?within\s*(\d+)\s*days",
+            text,
+            re.IGNORECASE,
+        )
+        if payment_terms_match:
+            header["payment_terms"] = f"Net {payment_terms_match.group(1)}"
+
+        return header
+
+    def _extract_line_items_improved(self, text: str, doc_type: str) -> List[Dict[str, Any]]:
+        """
+        Improved line item extraction that handles both traditional tables
+        and service-based descriptions (like "Bespoke Marketing Services").
+
+        Strategies (in order):
+        1. Service-based descriptions with amounts
+        2. Traditional table rows
+        3. Structured blocks (Tier 3 format)
+
+        Returns:
+            List of line item dictionaries
+        """
+
+        items: List[Dict[str, Any]] = []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        service_pattern = re.compile(
+            r"(?:Description|Service|Item)\s*[:\s]*\n"
+            r"\s*(.+?)(?:\n\s*(.+?))?\s*"
+            r"(?:Subtotal|Amount|Total)?\s*[:\s]*[£$€]?\s*([\d,]+\.?\d{0,2})",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in service_pattern.finditer(text):
+            desc_line1 = match.group(1).strip()
+            desc_line2 = match.group(2).strip() if match.group(2) else ""
+            amount_str = match.group(3).replace(",", "")
+
+            description = desc_line1
+            if desc_line2 and not re.search(r"(subtotal|total|amount)", desc_line2, re.IGNORECASE):
+                description += " " + desc_line2
+
+            item: Dict[str, Any] = {
+                "line_no": len(items) + 1,
+                "item_description": description,
+                "quantity": 1,
+                "unit_of_measure": "Service",
+                "line_amount": float(amount_str),
+            }
+
+            duration_match = re.search(r"\((\d+)\s*Months?\)", description, re.IGNORECASE)
+            if duration_match:
+                item["service_duration_months"] = int(duration_match.group(1))
+
+            items.append(item)
+
+        if not items:
+            table_start: Optional[int] = None
+            for idx, line in enumerate(lines):
+                if re.search(
+                    r"(Description|Item).*?(Quantity|Qty).*?(Price|Rate).*?(Total|Amount)",
+                    line,
+                    re.IGNORECASE,
+                ):
+                    table_start = idx + 1
+                    break
+
+            if table_start is not None:
+                for line in lines[table_start:]:
+                    if re.search(r"^(Subtotal|Tax|VAT|Total|Amount\s*Due)", line, re.IGNORECASE):
+                        break
+
+                    row_match = re.match(
+                        r"^(.+?)\s+(\d+)\s+([\d,]+\.?\d{0,2})\s+([\d,]+\.?\d{0,2})\s*$",
+                        line,
+                    )
+
+                    if row_match:
+                        desc, qty, price, total = row_match.groups()
+                        item = {
+                            "line_no": len(items) + 1,
+                            "item_description": desc.strip(),
+                            "quantity": int(qty),
+                            "unit_price": float(price.replace(",", "")),
+                            "line_amount": float(total.replace(",", "")),
+                        }
+                        items.append(item)
+
+        if not items:
+            block_pattern = re.compile(
+                r"^(.+?)\s*$\n"
+                r"\s*\(([^)]+)\)\s+(.+?)\s*$\n?"
+                r"\s*[£$€]?\s*([\d,]+\.?\d{0,2})\s*$",
+                re.MULTILINE,
+            )
+
+            for match in block_pattern.finditer(text):
+                title = match.group(1).strip()
+                duration = match.group(2).strip()
+                details = match.group(3).strip()
+                amount = match.group(4).replace(",", "")
+
+                description = f"{title} ({duration}) {details}"
+
+                item = {
+                    "line_no": len(items) + 1,
+                    "item_description": description,
+                    "quantity": 1,
+                    "unit_of_measure": "Service",
+                    "line_amount": float(amount),
+                }
+
+                months_match = re.search(r"Months?\s+(\d+)[-–](\d+)", duration, re.IGNORECASE)
+                if months_match:
+                    start_month = int(months_match.group(1))
+                    end_month = int(months_match.group(2))
+                    item["service_duration_months"] = end_month - start_month + 1
+
+                items.append(item)
+
+        for item in items:
+            qty = item.get("quantity")
+            line_amount = item.get("line_amount") or item.get("line_total")
+            unit_price = item.get("unit_price")
+
+            if line_amount is not None and qty not in (None, 0) and unit_price is None:
+                try:
+                    item["unit_price"] = round(float(line_amount) / float(qty), 2)
+                except Exception:
+                    pass
+            elif unit_price is not None and qty is not None and line_amount is None:
+                try:
+                    item["line_amount"] = round(float(unit_price) * float(qty), 2)
+                except Exception:
+                    pass
+
+        return items
+
+    def _extract_line_items_from_layout(
+        self, file_bytes: bytes, text: str, doc_type: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract line items using PDF layout analysis.
+        This provides the most accurate extraction when tables are present.
+
+        Args:
+            file_bytes: Raw PDF bytes
+            text: Extracted text (for fallback)
+            doc_type: Document type
+
+        Returns:
+            List of line item dictionaries
+        """
+
+        items: List[Dict[str, Any]] = []
+
+        if not file_bytes:
+            return items
+
+        try:
+            from io import BytesIO
+
+            import pdfplumber
+
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables(
+                        {
+                            "vertical_strategy": "lines_strict",
+                            "horizontal_strategy": "text",
+                            "intersection_tolerance": 5,
+                        }
+                    )
+
+                    if not tables:
+                        tables = page.extract_tables(
+                            {
+                                "vertical_strategy": "text",
+                                "horizontal_strategy": "text",
+                            }
+                        )
+
+                    for table in tables:
+                        if not table or len(table) < 2:
+                            continue
+
+                        header_row_idx: Optional[int] = None
+                        for idx in range(min(3, len(table))):
+                            row = table[idx]
+                            row_text = " ".join(str(cell or "").lower() for cell in row)
+                            if "description" in row_text or "item" in row_text:
+                                header_row_idx = idx
+                                break
+
+                        if header_row_idx is None:
+                            continue
+
+                        headers = [
+                            str(cell or "").lower().strip() for cell in table[header_row_idx]
+                        ]
+                        col_map: Dict[str, int] = {}
+
+                        for idx, header_cell in enumerate(headers):
+                            if "description" in header_cell or "item" in header_cell:
+                                col_map["description"] = idx
+                            elif "qty" in header_cell or "quantity" in header_cell:
+                                col_map["quantity"] = idx
+                            elif "price" in header_cell or "rate" in header_cell:
+                                col_map["unit_price"] = idx
+                            elif "amount" in header_cell or "total" in header_cell:
+                                col_map["line_amount"] = idx
+                            elif "measure" in header_cell or "uom" in header_cell:
+                                col_map["unit_of_measure"] = idx
+
+                        for row in table[header_row_idx + 1 :]:
+                            if not any(row):
+                                continue
+
+                            first_cell = str(row[0] or "").lower()
+                            if any(
+                                kw in first_cell
+                                for kw in ["subtotal", "tax", "total", "amount due"]
+                            ):
+                                break
+
+                            item: Dict[str, Any] = {"line_no": len(items) + 1}
+
+                            for field, col_idx in col_map.items():
+                                if col_idx < len(row):
+                                    value = row[col_idx]
+                                    if value is None:
+                                        continue
+                                    if field in {"quantity", "unit_price", "line_amount"}:
+                                        clean_val = re.sub(r"[^0-9.]", "", str(value))
+                                        if clean_val:
+                                            try:
+                                                item[field] = float(clean_val)
+                                            except Exception:
+                                                pass
+                                    else:
+                                        item[field] = str(value).strip()
+
+                            if "description" in item or "line_amount" in item:
+                                items.append(item)
+
+        except Exception as exc:
+            logger.debug(f"Layout-based line extraction failed: {exc}")
+
+        return items
+
+    def _validate_extraction_quality(
+        self,
+        header: Dict[str, Any],
+        line_items: List[Dict[str, Any]],
+        doc_type: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive validation with detailed scoring and error reporting.
+
+        Returns validation report with:
+        - is_valid: Boolean indicating if extraction meets minimum standards
+        - confidence_score: Float 0.0-1.0 indicating extraction quality
+        - errors: List of critical errors
+        - warnings: List of non-critical issues
+        - field_scores: Per-field confidence scores
+        """
+
+        report: Dict[str, Any] = {
+            "is_valid": True,
+            "confidence_score": 1.0,
+            "errors": [],
+            "warnings": [],
+            "field_scores": {},
+        }
+
+        required_fields = {
+            "Invoice": [
+                "invoice_id",
+                "invoice_date",
+                "vendor_name",
+                "buyer_id",
+                "invoice_total_incl_tax",
+            ],
+            "Purchase_Order": ["po_id", "order_date", "vendor_name", "total_amount"],
+            "Quote": ["quote_id", "quote_date", "vendor_name", "total_amount"],
+            "Contract": ["contract_id", "contract_start_date", "supplier_id"],
+        }
+
+        missing_fields: List[str] = []
+        for field in required_fields.get(doc_type, []):
+            if not header.get(field):
+                missing_fields.append(field)
+                report["confidence_score"] -= 0.15
+
+        if missing_fields:
+            report["errors"].append(
+                f"Missing required fields: {', '.join(missing_fields)}"
+            )
+            report["is_valid"] = False
+
+        if doc_type == "Invoice":
+            if header.get("vendor_name"):
+                header_text_segment = text[:500].upper()
+                vendor_upper = str(header["vendor_name"]).upper()
+                if vendor_upper not in header_text_segment:
+                    report["warnings"].append(
+                        f"Vendor name '{header['vendor_name']}' not found in document header"
+                    )
+                    report["confidence_score"] -= 0.10
+
+            if header.get("buyer_id"):
+                invoice_to_match = re.search(
+                    r"(?:Invoice|Bill)\s*To\s*[:\s]*(.{0,200})",
+                    text,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if invoice_to_match:
+                    section = invoice_to_match.group(1)
+                    buyer_upper = str(header["buyer_id"]).upper()
+                    if buyer_upper not in section.upper():
+                        report["errors"].append(
+                            f"Buyer '{header['buyer_id']}' not found in 'Invoice To' section"
+                        )
+                        report["is_valid"] = False
+                        report["confidence_score"] -= 0.20
+
+        amount_fields = {
+            "Invoice": ["invoice_amount", "tax_amount", "invoice_total_incl_tax"],
+            "Purchase_Order": ["total_amount"],
+            "Quote": ["total_amount", "total_amount_incl_tax"],
+        }
+
+        for field in amount_fields.get(doc_type, []):
+            value = header.get(field)
+            if value is not None:
+                try:
+                    numeric_value = float(value)
+                    if numeric_value < 0:
+                        report["errors"].append(f"{field} is negative: {numeric_value}")
+                        report["is_valid"] = False
+                    elif numeric_value == 0:
+                        report["warnings"].append(f"{field} is zero")
+                        report["confidence_score"] -= 0.05
+                    elif numeric_value > 10_000_000:
+                        report["warnings"].append(
+                            f"{field} unusually large: {numeric_value}"
+                        )
+                        report["confidence_score"] -= 0.05
+
+                    report["field_scores"][field] = 1.0
+                except (ValueError, TypeError):
+                    report["errors"].append(f"{field} is not a valid number: {value}")
+                    report["is_valid"] = False
+                    report["field_scores"][field] = 0.0
+
+        if doc_type == "Invoice":
+            subtotal = header.get("invoice_amount")
+            tax = header.get("tax_amount")
+            total = header.get("invoice_total_incl_tax")
+
+            if all(v is not None for v in [subtotal, tax, total]):
+                try:
+                    calculated_total = float(subtotal) + float(tax)
+                    actual_total = float(total)
+                    diff = abs(calculated_total - actual_total)
+                    if diff > 0.02:
+                        report["errors"].append(
+                            "Total mismatch: "
+                            f"{subtotal} + {tax} = {calculated_total}, but total is {actual_total} "
+                            f"(diff: {diff:.2f})"
+                        )
+                        report["is_valid"] = False
+                        report["confidence_score"] -= 0.15
+                    else:
+                        report["confidence_score"] = min(
+                            1.0, report["confidence_score"] + 0.05
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        if line_items:
+            for idx, item in enumerate(line_items, start=1):
+                if not item.get("item_description"):
+                    report["warnings"].append(f"Line {idx}: Missing description")
+                    report["confidence_score"] -= 0.02
+
+                if all(key in item for key in ["quantity", "unit_price"]):
+                    try:
+                        qty = float(item["quantity"])
+                        price = float(item["unit_price"])
+                        expected = qty * price
+                        actual_value = item.get("line_amount") or item.get("line_total")
+                        if actual_value is not None:
+                            actual = float(actual_value)
+                            diff = abs(expected - actual)
+                            if diff > 0.02:
+                                report["warnings"].append(
+                                    f"Line {idx}: Amount mismatch ({qty} × {price} = {expected:.2f}, got {actual:.2f})"
+                                )
+                                report["confidence_score"] -= 0.03
+                    except (ValueError, TypeError):
+                        pass
+
+            line_sum = sum(
+                float(item.get("line_amount") or item.get("line_total") or 0)
+                for item in line_items
+            )
+
+            header_subtotal = header.get("invoice_amount") or header.get("total_amount")
+            if header_subtotal and line_sum > 0:
+                try:
+                    diff = abs(line_sum - float(header_subtotal))
+                    if diff > 0.02:
+                        report["warnings"].append(
+                            f"Line items sum to {line_sum:.2f} but header shows {header_subtotal}"
+                        )
+                        report["confidence_score"] -= 0.05
+                except (ValueError, TypeError):
+                    pass
+        else:
+            if doc_type in ["Invoice", "Purchase_Order", "Quote"]:
+                report["warnings"].append("No line items extracted")
+                report["confidence_score"] -= 0.10
+
+        date_pairs = {
+            "Invoice": [("invoice_date", "due_date")],
+            "Purchase_Order": [("order_date", "expected_delivery_date")],
+            "Contract": [("contract_start_date", "contract_end_date")],
+        }
+
+        for date_field, compare_field in date_pairs.get(doc_type, []):
+            date1_val = header.get(date_field)
+            date2_val = header.get(compare_field)
+            if date1_val and date2_val:
+                try:
+                    from dateutil import parser as date_parser
+
+                    date1 = date_parser.parse(str(date1_val))
+                    date2 = date_parser.parse(str(date2_val))
+                    if date2 < date1:
+                        report["errors"].append(
+                            f"{compare_field} ({date2_val}) is before {date_field} ({date1_val})"
+                        )
+                        report["is_valid"] = False
+                        report["confidence_score"] -= 0.10
+                except Exception:
+                    pass
+
+        if doc_type == "Invoice" and header.get("po_id"):
+            if not self._check_po_exists(header["po_id"]):
+                report["warnings"].append(
+                    f"Referenced PO {header['po_id']} not found in database"
+                )
+                report["confidence_score"] -= 0.05
+
+        if "currency" in header:
+            currency = header["currency"]
+            currency_symbols = {"GBP": "£", "USD": "$", "EUR": "€"}
+            expected_symbol = currency_symbols.get(currency)
+            if expected_symbol and expected_symbol not in text[:1000]:
+                report["warnings"].append(
+                    f"Currency set to {currency} but symbol {expected_symbol} not found"
+                )
+                report["confidence_score"] -= 0.05
+
+        report["confidence_score"] = max(0.0, min(1.0, report["confidence_score"]))
+
+        return report
+
+    def _check_po_exists(self, po_id: str) -> bool:
+        """Check if a PO exists in the database."""
+
+        conn = None
+        try:
+            conn = self.agent_nick.get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM proc.purchase_order_agent WHERE po_id = %s LIMIT 1",
+                    (po_id,),
+                )
+                exists = cur.fetchone() is not None
+            return exists
+        except Exception as exc:
+            logger.debug(f"PO existence check failed: {exc}")
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     # ============================ NEW LAYOUT HELPERS ======================
     def _extract_layout_blocks(self, file_bytes: bytes) -> List[Dict[str, Any]]:
         blocks: List[Dict[str, Any]] = []
@@ -3053,255 +3734,162 @@ class DataExtractionAgent(BaseAgent):
         self, text: str, file_bytes: bytes, doc_type: str
     ) -> StructuredExtractionResult:
         """
-        Custom structured data extraction that prioritises deterministic methods and
-        avoids heavy LLM calls for faster and more consistent results.
+        Enhanced structured extraction with improved accuracy.
 
-        This implementation performs the following steps:
-        1. Use regex and simple heuristics to extract header fields.
-        2. Parse tables using camelot/pdfplumber for line items; fall back to regex line parsing.
-        3. Normalise extracted fields and reconcile totals from line items.
-        4. Infer currency and vendor names, sanitise names, and enrich contract details.
-        5. Cast values to appropriate SQL types and compute a simple validation score.
+        Extraction priority:
+        1. Layout-based (most accurate)
+        2. Improved regex (fast, reliable)
+        3. LLM fallback (only for missing critical fields)
 
-        Parameters
-        ----------
-        text : str
-            Raw document text extracted from the file.
-        file_bytes : bytes
-            Raw file contents; used for table parsing and layout heuristics.
-        doc_type : str
-            Canonical document type: "Invoice", "Purchase_Order", "Quote", or "Contract".
-
-        Returns
-        -------
-        Tuple[Dict[str, Any], List[Dict[str, Any]]]
-            Normalised header record and a list of normalised line item records.
+        Returns:
+            StructuredExtractionResult with header, line items, and validation report
         """
-        # 1) LLM-guided structural extraction to capture contextual values first
-        header: Dict[str, Any] = {}
+
+        import time
+
+        start_time = time.time()
+
+        logger.info(f"Starting extraction for {doc_type}")
+
+        header = self._parse_header_improved(text, file_bytes)
+        logger.info(f"Phase 1 complete: {len(header)} header fields extracted")
+
         line_items: List[Dict[str, Any]] = []
-        table_method: Optional[str] = None
-        table_warnings: List[str] = []
-        field_sources: Dict[str, str] = {}
-        llm_structured = self._llm_structured_extraction(text, doc_type)
-        llm_header = self._normalize_header_fields(
-            (llm_structured.get("header_data") if isinstance(llm_structured, dict) else {})
-            or {},
-            doc_type,
-        )
-        if llm_header:
-            before_keys = set(header.keys())
-            header = self._merge_record_fields(header, llm_header)
-            confidence = header.setdefault("_field_confidence", {})
-            llm_conf = self._confidence_from_method("llm_structured")
-            for key in llm_header:
-                if key.startswith("_"):
-                    continue
-                confidence[key] = max(confidence.get(key, 0.0), llm_conf)
-            gained = set(header.keys()) - before_keys
-            for key in gained:
-                field_sources.setdefault(key, "llm_structured")
-        llm_line_items = []
-        if isinstance(llm_structured, dict):
-            raw_items = llm_structured.get("line_items") or []
-            if raw_items:
-                try:
-                    llm_line_items = self._normalize_line_item_fields(raw_items, doc_type)
-                except Exception:
-                    llm_line_items = []
-            raw_context = llm_structured.get("field_contexts")
-            if isinstance(raw_context, dict):
-                context_map = {
-                    key: value
-                    for key, value in raw_context.items()
-                    if isinstance(value, str) and value.strip()
-                }
-                if context_map:
-                    header["_field_context"] = context_map
-        if llm_line_items:
-            line_items = self._merge_line_items(line_items, llm_line_items)
+        extraction_method: Optional[str] = None
 
-        # 2) Heuristic header extraction layered on top of LLM results
-        try:
-            header_regex = self._extract_header_regex(text, doc_type) or {}
-            normalized = self._normalize_header_fields(header_regex, doc_type)
-            before_keys = set(header.keys())
-            header = self._merge_record_fields(header, normalized)
-            gained = set(header.keys()) - before_keys
-            if gained:
-                field_sources.update({key: "regex" for key in gained})
-                logger.info("header_source=regex fields=%s", sorted(gained))
-        except Exception:
-            logger.debug("Regex header extraction failed", exc_info=True)
-        try:
-            header_layout = self._parse_header(text, file_bytes)
-            before_keys = set(header.keys())
-            header = self._merge_record_fields(header, header_layout)
-            gained = set(header.keys()) - before_keys
-            if gained:
-                field_sources.update({key: "layout" for key in gained})
-                logger.info("header_source=layout fields=%s", sorted(gained))
-        except Exception:
-            logger.debug("Layout header extraction failed", exc_info=True)
-        try:
-            ner_header = self._extract_header_with_ner(text)
-            if ner_header:
-                before_keys = set(header.keys())
-                header = self._merge_record_fields(header, ner_header)
-                gained = set(header.keys()) - before_keys
-                if gained:
-                    field_sources.update({key: "ner" for key in gained})
-                    logger.info("header_source=ner fields=%s", sorted(gained))
-        except Exception:
-            logger.debug("NER header extraction failed", exc_info=True)
+        if file_bytes:
+            try:
+                line_items = self._extract_line_items_from_layout(file_bytes, text, doc_type)
+                if line_items:
+                    extraction_method = "layout"
+                    logger.info(
+                        f"Layout extraction: {len(line_items)} line items found"
+                    )
+            except Exception as exc:
+                logger.debug(f"Layout extraction failed: {exc}")
 
-        try:
-            structured = extract_structured_content(text, doc_type)
-            schema_header = structured.get("header") or {}
-            schema_lines = structured.get("line_items") or []
-            if schema_header:
-                header = self._merge_record_fields(
-                    header,
-                    self._normalize_header_fields(schema_header, doc_type),
-                )
-            if schema_lines:
-                line_items = self._merge_line_items(line_items, schema_lines)
-        except Exception:
-            logger.debug("Schema-guided extraction fallback failed", exc_info=True)
-
-        if not header.get("vendor_name"):
-            from_match = re.search(r"\bfrom\s+([A-Za-z0-9&.,' ]{2,80})", text, re.I)
-            if from_match:
-                candidate = from_match.group(1)
-                candidate = re.split(r"\bfor\b", candidate, 1)[0]
-                candidate = re.sub(r"[^A-Za-z0-9&.,' ]", "", candidate).strip()
-                if candidate:
-                    header["vendor_name"] = candidate
-        if not header.get("vendor_name"):
-            vendor_guess = self._infer_vendor_name(text)
-            if vendor_guess:
-                header["vendor_name"] = vendor_guess
-
-        # 3) Line item extraction: table detection then regex fallback
-        try:
-            if file_bytes:
-                extracted, method, warnings = self._extract_line_items_from_pdf_tables(
-                    file_bytes, doc_type
-                )
-                if extracted:
-                    line_items = extracted
-                table_method = method or table_method
-                table_warnings.extend(warnings)
-        except Exception as exc:
-            table_warnings.append("table_extraction_exception")
-            logger.debug("Table extraction failed: %s", exc)
         if not line_items:
             try:
-                regex_items = self._extract_line_items_regex(text, doc_type) or []
-                if regex_items:
-                    line_items = regex_items
-                    table_method = table_method or "regex-lines"
+                line_items = self._extract_line_items_improved(text, doc_type)
+                if line_items:
+                    extraction_method = "regex_improved"
+                    logger.info(
+                        f"Regex extraction: {len(line_items)} line items found"
+                    )
             except Exception as exc:
-                table_warnings.append("regex_line_extract_exception")
-                logger.debug("Regex line extraction failed: %s", exc)
+                logger.debug(f"Regex extraction failed: {exc}")
 
-        # Normalise and clean numeric fields
+        critical_fields = {
+            "Invoice": ["invoice_id", "vendor_name", "invoice_total_incl_tax"],
+            "Purchase_Order": ["po_id", "vendor_name", "total_amount"],
+            "Quote": ["quote_id", "vendor_name", "total_amount"],
+            "Contract": ["contract_id", "supplier_id"],
+        }
+
+        missing_critical = [
+            field
+            for field in critical_fields.get(doc_type, [])
+            if not header.get(field)
+        ]
+
+        if missing_critical:
+            logger.info(f"Missing critical fields {missing_critical}, using LLM fallback")
+            try:
+                llm_data = self._llm_structured_extraction(text, doc_type)
+                llm_header = llm_data.get("header", {})
+                for field in missing_critical:
+                    if field in llm_header and llm_header[field]:
+                        header[field] = llm_header[field]
+                        logger.info(f"LLM filled missing field: {field}")
+
+                if not line_items and llm_data.get("line_items"):
+                    line_items = llm_data.get("line_items", [])
+                    extraction_method = "llm_fallback"
+                    logger.info(
+                        f"LLM extraction: {len(line_items)} line items found"
+                    )
+            except Exception as exc:
+                logger.warning(f"LLM fallback failed: {exc}")
+
+        header = self._normalize_header_fields(header, doc_type)
         if line_items:
             line_items = self._normalize_line_item_fields(line_items, doc_type)
-            for item in line_items:
-                for num_field in [
-                    "quantity",
-                    "unit_price",
-                    "line_amount",
-                    "tax_percent",
-                    "tax_amount",
-                    "total_amount_incl_tax",
-                    "line_total",
-                    "total_amount",
-                ]:
-                    if num_field in item:
-                        item[num_field] = self._clean_numeric(item[num_field])
 
-        # Preserve LLM-derived metadata before schema alignment
-        meta_confidence = dict(header.get("_field_confidence", {}))
-        meta_context = dict(header.get("_field_context", {}))
-
-        # 3) Reconcile header using line totals
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
 
-        # 4) Infer currency if missing
-        inferred_curr = self._infer_currency(text, header)
-        if inferred_curr:
-            header.setdefault("currency", inferred_curr)
+        if not header.get("currency"):
+            inferred_currency = self._infer_currency(text, header)
+            if inferred_currency:
+                header["currency"] = inferred_currency
+                logger.info(f"Inferred currency: {inferred_currency}")
 
-        # 5) Sanitise names and enrich contract fields
         header = self._sanitize_party_names(header)
+
         if doc_type == "Contract":
             header = self._enrich_contract_fields(text, header)
 
-        # 6) Align with schema and cast values
+        validation_report = self._validate_extraction_quality(
+            header, line_items, doc_type, text
+        )
+
+        header["_validation"] = validation_report
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "Extraction complete: %s - Method: %s, Time: %.2fs, Confidence: %.2f%%, Valid: %s",
+            doc_type,
+            extraction_method or "none",
+            elapsed,
+            validation_report["confidence_score"] * 100,
+            validation_report["is_valid"],
+        )
+
         header_df, header_missing, header_extra = self._build_dataframe_from_records(
             header, doc_type, "header"
         )
-        header_df_out = header_df.copy()
-        header = self._dataframe_to_header(header_df)
         line_df, line_missing, line_extra = self._build_dataframe_from_records(
             line_items, doc_type, "line_items"
         )
-        line_df_out = line_df.copy()
-        line_items = self._dataframe_to_records(line_df)
-        header, line_items = self._validate_and_cast(header, line_items, doc_type)
 
-        if meta_confidence:
-            existing_conf = header.get("_field_confidence", {}) or {}
-            if not isinstance(existing_conf, dict):
-                existing_conf = {}
-            merged_conf = {**meta_confidence, **existing_conf}
-            header["_field_confidence"] = merged_conf
-        if meta_context:
-            header["_field_context"] = meta_context
+        header_dict = self._dataframe_to_header(header_df)
+        line_items_list = self._dataframe_to_records(line_df)
 
-        # 7) Compute validation and confidence
-        ok, conf_boost, notes = self._validate_business_rules(doc_type, header, line_items)
-        total_missing = len(header_missing) + len(line_missing)
-        base_conf = 0.9 if total_missing == 0 else max(0.5, 0.9 - 0.05 * total_missing)
-        confidence = float(min(1.0, max(0.0, base_conf + conf_boost)))
-        if total_missing:
-            notes.append("Missing required fields")
-            ok = False
-        header["_validation"] = {
-            "ok": ok,
-            "notes": notes,
-            "confidence": confidence,
-        }
-        schema_notes = self._schema_verification_notes(
-            doc_type, header_missing, header_extra, line_missing, line_extra
+        header_dict, line_items_list = self._validate_and_cast(
+            header_dict, line_items_list, doc_type
         )
-        if schema_notes:
-            notes.extend(schema_notes)
-        self._log_structured_analysis(doc_type, header, line_items)
+
+        header_dict["_validation"] = validation_report
+
         report = {
-            "table_method": table_method or "none",
-            "table_warnings": table_warnings,
-            "header_missing": header_missing,
-            "line_missing": line_missing,
-            "validation_notes": notes,
-            "quality_score": confidence,
-            "field_confidence": header.get("_field_confidence", {}),
-            "field_sources": field_sources,
-            "line_items_detected": len(line_items),
-            "fields_failed": sorted(set(header_missing + line_missing)),
+            "extraction_method": extraction_method or "none",
+            "processing_time_seconds": round(elapsed, 2),
+            "header_fields_found": len(
+                [k for k, v in header_dict.items() if v not in (None, "", [])]
+            ),
+            "line_items_found": len(line_items_list),
+            "validation": validation_report,
+            "schema_alignment": {
+                "header_missing": header_missing,
+                "header_extra": header_extra,
+                "line_missing": line_missing,
+                "line_extra": line_extra,
+            },
         }
-        if schema_notes:
-            report["manual_review"] = schema_notes
+
+        if validation_report["confidence_score"] < 0.75:
+            logger.warning(
+                "Low confidence extraction: %.2f%% - Errors: %s",
+                validation_report["confidence_score"] * 100,
+                validation_report["errors"],
+            )
+
         return StructuredExtractionResult(
-            header=header,
-            line_items=line_items,
-            header_df=header_df_out,
-            line_df=line_df_out,
+            header=header_dict,
+            line_items=line_items_list,
+            header_df=header_df,
+            line_df=line_df,
             report=report,
         )
-
     def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
         """Run a single LLM pass to capture field-level context for the document."""
 
