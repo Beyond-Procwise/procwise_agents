@@ -8,11 +8,11 @@ import time
 import asyncio
 import logging
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
@@ -178,6 +178,91 @@ class OpportunityRejectionRequest(BaseModel):
 
 
 router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
+
+
+class EmailDispatchRequest(BaseModel):
+    """Flexible request model for dispatching stored RFQ drafts."""
+
+    unique_id: Optional[str] = None
+    rfq_id: Optional[str] = None
+    draft: Optional[Dict[str, Any]] = None
+    drafts: Optional[List[Dict[str, Any]]] = None
+    recipients: Optional[List[str]] = None
+    sender: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    action_id: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _extract_identifier(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+
+        if values.get("unique_id") or values.get("rfq_id"):
+            return values
+
+        draft_obj = values.get("draft")
+        if isinstance(draft_obj, dict):
+            unique_id = draft_obj.get("unique_id")
+            if unique_id:
+                values["unique_id"] = unique_id
+                return values
+
+        drafts_array = values.get("drafts")
+        if isinstance(drafts_array, list) and drafts_array:
+            first_draft = drafts_array[0]
+            if isinstance(first_draft, dict):
+                unique_id = first_draft.get("unique_id")
+                if unique_id:
+                    values["unique_id"] = unique_id
+                    return values
+
+        if "unique_id" in values or "supplier_id" in values:
+            return values
+
+        available_fields = list(values.keys())
+        raise ValueError(
+            "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
+            f"Available fields: {available_fields}"
+        )
+
+    @field_validator("recipients", mode="before")
+    @classmethod
+    def _normalise_recipients(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(",")]
+            return [part for part in parts if part]
+        if isinstance(value, list):
+            cleaned: List[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    cleaned.append(text)
+            return cleaned or None
+        if isinstance(value, tuple):
+            return cls._normalise_recipients(list(value))
+        raise TypeError("recipients must be a string or list of strings")
+
+    def get_identifier(self) -> str:
+        return (self.unique_id or self.rfq_id or "").strip()
+
+
+class EmailDispatchResponse(BaseModel):
+    success: bool
+    unique_id: str
+    sent: bool
+    message_id: Optional[str] = None
+    recipients: List[str]
+    sender: str
+    subject: str
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -384,29 +469,24 @@ async def extract_documents(
 # ---------------------------------------------------------------------------
 @router.post("/email")
 async def send_email(
-    rfq_id: str = Form(...),
-    recipients: Optional[str] = Form(None),
-    sender: Optional[str] = Form(None),
-    subject: Optional[str] = Form(None),
-    body: Optional[str] = Form(None),
-    action_id: Optional[str] = Form(None),
+    request: EmailDispatchRequest,
     orchestrator: Orchestrator = Depends(get_orchestrator),
     agent_nick=Depends(get_agent_nick),
 ):
     """Send a previously drafted RFQ email using the dispatch service."""
 
-    recipient_list = None
-    if recipients is not None:
-        recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
+    identifier = request.get_identifier()
+    if not identifier:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Missing Identifier",
+                "message": "No unique_id or rfq_id provided",
+                "hint": "Send: {\"unique_id\": \"PROC-WF-xxx\"}",
+            },
+        )
 
-    input_data = {
-        "rfq_id": rfq_id,
-        "recipients": recipient_list,
-        "sender": sender,
-        "subject": subject,
-        "body": body,
-        "action_id": action_id,
-    }
+    input_data = request.model_dump(exclude_none=True)
 
     prs = orchestrator.agent_nick.process_routing_service
 
@@ -427,7 +507,7 @@ async def send_email(
         agent_type="email_dispatch",
         action_desc=input_data,
         status="started",
-        action_id=action_id,
+        action_id=input_data.get("action_id"),
     )
 
     dispatch_service = EmailDispatchService(agent_nick)
@@ -435,11 +515,11 @@ async def send_email(
     try:
         dispatch_call = partial(
             dispatch_service.send_draft,
-            rfq_id,
-            recipient_list,
-            sender,
-            subject,
-            body,
+            identifier=identifier,
+            recipients=request.recipients,
+            sender=request.sender,
+            subject_override=request.subject,
+            body_override=request.body,
         )
         result = await run_in_threadpool(dispatch_call)
 
@@ -447,23 +527,65 @@ async def send_email(
         setattr(agent_nick, "dispatch_service_started", True)
         setattr(agent_nick, "email_dispatch_last_sent_at", dispatch_timestamp)
 
+        raw_recipients = result.get("recipients")
+        if isinstance(raw_recipients, str):
+            response_recipients = [raw_recipients]
+        elif isinstance(raw_recipients, list):
+            response_recipients = raw_recipients
+        elif raw_recipients:
+            response_recipients = list(raw_recipients)
+        else:
+            response_recipients = request.recipients or []
+
+        response = EmailDispatchResponse(
+            success=bool(result.get("sent", False)),
+            unique_id=result.get("unique_id", identifier),
+            sent=bool(result.get("sent", False)),
+            message_id=result.get("message_id"),
+            recipients=[str(r) for r in response_recipients],
+            sender=str(result.get("sender") or request.sender or ""),
+            subject=str(result.get("subject") or request.subject or ""),
+            error=result.get("error"),
+        )
+
         prs.log_action(
             process_id=process_id,
             agent_type="email_dispatch",
             action_desc=input_data,
-            process_output=result,
-            status="completed" if result.get("sent") else "failed",
+            process_output=response.model_dump(),
+            status="completed" if response.sent else "failed",
             action_id=action_id,
         )
 
         final_details = {
             "input": input_data,
             "agents": [],
-            "output": result,
-            "status": "completed" if result.get("sent") else "failed",
+            "output": response.model_dump(),
+            "status": "completed" if response.sent else "failed",
         }
         prs.update_process_details(process_id, final_details)
-        prs.update_process_status(process_id, 1 if result.get("sent") else -1)
+        prs.update_process_status(process_id, 1 if response.sent else -1)
+
+    except ValueError as exc:
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_dispatch",
+            action_desc=input_data,
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, -1)
+
+        error_message = str(exc)
+        status_code = 404 if "No stored draft" in error_message else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": "Draft Dispatch Failed",
+                "message": error_message,
+                "identifier": identifier,
+            },
+        )
 
     except Exception as exc:  # pragma: no cover - network/runtime
         prs.log_action(
@@ -476,11 +598,147 @@ async def send_email(
         prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
 
+    return response
+
+
+@router.post("/email/batch")
+async def dispatch_batch_emails(
+    request: Request,
+    agent_nick=Depends(get_agent_nick),
+):
+    body = await request.json()
+    drafts = body.get("drafts", []) if isinstance(body, dict) else []
+    if not drafts:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "No Drafts",
+                "message": "No drafts found in request body",
+                "hint": "Send EmailDraftingAgent output with 'drafts' array",
+            },
+        )
+
+    dispatch_service = EmailDispatchService(agent_nick)
+
+    results: List[Dict[str, Any]] = []
+    for draft in drafts:
+        if not isinstance(draft, dict):
+            continue
+        unique_id = draft.get("unique_id")
+        if not unique_id:
+            logger.warning("Skipping draft without unique_id: %s", draft.get("supplier_id"))
+            continue
+
+        try:
+            result = dispatch_service.send_draft(identifier=unique_id)
+            results.append(
+                {
+                    "unique_id": unique_id,
+                    "sent": bool(result.get("sent")),
+                    "message_id": result.get("message_id"),
+                    "supplier_id": draft.get("supplier_id"),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            logger.error("Failed to dispatch %s: %s", unique_id, str(exc))
+            results.append(
+                {
+                    "unique_id": unique_id,
+                    "sent": False,
+                    "error": str(exc),
+                    "supplier_id": draft.get("supplier_id"),
+                }
+            )
+
+    success_count = sum(1 for r in results if r.get("sent"))
+
     return {
-        "status": "completed" if result.get("sent") else "failed",
-        "result": result,
-        "action_id": action_id,
+        "success": success_count == len(results) if results else False,
+        "total": len(results),
+        "sent": success_count,
+        "failed": len(results) - success_count,
+        "results": results,
     }
+
+
+@router.post("/{workflow_id}/email/dispatch-all")
+async def dispatch_workflow_drafts(
+    workflow_id: str,
+    agent_nick=Depends(get_agent_nick),
+):
+    try:
+        with agent_nick.get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT unique_id, supplier_id, subject, sent
+                    FROM proc.draft_rfq_emails
+                    WHERE workflow_id = %s
+                      AND sent = FALSE
+                    ORDER BY id ASC
+                    """,
+                    (workflow_id,),
+                )
+                draft_rows = cur.fetchall()
+
+        if not draft_rows:
+            return {
+                "success": True,
+                "workflow_id": workflow_id,
+                "total": 0,
+                "sent": 0,
+                "failed": 0,
+                "message": "No unsent drafts found for workflow",
+            }
+
+        dispatch_service = EmailDispatchService(agent_nick)
+
+        results: List[Dict[str, Any]] = []
+        for unique_id, supplier_id, subject, sent in draft_rows:
+            try:
+                result = dispatch_service.send_draft(identifier=unique_id)
+                results.append(
+                    {
+                        "unique_id": unique_id,
+                        "sent": bool(result.get("sent")),
+                        "message_id": result.get("message_id"),
+                        "supplier_id": supplier_id,
+                        "subject": subject,
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - runtime dependent
+                logger.error("Failed to dispatch %s: %s", unique_id, str(exc))
+                results.append(
+                    {
+                        "unique_id": unique_id,
+                        "sent": False,
+                        "error": str(exc),
+                        "supplier_id": supplier_id,
+                        "subject": subject,
+                    }
+                )
+
+        success_count = sum(1 for r in results if r.get("sent"))
+
+        return {
+            "success": success_count == len(results),
+            "workflow_id": workflow_id,
+            "total": len(results),
+            "sent": success_count,
+            "failed": len(results) - success_count,
+            "results": results,
+        }
+
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        logger.exception("Workflow dispatch failed")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Workflow Dispatch Failed",
+                "message": str(exc),
+            },
+        )
+
 
 
 @router.post("/negotiate")

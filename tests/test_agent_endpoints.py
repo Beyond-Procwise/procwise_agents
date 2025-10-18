@@ -1,6 +1,7 @@
 import os
 import os
 import sys
+from typing import Any, Dict
 from types import SimpleNamespace
 
 import pytest
@@ -178,6 +179,57 @@ def test_email_workflow_returns_action_id(monkeypatch):
     assert prs.logged[0]["action_desc"]["rfq_id"] == "RFQ-123"
     assert prs.updated_details["output"]["sent"] is True
     assert prs.updated_details["status"] == "completed"
+
+
+def test_email_workflow_accepts_list_recipients(monkeypatch):
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
+    client = TestClient(app)
+
+    captured: Dict[str, Any] = {}
+
+    class StubDispatch:
+        def __init__(self, agent_nick):
+            captured["agent_nick"] = agent_nick
+
+        def send_draft(
+            self,
+            identifier,
+            recipients=None,
+            sender=None,
+            subject_override=None,
+            body_override=None,
+            attachments=None,
+        ):
+            captured["call"] = {
+                "identifier": identifier,
+                "recipients": recipients,
+            }
+            return {
+                "unique_id": identifier,
+                "sent": True,
+                "recipients": recipients,
+                "sender": sender or "sender@example.com",
+                "subject": subject_override or "subject",
+            }
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
+
+    payload = {
+        "unique_id": "PROC-WF-XYZ",
+        "recipients": ["quotes@example.com", "buyer@example.com"],
+    }
+
+    resp = client.post("/workflows/email", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["recipients"] == payload["recipients"]
+    assert captured["call"]["recipients"] == payload["recipients"]
 
 
 def test_email_workflow_marks_failed_dispatch(monkeypatch):
