@@ -2094,8 +2094,8 @@ class NegotiationAgent(BaseAgent):
     def _load_session_state(
         self, session_id: Optional[str], supplier: Optional[str]
     ) -> Tuple[Dict[str, Any], bool]:
-        identifier = self._coerce_text(session_id)
-        supplier_id = self._coerce_text(supplier)
+        identifier = self._normalize_identifier(session_id)
+        supplier_id = self._normalize_identifier(supplier)
         if not identifier or not supplier_id:
             return self._default_state(), False
         self._ensure_state_schema()
@@ -2155,8 +2155,8 @@ class NegotiationAgent(BaseAgent):
     def _save_session_state(
         self, session_id: Optional[str], supplier: Optional[str], state: Dict[str, Any]
     ) -> None:
-        identifier = self._coerce_text(session_id)
-        supplier_id = self._coerce_text(supplier)
+        identifier = self._normalize_identifier(session_id)
+        supplier_id = self._normalize_identifier(supplier)
         if not identifier or not supplier_id:
             return
         key = (identifier, supplier_id)
@@ -4624,8 +4624,8 @@ class NegotiationAgent(BaseAgent):
         self, session_id: str, supplier: str, round_no: int, counter_price: Optional[float]
     ) -> None:
         """Persist negotiation round details."""
-        identifier = self._coerce_text(session_id)
-        supplier_id = self._coerce_text(supplier)
+        identifier = self._normalize_identifier(session_id)
+        supplier_id = self._normalize_identifier(supplier)
         if not identifier or not supplier_id:
             return
         try:
@@ -5303,6 +5303,25 @@ class NegotiationAgent(BaseAgent):
         except Exception:
             return fallback
         return parsed if parsed > 0 else fallback
+
+    def _normalize_identifier(self, value: Any) -> Optional[str]:
+        text = self._coerce_text(value)
+        if text:
+            return text
+        if value is None:
+            return None
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                decoded = value.decode("utf-8", errors="ignore")
+            except Exception:
+                decoded = str(value)
+            decoded = decoded.strip()
+            return decoded or None
+        try:
+            coerced = str(value).strip()
+        except Exception:
+            return None
+        return coerced or None
 
     def _coerce_text(self, value: Any) -> Optional[str]:
         if isinstance(value, str):
