@@ -17,7 +17,6 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
 from html import escape
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
@@ -53,16 +52,6 @@ SYSTEM_POLISH = (
     "changing intent. Remove any wording that hints at internal scoring or "
     "analysis and return the improved email with an explicit Subject line."
 )
-
-
-def _current_rfq_date() -> str:
-    return datetime.utcnow().strftime("%Y%m%d")
-
-
-def _generate_rfq_id() -> str:
-    return f"RFQ-{_current_rfq_date()}-{uuid.uuid4().hex[:8].upper()}"
-
-
 def _chat(model: str, system: str, user: str, **kwargs) -> str:
     agent = kwargs.pop("agent", None)
     if agent is None:
@@ -144,7 +133,7 @@ class ThreadHeaders:
 
 @dataclass
 class DecisionContext:
-    rfq_id: Optional[str] = None
+    unique_id: Optional[str] = None
     supplier_id: Optional[str] = None
     supplier_name: Optional[str] = None
     current_offer: Optional[float] = None
@@ -161,7 +150,7 @@ class DecisionContext:
 
     def to_public_json(self) -> Dict[str, Any]:
         payload = {
-            "rfq_id": self.rfq_id,
+            "unique_id": self.unique_id,
             "supplier_id": self.supplier_id,
             "supplier_name": self.supplier_name,
             "current_offer": self.current_offer,
@@ -305,7 +294,6 @@ class EmailDraftingAgent(BaseAgent):
         "<p>{scope_summary_html}</p>"
         "<p>Please review the enclosed details and let us know if you require any clarification.</p>"
         "<p>Kindly complete the table and return your quotation by {deadline_html}.</p>"
-        "<p><strong>Note:</strong> Please do not change the subject line when replying.</p>"
         "{rfq_table_html}"
         "<p>We appreciate your timely response.</p>"
         "<p>Kind regards,<br>{your_name_html}<br>{your_title_html}<br>{your_company_html}</p>"
@@ -528,9 +516,12 @@ class EmailDraftingAgent(BaseAgent):
         receiver = to_list[0] if to_list else None
         sender = decision_data.get("sender") or self.agent_nick.settings.ses_default_sender
 
+        existing_unique = self._normalise_tracking_value(decision_data.get("unique_id"))
         supplied_rfq = self._normalise_rfq_identifier(decision_data.get("rfq_id"))
-        payload_rfq = _generate_rfq_id()
-        rfq_id_output = supplied_rfq or payload_rfq
+        workflow_hint = decision_data.get("workflow_id") or decision_data.get("workflow_ref")
+        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
+            workflow_hint, supplier_id
+        )
 
         asks_raw = decision_data.get("asks") or decision_data.get("counter_points") or []
         if isinstance(asks_raw, str):
@@ -554,7 +545,7 @@ class EmailDraftingAgent(BaseAgent):
         )
 
         payload = {
-            "rfq_id": payload_rfq,
+            "unique_id": unique_id,
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
             "current_offer": decision_data.get("current_offer"),
@@ -582,8 +573,8 @@ class EmailDraftingAgent(BaseAgent):
             user_prompt = (
                 f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
                 "Write a professional negotiation counter email with an explicit Subject line. "
-                "Reference the RFQ ID provided, summarise the commercial position, list the key asks "
-                "as bullet points, and close with a clear call to action."
+                "Summarise the commercial position, list the key asks as bullet points, and close "
+                "with a clear call to action."
             )
 
             model_name = getattr(
@@ -605,7 +596,7 @@ class EmailDraftingAgent(BaseAgent):
 
             subject_line, body_text = self._split_subject_and_body(response_text)
             fallback_text = self._build_negotiation_fallback(
-                rfq_id_output,
+                unique_id,
                 decision_data.get("counter_price"),
                 decision_data.get("target_price"),
                 decision_data.get("current_offer"),
@@ -638,13 +629,10 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
-        workflow_hint = decision_data.get("workflow_id") or decision_data.get("workflow_ref")
-
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
-            rfq_id=None,
             supplier_id=supplier_id,
-            existing=decision_data.get("unique_id"),
+            existing=unique_id,
         )
 
         annotated_body, marker_token = attach_hidden_marker(
@@ -695,7 +683,6 @@ class EmailDraftingAgent(BaseAgent):
         headers = {k: v for k, v in headers.items() if v is not None}
 
         metadata = {
-            "rfq_id": rfq_id_output,
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
             "counter_price": decision_data.get("counter_price"),
@@ -715,7 +702,6 @@ class EmailDraftingAgent(BaseAgent):
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
         draft = {
-            "rfq_id": rfq_id_output,
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
             "subject": subject,
@@ -762,10 +748,15 @@ class EmailDraftingAgent(BaseAgent):
         receiver = to_list[0] if to_list else None
         sender = context.get("sender") or self.agent_nick.settings.ses_default_sender
 
+        supplier_id = context.get("supplier_id")
+        workflow_hint = context.get("workflow_id") if isinstance(context, dict) else None
+        existing_unique = self._normalise_tracking_value(context.get("unique_id"))
         supplied_rfq = self._normalise_rfq_identifier(context.get("rfq_id"))
-        rfq_id_value = supplied_rfq or _generate_rfq_id()
+        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
+            workflow_hint, supplier_id
+        )
 
-        payload = {"rfq_id": rfq_id_value, "prompt": prompt_text}
+        payload = {"unique_id": unique_id, "prompt": prompt_text}
         user_prompt = (
             f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
             "Compose a professional procurement email with a clear Subject line and structured body. "
@@ -797,7 +788,7 @@ class EmailDraftingAgent(BaseAgent):
         }
         if polish_enabled and self.polish_model:
             polish_payload = {
-                "rfq_id": rfq_id_value,
+                "unique_id": unique_id,
                 "subject": subject,
                 "body": plain_text,
             }
@@ -828,13 +819,10 @@ class EmailDraftingAgent(BaseAgent):
         if plain_text:
             plain_text = self._clean_body_text(plain_text)
 
-        supplier_id = context.get("supplier_id")
-        workflow_hint = context.get("workflow_id") if isinstance(context, dict) else None
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
-            rfq_id=rfq_id_value,
             supplier_id=supplier_id,
-            existing=context.get("unique_id") if isinstance(context, dict) else None,
+            existing=unique_id,
         )
         annotated_body, marker_token = attach_hidden_marker(
             plain_text or "",
@@ -853,13 +841,12 @@ class EmailDraftingAgent(BaseAgent):
 
         metadata = {
             "intent": context.get("intent") or "PROMPT_COMPOSE",
-            "rfq_id": rfq_id_value,
+            "unique_id": unique_id,
         }
         if counter_price is not None:
             metadata["counter_price"] = counter_price
         if marker_token:
             metadata["dispatch_token"] = marker_token
-        metadata["unique_id"] = unique_id
         if workflow_hint:
             metadata["workflow_id"] = workflow_hint
 
@@ -868,7 +855,6 @@ class EmailDraftingAgent(BaseAgent):
             headers["X-Procwise-Workflow-Id"] = workflow_hint
 
         draft = {
-            "rfq_id": rfq_id_value,
             "subject": subject,
             "body": annotated_body,
             "text": plain_text,
@@ -883,6 +869,7 @@ class EmailDraftingAgent(BaseAgent):
             "metadata": metadata,
             "headers": headers,
             "unique_id": unique_id,
+            "workflow_id": workflow_hint,
         }
 
         return draft
@@ -990,8 +977,12 @@ class EmailDraftingAgent(BaseAgent):
     def _handle_negotiation_counter(self, context: AgentContext, data: Dict[str, Any]) -> AgentOutput:
         supplier_id = data.get("supplier_id")
         supplier_name = data.get("supplier_name") or supplier_id or "Supplier"
-        rfq_id_raw = data.get("rfq_id")
-        rfq_id = str(rfq_id_raw).strip().upper() if rfq_id_raw else "RFQ"
+        workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
+        supplied_rfq = self._normalise_rfq_identifier(data.get("rfq_id"))
+        existing_unique = self._normalise_tracking_value(data.get("unique_id"))
+        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
+            workflow_hint, supplier_id
+        )
         decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
         counter_price = data.get("counter_price")
         if counter_price is None:
@@ -1030,7 +1021,7 @@ class EmailDraftingAgent(BaseAgent):
         strategy = decision.get("strategy")
 
         payload = {
-            "rfq_id": rfq_id,
+            "unique_id": unique_id,
             "supplier_id": supplier_id,
             "round": round_no,
             "current_offer": current_offer,
@@ -1071,7 +1062,7 @@ class EmailDraftingAgent(BaseAgent):
 
         if not email_text:
             email_text = self._build_negotiation_fallback(
-                rfq_id,
+                unique_id,
                 counter_price,
                 target_price,
                 current_offer,
@@ -1085,12 +1076,10 @@ class EmailDraftingAgent(BaseAgent):
 
         body_content = self._sanitise_generated_body(email_text)
         body = self._clean_body_text(body_content)
-        workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
-            rfq_id=None,
             supplier_id=supplier_id,
-            existing=data.get("unique_id"),
+            existing=unique_id,
         )
         body, marker_token = attach_hidden_marker(
             body,
@@ -1133,7 +1122,6 @@ class EmailDraftingAgent(BaseAgent):
         draft = {
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
-            "rfq_id": rfq_id,
             "subject": subject,
             "body": body,
             "sent_status": False,
@@ -1143,6 +1131,7 @@ class EmailDraftingAgent(BaseAgent):
             "contact_level": contact_level,
             "metadata": metadata,
             "unique_id": unique_id,
+            "workflow_id": workflow_hint,
         }
 
         headers = {
@@ -1305,7 +1294,7 @@ class EmailDraftingAgent(BaseAgent):
 
     def _build_negotiation_fallback(
         self,
-        rfq_id: str,
+        unique_id: str,
         counter_price: Optional[Any],
         target_price: Optional[Any],
         current_offer: Optional[Any],
@@ -1575,11 +1564,20 @@ class EmailDraftingAgent(BaseAgent):
 
         normalised_template = re.sub(r"\s+", " ", template_text)
         normalised_default = re.sub(r"\s+", " ", self.TEXT_TEMPLATE.strip())
-        if normalised_template == normalised_default:
-            return True
 
-        if instruction_settings.get("interaction_type") or context.get("interaction_type"):
-            return True
+        if normalised_template == normalised_default:
+            interaction_type = instruction_settings.get("interaction_type") or context.get(
+                "interaction_type"
+            )
+            if interaction_type and interaction_type.lower() in {
+                "negotiation",
+                "follow_up",
+                "reminder",
+                "clarification",
+                "thank_you",
+            }:
+                return True
+            return False
 
         return False
 
@@ -1677,6 +1675,7 @@ class EmailDraftingAgent(BaseAgent):
         context_note = meta.get("context_note") or instructions.get("context_note")
 
         sections: List[str] = []
+
         greeting_name = template_args.get("supplier_contact_name_html") or "Supplier"
         sections.append(f"<p>Dear {greeting_name},</p>")
 
@@ -1686,10 +1685,18 @@ class EmailDraftingAgent(BaseAgent):
         )
         if opening:
             sections.append(opening)
+        else:
+            sections.append(
+                "<p>We are writing to request a formal quotation for the requirement outlined below.</p>"
+            )
 
         scope_html = template_args.get("scope_summary_html")
-        if scope_html:
+        if scope_html and scope_html.strip():
             sections.append(f"<p>{scope_html}</p>")
+        else:
+            sections.append(
+                "<p>Please review the detailed requirement and provide your quotation.</p>"
+            )
 
         if context_note:
             context_paragraph = self._wrap_paragraph(str(context_note))
@@ -1737,9 +1744,21 @@ class EmailDraftingAgent(BaseAgent):
         )
         if cta:
             sections.append(cta)
+        else:
+            deadline = template_args.get("deadline_html") or template_args.get("deadline")
+            if deadline:
+                sections.append(f"<p>Please return your quotation by {deadline}.</p>")
+            else:
+                sections.append(
+                    "<p>Please return your quotation at your earliest convenience.</p>"
+                )
 
-        if include_rfq_table and template_args.get("rfq_table_html"):
-            sections.append(template_args["rfq_table_html"])
+        if include_rfq_table:
+            rfq_table = template_args.get("rfq_table_html")
+            if rfq_table and rfq_table.strip():
+                sections.append(rfq_table)
+            else:
+                sections.append(RFQ_TABLE_HEADER)
 
         closing = self._build_dynamic_closing(
             interaction_type,
@@ -1749,6 +1768,8 @@ class EmailDraftingAgent(BaseAgent):
         )
         if closing:
             sections.append(closing)
+        else:
+            sections.append("<p>We appreciate your timely response.</p>")
 
         signature = self._build_signature_block(template_args)
         if signature:
@@ -2048,6 +2069,7 @@ class EmailDraftingAgent(BaseAgent):
         instructions: Dict[str, Any],
         override: Optional[str],
     ) -> str:
+        """Build call to action without RFQ ID references."""
         if override:
             return self._wrap_paragraph(str(override))
 
@@ -2068,7 +2090,9 @@ class EmailDraftingAgent(BaseAgent):
                 f"closer to {target_text} is achievable?"
             )
             if current_offer:
-                base += f" Your current offer of {current_offer} is appreciated and forms the basis of this discussion."
+                base += (
+                    f" Your current offer of {current_offer} is appreciated and forms the basis of this discussion."
+                )
         elif interaction_type == "follow_up":
             base = "We would appreciate an update on your quotation at your earliest convenience."
         elif interaction_type == "reminder":
@@ -2093,7 +2117,6 @@ class EmailDraftingAgent(BaseAgent):
             else:
                 base = "Please review the requirement and return your quotation using the table below."
 
-        # note = " Kindly retain the RFQ ID in the email subject when replying."
         return self._wrap_paragraph(f"{base}")
 
     def _build_dynamic_closing(
@@ -2465,7 +2488,7 @@ class EmailDraftingAgent(BaseAgent):
         manual_has_body = bool(manual_body_input and manual_body_input.strip())
         manual_subject_rendered: Optional[str] = None
         manual_body_rendered: Optional[str] = None
-        manual_rfq_id: Optional[str] = None
+        manual_unique_id: Optional[str] = None
         manual_sent_flag: bool = data.get("sent_status", True)
 
         instruction_settings = self._resolve_instruction_settings(context)
@@ -2545,10 +2568,14 @@ class EmailDraftingAgent(BaseAgent):
             or self._coerce_text(data.get("subject_template"))
         )
 
+        workflow_id = getattr(context, "workflow_id", None)
+        if not workflow_id:
+            workflow_id = f"WF-{uuid.uuid4().hex[:16]}"
+
         for supplier in ranking:
             supplier_id = supplier.get("supplier_id")
             supplier_name = supplier.get("supplier_name", supplier_id)
-            rfq_id = self._generate_rfq_id()
+            unique_id = self._generate_unique_identifier(workflow_id, supplier_id)
 
             profile = supplier_profiles.get(str(supplier_id)) if supplier_id is not None else {}
             if profile is None:
@@ -2587,7 +2614,7 @@ class EmailDraftingAgent(BaseAgent):
             template_args = {**data, **fmt_args, **contextual_args}
             template_args.update(
                 {
-                    "rfq_id": rfq_id,
+                    "unique_id": unique_id,
                     "additional_paragraph_html": additional_section_html,
                     "compliance_notice_html": compliance_section_html,
                     "negotiation_message_html": negotiation_section_html,
@@ -2638,19 +2665,19 @@ class EmailDraftingAgent(BaseAgent):
             if negotiation_section_html and negotiation_section_html not in content:
                 content = f"{content}{negotiation_section_html}"
             body = self._clean_body_text(content)
-            workflow_hint = getattr(context, "workflow_id", None)
             body, marker_token = attach_hidden_marker(
                 body,
                 supplier_id=supplier_id,
+                unique_id=unique_id,
             )
             if subject_template_source:
                 subject_args = dict(template_args)
-                subject_args.setdefault("rfq_id", rfq_id)
+                subject_args.setdefault("unique_id", unique_id)
                 rendered_subject = self._render_template_string(
                     subject_template_source, subject_args
                 )
                 subject = self._clean_subject_text(
-                    self._normalise_subject_line(rendered_subject, rfq_id),
+                    self._normalise_subject_line(rendered_subject, unique_id),
                     DEFAULT_RFQ_SUBJECT,
                 )
             else:
@@ -2677,7 +2704,6 @@ class EmailDraftingAgent(BaseAgent):
             draft = {
                 "supplier_id": supplier_id,
                 "supplier_name": supplier_name,
-                "rfq_id": rfq_id,
                 "subject": subject,
                 "body": body,
                 "sent_status": False,
@@ -2687,13 +2713,16 @@ class EmailDraftingAgent(BaseAgent):
                 "receiver": receiver,
                 "contact_level": contact_level,
                 "recipients": recipients,
+                "unique_id": unique_id,
+                "workflow_id": workflow_id,
             }
             if draft_action_id:
                 draft["action_id"] = draft_action_id
             draft.setdefault("thread_index", 1)
             metadata: Dict[str, Any] = {
-                "rfq_id": rfq_id,
+                "unique_id": unique_id,
                 "interaction_type": interaction_type,
+                "workflow_id": workflow_id,
             }
             if supplier_id is not None:
                 metadata["supplier_id"] = supplier_id
@@ -2707,7 +2736,9 @@ class EmailDraftingAgent(BaseAgent):
             draft = self._apply_workflow_context(draft, context)
             drafts.append(draft)
             self._store_draft(draft)
-            logger.debug("EmailDraftingAgent created draft %s for supplier %s", rfq_id, supplier_id)
+            logger.debug(
+                "EmailDraftingAgent created draft %s for supplier %s", unique_id, supplier_id
+            )
 
         if manual_recipients and manual_has_body:
             manual_comment, manual_message = self._split_existing_comment(manual_body_input)
@@ -2716,26 +2747,31 @@ class EmailDraftingAgent(BaseAgent):
                 if manual_comment
                 else self._sanitise_generated_body(manual_body_input)
             )
-            manual_rfq_id = self._extract_rfq_id(manual_comment) or self._generate_rfq_id()
+            extracted_manual_id = self._extract_rfq_id(manual_comment)
+            manual_unique_id = extracted_manual_id or self._generate_unique_identifier(
+                workflow_id, None
+            )
             manual_body_rendered = self._clean_body_text(manual_body_content)
-            workflow_hint = getattr(context, "workflow_id", None)
             manual_body_rendered, manual_marker_token = attach_hidden_marker(
                 manual_body_rendered,
                 supplier_id=None,
+                unique_id=manual_unique_id,
             )
             manual_subject_rendered = self._clean_subject_text(
                 manual_subject_input,
                 DEFAULT_RFQ_SUBJECT,
             )
 
-            manual_metadata: Dict[str, Any] = {"rfq_id": manual_rfq_id}
+            manual_metadata: Dict[str, Any] = {
+                "unique_id": manual_unique_id,
+                "workflow_id": workflow_id,
+            }
             if manual_marker_token:
                 manual_metadata["dispatch_token"] = manual_marker_token
 
             manual_draft = {
                 "supplier_id": None,
                 "supplier_name": ", ".join(manual_recipients),
-                "rfq_id": manual_rfq_id,
                 "subject": manual_subject_rendered,
                 "body": manual_body_rendered,
                 "sent_status": bool(manual_sent_flag),
@@ -2746,6 +2782,8 @@ class EmailDraftingAgent(BaseAgent):
                 "receiver": manual_recipients[0] if manual_recipients else None,
                 "contact_level": 1 if manual_recipients else 0,
                 "metadata": manual_metadata,
+                "unique_id": manual_unique_id,
+                "workflow_id": workflow_id,
             }
             if default_action_id:
                 manual_draft["action_id"] = default_action_id
@@ -2796,9 +2834,6 @@ class EmailDraftingAgent(BaseAgent):
             ),
         )
 
-
-    def _generate_rfq_id(self) -> str:
-        return _generate_rfq_id()
 
     def _derive_sender_identity(
         self, sender_email: str, override_title: Optional[str] = None
@@ -3056,11 +3091,22 @@ class EmailDraftingAgent(BaseAgent):
             return None
         return text or None
 
+    def _generate_unique_identifier(
+        self, workflow_id: Optional[str], supplier_id: Optional[str]
+    ) -> str:
+        """Generate unique identifier for emails."""
+
+        workflow_hint = self._normalise_tracking_value(workflow_id)
+        if not workflow_hint:
+            workflow_hint = f"WF-{uuid.uuid4().hex}"
+
+        supplier_hint = self._normalise_tracking_value(supplier_id)
+        return generate_unique_email_id(workflow_hint, supplier_hint)
+
     def _resolve_unique_id(
         self,
         *,
         workflow_id: Optional[Any],
-        rfq_id: Optional[Any],
         supplier_id: Optional[Any],
         existing: Optional[Any] = None,
     ) -> str:
@@ -3069,11 +3115,7 @@ class EmailDraftingAgent(BaseAgent):
             return existing_value
 
         workflow_hint = self._normalise_tracking_value(workflow_id)
-        if not workflow_hint:
-            workflow_hint = f"WF-{uuid.uuid4().hex}"
-
-        supplier_hint = self._normalise_tracking_value(supplier_id)
-        return generate_unique_email_id(workflow_hint, supplier_hint)
+        return self._generate_unique_identifier(workflow_hint, supplier_id)
 
     def execute(self, context: AgentContext) -> AgentOutput:
         result = super().execute(context)
@@ -3134,13 +3176,11 @@ class EmailDraftingAgent(BaseAgent):
 
                 unique_id = self._resolve_unique_id(
                     workflow_id=workflow_id,
-                    rfq_id=None,
                     supplier_id=draft.get("supplier_id"),
                     existing=draft.get("unique_id") or metadata.get("unique_id"),
                 )
                 draft["unique_id"] = unique_id
                 metadata.setdefault("unique_id", unique_id)
-                draft.setdefault("rfq_id", unique_id)
 
                 run_id = draft.get("run_id")
                 if not run_id:
@@ -3184,7 +3224,7 @@ class EmailDraftingAgent(BaseAgent):
 
                 thread_index = draft.get("thread_index")
                 if not isinstance(thread_index, int) or thread_index < 1:
-                    thread_index = self._next_thread_index(conn, draft["rfq_id"])
+                    thread_index = self._next_thread_index(conn, unique_id)
                     draft["thread_index"] = thread_index
 
                 recipients = draft.get("recipients")
@@ -3218,7 +3258,7 @@ class EmailDraftingAgent(BaseAgent):
                         RETURNING id
                         """,
                         (
-                            draft.get("rfq_id") or unique_id,
+                            unique_id,
                             unique_id,
                             draft.get("supplier_id"),
                             draft.get("supplier_name"),
@@ -3272,7 +3312,7 @@ class EmailDraftingAgent(BaseAgent):
                 )
             except Exception:
                 logger.debug(
-                    "Learning capture failed for draft %s", draft.get("rfq_id"), exc_info=True
+                    "Learning capture failed for draft %s", draft.get("unique_id"), exc_info=True
                 )
 
     def _synchronise_draft_records(self, result: AgentOutput) -> None:
@@ -3387,11 +3427,11 @@ class EmailDraftingAgent(BaseAgent):
 
             self._draft_table_checked = True
 
-    def _next_thread_index(self, conn, rfq_id: str) -> int:
+    def _next_thread_index(self, conn, unique_id: str) -> int:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(MAX(thread_index), 0) FROM proc.draft_rfq_emails WHERE rfq_id = %s",
-                (rfq_id,),
+                "SELECT COALESCE(MAX(thread_index), 0) FROM proc.draft_rfq_emails WHERE unique_id = %s",
+                (unique_id,),
             )
             row = cur.fetchone()
         try:
