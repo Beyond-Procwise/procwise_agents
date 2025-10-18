@@ -71,10 +71,55 @@ class ProcessRoutingService:
         self._agent_type_cache_by_id: Dict[str, str] = {}
         self._prompt_id_catalog: set[int] = set()
         self._policy_id_catalog: set[int] = set()
+        self._ensure_routing_table()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _ensure_routing_table(self) -> None:
+        """Ensure ``proc.routing`` exists with the expected columns."""
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.routing (
+                            process_id SERIAL PRIMARY KEY,
+                            process_name TEXT NOT NULL,
+                            workflow_id TEXT,
+                            process_details JSONB,
+                            process_status INTEGER DEFAULT 0,
+                            created_on TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                            created_by TEXT,
+                            modified_on TIMESTAMP WITHOUT TIME ZONE,
+                            modified_by TEXT,
+                            user_id TEXT,
+                            user_name TEXT,
+                            raw_data JSON
+                        )
+                        """
+                    )
+
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'proc'
+                          AND table_name = 'routing'
+                          AND column_name = 'workflow_id'
+                        """
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            "ALTER TABLE proc.routing ADD COLUMN workflow_id TEXT"
+                        )
+                conn.commit()
+        except Exception:
+            logger.exception(
+                "Failed to ensure proc.routing table has workflow_id column"
+            )
+
     @staticmethod
     def _serialize(obj: Any) -> Any:
         """Best effort serialization for complex objects.
