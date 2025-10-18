@@ -2198,22 +2198,29 @@ class DataExtractionAgent(BaseAgent):
                     except (ValueError, TypeError):
                         pass
 
-            line_sum = sum(
-                float(item.get("line_amount") or item.get("line_total") or 0)
-                for item in line_items
-            )
+            line_sum = 0.0
+            for item in line_items:
+                raw_value = item.get("line_amount") or item.get("line_total")
+                if raw_value is None:
+                    continue
+                cleaned = self._clean_numeric(raw_value)
+                if cleaned is None:
+                    continue
+                line_sum += cleaned
 
             header_subtotal = header.get("invoice_amount") or header.get("total_amount")
-            if header_subtotal and line_sum > 0:
-                try:
-                    diff = abs(line_sum - float(header_subtotal))
-                    if diff > 0.02:
-                        report["warnings"].append(
-                            f"Line items sum to {line_sum:.2f} but header shows {header_subtotal}"
-                        )
-                        report["confidence_score"] -= 0.05
-                except (ValueError, TypeError):
-                    pass
+            header_value = (
+                self._clean_numeric(header_subtotal)
+                if header_subtotal is not None
+                else None
+            )
+            if header_value is not None and line_sum > 0:
+                diff = abs(line_sum - header_value)
+                if diff > 0.02:
+                    report["warnings"].append(
+                        f"Line items sum to {line_sum:.2f} but header shows {header_subtotal}"
+                    )
+                    report["confidence_score"] -= 0.05
         else:
             if doc_type in ["Invoice", "Purchase_Order", "Quote"]:
                 report["warnings"].append("No line items extracted")
