@@ -485,9 +485,10 @@ class SupplierRelationshipService:
 
         cache = self._fallback_cache
         if cache is None:
-            cache = {"id": {}, "name": {}}
+            cache_builder: Dict[str, Dict[str, List[Dict[str, Any]]]] = {"id": {}, "name": {}}
             page_size = 256
             next_offset = None
+            build_failed = False
 
             while True:
                 try:
@@ -503,7 +504,7 @@ class SupplierRelationshipService:
                     logger.exception(
                         "SupplierRelationshipService fallback scroll failed while building in-memory relationship cache"
                     )
-                    cache = {"id": {}, "name": {}}
+                    build_failed = True
                     break
 
                 if not results:
@@ -515,16 +516,20 @@ class SupplierRelationshipService:
                         continue
                     sid = str(payload.get("supplier_id") or "").strip()
                     if sid:
-                        cache.setdefault("id", {}).setdefault(sid, []).append(payload)
+                        cache_builder.setdefault("id", {}).setdefault(sid, []).append(payload)
                     normalised_name = payload.get("supplier_name_normalized") or self._normalise_key(
                         payload.get("supplier_name")
                     )
                     if normalised_name:
-                        cache.setdefault("name", {}).setdefault(normalised_name, []).append(payload)
+                        cache_builder.setdefault("name", {}).setdefault(normalised_name, []).append(payload)
 
                 if next_offset is None:
                     break
 
+            if build_failed:
+                return []
+
+            cache = cache_builder
             self._fallback_cache = cache
 
         matches: List[Dict[str, Any]] = []
