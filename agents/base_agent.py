@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Mapping
 from urllib.parse import quote_plus
 import threading
 
@@ -223,7 +223,7 @@ class BaseAgent:
         # process logging tables retain the authoritative payload while the
         # storage layer remains responsible for any serialisation required.
         logged_input = context.input_data
-        logged_output = result.data
+        logged_output = self._prepare_logged_output(result.data)
         process_id = self.agent_nick.process_routing_service.log_process(
             process_name=self.__class__.__name__,
             process_details={"input": logged_input, "output": logged_output},
@@ -266,6 +266,31 @@ class BaseAgent:
             logger.debug("Context dataset capture failed", exc_info=True)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------------
+    def _prepare_logged_output(self, payload: Any) -> Any:
+        """Return a copy of ``payload`` with heavy knowledge blobs removed."""
+
+        return self._remove_knowledge_blocks(payload)
+
+    @classmethod
+    def _remove_knowledge_blocks(cls, value: Any) -> Any:
+        """Recursively drop ``knowledge`` keys from nested payloads."""
+
+        if isinstance(value, Mapping):
+            cleaned: Dict[Any, Any] = {}
+            for key, item in value.items():
+                if key == "knowledge":
+                    continue
+                cleaned[key] = cls._remove_knowledge_blocks(item)
+            return cleaned
+        if isinstance(value, list):
+            return [cls._remove_knowledge_blocks(item) for item in value]
+        if isinstance(value, tuple):  # Serialisation converts tuples to lists later
+            return [cls._remove_knowledge_blocks(item) for item in value]
+        return value
 
     # ------------------------------------------------------------------
     # Context preparation helpers
@@ -336,11 +361,22 @@ class BaseAgent:
         if manifest:
             snapshot["manifest"] = manifest
 
-        if any(value for key, value in snapshot.items() if key not in {"workflow_id", "agent_id", "user_id"}):
+        # Remove heavy knowledge payloads before attaching the snapshot to the
+        # runtime context or returning it to downstream consumers. This keeps
+        # the live ``context_snapshot`` informative without persisting large
+        # manifest knowledge bundles that are already available via
+        # ``AgentContext.knowledge_base``.
+        sanitized_snapshot = self._remove_knowledge_blocks(snapshot)
+
+        if any(
+            value
+            for key, value in sanitized_snapshot.items()
+            if key not in {"workflow_id", "agent_id", "user_id"}
+        ):
             context.input_data = dict(context.input_data)
-            context.input_data.setdefault("context_snapshot", snapshot)
-            context._prepared_context_snapshot = snapshot  # type: ignore[attr-defined]
-            return snapshot
+            context.input_data.setdefault("context_snapshot", sanitized_snapshot)
+            context._prepared_context_snapshot = sanitized_snapshot  # type: ignore[attr-defined]
+            return sanitized_snapshot
         context._prepared_context_snapshot = None  # type: ignore[attr-defined]
         return None
 

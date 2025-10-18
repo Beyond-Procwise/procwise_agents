@@ -86,6 +86,71 @@ def test_get_available_models_returns_fallback_when_empty(monkeypatch):
     assert models == list(base_agent._OLLAMA_FALLBACK_MODELS)
 
 
+def test_prepare_logged_output_strips_knowledge_without_touching_original():
+    agent = make_base_agent()
+    payload = {
+        "manifest": {
+            "task": {"name": "rfq"},
+            "knowledge": {"tables": ["proc.supplier"]},
+        },
+        "knowledge": {"tables": ["proc.action"]},
+        "drafts": [
+            {
+                "content": "hello",
+                "knowledge": {"debug": True},
+            }
+        ],
+    }
+
+    logged_output = agent._prepare_logged_output(payload)
+
+    # Original payload is preserved for runtime consumers
+    assert "knowledge" in payload
+    assert "knowledge" in payload["manifest"]
+    assert "knowledge" in payload["drafts"][0]
+
+    # Logged payload removes heavy knowledge blobs at every level
+    assert "knowledge" not in logged_output
+    assert "knowledge" not in logged_output["manifest"]
+    assert "knowledge" not in logged_output["drafts"][0]
+
+
+def test_context_snapshot_strips_knowledge_but_preserves_context_base():
+    class SnapshotAgent(base_agent.BaseAgent):
+        def run(self, ctx):
+            # Ensure knowledge remains available to the agent at runtime
+            assert ctx.knowledge_base == {"tables": ["proc.invoice_agent"]}
+            return base_agent.AgentOutput(
+                status=base_agent.AgentStatus.SUCCESS,
+                data={},
+            )
+
+    agent = SnapshotAgent(DummyAgentNick())
+
+    context = base_agent.AgentContext(
+        workflow_id="wf-knowledge",
+        agent_id="agent-knowledge",
+        user_id="user-knowledge",
+        input_data={"prompt": "hello"},
+    )
+    context.apply_manifest(
+        {
+            "task": {"name": "rfq"},
+            "knowledge": {"tables": ["proc.invoice_agent"]},
+        }
+    )
+
+    result = agent.execute(context)
+
+    snapshot = result.data.get("context_snapshot")
+    assert snapshot is not None
+    assert "knowledge" not in snapshot
+    assert "knowledge" not in snapshot.get("manifest", {})
+
+    # Underlying manifest supplied to the context remains unchanged
+    assert context.manifest()["knowledge"] == {"tables": ["proc.invoice_agent"]}
+
+
 def test_execute_persists_agentic_plan(monkeypatch):
     executed_statements: List[str] = []
     executed_params: List[Optional[tuple]] = []
