@@ -343,8 +343,9 @@ agent_id character varying(255) COLLATE pg_catalog."default" NOT NULL,
 ```
 ### `proc.routing`
 ```
-process_id integer NOT NULL DEFAULT nextval('proc.process_process_id_seq'::regclass),
+    process_id integer NOT NULL DEFAULT nextval('proc.process_process_id_seq'::regclass),
     process_name text COLLATE pg_catalog."default" NOT NULL,
+    workflow_id text COLLATE pg_catalog."default",
     process_details jsonb,
     process_status integer DEFAULT 0,
     created_on timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
