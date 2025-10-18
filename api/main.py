@@ -27,7 +27,7 @@ from agents.email_drafting_agent import EmailDraftingAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
-from api.routers import documents, run, system, training, workflows
+from api.routers import documents, run, stream, system, training, workflows
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -111,6 +111,7 @@ app.include_router(documents.router)
 app.include_router(workflows.router)
 app.include_router(system.router)
 app.include_router(run.router)
+app.include_router(stream.router)
 app.include_router(training.router)
 
 @app.get("/", tags=["General"])
