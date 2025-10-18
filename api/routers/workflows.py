@@ -187,7 +187,7 @@ class EmailDispatchRequest(BaseModel):
     rfq_id: Optional[str] = None
     draft: Optional[Dict[str, Any]] = None
     drafts: Optional[List[Dict[str, Any]]] = None
-    recipients: Optional[Union[List[str], str]] = None
+    recipients: Optional[List[str]] = None
     sender: Optional[str] = None
     subject: Optional[str] = None
     body: Optional[str] = None
@@ -235,11 +235,19 @@ class EmailDispatchRequest(BaseModel):
         if value is None:
             return None
         if isinstance(value, str):
-            if value.strip():
-                return [value.strip()]
-            return None
+            parts = [part.strip() for part in value.split(",")]
+            return [part for part in parts if part]
         if isinstance(value, list):
-            return value
+            cleaned: List[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    cleaned.append(text)
+            return cleaned or None
+        if isinstance(value, tuple):
+            return cls._normalise_recipients(list(value))
         raise TypeError("recipients must be a string or list of strings")
 
     def get_identifier(self) -> str:
