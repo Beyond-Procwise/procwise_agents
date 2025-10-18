@@ -6,9 +6,9 @@ opaque filenames.  Each put event fans out via SQS and triggers the handler
 below which:
 
 * Downloads the raw email object and parses RFC-2047 headers safely.
-* Extracts the ``rfq_id`` from a dedicated header, subject token, thread map, or
-  as a last resort from the textual body of the message.
-* Tags the original object and copies it into ``emails/{rfq_id}/ingest/`` so
+* Extracts the ``unique_id`` from dedicated headers, thread metadata, or as a
+  last resort from the textual body of the message.
+* Tags the original object and copies it into ``emails/{unique_id}/ingest/`` so
   downstream processors have a deterministic prefix to scan.
 * Moves unmatched emails into ``emails/_unmatched/`` for manual triage.
 
@@ -41,6 +41,10 @@ from services.email_thread_store import (
     lookup_thread_metadata,
     sanitise_thread_table_name,
 )
+from utils.email_tracking import (
+    extract_unique_id_from_body as _extract_uid_from_text,
+    extract_unique_id_from_headers,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -68,8 +72,8 @@ _DB_CONNECTION = None
 _SUPPLIER_TABLE_INITIALISED = False
 _SUPPLIER_OBJECT_TABLE_INITIALISED = False
 
-RFQ_SUBJECT_RE = re.compile(r"\bRFQ[-_](\d{8})[-_]?([A-Za-z0-9\-]+)", re.IGNORECASE)
-RFQ_HTML_COMMENT_RE = re.compile(r"<!--\s*RFQ-ID\s*:\s*([A-Za-z0-9_-]+)\s*-->", re.IGNORECASE)
+UID_HTML_COMMENT_RE = re.compile(r"<!--\s*PROCWISE:UID=([^>]+?)-->", re.IGNORECASE)
+UID_TOKEN_RE = re.compile(r"(?i)\bPROC-WF-[A-Z0-9]{6,}\b")
 
 _VALID_TABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
@@ -249,21 +253,28 @@ def _decode_header(value: Optional[str]) -> str:
     return str(header).strip()
 
 
-def _normalise_rfq(date: str, token: str) -> str:
-    return f"RFQ-{date}-{token}".upper()
+def _normalise_unique_id(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    value = str(token).strip()
+    return value.upper() or None
 
 
-def _extract_rfq_from_subject(subject: str) -> Optional[str]:
+def _extract_unique_id_from_subject(subject: str) -> Optional[str]:
     if not subject:
         return None
-    match = RFQ_SUBJECT_RE.search(subject)
-    if not match:
-        return None
-    date, token = match.groups()
-    return _normalise_rfq(date, token)
+    candidate = _extract_uid_from_text(subject)
+    if candidate:
+        return _normalise_unique_id(candidate)
+    match = UID_TOKEN_RE.search(subject)
+    if match:
+        return _normalise_unique_id(match.group(0))
+    return None
 
 
-def _lookup_rfq_from_thread(in_reply_to: Optional[str], references: Optional[str]) -> Optional[str]:
+def _lookup_unique_id_from_thread(
+    in_reply_to: Optional[str], references: Optional[str]
+) -> Optional[str]:
     candidates: List[str] = []
     for value in (in_reply_to, references):
         if not value:
@@ -286,7 +297,7 @@ def _lookup_rfq_from_thread(in_reply_to: Optional[str], references: Optional[str
 
     metadata = lookup_thread_metadata(conn, THREAD_TABLE, keys, logger=logger)
     if metadata:
-        return metadata[0]
+        return _normalise_unique_id(metadata[0])
     return None
 
 
@@ -294,7 +305,7 @@ def _strip_html(value: str) -> str:
     if not value:
         return ""
 
-    comment_tokens = RFQ_HTML_COMMENT_RE.findall(value)
+    comment_tokens = [token.strip() for token in UID_HTML_COMMENT_RE.findall(value)]
     cleaned = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", " ", value, flags=re.I | re.S)
     cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
@@ -326,11 +337,14 @@ def _iter_text_parts(message) -> Iterable[str]:
             yield _strip_html(html)
 
 
-def _extract_rfq_from_body(message) -> Optional[str]:
+def _extract_unique_id_from_message(message) -> Optional[str]:
     for text in _iter_text_parts(message):
-        match = RFQ_SUBJECT_RE.search(text)
+        candidate = _extract_uid_from_text(text)
+        if candidate:
+            return _normalise_unique_id(candidate)
+        match = UID_TOKEN_RE.search(text)
         if match:
-            return _normalise_rfq(*match.groups())
+            return _normalise_unique_id(match.group(0))
     return None
 
 
@@ -369,7 +383,7 @@ def _build_reply_metadata(message, bucket: str, key: str) -> Dict[str, object]:
     return metadata
 
 
-def _upsert_supplier_reply(rfq_id: str, metadata: Dict[str, object]) -> None:
+def _upsert_supplier_reply(unique_id: str, metadata: Dict[str, object]) -> None:
     connection = _get_db_connection()
     if connection is None:
         return
@@ -386,7 +400,7 @@ def _upsert_supplier_reply(rfq_id: str, metadata: Dict[str, object]) -> None:
         message_id = metadata.get("s3_key")
 
     params = (
-        rfq_id,
+        unique_id,
         message_id,
         metadata.get("mailbox"),
         metadata.get("subject"),
@@ -426,7 +440,9 @@ def _upsert_supplier_reply(rfq_id: str, metadata: Dict[str, object]) -> None:
         with connection.cursor() as cursor:
             cursor.execute(sql, params)
     except Exception:
-        logger.exception("Failed to upsert supplier reply for RFQ %s", rfq_id)
+        logger.exception(
+            "Failed to upsert supplier reply for unique_id %s", unique_id
+        )
 
 
 def _register_processed_object(
@@ -435,7 +451,7 @@ def _register_processed_object(
     key: str,
     etag: Optional[str],
     *,
-    rfq_id: Optional[str] = None,
+    unique_id: Optional[str] = None,
     message_id: Optional[str] = None,
 ) -> None:
     if connection is None or not (bucket and key and etag):
@@ -453,14 +469,16 @@ def _register_processed_object(
 
     try:
         with connection.cursor() as cursor:
-            cursor.execute(sql, (bucket, key, etag, rfq_id, message_id))
+            cursor.execute(sql, (bucket, key, etag, unique_id, message_id))
     except Exception:
         logger.exception(
             "Failed to register processed object %s/%s (etag=%s)", bucket, key, etag
         )
 
 
-def _lookup_processed_object(connection, bucket: str, key: str, etag: Optional[str]) -> Optional[Dict[str, object]]:
+def _lookup_processed_object(
+    connection, bucket: str, key: str, etag: Optional[str]
+) -> Optional[Dict[str, object]]:
     if connection is None or not (bucket and key and etag):
         return None
 
@@ -487,26 +505,26 @@ def _lookup_processed_object(connection, bucket: str, key: str, etag: Optional[s
         return None
 
     rfq_id, message_id = row
-    return {"rfq_id": rfq_id, "message_id": message_id}
+    return {"rfq_id": rfq_id, "unique_id": rfq_id, "message_id": message_id}
 
 
-def _tag_object(s3_client, bucket: str, key: str, rfq_id: str) -> None:
+def _tag_object(s3_client, bucket: str, key: str, unique_id: str) -> None:
     s3_client.put_object_tagging(
         Bucket=bucket,
         Key=key,
-        Tagging={"TagSet": [{"Key": "rfq-id", "Value": rfq_id}]},
+        Tagging={"TagSet": [{"Key": "rfq-id", "Value": unique_id}]},
     )
 
 
-def _copy_with_tags(s3_client, bucket: str, source_key: str, rfq_id: str) -> str:
+def _copy_with_tags(s3_client, bucket: str, source_key: str, unique_id: str) -> str:
     basename = source_key.rsplit("/", 1)[-1]
-    dest_key = f"{DEFAULT_PREFIX.rstrip('/')}/{rfq_id}/ingest/{basename}"
+    dest_key = f"{DEFAULT_PREFIX.rstrip('/')}/{unique_id}/ingest/{basename}"
     s3_client.copy_object(
         Bucket=bucket,
         CopySource={"Bucket": bucket, "Key": source_key},
         Key=dest_key,
         TaggingDirective="REPLACE",
-        Tagging=f"rfq-id={rfq_id}",
+        Tagging=f"rfq-id={unique_id}",
     )
     return dest_key
 
@@ -544,10 +562,14 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
             "Skipping already processed object %s/%s (etag=%s)", bucket, decoded_key, etag
         )
         return {
+            "unique_id": existing.get("unique_id"),
             "rfq_id": existing.get("rfq_id"),
             "s3_key": decoded_key,
             "status": "duplicate",
-            "metadata": {"message_id": existing.get("message_id")},
+            "metadata": {
+                "message_id": existing.get("message_id"),
+                "unique_id": existing.get("unique_id"),
+            },
         }
 
     response = s3_client.get_object(Bucket=bucket, Key=decoded_key)
@@ -559,24 +581,45 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
 
     metadata = _build_reply_metadata(message, bucket, decoded_key)
     subject = metadata.get("subject") or ""
-    rfq_id = (message.get("X-Procwise-RFQ-ID") or "").strip() or _extract_rfq_from_subject(subject)
-    if not rfq_id:
-        rfq_id = _lookup_rfq_from_thread(message.get("In-Reply-To"), message.get("References"))
-    if not rfq_id:
-        rfq_id = _extract_rfq_from_body(message)
 
-    if rfq_id:
-        rfq_id = rfq_id.upper()
-        metadata["rfq_id"] = rfq_id
-        _tag_object(s3_client, bucket, decoded_key, rfq_id)
-        dest_key = _copy_with_tags(s3_client, bucket, decoded_key, rfq_id)
+    header_candidates = {
+        "X-Procwise-Unique-Id": message.get_all("X-Procwise-Unique-Id", []),
+        "X-Procwise-Unique-ID": message.get_all("X-Procwise-Unique-ID", []),
+        "X-Procwise-Uid": message.get_all("X-Procwise-Uid", []),
+    }
+    unique_id = extract_unique_id_from_headers(header_candidates)
+    if not unique_id:
+        header_fallback = message.get("X-Procwise-Unique-Id")
+        if header_fallback:
+            unique_id = _normalise_unique_id(header_fallback)
+    if not unique_id:
+        unique_id = _lookup_unique_id_from_thread(
+            message.get("In-Reply-To"), message.get("References")
+        )
+    if not unique_id:
+        unique_id = _extract_unique_id_from_subject(subject)
+    if not unique_id:
+        unique_id = _extract_unique_id_from_message(message)
+    if not unique_id:
+        legacy_rfq = (message.get("X-Procwise-RFQ-ID") or "").strip()
+        if legacy_rfq:
+            unique_id = _normalise_unique_id(legacy_rfq)
+
+    if unique_id:
+        unique_id = _normalise_unique_id(unique_id)
+        metadata["unique_id"] = unique_id
+        metadata["rfq_id"] = unique_id  # legacy compatibility for downstream consumers
+        _tag_object(s3_client, bucket, decoded_key, unique_id)
+        dest_key = _copy_with_tags(s3_client, bucket, decoded_key, unique_id)
         metadata["s3_key"] = dest_key
-        logger.info("Tagged S3 object %s/%s with RFQ %s", bucket, decoded_key, rfq_id)
-        _upsert_supplier_reply(rfq_id, metadata)
+        logger.info(
+            "Tagged S3 object %s/%s with unique_id %s", bucket, decoded_key, unique_id
+        )
+        _upsert_supplier_reply(unique_id, metadata)
         try:
             mark_dispatch_response(
                 connection,
-                rfq_id=rfq_id,
+                rfq_id=unique_id,
                 in_reply_to=metadata.get("in_reply_to"),
                 references=metadata.get("references"),
                 response_message_id=metadata.get("message_id"),
@@ -587,18 +630,19 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
             )
         except Exception:  # pragma: no cover - best effort logging
             logger.exception(
-                "Failed to mark dispatch chain response for RFQ %s", rfq_id
+                "Failed to mark dispatch chain response for unique_id %s", unique_id
             )
         _register_processed_object(
             connection,
             bucket,
             decoded_key,
             etag,
-            rfq_id=rfq_id,
+            unique_id=unique_id,
             message_id=metadata.get("message_id"),
         )
         return {
-            "rfq_id": rfq_id,
+            "unique_id": unique_id,
+            "rfq_id": unique_id,
             "s3_key": dest_key,
             "status": "ok",
             "metadata": {
@@ -613,16 +657,19 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
         }
 
     dest_key = _move_to_unmatched(s3_client, bucket, decoded_key)
-    logger.warning("Unable to resolve RFQ for %s/%s; moved to %s", bucket, decoded_key, dest_key)
+    logger.warning(
+        "Unable to resolve unique_id for %s/%s; moved to %s", bucket, decoded_key, dest_key
+    )
     _register_processed_object(
         connection,
         bucket,
         decoded_key,
         etag,
-        rfq_id=None,
+        unique_id=None,
         message_id=metadata.get("message_id"),
     )
     return {
+        "unique_id": None,
         "rfq_id": None,
         "s3_key": dest_key,
         "status": "needs_review",
