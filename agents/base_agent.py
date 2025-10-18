@@ -98,6 +98,38 @@ class AgentContext:
             "knowledge": dict(self.knowledge_base),
         }
 
+    def create_child_context(
+        self,
+        agent_id: str,
+        input_data: Optional[Dict[str, Any]] = None,
+        **overrides: Any,
+    ) -> "AgentContext":
+        """Create a child context inheriting workflow metadata.
+
+        Child contexts inherit the workflow identifier, user, routing history,
+        and manifest data unless explicitly overridden.  This helper keeps
+        nested agent invocations consistent and avoids accidental workflow
+        identifier drift when delegating tasks such as drafting negotiation
+        emails.
+        """
+
+        child_input = dict(input_data) if isinstance(input_data, dict) else {}
+        return AgentContext(
+            workflow_id=overrides.get("workflow_id", self.workflow_id),
+            agent_id=agent_id,
+            user_id=overrides.get("user_id", self.user_id),
+            input_data=child_input,
+            parent_agent=overrides.get("parent_agent", self.agent_id),
+            routing_history=list(self.routing_history),
+            task_profile=overrides.get("task_profile", dict(self.task_profile)),
+            policy_context=overrides.get(
+                "policy_context", [dict(policy) for policy in self.policy_context]
+            ),
+            knowledge_base=overrides.get(
+                "knowledge_base", dict(self.knowledge_base)
+            ),
+        )
+
 
 @dataclass
 class AgentOutput:

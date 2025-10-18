@@ -659,17 +659,38 @@ class EmailDraftingAgent(BaseAgent):
             subject = self._clean_subject_text(None, DEFAULT_NEGOTIATION_SUBJECT)
 
         thread_headers = decision_data.get("thread")
+        resolved_thread_headers: Dict[str, Any] = {}
+        if isinstance(thread_headers, dict):
+            resolved_thread_headers = dict(thread_headers)
         headers: Dict[str, Any] = {
             "X-Procwise-Unique-Id": unique_id,
             "X-Procwise-Workflow-Id": workflow_hint,
         }
-        if isinstance(thread_headers, dict):
-            message_id = thread_headers.get("message_id")
+        message_id = None
+        if resolved_thread_headers:
+            message_id = resolved_thread_headers.get("Message-ID") or resolved_thread_headers.get("message_id")
+            in_reply_to = (
+                resolved_thread_headers.get("In-Reply-To")
+                or resolved_thread_headers.get("in_reply_to")
+            )
+            references = resolved_thread_headers.get("References") or resolved_thread_headers.get("references")
             if message_id:
-                headers["In-Reply-To"] = message_id
-            references = thread_headers.get("references")
+                headers["Message-ID"] = message_id
+            if in_reply_to:
+                headers["In-Reply-To"] = in_reply_to
+            elif not headers.get("In-Reply-To"):
+                legacy_reply = resolved_thread_headers.get("message_id")
+                if legacy_reply and legacy_reply != message_id:
+                    headers["In-Reply-To"] = legacy_reply
             if isinstance(references, list) and references:
                 headers["References"] = " ".join(str(ref) for ref in references if ref)
+            elif isinstance(references, str) and references.strip():
+                headers["References"] = references.strip()
+            resolved_thread_headers = {
+                key: value for key, value in resolved_thread_headers.items() if value is not None
+            }
+            if message_id:
+                resolved_thread_headers.setdefault("Message-ID", message_id)
 
         headers = {k: v for k, v in headers.items() if v is not None}
 
@@ -712,6 +733,10 @@ class EmailDraftingAgent(BaseAgent):
             "headers": headers,
             "unique_id": unique_id,
         }
+        if resolved_thread_headers:
+            draft["thread_headers"] = resolved_thread_headers
+        if message_id:
+            draft["message_id"] = message_id
 
         thread_index = decision_data.get("thread_index")
         if thread_index is not None:
@@ -1100,6 +1125,11 @@ class EmailDraftingAgent(BaseAgent):
         if workflow_hint:
             metadata["workflow_id"] = workflow_hint
 
+        thread_headers_payload = data.get("thread_headers") or data.get("thread")
+        resolved_thread_headers: Dict[str, Any] = {}
+        if isinstance(thread_headers_payload, dict):
+            resolved_thread_headers = dict(thread_headers_payload)
+
         draft = {
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
@@ -1120,7 +1150,38 @@ class EmailDraftingAgent(BaseAgent):
         }
         if workflow_hint:
             headers["X-Procwise-Workflow-Id"] = workflow_hint
+
+        message_id = None
+        if resolved_thread_headers:
+            message_id = resolved_thread_headers.get("Message-ID") or resolved_thread_headers.get("message_id")
+            in_reply_to = (
+                resolved_thread_headers.get("In-Reply-To")
+                or resolved_thread_headers.get("in_reply_to")
+            )
+            references = resolved_thread_headers.get("References") or resolved_thread_headers.get("references")
+            if message_id:
+                headers["Message-ID"] = message_id
+            if in_reply_to:
+                headers["In-Reply-To"] = in_reply_to
+            elif not headers.get("In-Reply-To"):
+                legacy_reply = resolved_thread_headers.get("message_id")
+                if legacy_reply and legacy_reply != message_id:
+                    headers["In-Reply-To"] = legacy_reply
+            if isinstance(references, list) and references:
+                headers["References"] = " ".join(str(ref) for ref in references if ref)
+            elif isinstance(references, str) and references.strip():
+                headers["References"] = references.strip()
+            resolved_thread_headers = {
+                key: value for key, value in resolved_thread_headers.items() if value is not None
+            }
+            if message_id:
+                resolved_thread_headers.setdefault("Message-ID", message_id)
+
         draft["headers"] = headers
+        if resolved_thread_headers:
+            draft["thread_headers"] = resolved_thread_headers
+        if message_id:
+            draft["message_id"] = message_id
 
         negotiation_extra = {
             "negotiation_message": negotiation_message,
@@ -1152,10 +1213,18 @@ class EmailDraftingAgent(BaseAgent):
             output_data["recipients"] = recipients
         if action_id:
             output_data["action_id"] = action_id
+        if message_id:
+            output_data["message_id"] = message_id
+        if resolved_thread_headers:
+            output_data["thread_headers"] = resolved_thread_headers
 
         pass_fields: Dict[str, Any] = {"drafts": [draft]}
         if action_id:
             pass_fields["action_id"] = action_id
+        if message_id:
+            pass_fields["message_id"] = message_id
+        if resolved_thread_headers:
+            pass_fields["thread_headers"] = resolved_thread_headers
 
         return self._with_plan(
             context,
