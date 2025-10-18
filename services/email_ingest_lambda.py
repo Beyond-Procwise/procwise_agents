@@ -512,7 +512,7 @@ def _tag_object(s3_client, bucket: str, key: str, unique_id: str) -> None:
     s3_client.put_object_tagging(
         Bucket=bucket,
         Key=key,
-        Tagging={"TagSet": [{"Key": "rfq-id", "Value": unique_id}]},
+        Tagging={"TagSet": [{"Key": "unique-id", "Value": unique_id}]},
     )
 
 
@@ -524,7 +524,7 @@ def _copy_with_tags(s3_client, bucket: str, source_key: str, unique_id: str) -> 
         CopySource={"Bucket": bucket, "Key": source_key},
         Key=dest_key,
         TaggingDirective="REPLACE",
-        Tagging=f"rfq-id={unique_id}",
+        Tagging=f"unique-id={unique_id}",
     )
     return dest_key
 
@@ -600,11 +600,6 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
         unique_id = _extract_unique_id_from_subject(subject)
     if not unique_id:
         unique_id = _extract_unique_id_from_message(message)
-    if not unique_id:
-        legacy_rfq = (message.get("X-Procwise-RFQ-ID") or "").strip()
-        if legacy_rfq:
-            unique_id = _normalise_unique_id(legacy_rfq)
-
     if unique_id:
         unique_id = _normalise_unique_id(unique_id)
         metadata["unique_id"] = unique_id
