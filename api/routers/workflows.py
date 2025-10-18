@@ -7,12 +7,11 @@ import os
 import time
 import asyncio
 import logging
-from functools import partial
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator, ConfigDict
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
@@ -180,18 +179,144 @@ class OpportunityRejectionRequest(BaseModel):
 router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
 
 
-class EmailDispatchRequest(BaseModel):
-    """Flexible request model for dispatching stored RFQ drafts."""
+class EmailDraftPayload(BaseModel):
+    """Structured representation of a stored RFQ draft."""
 
-    unique_id: Optional[str] = None
-    rfq_id: Optional[str] = None
-    draft: Optional[Dict[str, Any]] = None
-    drafts: Optional[List[Dict[str, Any]]] = None
-    recipients: Optional[List[str]] = None
-    sender: Optional[str] = None
-    subject: Optional[str] = None
-    body: Optional[str] = None
-    action_id: Optional[str] = None
+    unique_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier assigned to the draft (PROC-WF-XXXXXX).",
+    )
+    rfq_id: Optional[str] = Field(
+        default=None,
+        description="Legacy RFQ identifier used as a fallback when unique_id is absent.",
+    )
+    supplier_id: Optional[str] = Field(
+        default=None,
+        description="Supplier reference associated with the draft.",
+    )
+    recipients: Optional[List[str]] = Field(
+        default=None,
+        description="Explicit list of recipient email addresses to override the stored draft values.",
+    )
+    sender: Optional[EmailStr] = Field(
+        default=None,
+        description="Sender email address override.",
+    )
+    subject: Optional[str] = Field(
+        default=None,
+        description="Subject override to apply when dispatching the draft.",
+    )
+    body: Optional[str] = Field(
+        default=None,
+        description="Body override to apply when dispatching the draft.",
+    )
+    action_id: Optional[str] = Field(
+        default=None,
+        description="Action identifier emitted by upstream orchestration steps.",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Arbitrary metadata captured alongside the draft for auditing.",
+    )
+
+    model_config = ConfigDict(extra="allow")
+
+    @field_validator("unique_id", "rfq_id", "supplier_id", "action_id", mode="before")
+    @classmethod
+    def _strip_text(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("recipients", mode="before")
+    @classmethod
+    def _normalise_recipients(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            emails = [part.strip() for part in value.split(",") if part.strip()]
+            return emails or None
+        if isinstance(value, (list, tuple)):
+            cleaned = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    cleaned.append(text)
+            return cleaned or None
+        raise TypeError("recipients must be a string, list, or tuple of email addresses")
+
+    def resolved_identifier(self) -> Optional[str]:
+        for candidate in (self.unique_id, self.rfq_id):
+            if candidate:
+                identifier = candidate.strip()
+                if identifier:
+                    return identifier
+        return None
+
+    def resolved_recipients(self) -> Optional[List[str]]:
+        if not self.recipients:
+            return None
+        return [str(email).strip() for email in self.recipients if str(email).strip()]
+
+    def resolved_sender(self) -> Optional[str]:
+        if self.sender is None:
+            return None
+        sender = str(self.sender).strip()
+        return sender or None
+
+    def resolved_subject(self) -> Optional[str]:
+        if self.subject is None:
+            return None
+        return str(self.subject).strip()
+
+    def resolved_body(self) -> Optional[str]:
+        if self.body is None:
+            return None
+        return str(self.body)
+
+
+class EmailDispatchRequest(BaseModel):
+    """Request payload for dispatching stored RFQ drafts."""
+
+    unique_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier for the draft to dispatch (PROC-WF-XXXXXX).",
+    )
+    rfq_id: Optional[str] = Field(
+        default=None,
+        description="Fallback RFQ identifier when unique_id is unavailable.",
+    )
+    recipients: Optional[List[str]] = Field(
+        default=None,
+        description="Override recipient list for the dispatched email.",
+    )
+    sender: Optional[EmailStr] = Field(
+        default=None,
+        description="Override sender email address.",
+    )
+    subject: Optional[str] = Field(
+        default=None,
+        description="Optional subject override.",
+    )
+    body: Optional[str] = Field(
+        default=None,
+        description="Optional body override.",
+    )
+    action_id: Optional[str] = Field(
+        default=None,
+        description="Identifier linking this dispatch request to upstream workflow actions.",
+    )
+    draft: Optional[EmailDraftPayload] = Field(
+        default=None,
+        description="Single draft payload when the request originates from the drafting agent.",
+    )
+    drafts: Optional[List[EmailDraftPayload]] = Field(
+        default=None,
+        description="Collection of draft payloads for batch dispatch scenarios.",
+    )
 
     model_config = ConfigDict(extra="allow")
 
@@ -206,7 +331,7 @@ class EmailDispatchRequest(BaseModel):
 
         draft_obj = values.get("draft")
         if isinstance(draft_obj, dict):
-            unique_id = draft_obj.get("unique_id")
+            unique_id = draft_obj.get("unique_id") or draft_obj.get("rfq_id")
             if unique_id:
                 values["unique_id"] = unique_id
                 return values
@@ -215,7 +340,7 @@ class EmailDispatchRequest(BaseModel):
         if isinstance(drafts_array, list) and drafts_array:
             first_draft = drafts_array[0]
             if isinstance(first_draft, dict):
-                unique_id = first_draft.get("unique_id")
+                unique_id = first_draft.get("unique_id") or first_draft.get("rfq_id")
                 if unique_id:
                     values["unique_id"] = unique_id
                     return values
@@ -229,15 +354,23 @@ class EmailDispatchRequest(BaseModel):
             f"Available fields: {available_fields}"
         )
 
+    @field_validator("unique_id", "rfq_id", "action_id", mode="before")
+    @classmethod
+    def _strip_identifiers(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
     @field_validator("recipients", mode="before")
     @classmethod
     def _normalise_recipients(cls, value: Any) -> Optional[List[str]]:
         if value is None:
             return None
         if isinstance(value, str):
-            parts = [part.strip() for part in value.split(",")]
-            return [part for part in parts if part]
-        if isinstance(value, list):
+            emails = [part.strip() for part in value.split(",") if part.strip()]
+            return emails or None
+        if isinstance(value, (list, tuple)):
             cleaned: List[str] = []
             for item in value:
                 if item is None:
@@ -246,12 +379,75 @@ class EmailDispatchRequest(BaseModel):
                 if text:
                     cleaned.append(text)
             return cleaned or None
-        if isinstance(value, tuple):
-            return cls._normalise_recipients(list(value))
-        raise TypeError("recipients must be a string or list of strings")
+        raise TypeError("recipients must be provided as a string, list, or tuple of emails")
 
     def get_identifier(self) -> str:
-        return (self.unique_id or self.rfq_id or "").strip()
+        for candidate in (self.unique_id, self.rfq_id):
+            if candidate:
+                identifier = candidate.strip()
+                if identifier:
+                    return identifier
+
+        if self.draft:
+            identifier = self.draft.resolved_identifier()
+            if identifier:
+                return identifier
+
+        if self.drafts:
+            for draft in self.drafts:
+                identifier = draft.resolved_identifier()
+                if identifier:
+                    return identifier
+
+        return ""
+
+    def resolve_recipients(self) -> Optional[List[str]]:
+        if self.recipients:
+            return [str(email).strip() for email in self.recipients if str(email).strip()]
+        if self.draft:
+            recipients = self.draft.resolved_recipients()
+            if recipients:
+                return recipients
+        return None
+
+    def resolve_sender(self) -> Optional[str]:
+        if self.sender is not None:
+            sender = str(self.sender).strip()
+            return sender or None
+        if self.draft:
+            return self.draft.resolved_sender()
+        return None
+
+    def resolve_subject(self) -> Optional[str]:
+        if self.subject is not None:
+            return str(self.subject).strip()
+        if self.draft:
+            return self.draft.resolved_subject()
+        return None
+
+    def resolve_body(self) -> Optional[str]:
+        if self.body is not None:
+            return str(self.body)
+        if self.draft:
+            return self.draft.resolved_body()
+        return None
+
+    def resolve_action_id(self) -> Optional[str]:
+        if self.action_id:
+            return self.action_id
+        if self.draft and self.draft.action_id:
+            return self.draft.action_id
+        return None
+
+
+class EmailBatchDispatchRequest(BaseModel):
+    """Request payload for batch email dispatch operations."""
+
+    drafts: List[EmailDraftPayload] = Field(
+        ..., description="List of drafts to dispatch in a single batch operation."
+    )
+
+    model_config = ConfigDict(extra="allow")
 
 
 class EmailDispatchResponse(BaseModel):
@@ -262,7 +458,83 @@ class EmailDispatchResponse(BaseModel):
     recipients: List[str]
     sender: str
     subject: str
+    body: Optional[str] = None
+    draft: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+def _merge_form_values(form_data) -> Dict[str, Any]:
+    """Flatten ``FormData`` into a standard dictionary preserving multi-values."""
+
+    flattened: Dict[str, Any] = {}
+    for key, value in getattr(form_data, "multi_items", lambda: [])():
+        if key in flattened:
+            existing = flattened[key]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                flattened[key] = [existing, value]
+        else:
+            flattened[key] = value
+
+    for key, value in list(flattened.items()):
+        if isinstance(value, list) and len(value) == 1:
+            flattened[key] = value[0]
+
+    return flattened
+
+
+def _maybe_parse_embedded_json(value: Any) -> Any:
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate[0] in ("{", "["):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                return value
+    return value
+
+
+def _deserialise_structured_fields(payload: Dict[str, Any]) -> None:
+    for key in ("draft", "drafts"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, list):
+            payload[key] = [_maybe_parse_embedded_json(item) for item in value]
+        else:
+            payload[key] = _maybe_parse_embedded_json(value)
+
+
+async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest:
+    """Load the dispatch request supporting both JSON and form submissions."""
+
+    body_bytes = await request.body()
+    raw_payload: Any
+
+    if not body_bytes:
+        raw_payload = {}
+    else:
+        try:
+            raw_payload = json.loads(body_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                form = await request.form()
+            except Exception:
+                raw_payload = {}
+            else:
+                raw_payload = _merge_form_values(form)
+
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+
+    _deserialise_structured_fields(raw_payload)
+
+    return EmailDispatchRequest.model_validate(raw_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -469,13 +741,13 @@ async def extract_documents(
 # ---------------------------------------------------------------------------
 @router.post("/email")
 async def send_email(
-    request: EmailDispatchRequest,
+    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
     orchestrator: Orchestrator = Depends(get_orchestrator),
     agent_nick=Depends(get_agent_nick),
 ):
     """Send a previously drafted RFQ email using the dispatch service."""
 
-    identifier = request.get_identifier()
+    identifier = dispatch_request.get_identifier()
     if not identifier:
         raise HTTPException(
             status_code=400,
@@ -486,7 +758,7 @@ async def send_email(
             },
         )
 
-    input_data = request.model_dump(exclude_none=True)
+    input_data = dispatch_request.model_dump(exclude_none=True)
 
     prs = orchestrator.agent_nick.process_routing_service
 
@@ -502,26 +774,27 @@ async def send_email(
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
 
+    action_reference = dispatch_request.resolve_action_id()
+
     action_id = prs.log_action(
         process_id=process_id,
         agent_type="email_dispatch",
         action_desc=input_data,
         status="started",
-        action_id=input_data.get("action_id"),
+        action_id=action_reference,
     )
 
     dispatch_service = EmailDispatchService(agent_nick)
 
     try:
-        dispatch_call = partial(
+        result = await run_in_threadpool(
             dispatch_service.send_draft,
             identifier=identifier,
-            recipients=request.recipients,
-            sender=request.sender,
-            subject_override=request.subject,
-            body_override=request.body,
+            recipients=dispatch_request.resolve_recipients(),
+            sender=dispatch_request.resolve_sender(),
+            subject_override=dispatch_request.resolve_subject(),
+            body_override=dispatch_request.resolve_body(),
         )
-        result = await run_in_threadpool(dispatch_call)
 
         dispatch_timestamp = time.time()
         setattr(agent_nick, "dispatch_service_started", True)
@@ -535,33 +808,42 @@ async def send_email(
         elif raw_recipients:
             response_recipients = list(raw_recipients)
         else:
-            response_recipients = request.recipients or []
+            response_recipients = dispatch_request.resolve_recipients() or []
 
-        response = EmailDispatchResponse(
+        response_data: Dict[str, Any] = dict(result)
+        response_data.update(
             success=bool(result.get("sent", False)),
             unique_id=result.get("unique_id", identifier),
             sent=bool(result.get("sent", False)),
             message_id=result.get("message_id"),
             recipients=[str(r) for r in response_recipients],
-            sender=str(result.get("sender") or request.sender or ""),
-            subject=str(result.get("subject") or request.subject or ""),
+            sender=str(result.get("sender") or dispatch_request.resolve_sender() or ""),
+            subject=str(result.get("subject") or dispatch_request.resolve_subject() or ""),
             error=result.get("error"),
         )
+
+        if response_data.get("body") is None:
+            response_data["body"] = dispatch_request.resolve_body()
+
+        response = EmailDispatchResponse(**response_data)
+
+        response_payload = response.model_dump()
+        status_label = "completed" if response.sent else "failed"
 
         prs.log_action(
             process_id=process_id,
             agent_type="email_dispatch",
             action_desc=input_data,
-            process_output=response.model_dump(),
-            status="completed" if response.sent else "failed",
+            process_output=response_payload,
+            status=status_label,
             action_id=action_id,
         )
 
         final_details = {
             "input": input_data,
             "agents": [],
-            "output": response.model_dump(),
-            "status": "completed" if response.sent else "failed",
+            "output": response_payload,
+            "status": status_label,
         }
         prs.update_process_details(process_id, final_details)
         prs.update_process_status(process_id, 1 if response.sent else -1)
@@ -598,17 +880,20 @@ async def send_email(
         prs.update_process_status(process_id, -1)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return response
+    return {
+        **response_payload,
+        "status": status_label,
+        "result": response_payload,
+        "action_id": action_id,
+    }
 
 
 @router.post("/email/batch")
 async def dispatch_batch_emails(
-    request: Request,
+    request: EmailBatchDispatchRequest,
     agent_nick=Depends(get_agent_nick),
 ):
-    body = await request.json()
-    drafts = body.get("drafts", []) if isinstance(body, dict) else []
-    if not drafts:
+    if not request.drafts:
         raise HTTPException(
             status_code=400,
             detail={
@@ -621,32 +906,50 @@ async def dispatch_batch_emails(
     dispatch_service = EmailDispatchService(agent_nick)
 
     results: List[Dict[str, Any]] = []
-    for draft in drafts:
-        if not isinstance(draft, dict):
-            continue
-        unique_id = draft.get("unique_id")
-        if not unique_id:
-            logger.warning("Skipping draft without unique_id: %s", draft.get("supplier_id"))
+    for draft in request.drafts:
+        identifier = draft.resolved_identifier()
+        if not identifier:
+            logger.warning(
+                "Skipping draft without identifier: supplier_id=%s", draft.supplier_id
+            )
+            results.append(
+                {
+                    "unique_id": None,
+                    "sent": False,
+                    "error": "Draft missing unique identifier",
+                    "supplier_id": draft.supplier_id,
+                    "subject": draft.resolved_subject(),
+                }
+            )
             continue
 
         try:
-            result = dispatch_service.send_draft(identifier=unique_id)
+            result = await run_in_threadpool(
+                dispatch_service.send_draft,
+                identifier=identifier,
+                recipients=draft.resolved_recipients(),
+                sender=draft.resolved_sender(),
+                subject_override=draft.resolved_subject(),
+                body_override=draft.resolved_body(),
+            )
             results.append(
                 {
-                    "unique_id": unique_id,
+                    "unique_id": identifier,
                     "sent": bool(result.get("sent")),
                     "message_id": result.get("message_id"),
-                    "supplier_id": draft.get("supplier_id"),
+                    "supplier_id": draft.supplier_id,
+                    "subject": result.get("subject") or draft.resolved_subject(),
                 }
             )
         except Exception as exc:  # pragma: no cover - runtime dependent
-            logger.error("Failed to dispatch %s: %s", unique_id, str(exc))
+            logger.error("Failed to dispatch %s: %s", identifier, str(exc))
             results.append(
                 {
-                    "unique_id": unique_id,
+                    "unique_id": identifier,
                     "sent": False,
                     "error": str(exc),
-                    "supplier_id": draft.get("supplier_id"),
+                    "supplier_id": draft.supplier_id,
+                    "subject": draft.resolved_subject(),
                 }
             )
 
@@ -696,7 +999,11 @@ async def dispatch_workflow_drafts(
         results: List[Dict[str, Any]] = []
         for unique_id, supplier_id, subject, sent in draft_rows:
             try:
-                result = dispatch_service.send_draft(identifier=unique_id)
+                result = await run_in_threadpool(
+                    dispatch_service.send_draft,
+                    identifier=unique_id,
+                    subject_override=subject,
+                )
                 results.append(
                     {
                         "unique_id": unique_id,
