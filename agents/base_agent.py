@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Mapping
 from urllib.parse import quote_plus
 import threading
 
@@ -132,6 +132,38 @@ class AgentContext:
             "policies": [dict(policy) for policy in self.policy_context],
             "knowledge": dict(self.knowledge_base),
         }
+
+    def create_child_context(
+        self,
+        agent_id: str,
+        input_data: Optional[Dict[str, Any]] = None,
+        **overrides: Any,
+    ) -> "AgentContext":
+        """Create a child context inheriting workflow metadata.
+
+        Child contexts inherit the workflow identifier, user, routing history,
+        and manifest data unless explicitly overridden.  This helper keeps
+        nested agent invocations consistent and avoids accidental workflow
+        identifier drift when delegating tasks such as drafting negotiation
+        emails.
+        """
+
+        child_input = dict(input_data) if isinstance(input_data, dict) else {}
+        return AgentContext(
+            workflow_id=overrides.get("workflow_id", self.workflow_id),
+            agent_id=agent_id,
+            user_id=overrides.get("user_id", self.user_id),
+            input_data=child_input,
+            parent_agent=overrides.get("parent_agent", self.agent_id),
+            routing_history=list(self.routing_history),
+            task_profile=overrides.get("task_profile", dict(self.task_profile)),
+            policy_context=overrides.get(
+                "policy_context", [dict(policy) for policy in self.policy_context]
+            ),
+            knowledge_base=overrides.get(
+                "knowledge_base", dict(self.knowledge_base)
+            ),
+        )
 
 
 @dataclass
@@ -296,6 +328,31 @@ class BaseAgent:
         return result
 
     # ------------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------------
+    def _prepare_logged_output(self, payload: Any) -> Any:
+        """Return a copy of ``payload`` with heavy knowledge blobs removed."""
+
+        return self._remove_knowledge_blocks(payload)
+
+    @classmethod
+    def _remove_knowledge_blocks(cls, value: Any) -> Any:
+        """Recursively drop ``knowledge`` keys from nested payloads."""
+
+        if isinstance(value, Mapping):
+            cleaned: Dict[Any, Any] = {}
+            for key, item in value.items():
+                if key == "knowledge":
+                    continue
+                cleaned[key] = cls._remove_knowledge_blocks(item)
+            return cleaned
+        if isinstance(value, list):
+            return [cls._remove_knowledge_blocks(item) for item in value]
+        if isinstance(value, tuple):  # Serialisation converts tuples to lists later
+            return [cls._remove_knowledge_blocks(item) for item in value]
+        return value
+
+    # ------------------------------------------------------------------
     # Context preparation helpers
     # ------------------------------------------------------------------
     def _conversation_memory_service(self):
@@ -364,11 +421,22 @@ class BaseAgent:
         if manifest:
             snapshot["manifest"] = manifest
 
-        if any(value for key, value in snapshot.items() if key not in {"workflow_id", "agent_id", "user_id"}):
+        # Remove heavy knowledge payloads before attaching the snapshot to the
+        # runtime context or returning it to downstream consumers. This keeps
+        # the live ``context_snapshot`` informative without persisting large
+        # manifest knowledge bundles that are already available via
+        # ``AgentContext.knowledge_base``.
+        sanitized_snapshot = self._remove_knowledge_blocks(snapshot)
+
+        if any(
+            value
+            for key, value in sanitized_snapshot.items()
+            if key not in {"workflow_id", "agent_id", "user_id"}
+        ):
             context.input_data = dict(context.input_data)
-            context.input_data.setdefault("context_snapshot", snapshot)
-            context._prepared_context_snapshot = snapshot  # type: ignore[attr-defined]
-            return snapshot
+            context.input_data.setdefault("context_snapshot", sanitized_snapshot)
+            context._prepared_context_snapshot = sanitized_snapshot  # type: ignore[attr-defined]
+            return sanitized_snapshot
         context._prepared_context_snapshot = None  # type: ignore[attr-defined]
         return None
 

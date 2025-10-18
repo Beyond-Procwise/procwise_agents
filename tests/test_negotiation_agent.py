@@ -95,6 +95,11 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
 
+    thread_headers_stub = {
+        "Message-ID": "<agent-1@procwise.test>",
+        "In-Reply-To": "<supplier-previous@test>",
+        "References": ["<supplier-previous@test>"]
+    }
     stub_email_output = AgentOutput(
         status=AgentStatus.SUCCESS,
         data={
@@ -111,10 +116,14 @@ def test_negotiation_agent_composes_counter(monkeypatch):
                         "current_offer": 1300.0,
                         "round": 1,
                     },
+                    "thread_headers": thread_headers_stub,
+                    "message_id": thread_headers_stub["Message-ID"],
                 }
             ],
             "subject": "Re: RFQ-123 – Updated commercial terms",
             "body": "Email body",
+            "thread_headers": thread_headers_stub,
+            "message_id": thread_headers_stub["Message-ID"],
         },
     )
     stub_email_output.action_id = "email-action-1"
@@ -190,6 +199,9 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert "await_response" not in output.pass_fields
     assert output.pass_fields["supplier_responses"][0]["message_id"] == "reply-1"
     assert output.pass_fields["play_recommendations"] == plays
+    assert output.data["draft_payload"]["thread_headers"]["Message-ID"].startswith("<agent-1")
+    thread_state = output.data.get("thread_state")
+    assert isinstance(thread_state, dict) and thread_headers_stub["Message-ID"] in thread_state.get("references", [])
 
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
