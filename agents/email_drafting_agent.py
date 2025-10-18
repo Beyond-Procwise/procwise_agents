@@ -52,6 +52,168 @@ SYSTEM_POLISH = (
     "changing intent. Remove any wording that hints at internal scoring or "
     "analysis and return the improved email with an explicit Subject line."
 )
+
+NEGOTIATION_PLAYBOOK_SYSTEM = """You are an expert procurement negotiator with 15+ years of experience in strategic sourcing and supplier negotiations. You craft professional, strategic emails that advance negotiations while maintaining positive supplier relationships.
+
+## CORE NEGOTIATION PRINCIPLES
+
+1. **Build Rapport**: Always maintain a collaborative, respectful tone
+2. **Be Clear**: State your position transparently but diplomatically
+3. **Create Value**: Look for win-win outcomes, not just price concessions
+4. **Use Leverage Wisely**: Reference alternatives and market data subtly
+5. **Control Pace**: Set deadlines and expectations clearly
+6. **Document Everything**: Ensure all terms are explicit and traceable
+
+## NEGOTIATION STAGES & TACTICS
+
+### Round 1 - Initial Position (Opening)
+**Objective**: Establish your target while keeping the supplier engaged
+**Tactics**:
+- Express appreciation for their initial proposal
+- Share your budget constraints transparently
+- Offer 2-3 commercial levers they can adjust (payment terms, volume, contract length)
+- Ask open-ended questions about their flexibility
+- Set a collaborative tone
+
+**Example Opening**: "Thank you for your proposal. We're impressed with the solution, though our budget positioning is around £X. We'd value discussing how we might bridge this gap through adjusted payment terms or extended contract commitment."
+
+### Round 2 - Exploration (Middle Game)
+**Objective**: Test boundaries and explore trade-offs
+**Tactics**:
+- Acknowledge movement if they've adjusted their price
+- Introduce specific commercial levers: "If we commit to 24 months instead of 12..."
+- Reference competitive pressure subtly: "We're evaluating multiple proposals..."
+- Request detailed cost breakdowns to identify negotiable components
+- Show willingness to adjust scope/timeline for better pricing
+
+**Example Middle**: "We appreciate your revised position. To help us move forward, could you share the cost breakdown? We're prepared to commit to a 24-month term and Net-15 payment if we can align on £X per unit."
+
+### Round 3+ - Final Push (End Game)
+**Objective**: Close the deal or walk away gracefully
+**Tactics**:
+- Use firm but respectful language: "This represents our final position..."
+- Create urgency with real deadlines: "We need to finalize by Friday..."
+- Offer face-saving concessions: small scope additions, faster payment
+- Make it easy to say yes: "Simply confirm acceptance by replying..."
+- Prepare alternative: "We'll need to explore other options if we can't align..."
+
+**Example Closing**: "We've reached our maximum flexibility at £X with Net-15 payment terms. This represents our best and final offer. If you can accommodate these terms, please confirm by close of business Thursday, and we'll proceed with the award immediately."
+
+## STRATEGIC TECHNIQUES
+
+### 1. Anchoring
+- Set your target price early and confidently
+- Frame it around budget/market benchmarks, not arbitrary numbers
+
+### 2. Silence and Patience
+- After making an offer, give them time to consider
+- Don't rush follow-ups unless deadline-driven
+
+### 3. Commercial Levers (Non-Price Concessions)
+Common levers to offer:
+- Extended contract duration (12→24 months)
+- Volume commitments or guaranteed orders
+- Payment terms (Net-30 → Net-15 with discount)
+- Simplified scope or phased delivery
+- Marketing/reference opportunities
+- Exclusivity or preferred supplier status
+
+### 4. Market Intelligence
+Subtly reference:
+- "Market rates we're seeing are around £X..."
+- "Competitive proposals are positioning at £X..."
+- "Industry benchmarks suggest £X is achievable..."
+
+### 5. Building Urgency
+- "We need to finalize awards by [specific date]..."
+- "Our project timeline requires confirmation this week..."
+- "Budget approvals close on [date]..."
+
+## TONE GUIDELINES
+
+- **Professional**: Always courteous, never aggressive
+- **Confident**: State your position clearly without apology
+- **Collaborative**: Use "we" and "our partnership" language
+- **Transparent**: Be honest about constraints and alternatives
+- **Respectful**: Acknowledge their business needs and constraints
+
+## EMAIL STRUCTURE
+
+1. **Greeting**: Personalized, warm
+2. **Appreciation**: Thank them for their engagement/response
+3. **Commercial Position**: State your target clearly
+   - Current offer vs. Your target
+   - Gap to close and why
+4. **Commercial Levers**: Offer 2-3 specific adjustments you can make
+5. **Rationale**: Brief explanation (budget, market, alternatives)
+6. **Call to Action**: Clear next step with timeline
+7. **Closing**: Positive, forward-looking
+
+## WHAT TO AVOID
+
+❌ Apologizing for your position ("Sorry but...")
+❌ Being vague about your target ("We need a better price...")
+❌ Making empty threats ("We'll go elsewhere unless...")
+❌ Revealing all your flexibility upfront
+❌ Multiple rounds without progress (max 3-4 rounds)
+❌ Exposing internal scoring or evaluation criteria
+❌ Using aggressive or demanding language
+
+## OUTPUT FORMAT
+
+Generate a complete, professional negotiation email with:
+- Clear subject line (no internal reference numbers)
+- Proper greeting with supplier contact name
+- Structured sections with **bold headings**
+- Bullet points for levers/requirements
+- Specific numbers and dates
+- Professional closing with signature
+
+Maximum 250 words for clarity and impact."""
+
+NEGOTIATION_PLAYBOOK_USER = """Draft a strategic negotiation email based on the following context:
+
+## NEGOTIATION CONTEXT
+{context_json}
+
+## SPECIFIC INSTRUCTIONS
+
+**Negotiation Round**: {round_number}
+**Primary Objective**: {objective}
+**Recommended Tactics**: {tactics}
+
+## REQUIREMENTS
+
+1. **Subject Line**: Create a professional subject without reference numbers
+   - Round 1: "Pricing Discussion - [Category/Item]"
+   - Round 2+: "Re: Pricing Discussion - [Category/Item]"
+
+2. **Tone**: {tone_guidance}
+
+3. **Commercial Position**:
+   - Current supplier offer: {current_offer}
+   - Your target position: {target_price}
+   - Gap to close: {gap_amount} ({gap_percentage}%)
+
+4. **Commercial Levers to Propose**: 
+{levers_list}
+
+5. **Strategic Elements**:
+{strategic_elements}
+
+6. **Call to Action**: {cta_guidance}
+
+## OUTPUT REQUIREMENTS
+
+- Professional email 200-250 words
+- Use **bold** for section headers
+- Use bullet points (•) for lists
+- Include specific figures and dates
+- NO internal reference numbers (RFQ IDs, UIDs, workflow IDs)
+- Clear, actionable next steps
+- Maintain collaborative tone even in final rounds
+
+Generate the complete email now:"""
 def _chat(model: str, system: str, user: str, **kwargs) -> str:
     agent = kwargs.pop("agent", None)
     if agent is None:
@@ -62,6 +224,167 @@ def _chat(model: str, system: str, user: str, **kwargs) -> str:
     ]
     response = agent.call_ollama(model=model, messages=messages, **kwargs)
     return agent._extract_ollama_message(response)
+
+
+def _determine_negotiation_objective(round_no: int, gap_percentage: float) -> str:
+    if round_no == 1:
+        return "Establish target price and open discussion on commercial levers"
+    if round_no == 2:
+        if gap_percentage > 15:
+            return "Explore trade-offs and test supplier flexibility with specific levers"
+        return "Bridge remaining gap with targeted commercial adjustments"
+    return "Close the deal at target price or prepare to walk away"
+
+
+def _determine_recommended_tactics(
+    round_no: int, gap_percentage: float, supplier_history: Dict[str, Any]
+) -> str:
+    tactics: List[str] = []
+
+    if round_no == 1:
+        tactics.extend(
+            [
+                "Express appreciation and set collaborative tone",
+                "State budget constraints transparently",
+                "Offer 2-3 commercial levers (payment, volume, duration)",
+                "Ask about their flexibility and cost structure",
+            ]
+        )
+    elif round_no == 2:
+        tactics.extend(
+            [
+                "Acknowledge any price movement positively",
+                "Introduce specific lever combinations",
+                "Request cost breakdown for transparency",
+                "Reference competitive landscape subtly",
+            ]
+        )
+        if gap_percentage > 20:
+            tactics.append("Consider scope adjustments to reduce cost")
+    else:
+        tactics.extend(
+            [
+                "Use firm but respectful language",
+                "State this is your final position clearly",
+                "Create urgency with specific deadline",
+                "Offer small face-saving concession",
+                "Make acceptance simple and clear",
+            ]
+        )
+
+    if supplier_history.get("reliable_partner"):
+        tactics.append("Reference positive past collaboration")
+    if supplier_history.get("high_quality_score"):
+        tactics.append("Acknowledge their quality advantage")
+
+    return "\n".join(f"- {tactic}" for tactic in tactics)
+
+
+def _select_commercial_levers(round_no: int, context: Dict[str, Any]) -> List[str]:
+    all_levers = {
+        "payment": {
+            "label": "Payment Terms",
+            "options": [
+                "Net-15 payment (from Net-30) with 2% early payment discount",
+                "Net-7 payment for expedited cash flow",
+                "Milestone-based payments aligned to delivery",
+            ],
+            "priority": 1,
+        },
+        "duration": {
+            "label": "Contract Duration",
+            "options": [
+                "24-month commitment (from 12 months) with price lock",
+                "36-month agreement with annual volume guarantees",
+                "Multi-year framework with call-off flexibility",
+            ],
+            "priority": 1,
+        },
+        "volume": {
+            "label": "Volume Commitment",
+            "options": [
+                "Guaranteed minimum order quantity per quarter",
+                "Consolidated spend across product lines",
+                "Increased volume commitment (specify percentage)",
+            ],
+            "priority": 2,
+        },
+        "scope": {
+            "label": "Scope Adjustments",
+            "options": [
+                "Simplified packaging or delivery requirements",
+                "Extended lead time (add X weeks) for better pricing",
+                "Phased delivery to manage cash flow",
+            ],
+            "priority": 3,
+        },
+        "strategic": {
+            "label": "Strategic Benefits",
+            "options": [
+                "Preferred supplier status for future opportunities",
+                "Marketing/case study collaboration rights",
+                "Early access to new requirements in pipeline",
+            ],
+            "priority": 3,
+        },
+    }
+
+    selected: List[str] = []
+
+    if round_no == 1:
+        selected.extend(all_levers["payment"]["options"][:1])
+        selected.extend(all_levers["duration"]["options"][:1])
+    elif round_no == 2:
+        selected.extend(all_levers["payment"]["options"][:1])
+        selected.extend(all_levers["duration"]["options"][:1])
+        selected.extend(all_levers["volume"]["options"][:1])
+    else:
+        selected.append("Net-15 payment terms with 24-month commitment")
+        if context.get("willing_to_adjust_scope"):
+            selected.extend(all_levers["scope"]["options"][:1])
+
+    return selected[:3]
+
+
+def _generate_strategic_elements(round_no: int, context: Dict[str, Any]) -> List[str]:
+    elements: List[str] = []
+
+    market_rate = context.get("market_rate")
+    if market_rate:
+        elements.append(
+            f"Reference market benchmarks: 'Industry rates are averaging around {market_rate}'"
+        )
+
+    if round_no >= 2:
+        elements.append("Mention: 'We're evaluating multiple proposals and need to finalize by [date]'")
+
+    budget_ceiling = context.get("budget_ceiling")
+    if budget_ceiling:
+        elements.append(
+            f"Be transparent: 'Our budget approval ceiling is {budget_ceiling}'"
+        )
+
+    if context.get("is_incumbent") or context.get("past_relationship"):
+        elements.append(
+            "Acknowledge partnership: 'We value our ongoing collaboration and want to continue working together'"
+        )
+
+    if round_no >= 3 or context.get("urgent"):
+        elements.append(
+            "Create urgency: 'Our decision timeline requires confirmation by [specific date]'"
+        )
+
+    return elements
+
+
+def _calculate_tone_guidance(round_no: int, gap_percentage: float) -> str:
+    if round_no == 1:
+        return "Warm and collaborative - we're opening a discussion, not making demands"
+    if round_no == 2:
+        if gap_percentage > 20:
+            return "Professional but firm - we need movement, but stay respectful"
+        return "Encouraging and solution-focused - we're close to agreement"
+    return "Clear and decisive - this is final position, but leave door open for acceptance"
 
 
 class _InMemoryCursor:
@@ -250,31 +573,6 @@ def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
 
 RFQ_TABLE_HEADER = _build_rfq_table_html([])
 
-
-NEGOTIATION_COUNTER_SYSTEM_PROMPT = (
-    "You are a senior procurement negotiator crafting professional, well-structured emails. "
-    "CRITICAL RULES:\n"
-    "• NEVER include internal identifiers (RFQ IDs, UIDs, workflow IDs, reference numbers)\n"
-    "• NEVER mention internal scoring, evaluation, or analysis processes\n"
-    "• Use natural language references like 'our recent discussion' or 'your quotation'\n"
-    "• Format with clear sections using **bold** headings\n"
-    "• Use bullet points (•) for lists\n"
-    "• Keep professional but warm tone\n"
-    "• Maximum 200 words\n"
-    "• Ensure proper paragraph spacing"
-)
-
-NEGOTIATION_COUNTER_USER_PROMPT = (
-    "Context (JSON):\n{payload}\n\n"
-    "Draft a professional negotiation email with:\n"
-    "1. Personalized greeting without any reference numbers\n"
-    "2. Natural reference to previous communication (e.g., 'Thank you for your recent proposal')\n"
-    "3. **Pricing Position** section with clear figures\n"
-    "4. **Key Requirements** section with bullet-pointed asks\n"
-    "5. **Next Steps** with specific action and timeline\n"
-    "6. Professional closing\n\n"
-    "CRITICAL: Do NOT include RFQ IDs, UIDs, reference numbers, or any internal identifiers."
-)
 
 DEFAULT_NEGOTIATION_MODEL = "mistral"
 
@@ -974,154 +1272,259 @@ class EmailDraftingAgent(BaseAgent):
         if not self.prompt_template:
             self.prompt_template = DEFAULT_PROMPT_TEMPLATE
 
-    def _handle_negotiation_counter(self, context: AgentContext, data: Dict[str, Any]) -> AgentOutput:
-        supplier_id = data.get("supplier_id")
-        supplier_name = data.get("supplier_name") or supplier_id or "Supplier"
-        workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
-        supplied_rfq = self._normalise_rfq_identifier(data.get("rfq_id"))
-        existing_unique = self._normalise_tracking_value(data.get("unique_id"))
-        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
-            workflow_hint, supplier_id
-        )
-        decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
-        counter_price = data.get("counter_price")
-        if counter_price is None:
-            counter_price = decision.get("counter_price")
-        target_price = data.get("target_price")
-        if target_price is None:
-            target_price = decision.get("target_price")
-        current_offer = data.get("current_offer_numeric")
-        if current_offer is None:
-            current_offer = data.get("current_offer")
-        currency = data.get("currency") or decision.get("currency")
-        asks = data.get("asks") if isinstance(data.get("asks"), list) else decision.get("asks", [])
-        if not isinstance(asks, list):
-            asks = [asks] if asks else []
-        lead_time_request = data.get("lead_time_request") or decision.get("lead_time_request")
-        rationale = data.get("rationale") or decision.get("rationale")
-        negotiation_message = (
-            data.get("negotiation_message")
-            or decision.get("negotiation_message")
-            or data.get("message")
-        )
-        supplier_message = data.get("supplier_message")
-        round_value = data.get("round") or decision.get("round") or 1
+    def _draft_intelligent_negotiation_email(
+        self,
+        context: AgentContext,
+        data: Dict[str, Any],
+    ) -> str:
+        round_value = data.get("round") or 1
         try:
             round_no = int(round_value)
         except Exception:
             round_no = 1
-        session_state = data.get("session_state") if isinstance(data.get("session_state"), dict) else {}
-        reply_count_value = data.get("supplier_reply_count")
-        if reply_count_value is None and session_state:
-            reply_count_value = session_state.get("supplier_reply_count")
-        try:
-            supplier_reply_count = int(reply_count_value) if reply_count_value is not None else 0
-        except Exception:
-            supplier_reply_count = 0
-        strategy = decision.get("strategy")
 
-        payload = {
-            "unique_id": unique_id,
-            "supplier_id": supplier_id,
-            "round": round_no,
-            "current_offer": current_offer,
-            "target_price": target_price,
-            "counter_price": counter_price,
-            "currency": currency,
-            "asks": asks,
-            "lead_time_request": lead_time_request,
-            "rationale": rationale,
-            "negotiation_message": negotiation_message,
-            "supplier_message": supplier_message,
-            "supplier_reply_count": supplier_reply_count,
-            "strategy": strategy,
+        current_offer = data.get("current_offer_numeric")
+        if current_offer is None:
+            current_offer = data.get("current_offer")
+        target_price = data.get("target_price")
+        if target_price is None:
+            target_price = data.get("counter_price")
+        currency = data.get("currency") or data.get("currency_code") or "GBP"
+
+        gap_amount = None
+        gap_percentage = 0.0
+        if current_offer is not None and target_price is not None:
+            try:
+                current_float = float(current_offer)
+                target_float = float(target_price)
+                gap_amount = current_float - target_float
+                gap_percentage = (gap_amount / current_float) * 100 if current_float else 0.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                gap_amount = None
+                gap_percentage = 0.0
+
+        supplier_name = data.get("supplier_name", "Supplier")
+        current_offer_fmt = self._format_currency_value(current_offer, currency) or "Not specified"
+        target_price_fmt = self._format_currency_value(target_price, currency) or "Not specified"
+        gap_amount_fmt = (
+            self._format_currency_value(gap_amount, currency)
+            if gap_amount is not None
+            else "TBD"
+        )
+
+        supplier_history = {
+            "reliable_partner": data.get("reliable_partner", False),
+            "high_quality_score": (data.get("quality_score", 0) or 0) > 80,
+            "past_spend": data.get("total_spend"),
+            "past_relationship": bool(data.get("total_spend")),
         }
 
-        payload_json = json.dumps(payload, ensure_ascii=False, default=str)
-        model_name = getattr(self.agent_nick.settings, "negotiation_email_model", DEFAULT_NEGOTIATION_MODEL)
-        messages = [
-            {"role": "system", "content": NEGOTIATION_COUNTER_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": NEGOTIATION_COUNTER_USER_PROMPT.format(payload=payload_json),
-            },
-        ]
+        negotiation_context = {
+            "supplier_name": supplier_name,
+            "supplier_contact": data.get("contact_name", supplier_name),
+            "category": data.get("category", "products/services"),
+            "current_offer": current_offer_fmt,
+            "target_price": target_price_fmt,
+            "gap": gap_amount_fmt,
+            "gap_percentage": f"{gap_percentage:.1f}%",
+            "currency": currency,
+            "round": round_no,
+            "asks": data.get("asks", []),
+            "lead_time_request": data.get("lead_time_request"),
+            "supplier_message": data.get("supplier_message"),
+            "negotiation_message": data.get("negotiation_message"),
+            "strategy": data.get("strategy"),
+        }
 
-        email_text = ""
+        objective = _determine_negotiation_objective(round_no, gap_percentage)
+        tactics = _determine_recommended_tactics(round_no, gap_percentage, supplier_history)
+        levers = _select_commercial_levers(round_no, data)
+        strategic_elements = _generate_strategic_elements(round_no, data)
+        tone_guidance = _calculate_tone_guidance(round_no, gap_percentage)
+
+        if round_no == 1:
+            cta_guidance = "Request their thoughts on bridging the gap by [date 5-7 days out]"
+        elif round_no == 2:
+            cta_guidance = "Ask for revised proposal incorporating suggested levers by [date 3-5 days out]"
+        else:
+            cta_guidance = "Request confirmation of acceptance by [date 2-3 days out] or we proceed with alternatives"
+
+        levers_formatted = "\n".join(f"   • {lever}" for lever in levers)
+        strategic_formatted = (
+            "\n".join(f"   • {element}" for element in strategic_elements)
+            if strategic_elements
+            else "   • Focus on clear communication and professional tone"
+        )
+
+        user_prompt = NEGOTIATION_PLAYBOOK_USER.format(
+            context_json=json.dumps(negotiation_context, indent=2),
+            round_number=round_no,
+            objective=objective,
+            tactics=tactics,
+            tone_guidance=tone_guidance,
+            current_offer=current_offer_fmt,
+            target_price=target_price_fmt,
+            gap_amount=gap_amount_fmt,
+            gap_percentage=f"{gap_percentage:.1f}",
+            levers_list=levers_formatted,
+            strategic_elements=strategic_formatted,
+            cta_guidance=cta_guidance,
+        )
+
+        model_name = getattr(
+            self.agent_nick.settings,
+            "negotiation_email_model",
+            DEFAULT_NEGOTIATION_MODEL,
+        )
+
         try:
             response = self.call_ollama(
                 model=model_name,
-                messages=messages,
-                options={"temperature": 0.35, "top_p": 0.9, "num_ctx": 4096},
+                messages=[
+                    {"role": "system", "content": NEGOTIATION_PLAYBOOK_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options={
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "num_ctx": 8192,
+                },
             )
             email_text = self._extract_ollama_message(response)
-        except Exception:  # pragma: no cover - defensive composition
-            logger.exception(
-                "Failed to compose negotiation counter email via model %s", model_name
+        except Exception:
+            logger.exception("Failed to generate negotiation email via LLM")
+            email_text = ""
+
+        if not email_text or len(email_text.strip()) < 100:
+            logger.warning("LLM generated insufficient content, using fallback")
+            asks_value = data.get("asks")
+            asks_list = asks_value if isinstance(asks_value, list) else [asks_value] if asks_value else []
+            return self._build_negotiation_fallback(
+                unique_id=data.get("unique_id", ""),
+                counter_price=data.get("counter_price"),
+                target_price=data.get("target_price"),
+                current_offer=current_offer,
+                currency=currency,
+                asks=asks_list,
+                lead_time_request=data.get("lead_time_request"),
+                negotiation_message=data.get("negotiation_message"),
+                round_no=round_no,
+                line_items=data.get("line_items"),
             )
 
-        if not email_text:
-            email_text = self._build_negotiation_fallback(
-                unique_id,
-                counter_price,
-                target_price,
-                current_offer,
-                currency,
-                asks,
-                lead_time_request,
-                negotiation_message,
-                round_no,
-                decision.get("line_items") or data.get("line_items"),
-            )
+        return email_text
 
-        body_content = self._sanitise_generated_body(email_text)
+    def _handle_negotiation_counter(self, context: AgentContext, data: Dict[str, Any]) -> AgentOutput:
+        supplier_id = data.get("supplier_id")
+        supplier_name = data.get("supplier_name") or supplier_id or "Supplier"
+        workflow_hint = data.get("workflow_id") or getattr(context, "workflow_id", None)
+
+        decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
+        combined_data: Dict[str, Any] = {}
+        if decision:
+            combined_data.update(decision)
+        combined_data.update(data)
+
+        email_text = self._draft_intelligent_negotiation_email(context, combined_data)
+        subject_line, body_text = self._split_subject_and_body(email_text)
+        body_content = self._sanitise_generated_body(body_text)
         body = self._clean_body_text(body_content)
+
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
             supplier_id=supplier_id,
-            existing=unique_id,
+            existing=combined_data.get("unique_id"),
         )
+
+        round_no = combined_data.get("round") or 1
+        try:
+            round_int = int(round_no)
+        except Exception:
+            round_int = 1
+
+        if not subject_line or not subject_line.strip():
+            category = combined_data.get("category") or combined_data.get("item") or "Requirement"
+            subject_line = (
+                f"Pricing Discussion - {category}" if round_int == 1 else f"Re: Pricing Discussion - {category}"
+            )
+
+        subject = self._clean_subject_text(subject_line, DEFAULT_NEGOTIATION_SUBJECT)
+        if not subject:
+            subject = DEFAULT_NEGOTIATION_SUBJECT
+
+        contact_name = combined_data.get("contact_name") or supplier_name
+        greeting = f"Dear {contact_name},"
+        if greeting not in body:
+            body = f"{greeting}\n\n{body}" if body else greeting
+
         body, marker_token = attach_hidden_marker(
             body,
             supplier_id=supplier_id,
             unique_id=unique_id,
         )
 
-        subject_base = data.get("subject") or DEFAULT_NEGOTIATION_SUBJECT
-        subject = self._clean_subject_text(subject_base, DEFAULT_NEGOTIATION_SUBJECT)
-
-        sender_email = data.get("sender") or self.agent_nick.settings.ses_default_sender
-        recipients = self._normalise_recipients(data.get("recipients") or data.get("to"))
+        sender_email = combined_data.get("sender") or self.agent_nick.settings.ses_default_sender
+        recipients = self._normalise_recipients(
+            combined_data.get("recipients") or combined_data.get("to")
+        )
         receiver = recipients[0] if recipients else None
         contact_level = 1 if recipients else 0
 
         metadata = {
-            "counter_price": counter_price,
-            "target_price": target_price,
-            "current_offer": current_offer,
-            "round": round_no,
-            "supplier_reply_count": supplier_reply_count,
-            "strategy": strategy,
-            "asks": asks,
-            "lead_time_request": lead_time_request,
-            "rationale": rationale,
+            "unique_id": unique_id,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "counter_price": combined_data.get("counter_price") or combined_data.get("target_price"),
+            "target_price": combined_data.get("target_price"),
+            "current_offer": combined_data.get("current_offer")
+            or combined_data.get("current_offer_numeric"),
+            "currency": combined_data.get("currency") or combined_data.get("currency_code"),
+            "asks": combined_data.get("asks"),
+            "lead_time_request": combined_data.get("lead_time_request"),
+            "negotiation_message": combined_data.get("negotiation_message"),
+            "supplier_message": combined_data.get("supplier_message"),
+            "strategy": combined_data.get("strategy"),
+            "round": round_int,
             "intent": "NEGOTIATION_COUNTER",
+            "dispatch_token": marker_token,
+            "workflow_id": workflow_hint,
         }
+        metadata = {k: v for k, v in metadata.items() if v is not None}
 
-        if marker_token:
-            metadata["dispatch_token"] = marker_token
-        metadata["unique_id"] = unique_id
-        if workflow_hint:
-            metadata["workflow_id"] = workflow_hint
-
-        thread_headers_payload = data.get("thread_headers") or data.get("thread")
+        thread_headers_payload = combined_data.get("thread_headers") or combined_data.get("thread")
         resolved_thread_headers: Dict[str, Any] = {}
         if isinstance(thread_headers_payload, dict):
             resolved_thread_headers = dict(thread_headers_payload)
 
-        draft = {
+        headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
+        if workflow_hint:
+            headers["X-Procwise-Workflow-Id"] = workflow_hint
+
+        message_id = None
+        if resolved_thread_headers:
+            message_id = resolved_thread_headers.get("Message-ID") or resolved_thread_headers.get(
+                "message_id"
+            )
+            in_reply_to = resolved_thread_headers.get("In-Reply-To") or resolved_thread_headers.get(
+                "in_reply_to"
+            )
+            references = resolved_thread_headers.get("References") or resolved_thread_headers.get(
+                "references"
+            )
+
+            if message_id:
+                headers["Message-ID"] = message_id
+            if in_reply_to:
+                headers["In-Reply-To"] = in_reply_to
+            if isinstance(references, list) and references:
+                headers["References"] = " ".join(str(ref) for ref in references if ref)
+            elif isinstance(references, str) and references.strip():
+                headers["References"] = references.strip()
+
+        draft: Dict[str, Any] = {
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
+            "unique_id": unique_id,
             "subject": subject,
             "body": body,
             "sent_status": False,
@@ -1130,66 +1533,41 @@ class EmailDraftingAgent(BaseAgent):
             "receiver": receiver,
             "contact_level": contact_level,
             "metadata": metadata,
-            "unique_id": unique_id,
+            "headers": headers,
             "workflow_id": workflow_hint,
+            "intent": "NEGOTIATION_COUNTER",
         }
 
-        headers = {
-            "X-Procwise-Unique-Id": unique_id,
-        }
-        if workflow_hint:
-            headers["X-Procwise-Workflow-Id"] = workflow_hint
-
-        message_id = None
-        if resolved_thread_headers:
-            message_id = resolved_thread_headers.get("Message-ID") or resolved_thread_headers.get("message_id")
-            in_reply_to = (
-                resolved_thread_headers.get("In-Reply-To")
-                or resolved_thread_headers.get("in_reply_to")
-            )
-            references = resolved_thread_headers.get("References") or resolved_thread_headers.get("references")
-            if message_id:
-                headers["Message-ID"] = message_id
-            if in_reply_to:
-                headers["In-Reply-To"] = in_reply_to
-            elif not headers.get("In-Reply-To"):
-                legacy_reply = resolved_thread_headers.get("message_id")
-                if legacy_reply and legacy_reply != message_id:
-                    headers["In-Reply-To"] = legacy_reply
-            if isinstance(references, list) and references:
-                headers["References"] = " ".join(str(ref) for ref in references if ref)
-            elif isinstance(references, str) and references.strip():
-                headers["References"] = references.strip()
-            resolved_thread_headers = {
-                key: value for key, value in resolved_thread_headers.items() if value is not None
-            }
-            if message_id:
-                resolved_thread_headers.setdefault("Message-ID", message_id)
-
-        draft["headers"] = headers
         if resolved_thread_headers:
             draft["thread_headers"] = resolved_thread_headers
         if message_id:
             draft["message_id"] = message_id
 
+        action_id = combined_data.get("action_id") or context.input_data.get("action_id")
+        if action_id:
+            draft["action_id"] = action_id
+
+        thread_index = combined_data.get("thread_index", 1)
+        try:
+            draft["thread_index"] = max(1, int(thread_index))
+        except Exception:
+            draft["thread_index"] = 1
+
         negotiation_extra = {
-            "negotiation_message": negotiation_message,
-            "supplier_message": supplier_message,
+            "counter_price": combined_data.get("counter_price"),
+            "target_price": combined_data.get("target_price"),
+            "current_offer": combined_data.get("current_offer")
+            or combined_data.get("current_offer_numeric"),
+            "currency": combined_data.get("currency") or combined_data.get("currency_code"),
+            "asks": combined_data.get("asks"),
+            "lead_time_request": combined_data.get("lead_time_request"),
+            "negotiation_message": combined_data.get("negotiation_message"),
+            "supplier_message": combined_data.get("supplier_message"),
         }
         draft.update({k: v for k, v in negotiation_extra.items() if v})
 
-        action_id = data.get("action_id") or context.input_data.get("action_id")
-        if action_id:
-            draft["action_id"] = action_id
-        thread_index = data.get("thread_index")
-        try:
-            thread_index_int = int(thread_index) if thread_index is not None else 1
-        except Exception:
-            thread_index_int = 1
-        draft.setdefault("thread_index", max(1, thread_index_int))
-
         self._store_draft(draft)
-        self._record_learning_events(context, [draft], data)
+        self._record_learning_events(context, [draft], combined_data)
 
         output_data: Dict[str, Any] = {
             "drafts": [draft],
@@ -1198,6 +1576,7 @@ class EmailDraftingAgent(BaseAgent):
             "sender": sender_email,
             "intent": "NEGOTIATION_COUNTER",
         }
+
         if recipients:
             output_data["recipients"] = recipients
         if action_id:
@@ -1207,22 +1586,15 @@ class EmailDraftingAgent(BaseAgent):
         if resolved_thread_headers:
             output_data["thread_headers"] = resolved_thread_headers
 
-        pass_fields: Dict[str, Any] = {"drafts": [draft]}
-        if action_id:
-            pass_fields["action_id"] = action_id
-        if message_id:
-            pass_fields["message_id"] = message_id
-        if resolved_thread_headers:
-            pass_fields["thread_headers"] = resolved_thread_headers
-
         return self._with_plan(
             context,
             AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data=output_data,
-                pass_fields=pass_fields,
+                pass_fields={"drafts": [draft]},
             ),
         )
+
 
     def _render_negotiation_table(self, line_items: Optional[Any]) -> List[str]:
         if not line_items:
@@ -1324,64 +1696,43 @@ class EmailDraftingAgent(BaseAgent):
         lines.append("Dear Supplier Partner,")
         lines.append("")
 
-        if round_value and round_value > 1:
+        if round_value == 1:
             lines.append(
-                "Thank you for your response to our recent enquiry. We have reviewed your latest proposal and would like to continue our discussion."
+                "Thank you for your quotation. We've reviewed your proposal and would like to discuss the commercial terms to find a mutually beneficial arrangement."
+            )
+        elif round_value == 2:
+            lines.append(
+                "Thank you for your continued engagement. We appreciate your flexibility and would like to explore additional commercial adjustments to close the remaining gap."
             )
         else:
             lines.append(
-                "Thank you for your quotation. We appreciate the competitive pricing you have provided and would like to explore the following points further."
+                "Thank you for your responses throughout this process. We've now reached our final position and need to finalize terms this week."
             )
         lines.append("")
 
-        if round_value and round_value <= 1:
-            lines.append("**Pricing Discussion:**")
-            if offer_text and counter_text:
-                lines.append(f"• Your current offer: {offer_text}")
-                lines.append(f"• Our target position: {counter_text}")
-                if target_text and target_text != counter_text:
-                    lines.append(f"• Our budget ceiling: {target_text}")
-            elif counter_text:
-                lines.append(
-                    f"To align with our project budget, we would like to explore pricing around {counter_text}."
-                )
-            lines.append("")
-            lines.append(
-                "We believe this represents a fair market position and would enable us to proceed with the commitment you need."
-            )
-            lines.append("")
-        elif round_value == 2:
-            lines.append("**Revised Position:**")
-            lines.append("")
-            lines.append(
-                "We have reviewed our internal parameters and the current commercial landscape. To facilitate progression, we would need to adjust one of the following levers:"
-            )
-            lines.append("")
+        lines.append("**Commercial Position:**")
+        lines.append("")
+        if offer_text and counter_text:
+            lines.append(f"• Your current proposal: {offer_text}")
+            lines.append(f"• Our budget positioning: {counter_text}")
+            if target_text and target_text != counter_text:
+                lines.append(f"• Our absolute ceiling: {target_text}")
+        elif counter_text:
+            lines.append(f"• Our target positioning: {counter_text}")
+        lines.append("")
 
-            lever_options = [
-                "Extended contract term (12-24 months)",
-                "Consolidated volume commitment",
-                "Accelerated payment terms (Net-15 with early payment discount)",
-            ]
-
-            for option in lever_options[:2]:
-                lines.append(f"• {option}")
+        if round_value in (1, 2):
+            lines.append("**Commercial Levers:**")
             lines.append("")
-
-            if counter_text:
-                lines.append(f"Subject to alignment on the above, we can position at {counter_text}.")
+            lines.append("To facilitate an agreement, we can offer:")
             lines.append("")
-        else:
-            lines.append("**Final Position:**")
-            lines.append("")
-            lines.append(
-                "We have now exhausted our internal flexibility. The figures below represent our final position:"
-            )
-            lines.append("")
-            if counter_text:
-                lines.append(f"• Unit price: {counter_text}")
-            if lead_time_request:
-                lines.append(f"• Lead time: {lead_time_request}")
+            if round_value == 1:
+                lines.append("• 24-month contract commitment (from 12 months)")
+                lines.append("• Net-15 payment terms with 2% early payment discount")
+            else:
+                lines.append("• 24-month commitment with price lock guarantee")
+                lines.append("• Net-15 payment terms")
+                lines.append("• Consolidated volume across product lines")
             lines.append("")
 
         asks_list = [str(item).strip() for item in asks if str(item).strip()] if asks else []
@@ -1389,22 +1740,8 @@ class EmailDraftingAgent(BaseAgent):
             lines.append("**Key Requirements:**")
             lines.append("")
             for ask in asks_list:
-                formatted_ask = ask.strip()
-                if not formatted_ask.endswith((".", "?")):
-                    formatted_ask += "."
-                lines.append(f"• {formatted_ask}")
-            lines.append("")
-
-        if lead_time_request and round_value <= 2:
-            lines.append("**Delivery Requirements:**")
-            lines.append(f"• {lead_time_request}")
-            lines.append("")
-
-        table_lines = self._render_negotiation_table(line_items)
-        if table_lines:
-            lines.append("**Commercial Structure:**")
-            lines.append("")
-            lines.extend(table_lines)
+                formatted = ask if ask.endswith((".", "?")) else f"{ask}."
+                lines.append(f"• {formatted}")
             lines.append("")
 
         if negotiation_message:
@@ -1413,27 +1750,33 @@ class EmailDraftingAgent(BaseAgent):
             lines.append(negotiation_message)
             lines.append("")
 
-        if round_value and round_value >= 3:
+        if round_value >= 3:
+            lines.append("**Final Position:**")
+            lines.append("")
+            lines.append(
+                "This represents our maximum flexibility. We need confirmation by close of business this Friday to proceed with the award. If we cannot align on these terms, we'll need to explore alternative options."
+            )
+        elif round_value == 2:
             lines.append("**Next Steps:**")
             lines.append("")
             lines.append(
-                "This represents our final position. Could you please confirm by close of business this week whether you can accommodate these terms? This will enable us to proceed with the award decision promptly."
+                "Could you please review the commercial levers above and confirm your revised position by end of next week? This will help us maintain our project timeline."
             )
         else:
-            lines.append("**Action Required:**")
+            lines.append("**Next Steps:**")
             lines.append("")
             lines.append(
-                "Could you please review the above and confirm your position by end of this week? This will help us maintain our project timeline and finalize the commercial terms."
+                "We'd appreciate your thoughts on how we might bridge this gap using the levers above. Please share your revised proposal by next Friday."
             )
 
         lines.append("")
-        lines.append("We value our partnership and look forward to a mutually beneficial outcome.")
+        lines.append("We value this partnership and look forward to finding a mutually beneficial path forward.")
         lines.append("")
         lines.append("Best regards,")
         lines.append("Procurement Team")
-        lines.append("ProcWise")
 
         return "\n".join(lines)
+
 
     @staticmethod
     def _extract_ollama_message(response: Dict[str, Any]) -> str:
