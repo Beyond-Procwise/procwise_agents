@@ -122,15 +122,33 @@ class SupplierRelationshipService:
         except Exception as exc:
             if self._is_missing_index_error(exc):
                 logger.warning(
-                    "SupplierRelationshipService: missing Qdrant index detected. Falling back to in-memory filtering.",
+                    "SupplierRelationshipService: missing Qdrant index detected while loading supplier relationship. Attempting to create payload indexes before falling back.",
                     exc_info=True,
                 )
-                return self._fetch_relationship_without_index(
-                    supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
-                )
-
-            logger.exception("Failed to load supplier relationship from Qdrant")
-            return []
+                # Ensure indexes exist and retry once before resorting to a full collection scan.
+                self._ensure_payload_indexes()
+                try:
+                    results, _ = self.client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=models.Filter(must=must),
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=limit,
+                    )
+                except Exception as retry_exc:
+                    if self._is_missing_index_error(retry_exc):
+                        logger.warning(
+                            "SupplierRelationshipService: payload indexes still missing after retry. Falling back to in-memory filtering.",
+                            exc_info=True,
+                        )
+                        return self._fetch_relationship_without_index(
+                            supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
+                        )
+                    logger.exception("Failed to load supplier relationship from Qdrant")
+                    return []
+            else:
+                logger.exception("Failed to load supplier relationship from Qdrant")
+                return []
 
         return self._extract_payloads(results or [])
 
@@ -464,9 +482,10 @@ class SupplierRelationshipService:
         target_id = str(supplier_id) if supplier_id else None
         target_name = self._normalise_key(supplier_name) if supplier_name else None
 
-        # Fetch a slightly larger page size to reduce the number of fall-back scans
         page_size = max(limit, 50)
+        max_points_to_scan = max(2000, page_size * 40)
         next_offset = None
+        scanned = 0
         matches: List[Dict[str, Any]] = []
 
         while True:
@@ -488,20 +507,34 @@ class SupplierRelationshipService:
             if not results:
                 break
 
+            scanned += len(results)
             for payload in self._extract_payloads(results):
+                document_type = payload.get("document_type")
+                if document_type and document_type != "supplier_relationship":
+                    continue
+
                 if target_id and str(payload.get("supplier_id")) != target_id:
                     continue
+
                 if target_name:
                     payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
                         payload.get("supplier_name")
                     )
                     if payload_name != target_name:
                         continue
+
                 matches.append(payload)
                 if len(matches) >= limit:
                     return matches
 
             if next_offset is None:
+                break
+
+            if scanned >= max_points_to_scan:
+                logger.warning(
+                    "SupplierRelationshipService fallback scan aborted after inspecting %s records without finding enough"
+                    " matches", scanned
+                )
                 break
 
         return matches
