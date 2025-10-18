@@ -85,6 +85,8 @@ class EmailDispatchService:
                     "Draft found but missing unique_id. Draft data may be corrupted."
                 )
 
+            rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
+
             recipient_list = self._normalise_recipients(
                 recipients if recipients is not None else draft.get("recipients")
             )
@@ -207,6 +209,10 @@ class EmailDispatchService:
                     draft.get("supplier_id"),
                     message_id,
                 )
+                canonical_rfq_identifier = (
+                    rfq_identifier.upper() if isinstance(rfq_identifier, str) else None
+                )
+
                 try:
                     try:
                         self._record_thread_mapping(
@@ -233,7 +239,7 @@ class EmailDispatchService:
                 try:
                     register_dispatch_chain(
                         conn,
-                        rfq_id=unique_id,
+                        rfq_id=canonical_rfq_identifier or unique_id,
                         message_id=message_id,
                         subject=subject,
                         body=body,
