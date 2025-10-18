@@ -67,9 +67,7 @@ class EmailDispatchService:
 
         identifier = (identifier or "").strip()
         if not identifier:
-            raise ValueError(
-                "identifier (unique_id or rfq_id) is required to send an email draft"
-            )
+            raise ValueError("unique_id is required to send an email draft")
 
         with self.agent_nick.get_db_connection() as conn:
             draft_row = self._fetch_latest_draft(conn, identifier)
@@ -86,6 +84,8 @@ class EmailDispatchService:
                 raise ValueError(
                     "Draft found but missing unique_id. Draft data may be corrupted."
                 )
+
+            rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
 
             recipient_list = self._normalise_recipients(
                 recipients if recipients is not None else draft.get("recipients")
@@ -209,14 +209,28 @@ class EmailDispatchService:
                     draft.get("supplier_id"),
                     message_id,
                 )
+                canonical_rfq_identifier = (
+                    rfq_identifier.upper() if isinstance(rfq_identifier, str) else None
+                )
+
                 try:
-                    self._record_thread_mapping(
-                        conn,
-                        message_id,
-                        unique_id,
-                        draft.get("supplier_id"),
-                        recipient_list,
-                    )
+                    try:
+                        self._record_thread_mapping(
+                            conn,
+                            message_id,
+                            unique_id,
+                            draft.get("supplier_id"),
+                            recipient_list,
+                            rfq_id=unique_id,
+                        )
+                    except TypeError:
+                        self._record_thread_mapping(  # type: ignore[misc]
+                            conn,
+                            message_id,
+                            unique_id,
+                            draft.get("supplier_id"),
+                            recipient_list,
+                        )
                     conn.commit()
                 except Exception:  # pragma: no cover - defensive
                     self.logger.exception(
@@ -225,7 +239,7 @@ class EmailDispatchService:
                 try:
                     register_dispatch_chain(
                         conn,
-                        rfq_id=unique_id,
+                        rfq_id=canonical_rfq_identifier or unique_id,
                         message_id=message_id,
                         subject=subject,
                         body=body,
@@ -535,17 +549,25 @@ class EmailDispatchService:
         unique_id: str,
         supplier_id: Optional[str],
         recipients: Sequence[str],
+        *,
+        rfq_id: Optional[str] = None,
     ) -> None:
         if not message_id or conn is None or not self._thread_table_name:
             return
 
         self._ensure_thread_table(conn)
 
+        rfq_reference = self._normalise_identifier(rfq_id) or self._normalise_identifier(
+            unique_id
+        )
+        if not rfq_reference:
+            return
+
         record_thread_mapping(
             conn,
             self._thread_table_name,
             message_id=str(message_id),
-            rfq_id=str(unique_id),
+            rfq_id=rfq_reference,
             supplier_id=str(supplier_id) if supplier_id else None,
             recipients=recipients,
             logger=self.logger,
@@ -581,6 +603,14 @@ class EmailDispatchService:
             if candidate.lower() not in {item.lower() for item in values}:
                 values.append(candidate)
         return values
+
+    @staticmethod
+    def _normalise_identifier(value: Optional[Any]) -> Optional[str]:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        return None
 
     def _ensure_tracking_annotation(
         self,
