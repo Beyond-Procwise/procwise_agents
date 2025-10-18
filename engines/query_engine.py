@@ -13,6 +13,7 @@ import logging
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 
+import numpy as np
 import pandas as pd
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -762,6 +763,20 @@ class QueryEngine(BaseEngine):
         from services.rag_service import RAGService
 
         payloads: List[Dict[str, Any]] = []
+
+        def _normalise_payload_value(value: Any) -> Any:
+            """Convert pandas/numpy scalars into JSON-serialisable Python objects."""
+
+            if value is None:
+                return None
+            if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                return value.isoformat()
+            if isinstance(value, np.generic):
+                return value.item()
+            if pd.isna(value):
+                return None
+            return value
+
         for row in df.itertuples(index=False):
             categories = " > ".join(
                 [
@@ -778,27 +793,27 @@ class QueryEngine(BaseEngine):
                 f"line {row.invoice_line_id}."
             )
 
-            payloads.append(
-                {
-                    "record_id": f"flow_supplier_{row.supplier_id}_po_{row.po_id}",
-                    "document_type": "procurement_flow",
-                    "supplier_id": row.supplier_id,
-                    "supplier_name": row.supplier_name,
-                    "po_id": row.po_id,
-                    "po_line_id": getattr(row, "po_line_id", None),
-                    "item_description": row.item_description,
-                    "product": getattr(row, "product", None),
-                    "category_path": categories,
-                    "category_level_1": getattr(row, "category_level_1", None),
-                    "category_level_2": getattr(row, "category_level_2", None),
-                    "category_level_3": getattr(row, "category_level_3", None),
-                    "category_level_4": getattr(row, "category_level_4", None),
-                    "category_level_5": getattr(row, "category_level_5", None),
-                    "invoice_id": getattr(row, "invoice_id", None),
-                    "invoice_line_id": getattr(row, "invoice_line_id", None),
-                    "content": text_summary,
-                }
-            )
+            raw_payload = {
+                "record_id": f"flow_supplier_{row.supplier_id}_po_{row.po_id}",
+                "document_type": "procurement_flow",
+                "supplier_id": row.supplier_id,
+                "supplier_name": row.supplier_name,
+                "po_id": row.po_id,
+                "po_line_id": getattr(row, "po_line_id", None),
+                "item_description": row.item_description,
+                "product": getattr(row, "product", None),
+                "category_path": categories,
+                "category_level_1": getattr(row, "category_level_1", None),
+                "category_level_2": getattr(row, "category_level_2", None),
+                "category_level_3": getattr(row, "category_level_3", None),
+                "category_level_4": getattr(row, "category_level_4", None),
+                "category_level_5": getattr(row, "category_level_5", None),
+                "invoice_id": getattr(row, "invoice_id", None),
+                "invoice_line_id": getattr(row, "invoice_line_id", None),
+                "content": text_summary,
+            }
+
+            payloads.append({k: _normalise_payload_value(v) for k, v in raw_payload.items()})
 
         if not payloads:
             return
