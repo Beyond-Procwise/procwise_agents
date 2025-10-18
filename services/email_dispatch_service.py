@@ -211,6 +211,10 @@ class EmailDispatchService:
                     draft.get("supplier_id"),
                     message_id,
                 )
+                canonical_rfq_identifier = (
+                    rfq_identifier.upper() if isinstance(rfq_identifier, str) else None
+                )
+
                 try:
                     try:
                         self._record_thread_mapping(
@@ -219,7 +223,7 @@ class EmailDispatchService:
                             unique_id,
                             draft.get("supplier_id"),
                             recipient_list,
-                            rfq_id=rfq_identifier,
+                            rfq_id=canonical_rfq_identifier,
                         )
                     except TypeError:
                         self._record_thread_mapping(  # type: ignore[misc]
@@ -237,7 +241,7 @@ class EmailDispatchService:
                 try:
                     register_dispatch_chain(
                         conn,
-                        rfq_id=rfq_identifier or unique_id,
+                        rfq_id=canonical_rfq_identifier or unique_id,
                         message_id=message_id,
                         subject=subject,
                         body=body,
