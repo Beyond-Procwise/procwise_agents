@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -250,6 +251,102 @@ class _FakeCursor:
             self._store.delete_workflow_rows(workflow_id)
             return
 
+        if upper_stmt.startswith("INSERT INTO PROC.SUPPLIER_RISK_SIGNALS"):
+            (
+                supplier_id,
+                signal_type,
+                severity,
+                source,
+                payload,
+                occurred_at,
+            ) = params
+            self._store.insert_risk_signal(
+                supplier_id,
+                {
+                    "supplier_id": supplier_id,
+                    "signal_type": signal_type,
+                    "severity": severity,
+                    "source": source,
+                    "payload": payload,
+                    "occurred_at": occurred_at,
+                },
+            )
+            return
+
+        if upper_stmt.startswith("SELECT SUPPLIER_ID, SIGNAL_TYPE") and (
+            "FROM PROC.SUPPLIER_RISK_SIGNALS" in upper_stmt
+        ):
+            supplier_id, limit = params
+            rows = self._store.fetch_risk_signals(supplier_id, int(limit))
+            columns = [
+                "supplier_id",
+                "signal_type",
+                "severity",
+                "source",
+                "payload",
+                "occurred_at",
+            ]
+            self.description = [_ColumnDescriptor(col) for col in columns]
+            self._results = [
+                (
+                    row["supplier_id"],
+                    row["signal_type"],
+                    row["severity"],
+                    row["source"],
+                    row.get("payload"),
+                    row["occurred_at"],
+                )
+                for row in rows
+            ]
+            return
+
+        if upper_stmt.startswith("INSERT INTO PROC.SUPPLIER_RISK_SCORES"):
+            (
+                supplier_id,
+                score,
+                model_version,
+                feature_summary,
+                computed_at,
+            ) = params
+            self._store.upsert_risk_score(
+                supplier_id,
+                {
+                    "supplier_id": supplier_id,
+                    "score": score,
+                    "model_version": model_version,
+                    "feature_summary": feature_summary,
+                    "computed_at": computed_at,
+                },
+            )
+            return
+
+        if upper_stmt.startswith("SELECT SUPPLIER_ID, SCORE") and (
+            "FROM PROC.SUPPLIER_RISK_SCORES" in upper_stmt
+        ):
+            (supplier_id,) = params
+            row = self._store.fetch_risk_score(supplier_id)
+            if row is None:
+                self._results = []
+            else:
+                self._results = [
+                    (
+                        row["supplier_id"],
+                        row["score"],
+                        row["model_version"],
+                        row.get("feature_summary"),
+                        row["computed_at"],
+                    )
+                ]
+            columns = [
+                "supplier_id",
+                "score",
+                "model_version",
+                "feature_summary",
+                "computed_at",
+            ]
+            self.description = [_ColumnDescriptor(col) for col in columns]
+            return
+
         raise NotImplementedError(f"Unsupported fake query: {statement}")
 
 
@@ -262,6 +359,10 @@ class _FakePostgresStore:
             self.supplier_response = []  # type: ignore[attr-defined]
         if not hasattr(self, "workflow_email_tracking"):
             self.workflow_email_tracking = []  # type: ignore[attr-defined]
+        if not hasattr(self, "supplier_risk_signals"):
+            self.supplier_risk_signals = []  # type: ignore[attr-defined]
+        if not hasattr(self, "supplier_risk_scores"):
+            self.supplier_risk_scores = {}  # type: ignore[attr-defined]
 
     # -- information schema helpers --------------------------------------
     def column_exists(self, schema: str, table: str, column: str) -> bool:
@@ -299,6 +400,22 @@ class _FakePostgresStore:
                 "matched",
                 "created_at",
                 "thread_headers",
+            },
+            "proc.supplier_risk_signals": {
+                "id",
+                "supplier_id",
+                "signal_type",
+                "severity",
+                "source",
+                "payload",
+                "occurred_at",
+            },
+            "proc.supplier_risk_scores": {
+                "supplier_id",
+                "score",
+                "model_version",
+                "feature_summary",
+                "computed_at",
             },
         }
         return column in columns.get(full_table, set())
@@ -412,6 +529,34 @@ class _FakePostgresStore:
         self.workflow_email_tracking = [
             row for row in table if row["workflow_id"] != workflow_id
         ]
+
+    # -- risk intelligence operations -----------------------------------
+
+    def insert_risk_signal(self, supplier_id: str, row: Dict[str, Any]) -> None:
+        self.ensure_tables()
+        table = self.supplier_risk_signals  # type: ignore[attr-defined]
+        record = dict(row)
+        record.setdefault("supplier_id", supplier_id)
+        record.setdefault("occurred_at", datetime.utcnow())
+        table.append(record)
+
+    def fetch_risk_signals(self, supplier_id: str, limit: int) -> List[Dict[str, Any]]:
+        self.ensure_tables()
+        table = self.supplier_risk_signals  # type: ignore[attr-defined]
+        rows = [row.copy() for row in table if row.get("supplier_id") == supplier_id]
+        rows.sort(key=lambda item: item.get("occurred_at"), reverse=True)
+        return rows[:limit]
+
+    def upsert_risk_score(self, supplier_id: str, row: Dict[str, Any]) -> None:
+        self.ensure_tables()
+        table = self.supplier_risk_scores  # type: ignore[attr-defined]
+        table[supplier_id] = dict(row)
+
+    def fetch_risk_score(self, supplier_id: str) -> Optional[Dict[str, Any]]:
+        self.ensure_tables()
+        table = self.supplier_risk_scores  # type: ignore[attr-defined]
+        result = table.get(supplier_id)
+        return dict(result) if result is not None else None
 
 
 _FAKE_DB_STORE: Optional[_FakePostgresStore] = None
