@@ -110,10 +110,22 @@ class ProcessRoutingService:
                           AND column_name = 'workflow_id'
                         """
                     )
-                    if cursor.fetchone() is None:
+                    column_missing = cursor.fetchone() is None
+                    if column_missing:
                         cursor.execute(
                             "ALTER TABLE proc.routing ADD COLUMN workflow_id TEXT"
                         )
+
+                    cursor.execute(
+                        """
+                        UPDATE proc.routing
+                        SET workflow_id = process_details::jsonb ->> 'workflow_id'
+                        WHERE workflow_id IS NULL
+                          AND process_details IS NOT NULL
+                          AND jsonb_typeof(process_details::jsonb) = 'object'
+                          AND process_details::jsonb ? 'workflow_id'
+                        """
+                    )
                 conn.commit()
         except Exception:
             logger.exception(
