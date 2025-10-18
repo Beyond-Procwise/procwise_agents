@@ -12,7 +12,6 @@ from utils.email_tracking import (
     build_tracking_comment,
     embed_unique_id_in_email_body,
     ensure_tracking_prefix,
-    generate_unique_email_id,
     strip_tracking_comment,
 )
 from utils.gpu import configure_gpu
@@ -57,25 +56,36 @@ class EmailDispatchService:
     # ------------------------------------------------------------------
     def send_draft(
         self,
-        rfq_id: str,
+        identifier: str,
         recipients: Optional[Iterable[str]] = None,
         sender: Optional[str] = None,
         subject_override: Optional[str] = None,
         body_override: Optional[str] = None,
         attachments: Optional[List[Tuple[bytes, str]]] = None,
     ) -> Dict[str, Any]:
-        """Send the latest draft for ``rfq_id`` and mark it as sent."""
+        """Send the latest draft for ``identifier`` (unique_id preferred)."""
 
-        rfq_id = (rfq_id or "").strip()
-        if not rfq_id:
-            raise ValueError("rfq_id is required to send an email draft")
+        identifier = (identifier or "").strip()
+        if not identifier:
+            raise ValueError(
+                "identifier (unique_id or rfq_id) is required to send an email draft"
+            )
 
         with self.agent_nick.get_db_connection() as conn:
-            draft_row = self._fetch_latest_draft(conn, rfq_id)
+            draft_row = self._fetch_latest_draft(conn, identifier)
             if draft_row is None:
-                raise ValueError(f"No stored draft found for RFQ {rfq_id}")
+                raise ValueError(
+                    f"No stored draft found for identifier {identifier}. "
+                    "Please use unique_id format (PROC-WF-XXXXXX) or ensure the draft exists."
+                )
 
             draft = self._hydrate_draft(draft_row)
+
+            unique_id = draft.get("unique_id")
+            if not unique_id:
+                raise ValueError(
+                    "Draft found but missing unique_id. Draft data may be corrupted."
+                )
 
             recipient_list = self._normalise_recipients(
                 recipients if recipients is not None else draft.get("recipients")
@@ -101,10 +111,11 @@ class EmailDispatchService:
             else:
                 subject_candidate = draft.get("subject")
             subject_str = str(subject_candidate).strip() if subject_candidate else ""
-            subject = subject_str or f"{rfq_id} – Request for Quotation"
+            subject = subject_str or f"{unique_id} – Request for Quotation"
 
             body_source = body_override if body_override is not None else draft.get("body")
             body_text = str(body_source).strip() if body_source else ""
+
             draft_metadata_source = (
                 draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
             )
@@ -112,14 +123,13 @@ class EmailDispatchService:
             dispatch_run_id = uuid.uuid4().hex
             draft_metadata["dispatch_token"] = dispatch_run_id
             draft_metadata["run_id"] = dispatch_run_id
-            body, backend_metadata = self._ensure_rfq_annotation(
+            body, backend_metadata = self._ensure_tracking_annotation(
                 body_text,
-                rfq_id,
+                unique_id=unique_id,
                 supplier_id=draft.get("supplier_id"),
                 dispatch_token=dispatch_run_id,
                 run_id=draft.get("run_id") or dispatch_run_id,
                 workflow_id=draft.get("workflow_id"),
-                unique_id=draft.get("unique_id"),
             )
             backend_metadata["run_id"] = dispatch_run_id
 
@@ -138,7 +148,7 @@ class EmailDispatchService:
                 }
             )
             dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
-            dispatch_payload.setdefault("unique_id", backend_metadata.get("unique_id"))
+            dispatch_payload.setdefault("unique_id", unique_id)
             if backend_metadata.get("run_id"):
                 dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
             if backend_metadata.get("supplier_id"):
@@ -150,7 +160,7 @@ class EmailDispatchService:
 
             headers = {
                 "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
-                "X-Procwise-Unique-Id": backend_metadata.get("unique_id"),
+                "X-Procwise-Unique-Id": unique_id,
             }
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
@@ -170,7 +180,6 @@ class EmailDispatchService:
 
             sent = send_result.success
             message_id = send_result.message_id
-            unique_id = backend_metadata.get("unique_id")
 
             self._update_draft_status(
                 conn,
@@ -183,7 +192,7 @@ class EmailDispatchService:
             self._update_action_sent_status(
                 conn,
                 dispatch_payload,
-                rfq_id,
+                unique_id,
                 bool(sent),
             )
 
@@ -194,10 +203,9 @@ class EmailDispatchService:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
                 dispatch_payload["message_id"] = message_id
                 logger.info(
-                    "Dispatched supplier email workflow=%s unique_id=%s rfq_id=%s supplier=%s message_id=%s",
+                    "Dispatched supplier email workflow=%s unique_id=%s supplier=%s message_id=%s",
                     backend_metadata.get("workflow_id"),
                     unique_id,
-                    rfq_id,
                     draft.get("supplier_id"),
                     message_id,
                 )
@@ -205,19 +213,19 @@ class EmailDispatchService:
                     self._record_thread_mapping(
                         conn,
                         message_id,
-                        rfq_id,
+                        unique_id,
                         draft.get("supplier_id"),
                         recipient_list,
                     )
                     conn.commit()
                 except Exception:  # pragma: no cover - defensive
                     self.logger.exception(
-                        "Failed to persist thread mapping for RFQ %s", rfq_id
+                        "Failed to persist thread mapping for unique_id %s", unique_id
                     )
                 try:
                     register_dispatch_chain(
                         conn,
-                        rfq_id=rfq_id,
+                        rfq_id=unique_id,
                         message_id=message_id,
                         subject=subject,
                         body=body,
@@ -230,15 +238,15 @@ class EmailDispatchService:
                     conn.commit()
                 except Exception:  # pragma: no cover - best effort logging
                     self.logger.exception(
-                        "Failed to register dispatch chain for RFQ %s", rfq_id
+                        "Failed to register dispatch chain for unique_id %s", unique_id
                     )
+
                 workflow_identifier = backend_metadata.get("workflow_id")
-                unique_identifier = backend_metadata.get("unique_id")
-                if workflow_identifier and unique_identifier:
+                if workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
-                            unique_id=unique_identifier,
+                            unique_id=unique_id,
                             supplier_id=str(
                                 backend_metadata.get("supplier_id")
                                 or draft.get("supplier_id")
@@ -273,7 +281,7 @@ class EmailDispatchService:
                 dispatch_payload["message_id"] = message_id
 
             return {
-                "rfq_id": rfq_id,
+                "unique_id": unique_id,
                 "sent": bool(sent),
                 "recipients": recipient_list,
                 "sender": sender_email,
@@ -287,7 +295,25 @@ class EmailDispatchService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _fetch_latest_draft(self, conn, rfq_id: str) -> Optional[Tuple]:
+    def _fetch_latest_draft(self, conn, identifier: str) -> Optional[Tuple]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
+                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
+                FROM proc.draft_rfq_emails
+                WHERE unique_id = %s
+                ORDER BY sent ASC, thread_index DESC, id DESC
+                LIMIT 1
+                """,
+                (identifier,),
+            )
+            row = cur.fetchone()
+
+        if row:
+            return row
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -299,7 +325,7 @@ class EmailDispatchService:
                 ORDER BY sent ASC, thread_index DESC, id DESC
                 LIMIT 1
                 """,
-                (rfq_id,),
+                (identifier,),
             )
             return cur.fetchone()
 
@@ -453,18 +479,13 @@ class EmailDispatchService:
         self,
         conn,
         payload: Dict[str, Any],
-        rfq_id: str,
+        unique_id: str,
         sent: bool,
     ) -> None:
         action_id = self._extract_action_id(payload)
-        unique_id = payload.get("unique_id")
-        metadata = payload.get("dispatch_metadata")
-        if not unique_id and isinstance(metadata, dict):
-            unique_id = metadata.get("unique_id")
         if not action_id:
             logger.debug(
-                "No action identifier found for dispatch (rfq=%s unique_id=%s); skipping sent_status update",
-                rfq_id,
+                "No action identifier found for dispatch (unique_id=%s); skipping sent_status update",
                 unique_id,
             )
             return
@@ -483,7 +504,7 @@ class EmailDispatchService:
             if process_output is None:
                 return
 
-            if not self._mark_sent_status(process_output, rfq_id, sent):
+            if not self._mark_sent_status(process_output, unique_id, sent):
                 return
 
             updated_payload = json.dumps(process_output, default=str)
@@ -499,9 +520,8 @@ class EmailDispatchService:
                 )
         except Exception:  # pragma: no cover - defensive logging
             logger.exception(
-                "Failed to update sent_status for action %s (rfq=%s unique_id=%s)",
+                "Failed to update sent_status for action %s (unique_id=%s)",
                 action_id,
-                rfq_id,
                 unique_id,
             )
 
@@ -512,7 +532,7 @@ class EmailDispatchService:
         self,
         conn,
         message_id: Optional[str],
-        rfq_id: str,
+        unique_id: str,
         supplier_id: Optional[str],
         recipients: Sequence[str],
     ) -> None:
@@ -525,7 +545,7 @@ class EmailDispatchService:
             conn,
             self._thread_table_name,
             message_id=str(message_id),
-            rfq_id=str(rfq_id),
+            rfq_id=str(unique_id),
             supplier_id=str(supplier_id) if supplier_id else None,
             recipients=recipients,
             logger=self.logger,
@@ -562,33 +582,40 @@ class EmailDispatchService:
                 values.append(candidate)
         return values
 
-    def _ensure_rfq_annotation(
+    def _ensure_tracking_annotation(
         self,
         body: str,
-        rfq_id: str,
         *,
+        unique_id: str,
         supplier_id: Optional[str] = None,
         dispatch_token: Optional[str] = None,
         run_id: Optional[str] = None,
         workflow_id: Optional[str] = None,
-        unique_id: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         text = body or ""
         existing_metadata, cleaned_body = strip_tracking_comment(text)
 
-        resolved_workflow = workflow_id or (existing_metadata.workflow_id if existing_metadata else None)
+        resolved_workflow = workflow_id or (
+            existing_metadata.workflow_id if existing_metadata else None
+        )
         if not resolved_workflow:
-            raise ValueError("workflow_id is required to annotate outbound supplier emails")
-
-        resolved_supplier = supplier_id or (existing_metadata.supplier_id if existing_metadata else None)
-        resolved_token = dispatch_token or (existing_metadata.token if existing_metadata else None)
-        resolved_run = run_id or (existing_metadata.run_id if existing_metadata else None)
-        resolved_unique = unique_id or (existing_metadata.unique_id if existing_metadata else None)
-        if not resolved_unique:
-            resolved_unique = generate_unique_email_id(
-                resolved_workflow,
-                resolved_supplier,
+            raise ValueError(
+                "workflow_id is required to annotate outbound supplier emails"
             )
+
+        resolved_supplier = supplier_id or (
+            existing_metadata.supplier_id if existing_metadata else None
+        )
+        resolved_token = dispatch_token or (
+            existing_metadata.token if existing_metadata else None
+        )
+        resolved_run = run_id or (existing_metadata.run_id if existing_metadata else None)
+
+        resolved_unique = unique_id or (
+            existing_metadata.unique_id if existing_metadata else None
+        )
+        if not resolved_unique:
+            raise ValueError("unique_id is required to annotate outbound supplier emails")
 
         comment, tracking_meta = build_tracking_comment(
             workflow_id=resolved_workflow,
@@ -615,8 +642,7 @@ class EmailDispatchService:
             metadata["dispatch_token"] = tracking_meta.token
         if tracking_meta.run_id:
             metadata["run_id"] = tracking_meta.run_id
-        if rfq_id:
-            metadata["rfq_id"] = rfq_id
+
         return annotated_body, metadata
 
     @staticmethod
@@ -631,17 +657,17 @@ class EmailDispatchService:
             return None
 
     @staticmethod
-    def _mark_sent_status(data: Any, rfq_id: str, sent: bool) -> bool:
-        """Update ``sent_status`` in ``data`` for drafts matching ``rfq_id``."""
+    def _mark_sent_status(data: Any, unique_id: str, sent: bool) -> bool:
+        """Update ``sent_status`` in ``data`` for drafts matching ``unique_id``."""
 
         updated = False
         desired_status = "True" if sent else "False"
 
         if isinstance(data, dict):
             updated |= EmailDispatchService._update_draft_collection(
-                data.get("drafts"), rfq_id, sent
+                data.get("drafts"), unique_id, sent
             )
-            if data.get("rfq_id") == rfq_id:
+            if data.get("unique_id") == unique_id or data.get("rfq_id") == unique_id:
                 current = EmailDispatchService._normalise_sent_status(
                     data.get("sent_status")
                 )
@@ -652,18 +678,20 @@ class EmailDispatchService:
                     data["sent_on"] = datetime.utcnow().isoformat()
         elif isinstance(data, list):
             for item in data:
-                updated |= EmailDispatchService._mark_sent_status(item, rfq_id, sent)
+                updated |= EmailDispatchService._mark_sent_status(item, unique_id, sent)
 
         return updated
 
     @staticmethod
-    def _update_draft_collection(value: Any, rfq_id: str, sent: bool) -> bool:
+    def _update_draft_collection(value: Any, unique_id: str, sent: bool) -> bool:
         if not isinstance(value, list):
             return False
         updated = False
         desired_status = "True" if sent else "False"
         for draft in value:
-            if isinstance(draft, dict) and draft.get("rfq_id") == rfq_id:
+            if not isinstance(draft, dict):
+                continue
+            if draft.get("unique_id") == unique_id or draft.get("rfq_id") == unique_id:
                 current = EmailDispatchService._normalise_sent_status(
                     draft.get("sent_status")
                 )
