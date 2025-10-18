@@ -23,6 +23,7 @@ class SupplierRelationshipService:
             self.rag_service = None
         self.collection_name = getattr(self.settings, "qdrant_collection_name", None)
         self.client = getattr(agent_nick, "qdrant_client", None)
+        self._fallback_cache: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None
         self._ensure_payload_indexes()
 
     # ------------------------------------------------------------------
@@ -122,15 +123,33 @@ class SupplierRelationshipService:
         except Exception as exc:
             if self._is_missing_index_error(exc):
                 logger.warning(
-                    "SupplierRelationshipService: missing Qdrant index detected. Falling back to in-memory filtering.",
+                    "SupplierRelationshipService: missing Qdrant index detected while loading supplier relationship. Attempting to create payload indexes before falling back.",
                     exc_info=True,
                 )
-                return self._fetch_relationship_without_index(
-                    supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
-                )
-
-            logger.exception("Failed to load supplier relationship from Qdrant")
-            return []
+                # Ensure indexes exist and retry once before resorting to a full collection scan.
+                self._ensure_payload_indexes()
+                try:
+                    results, _ = self.client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=models.Filter(must=must),
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=limit,
+                    )
+                except Exception as retry_exc:
+                    if self._is_missing_index_error(retry_exc):
+                        logger.warning(
+                            "SupplierRelationshipService: payload indexes still missing after retry. Falling back to in-memory filtering.",
+                            exc_info=True,
+                        )
+                        return self._fetch_relationship_without_index(
+                            supplier_id=supplier_id, supplier_name=supplier_name, limit=limit
+                        )
+                    logger.exception("Failed to load supplier relationship from Qdrant")
+                    return []
+            else:
+                logger.exception("Failed to load supplier relationship from Qdrant")
+                return []
 
         return self._extract_payloads(results or [])
 
@@ -464,47 +483,77 @@ class SupplierRelationshipService:
         target_id = str(supplier_id) if supplier_id else None
         target_name = self._normalise_key(supplier_name) if supplier_name else None
 
-        # Fetch a slightly larger page size to reduce the number of fall-back scans
-        page_size = max(limit, 50)
-        next_offset = None
-        matches: List[Dict[str, Any]] = []
+        cache = self._fallback_cache
+        if cache is None:
+            cache_builder: Dict[str, Dict[str, List[Dict[str, Any]]]] = {"id": {}, "name": {}}
+            page_size = 256
+            next_offset = None
+            build_failed = False
 
-        while True:
-            try:
-                results, next_offset = self.client.scroll(
-                    collection_name=self.collection_name,
-                    scroll_filter=None,
-                    with_payload=True,
-                    with_vectors=False,
-                    limit=page_size,
-                    offset=next_offset,
-                )
-            except Exception:
-                logger.exception(
-                    "SupplierRelationshipService fallback scroll failed while loading supplier relationship"
-                )
-                break
+            while True:
+                try:
+                    results, next_offset = self.client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=None,
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=page_size,
+                        offset=next_offset,
+                    )
+                except Exception:
+                    logger.exception(
+                        "SupplierRelationshipService fallback scroll failed while building in-memory relationship cache"
+                    )
+                    build_failed = True
+                    break
 
-            if not results:
-                break
+                if not results:
+                    break
 
-            for payload in self._extract_payloads(results):
-                if target_id and str(payload.get("supplier_id")) != target_id:
-                    continue
-                if target_name:
-                    payload_name = payload.get("supplier_name_normalized") or self._normalise_key(
+                for payload in self._extract_payloads(results):
+                    document_type = payload.get("document_type")
+                    if document_type and document_type != "supplier_relationship":
+                        continue
+                    sid = str(payload.get("supplier_id") or "").strip()
+                    if sid:
+                        cache_builder.setdefault("id", {}).setdefault(sid, []).append(payload)
+                    normalised_name = payload.get("supplier_name_normalized") or self._normalise_key(
                         payload.get("supplier_name")
                     )
-                    if payload_name != target_name:
-                        continue
-                matches.append(payload)
-                if len(matches) >= limit:
-                    return matches
+                    if normalised_name:
+                        cache_builder.setdefault("name", {}).setdefault(normalised_name, []).append(payload)
 
-            if next_offset is None:
-                break
+                if next_offset is None:
+                    break
 
-        return matches
+            if build_failed:
+                return []
+
+            cache = cache_builder
+            self._fallback_cache = cache
+
+        matches: List[Dict[str, Any]] = []
+        if target_id:
+            matches.extend(cache.get("id", {}).get(target_id, []))
+        if target_name:
+            matches.extend(cache.get("name", {}).get(target_name, []))
+
+        if not matches:
+            return []
+
+        deduped: List[Dict[str, Any]] = []
+        seen: set[Any] = set()
+        for payload in matches:
+            record_id = payload.get("record_id") or (
+                str(payload.get("supplier_id") or ""),
+                payload.get("supplier_name_normalized") or self._normalise_key(payload.get("supplier_name")),
+            )
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            deduped.append(payload)
+
+        return deduped[:limit]
 
     @staticmethod
     def _is_missing_index_error(exc: Exception) -> bool:
