@@ -144,6 +144,9 @@ class ConversationMemoryService:
             return []
 
         stored_metadata: List[Dict[str, Any]] = []
+        payloads_to_upsert: List[Dict[str, Any]] = []
+        dedupe_keys: List[str] = []
+
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -153,17 +156,26 @@ class ConversationMemoryService:
             dedupe_key = f"{workflow_id}:{message_id}"
             if dedupe_key in self._seen_message_ids:
                 continue
-            text = self._format_entry(entry)
-            if not text:
+            text_for_embedding = self._format_entry(entry)
+            if not text_for_embedding:
                 continue
             metadata = self._build_metadata(workflow_id, message_id, entry)
-            try:
-                rag.upsert_texts([text], metadata=metadata)
-            except Exception:  # pragma: no cover - underlying storage errors already logged
-                logger.exception("Failed to store conversation entry for workflow %s", workflow_id)
-                continue
-            self._seen_message_ids.add(dedupe_key)
+            full_payload = {**entry, **metadata, "content": text_for_embedding}
+            payloads_to_upsert.append(full_payload)
             stored_metadata.append(metadata)
+            dedupe_keys.append(dedupe_key)
+
+        if not payloads_to_upsert:
+            return stored_metadata
+
+        try:
+            rag.upsert_payloads(payloads_to_upsert, text_representation_key="content")
+        except Exception:  # pragma: no cover - underlying storage errors already logged
+            logger.exception("Failed to store conversation entry for workflow %s", workflow_id)
+            return []
+
+        for dedupe_key in dedupe_keys:
+            self._seen_message_ids.add(dedupe_key)
         return stored_metadata
 
     def retrieve(

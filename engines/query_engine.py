@@ -13,8 +13,9 @@ import logging
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 
+import numpy as np
 import pandas as pd
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .base_engine import BaseEngine
 from utils.db import read_sql_compat
@@ -757,10 +758,25 @@ class QueryEngine(BaseEngine):
     # Procurement summarisation helpers
     # ------------------------------------------------------------------
     def _embed_procurement_summary(self, df: pd.DataFrame) -> None:
-        """Create a textual summary of ``df`` and upsert it via ``RAGService``."""
+        """Create structured procurement payloads and upsert via ``RAGService``."""
+
         from services.rag_service import RAGService
 
-        summaries = []
+        payloads: List[Dict[str, Any]] = []
+
+        def _normalise_payload_value(value: Any) -> Any:
+            """Convert pandas/numpy scalars into JSON-serialisable Python objects."""
+
+            if value is None:
+                return None
+            if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                return value.isoformat()
+            if isinstance(value, np.generic):
+                return value.item()
+            if pd.isna(value):
+                return None
+            return value
+
         for row in df.itertuples(index=False):
             categories = " > ".join(
                 [
@@ -769,21 +785,41 @@ class QueryEngine(BaseEngine):
                     if getattr(row, f"category_level_{i}")
                 ]
             )
-            summaries.append(
+
+            text_summary = (
                 f"Supplier {row.supplier_name} (ID {row.supplier_id}) has purchase order "
                 f"{row.po_id} item '{row.item_description}' mapped to product {row.product} "
                 f"under categories {categories} with invoice {row.invoice_id} "
                 f"line {row.invoice_line_id}."
             )
 
-        rag = rag_module.RAGService(self.agent_nick)
-        rag.upsert_texts(
-            summaries,
-            metadata={
-                "record_id": "procurement_flow",
+            raw_payload = {
+                "record_id": f"flow_supplier_{row.supplier_id}_po_{row.po_id}",
                 "document_type": "procurement_flow",
-            },
-        )
+                "supplier_id": row.supplier_id,
+                "supplier_name": row.supplier_name,
+                "po_id": row.po_id,
+                "po_line_id": getattr(row, "po_line_id", None),
+                "item_description": row.item_description,
+                "product": getattr(row, "product", None),
+                "category_path": categories,
+                "category_level_1": getattr(row, "category_level_1", None),
+                "category_level_2": getattr(row, "category_level_2", None),
+                "category_level_3": getattr(row, "category_level_3", None),
+                "category_level_4": getattr(row, "category_level_4", None),
+                "category_level_5": getattr(row, "category_level_5", None),
+                "invoice_id": getattr(row, "invoice_id", None),
+                "invoice_line_id": getattr(row, "invoice_line_id", None),
+                "content": text_summary,
+            }
+
+            payloads.append({k: _normalise_payload_value(v) for k, v in raw_payload.items()})
+
+        if not payloads:
+            return
+
+        rag = RAGService(self.agent_nick)
+        rag.upsert_payloads(payloads, text_representation_key="content")
 
     # ------------------------------------------------------------------
     # Agent training helpers
