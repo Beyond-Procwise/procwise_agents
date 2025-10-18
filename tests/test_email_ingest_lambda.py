@@ -20,7 +20,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from services import email_ingest_lambda as ingest
 
 
-def _build_email(subject="RFQ-20240101-abc12345", body="Quote 1200", **headers):
+def _build_email(subject="PROC-WF-ABC123DEF456", body="Quote 1200", **headers):
     message = EmailMessage()
     message["Subject"] = subject
     for key, value in headers.items():
@@ -32,7 +32,7 @@ def _build_email(subject="RFQ-20240101-abc12345", body="Quote 1200", **headers):
 _ACTIVE_STUBBERS = []
 
 
-def _prepare_s3_stub(email_bytes, bucket, key, *, rfq="RFQ-20240101-ABC12345", unmatched=False):
+def _prepare_s3_stub(email_bytes, bucket, key, *, unique_id="PROC-WF-ABC123DEF456", unmatched=False):
     client = boto3.client("s3", region_name="eu-west-1")
     stub = Stubber(client)
 
@@ -62,10 +62,10 @@ def _prepare_s3_stub(email_bytes, bucket, key, *, rfq="RFQ-20240101-ABC12345", u
             {
                 "Bucket": bucket,
                 "Key": key,
-                "Tagging": {"TagSet": [{"Key": "rfq-id", "Value": rfq}]},
+                "Tagging": {"TagSet": [{"Key": "rfq-id", "Value": unique_id}]},
             },
         )
-        dest_key = f"emails/{rfq}/ingest/{key.split('/')[-1]}"
+        dest_key = f"emails/{unique_id}/ingest/{key.split('/')[-1]}"
         stub.add_response(
             "copy_object",
             {},
@@ -74,7 +74,7 @@ def _prepare_s3_stub(email_bytes, bucket, key, *, rfq="RFQ-20240101-ABC12345", u
                 "CopySource": {"Bucket": bucket, "Key": key},
                 "Key": dest_key,
                 "TaggingDirective": "REPLACE",
-                "Tagging": f"rfq-id={rfq}",
+                "Tagging": f"rfq-id={unique_id}",
             },
         )
 
@@ -88,8 +88,8 @@ def _prepare_s3_stub(email_bytes, bucket, key, *, rfq="RFQ-20240101-ABC12345", u
 def stub_upsert(monkeypatch):
     calls = []
 
-    def fake_upsert(rfq_id, metadata):
-        calls.append((rfq_id, metadata))
+    def fake_upsert(unique_id, metadata):
+        calls.append((unique_id, metadata))
 
     monkeypatch.setattr(ingest, "_upsert_supplier_reply", fake_upsert)
     yield calls
@@ -149,18 +149,22 @@ def stub_thread_mapping(monkeypatch):
 def test_process_record_tags_and_copies_object(monkeypatch, stub_upsert):
     bucket = "procwisemvp"
     key = "emails/random-object"
-    email_bytes = _build_email(subject="Re: RFQ-20240101-abc12345", body="Price 1200")
+    unique_id = "PROC-WF-ABCDEF123456"
+    email_bytes = _build_email(
+        subject=f"Re: Pricing Update {unique_id}", body="Price 1200"
+    )
 
-    _prepare_s3_stub(email_bytes, bucket, key)
+    _prepare_s3_stub(email_bytes, bucket, key, unique_id=unique_id)
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
 
-    assert result["rfq_id"] == "RFQ-20240101-ABC12345"
-    assert result["s3_key"] == "emails/RFQ-20240101-ABC12345/ingest/random-object"
+    assert result["unique_id"] == unique_id
+    assert result["rfq_id"] == unique_id
+    assert result["s3_key"] == f"emails/{unique_id}/ingest/random-object"
     assert result["status"] == "ok"
-    assert result["metadata"]["subject"].lower().startswith("re: rfq-20240101")
-    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240101-ABC12345"
+    assert unique_id in result["metadata"]["subject"]
+    assert stub_upsert and stub_upsert[0][0] == unique_id
 
 
 def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert, stub_thread_mapping):
@@ -168,19 +172,20 @@ def test_process_record_uses_thread_lookup(monkeypatch, stub_upsert, stub_thread
     key = "emails/random-object-2"
     email_bytes = _build_email(subject="Re: Quote", body="No RFQ", **{"In-Reply-To": "<thread-123>"})
 
-    _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240202-THREAD12")
-    stub_thread_mapping["<thread-123>"] = "RFQ-20240202-THREAD12"
+    unique_id = "PROC-WF-THREAD1234"
+    _prepare_s3_stub(email_bytes, bucket, key, unique_id=unique_id)
+    stub_thread_mapping["<thread-123>"] = unique_id
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
 
-    assert result["rfq_id"] == "RFQ-20240202-THREAD12"
+    assert result["unique_id"] == unique_id
     assert result["status"] == "ok"
     assert result["s3_key"].endswith("random-object-2")
-    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240202-THREAD12"
+    assert stub_upsert and stub_upsert[0][0] == unique_id
 
 
-def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
+def test_process_record_moves_to_unmatched_when_missing_unique_id(stub_upsert):
     bucket = "procwisemvp"
     key = "emails/random-object-3"
     email_bytes = _build_email(subject="Quote", body="No identifier present")
@@ -190,6 +195,7 @@ def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
 
+    assert result["unique_id"] is None
     assert result["rfq_id"] is None
     assert result["s3_key"] == "emails/_unmatched/random-object-3"
     assert result["status"] == "needs_review"
@@ -199,9 +205,12 @@ def test_process_record_moves_to_unmatched_when_missing_rfq(stub_upsert):
 def test_lambda_handler_processes_sqs_envelope(monkeypatch, stub_upsert):
     bucket = "procwisemvp"
     key = "emails/random-object-4"
-    email_bytes = _build_email(subject="Re: RFQ-20240102-beefcafe", body="Confirming order")
+    unique_id = "PROC-WF-BEEFCAFE1234"
+    email_bytes = _build_email(
+        subject=f"Re: Follow-up {unique_id}", body="Confirming order"
+    )
 
-    _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240102-BEEFCAFE")
+    _prepare_s3_stub(email_bytes, bucket, key, unique_id=unique_id)
 
     s3_record = {
         "eventSource": "aws:s3",
@@ -217,15 +226,17 @@ def test_lambda_handler_processes_sqs_envelope(monkeypatch, stub_upsert):
 
     response = ingest.lambda_handler(sqs_event, context=None)
 
-    assert response["processed"][0]["rfq_id"] == "RFQ-20240102-BEEFCAFE"
-    assert stub_upsert and stub_upsert[0][0] == "RFQ-20240102-BEEFCAFE"
+    assert response["processed"][0]["unique_id"] == unique_id
+    assert response["processed"][0]["rfq_id"] == unique_id
+    assert stub_upsert and stub_upsert[0][0] == unique_id
 
 
 def test_process_record_persists_metadata(monkeypatch, stub_upsert):
     bucket = "procwisemvp"
     key = "emails/random-object-5"
+    unique_id = "PROC-WF-DEADBEEF1234"
     email_bytes = _build_email(
-        subject="Re: RFQ-20240103-deadbeef",
+        subject=f"Re: RFQ context {unique_id}",
         body="Please find quote attached",
         **{
             "From": "Supplier <supplier@example.com>",
@@ -235,7 +246,7 @@ def test_process_record_persists_metadata(monkeypatch, stub_upsert):
         },
     )
 
-    _prepare_s3_stub(email_bytes, bucket, key, rfq="RFQ-20240103-DEADBEEF")
+    _prepare_s3_stub(email_bytes, bucket, key, unique_id=unique_id)
 
     record = {"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}
     result = ingest.process_record(record)
@@ -243,7 +254,7 @@ def test_process_record_persists_metadata(monkeypatch, stub_upsert):
     assert result["metadata"]["mailbox"].lower().startswith("procwise")
     assert result["metadata"]["message_id"] == "<deadbeef@example.com>"
     rfq_id, metadata = stub_upsert[0]
-    assert rfq_id == "RFQ-20240103-DEADBEEF"
+    assert rfq_id == unique_id
     assert metadata["s3_key"].endswith("random-object-5")
     assert metadata["received_at"].isoformat().startswith("2025-02-03T10:00:00")
 
@@ -262,7 +273,11 @@ def test_process_record_skips_known_objects(monkeypatch):
         assert bucket_name == bucket
         assert object_key == key
         assert etag == "abc123"
-        return {"rfq_id": "RFQ-20240101-ABC12345", "message_id": "<id@example>"}
+        return {
+            "rfq_id": "PROC-WF-ABC12345DEF6",
+            "unique_id": "PROC-WF-ABC12345DEF6",
+            "message_id": "<id@example>",
+        }
 
     monkeypatch.setattr(ingest, "_lookup_processed_object", fake_lookup)
 
@@ -276,7 +291,8 @@ def test_process_record_skips_known_objects(monkeypatch):
     result = ingest.process_record(record)
 
     assert result["status"] == "duplicate"
-    assert result["rfq_id"] == "RFQ-20240101-ABC12345"
+    assert result["unique_id"] == "PROC-WF-ABC12345DEF6"
+    assert result["rfq_id"] == "PROC-WF-ABC12345DEF6"
     assert result["metadata"]["message_id"] == "<id@example>"
 
 
