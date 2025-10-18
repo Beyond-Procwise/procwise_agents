@@ -67,9 +67,7 @@ class EmailDispatchService:
 
         identifier = (identifier or "").strip()
         if not identifier:
-            raise ValueError(
-                "identifier (unique_id or rfq_id) is required to send an email draft"
-            )
+            raise ValueError("unique_id is required to send an email draft")
 
         with self.agent_nick.get_db_connection() as conn:
             draft_row = self._fetch_latest_draft(conn, identifier)
@@ -223,7 +221,7 @@ class EmailDispatchService:
                             unique_id,
                             draft.get("supplier_id"),
                             recipient_list,
-                            rfq_id=canonical_rfq_identifier,
+                            rfq_id=unique_id,
                         )
                     except TypeError:
                         self._record_thread_mapping(  # type: ignore[misc]
