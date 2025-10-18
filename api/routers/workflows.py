@@ -630,7 +630,9 @@ async def dispatch_batch_emails(
             continue
 
         try:
-            result = dispatch_service.send_draft(identifier=unique_id)
+            result = await run_in_threadpool(
+                dispatch_service.send_draft, identifier=unique_id
+            )
             results.append(
                 {
                     "unique_id": unique_id,
@@ -696,7 +698,9 @@ async def dispatch_workflow_drafts(
         results: List[Dict[str, Any]] = []
         for unique_id, supplier_id, subject, sent in draft_rows:
             try:
-                result = dispatch_service.send_draft(identifier=unique_id)
+                result = await run_in_threadpool(
+                    dispatch_service.send_draft, identifier=unique_id
+                )
                 results.append(
                     {
                         "unique_id": unique_id,
