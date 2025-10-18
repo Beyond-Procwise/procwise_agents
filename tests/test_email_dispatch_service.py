@@ -28,8 +28,12 @@ class InMemoryDraftStore:
         self.next_id += 1
         return record["id"]
 
-    def get_latest(self, rfq_id):
-        candidates = [row for row in self.rows.values() if row["rfq_id"] == rfq_id]
+    def get_latest(self, identifier):
+        candidates = [
+            row
+            for row in self.rows.values()
+            if row.get("unique_id") == identifier or row["rfq_id"] == identifier
+        ]
         if not candidates:
             return None
         # Order by sent flag then thread index then id to mirror SQL
@@ -49,6 +53,12 @@ class InMemoryDraftStore:
             row.get("payload"),
             row.get("sender"),
             row.get("sent_on"),
+            row.get("workflow_id"),
+            row.get("run_id"),
+            row.get("unique_id"),
+            row.get("mailbox"),
+            row.get("dispatch_run_id"),
+            row.get("dispatched_at"),
         )
 
     def update(self, draft_id, **updates):
@@ -174,6 +184,7 @@ class DummyNick:
 
 def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     store = InMemoryDraftStore()
+    unique_id = "PROC-WF-UNIT-12345"
     draft_payload = {
         "rfq_id": "RFQ-UNIT",
         "subject": DEFAULT_RFQ_SUBJECT,
@@ -186,6 +197,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "sent_status": False,
         "action_id": "action-1",
         "workflow_id": "wf-test-1",
+        "unique_id": unique_id,
     }
     draft_id = store.add(
             {
@@ -202,13 +214,21 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
                 "payload": json.dumps(draft_payload),
                 "sent_on": None,
                 "workflow_id": "wf-test-1",
+                "unique_id": unique_id,
             }
         )
 
     action_store = InMemoryActionStore()
     action_store.update(
         "action-1",
-        json.dumps({"drafts": [draft_payload], "rfq_id": "RFQ-UNIT", "sent_status": False}),
+        json.dumps(
+            {
+                "drafts": [draft_payload],
+                "rfq_id": "RFQ-UNIT",
+                "unique_id": unique_id,
+                "sent_status": False,
+            }
+        ),
     )
 
     nick = DummyNick(store, action_store)
@@ -217,11 +237,11 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     sent_args = {}
     recorded_thread = {}
 
-    def fake_record_thread(conn, message_id, rfq_id, supplier_id, recipients):
+    def fake_record_thread(conn, message_id, unique_id_value, supplier_id, recipients):
         recorded_thread.update(
             {
                 "message_id": message_id,
-                "rfq_id": rfq_id,
+                "unique_id": unique_id_value,
                 "supplier_id": supplier_id,
                 "recipients": list(recipients),
             }
@@ -246,6 +266,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     result = service.send_draft("RFQ-UNIT")
 
     assert result["sent"] is True
+    assert result["unique_id"] == unique_id
     assert result["recipients"] == ["buyer@example.com"]
     assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
@@ -259,10 +280,10 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
             sent_args["headers"]["X-Procwise-Workflow-Id"]
             == result["draft"]["dispatch_metadata"].get("workflow_id")
         )
-    assert result["draft"]["dispatch_metadata"]["rfq_id"] == "RFQ-UNIT"
+    assert result["draft"]["dispatch_metadata"]["unique_id"] == unique_id
     assert recorded_thread == {
         "message_id": "<message-id-1>",
-        "rfq_id": "RFQ-UNIT",
+        "unique_id": unique_id,
         "supplier_id": "S1",
         "recipients": ["buyer@example.com"],
     }

@@ -529,8 +529,8 @@ class SupplierRelationshipService:
                 )
                 break
 
-            if not results:
-                break
+                if not results:
+                    break
 
             scanned += len(results)
             for payload in self._extract_payloads(results):
@@ -548,7 +548,35 @@ class SupplierRelationshipService:
                 if len(matches) >= limit:
                     return matches
 
-            if next_offset is None:
+            cache = cache_builder
+            self._fallback_cache = cache
+
+        matches: List[Dict[str, Any]] = []
+        if target_id:
+            matches.extend(cache.get("id", {}).get(target_id, []))
+        if target_name:
+            matches.extend(cache.get("name", {}).get(target_name, []))
+
+        if not matches:
+            return []
+
+        deduped: List[Dict[str, Any]] = []
+        seen: set[Any] = set()
+        for payload in matches:
+            record_id = payload.get("record_id") or (
+                str(payload.get("supplier_id") or ""),
+                payload.get("supplier_name_normalized") or self._normalise_key(payload.get("supplier_name")),
+            )
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            deduped.append(payload)
+
+            if scanned >= max_points_to_scan:
+                logger.warning(
+                    "SupplierRelationshipService fallback scan aborted after inspecting %s records without finding enough"
+                    " matches", scanned
+                )
                 break
 
             if scanned >= max_points_to_scan:

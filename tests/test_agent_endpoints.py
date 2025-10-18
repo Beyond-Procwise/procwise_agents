@@ -119,16 +119,23 @@ def test_email_workflow_returns_action_id(monkeypatch):
 
         def send_draft(
             self,
-            rfq_id,
+            identifier,
             recipients=None,
             sender=None,
             subject_override=None,
             body_override=None,
             attachments=None,
         ):
-            calls["args"] = (rfq_id, recipients, sender, subject_override, body_override)
+            calls["args"] = (
+                identifier,
+                recipients,
+                sender,
+                subject_override,
+                body_override,
+            )
+            unique_id = f"PROC-WF-{identifier}"
             return {
-                "rfq_id": rfq_id,
+                "unique_id": unique_id,
                 "sent": True,
                 "recipients": recipients or ["r1", "r2"],
                 "sender": sender or "sender@example.com",
@@ -136,9 +143,10 @@ def test_email_workflow_returns_action_id(monkeypatch):
                 "body": body_override or "<p>generated</p>",
                 "thread_index": 1,
                 "draft": {
-                    "rfq_id": rfq_id,
+                    "rfq_id": identifier,
+                    "unique_id": unique_id,
                     "sent_status": True,
-                    "dispatch_metadata": {"rfq_id": rfq_id},
+                    "dispatch_metadata": {"unique_id": unique_id},
                 },
             }
 
@@ -186,7 +194,7 @@ def test_email_workflow_marks_failed_dispatch(monkeypatch):
 
         def send_draft(
             self,
-            rfq_id,
+            identifier,
             recipients=None,
             sender=None,
             subject_override=None,
@@ -194,14 +202,18 @@ def test_email_workflow_marks_failed_dispatch(monkeypatch):
             attachments=None,
         ):
             return {
-                "rfq_id": rfq_id,
+                "unique_id": f"PROC-WF-{identifier}",
                 "sent": False,
                 "recipients": recipients or [],
                 "sender": sender or "sender@example.com",
                 "subject": subject_override or "subject",
                 "body": body_override or "<p>body</p>",
                 "thread_index": 1,
-                "draft": {"rfq_id": rfq_id, "sent_status": False},
+                "draft": {
+                    "rfq_id": identifier,
+                    "unique_id": f"PROC-WF-{identifier}",
+                    "sent_status": False,
+                },
             }
 
     monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatchFail)
