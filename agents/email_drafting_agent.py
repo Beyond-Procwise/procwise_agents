@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import uuid
+from datetime import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html import escape
@@ -542,6 +543,12 @@ DEFAULT_NEGOTIATION_SUBJECT = "Re: Pricing Discussion"
 DEFAULT_FOLLOW_UP_SUBJECT = "Follow Up – Procurement Enquiry"
 
 
+def _current_rfq_date() -> str:
+    """Return today's date formatted for legacy RFQ identifiers."""
+
+    return datetime.utcnow().strftime("%Y%m%d")
+
+
 def _build_rfq_table_html(descriptions: Iterable[str]) -> str:
     header_cells = "".join(
         f'<th style="{_RFQ_HEADER_CELL_STYLE}">{escape(col)}</th>'
@@ -714,6 +721,75 @@ class EmailDraftingAgent(BaseAgent):
         )
         self.polish_model = getattr(settings, "email_polish_model", None)
 
+    # ------------------------------------------------------------------
+    # Logging overrides
+    # ------------------------------------------------------------------
+
+    def _prepare_logged_output(self, payload: Any) -> Any:
+        """Normalise logged output to the contract expected by proc.action."""
+
+        prepared = super()._prepare_logged_output(payload)
+        return self._normalise_action_payload(prepared)
+
+    def _normalise_action_payload(self, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            cleaned: Dict[str, Any] = {}
+            pending_unique: Optional[str] = None
+            for key, value in payload.items():
+                if key == "rfq_id":
+                    if isinstance(value, str) and value.strip():
+                        pending_unique = value.strip()
+                    continue
+                cleaned[key] = self._normalise_action_payload(value)
+
+            if pending_unique and "unique_id" not in cleaned:
+                cleaned["unique_id"] = pending_unique
+
+            drafts_obj = cleaned.get("drafts")
+            if isinstance(drafts_obj, list):
+                normalised_drafts: List[Any] = []
+                for draft_item in drafts_obj:
+                    if isinstance(draft_item, dict):
+                        normalised_drafts.append(self._coerce_draft_schema(draft_item))
+                    else:
+                        normalised_drafts.append(
+                            self._normalise_action_payload(draft_item)
+                        )
+                cleaned["drafts"] = normalised_drafts
+
+            return cleaned
+
+        if isinstance(payload, list):
+            return [self._normalise_action_payload(item) for item in payload]
+
+        return payload
+
+    def _coerce_draft_schema(self, draft: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned_draft = self._normalise_action_payload(draft)
+
+        # Ensure ``unique_id`` is always populated
+        unique_id = cleaned_draft.get("unique_id")
+        metadata = cleaned_draft.get("metadata")
+        if not unique_id and isinstance(metadata, dict):
+            unique_id = metadata.get("unique_id")
+        if not unique_id:
+            headers = cleaned_draft.get("headers")
+            if isinstance(headers, dict):
+                unique_id = headers.get("X-Procwise-Unique-Id")
+        if unique_id and "unique_id" not in cleaned_draft:
+            cleaned_draft["unique_id"] = unique_id
+
+        # Align top-level subject/body for log payload consumers
+        if isinstance(metadata, dict):
+            subject = metadata.get("subject")
+            if subject and "subject" not in cleaned_draft:
+                cleaned_draft["subject"] = subject
+            body = metadata.get("body")
+            if body and "body" not in cleaned_draft:
+                cleaned_draft["body"] = body
+
+        return cleaned_draft
+
     @staticmethod
     def _prepare_agent_nick(agent_nick):
         if agent_nick is None:
@@ -815,9 +891,8 @@ class EmailDraftingAgent(BaseAgent):
         sender = decision_data.get("sender") or self.agent_nick.settings.ses_default_sender
 
         existing_unique = self._normalise_tracking_value(decision_data.get("unique_id"))
-        supplied_rfq = self._normalise_rfq_identifier(decision_data.get("rfq_id"))
         workflow_hint = decision_data.get("workflow_id") or decision_data.get("workflow_ref")
-        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
+        unique_id = existing_unique or self._generate_unique_identifier(
             workflow_hint, supplier_id
         )
 
@@ -964,10 +1039,13 @@ class EmailDraftingAgent(BaseAgent):
                 headers["Message-ID"] = message_id
             if in_reply_to:
                 headers["In-Reply-To"] = in_reply_to
-            elif not headers.get("In-Reply-To"):
-                legacy_reply = resolved_thread_headers.get("message_id")
-                if legacy_reply and legacy_reply != message_id:
-                    headers["In-Reply-To"] = legacy_reply
+            else:
+                legacy_reply = (
+                    resolved_thread_headers.get("message_id")
+                    or resolved_thread_headers.get("Message-ID")
+                )
+                if legacy_reply:
+                    headers.setdefault("In-Reply-To", legacy_reply)
             if isinstance(references, list) and references:
                 headers["References"] = " ".join(str(ref) for ref in references if ref)
             elif isinstance(references, str) and references.strip():
@@ -1049,8 +1127,7 @@ class EmailDraftingAgent(BaseAgent):
         supplier_id = context.get("supplier_id")
         workflow_hint = context.get("workflow_id") if isinstance(context, dict) else None
         existing_unique = self._normalise_tracking_value(context.get("unique_id"))
-        supplied_rfq = self._normalise_rfq_identifier(context.get("rfq_id"))
-        unique_id = existing_unique or supplied_rfq or self._generate_unique_identifier(
+        unique_id = existing_unique or self._generate_unique_identifier(
             workflow_hint, supplier_id
         )
 
@@ -3043,6 +3120,22 @@ class EmailDraftingAgent(BaseAgent):
                     for key, value in dynamic_meta["internal_context"].items()
                     if value
                 }
+            if not internal_context:
+                fallback_context = self._build_supplier_personalisation(
+                    supplier,
+                    profile,
+                    template_args,
+                    data,
+                    instruction_settings,
+                    interaction_type,
+                )
+                if fallback_context:
+                    internal_context = {
+                        "supplier_context_html": fallback_context,
+                        "supplier_context_text": self._html_to_plain_text(
+                            fallback_context
+                        ),
+                    }
 
             draft = {
                 "supplier_id": supplier_id,
