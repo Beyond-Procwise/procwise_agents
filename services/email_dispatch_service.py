@@ -54,6 +54,54 @@ class EmailDispatchService:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def resolve_workflow_id(self, identifier: str) -> Optional[str]:
+        """Best-effort lookup of the workflow identifier for ``identifier``.
+
+        The email dispatch endpoint must not generate ad-hoc workflow
+        identifiers.  Instead it should re-use the identifier that was
+        attached to the drafted email.  This helper mirrors the first phase
+        of :meth:`send_draft` – fetching and hydrating the latest draft – but
+        bails out before attempting to send the message.  It returns ``None``
+        when the draft cannot be located or when the stored payload does not
+        expose a workflow token.
+        """
+
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return None
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                draft_row = self._fetch_latest_draft(conn, identifier)
+        except Exception:  # pragma: no cover - database connectivity
+            self.logger.exception(
+                "Failed to resolve workflow for dispatch identifier %s", identifier
+            )
+            return None
+
+        if not draft_row:
+            return None
+
+        draft = self._hydrate_draft(draft_row)
+
+        workflow_token = self._extract_workflow_identifier(draft)
+        if workflow_token:
+            return workflow_token
+
+        metadata = draft.get("metadata")
+        if isinstance(metadata, dict):
+            workflow_token = self._extract_workflow_identifier(metadata)
+            if workflow_token:
+                return workflow_token
+
+        dispatch_meta = draft.get("dispatch_metadata")
+        if isinstance(dispatch_meta, dict):
+            workflow_token = self._extract_workflow_identifier(dispatch_meta)
+            if workflow_token:
+                return workflow_token
+
+        return None
+
     def send_draft(
         self,
         identifier: str,
@@ -303,6 +351,10 @@ class EmailDispatchService:
                 "body": body,
                 "message_id": message_id,
                 "thread_index": dispatch_payload.get("thread_index"),
+                "workflow_id": backend_metadata.get("workflow_id")
+                or dispatch_payload.get("workflow_id"),
+                "run_id": backend_metadata.get("run_id")
+                or dispatch_payload.get("run_id"),
                 "draft": dispatch_payload,
             }
 
@@ -413,6 +465,24 @@ class EmailDispatchService:
         if not hydrated.get("sender"):
             hydrated["sender"] = getattr(self.settings, "ses_default_sender", "")
         return hydrated
+
+    @staticmethod
+    def _extract_workflow_identifier(payload: Any) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        for key in (
+            "workflow_id",
+            "workflowId",
+            "workflowID",
+            "process_workflow_id",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str):
+                token = value.strip()
+                if token:
+                    return token
+        return None
 
     def _update_draft_status(
         self,
