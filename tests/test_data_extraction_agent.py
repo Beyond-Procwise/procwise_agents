@@ -2,6 +2,7 @@ import os
 import sys
 import json
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import pandas as pd
 from pytest import approx
@@ -548,10 +549,10 @@ def test_llm_structured_pass_populates_header(monkeypatch):
         )
     }
 
-    captured_prompt = {}
+    captured_prompts = []
 
     def fake_call(prompt, model, format=None):
-        captured_prompt["prompt"] = prompt
+        captured_prompts.append(prompt)
         return llm_payload
 
     monkeypatch.setattr(agent, "call_ollama", fake_call)
@@ -568,7 +569,7 @@ def test_llm_structured_pass_populates_header(monkeypatch):
     assert header.get("_field_confidence", {}).get("invoice_id", 0) >= 0.7
     assert items and items[0]["item_id"] == "A1"
     assert result.report["table_method"] == "none"
-    assert "header_data" in captured_prompt["prompt"].lower()
+    assert any("header_data" in prompt.lower() for prompt in captured_prompts)
 
 
 def test_classify_doc_type_keyword_scoring(monkeypatch):
@@ -646,6 +647,274 @@ def test_llm_structured_prompt_includes_context(monkeypatch):
     prompt_lower = captured["prompt"].lower()
     assert "vendor sends an invoice" in prompt_lower
     assert "field_contexts" in prompt_lower
+
+
+def test_low_confidence_guard_blanks_critical_fields(monkeypatch):
+    """Critical header values are cleared when the document confidence is low."""
+
+    settings = SimpleNamespace(
+        extraction_model="m",
+        structured_low_confidence_threshold=0.6,
+        field_low_confidence_threshold=0.55,
+    )
+    agent = DataExtractionAgent(SimpleNamespace(settings=settings))
+
+    base_header = {
+        "invoice_id": "INV-9999",
+        "vendor_name": "Fuzzy Corp",
+        "invoice_total_incl_tax": "250.00",
+        "_field_confidence": {
+            "invoice_id": 0.3,
+            "vendor_name": 0.2,
+            "invoice_total_incl_tax": 0.4,
+        },
+    }
+
+    monkeypatch.setattr(
+        agent,
+        "_parse_header_improved",
+        lambda text, file_bytes=None: dict(base_header),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_extract_line_items_from_layout",
+        lambda file_bytes, text, doc_type: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_extract_line_items_improved",
+        lambda text, doc_type: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_normalize_header_fields",
+        lambda header, doc_type: header,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_normalize_line_item_fields",
+        lambda items, doc_type: items,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_reconcile_header_from_lines",
+        lambda header, items, doc_type: header,
+    )
+    monkeypatch.setattr(agent, "_infer_currency", lambda text, header: None)
+    monkeypatch.setattr(agent, "_sanitize_party_names", lambda header: header)
+    monkeypatch.setattr(
+        agent,
+        "_recover_missing_critical_fields",
+        lambda *args, **kwargs: {},
+    )
+
+    def fake_validate(header, line_items, doc_type, text):
+        return {
+            "is_valid": False,
+            "confidence_score": 0.4,
+            "errors": [],
+            "warnings": [],
+            "field_scores": {},
+        }
+
+    monkeypatch.setattr(agent, "_validate_extraction_quality", fake_validate)
+
+    captured_frames: Dict[str, Any] = {}
+
+    def fake_build(data, doc_type, segment):
+        captured_frames[segment] = (
+            dict(data)
+            if isinstance(data, dict)
+            else [dict(item) for item in data]
+        )
+        return pd.DataFrame(), [], []
+
+    monkeypatch.setattr(agent, "_build_dataframe_from_records", fake_build)
+    monkeypatch.setattr(
+        agent,
+        "_dataframe_to_header",
+        lambda df: captured_frames.get("header", {}),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_dataframe_to_records",
+        lambda df: captured_frames.get("line_items", []),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_validate_and_cast",
+        lambda header, items, doc_type: (header, items),
+    )
+
+    result = agent._extract_structured_data("sample text", b"", "Invoice")
+
+    validation_warnings = result.report["validation"]["warnings"]
+    assert result.header["invoice_id"] is None
+    assert result.header["vendor_name"] is None
+    assert result.header["invoice_total_incl_tax"] is None
+    assert result.header.get("_field_confidence", {}).get("invoice_id") == 0.0
+    assert any("invoice_id" in warning for warning in validation_warnings)
+
+
+def test_recover_missing_critical_fields_uses_document_context(monkeypatch):
+    settings = SimpleNamespace(
+        extraction_model="m",
+        field_recovery_confidence_threshold=0.7,
+    )
+    agent = DataExtractionAgent(SimpleNamespace(settings=settings))
+
+    document_text = (
+        "Invoice Number: INV-321\n"
+        "Vendor: Beyond Supplies Ltd.\n"
+        "Invoice Total: USD 2500.00"
+    )
+
+    header = {
+        "invoice_id": None,
+        "vendor_name": "",
+        "invoice_total_incl_tax": None,
+    }
+
+    captured_prompt: Dict[str, Any] = {}
+
+    def fake_call(prompt, model, format):
+        captured_prompt["prompt"] = prompt
+        payload = {
+            "invoice_id": {
+                "value": "INV-321",
+                "confidence": 0.91,
+                "context": "Invoice Number: INV-321",
+            },
+            "vendor_name": {
+                "value": "Beyond Supplies Ltd.",
+                "confidence": 0.88,
+                "context": "Vendor: Beyond Supplies Ltd.",
+            },
+            "invoice_total_incl_tax": {
+                "value": "2500.00",
+                "confidence": 0.86,
+                "context": "Invoice Total: USD 2500.00",
+            },
+        }
+        return {"response": json.dumps(payload)}
+
+    monkeypatch.setattr(agent, "call_ollama", fake_call)
+
+    validation_report = {"warnings": []}
+    recovered = agent._recover_missing_critical_fields(
+        document_text, "Invoice", header, validation_report
+    )
+
+    assert set(recovered) == {
+        "invoice_id",
+        "vendor_name",
+        "invoice_total_incl_tax",
+    }
+    assert recovered["invoice_id"]["value"] == "INV-321"
+    assert recovered["vendor_name"]["context"].startswith("Vendor: Beyond")
+    assert "Invoice Number" in captured_prompt["prompt"]
+
+
+def test_structured_extraction_injects_recovered_fields(monkeypatch):
+    settings = SimpleNamespace(
+        extraction_model="m",
+        structured_low_confidence_threshold=0.8,
+        field_low_confidence_threshold=0.7,
+    )
+    agent = DataExtractionAgent(SimpleNamespace(settings=settings))
+
+    base_header = {
+        "invoice_id": None,
+        "vendor_name": None,
+        "invoice_total_incl_tax": None,
+        "_field_confidence": {},
+        "_field_context": {},
+    }
+
+    monkeypatch.setattr(
+        agent,
+        "_parse_header_improved",
+        lambda text, file_bytes=None: dict(base_header),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_extract_line_items_from_layout",
+        lambda file_bytes, text, doc_type: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_extract_line_items_improved",
+        lambda text, doc_type: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_normalize_header_fields",
+        lambda header, doc_type: header,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_normalize_line_item_fields",
+        lambda items, doc_type: items,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_reconcile_header_from_lines",
+        lambda header, items, doc_type: header,
+    )
+    monkeypatch.setattr(agent, "_infer_currency", lambda text, header: None)
+    monkeypatch.setattr(agent, "_sanitize_party_names", lambda header: header)
+
+    monkeypatch.setattr(
+        agent,
+        "_validate_extraction_quality",
+        lambda header, items, doc_type, text: {
+            "is_valid": True,
+            "confidence_score": 0.9,
+            "errors": [],
+            "warnings": [],
+            "field_scores": {},
+        },
+    )
+
+    monkeypatch.setattr(
+        agent,
+        "_recover_missing_critical_fields",
+        lambda text, doc_type, header, report: {
+            "invoice_id": {
+                "value": "INV-2024-001",
+                "confidence": 0.93,
+                "context": "Invoice Number: INV-2024-001",
+            },
+            "vendor_name": {
+                "value": "Beyond Components",
+                "confidence": 0.91,
+                "context": "Vendor: Beyond Components",
+            },
+        },
+    )
+
+    captured: Dict[str, Any] = {}
+
+    def fake_build(data, doc_type, segment):
+        captured[segment] = data
+        if segment == "header":
+            return pd.DataFrame([data]), [], []
+        return pd.DataFrame(), [], []
+
+    monkeypatch.setattr(agent, "_build_dataframe_from_records", fake_build)
+    monkeypatch.setattr(agent, "_dataframe_to_header", lambda df: df.iloc[0].to_dict())
+    monkeypatch.setattr(agent, "_dataframe_to_records", lambda df: [])
+    monkeypatch.setattr(agent, "_validate_and_cast", lambda header, items, doc_type: (header, items))
+
+    result = agent._extract_structured_data(
+        "Invoice Number: INV-2024-001\nVendor: Beyond Components", b"", "Invoice"
+    )
+
+    assert result.header["invoice_id"] == "INV-2024-001"
+    assert result.header.get("_field_confidence", {}).get("vendor_name") == approx(0.91)
+    assert "field_contexts" in result.report
+    warnings = " ".join(result.report["validation"].get("warnings", []))
+    assert "Recovered critical fields via document-wide context" in warnings
 
 
 def test_persist_to_postgres_sanitizes_values(monkeypatch):

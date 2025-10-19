@@ -630,6 +630,12 @@ def _initialize_qdrant_collection_idempotent(client, collection_name: str, vecto
 # AGENT
 # ---------------------------------------------------------------------------
 class DataExtractionAgent(BaseAgent):
+    CRITICAL_HEADER_FIELDS: Dict[str, Tuple[str, ...]] = {
+        "Invoice": ("invoice_id", "vendor_name", "invoice_total_incl_tax"),
+        "Purchase_Order": ("po_id", "vendor_name", "total_amount"),
+        "Quote": ("quote_id", "vendor_name", "total_amount"),
+        "Contract": ("contract_id", "supplier_id"),
+    }
     AGENTIC_PLAN_STEPS = (
         "Collect source documents from S3 prefixes or targeted object keys, tagging scanned versus digital content.",
         "Extract header fields, line items, and structured tables using schema-driven parsing with OCR fallbacks.",
@@ -660,7 +666,6 @@ class DataExtractionAgent(BaseAgent):
 
                 extractor = DocumentExtractor(
                     _factory,
-                    reference_path=REFERENCE_PATH,
                 )
                 self._document_extractor = extractor
         return extractor
@@ -1363,7 +1368,19 @@ class DataExtractionAgent(BaseAgent):
         try:
             pdf = fitz.open(stream=file_bytes, filetype="pdf") if fitz else None
         except Exception as exc:
-            logger.debug("PyMuPDF open failed: %s", exc)
+            message = str(exc)
+            if any(keyword in message.lower() for keyword in ("mupdf", "zlib", "corrupt")):
+                logger.warning("PyMuPDF failed to open PDF: %s", message)
+                routing_log.append(
+                    {
+                        "page": 0,
+                        "route": "error",
+                        "error": "mupdf_open_failed",
+                        "message": message,
+                    }
+                )
+            else:
+                logger.debug("PyMuPDF open failed: %s", exc)
             pdf = None
 
         try:
@@ -1426,7 +1443,16 @@ class DataExtractionAgent(BaseAgent):
                         )
                     )
         except Exception as exc:
-            logger.warning("pdfplumber failed during page routing: %s", exc)
+            message = str(exc)
+            logger.warning("pdfplumber failed during page routing: %s", message)
+            routing_log.append(
+                {
+                    "page": 0,
+                    "route": "error",
+                    "error": "pdfplumber_failed",
+                    "message": message,
+                }
+            )
 
         if pdf is not None:
             try:
@@ -1541,8 +1567,9 @@ class DataExtractionAgent(BaseAgent):
         try:
             img = Image.open(BytesIO(file_bytes))
         except UnidentifiedImageError:
-            if allow_pdf_fallback:
-                logger.warning("Not a valid image; attempting PDF extraction fallback")
+            header = file_bytes.lstrip()[:4]
+            if allow_pdf_fallback and header == b"%PDF":
+                logger.warning("Image decode failed but bytes look like a PDF; attempting PDF extraction fallback")
                 bundle = self._extract_pdf_text_bundle(file_bytes)
                 return bundle.full_text
             logger.warning("Provided bytes are not a valid image")
@@ -1570,7 +1597,15 @@ class DataExtractionAgent(BaseAgent):
     def _extract_text(
         self, file_bytes: bytes, object_key: str, force_ocr: bool = False
     ) -> DocumentTextBundle:
-        ext = os.path.splitext(object_key)[1].lower()
+        path = Path(object_key)
+        ext = path.suffix.lower()
+        suffixes = [suffix.lower() for suffix in path.suffixes]
+        unsupported_composite_suffixes = {".drawio", ".vsdx"}
+        if any(suffix in unsupported_composite_suffixes for suffix in suffixes[:-1]):
+            logger.warning(
+                "Unsupported document type '%s' for %s", "".join(path.suffixes), object_key
+            )
+            return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
         if ext == ".pdf":
             return self._extract_pdf_text_bundle(file_bytes, force_ocr=force_ocr)
         if ext in {".doc", ".docx"}:
@@ -3758,17 +3793,24 @@ class DataExtractionAgent(BaseAgent):
 
         logger.info(f"Starting extraction for {doc_type}")
 
+        schema = SCHEMA_MAP.get(doc_type, {})
+        header_schema = schema.get("header", {})
+
         header = self._parse_header_improved(text, file_bytes)
         logger.info(f"Phase 1 complete: {len(header)} header fields extracted")
 
         line_items: List[Dict[str, Any]] = []
         extraction_method: Optional[str] = None
+        table_method: str = "none"
+        llm_used = False
+        llm_contexts: Dict[str, Any] = {}
 
         if file_bytes:
             try:
                 line_items = self._extract_line_items_from_layout(file_bytes, text, doc_type)
                 if line_items:
                     extraction_method = "layout"
+                    table_method = "layout"
                     logger.info(
                         f"Layout extraction: {len(line_items)} line items found"
                     )
@@ -3780,22 +3822,16 @@ class DataExtractionAgent(BaseAgent):
                 line_items = self._extract_line_items_improved(text, doc_type)
                 if line_items:
                     extraction_method = "regex_improved"
+                    table_method = "regex_improved"
                     logger.info(
                         f"Regex extraction: {len(line_items)} line items found"
                     )
             except Exception as exc:
                 logger.debug(f"Regex extraction failed: {exc}")
 
-        critical_fields = {
-            "Invoice": ["invoice_id", "vendor_name", "invoice_total_incl_tax"],
-            "Purchase_Order": ["po_id", "vendor_name", "total_amount"],
-            "Quote": ["quote_id", "vendor_name", "total_amount"],
-            "Contract": ["contract_id", "supplier_id"],
-        }
-
         missing_critical = [
             field
-            for field in critical_fields.get(doc_type, [])
+            for field in self.CRITICAL_HEADER_FIELDS.get(doc_type, ())
             if not header.get(field)
         ]
 
@@ -3803,15 +3839,61 @@ class DataExtractionAgent(BaseAgent):
             logger.info(f"Missing critical fields {missing_critical}, using LLM fallback")
             try:
                 llm_data = self._llm_structured_extraction(text, doc_type)
-                llm_header = llm_data.get("header", {})
+                llm_header = (
+                    llm_data.get("header")
+                    or llm_data.get("header_data")
+                    or {}
+                )
+                llm_contexts = llm_data.get("field_contexts") or {}
+
+                def _has_value(value: Any) -> bool:
+                    if value is None:
+                        return False
+                    if isinstance(value, str):
+                        return bool(value.strip())
+                    if isinstance(value, (list, tuple, set, dict)):
+                        return bool(value)
+                    return True
+
+                confidence_bucket = header.get("_field_confidence")
+                if not isinstance(confidence_bucket, dict):
+                    confidence_bucket = {}
+                    header["_field_confidence"] = confidence_bucket
+                llm_confidence = self._confidence_from_method("llm_structured")
+
                 for field in missing_critical:
-                    if field in llm_header and llm_header[field]:
-                        header[field] = llm_header[field]
+                    value = llm_header.get(field)
+                    if _has_value(value):
+                        header[field] = value
+                        confidence_bucket[field] = max(
+                            confidence_bucket.get(field, 0.0), llm_confidence
+                        )
+                        llm_used = True
                         logger.info(f"LLM filled missing field: {field}")
 
-                if not line_items and llm_data.get("line_items"):
-                    line_items = llm_data.get("line_items", [])
+                if llm_header:
+                    for field, value in llm_header.items():
+                        if not _has_value(value):
+                            continue
+                        if not _has_value(header.get(field)) and field in header_schema:
+                            header[field] = value
+                            confidence_bucket[field] = max(
+                                confidence_bucket.get(field, 0.0), llm_confidence
+                            )
+                            llm_used = True
+
+                if llm_contexts:
+                    context_bucket = header.setdefault("_field_context", {})
+                    if isinstance(context_bucket, dict):
+                        context_bucket.update(
+                            {k: v for k, v in llm_contexts.items() if _has_value(v)}
+                        )
+
+                llm_line_items = llm_data.get("line_items")
+                if not line_items and isinstance(llm_line_items, list) and llm_line_items:
+                    line_items = llm_line_items
                     extraction_method = "llm_fallback"
+                    llm_used = True
                     logger.info(
                         f"LLM extraction: {len(line_items)} line items found"
                     )
@@ -3823,6 +3905,9 @@ class DataExtractionAgent(BaseAgent):
             line_items = self._normalize_line_item_fields(line_items, doc_type)
 
         header = self._reconcile_header_from_lines(header, line_items, doc_type)
+
+        if llm_used and not extraction_method:
+            extraction_method = "llm_fallback"
 
         if not header.get("currency"):
             inferred_currency = self._infer_currency(text, header)
@@ -3838,6 +3923,45 @@ class DataExtractionAgent(BaseAgent):
         validation_report = self._validate_extraction_quality(
             header, line_items, doc_type, text
         )
+
+        cleared_low_confidence = self._apply_low_confidence_guard(
+            header, doc_type, validation_report
+        )
+        if cleared_low_confidence and llm_contexts:
+            for field in cleared_low_confidence:
+                llm_contexts.pop(field, None)
+
+        recovered_fields = self._recover_missing_critical_fields(
+            text, doc_type, header, validation_report
+        )
+        if recovered_fields:
+            field_conf_bucket = header.setdefault("_field_confidence", {})
+            if not isinstance(field_conf_bucket, dict):
+                field_conf_bucket = {}
+                header["_field_confidence"] = field_conf_bucket
+            context_bucket = header.setdefault("_field_context", {})
+            if not isinstance(context_bucket, dict):
+                context_bucket = {}
+                header["_field_context"] = context_bucket
+            for field, details in recovered_fields.items():
+                header[field] = details["value"]
+                field_conf_bucket[field] = details["confidence"]
+                context = details.get("context")
+                if context:
+                    context_bucket[field] = context
+                    if isinstance(llm_contexts, dict):
+                        llm_contexts[field] = context
+            validation_report.setdefault("warnings", []).append(
+                "Recovered critical fields via document-wide context: "
+                + ", ".join(sorted(recovered_fields))
+            )
+
+        field_context_bucket: Optional[Dict[str, Any]] = None
+        field_confidence_bucket: Optional[Dict[str, Any]] = None
+        if isinstance(header.get("_field_context"), dict):
+            field_context_bucket = dict(header["_field_context"])
+        if isinstance(header.get("_field_confidence"), dict):
+            field_confidence_bucket = dict(header["_field_confidence"])
 
         header["_validation"] = validation_report
 
@@ -3865,6 +3989,11 @@ class DataExtractionAgent(BaseAgent):
             header_dict, line_items_list, doc_type
         )
 
+        if field_context_bucket:
+            header_dict["_field_context"] = field_context_bucket
+        if field_confidence_bucket:
+            header_dict["_field_confidence"] = field_confidence_bucket
+
         header_dict["_validation"] = validation_report
 
         report = {
@@ -3881,7 +4010,11 @@ class DataExtractionAgent(BaseAgent):
                 "line_missing": line_missing,
                 "line_extra": line_extra,
             },
+            "table_method": table_method,
         }
+
+        if llm_contexts:
+            report["field_contexts"] = llm_contexts
 
         if validation_report["confidence_score"] < 0.75:
             logger.warning(
@@ -3897,6 +4030,183 @@ class DataExtractionAgent(BaseAgent):
             line_df=line_df,
             report=report,
         )
+
+    def _apply_low_confidence_guard(
+        self,
+        header: Dict[str, Any],
+        doc_type: str,
+        validation_report: Dict[str, Any],
+    ) -> List[str]:
+        """Reset critical header fields to None when overall confidence is low."""
+
+        doc_confidence = float(validation_report.get("confidence_score") or 0.0)
+        threshold = getattr(
+            self.settings, "structured_low_confidence_threshold", 0.65
+        )
+        if doc_confidence >= threshold:
+            return []
+
+        critical_fields = self.CRITICAL_HEADER_FIELDS.get(doc_type, ())
+        if not critical_fields:
+            return []
+
+        field_threshold = getattr(
+            self.settings, "field_low_confidence_threshold", 0.6
+        )
+
+        def _has_value(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple, set, dict)):
+                return bool(value)
+            return True
+
+        field_conf_bucket = header.get("_field_confidence")
+        if not isinstance(field_conf_bucket, dict):
+            field_conf_bucket = {}
+            header["_field_confidence"] = field_conf_bucket
+
+        context_bucket = header.get("_field_context")
+        if not isinstance(context_bucket, dict):
+            context_bucket = None
+
+        field_scores = validation_report.get("field_scores") or {}
+        cleared: List[str] = []
+
+        for field in critical_fields:
+            value = header.get(field)
+            if not _has_value(value):
+                continue
+            confidence = field_conf_bucket.get(field)
+            if confidence is None:
+                confidence = field_scores.get(field)
+            if confidence is None:
+                confidence = doc_confidence
+            if confidence >= field_threshold:
+                continue
+            header[field] = None
+            cleared.append(field)
+            field_conf_bucket[field] = 0.0
+            if context_bucket is not None:
+                context_bucket.pop(field, None)
+
+        if cleared:
+            warning = "Cleared low-confidence values for: " + ", ".join(
+                sorted(cleared)
+            )
+            validation_report.setdefault("warnings", []).append(warning)
+
+        return cleared
+
+    def _recover_missing_critical_fields(
+        self,
+        text: str,
+        doc_type: str,
+        header: Dict[str, Any],
+        validation_report: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Use the full document context to recover missing critical header fields."""
+
+        critical_fields = self.CRITICAL_HEADER_FIELDS.get(doc_type, ())
+        if not critical_fields or not text.strip():
+            return {}
+
+        def _has_value(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple, set, dict)):
+                return bool(value)
+            return True
+
+        missing_fields = [
+            field
+            for field in critical_fields
+            if not _has_value(header.get(field))
+        ]
+        if not missing_fields:
+            return {}
+
+        recovery_threshold = getattr(
+            self.settings, "field_recovery_confidence_threshold", 0.72
+        )
+
+        normalized_doc = re.sub(r"\s+", " ", text).lower()
+        llm_input = text
+
+        prompt_parts = [
+            "You are a procurement data expert for Beyond Procwise.",
+            f"The document type is {doc_type}.",
+            "The agent could not reliably populate the following critical header fields:",
+            ", ".join(missing_fields),
+            "Review the COMPLETE document text provided below and extract accurate values when they are explicitly stated.",
+            "Return ONLY valid JSON mapping each field name to an object with keys 'value', 'confidence', and 'context'.",
+            "- 'value' must be a string or null. Use null ONLY if the value is truly absent.",
+            "- 'confidence' must be a float between 0 and 1 reflecting your certainty.",
+            "- 'context' must quote a supporting snippet (<=200 characters) from the document or explain why the value is null.",
+            "Do not invent values. Prefer exact text matches for identifiers, company names, and totals.",
+            "Document text:\n" + llm_input,
+        ]
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            response = self.call_ollama(
+                prompt=prompt,
+                model=self.extraction_model,
+                format="json",
+            )
+            payload_raw = response.get("response", "{}")
+            payload = json.loads(payload_raw)
+            if not isinstance(payload, dict):
+                raise ValueError("Field recovery response is not a JSON object")
+        except Exception:
+            logger.warning("Critical field recovery failed", exc_info=True)
+            validation_report.setdefault("warnings", []).append(
+                "Critical field recovery attempt failed"
+            )
+            return {}
+
+        recovered: Dict[str, Dict[str, Any]] = {}
+        for field in missing_fields:
+            entry = payload.get(field)
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("value")
+            context = entry.get("context") or ""
+            try:
+                confidence = float(entry.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(confidence, 1.0))
+
+            if confidence < recovery_threshold:
+                continue
+
+            snippet = re.sub(r"\s+", " ", context).lower()
+            if snippet and snippet not in normalized_doc:
+                if isinstance(value, str):
+                    idx = text.lower().find(value.lower())
+                    if idx != -1:
+                        start = max(0, idx - 80)
+                        end = min(len(text), idx + len(value) + 80)
+                        context = text[start:end].strip()
+                        snippet = re.sub(r"\s+", " ", context).lower()
+                if snippet and snippet not in normalized_doc:
+                    continue
+
+            if not _has_value(value):
+                continue
+
+            recovered[field] = {
+                "value": value,
+                "confidence": confidence,
+                "context": context.strip()[:200] if context else "",
+            }
+
+        return recovered
     def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
         """Run a single LLM pass to capture field-level context for the document."""
 
