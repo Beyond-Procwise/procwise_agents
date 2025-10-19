@@ -919,10 +919,11 @@ class EmailWatcherV2:
             "matched_responses": tracker.matched_responses,
         }
 
-        self._process_agents(tracker)
+        handled_batch = self._process_agents(tracker)
 
         if (
-            self._resolve_supplier_agent(workflow_id, create=False) is not None
+            handled_batch
+            and self._resolve_supplier_agent(workflow_id, create=False) is not None
             and tracker.matched_responses
         ):
             supplier_response_repo.delete_responses(
@@ -932,10 +933,10 @@ class EmailWatcherV2:
 
         return result
 
-    def _process_agents(self, tracker: WorkflowTracker) -> None:
+    def _process_agents(self, tracker: WorkflowTracker) -> bool:
         pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
         if not pending_rows:
-            return
+            return False
 
         supplier_agent = self._resolve_supplier_agent(tracker.workflow_id)
         if supplier_agent is None:
@@ -944,9 +945,10 @@ class EmailWatcherV2:
                 tracker.workflow_id,
                 len(pending_rows),
             )
-            return
+            return False
 
         processed_ids: List[str] = []
+        handled_batch = False
         for row in pending_rows:
             unique_id = row.get("unique_id")
             matched = tracker.matched_responses.get(unique_id) if unique_id else None
@@ -1002,7 +1004,9 @@ class EmailWatcherV2:
                     "Supplier batch not complete for workflow %s; waiting for remaining responses",
                     tracker.workflow_id,
                 )
-                return
+                return False
+
+            handled_batch = True
 
             responses = wait_result.data.get("supplier_responses") or []
             expected = wait_result.data.get("expected_responses") or 0
@@ -1014,7 +1018,7 @@ class EmailWatcherV2:
                     expected,
                     collected,
                 )
-                return
+                return False
 
             ids_from_agent = [
                 uid
@@ -1076,3 +1080,4 @@ class EmailWatcherV2:
                 supplier_response_repo.delete_responses(
                     workflow_id=tracker.workflow_id, unique_ids=fallback_ids
                 )
+        return handled_batch
