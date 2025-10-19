@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import imaplib
-from typing import Any, Dict, List, Optional
+import inspect
+from typing import Any, Callable, Dict, List, Optional
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
@@ -59,6 +60,167 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
         "price": row.get("price"),
         "lead_time": row.get("lead_time"),
     }
+
+
+def _instantiate_supplier_agent(
+    value: Any, workflow_key: str
+) -> Optional[SupplierInteractionAgent]:
+    """Normalise arbitrary registry entries into ``SupplierInteractionAgent`` instances."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, SupplierInteractionAgent):
+        agent_class = value.__class__
+        agent_nick = getattr(value, "agent_nick", None)
+        try:
+            if agent_nick is not None:
+                clone = agent_class(agent_nick)
+            else:
+                clone = agent_class()
+        except TypeError:
+            try:
+                clone = agent_class()
+            except Exception:
+                logger.exception(
+                    "Failed to clone supplier agent %s for workflow %s",
+                    agent_class.__name__,
+                    workflow_key,
+                )
+                return None
+        except Exception:
+            logger.exception(
+                "Failed to clone supplier agent %s for workflow %s",
+                agent_class.__name__,
+                workflow_key,
+            )
+            return None
+
+        setattr(clone, "workflow_binding", workflow_key)
+        return clone
+
+    if inspect.isclass(value) and issubclass(value, SupplierInteractionAgent):
+        try:
+            return value()
+        except Exception:
+            logger.exception(
+                "Failed to instantiate supplier agent class %s for workflow %s",
+                value.__name__,
+                workflow_key,
+            )
+            return None
+
+    if callable(value):
+        try:
+            return value(workflow_key)
+        except TypeError:
+            try:
+                return value()
+            except Exception:
+                logger.exception(
+                    "Supplier interaction agent factory failed for workflow %s",
+                    workflow_key,
+                )
+                return None
+        except Exception:
+            logger.exception(
+                "Supplier interaction agent factory failed for workflow %s",
+                workflow_key,
+            )
+            return None
+
+    if isinstance(value, dict):
+        nested_factory = _supplier_agent_factory_from_registry(value)
+        if nested_factory:
+            return nested_factory(workflow_key)
+        return None
+
+    if hasattr(value, "execute"):
+        setattr(value, "workflow_binding", workflow_key)
+        return value  # type: ignore[return-value]
+
+    return None
+
+
+def _supplier_agent_factory_from_registry(
+    registry_entry: Any,
+) -> Optional[Callable[[str], Optional[SupplierInteractionAgent]]]:
+    """Convert agent registry entries into workflow-aware factories."""
+
+    if registry_entry is None:
+        return None
+
+    if callable(registry_entry) and not isinstance(
+        registry_entry, SupplierInteractionAgent
+    ):
+
+        def factory(workflow_key: str, builder=registry_entry):
+            return _instantiate_supplier_agent(builder, workflow_key)
+
+        return factory
+
+    if isinstance(registry_entry, SupplierInteractionAgent):
+
+        def factory(workflow_key: str, template=registry_entry):
+            return _instantiate_supplier_agent(template, workflow_key)
+
+        return factory
+
+    if isinstance(registry_entry, dict):
+        mapping: Dict[str, Any] = {}
+        fallback = None
+        nested_factory: Optional[Any] = None
+
+        for key, value in registry_entry.items():
+            lowered = key.lower() if isinstance(key, str) else key
+            if lowered in {"factory", "callable", "builder"}:
+                nested_factory = value
+                continue
+            mapping[key] = value
+
+        if nested_factory is None:
+            nested_factory = registry_entry.get("default_factory")
+
+        fallback = (
+            registry_entry.get("default")
+            or registry_entry.get("DEFAULT")
+            or registry_entry.get("*")
+        )
+
+        per_workflow = registry_entry.get("per_workflow")
+        if isinstance(per_workflow, dict):
+            mapping.update(per_workflow)
+
+        def factory(workflow_key: str, mapping=mapping, fallback=fallback, nested=nested_factory):
+            workflow_lookup = [workflow_key, workflow_key.lower()] if workflow_key else []
+            workflow_lookup += [workflow_key.upper()] if workflow_key else []
+
+            for candidate_key in workflow_lookup:
+                if candidate_key in mapping:
+                    agent = _instantiate_supplier_agent(
+                        mapping[candidate_key], workflow_key
+                    )
+                    if agent is not None:
+                        return agent
+
+            if "*" in mapping:
+                agent = _instantiate_supplier_agent(mapping["*"], workflow_key)
+                if agent is not None:
+                    return agent
+
+            if fallback is not None:
+                agent = _instantiate_supplier_agent(fallback, workflow_key)
+                if agent is not None:
+                    return agent
+
+            if nested is not None:
+                return _instantiate_supplier_agent(nested, workflow_key)
+
+            return None
+
+        return factory
+
+    return None
 
 
 def run_email_watcher_for_workflow(
@@ -217,30 +379,13 @@ def run_email_watcher_for_workflow(
         except Exception:
             registry_entry = None
 
-        if callable(registry_entry) and not isinstance(
-            registry_entry, SupplierInteractionAgent
-        ):
+        supplier_agent_factory = _supplier_agent_factory_from_registry(registry_entry)
 
-            def supplier_agent_factory(workflow_key: str, factory=registry_entry):
-                try:
-                    return factory(workflow_key)
-                except TypeError:
-                    return factory()
-
-        elif isinstance(registry_entry, SupplierInteractionAgent):
-            agent_nick = getattr(registry_entry, "agent_nick", None)
-
-            if agent_nick is not None:
-
-                def supplier_agent_factory(workflow_key: str, nick=agent_nick):
-                    agent = SupplierInteractionAgent(nick)
-                    setattr(agent, "workflow_binding", workflow_key)
-                    return agent
-
-            else:
-
-                def supplier_agent_factory(workflow_key: str, agent=registry_entry):
-                    return agent
+        if supplier_agent_factory is None and registry_entry is not None:
+            logger.warning(
+                "Agent registry entry for supplier_interaction is misconfigured; "
+                "falling back to implicit matching"
+            )
 
     watcher = EmailWatcherV2(
         supplier_agent_factory=supplier_agent_factory,

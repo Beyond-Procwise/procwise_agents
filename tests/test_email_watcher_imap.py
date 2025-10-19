@@ -137,3 +137,54 @@ def test_watcher_uses_agent_registry_supplier_factory(monkeypatch):
     assert resolved_factory is not None
     assert resolved_factory("wf-test") == agent_factory("wf-test")
     assert result["status"] == "processed"
+
+
+def test_watcher_supports_workflow_specific_agent_mapping(monkeypatch):
+    from services import email_watcher_imap
+
+    monkeypatch.setattr(email_watcher_imap, "app_settings", None)
+    monkeypatch.setattr(
+        email_watcher_imap, "_load_dispatch_rows", lambda workflow_id: [_sample_row()]
+    )
+
+    captured = {}
+
+    class _FakeWatcher:
+        def __init__(self, *args, **kwargs):
+            captured["factory"] = kwargs.get("supplier_agent_factory")
+
+        def wait_and_collect_responses(self, workflow_id):
+            return {
+                "complete": True,
+                "workflow_id": workflow_id,
+                "dispatched_count": 1,
+                "responded_count": 1,
+                "matched_responses": {},
+            }
+
+    monkeypatch.setattr(email_watcher_imap, "EmailWatcherV2", _FakeWatcher)
+    monkeypatch.setattr(
+        email_watcher_imap.supplier_response_repo,
+        "fetch_pending",
+        lambda workflow_id: [],
+    )
+
+    os.environ["IMAP_HOST"] = "imap.test"
+    os.environ["IMAP_USERNAME"] = "user@test"
+    os.environ["IMAP_PASSWORD"] = "secret"
+
+    mapping = {
+        "wf-test": lambda workflow_id: f"agent-{workflow_id}",
+        "default": lambda workflow_id: f"fallback-{workflow_id}",
+    }
+
+    email_watcher_imap.run_email_watcher_for_workflow(
+        workflow_id="wf-test",
+        run_id=None,
+        agent_registry={"supplier_interaction": mapping},
+    )
+
+    resolved_factory = captured.get("factory")
+    assert resolved_factory is not None
+    assert resolved_factory("wf-test") == "agent-wf-test"
+    assert resolved_factory("wf-other") == "fallback-wf-other"
