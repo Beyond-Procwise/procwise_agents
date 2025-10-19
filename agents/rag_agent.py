@@ -33,7 +33,7 @@ class RAGAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         model_name = getattr(
-            self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            self.settings, "reranker_model", "BAAI/bge-reranker-large"
         )
         # Cross encoder ensures accurate ranking while utilising the GPU
         self._reranker = load_cross_encoder(

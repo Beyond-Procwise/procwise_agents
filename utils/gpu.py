@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 _CONFIGURED: bool = False
 _DEVICE: Optional[str] = None
+_CROSS_ENCODER_CACHE: dict[tuple[str, str], Any] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +99,15 @@ def load_cross_encoder(
     """
 
     target_device = None if device is None else str(device)
+    cache_key = (model_name, (target_device or "cpu"))
+    cached = _CROSS_ENCODER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        return cross_encoder_cls(model_name, device=target_device)
+        encoder = cross_encoder_cls(model_name, device=target_device)
+        _CROSS_ENCODER_CACHE[cache_key] = encoder
+        return encoder
     except NotImplementedError as exc:  # pragma: no cover - hardware dependent
         if "meta tensor" not in str(exc):
             raise
@@ -123,4 +131,5 @@ def load_cross_encoder(
                     "Unexpected error moving cross encoder to device %s; continuing on CPU.",
                     target_device,
                 )
+        _CROSS_ENCODER_CACHE[cache_key] = encoder
         return encoder

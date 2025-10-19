@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, cast
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
-from agents.negotiation_pricer import NegotiationContext, SupplierSignals, plan_counter
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -64,6 +63,221 @@ TRADE_OFF_HINTS = {
     "Strategic": "Requires executive sponsorship and potential co-investment or exclusivity.",
     "Relational": "Demands governance time and tighter alignment of internal stakeholders.",
 }
+
+
+@dataclass
+class NegotiationContext:
+    current_offer: float
+    target_price: float
+    round_index: int = 1
+    currency: Optional[str] = None
+    aggressiveness: float = 0.5
+    leverage: float = 0.5
+    urgency: float = 0.5
+    risk_buffer_pct: float = 0.05
+    min_abs_buffer: float = 0.0
+    step_pct_of_gap: float = 0.1
+    min_abs_step: float = 1.0
+    max_rounds: int = 3
+    walkaway_price: Optional[float] = None
+    ask_early_pay_disc: Optional[float] = None
+    ask_lead_time_keep: bool = True
+
+
+@dataclass
+class SupplierSignals:
+    offer_prev: Optional[float] = None
+    offer_new: Optional[float] = None
+    message_text: str = ""
+
+
+def _detect_finality(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(pattern in lowered for pattern in FINAL_OFFER_PATTERNS)
+
+
+def _format_currency(amount: float, currency: Optional[str]) -> str:
+    if currency:
+        return f"{currency} {amount:,.2f}"
+    return f"{amount:,.2f}"
+
+
+def plan_counter(ctx: NegotiationContext, signals: SupplierSignals) -> Dict[str, object]:
+    """Plan counter pricing and supporting asks for the negotiation agent."""
+
+    log: List[str] = []
+    asks: List[str] = []
+    lead_time_request: Optional[str] = None
+
+    if ctx.round_index > ctx.max_rounds:
+        counter = min(ctx.current_offer, ctx.walkaway_price or ctx.current_offer)
+        counter = round(counter, 2)
+        message = (
+            f"Round {ctx.round_index} exceeds configured max rounds; hold at "
+            f"{_format_currency(counter, ctx.currency)} and focus on non-price levers."
+        )
+        log.append("Max rounds reached; maintaining prior position.")
+        return {
+            "decision": "hold",
+            "counter_price": counter,
+            "asks": asks,
+            "lead_time_request": lead_time_request,
+            "message": message,
+            "log": log,
+            "finality": False,
+        }
+
+    if ctx.current_offer <= 0 or ctx.target_price <= 0:
+        message = "Offer or target missing/invalid; request structured pricing."
+        asks.append("Confirm unit price, currency, tiered price @ 100/250/500.")
+        log.append("Invalid numeric input detected while planning counter.")
+        return {
+            "decision": "clarify",
+            "counter_price": None,
+            "asks": asks,
+            "lead_time_request": lead_time_request,
+            "message": message,
+            "log": log,
+            "finality": False,
+        }
+
+    current_offer = float(ctx.current_offer)
+    target_price = float(ctx.target_price)
+    gap_value = current_offer - target_price
+    gap_pct = gap_value / target_price if target_price else None
+    finality = _detect_finality(signals.message_text)
+
+    threshold = ctx.walkaway_price if ctx.walkaway_price is not None else target_price
+
+    if finality:
+        log.append("Supplier message contained final-offer language.")
+        if threshold is not None and current_offer <= threshold:
+            counter = round(min(current_offer, target_price), 2)
+            message = (
+                "Supplier signalled final offer within acceptable threshold; accept with a minor sweetener."
+            )
+            if ctx.ask_early_pay_disc:
+                asks.append(
+                    f"Offer early payment for {ctx.ask_early_pay_disc * 100:.1f}% discount on this final offer."
+                )
+            asks.append("Confirm net 30 terms and shipment schedule before closing.")
+            if ctx.ask_lead_time_keep:
+                lead_time_request = "Confirm committed lead time"
+            return {
+                "decision": "accept",
+                "counter_price": counter,
+                "asks": list(dict.fromkeys(asks)),
+                "lead_time_request": lead_time_request,
+                "message": message,
+                "log": log,
+                "finality": True,
+            }
+
+        message = (
+            "Supplier marked this as a final offer but it remains above our no-deal threshold; pause and escalate."
+        )
+        log.append("Final offer rejected because it exceeds walk-away threshold.")
+        return {
+            "decision": "decline",
+            "counter_price": None,
+            "asks": [],
+            "lead_time_request": None,
+            "message": message,
+            "log": log,
+            "finality": True,
+        }
+
+    if gap_value <= 0:
+        counter = round(min(current_offer, target_price), 2)
+        message = "Supplier already at/below target; accept while requesting a minor sweetener."
+        log.append("Offer meets target; recommending soft acceptance.")
+        if ctx.ask_early_pay_disc:
+            asks.append(
+                f"Offer early payment for {ctx.ask_early_pay_disc * 100:.1f}% discount."
+            )
+        asks.append("Confirm lead time and packaging before sign-off.")
+        if ctx.ask_lead_time_keep:
+            lead_time_request = "Maintain committed lead time"
+        return {
+            "decision": "accept",
+            "counter_price": counter,
+            "asks": list(dict.fromkeys(asks)),
+            "lead_time_request": lead_time_request,
+            "message": message,
+            "log": log,
+            "finality": finality,
+        }
+
+    round_no = ctx.round_index
+    counter_price: float
+
+    if round_no <= 1:
+        if gap_pct is not None and gap_pct > 0.10:
+            counter_price = max(target_price, current_offer * 0.88)
+            log.append("Round 1 anchor strategy applied with ~12% reduction from supplier offer.")
+            asks.extend(
+                [
+                    "Volume-based discount for 250/500 unit tiers?",
+                    "Improved payment terms (net 45 or early-pay option).",
+                    "Explore alternative specs or components to lower cost.",
+                ]
+            )
+        else:
+            counter_price = (current_offer + target_price) / 2
+            log.append("Round 1 gap within 10%; proposing midpoint counter.")
+            asks.extend(
+                [
+                    "Hold quoted price for the full project timeline.",
+                    "Include expedited production slot if volumes increase.",
+                ]
+            )
+        message_intro = "Round 1 plan"
+    elif round_no == 2:
+        if gap_pct is not None and gap_pct <= 0.10:
+            counter_price = (current_offer + target_price) / 2
+            log.append("Round 2 midpoint strategy: splitting difference with supplier.")
+        else:
+            step = gap_value * 0.6
+            counter_price = current_offer - step
+            log.append(
+                "Round 2 assertive push: capturing ~60% of remaining gap to accelerate convergence."
+            )
+        message_intro = "Round 2 plan"
+    else:
+        buffer_value = max(ctx.min_abs_buffer, target_price * ctx.risk_buffer_pct)
+        threshold = target_price + buffer_value
+        if threshold < current_offer:
+            counter_price = threshold
+            log.append("Round 3+ buffer enforcement: targeting risk-adjusted threshold.")
+        else:
+            counter_price = max(target_price, current_offer * (1 - ctx.step_pct_of_gap))
+            log.append("Round 3+ soft landing: small decrement while reinforcing asks.")
+        message_intro = f"Round {round_no} plan"
+
+    counter_price = round(max(counter_price, target_price), 2)
+
+    if ctx.ask_early_pay_disc and ctx.ask_early_pay_disc > 0:
+        asks.append(
+            f"Offer early payment for {ctx.ask_early_pay_disc * 100:.1f}% discount if counter accepted."
+        )
+    if ctx.ask_lead_time_keep:
+        lead_time_request = "Hold quoted lead time"
+    asks.append("Validate packaging, warranty, and compliance terms before sign-off.")
+
+    message = (
+        f"{message_intro}: counter at {_format_currency(counter_price, ctx.currency)}."
+        " Reinforce commercial levers while positioning for collaborative win-win."
+    )
+
+    return {
+        "decision": "counter",
+        "counter_price": counter_price,
+        "asks": list(dict.fromkeys(asks)),
+        "lead_time_request": lead_time_request,
+        "message": message,
+        "log": log,
+        "finality": finality,
+    }
 
 PLAYBOOK_PATH = Path(__file__).resolve().parent.parent / "resources" / "reference_data" / "negotiation_playbook.json"
 
