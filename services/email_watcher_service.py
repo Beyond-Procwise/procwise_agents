@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
@@ -64,6 +64,79 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
     }
 
 
+def _resolve_agent_dependency(
+    agent_registry: Optional[Any],
+    orchestrator: Optional[Any],
+    preferred_keys: Sequence[str],
+) -> Optional[Any]:
+    """Best-effort resolution of shared agent instances.
+
+    The email watcher operates in long-running background threads where
+    instantiating new agent instances is expensive (pulling vector stores,
+    DB connections, etc.).  This helper attempts to reuse agents that have
+    already been registered with either the provided ``agent_registry`` or
+    an ``orchestrator`` instance.  ``preferred_keys`` accepts both snake_case
+    and CamelCase identifiers so legacy aliases resolve correctly.
+    """
+
+    if not preferred_keys:
+        return None
+
+    registries: List[Any] = []
+    if agent_registry:
+        registries.append(agent_registry)
+    if orchestrator:
+        orch_registry = getattr(orchestrator, "agents", None)
+        if orch_registry:
+            registries.append(orch_registry)
+        agent_nick = getattr(orchestrator, "agent_nick", None)
+        if agent_nick:
+            nick_registry = getattr(agent_nick, "agents", None)
+            if nick_registry:
+                registries.append(nick_registry)
+
+    for registry in registries:
+        if registry is None:
+            continue
+        getter = getattr(registry, "get", None)
+        for key in preferred_keys:
+            candidate = None
+            if callable(getter):
+                try:
+                    candidate = getter(key)
+                except Exception:  # pragma: no cover - defensive
+                    candidate = None
+            if candidate is None and hasattr(registry, "__getitem__"):
+                try:
+                    candidate = registry[key]
+                except Exception:  # pragma: no cover - registry miss or KeyError
+                    candidate = None
+            if candidate:
+                return candidate
+
+    fallback_sources: List[Any] = []
+    if agent_registry:
+        fallback_sources.append(agent_registry)
+    if orchestrator:
+        fallback_sources.append(orchestrator)
+        agent_nick = getattr(orchestrator, "agent_nick", None)
+        if agent_nick:
+            fallback_sources.append(agent_nick)
+
+    for source in fallback_sources:
+        if source is None:
+            continue
+        for key in preferred_keys:
+            candidate = getattr(source, key, None)
+            if candidate:
+                return candidate
+            alt = getattr(source, f"{key}_agent", None)
+            if alt:
+                return alt
+
+    return None
+
+
 def run_email_watcher_for_workflow(
     *,
     workflow_id: str,
@@ -73,6 +146,8 @@ def run_email_watcher_for_workflow(
     mailbox_name: Optional[str] = None,
     agent_registry: Optional[Dict[str, Any]] = None,
     orchestrator: Optional[Any] = None,
+    supplier_agent: Optional[Any] = None,
+    negotiation_agent: Optional[Any] = None,
     max_workers: int = 8,
 ) -> Dict[str, Any]:
     """Collect supplier responses for ``workflow_id`` using ``EmailWatcherV2``."""
@@ -212,10 +287,19 @@ def run_email_watcher_for_workflow(
     except Exception:
         max_attempts = 10
 
+    supplier_agent = supplier_agent or _resolve_agent_dependency(
+        agent_registry, orchestrator, ("supplier_interaction", "SupplierInteractionAgent")
+    )
+    negotiation_agent = negotiation_agent or _resolve_agent_dependency(
+        agent_registry, orchestrator, ("negotiation", "NegotiationAgent")
+    )
+
     watcher = EmailWatcherV2(
         dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
         poll_interval_seconds=max(1, poll_interval),
         max_poll_attempts=max(1, max_attempts),
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
         mailbox=mailbox,
         imap_host=imap_host,
         imap_username=imap_username,
@@ -297,6 +381,10 @@ class EmailWatcherService:
         post_dispatch_interval_seconds: Optional[int] = None,
         dispatch_wait_seconds: Optional[int] = None,
         watcher_runner: Optional[Callable[..., Dict[str, object]]] = None,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -319,6 +407,10 @@ class EmailWatcherService:
         self._post_dispatch_interval = post_dispatch_interval_seconds
         self._dispatch_wait = dispatch_wait_seconds
         self._runner: Callable[..., Dict[str, object]] = watcher_runner or run_email_watcher_for_workflow
+        self._agent_registry = agent_registry
+        self._orchestrator = orchestrator
+        self._supplier_agent = supplier_agent
+        self._negotiation_agent = negotiation_agent
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -420,8 +512,10 @@ class EmailWatcherService:
                         workflow_id=workflow_id,
                         run_id=None,
                         wait_seconds_after_last_dispatch=self._dispatch_wait,
-                        agent_registry=None,
-                        orchestrator=None,
+                        agent_registry=self._agent_registry,
+                        orchestrator=self._orchestrator,
+                        supplier_agent=self._supplier_agent,
+                        negotiation_agent=self._negotiation_agent,
                     )
                     status = str(result.get("status") or "").lower()
                     processed_workflow = True

@@ -294,3 +294,57 @@ def test_filter_drafts_realigns_conflicting_workflow_ids():
         assert metadata.get("workflow_id") == "wf-parent"
         context_meta = metadata.get("context") or {}
         assert context_meta.get("workflow_id") == "wf-parent"
+
+
+def test_select_workflow_identifier_prefers_unique_draft_id():
+    drafts = [
+        {"workflow_id": "wf-dispatch", "unique_id": "uid-1"},
+        {"unique_id": "uid-2", "metadata": {"workflow_id": "wf-dispatch"}},
+    ]
+
+    result = Orchestrator._select_workflow_identifier(drafts, "generated-workflow")
+
+    assert result == "wf-dispatch"
+
+
+def test_supplier_workflow_uses_dispatch_workflow_id_when_unique(monkeypatch):
+    class SingleWorkflowEmailAgent:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, context):
+            self.calls.append(context.input_data)
+            drafts = [
+                {
+                    "supplier_id": "S1",
+                    "workflow_id": "wf-dispatch",
+                    "unique_id": "uid-unique",
+                }
+            ]
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"drafts": drafts},
+                pass_fields={"drafts": drafts},
+            )
+
+    email_agent = SingleWorkflowEmailAgent()
+    supplier_agent = StubSupplierAgent()
+    coordinator = StubCoordinator()
+
+    monkeypatch.setattr(
+        patch_dependencies, "coordinator", coordinator, raising=False
+    )
+
+    nick = StubNick(email_agent, supplier_agent)
+    orchestrator = Orchestrator(nick)
+
+    response = orchestrator.execute_workflow(
+        "supplier_interaction", {"draft_payload": {"subject": "RFQ"}}
+    )
+
+    result = response.get("result", {})
+    supplier_input = supplier_agent.calls[0]
+
+    assert supplier_input.get("workflow_id") == "wf-dispatch"
+    assert coordinator.calls[0]["workflow_id"] == "wf-dispatch"
+    assert result["activation_monitor"]["activated"] is True

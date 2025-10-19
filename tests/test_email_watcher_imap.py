@@ -89,3 +89,65 @@ def test_watcher_waits_until_dispatch_complete(monkeypatch):
     assert result["status"] == "waiting_for_dispatch"
     assert "pending_unique_ids" in result
     assert instantiated["count"] == 0
+
+
+def test_run_email_watcher_uses_agent_registry(monkeypatch):
+    from services import email_watcher_service
+
+    env_values = {
+        "IMAP_HOST": "imap.test",
+        "IMAP_USERNAME": "user@test",
+        "IMAP_PASSWORD": "secret",
+    }
+
+    monkeypatch.setattr(email_watcher_service, "app_settings", None)
+    monkeypatch.setattr(email_watcher_service, "_env", lambda key, default=None: env_values.get(key, default))
+    monkeypatch.setattr(email_watcher_service, "_setting", lambda *args: None)
+    monkeypatch.setattr(
+        email_watcher_service,
+        "_load_dispatch_rows",
+        lambda workflow_id: [_sample_row()],
+    )
+    monkeypatch.setattr(
+        email_watcher_service.supplier_response_repo,
+        "fetch_pending",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        email_watcher_service.supplier_response_repo,
+        "delete_responses",
+        lambda **kwargs: None,
+    )
+
+    captured = {}
+
+    class _FakeWatcher:
+        def __init__(self, *, supplier_agent=None, negotiation_agent=None, **kwargs):
+            captured["supplier_agent"] = supplier_agent
+            captured["negotiation_agent"] = negotiation_agent
+
+        def wait_and_collect_responses(self, workflow_id):
+            return {
+                "complete": False,
+                "dispatched_count": 1,
+                "responded_count": 0,
+                "matched_responses": {},
+            }
+
+    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+
+    supplier_agent = object()
+    negotiation_agent = object()
+
+    result = email_watcher_service.run_email_watcher_for_workflow(
+        workflow_id="wf-agent",
+        run_id=None,
+        agent_registry={
+            "supplier_interaction": supplier_agent,
+            "negotiation": negotiation_agent,
+        },
+    )
+
+    assert captured.get("supplier_agent") is supplier_agent
+    assert captured.get("negotiation_agent") is negotiation_agent
+    assert result["status"] == "not_ready"
