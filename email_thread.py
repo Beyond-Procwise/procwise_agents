@@ -1,10 +1,11 @@
 """Email thread utilities ensuring identifier continuity across negotiation rounds."""
+
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-import uuid
 
 
 def _generate_thread_id() -> str:
@@ -15,8 +16,10 @@ def _generate_supplier_unique_id() -> str:
     return f"SUP-{uuid.uuid4().hex[:10].upper()}"
 
 
-def _generate_hidden_identifier() -> str:
-    return f"PROC-WF-{uuid.uuid4().hex[:12].upper()}"
+def _generate_unique_identifier(workflow_id: str, supplier_id: str) -> str:
+    seed = f"{workflow_id}-{supplier_id}-{uuid.uuid4().hex[:8]}"
+    token = seed.replace("_", "-").upper()
+    return f"PROC-WF-{token[:16]}"
 
 
 def make_action_id(round_num: int, supplier_unique_id: str) -> str:
@@ -33,16 +36,18 @@ def make_action_id(round_num: int, supplier_unique_id: str) -> str:
 class EmailThread:
     """Represents a single supplier communication thread across the workflow."""
 
-    thread_id: str = field(default_factory=_generate_thread_id)
-    supplier_id: str = ""
+    workflow_id: str
+    supplier_id: str
     supplier_unique_id: str = field(default_factory=_generate_supplier_unique_id)
-    hidden_identifier: str = field(default_factory=_generate_hidden_identifier)
+    unique_id: str = ""
+    thread_id: str = field(default_factory=_generate_thread_id)
     messages: List[Dict[str, Any]] = field(default_factory=list)
     current_round: int = 0
 
     def __post_init__(self) -> None:
         self.supplier_unique_id = self._normalise_supplier_unique_id(self.supplier_unique_id)
-        self.hidden_identifier = self._normalise_hidden_identifier(self.hidden_identifier)
+        if not self.unique_id:
+            self.unique_id = _generate_unique_identifier(self.workflow_id, self.supplier_id)
 
     @staticmethod
     def _normalise_supplier_unique_id(value: str) -> str:
@@ -51,13 +56,6 @@ class EmailThread:
             token = f"SUP-{token}" if token else _generate_supplier_unique_id()
         if len(token.split("-")) == 1:
             token = f"SUP-{token}"  # ensure prefix
-        return token
-
-    @staticmethod
-    def _normalise_hidden_identifier(value: str) -> str:
-        token = (value or "").upper()
-        if not token.startswith("PROC-WF-"):
-            token = f"PROC-WF-{token}" if token else _generate_hidden_identifier()
         return token
 
     def add_message(
@@ -76,9 +74,10 @@ class EmailThread:
 
         entry: Dict[str, Any] = {
             "thread_id": self.thread_id,
-            "hidden_identifier": self.hidden_identifier,
+            "workflow_id": self.workflow_id,
             "supplier_id": self.supplier_id,
             "supplier_unique_id": self.supplier_unique_id,
+            "unique_id": self.unique_id,
             "message_type": message_type,
             "content": content,
             "action_id": action_id,
@@ -96,9 +95,10 @@ class EmailThread:
 
         header = (
             f"Thread ID: {self.thread_id}\n"
+            f"Workflow ID: {self.workflow_id}\n"
             f"Supplier ID: {self.supplier_id}\n"
             f"Supplier Unique ID: {self.supplier_unique_id}\n"
-            f"Hidden Identifier: {self.hidden_identifier}\n"
+            f"Unique Identifier: {self.unique_id}\n"
         )
         body_segments = []
         for message in self.messages:
@@ -113,6 +113,7 @@ class NegotiationSession:
     """Metadata for a workflow execution session."""
 
     session_id: str
+    workflow_id: str
     start_time: str
     current_round: int = 0
     supplier_states: Dict[str, Dict[str, Any]] = field(default_factory=dict)
