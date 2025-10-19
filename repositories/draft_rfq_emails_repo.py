@@ -67,16 +67,15 @@ def _parse_dt(dt) -> datetime:
     except Exception:
         return datetime.now(timezone.utc)
 
-def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[str] = None) -> Tuple[Set[str], Dict[str, str], Optional[datetime]]:
-    """
-    Return:
-      - set of unique_ids expected for this workflow (optionally filtered by run_id),
-      - mapping unique_id -> supplier_id (may be None),
-      - last dispatch time (max dispatched_at)
-    """
+def _expected_unique_id_rows(
+    *, workflow_id: str, run_id: Optional[str] = None
+) -> List[Tuple[str, Optional[str], datetime, Optional[bool]]]:
     with get_conn() as conn:
         if isinstance(conn, sqlite3.Connection):
-            q = "SELECT unique_id, supplier_id, dispatched_at FROM draft_rfq_emails WHERE workflow_id=?"
+            q = (
+                "SELECT unique_id, supplier_id, dispatched_at, sent "
+                "FROM draft_rfq_emails WHERE workflow_id=?"
+            )
             params = [workflow_id]
             if run_id is not None:
                 q += " AND run_id=?"
@@ -86,7 +85,10 @@ def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[
             rows = cur.fetchall()
             cur.close()
         else:
-            q = "SELECT unique_id, supplier_id, dispatched_at FROM proc.draft_rfq_emails WHERE workflow_id=%s"
+            q = (
+                "SELECT unique_id, supplier_id, dispatched_at, sent "
+                "FROM proc.draft_rfq_emails WHERE workflow_id=%s"
+            )
             params = [workflow_id]
             if run_id is not None:
                 q += " AND run_id=%s"
@@ -95,6 +97,20 @@ def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[
             cur.execute(q, params)
             rows = cur.fetchall()
             cur.close()
+
+    return rows
+
+
+def expected_unique_ids_and_last_dispatch(
+    *, workflow_id: str, run_id: Optional[str] = None
+) -> Tuple[Set[str], Dict[str, str], Optional[datetime]]:
+    """
+    Return:
+      - set of unique_ids expected for this workflow (optionally filtered by run_id),
+      - mapping unique_id -> supplier_id (may be None),
+      - last dispatch time (max dispatched_at)
+    """
+    rows = _expected_unique_id_rows(workflow_id=workflow_id, run_id=run_id)
 
     ids: Set[str] = set()
     map_uid_to_supplier: Dict[str, str] = {}
@@ -111,6 +127,37 @@ def expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id: Optional[
         if last_dt is None or dt > last_dt:
             last_dt = dt
     return ids, map_uid_to_supplier, last_dt
+
+
+def expected_unique_ids_and_last_dispatch_with_pending(
+    *, workflow_id: str, run_id: Optional[str] = None
+) -> Tuple[Set[str], Dict[str, str], Optional[datetime], Set[str]]:
+    """
+    Extended variant that also reports unsent (pending) unique identifiers.
+    """
+
+    rows = _expected_unique_id_rows(workflow_id=workflow_id, run_id=run_id)
+
+    ids: Set[str] = set()
+    map_uid_to_supplier: Dict[str, str] = {}
+    last_dt: Optional[datetime] = None
+    pending: Set[str] = set()
+
+    for row in rows:
+        uid = row[0]
+        sid = row[1]
+        dt = _parse_dt(row[2])
+        sent_flag = row[3] if len(row) > 3 else True
+        if uid:
+            ids.add(uid)
+            if sid:
+                map_uid_to_supplier[uid] = sid
+            if not sent_flag:
+                pending.add(uid)
+        if last_dt is None or dt > last_dt:
+            last_dt = dt
+
+    return ids, map_uid_to_supplier, last_dt, pending
 
 
 def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:

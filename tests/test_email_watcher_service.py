@@ -9,12 +9,14 @@ import services.email_watcher_service as email_watcher_service
 
 def test_email_watcher_service_notify_triggers_runner(monkeypatch):
     calls = []
+    runner_kwargs = []
 
     def fake_load_active_workflow_ids():
         return []
 
     def fake_runner(**kwargs):
         calls.append(kwargs.get("workflow_id"))
+        runner_kwargs.append(kwargs)
         return {"status": "skipped"}
 
     monkeypatch.setattr(
@@ -23,11 +25,13 @@ def test_email_watcher_service_notify_triggers_runner(monkeypatch):
         fake_load_active_workflow_ids,
     )
 
+    registry = {"supplier_interaction": object()}
     watcher = email_watcher_service.EmailWatcherService(
         poll_interval_seconds=60,
         post_dispatch_interval_seconds=60,
         dispatch_wait_seconds=0,
         watcher_runner=fake_runner,
+        agent_registry=registry,
     )
 
     watcher.start()
@@ -38,5 +42,6 @@ def test_email_watcher_service_notify_triggers_runner(monkeypatch):
                 break
             time.sleep(0.05)
         assert "wf-priority" in calls
+        assert any(entry.get("agent_registry") is registry for entry in runner_kwargs)
     finally:
         watcher.stop()

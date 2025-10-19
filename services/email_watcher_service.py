@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from repositories import workflow_email_tracking_repo
 from services.email_watcher_imap import run_email_watcher_for_workflow
@@ -24,6 +24,7 @@ class EmailWatcherService:
         post_dispatch_interval_seconds: Optional[int] = None,
         dispatch_wait_seconds: Optional[int] = None,
         watcher_runner: Optional[Callable[..., Dict[str, object]]] = None,
+        agent_registry: Optional[Dict[str, Any]] = None,
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -46,6 +47,7 @@ class EmailWatcherService:
         self._post_dispatch_interval = post_dispatch_interval_seconds
         self._dispatch_wait = dispatch_wait_seconds
         self._runner: Callable[..., Dict[str, object]] = watcher_runner or run_email_watcher_for_workflow
+        self._agent_registry: Optional[Dict[str, Any]] = agent_registry
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -147,7 +149,7 @@ class EmailWatcherService:
                         workflow_id=workflow_id,
                         run_id=None,
                         wait_seconds_after_last_dispatch=self._dispatch_wait,
-                        agent_registry=None,
+                        agent_registry=self._agent_registry,
                         orchestrator=None,
                     )
                     status = str(result.get("status") or "").lower()

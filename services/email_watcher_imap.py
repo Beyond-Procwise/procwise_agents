@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
+from agents.supplier_interaction_agent import SupplierInteractionAgent
 from services.email_watcher_v2 import EmailWatcherV2
 
 try:  # pragma: no cover - settings import may fail in minimal environments
@@ -209,7 +210,40 @@ def run_email_watcher_for_workflow(
     except Exception:
         max_attempts = 10
 
+    supplier_agent_factory = None
+    if agent_registry:
+        try:
+            registry_entry = agent_registry.get("supplier_interaction")  # type: ignore[call-arg]
+        except Exception:
+            registry_entry = None
+
+        if callable(registry_entry) and not isinstance(
+            registry_entry, SupplierInteractionAgent
+        ):
+
+            def supplier_agent_factory(workflow_key: str, factory=registry_entry):
+                try:
+                    return factory(workflow_key)
+                except TypeError:
+                    return factory()
+
+        elif isinstance(registry_entry, SupplierInteractionAgent):
+            agent_nick = getattr(registry_entry, "agent_nick", None)
+
+            if agent_nick is not None:
+
+                def supplier_agent_factory(workflow_key: str, nick=agent_nick):
+                    agent = SupplierInteractionAgent(nick)
+                    setattr(agent, "workflow_binding", workflow_key)
+                    return agent
+
+            else:
+
+                def supplier_agent_factory(workflow_key: str, agent=registry_entry):
+                    return agent
+
     watcher = EmailWatcherV2(
+        supplier_agent_factory=supplier_agent_factory,
         dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
         poll_interval_seconds=max(1, poll_interval),
         max_poll_attempts=max(1, max_attempts),

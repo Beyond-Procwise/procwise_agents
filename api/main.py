@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
             training_endpoint=app.state.model_training_endpoint,
         )
         app.state.rag_pipeline = RAGPipeline(agent_nick)
-        email_watcher_service = EmailWatcherService()
+        email_watcher_service = EmailWatcherService(agent_registry=agent_nick.agents)
         email_watcher_service.start()
         app.state.email_watcher_service = email_watcher_service
         logger.info("System initialized successfully.")
