@@ -9,6 +9,119 @@ import sqlite3
 
 from services.db import get_conn
 
+_FAKE_INTERACTIONS: List[Dict[str, Any]] = []
+
+
+def _is_fake_connection(conn) -> bool:
+    return hasattr(conn, "_store")
+
+
+def _fake_reset() -> None:
+    _FAKE_INTERACTIONS.clear()
+
+
+def _fake_store_row(row: SupplierInteractionRow) -> Dict[str, Any]:
+    return {
+        "workflow_id": row.workflow_id,
+        "unique_id": row.unique_id,
+        "supplier_id": row.supplier_id,
+        "supplier_email": row.supplier_email,
+        "round_number": row.round_number,
+        "direction": row.direction,
+        "interaction_type": row.interaction_type,
+        "status": row.status,
+        "subject": row.subject,
+        "body": row.body,
+        "message_id": row.message_id,
+        "in_reply_to": list(row.in_reply_to or []),
+        "references": list(row.references or []),
+        "rfq_id": row.rfq_id,
+        "received_at": row.received_at,
+        "processed_at": row.processed_at,
+        "metadata": dict(row.metadata or {}),
+    }
+
+
+def _fake_upsert(row: SupplierInteractionRow) -> None:
+    data = _fake_store_row(row)
+    for existing in _FAKE_INTERACTIONS:
+        if (
+            existing["unique_id"] == data["unique_id"]
+            and existing["direction"] == data["direction"]
+        ):
+            existing.update(data)
+            return
+    _FAKE_INTERACTIONS.append(data)
+
+
+def _fake_mark_status(unique_ids: Iterable[str], direction: str, status: str, processed_at: Optional[datetime]) -> None:
+    ids = {uid for uid in unique_ids if uid}
+    for row in _FAKE_INTERACTIONS:
+        if row["direction"] != direction:
+            continue
+        if row["unique_id"] in ids:
+            row["status"] = status
+            row["processed_at"] = processed_at
+
+
+def _fake_fetch_by_status(
+    *,
+    workflow_id: str,
+    status: str,
+    direction: str,
+    interaction_type: Optional[str],
+    round_number: Optional[int],
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for row in _FAKE_INTERACTIONS:
+        if row["workflow_id"] != workflow_id or row["direction"] != direction:
+            continue
+        if row["status"] != status:
+            continue
+        if interaction_type and row.get("interaction_type") != interaction_type:
+            continue
+        if round_number is not None and row.get("round_number") != round_number:
+            continue
+        results.append({
+            **row,
+            "in_reply_to": list(row.get("in_reply_to") or []),
+            "references": list(row.get("references") or []),
+            "metadata": dict(row.get("metadata") or {}),
+        })
+    return results
+
+
+def _fake_lookup_outbound(unique_id: str) -> Optional[Dict[str, Any]]:
+    for row in _FAKE_INTERACTIONS:
+        if row["unique_id"] == unique_id and row["direction"] == "outbound":
+            return {
+                **row,
+                "in_reply_to": list(row.get("in_reply_to") or []),
+                "references": list(row.get("references") or []),
+                "metadata": dict(row.get("metadata") or {}),
+            }
+    return None
+
+
+def _fake_find_pending_by_rfq(rfq_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not rfq_id:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for row in _FAKE_INTERACTIONS:
+        if row["direction"] != "outbound":
+            continue
+        if row.get("rfq_id") != rfq_id:
+            continue
+        if row.get("status") not in {"pending", "sent"}:
+            continue
+        rows.append({
+            **row,
+            "in_reply_to": list(row.get("in_reply_to") or []),
+            "references": list(row.get("references") or []),
+            "metadata": dict(row.get("metadata") or {}),
+        })
+    return rows
+
 
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
@@ -115,6 +228,9 @@ def _normalise_dt(value: Optional[datetime]) -> Optional[datetime]:
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            cur.close()
+            return
         if isinstance(conn, sqlite3.Connection):
             cur.executescript(DDL_SQLITE)
         else:
@@ -127,11 +243,15 @@ def reset() -> None:
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            _fake_reset()
+            cur.close()
+            return
         if isinstance(conn, sqlite3.Connection):
             cur.execute("DELETE FROM supplier_interaction")
             conn.commit()
         else:
-            cur.execute("TRUNCATE TABLE proc.supplier_interaction")
+            cur.execute("DELETE FROM proc.supplier_interaction")
         cur.close()
 
 
@@ -176,6 +296,10 @@ def register_outbound(row: SupplierInteractionRow) -> None:
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            _fake_upsert(row)
+            cur.close()
+            return
         if isinstance(conn, sqlite3.Connection):
             q = (
                 "INSERT INTO supplier_interaction (workflow_id, unique_id, supplier_id, supplier_email, "
@@ -235,6 +359,10 @@ def mark_status(*, unique_ids: Iterable[str], direction: str, status: str, proce
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            _fake_mark_status(ids, direction, status, processed)
+            cur.close()
+            return
         if isinstance(conn, sqlite3.Connection):
             placeholders = ",".join(["?"] * len(ids))
             q = (
@@ -262,6 +390,15 @@ def fetch_by_status(
 ) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            cur.close()
+            return _fake_fetch_by_status(
+                workflow_id=workflow_id,
+                status=status,
+                direction=direction,
+                interaction_type=interaction_type,
+                round_number=round_number,
+            )
         params: List[Any] = [workflow_id, direction, status]
         filters: List[str] = []
         if interaction_type:
@@ -314,6 +451,9 @@ def lookup_outbound(unique_id: str) -> Optional[Dict[str, Any]]:
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            cur.close()
+            return _fake_lookup_outbound(unique_id)
         if isinstance(conn, sqlite3.Connection):
             q = (
                 "SELECT workflow_id, unique_id, supplier_id, supplier_email, round_number, interaction_type, status, subject, body, "
@@ -392,6 +532,9 @@ def find_pending_by_rfq(rfq_id: Optional[str]) -> List[Dict[str, Any]]:
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if _is_fake_connection(conn):
+            cur.close()
+            return _fake_find_pending_by_rfq(rfq_id)
         if isinstance(conn, sqlite3.Connection):
             q = (
                 "SELECT workflow_id, unique_id, supplier_id, supplier_email, round_number, interaction_type, status, subject, body, "

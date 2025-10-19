@@ -8,15 +8,15 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from repositories import supplier_interaction_repo
 from repositories.supplier_interaction_repo import SupplierInteractionRow
-from services.email_watcher_integrated import (
+from services.email_watcher_v2 import (
     ContinuousEmailWatcher,
+    EmailResponse,
     embed_unique_id_in_email_body,
     generate_unique_email_id,
     get_supplier_responses,
     mark_interaction_processed,
     register_sent_email,
 )
-from services.email_watcher_v2 import EmailResponse
 
 
 def setup_module(_module):

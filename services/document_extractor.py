@@ -20,7 +20,7 @@ try:  # Optional dependency that acts as a secondary PDF fallback.
 except Exception:  # pragma: no cover - optional dependency
     pdfplumber = None  # type: ignore
 
-from agents.document_jsonifier import (
+from services.document_structurer import (
     DocumentJsonifier,
     LayoutElement,
     LayoutTable,

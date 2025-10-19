@@ -36,7 +36,7 @@ class RAGService:
         model_name = getattr(
             self.settings,
             "reranker_model",
-            "cross-encoder/ms-marco-MiniLM-L-12-v2",
+            "BAAI/bge-reranker-large",
         )
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
