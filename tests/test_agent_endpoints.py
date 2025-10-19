@@ -118,6 +118,9 @@ def test_email_workflow_returns_action_id(monkeypatch):
         def __init__(self, agent_nick):
             calls["agent_nick"] = agent_nick
 
+        def resolve_workflow_id(self, identifier):
+            return f"wf-{identifier}" if identifier else None
+
         def send_draft(
             self,
             identifier,
@@ -195,6 +198,9 @@ def test_email_workflow_accepts_list_recipients(monkeypatch):
         def __init__(self, agent_nick):
             captured["agent_nick"] = agent_nick
 
+        def resolve_workflow_id(self, identifier):
+            return f"wf-{identifier}" if identifier else None
+
         def send_draft(
             self,
             identifier,
@@ -244,6 +250,9 @@ def test_email_workflow_marks_failed_dispatch(monkeypatch):
         def __init__(self, agent_nick):
             self.agent_nick = agent_nick
 
+        def resolve_workflow_id(self, identifier):
+            return f"wf-{identifier}" if identifier else None
+
         def send_draft(
             self,
             identifier,
@@ -288,5 +297,65 @@ def test_email_workflow_marks_failed_dispatch(monkeypatch):
 
     prs = orchestrator.agent_nick.process_routing_service
     assert prs.updated_details["status"] == "failed"
+
+
+def test_email_dispatch_without_workflow_is_rejected(monkeypatch):
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
+    client = TestClient(app)
+
+    class StubDispatch:
+        def __init__(self, agent_nick):
+            self.agent_nick = agent_nick
+
+        def resolve_workflow_id(self, identifier):
+            return None
+
+        def send_draft(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("send_draft should not be invoked when workflow is missing")
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
+
+    resp = client.post("/workflows/email", json={"unique_id": "PROC-WF-123"})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "WorkflowUnavailable"
+    assert detail["identifier"] == "PROC-WF-123"
+
+
+def test_email_dispatch_detects_workflow_mismatch(monkeypatch):
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
+    client = TestClient(app)
+
+    class StubDispatch:
+        def __init__(self, agent_nick):
+            self.agent_nick = agent_nick
+
+        def resolve_workflow_id(self, identifier):
+            return "wf-stored"
+
+        def send_draft(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("send_draft should not be invoked when workflows mismatch")
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
+
+    resp = client.post(
+        "/workflows/email",
+        json={"unique_id": "PROC-WF-456", "workflow_id": "wf-request"},
+    )
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "WorkflowMismatch"
+    assert detail["request_workflow_id"] == "wf-request"
+    assert detail["stored_workflow_id"] == "wf-stored"
 
 

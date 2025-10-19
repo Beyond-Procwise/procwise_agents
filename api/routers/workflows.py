@@ -17,6 +17,7 @@ from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
 from services.email_dispatch_service import EmailDispatchService
+from repositories import draft_rfq_emails_repo
 
 # Ensure GPU-related environment variables are set
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -510,6 +511,98 @@ def _deserialise_structured_fields(payload: Dict[str, Any]) -> None:
             payload[key] = _maybe_parse_embedded_json(value)
 
 
+def _coerce_identifier(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def _extract_workflow_token(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        try:
+            payload = dict(payload)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    for key in ("workflow_id", "workflowId", "workflowID", "process_workflow_id"):
+        token = _coerce_identifier(payload.get(key))
+        if token:
+            return token
+    return None
+
+
+def _resolve_dispatch_workflow_id(
+    request_model: "EmailDispatchRequest", identifier: Optional[str]
+) -> Optional[str]:
+    candidate = None
+
+    extras = getattr(request_model, "model_extra", None)
+    if isinstance(extras, dict):
+        candidate = _extract_workflow_token(extras)
+
+    if not candidate:
+        draft = getattr(request_model, "draft", None)
+        if draft is not None:
+            try:
+                candidate = _extract_workflow_token(draft.model_dump(exclude_none=True))
+            except Exception:
+                candidate = None
+            if not candidate:
+                draft_extras = getattr(draft, "model_extra", None)
+                if isinstance(draft_extras, dict):
+                    candidate = _extract_workflow_token(draft_extras)
+            if not candidate:
+                metadata = getattr(draft, "metadata", None)
+                if isinstance(metadata, dict):
+                    candidate = _extract_workflow_token(metadata)
+
+    if not candidate:
+        drafts = getattr(request_model, "drafts", None)
+        if isinstance(drafts, list):
+            for entry in drafts:
+                if entry is None:
+                    continue
+                try:
+                    entry_dict = entry.model_dump(exclude_none=True)  # type: ignore[call-arg]
+                except AttributeError:
+                    entry_dict = entry if isinstance(entry, dict) else None
+                if not isinstance(entry_dict, dict):
+                    continue
+                candidate = _extract_workflow_token(entry_dict)
+                if candidate:
+                    break
+                metadata = entry_dict.get("metadata")
+                candidate = _extract_workflow_token(metadata)
+                if candidate:
+                    break
+
+    if candidate:
+        return candidate
+
+    identifier_token = _coerce_identifier(identifier)
+    if not identifier_token:
+        return None
+
+    try:
+        draft_record = draft_rfq_emails_repo.load_by_unique_id(identifier_token)
+    except Exception:
+        logger.exception(
+            "Failed to resolve workflow_id from draft repository for identifier=%s",
+            identifier_token,
+        )
+        return None
+
+    if isinstance(draft_record, dict):
+        return _coerce_identifier(draft_record.get("workflow_id"))
+    return None
+
+
 async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest:
     """Load the dispatch request supporting both JSON and form submissions."""
 
@@ -759,6 +852,33 @@ async def send_email(
         )
 
     input_data = dispatch_request.model_dump(exclude_none=True)
+    dispatch_service = EmailDispatchService(agent_nick)
+
+    workflow_id_hint = _resolve_dispatch_workflow_id(dispatch_request, identifier)
+    repository_workflow_id = dispatch_service.resolve_workflow_id(identifier)
+
+    if workflow_id_hint and repository_workflow_id and workflow_id_hint != repository_workflow_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "WorkflowMismatch",
+                "message": "Dispatch identifier is associated with a different workflow",
+                "request_workflow_id": workflow_id_hint,
+                "stored_workflow_id": repository_workflow_id,
+            },
+        )
+
+    workflow_id_hint = workflow_id_hint or repository_workflow_id
+
+    if not workflow_id_hint:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "WorkflowUnavailable",
+                "message": "Unable to resolve workflow_id for dispatch identifier",
+                "identifier": identifier,
+            },
+        )
 
     prs = orchestrator.agent_nick.process_routing_service
 
@@ -767,9 +887,12 @@ async def send_email(
         "agents": [],
         "output": {},
         "status": "saved",
+        "workflow_id": workflow_id_hint,
     }
     process_id = prs.log_process(
-        process_name="email_dispatch", process_details=initial_details
+        process_name="email_dispatch",
+        process_details=initial_details,
+        workflow_id=workflow_id_hint,
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
@@ -784,7 +907,7 @@ async def send_email(
         action_id=action_reference,
     )
 
-    dispatch_service = EmailDispatchService(agent_nick)
+    workflow_id_final = workflow_id_hint
 
     try:
         result = await run_in_threadpool(
@@ -810,6 +933,31 @@ async def send_email(
         else:
             response_recipients = dispatch_request.resolve_recipients() or []
 
+        result_workflow_id = _coerce_identifier(result.get("workflow_id"))
+        if not result_workflow_id:
+            draft_payload = result.get("draft") if isinstance(result, dict) else None
+            if isinstance(draft_payload, dict):
+                result_workflow_id = _extract_workflow_token(draft_payload)
+
+        if workflow_id_hint and result_workflow_id and workflow_id_hint != result_workflow_id:
+            logger.error(
+                "Dispatch workflow mismatch for identifier=%s request_workflow=%s result_workflow=%s",
+                identifier,
+                workflow_id_hint,
+                result_workflow_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "WorkflowMismatch",
+                    "message": "Dispatch completed under different workflow identifier",
+                    "request_workflow_id": workflow_id_hint,
+                    "result_workflow_id": result_workflow_id,
+                },
+            )
+
+        workflow_id_final = result_workflow_id or workflow_id_hint
+
         response_data: Dict[str, Any] = dict(result)
         response_data.update(
             success=bool(result.get("sent", False)),
@@ -820,6 +968,7 @@ async def send_email(
             sender=str(result.get("sender") or dispatch_request.resolve_sender() or ""),
             subject=str(result.get("subject") or dispatch_request.resolve_subject() or ""),
             error=result.get("error"),
+            workflow_id=workflow_id_final,
         )
 
         if response_data.get("body") is None:
@@ -844,6 +993,7 @@ async def send_email(
             "agents": [],
             "output": response_payload,
             "status": status_label,
+            "workflow_id": workflow_id_final,
         }
         prs.update_process_details(process_id, final_details)
         prs.update_process_status(process_id, 1 if response.sent else -1)
@@ -885,6 +1035,7 @@ async def send_email(
         "status": status_label,
         "result": response_payload,
         "action_id": action_id,
+        "workflow_id": workflow_id_final,
     }
 
 
