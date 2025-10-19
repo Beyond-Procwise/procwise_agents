@@ -103,13 +103,14 @@ class Settings(BaseSettings):
         default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
     )
     rag_model: str = Field(default="gemma3:1b-it-qat", env="RAG_LLM_MODEL")
-    # ``nomic-embed-text`` offers competitive retrieval quality with a compact
-    # footprint (768 dimensions) and is optimised for procurement-style
-    # documents, making it a better default for document extraction pipelines.
-    embedding_model: str = "multi-qa-mpnet-base-dot-v1"
-    vector_size: int = 768
+    # ``BAAI/bge-large-en-v1.5`` provides state-of-the-art dense retrieval
+    # performance for procurement terminology while remaining compatible with
+    # Qdrant's HNSW indexes. The model outputs 1024 dimensional vectors which
+    # improves clustering of nuanced supplier and category data.
+    embedding_model: str = "BAAI/bge-large-en-v1.5"
+    vector_size: int = 1024
     reranker_model: str = Field(
-        default="cross-encoder/ms-marco-MiniLM-L-12-v2", env="RERANKER_MODEL"
+        default="BAAI/bge-reranker-large", env="RERANKER_MODEL"
     )
     procurement_knowledge_path: Optional[str] = Field(
         default=None, env="PROCUREMENT_KNOWLEDGE_PATH"

@@ -65,7 +65,7 @@ class RAGPipeline:
         model_name = getattr(
             self.settings,
             "reranker_model",
-            "cross-encoder/ms-marco-MiniLM-L-12-v2",
+            "BAAI/bge-reranker-large",
         )
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
@@ -90,10 +90,12 @@ class RAGPipeline:
         """Re-rank search hits using a cross-encoder for improved accuracy."""
         if not hits:
             return []
-        pairs = [
-            (query, h.payload.get("summary", h.payload.get("content", "")))
-            for h in hits
-        ]
+        pairs = []
+        for hit in hits:
+            payload = getattr(hit, "payload", {}) or {}
+            summary = payload.get("summary") or payload.get("text_summary")
+            text = summary or payload.get("content", "")
+            pairs.append((query, text))
         scores = self._reranker.predict(pairs)
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         return [h for h, _ in ranked[:top_k]]

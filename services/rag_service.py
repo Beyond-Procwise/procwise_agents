@@ -75,10 +75,33 @@ class RAGService:
             if not isinstance(payload, dict):
                 continue
 
+            structured_payload = payload.get("payload")
+            if isinstance(structured_payload, dict):
+                base_payload = dict(structured_payload)
+            else:
+                base_payload = dict(payload)
+            base_payload.pop("payload", None)
+
+            record_id = (
+                base_payload.get("record_id")
+                or payload.get("record_id")
+                or str(uuid.uuid4())
+            )
+            base_payload["record_id"] = record_id
+
+            if text_representation_key in base_payload:
+                base_payload.pop(text_representation_key, None)
+
             text_to_embed = payload.get(text_representation_key)
+            if text_to_embed is None and text_representation_key != "content":
+                text_to_embed = base_payload.get(text_representation_key)
+            if not isinstance(text_to_embed, str) or not text_to_embed.strip():
+                summary_fallback = payload.get("text_summary")
+                if isinstance(summary_fallback, str) and summary_fallback.strip():
+                    text_to_embed = summary_fallback
             if not isinstance(text_to_embed, str) or not text_to_embed.strip():
                 try:
-                    text_to_embed = json.dumps(payload, ensure_ascii=False)
+                    text_to_embed = json.dumps(base_payload, ensure_ascii=False)
                 except (TypeError, ValueError):
                     text_to_embed = ""
 
@@ -86,10 +109,26 @@ class RAGService:
             if not chunks:
                 continue
 
-            record_id = payload.get("record_id") or str(uuid.uuid4())
-
             for idx, chunk in enumerate(chunks):
-                chunk_payload = {**payload, "content": chunk, "chunk_id": idx, "record_id": record_id}
+                chunk_payload = dict(base_payload)
+                chunk_payload["chunk_id"] = idx
+                if (
+                    "content" in chunk_payload
+                    and chunk_payload.get("content") != chunk
+                ):
+                    chunk_payload.setdefault(
+                        "_rag_source_content", chunk_payload.get("content")
+                    )
+                chunk_payload["content"] = chunk
+                if (
+                    "text_summary" in chunk_payload
+                    and chunk_payload.get("text_summary") != chunk
+                ):
+                    chunk_payload.setdefault(
+                        "_rag_source_text_summary",
+                        chunk_payload.get("text_summary"),
+                    )
+                chunk_payload["text_summary"] = chunk
                 texts_for_embedding.append(chunk)
                 payloads_for_storage.append(chunk_payload)
 
@@ -234,7 +273,16 @@ class RAGService:
 
         # --- Re-rank with cross-encoder ---
         pairs = [
-            (query, h.payload.get("content", h.payload.get("summary", "")))
+            (
+                query,
+                h.payload.get(
+                    "text_summary",
+                    h.payload.get(
+                        "content",
+                        h.payload.get("summary", ""),
+                    ),
+                ),
+            )
             for h in hits
         ]
         scores = self._reranker.predict(pairs)

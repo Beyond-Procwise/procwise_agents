@@ -345,6 +345,37 @@ def test_fetch_procurement_flow_handles_missing_category_mapping(monkeypatch):
         assert df[field].isna().all()
 
 
+def test_assign_procurement_categories_uses_vector_fallback():
+    engine = QueryEngine(agent_nick=types.SimpleNamespace())
+
+    df = pd.DataFrame(
+        {
+            "supplier_id": ["S1", "S1"],
+            "supplier_name": ["Alpha", "Alpha"],
+            "po_id": ["PO-1", "PO-2"],
+            "po_line_id": [101, 202],
+            "item_description": ["Heavy duty bolt", "Cable tie pack"],
+            "invoice_id": ["INV-1", "INV-2"],
+            "invoice_line_id": [501, 502],
+        }
+    )
+
+    category_df = pd.DataFrame(
+        {
+            "product": ["Bolt", "Cable Tie"],
+            "category_level_1": ["Hardware", "Hardware"],
+            "category_level_2": ["Fasteners", "Fasteners"],
+            "category_level_3": [None, None],
+            "category_level_4": [None, None],
+            "category_level_5": [None, None],
+        }
+    )
+
+    result = engine._assign_procurement_categories(df.copy(), category_df)
+
+    assert list(result["product"]) == ["Bolt", "Cable Tie"]
+
+
 def test_train_procurement_context_embeds_schema(monkeypatch):
     class DummyConnection:
         def __enter__(self):
