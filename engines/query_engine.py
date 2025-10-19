@@ -9,9 +9,10 @@ and purchase order tables.  The returned ``pandas.DataFrame`` is consumed by
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from contextlib import contextmanager
-from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -98,7 +99,9 @@ PROCUREMENT_CATEGORY_FIELDS = [
     "category_level_5",
 ]
 
-_PRODUCT_SIMILARITY_THRESHOLD = 0.35
+_PRODUCT_SIMILARITY_THRESHOLD = 0.45
+_FALLBACK_EMBED_DIM = 256
+_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
 
 # Canonical procurement tables that should be embedded for supplier-aware RAG
 _PROCUREMENT_TABLE_SOURCES: dict[str, tuple[str, str]] = {
@@ -120,6 +123,11 @@ class QueryEngine(BaseEngine):
     def __init__(self, agent_nick):
         super().__init__()
         self.agent_nick = agent_nick
+        self._cached_category_vectors: Optional[np.ndarray] = None
+        self._cached_category_rows: List[Any] = []
+        self._cached_category_keys: Optional[tuple[str, ...]] = None
+        self._cached_embedder_signature: Optional[Any] = None
+        self._fallback_token_cache: Dict[str, int] = {}
 
     @contextmanager
     def _pandas_reader(self):
@@ -704,7 +712,8 @@ class QueryEngine(BaseEngine):
         if df.empty or category_df.empty:
             return df
 
-        mapping_rows = []
+        product_rows: List[Any] = []
+        product_texts: List[str] = []
         for row in category_df.itertuples(index=False, name="CategoryRow"):
             product = getattr(row, "product", None)
             if product is None:
@@ -714,34 +723,55 @@ class QueryEngine(BaseEngine):
             if not product_str:
                 continue
 
-            mapping_rows.append((product_str.lower(), row))
+            product_rows.append(row)
+            product_texts.append(product_str.lower())
 
-        if not mapping_rows:
+        if not product_rows:
             return df
 
-        matched_rows = []
-        descriptions = df.get("item_description", pd.Series(dtype="object")).fillna("")
+        descriptions_series = df.get("item_description", pd.Series(dtype="object")).fillna("")
+        description_texts = [str(desc).strip().lower() for desc in descriptions_series]
 
-        for description in descriptions:
-            description_str = str(description).strip()
-            if not description_str:
-                matched_rows.append(None)
+        matched_rows: List[Optional[Any]] = [None] * len(description_texts)
+        if not description_texts:
+            return df
+
+        embedder = self._resolve_category_embedder()
+        embedder_signature = self._embedder_signature(embedder)
+
+        fingerprint = tuple(product_texts)
+        needs_refresh = (
+            self._cached_category_vectors is None
+            or self._cached_category_keys != fingerprint
+            or self._cached_embedder_signature != embedder_signature
+        )
+
+        if needs_refresh:
+            category_vectors = self._encode_texts(product_texts, embedder)
+            if category_vectors is None:
+                return df
+            self._cached_category_vectors = category_vectors
+            self._cached_category_rows = product_rows
+            self._cached_category_keys = fingerprint
+            self._cached_embedder_signature = embedder_signature
+
+        category_vectors = self._cached_category_vectors
+        if category_vectors is None or category_vectors.size == 0:
+            return df
+
+        desc_vectors = self._encode_texts(description_texts, embedder)
+        if desc_vectors is None or desc_vectors.size == 0:
+            return df
+
+        similarity_matrix = np.matmul(desc_vectors, category_vectors.T)
+
+        for idx, similarities in enumerate(similarity_matrix):
+            if not description_texts[idx]:
                 continue
-
-            desc_key = description_str.lower()
-            best_score = 0.0
-            best_row = None
-
-            for product_key, mapping_row in mapping_rows:
-                score = SequenceMatcher(None, desc_key, product_key).ratio()
-                if score > best_score:
-                    best_score = score
-                    best_row = mapping_row
-
+            best_idx = int(np.argmax(similarities))
+            best_score = float(similarities[best_idx])
             if best_score >= _PRODUCT_SIMILARITY_THRESHOLD:
-                matched_rows.append(best_row)
-            else:
-                matched_rows.append(None)
+                matched_rows[idx] = self._cached_category_rows[best_idx]
 
         for field in PROCUREMENT_CATEGORY_FIELDS:
             values = []
@@ -753,6 +783,83 @@ class QueryEngine(BaseEngine):
             df[field] = values
 
         return df
+
+    def _resolve_category_embedder(self):
+        """Return the embedding model used for procurement category linkage."""
+
+        embedder = getattr(self.agent_nick, "embedding_model", None)
+        if embedder is not None and hasattr(embedder, "encode"):
+            return embedder
+        return None
+
+    @staticmethod
+    def _embedder_signature(embedder) -> Any:
+        """Return a cache key identifying the active embedder instance."""
+
+        return "fallback" if embedder is None else id(embedder)
+
+    def _encode_texts(self, texts: List[str], embedder) -> Optional[np.ndarray]:
+        """Encode ``texts`` using ``embedder`` with hashed fallback vectors."""
+
+        if not texts:
+            return None
+
+        normalised = [str(t).strip().lower() for t in texts]
+
+        if embedder is not None:
+            try:
+                vectors = embedder.encode(
+                    normalised,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                arr = np.array(vectors, dtype="float32")
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                return arr
+            except Exception:
+                logger.exception(
+                    "Embedding model encoding failed; reverting to hashed fallback vectors"
+                )
+
+        fallback_vectors = self._fallback_encode(normalised)
+        if fallback_vectors is None:
+            return None
+        return fallback_vectors
+
+    def _fallback_encode(self, texts: List[str]) -> Optional[np.ndarray]:
+        """Hash-based embedding fallback used when no model is available."""
+
+        if not texts:
+            return None
+
+        vectors = np.zeros((len(texts), _FALLBACK_EMBED_DIM), dtype="float32")
+        for idx, text in enumerate(texts):
+            if not text:
+                continue
+            vectors[idx] = self._hash_text(text)
+        return vectors
+
+    def _hash_text(self, text: str) -> np.ndarray:
+        """Return a normalised hashed token vector for ``text``."""
+
+        vector = np.zeros((_FALLBACK_EMBED_DIM,), dtype="float32")
+        tokens = _TOKEN_PATTERN.findall(text.lower())
+        if not tokens:
+            return vector
+
+        for token in tokens:
+            idx = self._fallback_token_cache.get(token)
+            if idx is None:
+                digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
+                idx = int(digest, 16) % _FALLBACK_EMBED_DIM
+                self._fallback_token_cache[token] = idx
+            vector[idx] += 1.0
+
+        norm = float(np.linalg.norm(vector))
+        if norm > 0:
+            vector /= norm
+        return vector
 
     # ------------------------------------------------------------------
     # Procurement summarisation helpers
@@ -793,8 +900,9 @@ class QueryEngine(BaseEngine):
                 f"line {row.invoice_line_id}."
             )
 
-            raw_payload = {
-                "record_id": f"flow_supplier_{row.supplier_id}_po_{row.po_id}",
+            record_id = f"flow_supplier_{row.supplier_id}_po_{row.po_id}"
+            structured_payload = {
+                "record_id": record_id,
                 "document_type": "procurement_flow",
                 "supplier_id": row.supplier_id,
                 "supplier_name": row.supplier_name,
@@ -810,16 +918,24 @@ class QueryEngine(BaseEngine):
                 "category_level_5": getattr(row, "category_level_5", None),
                 "invoice_id": getattr(row, "invoice_id", None),
                 "invoice_line_id": getattr(row, "invoice_line_id", None),
-                "content": text_summary,
             }
 
-            payloads.append({k: _normalise_payload_value(v) for k, v in raw_payload.items()})
+            payloads.append(
+                {
+                    "record_id": record_id,
+                    "payload": {
+                        k: _normalise_payload_value(v)
+                        for k, v in structured_payload.items()
+                    },
+                    "text_summary": _normalise_payload_value(text_summary),
+                }
+            )
 
         if not payloads:
             return
 
         rag = RAGService(self.agent_nick)
-        rag.upsert_payloads(payloads, text_representation_key="content")
+        rag.upsert_payloads(payloads, text_representation_key="text_summary")
 
     # ------------------------------------------------------------------
     # Agent training helpers

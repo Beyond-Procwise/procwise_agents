@@ -33,7 +33,7 @@ class RAGAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         model_name = getattr(
-            self.settings, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            self.settings, "reranker_model", "BAAI/bge-reranker-large"
         )
         # Cross encoder ensures accurate ranking while utilising the GPU
         self._reranker = load_cross_encoder(
@@ -59,6 +59,8 @@ class RAGAgent(BaseAgent):
             f"RAGAgent received query: '{query}' for user: '{user_id}'"
             + (f" in session '{session_id}'" if session_id else "")
         )
+
+        history = self._load_chat_history(user_id, session_id)
 
         must: list[models.FieldCondition] = []
         if doc_type:
@@ -129,7 +131,6 @@ class RAGAgent(BaseAgent):
 
         if not reranked_docs and not knowledge_hits_sorted:
             answer = "I could not find any relevant documents to answer your question."
-            history = self._load_chat_history(user_id, session_id)
             history.append({"query": query, "answer": answer})
             self._save_chat_history(user_id, history, session_id)
             return {
@@ -172,6 +173,12 @@ class RAGAgent(BaseAgent):
                 json.dumps(payload_snapshot, ensure_ascii=False)
             )
 
+        conversation_context = self._format_recent_history(history, limit=3)
+        if conversation_context:
+            conversation_section = f"RECENT CONVERSATION:\n{conversation_context}\n\n"
+        else:
+            conversation_section = ""
+
         rag_prompt = (
             "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
             "the USER QUESTION. If you must rely on prior knowledge, limit it strictly to procurement topics and never infer "
@@ -188,7 +195,7 @@ class RAGAgent(BaseAgent):
             "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
             f"AGENTIC PLAN:\n{plan_text}\n\n"
             f"CONTEXT OUTLINE:\n{outline_text}\n\n"
-            f"RETRIEVED CONTENT:\n{context_block}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
+            f"{conversation_section}RETRIEVED CONTENT:\n{context_block}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
         )
 
         # Generate answer and follow-up suggestions in parallel
@@ -209,7 +216,6 @@ class RAGAgent(BaseAgent):
         followups = follow_future.result()
         answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
 
-        history = self._load_chat_history(user_id, session_id)
         history.append({"query": query, "answer": answer})
         self._save_chat_history(user_id, history, session_id)
 
@@ -251,8 +257,13 @@ class RAGAgent(BaseAgent):
             (
                 query,
                 hit.payload.get(
-                    "content",
-                    hit.payload.get("summary", json.dumps(hit.payload, ensure_ascii=False)),
+                    "text_summary",
+                    hit.payload.get(
+                        "content",
+                        hit.payload.get(
+                            "summary", json.dumps(hit.payload, ensure_ascii=False)
+                        ),
+                    ),
                 ),
             )
             for hit in hits
@@ -295,6 +306,25 @@ class RAGAgent(BaseAgent):
         resp = self.call_ollama(prompt, model=self.settings.extraction_model)
         questions = resp.get("response", "").strip().splitlines()
         return [q for q in questions if q]
+
+    def _format_recent_history(self, history: Sequence[Dict[str, Any]], limit: int = 3) -> str:
+        """Return the last ``limit`` user/assistant turns as a formatted string."""
+
+        if not history:
+            return ""
+
+        recent_turns = history[-max(1, limit) :]
+        lines: List[str] = []
+        for turn in recent_turns:
+            if not isinstance(turn, dict):
+                continue
+            query = turn.get("query")
+            if isinstance(query, str) and query.strip():
+                lines.append(f"User: {query.strip()}")
+            answer = turn.get("answer")
+            if isinstance(answer, str) and answer.strip():
+                lines.append(f"Assistant: {answer.strip()}")
+        return "\n".join(lines).strip()
 
     def _load_chat_history(self, user_id: str, session_id: str | None = None) -> list:
         history_key = (
