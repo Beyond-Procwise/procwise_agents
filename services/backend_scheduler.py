@@ -188,7 +188,11 @@ class BackendScheduler:
     def _ensure_email_watcher_service(self) -> EmailWatcherService:
         with self._email_watcher_lock:
             if self._email_watcher_service is None:
-                self._email_watcher_service = EmailWatcherService()
+                registry = getattr(self.agent_nick, "agents", None)
+                self._email_watcher_service = EmailWatcherService(
+                    agent_registry=registry,
+                    orchestrator=None,
+                )
             service = self._email_watcher_service
         service.start()
         return service

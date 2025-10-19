@@ -1985,12 +1985,31 @@ class Orchestrator:
                 default_text = None
 
         if unique_candidates:
+            lowered_candidates = {candidate.lower(): candidate for candidate in unique_candidates}
+
             if default_text:
                 lowered_default = default_text.lower()
-                if len(unique_candidates) > 1:
+                if lowered_default in lowered_candidates:
                     return default_text
-                if unique_candidates[0].lower() != lowered_default:
-                    return default_text
+
+            if len(unique_candidates) == 1:
+                selected = unique_candidates[0]
+                if default_text and selected.lower() != default_text.lower():
+                    logger.info(
+                        "Realigning supplier workflow from %s to %s based on draft metadata",
+                        default_text,
+                        selected,
+                    )
+                return selected
+
+            if default_text:
+                logger.warning(
+                    "Conflicting workflow identifiers found in drafts %s; retaining parent workflow %s",
+                    unique_candidates,
+                    default_text,
+                )
+                return default_text
+
             return unique_candidates[0]
 
         return default_text
@@ -2259,8 +2278,19 @@ class Orchestrator:
         child_input.setdefault("agent_manifest", manifest)
         child_input.setdefault("policy_context", manifest.get("policies", []))
         child_input.setdefault("knowledge_context", manifest.get("knowledge", {}))
+        workflow_override = None
+        if isinstance(pass_fields, dict):
+            workflow_override = pass_fields.get("workflow_id") or pass_fields.get("workflow")
+        if not workflow_override and isinstance(child_input, dict):
+            workflow_override = child_input.get("workflow_id") or child_input.get("workflow")
+        if workflow_override:
+            try:
+                workflow_override = str(workflow_override).strip()
+            except Exception:
+                workflow_override = None
+        workflow_id = workflow_override or parent_context.workflow_id
         child_context = AgentContext(
-            workflow_id=parent_context.workflow_id,
+            workflow_id=workflow_id,
             agent_id=agent_name,
             user_id=parent_context.user_id,
             input_data=child_input,
@@ -2271,5 +2301,7 @@ class Orchestrator:
             knowledge_base=manifest.get("knowledge", {}),
             process_id=parent_context.process_id,
         )
+        if workflow_override:
+            child_context.input_data["workflow_id"] = workflow_id
         child_context.apply_manifest(manifest)
         return child_context
