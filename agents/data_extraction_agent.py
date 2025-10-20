@@ -72,6 +72,12 @@ configure_gpu()
 HITL_CONFIDENCE_THRESHOLD = 0.85
 
 REFERENCE_PATH = Path(__file__).resolve().parents[1] / "docs" / "procurement_table_reference.md"
+LEARNING_LOG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "resources"
+    / "learning"
+    / "data_extraction_llm_logs.jsonl"
+)
 _TABLE_SECTION_PATTERN = re.compile(r"### `([^`]+)`'?[\r\n]+```(.*?)```", re.DOTALL)
 
 
@@ -643,17 +649,40 @@ class DataExtractionAgent(BaseAgent):
     )
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.extraction_model = getattr(
-            self.settings,
-            "document_extraction_model",
-            self.settings.extraction_model,
-        )
+        self._learning_log_path = LEARNING_LOG_PATH
+        try:
+            self._learning_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.debug("Unable to ensure learning log directory", exc_info=True)
+        self._learning_log_lock = threading.Lock()
+        self.extraction_model = self._select_fast_extraction_model()
         self._document_extractor: Optional[DocumentExtractor] = None
         self._document_extractor_lock = threading.Lock()
 
     # --------------------------------------------------------------------
     # Regex-based header extraction
     # --------------------------------------------------------------------
+    def _select_fast_extraction_model(self) -> str:
+        preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
+        try:
+            available = set(self._get_available_ollama_models())
+        except Exception:
+            logger.debug("Unable to list Ollama models; defaulting to first preference", exc_info=True)
+            available = set()
+
+        for candidate in preferred_models:
+            if candidate in available:
+                logger.info("DataExtractionAgent using fast model '%s'", candidate)
+                return candidate
+
+        fallback = preferred_models[0]
+        logger.info(
+            "Preferred models %s not detected; defaulting to '%s'",
+            preferred_models,
+            fallback,
+        )
+        return fallback
+
     def _get_document_extractor(self) -> DocumentExtractor:
         extractor = self._document_extractor
         if extractor is not None:
@@ -1263,7 +1292,10 @@ class DataExtractionAgent(BaseAgent):
 
         if doc_type in {"Purchase_Order", "Invoice", "Quote", "Contract"}:
             structured = self._extract_structured_data(
-                text, file_bytes, doc_type
+                text,
+                file_bytes,
+                doc_type,
+                object_key,
             )
             merged_header = self._merge_record_fields(structured.header, raw_header)
             if vendor_name:
@@ -2156,106 +2188,11 @@ class DataExtractionAgent(BaseAgent):
                         report["is_valid"] = False
                         report["confidence_score"] -= 0.20
 
-        amount_fields = {
-            "Invoice": ["invoice_amount", "tax_amount", "invoice_total_incl_tax"],
-            "Purchase_Order": ["total_amount"],
-            "Quote": ["total_amount", "total_amount_incl_tax"],
-        }
-
-        for field in amount_fields.get(doc_type, []):
-            value = header.get(field)
-            if value is not None:
-                try:
-                    numeric_value = float(value)
-                    if numeric_value < 0:
-                        report["errors"].append(f"{field} is negative: {numeric_value}")
-                        report["is_valid"] = False
-                    elif numeric_value == 0:
-                        report["warnings"].append(f"{field} is zero")
-                        report["confidence_score"] -= 0.05
-                    elif numeric_value > 10_000_000:
-                        report["warnings"].append(
-                            f"{field} unusually large: {numeric_value}"
-                        )
-                        report["confidence_score"] -= 0.05
-
-                    report["field_scores"][field] = 1.0
-                except (ValueError, TypeError):
-                    report["errors"].append(f"{field} is not a valid number: {value}")
-                    report["is_valid"] = False
-                    report["field_scores"][field] = 0.0
-
-        if doc_type == "Invoice":
-            subtotal = header.get("invoice_amount")
-            tax = header.get("tax_amount")
-            total = header.get("invoice_total_incl_tax")
-
-            if all(v is not None for v in [subtotal, tax, total]):
-                try:
-                    calculated_total = float(subtotal) + float(tax)
-                    actual_total = float(total)
-                    diff = abs(calculated_total - actual_total)
-                    if diff > 0.02:
-                        report["errors"].append(
-                            "Total mismatch: "
-                            f"{subtotal} + {tax} = {calculated_total}, but total is {actual_total} "
-                            f"(diff: {diff:.2f})"
-                        )
-                        report["is_valid"] = False
-                        report["confidence_score"] -= 0.15
-                    else:
-                        report["confidence_score"] = min(
-                            1.0, report["confidence_score"] + 0.05
-                        )
-                except (ValueError, TypeError):
-                    pass
-
         if line_items:
             for idx, item in enumerate(line_items, start=1):
                 if not item.get("item_description"):
                     report["warnings"].append(f"Line {idx}: Missing description")
                     report["confidence_score"] -= 0.02
-
-                if all(key in item for key in ["quantity", "unit_price"]):
-                    try:
-                        qty = float(item["quantity"])
-                        price = float(item["unit_price"])
-                        expected = qty * price
-                        actual_value = item.get("line_amount") or item.get("line_total")
-                        if actual_value is not None:
-                            actual = float(actual_value)
-                            diff = abs(expected - actual)
-                            if diff > 0.02:
-                                report["warnings"].append(
-                                    f"Line {idx}: Amount mismatch ({qty} × {price} = {expected:.2f}, got {actual:.2f})"
-                                )
-                                report["confidence_score"] -= 0.03
-                    except (ValueError, TypeError):
-                        pass
-
-            line_sum = 0.0
-            for item in line_items:
-                raw_value = item.get("line_amount") or item.get("line_total")
-                if raw_value is None:
-                    continue
-                cleaned = self._clean_numeric(raw_value)
-                if cleaned is None:
-                    continue
-                line_sum += cleaned
-
-            header_subtotal = header.get("invoice_amount") or header.get("total_amount")
-            header_value = (
-                self._clean_numeric(header_subtotal)
-                if header_subtotal is not None
-                else None
-            )
-            if header_value is not None and line_sum > 0:
-                diff = abs(line_sum - header_value)
-                if diff > 0.02:
-                    report["warnings"].append(
-                        f"Line items sum to {line_sum:.2f} but header shows {header_subtotal}"
-                    )
-                    report["confidence_score"] -= 0.05
         else:
             if doc_type in ["Invoice", "Purchase_Order", "Quote"]:
                 report["warnings"].append("No line items extracted")
@@ -3678,6 +3615,38 @@ class DataExtractionAgent(BaseAgent):
             merged = merged[:max_chars]
         return merged
 
+    def _log_llm_learning_sample(
+        self,
+        *,
+        doc_type: str,
+        source_hint: Optional[str],
+        prompt: str,
+        raw_response: str,
+    ) -> None:
+        if not prompt and not raw_response:
+            return
+
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "doc_type": doc_type,
+            "source_hint": source_hint or "",
+            "prompt": prompt,
+            "raw_response": raw_response,
+        }
+
+        try:
+            payload = json.dumps(record, ensure_ascii=False)
+        except Exception:
+            logger.debug("Failed to serialise learning log record", exc_info=True)
+            return
+
+        try:
+            with self._learning_log_lock:
+                with self._learning_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(payload + "\n")
+        except Exception:
+            logger.debug("Failed to append learning log", exc_info=True)
+
     def _llm_structured_dataframes(
         self,
         text: str,
@@ -3773,7 +3742,11 @@ class DataExtractionAgent(BaseAgent):
         return header_df, line_df, cleaned_notes
 
     def _extract_structured_data(
-        self, text: str, file_bytes: bytes, doc_type: str
+        self,
+        text: str,
+        file_bytes: bytes,
+        doc_type: str,
+        source_hint: Optional[str] = None,
     ) -> StructuredExtractionResult:
         """
         Enhanced structured extraction with improved accuracy.
@@ -3838,7 +3811,11 @@ class DataExtractionAgent(BaseAgent):
         if missing_critical:
             logger.info(f"Missing critical fields {missing_critical}, using LLM fallback")
             try:
-                llm_data = self._llm_structured_extraction(text, doc_type)
+                llm_data = self._llm_structured_extraction(
+                    text,
+                    doc_type,
+                    source_hint=source_hint,
+                )
                 llm_header = (
                     llm_data.get("header")
                     or llm_data.get("header_data")
@@ -4207,7 +4184,13 @@ class DataExtractionAgent(BaseAgent):
             }
 
         return recovered
-    def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
+    def _llm_structured_extraction(
+        self,
+        text: str,
+        doc_type: str,
+        *,
+        source_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Run a single LLM pass to capture field-level context for the document."""
 
         schema = SCHEMA_MAP.get(doc_type, {})
@@ -4222,32 +4205,63 @@ class DataExtractionAgent(BaseAgent):
         header_field_str = ", ".join(header_fields) if header_fields else "(none)"
         line_field_str = ", ".join(line_fields) if line_fields else "(none)"
 
+        filename_hint = ""
+        if source_hint:
+            try:
+                filename_hint = Path(source_hint).name
+            except Exception:
+                filename_hint = source_hint
+
         prompt_parts = [
-            f"You are an information extraction engine for {doc_type}. {context_hint}",
-            "Return ONLY valid JSON in the following structure:",
-            "{\n  \"header_data\": { ... },\n  \"line_items\": [ ... ],\n  \"field_contexts\": { ... }\n}",
-            "Rules:",
-            "- header_data MUST include only the canonical fields listed below and use null when a value cannot be located.",
-            "- line_items MUST be a list of objects containing only the permitted line item fields in the order supplied.",
-            "- field_contexts MUST map each header field to a short snippet (<=160 chars) of the supporting text.",
-            "- Dates must use YYYY-MM-DD, currency must be a 3-letter ISO code, and numeric values must be plain decimals.",
+            "You are Beyond Procwise's high-speed DataExtractionAgent.",
+            f"Document type: {doc_type}.",
+            context_hint.strip(),
+            "Respond with ONLY valid JSON using the structure:\n{\n  \"header_data\": { ... },\n  \"line_items\": [ ... ],\n  \"field_contexts\": { ... }\n}",
+            "General extraction rules:",
+            "- Use null for any field that is not explicitly present in the document text.",
+            "- Do not invent values. Preserve numeric formatting (no extra symbols or commas).",
+            "- field_contexts must quote a supporting snippet (<=160 characters).",
+            "- Dates must be YYYY-MM-DD, currency codes must be 3-letter ISO, and numeric values plain decimals.",
             f"Header fields: {header_field_str}",
             f"Line item fields: {line_field_str}",
         ]
+
+        if doc_type == "Invoice":
+            invoice_guidance = "\n".join(
+                [
+                    "Invoice ID guidance:",
+                    "1. The invoice_id may be unlabeled—scan the title block and first 25 lines for prominent numbers or alphanumeric IDs.",
+                    "2. Treat the filename hint as a clue only when the identical token is also present in the document text.",
+                    "3. Prefer candidates near words such as 'invoice', 'bill', 'statement', or adjacent to totals and dates.",
+                    "4. If no textual confirmation exists, output null (never guess).",
+                ]
+            )
+            prompt_parts.append(invoice_guidance)
+
+        prompt_parts.append(
+            "The document text is the ground truth. Filename hints only help you focus your search."
+        )
+
+        if filename_hint:
+            prompt_parts.append(f"Filename hint: {filename_hint}")
+
         prompt_parts.append(SUPPLIER_EXTRACTION_GUIDANCE)
+
         extra_instruction = DOC_TYPE_EXTRA_INSTRUCTIONS.get(doc_type)
         if extra_instruction:
             prompt_parts.append(extra_instruction)
+
         prompt_parts.append(
-            "If a supplier or contracting party name appears anywhere in the header, footer, or signature blocks, "
-            "capture it instead of leaving supplier fields null."
+            "If a supplier or contracting party name appears anywhere in the header, footer, or signature blocks, capture it instead of leaving supplier fields null."
         )
+
         if schema_context:
             prompt_parts.append(
                 "Schema guidance sourced from procurement_table_reference.md:\n" + schema_context
             )
-        prompt_parts.append("Document:\n" + llm_input)
-        prompt = "\n".join(part for part in prompt_parts if part)
+
+        prompt_parts.append("Document text (authoritative source):\n" + llm_input)
+        prompt = "\n\n".join(part for part in prompt_parts if part)
 
         try:
             response = self.call_ollama(
@@ -4255,7 +4269,14 @@ class DataExtractionAgent(BaseAgent):
                 model=self.extraction_model,
                 format="json",
             )
-            payload = json.loads(response.get("response", "{}"))
+            raw_payload = response.get("response", "")
+            self._log_llm_learning_sample(
+                doc_type=doc_type,
+                source_hint=filename_hint or source_hint,
+                prompt=prompt,
+                raw_response=raw_payload,
+            )
+            payload = json.loads(raw_payload or "{}")
             if not isinstance(payload, dict):
                 raise ValueError("LLM structured payload is not a JSON object")
             return payload

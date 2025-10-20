@@ -173,7 +173,9 @@ def test_raw_payload_merges_into_persistence(monkeypatch):
         report={"table_method": "none"},
     )
     monkeypatch.setattr(
-        agent, "_extract_structured_data", lambda text, fb, dt: structured
+        agent,
+        "_extract_structured_data",
+        lambda text, fb, dt, source_hint=None: structured,
     )
 
     stub_result = SimpleNamespace(
