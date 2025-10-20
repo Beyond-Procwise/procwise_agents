@@ -731,13 +731,35 @@ class DataExtractionAgent(BaseAgent):
                 logger.info("DataExtractionAgent using fast model '%s'", candidate)
                 return candidate
 
-        fallback = preferred_models[0]
-        logger.info(
-            "Preferred models %s not detected; defaulting to '%s'",
-            preferred_models,
-            fallback,
+        configured_model = getattr(
+            self.settings,
+            "document_extraction_model",
+            preferred_models[0],
         )
-        return fallback
+
+        if configured_model in available:
+            logger.info(
+                "Preferred models %s not detected; using configured model '%s'",
+                preferred_models,
+                configured_model,
+            )
+            return configured_model
+
+        if available:
+            fallback = sorted(available)[0]
+            logger.info(
+                "Preferred models %s not detected; defaulting to available model '%s'",
+                preferred_models,
+                fallback,
+            )
+            return fallback
+
+        logger.info(
+            "Preferred models %s not detected; defaulting to configured model '%s'",
+            preferred_models,
+            configured_model,
+        )
+        return configured_model
 
     def _get_document_extractor(self) -> DocumentExtractor:
         extractor = self._document_extractor
@@ -2519,6 +2541,7 @@ class DataExtractionAgent(BaseAgent):
 
         value_type = "amount" if field in {"total_amount", "invoice_total_incl_tax"} else "id"
         lower_synonyms = [syn.lower() for syn in synonyms]
+        value: Optional[Any] = None
         for idx, line in enumerate(lines):
             if not line:
                 continue
