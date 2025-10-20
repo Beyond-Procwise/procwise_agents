@@ -72,6 +72,12 @@ configure_gpu()
 HITL_CONFIDENCE_THRESHOLD = 0.85
 
 REFERENCE_PATH = Path(__file__).resolve().parents[1] / "docs" / "procurement_table_reference.md"
+LEARNING_LOG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "resources"
+    / "learning"
+    / "data_extraction_llm_logs.jsonl"
+)
 _TABLE_SECTION_PATTERN = re.compile(r"### `([^`]+)`'?[\r\n]+```(.*?)```", re.DOTALL)
 
 
@@ -442,8 +448,17 @@ PATTERN_TARGETS = {
 # NEW: robust alias maps + supplier profiles + totals stop
 # ---------------------------------------------------------------------------
 FIELD_ALIASES = {
-    "invoice_id": [r"\bInvoice\s*(?:No\.?|#|Number)\b", r"\bTax\s*Invoice\s*No\b", r"\bBill\s*No\b"],
-    "po_id": [r"\bPO\s*(?:No\.?|#|Number)\b", r"\bPurchase\s*Order\s*(?:No|Number)\b"],
+    "invoice_id": [
+        r"\bInvoice\s*(?:No\.?|#|Number|Id|Reference)\b",
+        r"\bTax\s*Invoice\s*(?:No\.?|Number)\b",
+        r"\bBill\s*(?:No\.?|Number)\b",
+        r"\bInv\s*(?:No\.?|#|Number)\b",
+    ],
+    "po_id": [
+        r"\bPO\s*(?:No\.?|#|Number|Id)\b",
+        r"\bPurchase\s*Order\s*(?:No\.?|Number|Id|Reference)\b",
+        r"\bOrder\s*(?:No\.?|Number|Id)\b",
+    ],
     "invoice_date": [r"\bInvoice\s*Date\b", r"\bInv\s*Date\b", r"\bBilling\s*Date\b"],
     "due_date": [r"\bDue\s*Date\b", r"\bPayment\s*Due\b"],
     "invoice_paid_date": [r"\bPaid\s*Date\b", r"\bPayment\s*Date\b"],
@@ -509,6 +524,53 @@ LINE_HEADERS_ALIASES = {
     "currency": [r"\bCurrency\b"],
     "line_total": [r"\bLine\s*Total\b", r"\bAmount\b", r"\bTotal\b"],
     "total_amount": [r"\bTotal\b", r"\bTotal\s*Amount\b", r"\bOrder\s*Total\b"],
+}
+
+CONTEXTUAL_FIELD_SYNONYMS = {
+    "invoice_id": [
+        "invoice number",
+        "invoice id",
+        "invoice no",
+        "invoice #",
+        "invoice reference",
+        "tax invoice number",
+        "billing reference",
+        "inv number",
+        "inv no",
+        "bill number",
+        "document number",
+    ],
+    "po_id": [
+        "purchase order number",
+        "purchase order no",
+        "purchase order",
+        "po number",
+        "po no",
+        "po #",
+        "order number",
+        "order id",
+        "order reference",
+    ],
+    "total_amount": [
+        "total amount",
+        "amount due",
+        "balance due",
+        "total due",
+        "amount payable",
+        "total payable",
+        "invoice total",
+        "grand total",
+        "total invoice amount",
+        "total to pay",
+    ],
+    "invoice_total_incl_tax": [
+        "total including tax",
+        "total incl tax",
+        "total with tax",
+        "total amount due",
+        "gross total",
+        "total payable",
+    ],
 }
 TOTALS_STOP_WORDS = re.compile(r"\b(Subtotal|Tax|VAT|GST|Total|Amount\s*Due)\b", re.I)
 
@@ -643,17 +705,40 @@ class DataExtractionAgent(BaseAgent):
     )
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
-        self.extraction_model = getattr(
-            self.settings,
-            "document_extraction_model",
-            self.settings.extraction_model,
-        )
+        self._learning_log_path = LEARNING_LOG_PATH
+        try:
+            self._learning_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.debug("Unable to ensure learning log directory", exc_info=True)
+        self._learning_log_lock = threading.Lock()
+        self.extraction_model = self._select_fast_extraction_model()
         self._document_extractor: Optional[DocumentExtractor] = None
         self._document_extractor_lock = threading.Lock()
 
     # --------------------------------------------------------------------
     # Regex-based header extraction
     # --------------------------------------------------------------------
+    def _select_fast_extraction_model(self) -> str:
+        preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
+        try:
+            available = set(self._get_available_ollama_models())
+        except Exception:
+            logger.debug("Unable to list Ollama models; defaulting to first preference", exc_info=True)
+            available = set()
+
+        for candidate in preferred_models:
+            if candidate in available:
+                logger.info("DataExtractionAgent using fast model '%s'", candidate)
+                return candidate
+
+        fallback = preferred_models[0]
+        logger.info(
+            "Preferred models %s not detected; defaulting to '%s'",
+            preferred_models,
+            fallback,
+        )
+        return fallback
+
     def _get_document_extractor(self) -> DocumentExtractor:
         extractor = self._document_extractor
         if extractor is not None:
@@ -1263,7 +1348,10 @@ class DataExtractionAgent(BaseAgent):
 
         if doc_type in {"Purchase_Order", "Invoice", "Quote", "Contract"}:
             structured = self._extract_structured_data(
-                text, file_bytes, doc_type
+                text,
+                file_bytes,
+                doc_type,
+                object_key,
             )
             merged_header = self._merge_record_fields(structured.header, raw_header)
             if vendor_name:
@@ -1641,23 +1729,24 @@ class DataExtractionAgent(BaseAgent):
         logger.warning("Unsupported document type '%s' for %s", ext, object_key)
         return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
 
-    def _parse_header_improved(self, text: str, file_bytes: bytes | None = None) -> Dict[str, Any]:
-        """
-        Enhanced header extraction with better pattern matching and party identification.
-
-        Key improvements:
-        - Multiple patterns for each field (fallback strategy)
-        - Correct party identification based on document flow
-        - Bank details extraction
-        - Currency detection from symbols and codes
-        - Payment terms parsing
-
-        Returns:
-            Dict with extracted header fields
-        """
+    def _parse_header_improved(
+        self,
+        text: str,
+        file_bytes: bytes | None = None,
+        source_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enhanced header extraction tuned for unlabeled procurement fields."""
 
         header: Dict[str, Any] = {}
+        field_context: Dict[str, str] = {}
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        contextual_values, contextual_context = self._derive_contextual_key_fields(
+            lines,
+            source_hint=source_hint,
+        )
+        header.update(contextual_values)
+        field_context.update(contextual_context)
 
         inv_patterns = [
             r"Invoice\s*(?:No\.?|Number|#)\s*[:\s]*([A-Z]{2,4}\d{4,})",
@@ -1667,7 +1756,8 @@ class DataExtractionAgent(BaseAgent):
         for pattern in inv_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                header["invoice_id"] = match.group(1).strip().upper()
+                header.setdefault("invoice_id", match.group(1).strip().upper())
+                field_context.setdefault("invoice_id", match.group(0).strip())
                 break
 
         po_patterns = [
@@ -1680,7 +1770,8 @@ class DataExtractionAgent(BaseAgent):
                 value = match.group(1).strip().upper()
                 if not value.startswith("PO"):
                     value = "PO" + value
-                header["po_id"] = value
+                header.setdefault("po_id", value)
+                field_context.setdefault("po_id", match.group(0).strip())
                 break
 
         quote_patterns = [
@@ -1693,7 +1784,8 @@ class DataExtractionAgent(BaseAgent):
                 value = match.group(1).strip().upper()
                 if not value.startswith("QUT"):
                     value = "QUT" + value
-                header["quote_id"] = value
+                header.setdefault("quote_id", value)
+                field_context.setdefault("quote_id", match.group(0).strip())
                 break
 
         date_patterns: Dict[str, List[str]] = {
@@ -1714,17 +1806,21 @@ class DataExtractionAgent(BaseAgent):
         }
 
         for field, patterns in date_patterns.items():
+            if header.get(field):
+                continue
             for pattern in patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    try:
-                        from dateutil import parser as date_parser
+                if not match:
+                    continue
+                try:
+                    from dateutil import parser as date_parser
 
-                        parsed = date_parser.parse(match.group(1), dayfirst=False)
-                        header[field] = parsed.strftime("%Y-%m-%d")
-                        break
-                    except Exception:
-                        continue
+                    parsed = date_parser.parse(match.group(1), dayfirst=False)
+                    header[field] = parsed.strftime("%Y-%m-%d")
+                    field_context.setdefault(field, match.group(0))
+                    break
+                except Exception:
+                    continue
 
         issuer: Optional[str] = None
         for line in lines[:10]:
@@ -1750,10 +1846,11 @@ class DataExtractionAgent(BaseAgent):
 
         if issuer:
             if doc_type_hint == "Invoice":
-                header["vendor_name"] = issuer
-                header["supplier_id"] = issuer
+                header.setdefault("vendor_name", issuer)
+                header.setdefault("supplier_id", issuer)
+                field_context.setdefault("vendor_name", issuer)
             elif doc_type_hint == "Purchase_Order":
-                header["buyer_id"] = issuer
+                header.setdefault("buyer_id", issuer)
 
         recipient_patterns = [
             r"(?:Invoice|Bill)\s*To\s*[:\s]*\n\s*([A-Z][A-Za-z\s&\.]{2,50})",
@@ -1763,21 +1860,29 @@ class DataExtractionAgent(BaseAgent):
 
         for pattern in recipient_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                recipient = match.group(1).strip()
-                if doc_type_hint == "Invoice":
+            if not match:
+                continue
+            recipient = match.group(1).strip()
+            snippet = match.group(0).strip()
+            if doc_type_hint == "Invoice":
+                if "buyer_id" not in header:
                     header["buyer_id"] = recipient
-                elif doc_type_hint == "Purchase_Order":
+                    field_context.setdefault("buyer_id", snippet)
+            elif doc_type_hint == "Purchase_Order":
+                if "vendor_name" not in header:
                     header["vendor_name"] = recipient
+                    field_context.setdefault("vendor_name", snippet)
+                if "supplier_id" not in header:
                     header["supplier_id"] = recipient
-                break
+                    field_context.setdefault("supplier_id", snippet)
+            break
 
         if "£" in text or "GBP" in text.upper():
-            header["currency"] = "GBP"
+            header.setdefault("currency", "GBP")
         elif "€" in text or "EUR" in text.upper():
-            header["currency"] = "EUR"
+            header.setdefault("currency", "EUR")
         elif "$" in text or "USD" in text.upper():
-            header["currency"] = "USD"
+            header.setdefault("currency", "USD")
 
         amount_patterns: Dict[str, List[str]] = {
             "invoice_amount": [
@@ -1795,22 +1900,26 @@ class DataExtractionAgent(BaseAgent):
         }
 
         for field, patterns in amount_patterns.items():
+            if header.get(field):
+                continue
             for pattern in patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    if field == "tax_amount" and len(match.groups()) == 2:
-                        try:
-                            header["tax_percent"] = float(match.group(1))
-                        except Exception:
-                            pass
-                        amount_str = match.group(2)
-                    else:
-                        amount_str = match.group(1)
+                if not match:
+                    continue
+                if field == "tax_amount" and len(match.groups()) == 2:
                     try:
-                        header[field] = float(amount_str.replace(",", ""))
-                        break
+                        header.setdefault("tax_percent", float(match.group(1)))
                     except Exception:
-                        continue
+                        pass
+                    amount_str = match.group(2)
+                else:
+                    amount_str = match.group(1)
+                try:
+                    header[field] = float(amount_str.replace(",", ""))
+                    field_context.setdefault(field, match.group(0).strip())
+                    break
+                except Exception:
+                    continue
 
         bank_patterns = {
             "account_number": r"Account\s*Number\s*[:\s]*(\d+)",
@@ -1822,11 +1931,11 @@ class DataExtractionAgent(BaseAgent):
         bank_details: Dict[str, Any] = {}
         for field, pattern in bank_patterns.items():
             match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                bank_details[field] = match.group(1).strip()
-
+            if not match:
+                continue
+            bank_details[field] = match.group(1).strip()
         if bank_details:
-            header["bank_details"] = bank_details
+            header.setdefault("bank_details", bank_details)
 
         payment_terms_match = re.search(
             r"Payment\s*(?:must\s*be\s*made\s*)?within\s*(\d+)\s*days",
@@ -1834,7 +1943,17 @@ class DataExtractionAgent(BaseAgent):
             re.IGNORECASE,
         )
         if payment_terms_match:
-            header["payment_terms"] = f"Net {payment_terms_match.group(1)}"
+            header.setdefault("payment_terms", f"Net {payment_terms_match.group(1)}")
+            field_context.setdefault("payment_terms", payment_terms_match.group(0))
+
+        if not header.get("vendor_name"):
+            fallback_vendor = self._infer_vendor_name(text, source_hint)
+            if fallback_vendor:
+                header["vendor_name"] = fallback_vendor
+                field_context.setdefault("vendor_name", fallback_vendor)
+
+        if field_context:
+            header["_field_context"] = field_context
 
         return header
 
@@ -2156,106 +2275,11 @@ class DataExtractionAgent(BaseAgent):
                         report["is_valid"] = False
                         report["confidence_score"] -= 0.20
 
-        amount_fields = {
-            "Invoice": ["invoice_amount", "tax_amount", "invoice_total_incl_tax"],
-            "Purchase_Order": ["total_amount"],
-            "Quote": ["total_amount", "total_amount_incl_tax"],
-        }
-
-        for field in amount_fields.get(doc_type, []):
-            value = header.get(field)
-            if value is not None:
-                try:
-                    numeric_value = float(value)
-                    if numeric_value < 0:
-                        report["errors"].append(f"{field} is negative: {numeric_value}")
-                        report["is_valid"] = False
-                    elif numeric_value == 0:
-                        report["warnings"].append(f"{field} is zero")
-                        report["confidence_score"] -= 0.05
-                    elif numeric_value > 10_000_000:
-                        report["warnings"].append(
-                            f"{field} unusually large: {numeric_value}"
-                        )
-                        report["confidence_score"] -= 0.05
-
-                    report["field_scores"][field] = 1.0
-                except (ValueError, TypeError):
-                    report["errors"].append(f"{field} is not a valid number: {value}")
-                    report["is_valid"] = False
-                    report["field_scores"][field] = 0.0
-
-        if doc_type == "Invoice":
-            subtotal = header.get("invoice_amount")
-            tax = header.get("tax_amount")
-            total = header.get("invoice_total_incl_tax")
-
-            if all(v is not None for v in [subtotal, tax, total]):
-                try:
-                    calculated_total = float(subtotal) + float(tax)
-                    actual_total = float(total)
-                    diff = abs(calculated_total - actual_total)
-                    if diff > 0.02:
-                        report["errors"].append(
-                            "Total mismatch: "
-                            f"{subtotal} + {tax} = {calculated_total}, but total is {actual_total} "
-                            f"(diff: {diff:.2f})"
-                        )
-                        report["is_valid"] = False
-                        report["confidence_score"] -= 0.15
-                    else:
-                        report["confidence_score"] = min(
-                            1.0, report["confidence_score"] + 0.05
-                        )
-                except (ValueError, TypeError):
-                    pass
-
         if line_items:
             for idx, item in enumerate(line_items, start=1):
                 if not item.get("item_description"):
                     report["warnings"].append(f"Line {idx}: Missing description")
                     report["confidence_score"] -= 0.02
-
-                if all(key in item for key in ["quantity", "unit_price"]):
-                    try:
-                        qty = float(item["quantity"])
-                        price = float(item["unit_price"])
-                        expected = qty * price
-                        actual_value = item.get("line_amount") or item.get("line_total")
-                        if actual_value is not None:
-                            actual = float(actual_value)
-                            diff = abs(expected - actual)
-                            if diff > 0.02:
-                                report["warnings"].append(
-                                    f"Line {idx}: Amount mismatch ({qty} × {price} = {expected:.2f}, got {actual:.2f})"
-                                )
-                                report["confidence_score"] -= 0.03
-                    except (ValueError, TypeError):
-                        pass
-
-            line_sum = 0.0
-            for item in line_items:
-                raw_value = item.get("line_amount") or item.get("line_total")
-                if raw_value is None:
-                    continue
-                cleaned = self._clean_numeric(raw_value)
-                if cleaned is None:
-                    continue
-                line_sum += cleaned
-
-            header_subtotal = header.get("invoice_amount") or header.get("total_amount")
-            header_value = (
-                self._clean_numeric(header_subtotal)
-                if header_subtotal is not None
-                else None
-            )
-            if header_value is not None and line_sum > 0:
-                diff = abs(line_sum - header_value)
-                if diff > 0.02:
-                    report["warnings"].append(
-                        f"Line items sum to {line_sum:.2f} but header shows {header_subtotal}"
-                    )
-                    report["confidence_score"] -= 0.05
         else:
             if doc_type in ["Invoice", "Purchase_Order", "Quote"]:
                 report["warnings"].append("No line items extracted")
@@ -2484,6 +2508,383 @@ class DataExtractionAgent(BaseAgent):
         return overall_ok, min(1.0, conf), notes
 
     # ============================ HEADER PARSING ==========================
+    def _contextual_field_lookup(
+        self,
+        lines: List[str],
+        field: str,
+    ) -> Optional[Any]:
+        synonyms = CONTEXTUAL_FIELD_SYNONYMS.get(field)
+        if not synonyms:
+            return None
+
+        value_type = "amount" if field in {"total_amount", "invoice_total_incl_tax"} else "id"
+        lower_synonyms = [syn.lower() for syn in synonyms]
+        for idx, line in enumerate(lines):
+            if not line:
+                continue
+            lower_line = line.lower()
+            match_synonym = next((syn for syn in lower_synonyms if syn in lower_line), None)
+            if not match_synonym:
+                continue
+
+            value = self._extract_value_from_contextual_line(
+                line,
+                match_synonym,
+                value_type,
+            )
+            if value is None and idx + 1 < len(lines):
+                next_line = lines[idx + 1]
+                next_candidate: Optional[Any] = None
+                if value_type == "id":
+                    if "date" not in next_line.lower():
+                        next_candidate = self._extract_value_from_contextual_line(
+                            next_line,
+                            "",
+                            value_type,
+                        )
+                        if isinstance(next_candidate, str):
+                            if not any(ch.isalpha() for ch in next_candidate) and sum(
+                                ch.isdigit() for ch in next_candidate
+                            ) < 5:
+                                next_candidate = None
+                else:
+                    next_candidate = self._extract_value_from_contextual_line(
+                        next_line,
+                        "",
+                        value_type,
+                    )
+                if next_candidate is not None:
+                    value = next_candidate
+        if value is not None:
+            return value
+        return None
+
+    def _looks_like_date_token(self, token: str) -> bool:
+        cleaned = token.strip()
+        if not cleaned:
+            return False
+        if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", cleaned):
+            return True
+        if re.fullmatch(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", cleaned):
+            return True
+        if re.fullmatch(r"\d{1,2}[A-Z]{3}\d{2,4}", cleaned, re.I):
+            return True
+        if cleaned.isdigit():
+            length = len(cleaned)
+            if length == 4 and 1900 <= int(cleaned) <= 2100:
+                return True
+            if length == 6:
+                prefix = cleaned[:4]
+                if prefix.isdigit() and 1900 <= int(prefix) <= 2100:
+                    return True
+            if length == 8:
+                try:
+                    parser.parse(cleaned, fuzzy=False)
+                    return True
+                except Exception:
+                    return False
+        return False
+
+    def _find_identifier_by_context(
+        self,
+        lines: List[str],
+        keywords: Tuple[str, ...],
+        filename_hint: Optional[str] = None,
+        *,
+        enforce_prefix: Optional[str] = None,
+    ) -> Optional[Tuple[str, str]]:
+        if not lines:
+            return None
+        normalized_hint = (filename_hint or "").lower()
+        candidates: List[Tuple[float, str, str]] = []
+        prefix = enforce_prefix.upper() if enforce_prefix else ""
+        for idx, line in enumerate(lines):
+            window = lines[max(0, idx - 1) : min(len(lines), idx + 2)]
+            window_text = " ".join(window).lower()
+            if not any(keyword in window_text for keyword in keywords):
+                continue
+            search_block = " ".join(lines[idx : min(len(lines), idx + 2)])
+            tokens = re.findall(r"[A-Z0-9][A-Z0-9\-\/\.]{2,}", search_block, re.I)
+            for token in tokens:
+                candidate = token.strip("-#:/ ")
+                if not candidate:
+                    continue
+                digits = sum(ch.isdigit() for ch in candidate)
+                if digits < 3:
+                    continue
+                if self._looks_like_date_token(candidate):
+                    continue
+                base_score = 1.0
+                if any(ch.isalpha() for ch in candidate):
+                    base_score += 0.6
+                if digits >= 5:
+                    base_score += 0.3
+                if idx <= 5:
+                    base_score += 0.4
+                if any(keyword in line.lower() for keyword in keywords):
+                    base_score += 0.3
+                candidate_upper = candidate.upper()
+                if normalized_hint:
+                    cand_lower = candidate_upper.lower()
+                    if cand_lower in normalized_hint:
+                        base_score += 1.2
+                    elif cand_lower.replace("-", "") in normalized_hint:
+                        base_score += 0.8
+                    elif cand_lower.replace("po", "") in normalized_hint:
+                        base_score += 0.4
+                adjusted_value = candidate_upper
+                if prefix:
+                    if adjusted_value.startswith(prefix):
+                        base_score += 0.6
+                    elif not any(ch.isalpha() for ch in adjusted_value):
+                        adjusted_value = prefix + adjusted_value
+                        base_score += 0.5
+                candidates.append((base_score, adjusted_value, search_block.strip()))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        seen: set[str] = set()
+        for _, value, context in candidates:
+            if value in seen:
+                continue
+            seen.add(value)
+            return value, context
+        return None
+
+    def _find_amount_by_context(
+        self,
+        lines: List[str],
+        keywords: Tuple[str, ...],
+    ) -> Optional[Tuple[float, str]]:
+        if not lines:
+            return None
+        candidates: List[Tuple[float, float, str]] = []
+        for idx, line in enumerate(lines[:100]):
+            window = lines[max(0, idx - 2) : min(len(lines), idx + 3)]
+            window_text = " ".join(window).lower()
+            if not any(keyword in window_text for keyword in keywords):
+                continue
+            amount = self._extract_numeric_from_text(line)
+            context_line = line
+            if amount is None and idx + 1 < len(lines):
+                next_line = lines[idx + 1]
+                amount = self._extract_numeric_from_text(next_line)
+                if amount is not None:
+                    context_line = f"{line} / {next_line}".strip()
+            if amount is None:
+                continue
+            lower_line = line.lower()
+            if "subtotal" in lower_line:
+                continue
+            if "tax" in lower_line and not any(
+                focus in lower_line for focus in ("total due", "amount due", "balance due")
+            ):
+                continue
+            weight = 1.0
+            if any(keyword in lower_line for keyword in keywords):
+                weight += 0.6
+            if idx <= 5:
+                weight += 0.3
+            candidates.append((weight, float(amount), context_line))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, value, context_line = candidates[0]
+        return value, context_line.strip()
+
+    def _find_vendor_from_context(
+        self,
+        lines: List[str],
+    ) -> Optional[Tuple[str, str]]:
+        if not lines:
+            return None
+        keywords = (
+            "invoice",
+            "purchase order",
+            "purchase-order",
+            "quote",
+            "statement",
+            "bill",
+            "total",
+            "amount",
+            "date",
+            "number",
+            "customer",
+            "ship",
+            "bill to",
+            "sold to",
+        )
+        candidates: List[Tuple[float, str, str]] = []
+        for idx, raw_line in enumerate(lines[:20]):
+            line = raw_line.strip(" :-\t")
+            if not line or len(line) < 3:
+                continue
+            lower = line.lower()
+            if lower.startswith(("from:", "to:", "bill to", "ship to", "deliver to")):
+                continue
+            if any(keyword in lower for keyword in keywords):
+                continue
+            if any(ch.isdigit() for ch in line):
+                letters = sum(ch.isalpha() for ch in line)
+                digits = sum(ch.isdigit() for ch in line)
+                if digits >= letters:
+                    continue
+            letters = sum(ch.isalpha() for ch in line)
+            uppercase = sum(ch.isupper() for ch in line if ch.isalpha())
+            uppercase_ratio = (uppercase / letters) if letters else 0.0
+            score = 1.0
+            if uppercase_ratio >= 0.6:
+                score += 0.3
+            if any(suffix in lower for suffix in ("ltd", "limited", "inc", "llc", "gmbh", "pty", "plc", "company", "corp", "co")):
+                score += 0.5
+            if idx <= 3:
+                score += 0.4
+            if len(line.split()) <= 6:
+                score += 0.2
+            candidates.append((score, line, raw_line.strip()))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, value, context_line = candidates[0]
+        return value, context_line
+
+    def _derive_contextual_key_fields(
+        self,
+        lines: List[str],
+        *,
+        source_hint: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        contextual_values: Dict[str, Any] = {}
+        field_context: Dict[str, str] = {}
+        if not lines:
+            return contextual_values, field_context
+
+        filename_hint: Optional[str] = None
+        if source_hint:
+            try:
+                filename_hint = Path(source_hint).name
+            except Exception:
+                filename_hint = source_hint
+
+        top_lines = lines[:60]
+
+        invoice_candidate = self._find_identifier_by_context(
+            top_lines,
+            ("invoice", "inv", "tax invoice", "bill", "statement"),
+            filename_hint,
+        )
+        if invoice_candidate:
+            contextual_values["invoice_id"], context_line = invoice_candidate
+            field_context.setdefault("invoice_id", context_line)
+
+        po_candidate = self._find_identifier_by_context(
+            top_lines,
+            ("purchase order", "purchase-order", "order", "po"),
+            filename_hint,
+            enforce_prefix="PO",
+        )
+        if po_candidate:
+            contextual_values.setdefault("po_id", po_candidate[0])
+            field_context.setdefault("po_id", po_candidate[1])
+
+        vendor_candidate = self._find_vendor_from_context(top_lines)
+        if vendor_candidate:
+            contextual_values.setdefault("vendor_name", vendor_candidate[0])
+            field_context.setdefault("vendor_name", vendor_candidate[1])
+
+        invoice_total_candidate = self._find_amount_by_context(
+            lines,
+            (
+                "invoice total",
+                "total due",
+                "amount due",
+                "invoice amount",
+                "total payable",
+                "balance due",
+                "total incl",
+            ),
+        )
+        if invoice_total_candidate:
+            contextual_values.setdefault(
+                "invoice_total_incl_tax", invoice_total_candidate[0]
+            )
+            field_context.setdefault(
+                "invoice_total_incl_tax", invoice_total_candidate[1]
+            )
+
+        order_total_candidate = self._find_amount_by_context(
+            lines,
+            (
+                "order total",
+                "total order",
+                "purchase order total",
+                "po total",
+                "order amount",
+                "total amount",
+                "total price",
+            ),
+        )
+        if order_total_candidate:
+            contextual_values.setdefault("total_amount", order_total_candidate[0])
+            field_context.setdefault("total_amount", order_total_candidate[1])
+
+        return contextual_values, field_context
+
+    def _extract_value_from_contextual_line(
+        self,
+        line: str,
+        synonym: str,
+        value_type: str,
+    ) -> Optional[Any]:
+        candidate_sections: List[str] = []
+        working_line = line.strip()
+        if synonym:
+            lower_line = working_line.lower()
+            start_idx = lower_line.find(synonym)
+            if start_idx >= 0:
+                after = working_line[start_idx + len(synonym):].strip(" :#-\t")
+                before = working_line[:start_idx].strip(" :#-\t")
+                if after:
+                    candidate_sections.append(after)
+                if before:
+                    candidate_sections.append(before.split(":")[-1].strip())
+        else:
+            candidate_sections.append(working_line)
+
+        for section in candidate_sections:
+            if not section:
+                continue
+            if value_type == "amount":
+                amount = self._extract_numeric_from_text(section)
+                if amount is not None:
+                    return amount
+            else:
+                identifier = self._extract_identifier_from_text(section)
+                if identifier:
+                    return identifier
+        return None
+
+    def _extract_identifier_from_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        cleaned = text.strip(" :#-\t")
+        matches = re.findall(r"[A-Z0-9][A-Z0-9\-\/\.]{1,}", cleaned, re.I)
+        for match in matches:
+            digits = sum(ch.isdigit() for ch in match)
+            if digits >= 2:
+                return match.strip().upper()
+        return None
+
+    def _extract_numeric_from_text(self, text: str) -> Optional[float]:
+        if not text:
+            return None
+        cleaned = re.sub(r"\b(?:usd|eur|gbp|aud|cad|inr|jpy|cny|sgd)\b", "", text, flags=re.I)
+        match = re.search(r"([€£$]?[\s\-]*\d[\d,]*(?:\.\d+)?)", cleaned)
+        if not match:
+            return None
+        numeric = match.group(1).replace(" ", "")
+        return self._clean_numeric(numeric)
+
     def _parse_header(self, text: str, file_bytes: bytes | None = None) -> Dict[str, Any]:
         header: Dict[str, Any] = {}
         conf: Dict[str, float] = {}
@@ -2551,7 +2952,16 @@ class DataExtractionAgent(BaseAgent):
             except Exception:
                 pass
 
-        # 3) NER supplement
+        # 3) Contextual synonym fallback (label-free values)
+        for field in ("invoice_id", "po_id", "total_amount", "invoice_total_incl_tax"):
+            if field in header and header[field]:
+                continue
+            value = self._contextual_field_lookup(lines, field)
+            if value is not None:
+                header[field] = value
+                self._record_conf(conf, field, "contextual_synonym", True)
+
+        # 4) NER supplement
         ner_header = self._extract_header_with_ner(text)
         for k, v in ner_header.items():
             header.setdefault(k, v)
@@ -3678,6 +4088,38 @@ class DataExtractionAgent(BaseAgent):
             merged = merged[:max_chars]
         return merged
 
+    def _log_llm_learning_sample(
+        self,
+        *,
+        doc_type: str,
+        source_hint: Optional[str],
+        prompt: str,
+        raw_response: str,
+    ) -> None:
+        if not prompt and not raw_response:
+            return
+
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "doc_type": doc_type,
+            "source_hint": source_hint or "",
+            "prompt": prompt,
+            "raw_response": raw_response,
+        }
+
+        try:
+            payload = json.dumps(record, ensure_ascii=False)
+        except Exception:
+            logger.debug("Failed to serialise learning log record", exc_info=True)
+            return
+
+        try:
+            with self._learning_log_lock:
+                with self._learning_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(payload + "\n")
+        except Exception:
+            logger.debug("Failed to append learning log", exc_info=True)
+
     def _llm_structured_dataframes(
         self,
         text: str,
@@ -3773,7 +4215,11 @@ class DataExtractionAgent(BaseAgent):
         return header_df, line_df, cleaned_notes
 
     def _extract_structured_data(
-        self, text: str, file_bytes: bytes, doc_type: str
+        self,
+        text: str,
+        file_bytes: bytes,
+        doc_type: str,
+        source_hint: Optional[str] = None,
     ) -> StructuredExtractionResult:
         """
         Enhanced structured extraction with improved accuracy.
@@ -3796,7 +4242,7 @@ class DataExtractionAgent(BaseAgent):
         schema = SCHEMA_MAP.get(doc_type, {})
         header_schema = schema.get("header", {})
 
-        header = self._parse_header_improved(text, file_bytes)
+        header = self._parse_header_improved(text, file_bytes, source_hint=source_hint)
         logger.info(f"Phase 1 complete: {len(header)} header fields extracted")
 
         line_items: List[Dict[str, Any]] = []
@@ -3838,7 +4284,11 @@ class DataExtractionAgent(BaseAgent):
         if missing_critical:
             logger.info(f"Missing critical fields {missing_critical}, using LLM fallback")
             try:
-                llm_data = self._llm_structured_extraction(text, doc_type)
+                llm_data = self._llm_structured_extraction(
+                    text,
+                    doc_type,
+                    source_hint=source_hint,
+                )
                 llm_header = (
                     llm_data.get("header")
                     or llm_data.get("header_data")
@@ -4207,7 +4657,13 @@ class DataExtractionAgent(BaseAgent):
             }
 
         return recovered
-    def _llm_structured_extraction(self, text: str, doc_type: str) -> Dict[str, Any]:
+    def _llm_structured_extraction(
+        self,
+        text: str,
+        doc_type: str,
+        *,
+        source_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Run a single LLM pass to capture field-level context for the document."""
 
         schema = SCHEMA_MAP.get(doc_type, {})
@@ -4222,32 +4678,63 @@ class DataExtractionAgent(BaseAgent):
         header_field_str = ", ".join(header_fields) if header_fields else "(none)"
         line_field_str = ", ".join(line_fields) if line_fields else "(none)"
 
+        filename_hint = ""
+        if source_hint:
+            try:
+                filename_hint = Path(source_hint).name
+            except Exception:
+                filename_hint = source_hint
+
         prompt_parts = [
-            f"You are an information extraction engine for {doc_type}. {context_hint}",
-            "Return ONLY valid JSON in the following structure:",
-            "{\n  \"header_data\": { ... },\n  \"line_items\": [ ... ],\n  \"field_contexts\": { ... }\n}",
-            "Rules:",
-            "- header_data MUST include only the canonical fields listed below and use null when a value cannot be located.",
-            "- line_items MUST be a list of objects containing only the permitted line item fields in the order supplied.",
-            "- field_contexts MUST map each header field to a short snippet (<=160 chars) of the supporting text.",
-            "- Dates must use YYYY-MM-DD, currency must be a 3-letter ISO code, and numeric values must be plain decimals.",
+            "You are Beyond Procwise's high-speed DataExtractionAgent.",
+            f"Document type: {doc_type}.",
+            context_hint.strip(),
+            "Respond with ONLY valid JSON using the structure:\n{\n  \"header_data\": { ... },\n  \"line_items\": [ ... ],\n  \"field_contexts\": { ... }\n}",
+            "General extraction rules:",
+            "- Use null for any field that is not explicitly present in the document text.",
+            "- Do not invent values. Preserve numeric formatting (no extra symbols or commas).",
+            "- field_contexts must quote a supporting snippet (<=160 characters).",
+            "- Dates must be YYYY-MM-DD, currency codes must be 3-letter ISO, and numeric values plain decimals.",
             f"Header fields: {header_field_str}",
             f"Line item fields: {line_field_str}",
         ]
+
+        if doc_type == "Invoice":
+            invoice_guidance = "\n".join(
+                [
+                    "Invoice ID guidance:",
+                    "1. The invoice_id may be unlabeled—scan the title block and first 25 lines for prominent numbers or alphanumeric IDs.",
+                    "2. Treat the filename hint as a clue only when the identical token is also present in the document text.",
+                    "3. Prefer candidates near words such as 'invoice', 'bill', 'statement', or adjacent to totals and dates.",
+                    "4. If no textual confirmation exists, output null (never guess).",
+                ]
+            )
+            prompt_parts.append(invoice_guidance)
+
+        prompt_parts.append(
+            "The document text is the ground truth. Filename hints only help you focus your search."
+        )
+
+        if filename_hint:
+            prompt_parts.append(f"Filename hint: {filename_hint}")
+
         prompt_parts.append(SUPPLIER_EXTRACTION_GUIDANCE)
+
         extra_instruction = DOC_TYPE_EXTRA_INSTRUCTIONS.get(doc_type)
         if extra_instruction:
             prompt_parts.append(extra_instruction)
+
         prompt_parts.append(
-            "If a supplier or contracting party name appears anywhere in the header, footer, or signature blocks, "
-            "capture it instead of leaving supplier fields null."
+            "If a supplier or contracting party name appears anywhere in the header, footer, or signature blocks, capture it instead of leaving supplier fields null."
         )
+
         if schema_context:
             prompt_parts.append(
                 "Schema guidance sourced from procurement_table_reference.md:\n" + schema_context
             )
-        prompt_parts.append("Document:\n" + llm_input)
-        prompt = "\n".join(part for part in prompt_parts if part)
+
+        prompt_parts.append("Document text (authoritative source):\n" + llm_input)
+        prompt = "\n\n".join(part for part in prompt_parts if part)
 
         try:
             response = self.call_ollama(
@@ -4255,7 +4742,14 @@ class DataExtractionAgent(BaseAgent):
                 model=self.extraction_model,
                 format="json",
             )
-            payload = json.loads(response.get("response", "{}"))
+            raw_payload = response.get("response", "")
+            self._log_llm_learning_sample(
+                doc_type=doc_type,
+                source_hint=filename_hint or source_hint,
+                prompt=prompt,
+                raw_response=raw_payload,
+            )
+            payload = json.loads(raw_payload or "{}")
             if not isinstance(payload, dict):
                 raise ValueError("LLM structured payload is not a JSON object")
             return payload
