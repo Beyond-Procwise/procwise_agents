@@ -664,21 +664,43 @@ class DataExtractionAgent(BaseAgent):
     # --------------------------------------------------------------------
     def _select_fast_extraction_model(self) -> str:
         preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
+
+        configured_models: Tuple[str, ...] = tuple(
+            model
+            for model in (
+                getattr(self.settings, "document_extraction_model", None),
+                getattr(self.settings, "extraction_model", None),
+            )
+            if model
+        )
+
+        candidates: Tuple[str, ...] = tuple(
+            dict.fromkeys(  # preserves order while dropping duplicates
+                list(configured_models) + list(preferred_models)
+            ).keys()
+        )
+
+        if not candidates:
+            candidates = preferred_models
+
         try:
             available = set(self._get_available_ollama_models())
         except Exception:
-            logger.debug("Unable to list Ollama models; defaulting to first preference", exc_info=True)
-            available = set()
+            logger.debug(
+                "Unable to list Ollama models; defaulting to first configured preference",
+                exc_info=True,
+            )
+            available = None
 
-        for candidate in preferred_models:
-            if candidate in available:
+        for candidate in candidates:
+            if available is None or candidate in available:
                 logger.info("DataExtractionAgent using fast model '%s'", candidate)
                 return candidate
 
-        fallback = preferred_models[0]
+        fallback = candidates[0]
         logger.info(
             "Preferred models %s not detected; defaulting to '%s'",
-            preferred_models,
+            candidates,
             fallback,
         )
         return fallback
