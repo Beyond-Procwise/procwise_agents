@@ -1725,6 +1725,7 @@ class Orchestrator:
         supplier_input.setdefault("dispatch_timeout", dispatch_timeout)
         supplier_input.setdefault("dispatch_timeout_seconds", dispatch_timeout)
         supplier_input.setdefault("dispatch_poll_interval", dispatch_poll)
+        supplier_input.setdefault("action", "await_workflow_batch")
 
         supplier_ctx = self._create_child_context(context, "supplier_interaction", supplier_input)
         for key in (
