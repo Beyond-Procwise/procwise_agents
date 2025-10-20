@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
+
+from html import escape
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
@@ -17,6 +19,7 @@ from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
 from utils.gpu import configure_gpu
+from utils.email_markers import attach_hidden_marker
 
 from pathlib import Path
 
@@ -1588,6 +1591,10 @@ class NegotiationAgent(BaseAgent):
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
 
         supplier_name = context.input_data.get("supplier_name")
+        contact_name = self._resolve_contact_name(
+            context.input_data if isinstance(context.input_data, dict) else {},
+            fallback=supplier_name or supplier,
+        )
         supplier_identifier = context.input_data.get("supplier_id") or supplier
         procurement_summary = self._retrieve_procurement_summary(
             supplier_id=supplier_identifier,
@@ -1608,6 +1615,7 @@ class NegotiationAgent(BaseAgent):
             currency,
             round_no,
             supplier=supplier,
+            supplier_name=supplier_name,
             supplier_snippets=supplier_snippets,
             supplier_message=supplier_message,
             playbook_context=playbook_context,
@@ -1615,6 +1623,7 @@ class NegotiationAgent(BaseAgent):
             zopa=zopa,
             procurement_summary=procurement_summary,
             rag_snippets=rag_snippets,
+            contact_name=contact_name,
         )
 
         if play_recommendations:
@@ -1670,6 +1679,8 @@ class NegotiationAgent(BaseAgent):
             "market_floor_price": market_floor,
             "normalised_inputs": normalised_inputs,
             "human_override_required": decision.get("human_override_required", False),
+            "contact_name": contact_name,
+            "supplier_contact": contact_name,
         }
 
         draft_payload.setdefault("subject", self._format_negotiation_subject(state))
@@ -1728,6 +1739,8 @@ class NegotiationAgent(BaseAgent):
             "term_days": term_days,
             "valid_until": valid_until,
             "market_floor_price": market_floor,
+            "contact_name": contact_name,
+            "supplier_contact": contact_name,
         }
 
         email_action_id: Optional[str] = None
@@ -1736,25 +1749,23 @@ class NegotiationAgent(BaseAgent):
         draft_records: List[Dict[str, Any]] = []
         next_agents: List[str] = []
 
-        subject_seed = self._coerce_text(draft_payload.get("subject"))
-        if not subject_seed:
-            subject_seed = self._format_negotiation_subject(state)
-
-        draft_stub = {
-            "session_reference": session_reference,
-            "unique_id": session_reference,
-            "supplier_id": supplier,
-            "rfq_id": rfq_value,
-            "intent": "NEGOTIATION_COUNTER",
-            "metadata": draft_metadata,
-            "negotiation_message": negotiation_message,
-            "counter_proposals": counter_options,
-            "sent_status": False,
-            "thread_index": round_no,
-            "subject": subject_seed,
-        }
-        if thread_headers:
-            draft_stub["thread_headers"] = thread_headers
+        draft_stub = self._build_email_draft_stub(
+            context=context,
+            draft_payload=draft_payload,
+            metadata=draft_metadata,
+            negotiation_message=negotiation_message,
+            supplier_id=supplier,
+            supplier_name=supplier_name,
+            contact_name=contact_name,
+            session_reference=session_reference,
+            rfq_id=rfq_value,
+            recipients=recipients,
+            thread_headers=thread_headers if isinstance(thread_headers, dict) else None,
+        )
+        draft_stub.setdefault("intent", "NEGOTIATION_COUNTER")
+        draft_stub["negotiation_message"] = negotiation_message
+        draft_stub["counter_proposals"] = counter_options
+        draft_stub["thread_index"] = round_no
         draft_stub["closing_round"] = round_no >= 3
         if currency:
             draft_stub["currency"] = currency
@@ -1765,11 +1776,8 @@ class NegotiationAgent(BaseAgent):
         descriptor = playbook_context.get("descriptor")
         if descriptor:
             draft_stub["playbook_descriptor"] = descriptor
-        draft_stub["payload"] = draft_payload
-        if recipients:
-            draft_stub["recipients"] = recipients
-        if negotiation_message:
-            draft_stub.setdefault("body", negotiation_message)
+        if thread_headers and not isinstance(thread_headers, dict):
+            draft_stub["thread_headers"] = thread_headers
 
         email_payload = self._build_email_agent_payload(
             context,
@@ -1791,12 +1799,19 @@ class NegotiationAgent(BaseAgent):
             email_body = email_data.get("body")
             candidate_headers = email_data.get("thread_headers")
             if isinstance(candidate_headers, dict):
+                candidate_headers = {
+                    key: value
+                    for key, value in candidate_headers.items()
+                    if value is not None
+                }
                 header_message_id = self._coerce_text(
                     candidate_headers.get("Message-ID")
                     or candidate_headers.get("message_id")
                 )
                 if header_message_id:
                     sent_message_id = header_message_id
+                draft_payload["thread_headers"] = dict(candidate_headers)
+                state["last_thread_headers"] = dict(candidate_headers)
             drafts_payload = email_data.get("drafts")
             if isinstance(drafts_payload, list) and drafts_payload:
                 for draft in drafts_payload:
@@ -2843,17 +2858,21 @@ class NegotiationAgent(BaseAgent):
                         state.get("base_subject"),
                         state.get("initial_body"),
                     ]
-                    updates = [
-                        "supplier_reply_count = EXCLUDED.supplier_reply_count",
-                        "current_round = EXCLUDED.current_round",
-                        "status = EXCLUDED.status",
-                        "awaiting_response = EXCLUDED.awaiting_response",
-                        "last_supplier_msg_id = EXCLUDED.last_supplier_msg_id",
-                        "last_agent_msg_id = EXCLUDED.last_agent_msg_id",
-                        "last_email_sent_at = EXCLUDED.last_email_sent_at",
-                        "base_subject = EXCLUDED.base_subject",
-                        "initial_body = EXCLUDED.initial_body",
-                    ]
+
+                    update_columns: List[str] = []
+                    update_values: List[Any] = []
+
+                    def _register(column_name: str, value: Any, *, allow_update: bool = True) -> None:
+                        columns.append(column_name)
+                        values.append(value)
+                        if allow_update and column_name not in {column, "supplier_id"}:
+                            update_columns.append(column_name)
+                            update_values.append(value)
+
+                    for idx, col_name in enumerate(columns[:]):
+                        if col_name not in {column, "supplier_id"}:
+                            update_columns.append(col_name)
+                            update_values.append(values[idx])
 
                     thread_state_payload = state.get("thread_state")
                     if thread_state_payload is not None:
@@ -2863,41 +2882,45 @@ class NegotiationAgent(BaseAgent):
                             )
                         except Exception:
                             thread_state_serialised = None
-                        columns.append("thread_state")
-                        values.append(thread_state_serialised)
-                        updates.append("thread_state = EXCLUDED.thread_state")
+                        _register("thread_state", thread_state_serialised)
 
                     workflow_value = state.get("workflow_id") or (
                         identifier if column != "workflow_id" else None
                     )
                     if workflow_value and column != "workflow_id":
-                        columns.append("workflow_id")
-                        values.append(workflow_value)
-                        updates.append("workflow_id = EXCLUDED.workflow_id")
+                        _register("workflow_id", workflow_value)
 
                     session_reference_value = state.get("session_reference")
                     if session_reference_value:
-                        columns.append("session_reference")
-                        values.append(session_reference_value)
-                        updates.append("session_reference = EXCLUDED.session_reference")
+                        _register("session_reference", session_reference_value)
 
                     updated_on = datetime.now(timezone.utc)
-                    columns.append("updated_on")
-                    values.append(updated_on)
-                    updates.append("updated_on = EXCLUDED.updated_on")
+                    _register("updated_on", updated_on)
 
-                    placeholders = ", ".join(["%s"] * len(values))
                     column_list = ", ".join(columns)
-                    update_clause = ", ".join(updates)
+                    placeholders = ", ".join(["%s"] * len(values))
 
-                    cur.execute(
-                        f"""
-                        INSERT INTO proc.negotiation_session_state ({column_list})
-                        VALUES ({placeholders})
-                        ON CONFLICT ({column}, supplier_id) DO UPDATE SET {update_clause}
-                        """,
-                        tuple(values),
-                    )
+                    update_clause = ", ".join(f"{name} = %s" for name in update_columns)
+                    updated = False
+                    if update_clause:
+                        cur.execute(
+                            f"""
+                            UPDATE proc.negotiation_session_state
+                               SET {update_clause}
+                             WHERE {column} = %s AND supplier_id = %s
+                            """,
+                            tuple(update_values + [identifier, supplier_id]),
+                        )
+                        updated = cur.rowcount > 0
+
+                    if not updated:
+                        cur.execute(
+                            f"""
+                            INSERT INTO proc.negotiation_session_state ({column_list})
+                            VALUES ({placeholders})
+                            """,
+                            tuple(values),
+                        )
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to persist negotiation session state")
@@ -3080,11 +3103,13 @@ class NegotiationAgent(BaseAgent):
         round_no: int,
         currency: Optional[str],
         supplier: Optional[str],
+        supplier_name: Optional[str],
         supplier_message: Optional[str],
         signals: Dict[str, Any],
         zopa: Dict[str, Any],
         playbook_context: Optional[Dict[str, Any]],
         procurement_summary: Optional[Dict[str, Any]],
+        contact_name: Optional[str],
     ) -> str:
         """Compose a human-like, strategically crafted negotiation message."""
 
@@ -4026,6 +4051,7 @@ class NegotiationAgent(BaseAgent):
         round_no: int,
         *,
         supplier: Optional[str] = None,
+        supplier_name: Optional[str] = None,
         supplier_snippets: Optional[List[str]] = None,
         supplier_message: Optional[str] = None,
         playbook_context: Optional[Dict[str, Any]] = None,
@@ -4033,6 +4059,7 @@ class NegotiationAgent(BaseAgent):
         zopa: Optional[Dict[str, Any]] = None,
         procurement_summary: Optional[Dict[str, Any]] = None,
         rag_snippets: Optional[List[str]] = None,
+        contact_name: Optional[str] = None,
     ) -> str:
         """Build negotiation message using skilled negotiation techniques."""
 
@@ -4040,22 +4067,25 @@ class NegotiationAgent(BaseAgent):
             decision, price, target_price, round_no
         )
 
+        message_text: Optional[str] = None
         if self._use_enhanced_messages and hasattr(
             self, "_compose_negotiation_message"
         ):
             try:
-                return self._compose_negotiation_message(
+                message_text = self._compose_negotiation_message(
                     context=context,
                     decision=decision,
                     positions=positions,
                     round_no=round_no,
                     currency=currency,
                     supplier=supplier,
+                    supplier_name=supplier_name,
                     supplier_message=supplier_message,
                     signals=signals or {},
                     zopa=zopa or {},
                     playbook_context=playbook_context,
                     procurement_summary=procurement_summary,
+                    contact_name=contact_name,
                 )
             except Exception as exc:
                 logger.warning(
@@ -4064,23 +4094,25 @@ class NegotiationAgent(BaseAgent):
                     exc_info=True,
                 )
 
-        return self._build_summary_fallback(
-            context=context,
-            session_reference=session_reference,
-            decision=decision,
-            price=price,
-            target_price=target_price,
-            currency=currency,
-            round_no=round_no,
-            supplier=supplier,
-            supplier_snippets=supplier_snippets,
-            supplier_message=supplier_message,
-            playbook_context=playbook_context,
-            signals=signals,
-            zopa=zopa,
-            procurement_summary=procurement_summary,
-            rag_snippets=rag_snippets,
-        )
+        if message_text is None:
+            message_text = self._build_summary_fallback(
+                context=context,
+                session_reference=session_reference,
+                decision=decision,
+                price=price,
+                target_price=target_price,
+                currency=currency,
+                round_no=round_no,
+                supplier=supplier,
+                supplier_snippets=supplier_snippets,
+                supplier_message=supplier_message,
+                playbook_context=playbook_context,
+                signals=signals,
+                zopa=zopa,
+                procurement_summary=procurement_summary,
+                rag_snippets=rag_snippets,
+            )
+        return message_text or ""
 
     def _build_positions_from_decision(
         self,
@@ -5439,6 +5471,154 @@ class NegotiationAgent(BaseAgent):
                 snippets.append(value.strip())
         return snippets[:5]
 
+    def _resolve_contact_name(
+        self, payload: Optional[Dict[str, Any]], *, fallback: Optional[str] = None
+    ) -> Optional[str]:
+        if not isinstance(payload, dict):
+            payload = {}
+
+        candidate_keys = (
+            "contact_name",
+            "contact_person",
+            "contact",
+            "supplier_contact",
+            "supplier_contact_name",
+            "primary_contact_name",
+            "recipient_name",
+            "to_name",
+            "attention_to",
+            "contact_full_name",
+            "contact_name_1",
+            "contact_name_2",
+        )
+        for key in candidate_keys:
+            if key not in payload:
+                continue
+            resolved = self._normalise_contact_name(payload.get(key))
+            if resolved:
+                return resolved
+
+        nested_keys = (
+            "name",
+            "full_name",
+            "display_name",
+            "contact_name",
+            "first_name",
+            "last_name",
+        )
+        for key in ("primary_contact", "contact", "supplier_contact"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                for nested_key in nested_keys:
+                    resolved = self._normalise_contact_name(nested.get(nested_key))
+                    if resolved:
+                        return resolved
+
+        contacts = payload.get("supplier_contacts")
+        if isinstance(contacts, list):
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    continue
+                for nested_key in nested_keys:
+                    resolved = self._normalise_contact_name(contact.get(nested_key))
+                    if resolved:
+                        return resolved
+
+        email_keys = (
+            "recipient_email",
+            "receiver",
+            "recipients",
+            "supplier_contact_email",
+            "contact_email",
+            "from_address",
+            "supplier_email",
+            "email",
+        )
+        for key in email_keys:
+            candidate = payload.get(key)
+            if isinstance(candidate, (list, tuple, set)):
+                items = candidate
+            else:
+                items = (candidate,)
+            for item in items:
+                parsed = self._extract_name_from_email(item)
+                if parsed:
+                    return parsed
+
+        if fallback:
+            fallback_name = self._normalise_contact_name(fallback)
+            if fallback_name and not self._is_likely_identifier(fallback_name):
+                return fallback_name
+            parsed = self._extract_name_from_email(fallback)
+            if parsed:
+                return parsed
+
+        return None
+
+    def _normalise_contact_name(self, value: Any) -> Optional[str]:
+        text = self._coerce_text(value)
+        if not text:
+            return None
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text).strip(" ,.;")
+        if not text:
+            return None
+        if "@" in text and " " not in text:
+            return None
+        return text
+
+    @staticmethod
+    def _is_likely_identifier(value: str) -> bool:
+        token = value.strip()
+        if not token:
+            return False
+        return bool(re.match(r"^[A-Z]{2,}[A-Z0-9._-]*$", token))
+
+    def _extract_name_from_email(self, value: Any) -> Optional[str]:
+        email = self._coerce_text(value)
+        if not email or "@" not in email:
+            return None
+        local = email.split("@", 1)[0]
+        tokens = [
+            token
+            for token in re.split(r"[._+\-]", local)
+            if token and token.isalpha()
+        ]
+        if not tokens:
+            return None
+        return " ".join(token.capitalize() for token in tokens)
+
+    @staticmethod
+    def _has_explicit_greeting(message: Optional[str]) -> bool:
+        if not message:
+            return False
+        snippet = message.lstrip()
+        lowered = snippet.lower()
+        greeting_prefixes = (
+            "dear ",
+            "hi ",
+            "hello ",
+            "greetings",
+            "good morning",
+            "good afternoon",
+            "good evening",
+        )
+        return any(lowered.startswith(prefix) for prefix in greeting_prefixes)
+
+    def _build_personal_greeting(
+        self, contact_name: Optional[str], supplier_name: Optional[str]
+    ) -> Optional[str]:
+        for candidate in (contact_name, supplier_name):
+            if not candidate:
+                continue
+            resolved = self._normalise_contact_name(candidate)
+            if resolved and not self._is_likely_identifier(resolved):
+                return f"Dear {resolved},"
+            parsed = self._extract_name_from_email(candidate)
+            if parsed:
+                return f"Dear {parsed},"
+        return None
+
     def _build_decision_log(
         self,
         supplier: Optional[str],
@@ -6020,6 +6200,202 @@ class NegotiationAgent(BaseAgent):
         if isinstance(value, list):
             return value
         return [value]
+
+    def _ensure_email_agent(self) -> Optional[EmailDraftingAgent]:
+        try:
+            if self._email_agent is None:
+                with self._email_agent_lock:
+                    if self._email_agent is None:
+                        self._email_agent = EmailDraftingAgent(self.agent_nick)
+        except Exception:
+            logger.debug("Unable to initialise EmailDraftingAgent", exc_info=True)
+            return None
+        return self._email_agent
+
+    @staticmethod
+    def _simple_html_from_text(text: str) -> str:
+        lines = text.splitlines()
+        html_parts: List[str] = []
+        bullets: List[str] = []
+
+        def flush() -> None:
+            if bullets:
+                items = "".join(f"<li>{escape(item)}</li>" for item in bullets)
+                html_parts.append(f"<ul>{items}</ul>")
+                bullets.clear()
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                flush()
+                continue
+            if re.match(r"^[-*•]\s+", stripped):
+                bullets.append(stripped[1:].strip())
+                continue
+            flush()
+            html_parts.append(f"<p>{escape(stripped)}</p>")
+        flush()
+        return "".join(html_parts)
+
+    @staticmethod
+    def _normalise_recipient_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        candidates: List[str] = []
+        if isinstance(value, str):
+            tokens = re.split(r"[;,]", value)
+            candidates.extend(token.strip() for token in tokens if token.strip())
+        elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            for item in value:
+                if isinstance(item, str):
+                    tokens = re.split(r"[;,]", item)
+                    candidates.extend(token.strip() for token in tokens if token.strip())
+        return candidates
+
+    @staticmethod
+    def _merge_recipients_basic(to_list: List[str], cc_list: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen: Set[str] = set()
+        for addr in list(to_list) + list(cc_list):
+            candidate = addr.strip()
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+        return merged
+
+    def _build_email_draft_stub(
+        self,
+        *,
+        context: AgentContext,
+        draft_payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        negotiation_message: Optional[str],
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+        contact_name: Optional[str],
+        session_reference: Optional[str],
+        rfq_id: Optional[str],
+        recipients: Optional[Sequence[Any]],
+        thread_headers: Optional[Any],
+    ) -> Dict[str, Any]:
+        workflow_id = getattr(context, "workflow_id", None)
+        subject_seed = self._coerce_text(draft_payload.get("subject"))
+        subject = subject_seed or DEFAULT_NEGOTIATION_SUBJECT
+
+        message_body = self._coerce_text(negotiation_message) or ""
+        greeting_line = self._build_personal_greeting(contact_name, supplier_name)
+        if greeting_line and not self._has_explicit_greeting(message_body):
+            message_body = greeting_line if not message_body else f"{greeting_line}\n\n{message_body}".strip()
+        cleaned_body = EmailDraftingAgent._clean_body_text(message_body)
+
+        email_agent = self._ensure_email_agent()
+        sanitised_html = ""
+        plain_text = cleaned_body
+        if email_agent and cleaned_body:
+            try:
+                html_candidate = email_agent._render_html_from_text(cleaned_body)
+                sanitised_html = email_agent._sanitise_generated_body(html_candidate)
+                if not sanitised_html:
+                    sanitised_html = email_agent._render_html_from_text(cleaned_body)
+                if sanitised_html:
+                    extracted = email_agent._html_to_plain_text(sanitised_html)
+                    if extracted:
+                        plain_text = EmailDraftingAgent._clean_body_text(extracted)
+            except Exception:
+                logger.debug("Failed to render negotiation draft HTML", exc_info=True)
+                sanitised_html = ""
+        if not sanitised_html and cleaned_body:
+            sanitised_html = self._simple_html_from_text(cleaned_body)
+            plain_text = cleaned_body
+
+        if plain_text:
+            plain_text = EmailDraftingAgent._clean_body_text(plain_text)
+
+        unique_id = self._coerce_text(session_reference) or self._coerce_text(
+            draft_payload.get("unique_id")
+        )
+        if not unique_id:
+            unique_id = str(uuid.uuid4())
+
+        annotated_body, marker_token = attach_hidden_marker(
+            plain_text or "",
+            supplier_id=supplier_id,
+            unique_id=unique_id,
+        )
+
+        to_candidates = self._normalise_recipient_list(recipients)
+        if not to_candidates:
+            to_candidates = self._normalise_recipient_list(draft_payload.get("recipients"))
+        cc_candidates = self._normalise_recipient_list(draft_payload.get("cc"))
+        deduped_cc = self._merge_recipients_basic([], cc_candidates)
+        if to_candidates:
+            lower_to = {addr.lower() for addr in to_candidates}
+            deduped_cc = [addr for addr in deduped_cc if addr.lower() not in lower_to]
+        if email_agent:
+            try:
+                merged = email_agent._merge_recipients(to_candidates, cc_candidates)
+            except Exception:
+                merged = self._merge_recipients_basic(to_candidates, cc_candidates)
+        else:
+            merged = self._merge_recipients_basic(to_candidates, cc_candidates)
+        recipients_list = merged
+
+        receiver = to_candidates[0] if to_candidates else (recipients_list[0] if recipients_list else None)
+        sender = context.input_data.get("sender") if isinstance(context.input_data, dict) else None
+        if not sender:
+            sender = getattr(self.agent_nick.settings, "ses_default_sender", None)
+
+        headers: Dict[str, Any] = {
+            "X-Procwise-Unique-Id": unique_id,
+        }
+        if workflow_id:
+            headers["X-Procwise-Workflow-Id"] = workflow_id
+
+        metadata_payload = dict(metadata or {})
+        metadata_payload.setdefault("unique_id", unique_id)
+        if marker_token:
+            metadata_payload.setdefault("dispatch_token", marker_token)
+        if workflow_id is not None:
+            metadata_payload.setdefault("workflow_id", workflow_id)
+        if supplier_id is not None:
+            metadata_payload.setdefault("supplier_id", supplier_id)
+        if contact_name:
+            metadata_payload.setdefault("contact_name", contact_name)
+            metadata_payload.setdefault("supplier_contact", contact_name)
+
+        stub: Dict[str, Any] = {
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "contact_name": contact_name,
+            "supplier_contact": contact_name,
+            "subject": subject,
+            "body": annotated_body,
+            "text": plain_text,
+            "html": sanitised_html,
+            "sender": sender,
+            "recipients": recipients_list,
+            "receiver": receiver,
+            "to": receiver,
+            "cc": deduped_cc,
+            "contact_level": 1 if receiver else 0,
+            "sent_status": False,
+            "metadata": metadata_payload,
+            "headers": headers,
+            "unique_id": unique_id,
+            "session_reference": session_reference or unique_id,
+            "rfq_id": rfq_id,
+            "payload": draft_payload,
+            "workflow_id": workflow_id,
+        }
+
+        if isinstance(thread_headers, dict) and thread_headers:
+            stub["thread_headers"] = dict(thread_headers)
+
+        return stub
 
     def _build_email_agent_payload(
         self,
