@@ -675,7 +675,7 @@ def test_low_confidence_guard_blanks_critical_fields(monkeypatch):
     monkeypatch.setattr(
         agent,
         "_parse_header_improved",
-        lambda text, file_bytes=None: dict(base_header),
+        lambda text, file_bytes=None, source_hint=None: dict(base_header),
     )
     monkeypatch.setattr(
         agent,
@@ -836,7 +836,7 @@ def test_structured_extraction_injects_recovered_fields(monkeypatch):
     monkeypatch.setattr(
         agent,
         "_parse_header_improved",
-        lambda text, file_bytes=None: dict(base_header),
+        lambda text, file_bytes=None, source_hint=None: dict(base_header),
     )
     monkeypatch.setattr(
         agent,
