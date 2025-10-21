@@ -87,6 +87,22 @@ class Settings(BaseSettings):
         default=60, env="EMAIL_INBOUND_INITIAL_WAIT_SECONDS"
     )
 
+    negotiation_multi_round_enabled: bool = Field(
+        default=True, env="NEGOTIATION_MULTI_ROUND_ENABLED"
+    )
+    negotiation_max_rounds: int = Field(
+        default=3, env="NEGOTIATION_MAX_ROUNDS"
+    )
+    negotiation_round_base_timeout: int = Field(
+        default=900, env="NEGOTIATION_ROUND_BASE_TIMEOUT"
+    )
+    negotiation_per_supplier_timeout: int = Field(
+        default=300, env="NEGOTIATION_PER_SUPPLIER_TIMEOUT"
+    )
+    negotiation_max_round_timeout: int = Field(
+        default=3600, env="NEGOTIATION_MAX_ROUND_TIMEOUT"
+    )
+
     # IMAP mailbox configuration
     imap_host: Optional[str] = Field(default=None, env="IMAP_HOST")
     imap_port: Optional[int] = Field(default=None, env="IMAP_PORT")
