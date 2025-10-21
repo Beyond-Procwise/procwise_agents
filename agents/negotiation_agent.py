@@ -1720,7 +1720,7 @@ class NegotiationAgent(BaseAgent):
         for supplier_id, supplier_state in active_suppliers.items():
             if not isinstance(supplier_state, dict):
                 continue
-            if supplier_state.get("status") in {"COMPLETED", "ACCEPTED", "DECLINED"}:
+            if supplier_state.get("status") in {"COMPLETED", "ACCEPTED", "DECLINED", "FAILED"}:
                 continue
 
             base_entry = dict(supplier_state.get("entry") or {})
