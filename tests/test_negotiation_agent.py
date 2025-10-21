@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -12,7 +13,31 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.negotiation_agent import NegotiationAgent
+_stub_prompt_module = types.ModuleType("orchestration.prompt_engine")
+
+
+class _StubPromptEngine:
+    def __init__(self, agent_nick=None, prompt_rows=None):
+        self._prompts = [dict(row) for row in prompt_rows or []]
+
+    def get_prompt(self, prompt_id):
+        for row in self._prompts:
+            if str(row.get("prompt_id")) == str(prompt_id):
+                return dict(row)
+        return {}
+
+    def prompts_for_agent(self, agent_name):
+        return []
+
+
+_stub_prompt_module.PromptEngine = _StubPromptEngine
+_stub_orchestration_pkg = types.ModuleType("orchestration")
+_stub_orchestration_pkg.prompt_engine = _stub_prompt_module
+_stub_orchestration_pkg.__path__ = []  # type: ignore[attr-defined]
+sys.modules.setdefault("orchestration", _stub_orchestration_pkg)
+sys.modules.setdefault("orchestration.prompt_engine", _stub_prompt_module)
+
+from agents.negotiation_agent import NegotiationAgent, NegotiationEmailHTMLBuilder
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
@@ -74,6 +99,70 @@ class DummyNick:
             return DummyConn()
 
         self.get_db_connection = get_db_connection
+
+
+def test_negotiation_email_html_builder_renders_layout():
+    builder = NegotiationEmailHTMLBuilder()
+    body_text = (
+        "Hello Alex,\n\n"
+        "Thank you for the revised proposal.\n"
+        "- Include expedited shipping.\n"
+        "- Hold pricing for 12 months.\n\n"
+        "Regards,\nProcurement"
+    )
+
+    html = builder.build(subject="Re: Pricing Discussion", body_text=body_text)
+
+    assert "<!DOCTYPE html>" in html
+    assert "Beyond Procwise" in html
+    assert html.count("<li") == 2
+    assert "Human review required" in html
+    assert "Re: Pricing Discussion" in html
+
+
+def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    class StubEmailAgent:
+        def _sanitise_generated_body(self, html):
+            return html
+
+        def _html_to_plain_text(self, html):
+            return "Hello Alex,\n- Include expedited shipping.\n- Hold pricing for 12 months.\nRegards"
+
+    monkeypatch.setattr(agent, "_ensure_email_agent", lambda: StubEmailAgent())
+
+    context = AgentContext(
+        workflow_id="wf-html",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={"sender": "buyer@example.com"},
+    )
+
+    stub = agent._build_email_draft_stub(
+        context=context,
+        draft_payload={"subject": "Re: Pricing Discussion", "recipients": ["alex@example.com"]},
+        metadata={},
+        negotiation_message=(
+            "Hello Alex,\n\n- Include expedited shipping.\n- Hold pricing for 12 months.\n\nRegards"
+        ),
+        supplier_id="SUP-1",
+        supplier_name="Acme Supplies",
+        contact_name="Alex",
+        session_reference="session-123",
+        rfq_id="RFQ-100",
+        recipients=None,
+        thread_headers=None,
+    )
+
+    assert "<!DOCTYPE html>" in stub["html"]
+    assert "Beyond Procwise" in stub["html"]
+    assert "Human review required" in stub["html"]
+    assert "Include expedited shipping" in stub["html"]
+    assert "Hold pricing for 12 months" in stub["html"]
+    assert stub["text"].startswith("Hello Alex")
+    assert "<html" not in stub["text"].lower()
 
 
 def test_negotiation_agent_handles_missing_fields(monkeypatch):
@@ -216,8 +305,6 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert payload["subject"].startswith("Re:")
     assert payload["drafts"][0]["supplier_id"] == "S1"
     assert payload["intent"] == "NEGOTIATION_COUNTER"
-
-
 def test_negotiation_agent_detects_final_offer(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)
