@@ -3983,19 +3983,47 @@ class NegotiationAgent(BaseAgent):
                         "ALTER TABLE proc.negotiation_session_state ALTER COLUMN rfq_id DROP NOT NULL"
                     )
                     cur.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_workflow_supplier_idx
-                            ON proc.negotiation_session_state (workflow_id, supplier_id)
-                            WHERE workflow_id IS NOT NULL
-                        """
+                        "DROP INDEX IF EXISTS proc.negotiation_session_state_workflow_supplier_idx"
                     )
                     cur.execute(
+                        "DROP INDEX IF EXISTS proc.negotiation_session_state_unique_supplier_idx"
+                    )
+
+                    cur.execute(
                         """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_unique_supplier_idx
-                            ON proc.negotiation_session_state (unique_id, supplier_id)
-                            WHERE unique_id IS NOT NULL
+                        SELECT constraint_name
+                          FROM information_schema.table_constraints
+                         WHERE table_schema = 'proc'
+                           AND table_name = 'negotiation_session_state'
+                           AND constraint_name = 'negotiation_session_state_workflow_supplier_key'
                         """
                     )
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            ALTER TABLE proc.negotiation_session_state
+                            ADD CONSTRAINT negotiation_session_state_workflow_supplier_key
+                            UNIQUE (workflow_id, supplier_id)
+                            """
+                        )
+
+                    cur.execute(
+                        """
+                        SELECT constraint_name
+                          FROM information_schema.table_constraints
+                         WHERE table_schema = 'proc'
+                           AND table_name = 'negotiation_session_state'
+                           AND constraint_name = 'negotiation_session_state_unique_supplier_key'
+                        """
+                    )
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            ALTER TABLE proc.negotiation_session_state
+                            ADD CONSTRAINT negotiation_session_state_unique_supplier_key
+                            UNIQUE (unique_id, supplier_id)
+                            """
+                        )
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.debug("failed to ensure negotiation state schema", exc_info=True)
@@ -4045,19 +4073,47 @@ class NegotiationAgent(BaseAgent):
                         "ALTER TABLE proc.negotiation_sessions ALTER COLUMN rfq_id DROP NOT NULL"
                     )
                     cur.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_sessions_workflow_supplier_round_idx
-                            ON proc.negotiation_sessions (workflow_id, supplier_id, round)
-                            WHERE workflow_id IS NOT NULL
-                        """
+                        "DROP INDEX IF EXISTS proc.negotiation_sessions_workflow_supplier_round_idx"
                     )
                     cur.execute(
+                        "DROP INDEX IF EXISTS proc.negotiation_sessions_unique_supplier_round_idx"
+                    )
+
+                    cur.execute(
                         """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_sessions_unique_supplier_round_idx
-                            ON proc.negotiation_sessions (unique_id, supplier_id, round)
-                            WHERE unique_id IS NOT NULL
+                        SELECT constraint_name
+                          FROM information_schema.table_constraints
+                         WHERE table_schema = 'proc'
+                           AND table_name = 'negotiation_sessions'
+                           AND constraint_name = 'negotiation_sessions_workflow_supplier_round_key'
                         """
                     )
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            ALTER TABLE proc.negotiation_sessions
+                            ADD CONSTRAINT negotiation_sessions_workflow_supplier_round_key
+                            UNIQUE (workflow_id, supplier_id, round)
+                            """
+                        )
+
+                    cur.execute(
+                        """
+                        SELECT constraint_name
+                          FROM information_schema.table_constraints
+                         WHERE table_schema = 'proc'
+                           AND table_name = 'negotiation_sessions'
+                           AND constraint_name = 'negotiation_sessions_unique_supplier_round_key'
+                        """
+                    )
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            ALTER TABLE proc.negotiation_sessions
+                            ADD CONSTRAINT negotiation_sessions_unique_supplier_round_key
+                            UNIQUE (unique_id, supplier_id, round)
+                            """
+                        )
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.debug("failed to ensure negotiation sessions schema", exc_info=True)
