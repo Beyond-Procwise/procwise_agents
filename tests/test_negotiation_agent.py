@@ -737,6 +737,10 @@ def test_negotiation_agent_runs_batch_in_parallel(monkeypatch):
     assert output.data["failed_suppliers"] == []
     assert output.pass_fields["negotiation_batch"] is True
     assert len(output.pass_fields["batch_results"]) == 2
+    summaries = output.data.get("round_summaries")
+    assert summaries and summaries[0]["suppliers"] == ["S1", "S2"]
+    assert summaries[0]["round"] is None
+    assert output.pass_fields["round_summaries"][0]["suppliers"] == ["S1", "S2"]
 
 
 def test_negotiation_agent_batch_records_failures(monkeypatch):
@@ -794,6 +798,8 @@ def test_negotiation_agent_batch_records_failures(monkeypatch):
     assert output.data["failed_suppliers"]
     assert output.data["successful_suppliers"] == ["S1"]
     assert len(output.data["drafts"]) == 1
+    summaries = output.data.get("round_summaries")
+    assert summaries and set(summaries[0]["suppliers"]) == {"S1", "S2"}
 
 
 def test_negotiation_agent_adopts_workflow_from_drafts_when_mismatched(monkeypatch):
