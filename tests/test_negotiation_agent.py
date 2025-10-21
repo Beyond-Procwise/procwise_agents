@@ -37,7 +37,10 @@ _stub_orchestration_pkg.__path__ = []  # type: ignore[attr-defined]
 sys.modules.setdefault("orchestration", _stub_orchestration_pkg)
 sys.modules.setdefault("orchestration.prompt_engine", _stub_prompt_module)
 
-from agents.negotiation_agent import NegotiationAgent, NegotiationEmailHTMLBuilder
+from agents.negotiation_agent import (
+    NegotiationAgent,
+    NegotiationEmailHTMLShellBuilder,
+)
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
@@ -102,7 +105,7 @@ class DummyNick:
 
 
 def test_negotiation_email_html_builder_renders_layout():
-    builder = NegotiationEmailHTMLBuilder()
+    builder = NegotiationEmailHTMLShellBuilder()
     body_text = (
         "Hello Alex,\n\n"
         "Thank you for the revised proposal.\n"
@@ -154,6 +157,10 @@ def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
         rfq_id="RFQ-100",
         recipients=None,
         thread_headers=None,
+        round_number=1,
+        decision={},
+        currency="USD",
+        playbook_context=None,
     )
 
     assert "<!DOCTYPE html>" in stub["html"]
@@ -163,6 +170,49 @@ def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
     assert "Hold pricing for 12 months" in stub["html"]
     assert stub["text"].startswith("Hello Alex")
     assert "<html" not in stub["text"].lower()
+
+
+def test_negotiation_agent_draft_stub_preserves_html_shell(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    class StubEmailAgent:
+        def _sanitise_generated_body(self, html):
+            return html
+
+        def _html_to_plain_text(self, html):
+            return "Hi there"
+
+    monkeypatch.setattr(agent, "_ensure_email_agent", lambda: StubEmailAgent())
+
+    context = AgentContext(
+        workflow_id="wf-shell",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={"sender": "buyer@example.com"},
+    )
+
+    stub = agent._build_email_draft_stub(
+        context=context,
+        draft_payload={"subject": "Negotiation Update"},
+        metadata={},
+        negotiation_message="Hello supplier,\nPlease review our counter.",
+        supplier_id="SUP-shell",
+        supplier_name="Shell Supplier",
+        contact_name="Jordan",
+        session_reference="session-shell",
+        rfq_id="RFQ-shell",
+        recipients=None,
+        thread_headers=None,
+        round_number=2,
+        decision={},
+        currency=None,
+        playbook_context=None,
+    )
+
+    assert stub["html"].strip()
+    assert "<html" in stub["html"].lower()
+    assert stub["text"].strip()
 
 
 def test_negotiation_agent_handles_missing_fields(monkeypatch):
