@@ -3,9 +3,11 @@ import logging
 import math
 import os
 import re
+import binascii
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
@@ -671,6 +673,74 @@ class NegotiationAgent(BaseAgent):
             os.getenv("NEG_USE_ENHANCED_MESSAGES", "false").lower() == "true"
         )
 
+    @contextmanager
+    def _session_lock(self, workflow_id: str, supplier_id: str, round_no: int):
+        """Cross-process advisory lock to avoid duplicate negotiation runs."""
+
+        key_parts = [workflow_id, supplier_id, str(round_no or 1)]
+        token = ":".join(part or "" for part in key_parts)
+        lock_id = binascii.crc32(token.encode("utf-8", "ignore")) & 0x7FFFFFFF
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            yield True
+            return
+
+        conn_manager = get_conn()
+        owns_manager = hasattr(conn_manager, "__enter__") and hasattr(conn_manager, "__exit__")
+        connection = None
+        acquired = False
+        try:
+            connection = conn_manager.__enter__() if owns_manager else conn_manager
+            if connection is None:
+                yield True
+                return
+
+            with connection.cursor() as cur:
+                try:
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
+                    row = cur.fetchone()
+                    if row is None or row[0] is None:
+                        acquired = True
+                    else:
+                        acquired = bool(row[0])
+                except Exception:
+                    logger.debug(
+                        "Advisory lock attempt failed; continuing without distributed lock",
+                        exc_info=True,
+                    )
+                    acquired = True
+            connection.commit()
+
+            if not acquired:
+                yield False
+                return
+
+            try:
+                yield True
+            finally:
+                try:
+                    with connection.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+                    connection.commit()
+                except Exception:  # pragma: no cover - unlock best effort
+                    logger.debug(
+                        "Failed to release advisory lock for workflow=%s supplier=%s round=%s",
+                        workflow_id,
+                        supplier_id,
+                        round_no,
+                        exc_info=True,
+                    )
+        finally:
+            if connection is not None:
+                if owns_manager:
+                    conn_manager.__exit__(None, None, None)
+                else:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+
     def _resolve_session_id(self, context: AgentContext) -> Optional[str]:
         """Derive the canonical negotiation session identifier."""
 
@@ -1143,14 +1213,76 @@ class NegotiationAgent(BaseAgent):
         workflow_id = identifier.workflow_id
         session_id = workflow_id
 
-        rfq_id: Optional[str] = None
+        round_hint = None
         if isinstance(payload, dict):
-            for key in ("rfq_id", "rfqId", "rfq", "rfq_reference", "rfqReference"):
-                candidate = payload.get(key)
-                text = self._coerce_text(candidate)
-                if text:
-                    rfq_id = text
-                    break
+            round_hint = payload.get("round")
+        try:
+            lock_round = int(round_hint) if round_hint is not None else identifier.round_number
+        except Exception:
+            lock_round = identifier.round_number
+        if not isinstance(lock_round, int) or lock_round < 1:
+            lock_round = max(int(identifier.round_number or 1), 1)
+
+        lock_context = self._session_lock(workflow_id, supplier, lock_round)
+        lock_acquired = lock_context.__enter__()
+        if not lock_acquired:
+            lock_context.__exit__(None, None, None)
+            logger.warning(
+                "NegotiationAgent concurrency guard prevented duplicate run",
+                extra={
+                    "workflow_id": workflow_id,
+                    "supplier_id": supplier,
+                    "round": lock_round,
+                },
+            )
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={
+                        "workflow_id": workflow_id,
+                        "supplier_id": supplier,
+                        "round": lock_round,
+                        "locked": True,
+                        "message": "Another negotiation instance is already processing this supplier round.",
+                    },
+                    error="negotiation_session_locked",
+                ),
+            )
+
+        try:
+            return self._run_single_negotiation_locked(
+                context,
+                identifier,
+                payload,
+                session_reference,
+                supplier,
+                workflow_id,
+                session_id,
+                round_hint,
+            )
+        finally:
+            lock_context.__exit__(None, None, None)
+
+    def _run_single_negotiation_locked(
+        self,
+        context: AgentContext,
+        identifier: NegotiationIdentifier,
+        payload: Dict[str, Any],
+        session_reference: str,
+        supplier: str,
+        workflow_id: str,
+        session_id: Optional[str],
+        raw_round_hint: Any,
+    ) -> AgentOutput:
+
+        rfq_id: Optional[str] = None
+        for key in ("rfq_id", "rfqId", "rfq", "rfq_reference", "rfqReference"):
+            candidate = payload.get(key) if isinstance(payload, dict) else None
+            text = self._coerce_text(candidate)
+            if text:
+                rfq_id = text
+                break
 
         state_identifier: Optional[str] = self._coerce_text(workflow_id)
         if not state_identifier:
@@ -1167,7 +1299,7 @@ class NegotiationAgent(BaseAgent):
         if rfq_id and isinstance(context.input_data, dict):
             context.input_data.setdefault("rfq_id", rfq_id)
         rfq_value = rfq_id or state_identifier
-        raw_round = context.input_data.get("round", identifier.round_number)
+        raw_round = raw_round_hint if raw_round_hint is not None else identifier.round_number
 
         state_identifier = identifier.workflow_id or state_identifier
 
@@ -1214,6 +1346,7 @@ class NegotiationAgent(BaseAgent):
         state, _ = self._load_session_state(state_identifier, supplier)
         state["workflow_id"] = identifier.workflow_id
         state["session_reference"] = session_reference
+        state["supplier_id"] = supplier
 
         round_no = int(state.get("current_round", 1))
         if isinstance(raw_round, (int, float)):
@@ -1591,6 +1724,19 @@ class NegotiationAgent(BaseAgent):
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
 
         supplier_name = context.input_data.get("supplier_name")
+        decision["supplier_id"] = supplier
+        if supplier_name:
+            decision.setdefault("supplier_name", supplier_name)
+        else:
+            decision.setdefault("supplier_name", supplier)
+        decision.setdefault("supplier", decision.get("supplier_name"))
+        decision.setdefault("workflow_id", identifier.workflow_id)
+        decision.setdefault("workflow_ref", identifier.workflow_id)
+        decision.setdefault("session_reference", session_reference)
+        decision.setdefault("unique_id", session_reference)
+        decision.setdefault("round", round_no)
+        decision.setdefault("rfq_id", rfq_value)
+
         contact_name = self._resolve_contact_name(
             context.input_data if isinstance(context.input_data, dict) else {},
             fallback=supplier_name or supplier,
@@ -1648,6 +1794,7 @@ class NegotiationAgent(BaseAgent):
             "session_reference": session_reference,
             "unique_id": session_reference,
             "supplier_id": supplier,
+            "workflow_id": identifier.workflow_id,
             "rfq_id": rfq_value,
             "current_offer": price_raw,
             "current_offer_numeric": price,
@@ -2708,6 +2855,81 @@ class NegotiationAgent(BaseAgent):
         setattr(self, attr_name, column)
         return column
 
+    def _get_unique_constraint(
+        self,
+        table: str,
+        *,
+        preferred: Sequence[str],
+        fallbacks: Sequence[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        attr_name = f"_{table}_unique_constraint"
+        cached = getattr(self, attr_name, None)
+        if isinstance(cached, (list, tuple)) and cached:
+            return tuple(cached)
+
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        candidates: List[Tuple[str, ...]] = []
+        if callable(get_conn):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT constraint_name
+                              FROM information_schema.table_constraints
+                             WHERE table_schema = 'proc'
+                               AND table_name = %s
+                               AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                            """,
+                            (table,),
+                        )
+                        constraints = [row[0] for row in cur.fetchall() or []]
+                        for constraint in constraints:
+                            cur.execute(
+                                """
+                                SELECT column_name
+                                  FROM information_schema.key_column_usage
+                                 WHERE table_schema = 'proc'
+                                   AND table_name = %s
+                                   AND constraint_name = %s
+                                 ORDER BY ordinal_position
+                                """,
+                                (table, constraint),
+                            )
+                            cols = [row[0] for row in cur.fetchall() or []]
+                            if cols:
+                                candidates.append(tuple(cols))
+                conn.commit()
+            except Exception:  # pragma: no cover - diagnostic only
+                logger.debug(
+                    "Failed to introspect unique constraints for %s", table, exc_info=True
+                )
+
+        def _match(target: Sequence[str]) -> Optional[Tuple[str, ...]]:
+            normalised = tuple(target)
+            for candidate in candidates:
+                if tuple(candidate) == normalised:
+                    return tuple(candidate)
+            return None
+
+        preferred_match = _match(preferred)
+        if preferred_match:
+            setattr(self, attr_name, preferred_match)
+            return preferred_match
+
+        for fallback in fallbacks:
+            match = _match(fallback)
+            if match:
+                setattr(self, attr_name, match)
+                return match
+
+        if candidates:
+            setattr(self, attr_name, candidates[0])
+            return candidates[0]
+
+        setattr(self, attr_name, tuple(preferred))
+        return tuple(preferred)
+
     @staticmethod
     def _normalise_base_subject(subject: Optional[str]) -> Optional[str]:
         if subject is None:
@@ -2832,95 +3054,74 @@ class NegotiationAgent(BaseAgent):
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
                     column = self._get_identifier_column("negotiation_session_state")
-                    columns = [
-                        column,
-                        "supplier_id",
-                        "supplier_reply_count",
-                        "current_round",
-                        "status",
-                        "awaiting_response",
-                        "last_supplier_msg_id",
-                        "last_agent_msg_id",
-                        "last_email_sent_at",
-                        "base_subject",
-                        "initial_body",
-                    ]
-                    values: List[Any] = [
-                        identifier,
-                        supplier_id,
-                        int(state.get("supplier_reply_count", 0)),
-                        int(state.get("current_round", 1)),
-                        state.get("status", "ACTIVE"),
-                        bool(state.get("awaiting_response", False)),
-                        state.get("last_supplier_msg_id"),
-                        state.get("last_agent_msg_id"),
-                        state.get("last_email_sent_at"),
-                        state.get("base_subject"),
-                        state.get("initial_body"),
-                    ]
-
-                    update_columns: List[str] = []
-                    update_values: List[Any] = []
-
-                    def _register(column_name: str, value: Any, *, allow_update: bool = True) -> None:
-                        columns.append(column_name)
-                        values.append(value)
-                        if allow_update and column_name not in {column, "supplier_id"}:
-                            update_columns.append(column_name)
-                            update_values.append(value)
-
-                    for idx, col_name in enumerate(columns[:]):
-                        if col_name not in {column, "supplier_id"}:
-                            update_columns.append(col_name)
-                            update_values.append(values[idx])
+                    record: Dict[str, Any] = {
+                        column: identifier,
+                        "supplier_id": supplier_id,
+                        "supplier_reply_count": int(state.get("supplier_reply_count", 0)),
+                        "current_round": int(state.get("current_round", 1)),
+                        "status": state.get("status", "ACTIVE"),
+                        "awaiting_response": bool(state.get("awaiting_response", False)),
+                        "last_supplier_msg_id": state.get("last_supplier_msg_id"),
+                        "last_agent_msg_id": state.get("last_agent_msg_id"),
+                        "last_email_sent_at": state.get("last_email_sent_at"),
+                        "base_subject": state.get("base_subject"),
+                        "initial_body": state.get("initial_body"),
+                        "updated_on": datetime.now(timezone.utc),
+                    }
 
                     thread_state_payload = state.get("thread_state")
                     if thread_state_payload is not None:
                         try:
-                            thread_state_serialised = json.dumps(
+                            record["thread_state"] = json.dumps(
                                 thread_state_payload, ensure_ascii=False, default=str
                             )
                         except Exception:
-                            thread_state_serialised = None
-                        _register("thread_state", thread_state_serialised)
+                            record["thread_state"] = None
 
                     workflow_value = state.get("workflow_id") or (
                         identifier if column != "workflow_id" else None
                     )
-                    if workflow_value and column != "workflow_id":
-                        _register("workflow_id", workflow_value)
+                    if workflow_value:
+                        record.setdefault("workflow_id", workflow_value)
 
                     session_reference_value = state.get("session_reference")
                     if session_reference_value:
-                        _register("session_reference", session_reference_value)
+                        record.setdefault("session_reference", session_reference_value)
 
-                    updated_on = datetime.now(timezone.utc)
-                    _register("updated_on", updated_on)
+                    unique_columns = self._get_unique_constraint(
+                        "negotiation_session_state",
+                        preferred=(column, "supplier_id"),
+                        fallbacks=(
+                            (column, "supplier_id"),
+                            ("workflow_id", "supplier_id"),
+                            ("rfq_id", "supplier_id"),
+                            ("session_id", "supplier_id"),
+                        ),
+                    )
 
-                    column_list = ", ".join(columns)
-                    placeholders = ", ".join(["%s"] * len(values))
+                    columns = list(record.keys())
+                    values = [record[col] for col in columns]
+                    conflict_clause = ", ".join(unique_columns)
+                    unique_set = set(unique_columns)
+                    update_targets = [col for col in columns if col not in unique_set]
 
-                    update_clause = ", ".join(f"{name} = %s" for name in update_columns)
-                    updated = False
-                    if update_clause:
-                        cur.execute(
-                            f"""
-                            UPDATE proc.negotiation_session_state
-                               SET {update_clause}
-                             WHERE {column} = %s AND supplier_id = %s
-                            """,
-                            tuple(update_values + [identifier, supplier_id]),
+                    insert_sql = (
+                        f"INSERT INTO proc.negotiation_session_state ({', '.join(columns)}) "
+                        f"VALUES ({', '.join(['%s'] * len(columns))})"
+                    )
+                    if update_targets:
+                        update_sql = ", ".join(
+                            f"{col} = EXCLUDED.{col}" for col in update_targets
                         )
-                        updated = cur.rowcount > 0
-
-                    if not updated:
-                        cur.execute(
-                            f"""
-                            INSERT INTO proc.negotiation_session_state ({column_list})
-                            VALUES ({placeholders})
-                            """,
-                            tuple(values),
+                        insert_sql = (
+                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_sql}"
                         )
+                    else:
+                        insert_sql = (
+                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO NOTHING"
+                        )
+
+                    cur.execute(insert_sql, tuple(values))
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to persist negotiation session state")
@@ -5367,14 +5568,48 @@ class NegotiationAgent(BaseAgent):
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
                     column = self._get_identifier_column("negotiation_sessions")
-                    cur.execute(
-                        f"""
-                        INSERT INTO proc.negotiation_sessions
-                            ({column}, supplier_id, round, counter_offer, created_on)
-                        VALUES (%s, %s, %s, %s, NOW())
-                        """,
-                        (identifier, supplier_id, round_no, counter_price),
+                    unique_columns = self._get_unique_constraint(
+                        "negotiation_sessions",
+                        preferred=(column, "supplier_id", "round"),
+                        fallbacks=((column, "supplier_id"), ("rfq_id", "supplier_id", "round")),
                     )
+
+                    record: Dict[str, Any] = {
+                        column: identifier,
+                        "supplier_id": supplier_id,
+                        "round": int(round_no or 1),
+                        "counter_offer": counter_price,
+                        "created_on": datetime.now(timezone.utc),
+                    }
+
+                    if "workflow_id" in unique_columns and "workflow_id" not in record:
+                        record["workflow_id"] = identifier
+
+                    columns = list(record.keys())
+                    values = [record[col] for col in columns]
+                    conflict_clause = ", ".join(unique_columns)
+                    unique_set = set(unique_columns)
+                    update_targets = [
+                        col for col in columns if col not in unique_set and col != "created_on"
+                    ]
+
+                    insert_sql = (
+                        f"INSERT INTO proc.negotiation_sessions ({', '.join(columns)}) "
+                        f"VALUES ({', '.join(['%s'] * len(columns))})"
+                    )
+                    if update_targets:
+                        update_sql = ", ".join(
+                            f"{col} = EXCLUDED.{col}" for col in update_targets
+                        )
+                        insert_sql = (
+                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_sql}"
+                        )
+                    else:
+                        insert_sql = (
+                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO NOTHING"
+                        )
+
+                    cur.execute(insert_sql, tuple(values))
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to store negotiation session")
@@ -6414,6 +6649,20 @@ class NegotiationAgent(BaseAgent):
             payload.setdefault("workflow_id", workflow_id)
         else:
             logger.warning("NegotiationAgent building email payload without workflow_id on context")
+
+        supplier_hint = (
+            payload.get("supplier_id")
+            or payload.get("supplier")
+            or context.input_data.get("supplier_id")
+            or context.input_data.get("supplier")
+            or state.get("supplier_id")
+        )
+        supplier_token = self._coerce_text(supplier_hint)
+        if supplier_token:
+            payload["supplier_id"] = supplier_token
+            payload.setdefault("supplier", supplier_token)
+            decision_payload.setdefault("supplier_id", supplier_token)
+            decision_payload.setdefault("supplier", supplier_token)
 
         logger.info(
             "Building email drafting payload for supplier",
