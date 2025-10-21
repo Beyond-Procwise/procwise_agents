@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
+import hashlib
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
@@ -494,6 +495,142 @@ class ResponseMatcher:
 
 
 @dataclass
+class EmailHistoryEntry:
+    workflow_id: str
+    supplier_id: str
+    session_reference: Optional[str]
+    subject: Optional[str]
+    body: Optional[str]
+    recipients: List[str] = field(default_factory=list)
+    cc: List[str] = field(default_factory=list)
+    sender: Optional[str] = None
+    message_id: Optional[str] = None
+    email_action_id: Optional[str] = None
+    thread_headers: Optional[Dict[str, Any]] = None
+    dispatched: bool = False
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "workflow_id": self.workflow_id,
+            "supplier_id": self.supplier_id,
+            "session_reference": self.session_reference,
+            "subject": self.subject,
+            "body": self.body,
+            "recipients": list(self.recipients),
+            "cc": list(self.cc),
+            "sender": self.sender,
+            "message_id": self.message_id,
+            "email_action_id": self.email_action_id,
+            "thread_headers": dict(self.thread_headers) if isinstance(self.thread_headers, dict) else None,
+            "dispatched": bool(self.dispatched),
+            "created_at": self.created_at.isoformat(),
+            "metadata": dict(self.metadata) if isinstance(self.metadata, dict) else {},
+        }
+        return payload
+
+    @staticmethod
+    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Optional["EmailHistoryEntry"]:
+        if not isinstance(data, dict):
+            return None
+        workflow_id = str(data.get("workflow_id") or "").strip()
+        supplier_id = str(data.get("supplier_id") or "").strip()
+        if not workflow_id or not supplier_id:
+            return None
+        created_at = cls._parse_datetime(data.get("created_at")) or datetime.now(timezone.utc)
+        recipients = [str(item).strip() for item in data.get("recipients", []) if item]
+        cc = [str(item).strip() for item in data.get("cc", []) if item]
+        thread_headers = data.get("thread_headers") if isinstance(data.get("thread_headers"), dict) else None
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        return cls(
+            workflow_id=workflow_id,
+            supplier_id=supplier_id,
+            session_reference=data.get("session_reference"),
+            subject=data.get("subject"),
+            body=data.get("body"),
+            recipients=recipients,
+            cc=cc,
+            sender=data.get("sender"),
+            message_id=data.get("message_id"),
+            email_action_id=data.get("email_action_id"),
+            thread_headers=thread_headers,
+            dispatched=bool(data.get("dispatched", False)),
+            created_at=created_at,
+            metadata=metadata,
+        )
+
+    def dedup_key(self) -> Tuple[str, str]:
+        if self.message_id:
+            return ("message_id", self.message_id)
+        if self.email_action_id:
+            return ("email_action_id", self.email_action_id)
+        hash_basis = "::".join(filter(None, [self.subject or "", self.body or ""]))
+        digest = hashlib.sha256(hash_basis.encode("utf-8", "ignore")).hexdigest()
+        return ("content", digest)
+
+
+class EmailThreadManager:
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[str, str], List[EmailHistoryEntry]] = defaultdict(list)
+        self._dedup: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
+        self._lock = threading.RLock()
+
+    def add_entry(self, entry: EmailHistoryEntry) -> EmailHistoryEntry:
+        key = (entry.workflow_id, entry.supplier_id)
+        dedup_key = entry.dedup_key()
+        with self._lock:
+            if dedup_key in self._dedup[key]:
+                return entry
+            self._entries[key].append(entry)
+            self._dedup[key].add(dedup_key)
+        return entry
+
+    def set_history(self, workflow_id: str, supplier_id: str, entries: List[EmailHistoryEntry]) -> None:
+        key = (workflow_id, supplier_id)
+        with self._lock:
+            self._entries[key] = list(entries)
+            self._dedup[key] = {entry.dedup_key() for entry in entries}
+
+    def get_history(self, workflow_id: str, supplier_id: str) -> List[EmailHistoryEntry]:
+        key = (workflow_id, supplier_id)
+        with self._lock:
+            return list(self._entries.get(key, []))
+
+    def get_history_dicts(self, workflow_id: str, supplier_id: str) -> List[Dict[str, Any]]:
+        history = self.get_history(workflow_id, supplier_id)
+        return [entry.to_dict() for entry in history]
+
+    def summarise(self, workflow_id: str, supplier_id: str) -> Dict[str, Any]:
+        history = self.get_history(workflow_id, supplier_id)
+        if not history:
+            return {"total_emails": 0, "last_subject": None, "last_sent_at": None}
+        history.sort(key=lambda entry: entry.created_at)
+        last_entry = history[-1]
+        subjects = [entry.subject for entry in history if entry.subject]
+        summary = {
+            "total_emails": len(history),
+            "last_subject": last_entry.subject,
+            "last_sent_at": last_entry.created_at.isoformat(),
+        }
+        if subjects:
+            summary["subjects"] = subjects
+        if last_entry.message_id:
+            summary["last_message_id"] = last_entry.message_id
+        return summary
+
+@dataclass
 class NegotiationPositions:
     start: Optional[float]
     desired: Optional[float]
@@ -670,6 +807,7 @@ class NegotiationAgent(BaseAgent):
         self._negotiation_session_state_identifier_column: Optional[str] = None
         self._negotiation_sessions_identifier_column: Optional[str] = None
         self.response_matcher = ResponseMatcher(getattr(self.agent_nick, "get_db_connection", None))
+        self._email_thread_manager = EmailThreadManager()
 
         # Feature flag for enhanced negotiation message composition
         self._use_enhanced_messages = (
@@ -2762,6 +2900,14 @@ class NegotiationAgent(BaseAgent):
                 "market_floor_price": market_floor,
                 "normalised_inputs": normalised_inputs,
             }
+            history_payload, history_summary, all_sent = self._compose_email_history_payload(
+                identifier.workflow_id,
+                supplier,
+                state,
+            )
+            data["email_history"] = history_payload
+            data["email_thread_summary"] = history_summary
+            data["all_emails_sent"] = all_sent
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s session_id=%s reason=%s",
                 supplier,
@@ -3197,6 +3343,26 @@ class NegotiationAgent(BaseAgent):
         elif isinstance(final_thread_headers, str) and not sent_message_id:
             sent_message_id = self._coerce_text(final_thread_headers)
 
+        self._capture_email_to_history(
+            workflow_id=identifier.workflow_id,
+            supplier_id=supplier,
+            state=state,
+            draft_records=draft_records,
+            subject=email_subject or draft_payload.get("subject"),
+            body=email_body or negotiation_message,
+            thread_headers=final_thread_headers,
+            email_action_id=email_action_id,
+            message_id=sent_message_id,
+            recipients=draft_payload.get("recipients") or recipients,
+            cc=draft_payload.get("cc"),
+            sender=(
+                draft_payload.get("from_address")
+                or draft_payload.get("sender")
+                or context.input_data.get("sender")
+            ),
+            session_reference=session_reference,
+        )
+
         if sent_message_id and thread_state:
             thread_state.update_after_send(sent_message_id)
 
@@ -3280,6 +3446,15 @@ class NegotiationAgent(BaseAgent):
             "normalised_inputs": normalised_inputs,
             "thread_state": thread_state.as_dict() if thread_state else None,
         }
+
+        history_payload, history_summary, all_sent = self._compose_email_history_payload(
+            identifier.workflow_id,
+            supplier,
+            state,
+        )
+        data["email_history"] = history_payload
+        data["email_thread_summary"] = history_summary
+        data["all_emails_sent"] = all_sent
 
         if email_subject:
             data["email_subject"] = email_subject
@@ -3868,6 +4043,7 @@ class NegotiationAgent(BaseAgent):
             "thread_state": None,
             "workflow_id": None,
             "session_reference": None,
+            "email_history": [],
         }
 
     def _public_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -3924,6 +4100,231 @@ class NegotiationAgent(BaseAgent):
             return
         state["thread_state"] = thread_state.as_dict()
 
+    def _sync_email_history_cache(
+        self,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        payload: Sequence[Dict[str, Any]],
+    ) -> None:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return
+        entries: List[EmailHistoryEntry] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            hydrated = EmailHistoryEntry.from_dict(
+                {
+                    **item,
+                    "workflow_id": item.get("workflow_id", workflow_key),
+                    "supplier_id": item.get("supplier_id", supplier_key),
+                }
+            )
+            if hydrated:
+                entries.append(hydrated)
+        if entries:
+            self._email_thread_manager.set_history(workflow_key, supplier_key, entries)
+        else:
+            self._email_thread_manager.set_history(workflow_key, supplier_key, [])
+
+    def _capture_email_to_history(
+        self,
+        *,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        state: Dict[str, Any],
+        draft_records: Sequence[Dict[str, Any]],
+        subject: Optional[str],
+        body: Optional[str],
+        thread_headers: Optional[Any],
+        email_action_id: Optional[str],
+        message_id: Optional[str],
+        recipients: Optional[Sequence[Any]] = None,
+        cc: Optional[Sequence[Any]] = None,
+        sender: Optional[str] = None,
+        session_reference: Optional[str] = None,
+    ) -> None:
+        workflow_key = self._coerce_text(workflow_id or state.get("workflow_id"))
+        supplier_key = self._coerce_text(supplier_id or state.get("supplier_id"))
+        if not workflow_key or not supplier_key:
+            return
+        session_ref = (
+            self._coerce_text(session_reference)
+            or self._coerce_text(state.get("session_reference"))
+        )
+        header_dict: Optional[Dict[str, Any]] = None
+        if isinstance(thread_headers, dict):
+            header_dict = {
+                key: value
+                for key, value in thread_headers.items()
+                if value is not None
+            }
+        elif isinstance(thread_headers, str) and not message_id:
+            message_id = self._coerce_text(thread_headers)
+        normalised_recipients = self._normalise_recipient_list(recipients)
+        normalised_cc = self._normalise_recipient_list(cc)
+        base_sender = self._coerce_text(sender)
+
+        existing_history = state.setdefault("email_history", [])
+        if not isinstance(existing_history, list):
+            existing_history = []
+            state["email_history"] = existing_history
+
+        existing_keys: Set[Tuple[str, str]] = set()
+        for item in list(existing_history):
+            if not isinstance(item, dict):
+                continue
+            hydrated = EmailHistoryEntry.from_dict(
+                {
+                    **item,
+                    "workflow_id": workflow_key,
+                    "supplier_id": supplier_key,
+                }
+            )
+            if hydrated:
+                existing_keys.add(hydrated.dedup_key())
+
+        new_entries: List[EmailHistoryEntry] = []
+        records_iterable: Sequence[Any]
+        if draft_records:
+            records_iterable = draft_records
+        else:
+            records_iterable = [{}]
+
+        for raw in records_iterable:
+            draft = raw if isinstance(raw, dict) else {}
+            entry_subject = self._coerce_text(
+                draft.get("subject")
+                or draft.get("Subject")
+                or subject
+            )
+            entry_body = (
+                draft.get("body")
+                or draft.get("html_body")
+                or draft.get("text")
+                or body
+            )
+            if entry_body is not None and not isinstance(entry_body, str):
+                entry_body = str(entry_body)
+            entry_recipients = self._normalise_recipient_list(
+                draft.get("recipients") or draft.get("to") or normalised_recipients
+            )
+            entry_cc = self._normalise_recipient_list(
+                draft.get("cc") or normalised_cc
+            )
+            entry_sender = self._coerce_text(
+                draft.get("sender") or draft.get("from") or base_sender
+            )
+            entry_message_id = self._coerce_text(
+                draft.get("message_id")
+                or draft.get("Message-ID")
+                or message_id
+            )
+            draft_headers = draft.get("thread_headers")
+            header_payload: Optional[Dict[str, Any]] = None
+            if isinstance(draft_headers, dict):
+                header_payload = {
+                    key: value
+                    for key, value in draft_headers.items()
+                    if value is not None
+                }
+                if not entry_message_id:
+                    entry_message_id = self._coerce_text(
+                        header_payload.get("Message-ID")
+                        or header_payload.get("message_id")
+                    )
+            elif isinstance(draft_headers, str) and not entry_message_id:
+                entry_message_id = self._coerce_text(draft_headers)
+            if header_payload is None and header_dict:
+                header_payload = dict(header_dict)
+
+            entry_action_id = self._coerce_text(
+                draft.get("email_action_id") or email_action_id
+            )
+            dispatched = bool(
+                draft.get("sent_status")
+                or draft.get("sent")
+                or draft.get("dispatched")
+                or str(draft.get("status", "")).upper() in {"SENT", "DISPATCHED"}
+            )
+            if (
+                not entry_subject
+                and not entry_body
+                and not entry_message_id
+                and not entry_action_id
+            ):
+                continue
+            metadata: Dict[str, Any] = {}
+            for key in ("intent", "thread_index", "closing_round", "draft_type"):
+                if key in draft:
+                    metadata[key] = draft.get(key)
+            if isinstance(draft.get("metadata"), dict):
+                metadata["metadata"] = dict(draft.get("metadata"))
+
+            entry = EmailHistoryEntry(
+                workflow_id=workflow_key,
+                supplier_id=supplier_key,
+                session_reference=session_ref,
+                subject=entry_subject,
+                body=entry_body,
+                recipients=entry_recipients,
+                cc=entry_cc,
+                sender=entry_sender,
+                message_id=entry_message_id,
+                email_action_id=entry_action_id,
+                thread_headers=header_payload,
+                dispatched=dispatched,
+                metadata=metadata,
+            )
+            dedup_key = entry.dedup_key()
+            if dedup_key in existing_keys:
+                continue
+            existing_keys.add(dedup_key)
+            new_entries.append(entry)
+
+        if not new_entries:
+            return
+
+        for entry in new_entries:
+            self._email_thread_manager.add_entry(entry)
+            existing_history.append(entry.to_dict())
+
+        self._sync_email_history_cache(workflow_key, supplier_key, existing_history)
+
+    def _compose_email_history_payload(
+        self,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        state: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], bool]:
+        workflow_key = self._coerce_text(workflow_id or state.get("workflow_id"))
+        supplier_key = self._coerce_text(supplier_id or state.get("supplier_id"))
+        history: List[Dict[str, Any]] = []
+        if workflow_key and supplier_key:
+            history = self._email_thread_manager.get_history_dicts(
+                workflow_key, supplier_key
+            )
+        if not history and isinstance(state.get("email_history"), list):
+            history = [
+                item
+                for item in state["email_history"]
+                if isinstance(item, dict)
+            ]
+        summary = (
+            self._email_thread_manager.summarise(workflow_key, supplier_key)
+            if workflow_key and supplier_key
+            else {"total_emails": len(history), "last_subject": None, "last_sent_at": None}
+        )
+        if not summary.get("total_emails") and history:
+            summary = {
+                "total_emails": len(history),
+                "last_subject": history[-1].get("subject"),
+                "last_sent_at": history[-1].get("created_at"),
+            }
+        all_sent = bool(history) and all(bool(item.get("dispatched")) for item in history)
+        return history, summary, all_sent
+
     def _get_cached_state(
         self, cache_key: Optional[Tuple[str, str]]
     ) -> Optional[Dict[str, Any]]:
@@ -3958,6 +4359,7 @@ class NegotiationAgent(BaseAgent):
                             base_subject TEXT,
                             initial_body TEXT,
                             thread_state JSONB,
+                            email_history JSONB,
                             session_reference VARCHAR(255),
                             unique_id VARCHAR(255),
                             rfq_id TEXT,
@@ -3973,6 +4375,9 @@ class NegotiationAgent(BaseAgent):
                     )
                     cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS thread_state JSONB"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS email_history JSONB"
                     )
                     cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS workflow_id VARCHAR(255)"
@@ -4316,7 +4721,7 @@ class NegotiationAgent(BaseAgent):
                         f"""
                         SELECT supplier_reply_count, current_round, status, awaiting_response,
                                last_supplier_msg_id, last_agent_msg_id, last_email_sent_at,
-                               base_subject, initial_body, thread_state, workflow_id, session_reference
+                               base_subject, initial_body, thread_state, email_history, workflow_id, session_reference
                           FROM proc.negotiation_session_state
                          WHERE workflow_id = %s AND supplier_id = %s
                         """,
@@ -4335,6 +4740,7 @@ class NegotiationAgent(BaseAgent):
                             base_subject,
                             initial_body,
                             thread_state_raw,
+                            email_history_raw,
                             workflow_value,
                             session_reference_value,
                         ) = row
@@ -4363,6 +4769,25 @@ class NegotiationAgent(BaseAgent):
                                     state["thread_state"] = None
                             elif isinstance(thread_state_raw, dict):
                                 state["thread_state"] = dict(thread_state_raw)
+                        if email_history_raw:
+                            parsed_history: List[Dict[str, Any]] = []
+                            if isinstance(email_history_raw, (bytes, bytearray, memoryview)):
+                                try:
+                                    email_history_raw = email_history_raw.tobytes().decode("utf-8")
+                                except Exception:
+                                    email_history_raw = None
+                            if isinstance(email_history_raw, str):
+                                try:
+                                    parsed_history = json.loads(email_history_raw)
+                                except Exception:
+                                    parsed_history = []
+                            elif isinstance(email_history_raw, list):
+                                parsed_history = [
+                                    item
+                                    for item in email_history_raw
+                                    if isinstance(item, dict)
+                                ]
+                            state["email_history"] = parsed_history
                         if workflow_value:
                             state["workflow_id"] = self._coerce_text(workflow_value)
                         if session_reference_value:
@@ -4373,6 +4798,13 @@ class NegotiationAgent(BaseAgent):
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load negotiation session state")
         state.setdefault("workflow_id", workflow_id)
+        if not isinstance(state.get("email_history"), list):
+            state["email_history"] = []
+        self._sync_email_history_cache(
+            workflow_id,
+            supplier_id,
+            state.get("email_history") or [],
+        )
         with self._state_lock:
             self._state_cache[key] = dict(state)
         return dict(state), exists
@@ -4427,6 +4859,21 @@ class NegotiationAgent(BaseAgent):
                             )
                         except Exception:
                             record["thread_state"] = None
+
+                    email_history_payload = state.get("email_history")
+                    if isinstance(email_history_payload, list):
+                        try:
+                            record["email_history"] = json.dumps(
+                                [
+                                    entry
+                                    for entry in email_history_payload
+                                    if isinstance(entry, dict)
+                                ],
+                                ensure_ascii=False,
+                                default=str,
+                            )
+                        except Exception:
+                            record["email_history"] = json.dumps([], ensure_ascii=False)
 
                     workflow_value = self._coerce_text(state.get("workflow_id"))
                     if workflow_value:

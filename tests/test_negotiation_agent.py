@@ -602,6 +602,7 @@ def test_save_session_state_uses_workflow_supplier_unique_key(monkeypatch):
             "base_subject": {"nullable": True},
             "initial_body": {"nullable": True},
             "thread_state": {"nullable": True},
+            "email_history": {"nullable": True},
             "session_reference": {"nullable": True},
             "unique_id": {"nullable": True},
             "rfq_id": {"nullable": True},
