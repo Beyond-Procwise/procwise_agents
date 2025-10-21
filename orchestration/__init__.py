@@ -1,5 +1,6 @@
 """Orchestration helpers for procurement workflows."""
 
+from .orchestrator import WorkflowOrchestrator
 from .procurement_workflow import (
     DraftEmail,
     DispatchRecord,
@@ -11,7 +12,6 @@ from .procurement_workflow import (
     QuoteComparisonAgent,
     SupplierInteractionAgent,
     WorkflowContextManager,
-    WorkflowOrchestrator,
     build_status_request_id,
     handle_supplier_response,
     validate_implementation,
