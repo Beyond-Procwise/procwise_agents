@@ -11,6 +11,12 @@ import os
 from functools import lru_cache
 from jinja2 import Template
 
+from orchestration.procurement_workflow import (
+    MockDatabaseConnection,
+    SupplierResponse,
+    WorkflowOrchestrator as _BaseWorkflowOrchestrator,
+)
+
 try:  # Optional dependency for JSONPath mapping
     from jsonpath_ng import parse as jsonpath_parse
 except Exception:  # pragma: no cover - library may be absent in tests
@@ -2306,3 +2312,250 @@ class Orchestrator:
             child_context.input_data["workflow_id"] = workflow_id
         child_context.apply_manifest(manifest)
         return child_context
+
+
+class WorkflowOrchestrator(_BaseWorkflowOrchestrator):
+    """High-level procurement workflow runner with response gating."""
+
+    MAX_NEGOTIATION_ROUNDS: int = 3
+
+    def __init__(
+        self,
+        *,
+        db: Optional[MockDatabaseConnection] = None,
+        wait_timeout: float = 300.0,
+        poll_interval: Optional[float] = None,
+    ) -> None:
+        super().__init__(db=db or MockDatabaseConnection(), wait_timeout=wait_timeout)
+
+        if poll_interval is not None:
+            self.check_interval = max(float(poll_interval), 0.1)
+
+        timeout_env = os.getenv("RESPONSE_GATE_TIMEOUT_SEC")
+        if timeout_env:
+            try:
+                self.wait_timeout = max(float(timeout_env), 0.1)
+            except ValueError:
+                logger.debug("Invalid RESPONSE_GATE_TIMEOUT_SEC override: %s", timeout_env)
+
+        poll_env = os.getenv("RESPONSE_GATE_POLL_INTERVAL_SEC")
+        if poll_env:
+            try:
+                self.check_interval = max(float(poll_env), 0.1)
+            except ValueError:
+                logger.debug("Invalid RESPONSE_GATE_POLL_INTERVAL_SEC override: %s", poll_env)
+
+    async def execute_workflow(self, suppliers: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Run the illustrative procurement workflow end-to-end."""
+
+        logger.info("Starting procurement workflow %s", self.workflow_id)
+        await self.context_manager.initialize_workflow_understanding()
+
+        drafts, expected_initial = await self._phase_initial_emails(suppliers)
+        initial_responses: Dict[str, Any] = {}
+        if expected_initial:
+            initial = await self._collect_supplier_responses(
+                suppliers,
+                round_number=0,
+                expected_unique_ids=expected_initial,
+            )
+            initial_responses = {
+                supplier_id: response.payload for supplier_id, response in initial.items()
+            }
+
+        negotiation_results = await self._phase_negotiation(
+            suppliers,
+            initial_responses,
+        )
+
+        final_summary = await self._phase_quote_evaluation()
+
+        logger.info("Completed procurement workflow %s", self.workflow_id)
+        return {
+            "workflow_id": self.workflow_id,
+            "session_id": self.session_id,
+            "initial_drafts": {
+                supplier_id: self._draft_to_dict(draft)
+                for supplier_id, draft in drafts.items()
+            },
+            "negotiation": negotiation_results,
+            "evaluation": final_summary,
+        }
+
+    async def _phase_initial_emails(
+        self, suppliers: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], Set[str]]:
+        drafts: Dict[str, Any] = {}
+        expected_ids: Set[str] = set()
+
+        for supplier in suppliers:
+            supplier_id = supplier.get("id") or supplier.get("supplier_id")
+            if not supplier_id:
+                logger.warning("Skipping supplier without identifier: %s", supplier)
+                continue
+
+            thread = self.create_thread_for_supplier(supplier)
+            draft = await self.drafting_agent.generate_initial_email(
+                self.workflow_id,
+                supplier,
+            )
+            expected_ids.add(draft.unique_id)
+
+            thread.add_message(
+                "initial_email",
+                draft.body,
+                draft.action_id,
+                round_number=0,
+                headers={
+                    "X-Procwise-Unique-Id": draft.unique_id,
+                    "X-Procwise-Workflow-Id": self.workflow_id,
+                },
+            )
+
+            drafts[supplier_id] = draft
+
+        if expected_ids:
+            await self._initialize_response_tracking(
+                round_num=0,
+                expected_count=len(expected_ids),
+                expected_unique_ids=expected_ids,
+            )
+
+        return drafts, expected_ids
+
+    async def _collect_supplier_responses(
+        self,
+        suppliers: List[Dict[str, Any]],
+        *,
+        round_number: int,
+        expected_unique_ids: Set[str],
+    ) -> Dict[str, SupplierResponse]:
+        if not expected_unique_ids:
+            return {}
+
+        responses = await self.interaction_agent.collect_round_responses(
+            self.workflow_id,
+            round_number=round_number,
+            expected_unique_ids=expected_unique_ids,
+            timeout=self.wait_timeout,
+            poll_interval=self.check_interval,
+        )
+
+        collected: Dict[str, SupplierResponse] = {}
+        for response in responses.values():
+            supplier_id = response.supplier_id
+            thread = self.threads.get(supplier_id)
+            if thread is None:
+                logger.debug(
+                    "Received response for unknown supplier %s (round %s)",
+                    supplier_id,
+                    round_number,
+                )
+                continue
+
+            action_id = f"SUPP-R{round_number}-{thread.supplier_unique_id}"
+            thread.add_message(
+                f"supplier_response_round_{round_number}",
+                json.dumps(response.payload, indent=2, sort_keys=True),
+                action_id,
+                round_number=round_number,
+            )
+            self.session.supplier_states[supplier_id]["responses_received"] = round_number
+            collected[supplier_id] = response
+
+        return collected
+
+    async def _phase_negotiation(
+        self,
+        suppliers: List[Dict[str, Any]],
+        initial_responses: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
+        latest_responses: Dict[str, SupplierResponse] = {}
+        for supplier_id, payload in initial_responses.items():
+            response = self._response_from_payload(supplier_id, payload, 0)
+            if response:
+                latest_responses[supplier_id] = response
+
+        for round_number in range(1, self.MAX_NEGOTIATION_ROUNDS + 1):
+            self.session.current_round = round_number
+            supplier_responses = list(latest_responses.values())
+
+            if supplier_responses:
+                drafts = await self.negotiation_agent.run(
+                    self.workflow_id,
+                    round_number,
+                    supplier_responses,
+                    self.threads,
+                )
+            else:
+                drafts = []
+
+            expected_ids: Set[str] = set()
+            for draft in drafts:
+                supplier_id = draft.supplier_id
+                results[f"{supplier_id}_round_{round_number}"] = self._draft_to_dict(draft)
+                thread = self.threads.get(supplier_id)
+                if thread:
+                    thread.add_message(
+                        f"negotiation_round_{round_number}",
+                        draft.body,
+                        draft.action_id,
+                        round_number=round_number,
+                    )
+                    self.session.supplier_states[supplier_id]["rounds_completed"] = round_number
+                expected_ids.add(draft.unique_id)
+
+            if round_number >= self.MAX_NEGOTIATION_ROUNDS or not expected_ids:
+                latest_responses = {}
+                continue
+
+            await self._initialize_response_tracking(
+                round_num=round_number,
+                expected_count=len(expected_ids),
+                expected_unique_ids=expected_ids,
+            )
+            latest_responses = await self._collect_supplier_responses(
+                suppliers,
+                round_number=round_number,
+                expected_unique_ids=expected_ids,
+            )
+            for supplier_id, response in latest_responses.items():
+                results[f"{supplier_id}_supplier_response_round_{round_number}"] = response.payload
+
+        return results
+
+    async def _phase_quote_evaluation(self) -> Dict[str, Any]:
+        return await self.comparison_agent.compare(self.workflow_id)
+
+    @staticmethod
+    def _draft_to_dict(draft: Any) -> Dict[str, Any]:
+        if isinstance(draft, dict):
+            return dict(draft)
+
+        payload: Dict[str, Any] = {}
+        for field in getattr(draft, "__dataclass_fields__", {}):
+            payload[field] = getattr(draft, field)
+        return payload
+
+    def _response_from_payload(
+        self,
+        supplier_id: str,
+        payload: Dict[str, Any],
+        round_number: int,
+    ) -> Optional["SupplierResponse"]:
+        if not payload:
+            return None
+
+        thread = self.threads.get(supplier_id)
+        unique_id = thread.unique_id if thread else None
+        if not unique_id:
+            return None
+
+        return SupplierResponse(
+            workflow_id=self.workflow_id,
+            unique_id=unique_id,
+            supplier_id=supplier_id,
+            round_number=round_number,
+            payload=payload,
+        )
