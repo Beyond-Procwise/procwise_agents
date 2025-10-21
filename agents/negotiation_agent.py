@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
+import hashlib
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
@@ -1384,6 +1385,7 @@ class NegotiationAgent(BaseAgent):
         self._negotiation_session_state_identifier_column: Optional[str] = None
         self._negotiation_sessions_identifier_column: Optional[str] = None
         self.response_matcher = ResponseMatcher(getattr(self.agent_nick, "get_db_connection", None))
+        self._email_thread_manager = EmailThreadManager()
 
         # Feature flag for enhanced negotiation message composition
         self._use_enhanced_messages = (
@@ -3490,6 +3492,14 @@ class NegotiationAgent(BaseAgent):
                 "current_email": draft_records[0] if draft_records else None,
                 "all_emails_sent": len(email_thread_history),
             }
+            history_payload, history_summary, all_sent = self._compose_email_history_payload(
+                identifier.workflow_id,
+                supplier,
+                state,
+            )
+            data["email_history"] = history_payload
+            data["email_thread_summary"] = history_summary
+            data["all_emails_sent"] = all_sent
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s session_id=%s reason=%s",
                 supplier,
@@ -3960,6 +3970,26 @@ class NegotiationAgent(BaseAgent):
         elif isinstance(final_thread_headers, str) and not sent_message_id:
             sent_message_id = self._coerce_text(final_thread_headers)
 
+        self._capture_email_to_history(
+            workflow_id=identifier.workflow_id,
+            supplier_id=supplier,
+            state=state,
+            draft_records=draft_records,
+            subject=email_subject or draft_payload.get("subject"),
+            body=email_body or negotiation_message,
+            thread_headers=final_thread_headers,
+            email_action_id=email_action_id,
+            message_id=sent_message_id,
+            recipients=draft_payload.get("recipients") or recipients,
+            cc=draft_payload.get("cc"),
+            sender=(
+                draft_payload.get("from_address")
+                or draft_payload.get("sender")
+                or context.input_data.get("sender")
+            ),
+            session_reference=session_reference,
+        )
+
         if sent_message_id and thread_state:
             thread_state.update_after_send(sent_message_id)
 
@@ -4047,6 +4077,15 @@ class NegotiationAgent(BaseAgent):
             "current_email": draft_records[0] if draft_records else None,
             "all_emails_sent": len(email_thread_history),
         }
+
+        history_payload, history_summary, all_sent = self._compose_email_history_payload(
+            identifier.workflow_id,
+            supplier,
+            state,
+        )
+        data["email_history"] = history_payload
+        data["email_thread_summary"] = history_summary
+        data["all_emails_sent"] = all_sent
 
         if email_subject:
             data["email_subject"] = email_subject
@@ -4753,6 +4792,7 @@ class NegotiationAgent(BaseAgent):
                             base_subject TEXT,
                             initial_body TEXT,
                             thread_state JSONB,
+                            email_history JSONB,
                             session_reference VARCHAR(255),
                             unique_id VARCHAR(255),
                             rfq_id TEXT,
@@ -4768,6 +4808,9 @@ class NegotiationAgent(BaseAgent):
                     )
                     cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS thread_state JSONB"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS email_history JSONB"
                     )
                     cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS workflow_id VARCHAR(255)"
@@ -5140,6 +5183,7 @@ class NegotiationAgent(BaseAgent):
                             base_subject,
                             initial_body,
                             thread_state_raw,
+                            email_history_raw,
                             workflow_value,
                             session_reference_value,
                             email_history_raw,
@@ -5169,6 +5213,25 @@ class NegotiationAgent(BaseAgent):
                                     state["thread_state"] = None
                             elif isinstance(thread_state_raw, dict):
                                 state["thread_state"] = dict(thread_state_raw)
+                        if email_history_raw:
+                            parsed_history: List[Dict[str, Any]] = []
+                            if isinstance(email_history_raw, (bytes, bytearray, memoryview)):
+                                try:
+                                    email_history_raw = email_history_raw.tobytes().decode("utf-8")
+                                except Exception:
+                                    email_history_raw = None
+                            if isinstance(email_history_raw, str):
+                                try:
+                                    parsed_history = json.loads(email_history_raw)
+                                except Exception:
+                                    parsed_history = []
+                            elif isinstance(email_history_raw, list):
+                                parsed_history = [
+                                    item
+                                    for item in email_history_raw
+                                    if isinstance(item, dict)
+                                ]
+                            state["email_history"] = parsed_history
                         if workflow_value:
                             state["workflow_id"] = self._coerce_text(workflow_value)
                         if session_reference_value:
