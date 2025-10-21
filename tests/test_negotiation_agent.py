@@ -25,10 +25,16 @@ class DummyNick:
             ses_default_sender="noreply@example.com",
             enable_learning=enable_learning,
         )
+        self.action_logs: List[Dict[str, Any]] = []
+
+        def _log_action(**kwargs):
+            self.action_logs.append(dict(kwargs))
+            return kwargs.get("action_id") or f"action-{len(self.action_logs)}"
+
         self.process_routing_service = SimpleNamespace(
             log_process=lambda **_: 1,
             log_run_detail=lambda **_: "run-1",
-            log_action=lambda **_: "action-1",
+            log_action=_log_action,
             validate_workflow_id=lambda *args, **kwargs: True,
         )
         self.ollama_options = lambda: {}
@@ -89,6 +95,8 @@ def test_negotiation_agent_handles_missing_fields(monkeypatch):
     assert output.data["negotiation_allowed"] is True
     assert output.data["intent"] == "NEGOTIATION_COUNTER"
     assert output.data["message"].lower().startswith("round 1 plan")
+    email_actions = [entry for entry in nick.action_logs if entry.get("agent_type") == "EmailDraftingAgent"]
+    assert not email_actions
 
 
 def test_negotiation_agent_composes_counter(monkeypatch):
@@ -202,6 +210,12 @@ def test_negotiation_agent_composes_counter(monkeypatch):
     assert output.data["draft_payload"]["thread_headers"]["Message-ID"].startswith("<agent-1")
     thread_state = output.data.get("thread_state")
     assert isinstance(thread_state, dict) and thread_headers_stub["Message-ID"] in thread_state.get("references", [])
+    email_actions = [entry for entry in nick.action_logs if entry.get("agent_type") == "EmailDraftingAgent"]
+    assert len(email_actions) == 1
+    payload = email_actions[0]["process_output"]
+    assert payload["subject"].startswith("Re:")
+    assert payload["drafts"][0]["supplier_id"] == "S1"
+    assert payload["intent"] == "NEGOTIATION_COUNTER"
 
 
 def test_negotiation_agent_detects_final_offer(monkeypatch):
@@ -741,6 +755,11 @@ def test_negotiation_agent_runs_batch_in_parallel(monkeypatch):
     assert summaries and summaries[0]["suppliers"] == ["S1", "S2"]
     assert summaries[0]["round"] is None
     assert output.pass_fields["round_summaries"][0]["suppliers"] == ["S1", "S2"]
+    email_actions = [entry for entry in nick.action_logs if entry.get("agent_type") == "EmailDraftingAgent"]
+    assert len(email_actions) == 2
+    first_payload = email_actions[0]["process_output"]
+    assert first_payload["intent"] == "NEGOTIATION_COUNTER"
+    assert first_payload["drafts"][0]["supplier_id"] in {"S1", "S2"}
 
 
 def test_negotiation_agent_batch_records_failures(monkeypatch):
@@ -800,6 +819,9 @@ def test_negotiation_agent_batch_records_failures(monkeypatch):
     assert len(output.data["drafts"]) == 1
     summaries = output.data.get("round_summaries")
     assert summaries and set(summaries[0]["suppliers"]) == {"S1", "S2"}
+    email_actions = [entry for entry in nick.action_logs if entry.get("agent_type") == "EmailDraftingAgent"]
+    assert len(email_actions) == 1
+    assert email_actions[0]["process_output"]["drafts"][0]["supplier_id"] == "S1"
 
 
 def test_negotiation_agent_batches_wait_for_prior_round(monkeypatch):

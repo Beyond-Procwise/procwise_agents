@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from html import escape
@@ -864,6 +865,19 @@ class NegotiationAgent(BaseAgent):
             payload.setdefault("round", identifier.round_number)
 
         return identifier
+
+    def execute(self, context: AgentContext) -> AgentOutput:
+        """Execute the negotiation agent and persist consolidated email drafts."""
+
+        result = super().execute(context)
+        try:
+            self._flush_email_draft_actions(context, result)
+        except Exception:  # pragma: no cover - defensive logging of email actions
+            logger.exception("Failed to persist negotiation email draft actions")
+        finally:
+            if hasattr(context, "_pending_email_actions"):
+                delattr(context, "_pending_email_actions")
+        return result
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
@@ -2768,15 +2782,27 @@ class NegotiationAgent(BaseAgent):
                 if watch_fields:
                     pass_fields.update(watch_fields)
                     next_agents.append("SupplierInteractionAgent")
-            return self._with_plan(
-                context,
-                AgentOutput(
-                    status=AgentStatus.SUCCESS,
-                    data=data,
-                    pass_fields=pass_fields,
-                    next_agents=next_agents,
-                ),
+            output = AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                pass_fields=pass_fields,
+                next_agents=next_agents,
             )
+            output = self._with_plan(context, output)
+            self._queue_email_draft_action(
+                context,
+                supplier_id=supplier,
+                supplier_name=supplier_name,
+                round_number=round_no,
+                subject=draft_payload.get("subject"),
+                body=email_body or negotiation_message,
+                drafts=draft_records,
+                decision=decision,
+                negotiation_message=stop_message,
+                agentic_plan=output.agentic_plan,
+                context_snapshot=self._build_email_context_snapshot(context),
+            )
+            return output
 
         optimized = self._optimize_multi_issue(
             price=price,
@@ -8415,5 +8441,244 @@ class NegotiationAgent(BaseAgent):
         )
         if fallback_payload:
             output.pass_fields.setdefault("fallback_email_payload", fallback_payload)
-        return self._with_plan(parent_context, output)
+        output = self._with_plan(parent_context, output)
+        self._queue_email_draft_action(
+            parent_context,
+            supplier_id=supplier,
+            supplier_name=supplier_name,
+            round_number=round_no,
+            subject=email_subject or draft_payload.get("subject"),
+            body=email_body or negotiation_message,
+            drafts=draft_records,
+            decision=decision,
+            negotiation_message=negotiation_message,
+            agentic_plan=output.agentic_plan,
+            context_snapshot=self._build_email_context_snapshot(parent_context),
+        )
+        return output
+
+    def _queue_email_draft_action(
+        self,
+        context: AgentContext,
+        *,
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+        round_number: Optional[int],
+        subject: Optional[Any],
+        body: Optional[Any],
+        drafts: Sequence[Dict[str, Any]],
+        decision: Dict[str, Any],
+        negotiation_message: Optional[str],
+        agentic_plan: Optional[str],
+        context_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        if not drafts:
+            return
+        draft_items = [dict(draft) for draft in drafts if isinstance(draft, dict)]
+        if not draft_items:
+            return
+
+        payload = self._prepare_email_action_payload(
+            context=context,
+            supplier_id=supplier_id,
+            supplier_name=supplier_name,
+            round_number=round_number,
+            subject=subject,
+            body=body,
+            drafts=draft_items,
+            decision=decision,
+            negotiation_message=negotiation_message,
+            agentic_plan=agentic_plan,
+            context_snapshot=context_snapshot,
+        )
+        if not payload:
+            return
+
+        entry = {
+            "supplier_id": supplier_id,
+            "round": round_number,
+            "process_output": payload,
+            "description": (
+                f"Negotiation email draft for supplier {supplier_name or supplier_id or 'unknown'}"
+                + (f" round {round_number}" if round_number else "")
+            ),
+        }
+        pending: List[Dict[str, Any]] = getattr(context, "_pending_email_actions", [])
+        pending.append(entry)
+        setattr(context, "_pending_email_actions", pending)
+
+    def _prepare_email_action_payload(
+        self,
+        *,
+        context: AgentContext,
+        supplier_id: Optional[str],
+        supplier_name: Optional[str],
+        round_number: Optional[int],
+        subject: Optional[Any],
+        body: Optional[Any],
+        drafts: Sequence[Dict[str, Any]],
+        decision: Dict[str, Any],
+        negotiation_message: Optional[str],
+        agentic_plan: Optional[str],
+        context_snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        primary = drafts[0]
+
+        subject_text = self._coerce_text(subject) or self._coerce_text(primary.get("subject"))
+        if not subject_text:
+            subject_text = DEFAULT_NEGOTIATION_SUBJECT
+
+        body_text = self._coerce_text(body) or primary.get("body")
+        if not body_text and negotiation_message:
+            body_text = self._coerce_text(negotiation_message)
+        if not isinstance(body_text, str):
+            body_text = ""
+
+        sender = primary.get("sender") or getattr(
+            getattr(self.agent_nick, "settings", SimpleNamespace()),
+            "ses_default_sender",
+            None,
+        )
+
+        recipients = primary.get("recipients")
+        if not isinstance(recipients, list):
+            recipients = self._normalise_recipient_list(primary.get("to") or primary.get("receiver"))
+
+        receiver = primary.get("receiver")
+        if not receiver and recipients:
+            receiver = recipients[0]
+
+        to_field = primary.get("to") or list(recipients or [])
+        cc_field = primary.get("cc") or []
+        if isinstance(cc_field, str):
+            cc_field = self._normalise_recipient_list(cc_field)
+        elif not isinstance(cc_field, list):
+            cc_field = []
+
+        metadata = dict(primary.get("metadata") or {})
+        metadata.setdefault("supplier_id", supplier_id)
+        if supplier_name:
+            metadata.setdefault("supplier_name", supplier_name)
+        if decision.get("strategy"):
+            metadata.setdefault("strategy", decision.get("strategy"))
+        if decision.get("intent"):
+            metadata.setdefault("intent", decision.get("intent"))
+        metadata.setdefault("intent", "NEGOTIATION_COUNTER")
+        if round_number is not None:
+            metadata.setdefault("round", round_number)
+        metadata.setdefault("workflow_id", context.workflow_id)
+
+        headers = dict(primary.get("headers") or {})
+        thread_headers = primary.get("thread_headers")
+        if isinstance(thread_headers, dict):
+            thread_headers = {k: v for k, v in thread_headers.items() if v is not None}
+
+        unique_id = primary.get("unique_id") or metadata.get("unique_id")
+        if not unique_id and isinstance(thread_headers, dict):
+            unique_id = thread_headers.get("X-Procwise-Unique-Id")
+
+        message_id = primary.get("message_id") or headers.get("Message-ID")
+
+        contact_level = primary.get("contact_level") if isinstance(primary.get("contact_level"), int) else 0
+        thread_index = primary.get("thread_index")
+        if not isinstance(thread_index, int):
+            thread_index = 1
+
+        text_version = primary.get("text")
+        if not isinstance(text_version, str) and body_text:
+            text_version = EmailDraftingAgent._clean_body_text(body_text)
+
+        html_version = primary.get("html") or primary.get("body_html")
+        if not isinstance(html_version, str) and body_text:
+            html_version = self._simple_html_from_text(body_text)
+
+        cleaned_drafts = [deepcopy(draft) for draft in drafts]
+
+        payload: Dict[str, Any] = {
+            "drafts": cleaned_drafts,
+            "subject": subject_text,
+            "body": body_text,
+            "text": text_version or body_text,
+            "html": html_version or "",
+            "sender": sender,
+            "recipients": list(recipients or []),
+            "receiver": receiver,
+            "to": list(to_field or []),
+            "cc": list(cc_field or []),
+            "contact_level": contact_level,
+            "sent_status": bool(primary.get("sent_status", False)),
+            "metadata": metadata,
+            "headers": headers,
+            "unique_id": unique_id,
+            "thread_headers": thread_headers,
+            "message_id": message_id,
+            "workflow_id": context.workflow_id,
+            "thread_index": thread_index,
+            "intent": "NEGOTIATION_COUNTER",
+            "agentic_plan": agentic_plan,
+            "context_snapshot": context_snapshot,
+        }
+
+        if primary.get("id") is not None:
+            payload["id"] = primary.get("id")
+        if primary.get("draft_record_id") is not None:
+            payload["draft_record_id"] = primary.get("draft_record_id")
+        if supplier_id:
+            payload.setdefault("supplier_id", supplier_id)
+        if supplier_name:
+            payload.setdefault("supplier_name", supplier_name)
+
+        email_agent = self._ensure_email_agent()
+        if email_agent:
+            try:
+                payload = email_agent._normalise_action_payload(payload)
+            except Exception:
+                logger.debug("Failed to normalise email draft payload", exc_info=True)
+
+        return payload
+
+    def _build_email_context_snapshot(self, context: AgentContext) -> Dict[str, Any]:
+        snapshot = {
+            "workflow_id": getattr(context, "workflow_id", None),
+            "agent_id": "EmailDraftingAgent",
+            "user_id": getattr(context, "user_id", None),
+            "manifest": context.manifest(),
+        }
+        return {key: value for key, value in snapshot.items() if value}
+
+    def _flush_email_draft_actions(
+        self, context: AgentContext, result: AgentOutput
+    ) -> None:
+        pending: Sequence[Dict[str, Any]] = getattr(context, "_pending_email_actions", [])
+        if not pending:
+            return
+
+        routing = getattr(self.agent_nick, "process_routing_service", None)
+        if routing is None or not hasattr(routing, "log_action"):
+            logger.debug("Process routing service missing; skipping email draft action logging")
+            return
+
+        process_id = getattr(context, "process_id", None)
+        if not process_id:
+            logger.debug("No process_id available for negotiation email draft logging")
+            return
+
+        status_value = "completed" if result.status == AgentStatus.SUCCESS else "failed"
+
+        for entry in pending:
+            process_output = entry.get("process_output")
+            if not process_output:
+                continue
+            description = entry.get("description") or "Negotiation email draft"
+            try:
+                routing.log_action(
+                    process_id=process_id,
+                    agent_type="EmailDraftingAgent",
+                    action_desc=description,
+                    process_output=process_output,
+                    status=status_value,
+                    run_id=None,
+                )
+            except Exception:
+                logger.exception("Failed to log negotiation email draft action")
 
