@@ -802,6 +802,103 @@ def test_negotiation_agent_batch_records_failures(monkeypatch):
     assert summaries and set(summaries[0]["suppliers"]) == {"S1", "S2"}
 
 
+def test_negotiation_agent_batches_wait_for_prior_round(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    call_order: List[int] = []
+
+    def fake_execute_batch_entry(self, context, payload):
+        round_no = int(payload.get("round") or payload.get("round_number") or 1)
+        call_order.append(round_no)
+        supplier_id = payload.get("supplier_id")
+        session_ref = payload.get("session_reference") or f"{supplier_id}-session"
+        response_payload = {
+            "message_id": f"{supplier_id}-r{round_no}",
+            "round": round_no,
+        }
+        data = {
+            "supplier": supplier_id,
+            "rfq_id": payload.get("rfq_id"),
+            "session_reference": session_ref,
+            "unique_id": session_ref,
+            "round": round_no,
+            "decision": {"strategy": "counter"},
+            "drafts": [
+                {
+                    "supplier_id": supplier_id,
+                    "rfq_id": payload.get("rfq_id"),
+                    "round": round_no,
+                }
+            ],
+            "draft_payload": {
+                "supplier_id": supplier_id,
+                "round": round_no,
+            },
+            "supplier_responses": [response_payload],
+        }
+        return AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data=data,
+            pass_fields=dict(data),
+            next_agents=[],
+        )
+
+    monkeypatch.setattr(NegotiationAgent, "_execute_batch_entry", fake_execute_batch_entry)
+
+    context = AgentContext(
+        workflow_id="wf-seq",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={
+            "negotiation_batch": [
+                {
+                    "supplier_id": "S1",
+                    "rfq_id": "RFQ-1",
+                    "round": 1,
+                    "session_reference": "S1-session",
+                },
+                {
+                    "supplier_id": "S2",
+                    "rfq_id": "RFQ-2",
+                    "round": 1,
+                    "session_reference": "S2-session",
+                },
+                {
+                    "supplier_id": "S1",
+                    "rfq_id": "RFQ-1",
+                    "round": 2,
+                    "session_reference": "S1-session",
+                },
+                {
+                    "supplier_id": "S2",
+                    "rfq_id": "RFQ-2",
+                    "round": 2,
+                    "session_reference": "S2-session",
+                },
+            ],
+            "shared_context": {"target_price": 800.0},
+        },
+    )
+
+    output = agent.run(context)
+
+    assert call_order[:2] == [1, 1]
+    assert call_order[2:] == [2, 2]
+
+    assert output.status == AgentStatus.SUCCESS
+    summaries = output.data.get("round_summaries") or []
+    assert len(summaries) == 2
+    assert summaries[0]["round"] == 1
+    assert set(summaries[0]["suppliers"]) == {"S1", "S2"}
+    supplier_map = output.data.get("results_by_supplier") or {}
+    supplier_record = supplier_map["S1"]
+    responses = supplier_record["output"].get("supplier_responses")
+    assert {resp["message_id"] for resp in responses} == {"S1-r1", "S1-r2"}
+    draft_payload = supplier_record["output"].get("draft_payload")
+    assert draft_payload["supplier_responses"] == responses
+
+
 def test_negotiation_agent_adopts_workflow_from_drafts_when_mismatched(monkeypatch):
     nick = DummyNick()
     agent = NegotiationAgent(nick)

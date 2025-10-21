@@ -942,6 +942,349 @@ class NegotiationAgent(BaseAgent):
         payload["_batch_execution"] = True
         return payload
 
+    def _bucket_entries_by_round(self, entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Group negotiation batch entries by round to enforce sequential execution."""
+
+        buckets: Dict[Tuple[Optional[int], Optional[Any]], Dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_round = None
+            for key in ("round", "round_number", "round_no"):
+                candidate = entry.get(key)
+                if candidate is not None:
+                    raw_round = candidate
+                    break
+
+            numeric_sort: Optional[int] = None
+            display_round: Optional[Any] = None
+            if raw_round is not None:
+                try:
+                    numeric_sort = int(float(raw_round))
+                    display_round = numeric_sort
+                except Exception:
+                    display_round = raw_round
+            else:
+                numeric_sort = 1
+
+            bucket_key = (numeric_sort, display_round)
+            bucket = buckets.get(bucket_key)
+            if not bucket:
+                bucket = {
+                    "round": display_round,
+                    "numeric_sort": numeric_sort,
+                    "entries": [],
+                }
+                buckets[bucket_key] = bucket
+            bucket["entries"].append(entry)
+
+        ordered = sorted(
+            buckets.values(),
+            key=lambda bucket: (
+                0,
+                bucket["numeric_sort"],
+            )
+            if bucket.get("numeric_sort") is not None
+            else (
+                1,
+                str(bucket.get("round") or "").lower(),
+            ),
+        )
+        return ordered
+
+    def _compute_batch_workers(self, entries: Sequence[Dict[str, Any]]) -> int:
+        """Determine worker pool size for the provided batch entries."""
+
+        try:
+            configured_workers = getattr(self.agent_nick.settings, "negotiation_parallel_workers", None)
+            if configured_workers is not None:
+                try:
+                    configured_workers = int(configured_workers)
+                except Exception:
+                    configured_workers = None
+            max_workers: Optional[int] = (
+                configured_workers if configured_workers and configured_workers > 0 else None
+            )
+        except Exception:
+            max_workers = None
+
+        if max_workers is None:
+            cpu_default = os.cpu_count() or 4
+            max_workers = max(1, cpu_default)
+
+        unique_suppliers: Set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            supplier_id = entry.get("supplier_id") or entry.get("supplier")
+            if supplier_id is None:
+                continue
+            text = self._coerce_text(supplier_id)
+            if text:
+                unique_suppliers.add(text)
+
+        desired_workers = max(1, len(unique_suppliers)) if unique_suppliers else len(entries)
+        if desired_workers <= 0:
+            desired_workers = len(entries) if entries else 1
+
+        workers = max(desired_workers, max_workers)
+        workers = min(workers, max(1, len(entries)))
+        return max(workers, 1)
+
+    def _resolve_batch_entry_output(
+        self, context: AgentContext, payload: Dict[str, Any]
+    ):
+        """Execute a batch entry and hydrate deferred email tasks if present."""
+
+        result = self._execute_batch_entry(context, payload)
+        if isinstance(result, AgentOutput) and isinstance(result.data, dict):
+            pending_task = result.data.get("pending_email")
+            if result.data.get("deferred_email") and isinstance(pending_task, dict):
+                identifier_info = pending_task.get("identifier") or {}
+                identifier = NegotiationIdentifier(
+                    workflow_id=
+                    identifier_info.get("workflow_id")
+                    or payload.get("workflow_id")
+                    or context.workflow_id,
+                    supplier_id=
+                    identifier_info.get("supplier_id")
+                    or payload.get("supplier_id")
+                    or payload.get("supplier"),
+                    session_reference=
+                    identifier_info.get("session_reference")
+                    or payload.get("session_reference")
+                    or payload.get("unique_id"),
+                    round_number=int(
+                        identifier_info.get("round_number")
+                        or payload.get("round")
+                        or payload.get("round_number")
+                        or 1
+                    ),
+                )
+                result = self._finalize_email_round(context, identifier, pending_task)
+        return result
+
+    def _combine_supplier_responses(
+        self, responses: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Coalesce supplier responses, de-duplicating by message identifier."""
+
+        combined: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for response in responses:
+            if not isinstance(response, dict):
+                continue
+            response_copy = {key: value for key, value in response.items() if value is not None}
+            message_id = self._coerce_text(
+                response_copy.get("message_id")
+                or response_copy.get("Message-ID")
+                or response_copy.get("id")
+                or response_copy.get("unique_id")
+            )
+            try:
+                unique_key = message_id or json.dumps(response_copy, sort_keys=True)
+            except Exception:
+                unique_key = message_id or repr(sorted(response_copy.items()))
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+            combined.append(response_copy)
+        return combined
+
+    def _ingest_batch_entry_result(
+        self,
+        *,
+        payload: Dict[str, Any],
+        result: AgentOutput,
+        aggregated_results: List[Dict[str, Any]],
+        drafts: List[Dict[str, Any]],
+        failed_records: List[Dict[str, Any]],
+        success_ids: List[str],
+        next_agents: Set[str],
+        supplier_history: Dict[str, Dict[str, Any]],
+    ) -> None:
+        supplier_id = payload.get("supplier_id") or payload.get("supplier")
+        session_reference = (
+            payload.get("session_reference")
+            or payload.get("unique_id")
+        )
+
+        record_reference = (
+            result.data.get("session_reference")
+            or result.data.get("unique_id")
+            or session_reference
+        ) if isinstance(result.data, dict) else session_reference
+
+        record_supplier = None
+        if isinstance(result.data, dict):
+            record_supplier = result.data.get("supplier")
+        record = {
+            "supplier_id": record_supplier
+            or supplier_id
+            or payload.get("supplier_id"),
+            "session_reference": record_reference,
+            "unique_id": record_reference,
+            "status": result.status.value,
+            "output": result.data if isinstance(result.data, dict) else {},
+            "pass_fields": result.pass_fields if isinstance(result.pass_fields, dict) else {},
+            "next_agents": list(result.next_agents),
+        }
+        if result.error:
+            record["error"] = result.error
+        if result.action_id:
+            record["action_id"] = result.action_id
+
+        aggregated_results.append(record)
+
+        supplier_key = self._coerce_text(record.get("supplier_id"))
+        if supplier_key:
+            history = supplier_history.setdefault(
+                supplier_key,
+                {"records": [], "responses": []},
+            )
+            history["records"].append(record)
+        else:
+            history = None
+
+        if result.status == AgentStatus.SUCCESS:
+            if supplier_key:
+                success_ids.append(supplier_key)
+            result_drafts = (
+                result.data.get("drafts")
+                if isinstance(result.data, dict)
+                else None
+            )
+            if isinstance(result_drafts, list):
+                for draft in result_drafts:
+                    if isinstance(draft, dict):
+                        drafts.append(draft)
+            next_agents.update(result.next_agents)
+        else:
+            failed_records.append(
+                {
+                    "supplier_id": record.get("supplier_id"),
+                    "session_reference": record.get("session_reference"),
+                    "status": record.get("status"),
+                    "error": record.get("error"),
+                }
+            )
+
+        if history is not None and isinstance(record.get("output"), dict):
+            responses = record["output"].get("supplier_responses")
+            collected = history.get("responses") or []
+            if isinstance(responses, list):
+                for entry in responses:
+                    if isinstance(entry, dict):
+                        collected.append(dict(entry))
+            history["responses"] = self._combine_supplier_responses(collected)
+
+            combined_responses = history["responses"]
+            if combined_responses:
+                record_output = dict(record["output"])
+                record_output["supplier_responses"] = combined_responses
+                draft_payload = record_output.get("draft_payload")
+                if isinstance(draft_payload, dict):
+                    payload_copy = dict(draft_payload)
+                    payload_copy["supplier_responses"] = combined_responses
+                    record_output["draft_payload"] = payload_copy
+                record["output"] = record_output
+
+                pass_fields = record.get("pass_fields")
+                if isinstance(pass_fields, dict):
+                    pass_fields = dict(pass_fields)
+                else:
+                    pass_fields = {}
+                pass_fields["supplier_responses"] = combined_responses
+                record["pass_fields"] = pass_fields
+
+    def _process_round_entries(
+        self,
+        *,
+        context: AgentContext,
+        entries: Sequence[Dict[str, Any]],
+        aggregated_results: List[Dict[str, Any]],
+        drafts: List[Dict[str, Any]],
+        failed_records: List[Dict[str, Any]],
+        success_ids: List[str],
+        next_agents: Set[str],
+        supplier_history: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not entries:
+            return
+
+        if len(entries) == 1:
+            payload = entries[0]
+            try:
+                result = self._resolve_batch_entry_output(context, payload)
+            except Exception as exc:  # pragma: no cover - defensive
+                supplier_id = payload.get("supplier_id") or payload.get("supplier")
+                session_reference = (
+                    payload.get("session_reference")
+                    or payload.get("unique_id")
+                )
+                record = {
+                    "supplier_id": supplier_id,
+                    "session_reference": session_reference,
+                    "unique_id": session_reference,
+                    "status": AgentStatus.FAILED.value,
+                    "error": str(exc),
+                }
+                aggregated_results.append(record)
+                failed_records.append(record)
+                return
+
+            self._ingest_batch_entry_result(
+                payload=payload,
+                result=result,
+                aggregated_results=aggregated_results,
+                drafts=drafts,
+                failed_records=failed_records,
+                success_ids=success_ids,
+                next_agents=next_agents,
+                supplier_history=supplier_history,
+            )
+            return
+
+        max_workers = self._compute_batch_workers(entries)
+
+        futures: List[Tuple[Dict[str, Any], Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for payload in entries:
+                futures.append(
+                    (payload, executor.submit(self._resolve_batch_entry_output, context, payload))
+                )
+
+            for payload, future in futures:
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive aggregation
+                    supplier_id = payload.get("supplier_id") or payload.get("supplier")
+                    session_reference = (
+                        payload.get("session_reference")
+                        or payload.get("unique_id")
+                    )
+                    record = {
+                        "supplier_id": supplier_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "status": AgentStatus.FAILED.value,
+                        "error": str(exc),
+                    }
+                    aggregated_results.append(record)
+                    failed_records.append(record)
+                    continue
+
+                self._ingest_batch_entry_result(
+                    payload=payload,
+                    result=result,
+                    aggregated_results=aggregated_results,
+                    drafts=drafts,
+                    failed_records=failed_records,
+                    success_ids=success_ids,
+                    next_agents=next_agents,
+                    supplier_history=supplier_history,
+                )
+
     def _execute_batch_entry(
         self, parent_context: AgentContext, payload: Dict[str, Any]
     ) -> AgentOutput:
@@ -1050,146 +1393,55 @@ class NegotiationAgent(BaseAgent):
                     ),
                 )
 
-        try:
-            configured_workers = getattr(self.agent_nick.settings, "negotiation_parallel_workers", None)
-            if configured_workers is not None:
-                try:
-                    configured_workers = int(configured_workers)
-                except Exception:
-                    configured_workers = None
-            max_workers = configured_workers if configured_workers and configured_workers > 0 else None
-        except Exception:
-            max_workers = None
+        round_batches = self._bucket_entries_by_round(prepared_entries)
 
-        if max_workers is None:
-            cpu_default = os.cpu_count() or 4
-            max_workers = max(1, cpu_default)
-
-        unique_suppliers: Set[str] = set()
-        for entry in prepared_entries:
-            supplier_id = entry.get("supplier_id") or entry.get("supplier")
-            if supplier_id is None:
-                continue
-            try:
-                supplier_key = str(supplier_id).strip()
-            except Exception:
-                continue
-            if supplier_key:
-                unique_suppliers.add(supplier_key)
-
-        desired_workers = max(1, len(unique_suppliers)) if unique_suppliers else len(prepared_entries)
-        if desired_workers <= 0:
-            desired_workers = len(prepared_entries)
-
-        max_workers = max(desired_workers, max_workers)
-        max_workers = min(max_workers, len(prepared_entries))
-
-        futures: List[Tuple[Dict[str, Any], Any]] = []
         aggregated_results: List[Dict[str, Any]] = []
         drafts: List[Dict[str, Any]] = []
         failed_records: List[Dict[str, Any]] = []
         success_ids: List[str] = []
-        supplier_map: Dict[str, Dict[str, Any]] = {}
+        supplier_history: Dict[str, Dict[str, Any]] = {}
         next_agents: Set[str] = set()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for payload in prepared_entries:
-                futures.append((payload, executor.submit(self._execute_batch_entry, context, payload)))
+        for batch in round_batches:
+            entries = batch.get("entries") or []
+            if not entries:
+                continue
+            self._process_round_entries(
+                context=context,
+                entries=entries,
+                aggregated_results=aggregated_results,
+                drafts=drafts,
+                failed_records=failed_records,
+                success_ids=success_ids,
+                next_agents=next_agents,
+                supplier_history=supplier_history,
+            )
 
-            for payload, future in futures:
-                supplier_id = payload.get("supplier_id") or payload.get("supplier")
-                session_reference = (
-                    payload.get("session_reference")
-                    or payload.get("unique_id")
-                )
-                try:
-                    result = future.result()
-                    if isinstance(result, AgentOutput) and isinstance(result.data, dict):
-                        pending_task = result.data.get("pending_email")
-                        if result.data.get("deferred_email") and isinstance(pending_task, dict):
-                            identifier_info = pending_task.get("identifier") or {}
-                            identifier = NegotiationIdentifier(
-                                workflow_id=
-                                identifier_info.get("workflow_id")
-                                or payload.get("workflow_id")
-                                or context.workflow_id,
-                                supplier_id=
-                                identifier_info.get("supplier_id")
-                                or payload.get("supplier_id")
-                                or payload.get("supplier"),
-                                session_reference=
-                                identifier_info.get("session_reference")
-                                or session_reference,
-                                round_number=int(
-                                    identifier_info.get("round_number")
-                                    or payload.get("round")
-                                    or payload.get("round_number")
-                                    or 1
-                                ),
-                            )
-                            try:
-                                result = self._finalize_email_round(context, identifier, pending_task)
-                            except Exception:
-                                logger.exception("Failed to finalize deferred email drafting payload")
-                                raise
-                except Exception as exc:  # pragma: no cover - defensive aggregation
-                    error_message = str(exc)
-                    record = {
-                        "supplier_id": supplier_id,
-                        "session_reference": session_reference,
-                        "unique_id": session_reference,
-                        "status": AgentStatus.FAILED.value,
-                        "error": error_message,
-                    }
-                    aggregated_results.append(record)
-                    failed_records.append(record)
+        if aggregated_results:
+            deduped_results: List[Dict[str, Any]] = []
+            seen_keys: Set[Tuple[Optional[str], Optional[str], Optional[Any]]] = set()
+            for record in aggregated_results:
+                supplier_key = self._coerce_text(record.get("supplier_id"))
+                session_reference = self._coerce_text(record.get("session_reference"))
+                output_payload = record.get("output") or {}
+                round_marker = None
+                if isinstance(output_payload, dict):
+                    round_marker = output_payload.get("round")
+                key = (supplier_key, session_reference, round_marker)
+                if key in seen_keys:
                     continue
+                seen_keys.add(key)
+                deduped_results.append(record)
+            aggregated_results = deduped_results
 
-                record_reference = (
-                    result.data.get("session_reference")
-                    or result.data.get("unique_id")
-                    or session_reference
-                )
-                record = {
-                    "supplier_id": result.data.get("supplier")
-                    or supplier_id
-                    or payload.get("supplier_id"),
-                    "session_reference": record_reference,
-                    "unique_id": record_reference,
-                    "status": result.status.value,
-                    "output": result.data,
-                    "pass_fields": result.pass_fields,
-                    "next_agents": list(result.next_agents),
-                }
-                if result.error:
-                    record["error"] = result.error
-                if result.action_id:
-                    record["action_id"] = result.action_id
+        supplier_map: Dict[str, Dict[str, Any]] = {}
+        for supplier_key, history in supplier_history.items():
+            records = history.get("records") or []
+            if not records:
+                continue
+            supplier_map[supplier_key] = records[-1]
 
-                aggregated_results.append(record)
-
-                supplier_key = record.get("supplier_id")
-                if supplier_key:
-                    supplier_map[str(supplier_key)] = record
-
-                if result.status == AgentStatus.SUCCESS:
-                    if supplier_key:
-                        success_ids.append(str(supplier_key))
-                    result_drafts = result.data.get("drafts")
-                    if isinstance(result_drafts, list):
-                        for draft in result_drafts:
-                            if isinstance(draft, dict):
-                                drafts.append(draft)
-                    next_agents.update(result.next_agents)
-                else:
-                    failed_records.append(
-                        {
-                            "supplier_id": supplier_key,
-                            "session_reference": record.get("session_reference"),
-                            "status": record.get("status"),
-                            "error": record.get("error"),
-                        }
-                    )
+        success_ids = list(dict.fromkeys(success_ids))
 
         any_success = any(record["status"] == AgentStatus.SUCCESS.value for record in aggregated_results)
         any_failure = any(record["status"] != AgentStatus.SUCCESS.value for record in aggregated_results)
