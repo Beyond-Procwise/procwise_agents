@@ -869,24 +869,167 @@ class NegotiationAgent(BaseAgent):
     def execute(self, context: AgentContext) -> AgentOutput:
         """Execute the negotiation agent and persist consolidated email drafts."""
 
-        result = super().execute(context)
+        setattr(context, "_email_actions_deferred", True)
         try:
-            self._flush_email_draft_actions(context, result)
-        except Exception:  # pragma: no cover - defensive logging of email actions
-            logger.exception("Failed to persist negotiation email draft actions")
+            result = super().execute(context)
+            self._finalize_email_actions(context, result)
+            return result
         finally:
-            if hasattr(context, "_pending_email_actions"):
-                delattr(context, "_pending_email_actions")
-        return result
+            if hasattr(context, "_email_actions_deferred"):
+                delattr(context, "_email_actions_deferred")
 
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
 
         batch_entries, shared_context = self._extract_batch_inputs(context.input_data)
+        result: AgentOutput
         if batch_entries:
-            return self._run_batch_negotiations(context, batch_entries, shared_context)
+            result = self._run_batch_negotiations(context, batch_entries, shared_context)
+        else:
+            result = self._run_single_negotiation(context)
 
-        return self._run_single_negotiation(context)
+        if not getattr(context, "_email_actions_deferred", False):
+            self._finalize_email_actions(context, result)
+
+        return result
+
+    def _finalize_email_actions(self, context: AgentContext, result: AgentOutput) -> None:
+        if not isinstance(result, AgentOutput):
+            return
+
+        if not getattr(context, "_pending_email_actions", None):
+            try:
+                self._backfill_email_actions_from_result(context, result)
+            except Exception:  # pragma: no cover - defensive backfill for email actions
+                logger.debug(
+                    "Failed to backfill negotiation email draft actions from result",
+                    exc_info=True,
+                )
+
+        run_id = None
+        try:
+            run_id = self._ensure_process_context_for_email_actions(context, result)
+        except Exception:  # pragma: no cover - defensive context preparation
+            logger.debug(
+                "Failed to initialise process context for negotiation email actions",
+                exc_info=True,
+            )
+
+        try:
+            self._flush_email_draft_actions(context, result, run_id=run_id)
+        except Exception:  # pragma: no cover - defensive logging of email actions
+            logger.exception("Failed to persist negotiation email draft actions")
+        finally:
+            if hasattr(context, "_pending_email_actions"):
+                delattr(context, "_pending_email_actions")
+
+    def _backfill_email_actions_from_result(
+        self, context: AgentContext, result: AgentOutput
+    ) -> None:
+        if not isinstance(result, AgentOutput):
+            return
+
+        payload = result.data if isinstance(result.data, dict) else None
+        if not payload:
+            return
+
+        drafts = payload.get("drafts")
+        if not isinstance(drafts, list) or not drafts:
+            return
+
+        decision = payload.get("decision")
+        if not isinstance(decision, dict):
+            decision = {}
+
+        draft_payload = payload.get("draft_payload")
+        if not isinstance(draft_payload, dict):
+            draft_payload = {}
+
+        supplier_id = payload.get("supplier_id") or payload.get("supplier")
+        supplier_name = payload.get("supplier_name") or decision.get("supplier_name")
+        round_number = payload.get("round") or decision.get("round")
+        try:
+            round_value = int(round_number) if round_number is not None else None
+        except (TypeError, ValueError):
+            round_value = None
+        subject = payload.get("email_subject") or draft_payload.get("subject")
+        body = payload.get("email_body") or payload.get("message")
+        negotiation_message = payload.get("negotiation_message") or payload.get("message")
+        agentic_plan = getattr(result, "agentic_plan", None)
+        context_snapshot = self._build_email_context_snapshot(context)
+
+        self._queue_email_draft_action(
+            context,
+            supplier_id=self._coerce_text(supplier_id) if supplier_id else None,
+            supplier_name=self._coerce_text(supplier_name) if supplier_name else None,
+            round_number=round_value,
+            subject=subject,
+            body=body,
+            drafts=drafts,
+            decision=decision,
+            negotiation_message=negotiation_message,
+            agentic_plan=agentic_plan,
+            context_snapshot=context_snapshot,
+        )
+
+    def _ensure_process_context_for_email_actions(
+        self, context: AgentContext, result: AgentOutput
+    ) -> Optional[Any]:
+        if getattr(context, "process_id", None):
+            return None
+
+        routing = getattr(self.agent_nick, "process_routing_service", None)
+        if routing is None:
+            return None
+
+        log_process = getattr(routing, "log_process", None)
+        if not callable(log_process):
+            return None
+
+        logged_input = context.input_data if isinstance(context.input_data, dict) else {}
+        logged_output = self._prepare_logged_output(getattr(result, "data", {}))
+
+        try:
+            process_id = log_process(
+                process_name=self.__class__.__name__,
+                process_details={"input": logged_input, "output": logged_output},
+                user_id=context.user_id,
+                user_name=getattr(self.agent_nick.settings, "script_user", None),
+                process_status=0,
+                workflow_id=context.workflow_id,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to create process log for negotiation email actions",
+                exc_info=True,
+            )
+            return None
+
+        if not process_id:
+            return None
+
+        context.process_id = process_id
+
+        log_run_detail = getattr(routing, "log_run_detail", None)
+        if not callable(log_run_detail):
+            return None
+
+        try:
+            now = datetime.utcnow()
+            return log_run_detail(
+                process_id=process_id,
+                process_status=result.status.value,
+                process_details={"input": logged_input, "output": logged_output},
+                process_start_ts=now,
+                process_end_ts=now,
+                triggered_by=context.user_id,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to log negotiation email action run detail",
+                exc_info=True,
+            )
+            return None
 
     def _extract_batch_inputs(
         self, payload: Optional[Dict[str, Any]]
@@ -7932,7 +8075,7 @@ class NegotiationAgent(BaseAgent):
         return {key: value for key, value in snapshot.items() if value}
 
     def _flush_email_draft_actions(
-        self, context: AgentContext, result: AgentOutput
+        self, context: AgentContext, result: AgentOutput, *, run_id: Optional[Any] = None
     ) -> None:
         pending: Sequence[Dict[str, Any]] = getattr(context, "_pending_email_actions", [])
         if not pending:
@@ -7962,7 +8105,7 @@ class NegotiationAgent(BaseAgent):
                     action_desc=description,
                     process_output=process_output,
                     status=status_value,
-                    run_id=None,
+                    run_id=run_id,
                 )
             except Exception:
                 logger.exception("Failed to log negotiation email draft action")
