@@ -696,6 +696,13 @@ class EmailWatcherV2:
         if not pending_rows:
             return
 
+        if not tracker.all_dispatched:
+            logger.info(
+                "Deferring supplier interaction for workflow %s until all dispatches are recorded",
+                tracker.workflow_id,
+            )
+            return
+
         processed_ids: List[str] = []
         for row in pending_rows:
             unique_id = row.get("unique_id")
@@ -723,6 +730,14 @@ class EmailWatcherV2:
             }
             if rfq_id:
                 input_payload["rfq_id"] = rfq_id
+
+            expected_ids = list(tracker.email_records.keys())
+            if expected_ids:
+                input_payload.setdefault("expected_unique_ids", expected_ids)
+            dispatch_total = getattr(tracker, "dispatched_count", None)
+            if dispatch_total:
+                input_payload.setdefault("expected_dispatch_count", dispatch_total)
+                input_payload.setdefault("expected_email_count", dispatch_total)
 
             headers = {
                 "message_id": message_id,
