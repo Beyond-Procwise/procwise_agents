@@ -2434,7 +2434,7 @@ class WorkflowOrchestrator(_BaseWorkflowOrchestrator):
             return {}
 
         responses = await self.interaction_agent.collect_round_responses(
-            self.workflow_id,
+            self.session_id,
             round_number=round_number,
             expected_unique_ids=expected_unique_ids,
             timeout=self.wait_timeout,
@@ -2526,7 +2526,7 @@ class WorkflowOrchestrator(_BaseWorkflowOrchestrator):
         return results
 
     async def _phase_quote_evaluation(self) -> Dict[str, Any]:
-        return await self.comparison_agent.compare(self.workflow_id)
+        return await self.comparison_agent.compare(self.session_id)
 
     @staticmethod
     def _draft_to_dict(draft: Any) -> Dict[str, Any]:
