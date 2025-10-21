@@ -3716,6 +3716,22 @@ class EmailDraftingAgent(BaseAgent):
                          recipient_email, contact_level, thread_index, sender, payload,
                          workflow_id, run_id, mailbox)
                         VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (workflow_id, unique_id) DO UPDATE SET
+                            rfq_id = EXCLUDED.rfq_id,
+                            unique_id = EXCLUDED.unique_id,
+                            supplier_id = EXCLUDED.supplier_id,
+                            supplier_name = EXCLUDED.supplier_name,
+                            subject = EXCLUDED.subject,
+                            body = EXCLUDED.body,
+                            sent = EXCLUDED.sent,
+                            recipient_email = EXCLUDED.recipient_email,
+                            contact_level = EXCLUDED.contact_level,
+                            thread_index = EXCLUDED.thread_index,
+                            sender = EXCLUDED.sender,
+                            payload = EXCLUDED.payload,
+                            workflow_id = EXCLUDED.workflow_id,
+                            run_id = EXCLUDED.run_id,
+                            mailbox = EXCLUDED.mailbox
                         RETURNING id
                         """,
                         (
@@ -3883,6 +3899,10 @@ class EmailDraftingAgent(BaseAgent):
                 )
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS dispatch_run_id TEXT"
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_rfq_emails_wf_uid"
+                    " ON proc.draft_rfq_emails (workflow_id, unique_id)"
                 )
 
 
