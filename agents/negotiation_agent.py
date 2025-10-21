@@ -3206,6 +3206,7 @@ class NegotiationAgent(BaseAgent):
         except Exception:  # pragma: no cover - best effort
             logger.debug("failed to ensure negotiation state schema", exc_info=True)
         finally:
+            setattr(self, "_proc_negotiation_session_state_column_metadata", None)
             self._state_schema_checked = True
 
     def _get_identifier_column(
@@ -3213,7 +3214,7 @@ class NegotiationAgent(BaseAgent):
         table: str,
         *,
         default: str = "workflow_id",
-        fallback: str = "rfq_id",
+        fallback: str = "unique_id",
         alt_fallback: str = "session_id",
     ) -> str:
         attr_name = f"_{table}_identifier_column"
@@ -3273,6 +3274,44 @@ class NegotiationAgent(BaseAgent):
 
         setattr(self, attr_name, column)
         return column
+
+    def _get_column_metadata(
+        self,
+        table: str,
+        *,
+        schema: str = "proc",
+    ) -> Dict[str, Dict[str, Any]]:
+        attr_name = f"_{schema}_{table}_column_metadata"
+        cached = getattr(self, attr_name, None)
+        if isinstance(cached, dict) and cached:
+            return cached
+
+        metadata: Dict[str, Dict[str, Any]] = {}
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if callable(get_conn):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT column_name, is_nullable
+                              FROM information_schema.columns
+                             WHERE table_schema = %s
+                               AND table_name = %s
+                            """,
+                            (schema, table),
+                        )
+                        for name, is_nullable in cur.fetchall() or []:
+                            nullable = (is_nullable or "").upper() != "NO"
+                            metadata[name] = {"nullable": nullable}
+                conn.commit()
+            except Exception:  # pragma: no cover - best effort
+                logger.debug(
+                    "failed to load column metadata for %s.%s", schema, table, exc_info=True
+                )
+
+        setattr(self, attr_name, metadata)
+        return metadata
 
     def _get_unique_constraint(
         self,
@@ -3378,12 +3417,21 @@ class NegotiationAgent(BaseAgent):
     def _load_session_state(
         self, session_id: Optional[str], supplier: Optional[str]
     ) -> Tuple[Dict[str, Any], bool]:
-        identifier = self._coerce_text(session_id)
+        workflow_id = self._coerce_text(session_id)
         supplier_id = self._coerce_text(supplier)
-        if not identifier or not supplier_id:
+        if not workflow_id or not supplier_id:
+            logger.error(
+                "cannot load negotiation session state without workflow_id and supplier"
+            )
             return self._default_state(), False
         self._ensure_state_schema()
-        key = (identifier, supplier_id)
+        column_metadata = self._get_column_metadata("negotiation_session_state")
+        if "workflow_id" not in column_metadata:
+            logger.error(
+                "negotiation_session_state.workflow_id column missing; unable to load state"
+            )
+            return self._default_state(), False
+        key = (workflow_id, supplier_id)
         with self._state_lock:
             if key in self._state_cache:
                 return dict(self._state_cache[key]), True
@@ -3393,16 +3441,15 @@ class NegotiationAgent(BaseAgent):
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    column = self._get_identifier_column("negotiation_session_state")
                     cur.execute(
                         f"""
                         SELECT supplier_reply_count, current_round, status, awaiting_response,
                                last_supplier_msg_id, last_agent_msg_id, last_email_sent_at,
                                base_subject, initial_body, thread_state, workflow_id, session_reference
                           FROM proc.negotiation_session_state
-                         WHERE {column} = %s AND supplier_id = %s
+                         WHERE workflow_id = %s AND supplier_id = %s
                         """,
-                        (identifier, supplier_id),
+                        (workflow_id, supplier_id),
                     )
                     row = cur.fetchone()
                     if row:
@@ -3454,6 +3501,7 @@ class NegotiationAgent(BaseAgent):
                         exists = True
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load negotiation session state")
+        state.setdefault("workflow_id", workflow_id)
         with self._state_lock:
             self._state_cache[key] = dict(state)
         return dict(state), exists
@@ -3461,20 +3509,32 @@ class NegotiationAgent(BaseAgent):
     def _save_session_state(
         self, session_id: Optional[str], supplier: Optional[str], state: Dict[str, Any]
     ) -> None:
-        identifier = self._coerce_text(session_id)
+        workflow_id = self._coerce_text(session_id)
         supplier_id = self._coerce_text(supplier)
-        if not identifier or not supplier_id:
+        if not workflow_id or not supplier_id:
+            logger.error(
+                "cannot persist negotiation session state without workflow_id and supplier"
+            )
             return
-        key = (identifier, supplier_id)
+        key = (workflow_id, supplier_id)
         with self._state_lock:
             self._state_cache[key] = dict(state)
+        state.setdefault("workflow_id", workflow_id)
         self._ensure_state_schema()
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    column = self._get_identifier_column("negotiation_session_state")
+                    column_metadata = self._get_column_metadata(
+                        "negotiation_session_state"
+                    )
+                    if "workflow_id" not in column_metadata:
+                        logger.error(
+                            "negotiation_session_state.workflow_id column missing; unable to persist state"
+                        )
+                        conn.rollback()
+                        return
                     record: Dict[str, Any] = {
-                        column: identifier,
+                        "workflow_id": workflow_id,
                         "supplier_id": supplier_id,
                         "supplier_reply_count": int(state.get("supplier_reply_count", 0)),
                         "current_round": int(state.get("current_round", 1)),
@@ -3497,23 +3557,48 @@ class NegotiationAgent(BaseAgent):
                         except Exception:
                             record["thread_state"] = None
 
-                    workflow_value = state.get("workflow_id") or (
-                        identifier if column != "workflow_id" else None
-                    )
+                    workflow_value = self._coerce_text(state.get("workflow_id"))
                     if workflow_value:
-                        record.setdefault("workflow_id", workflow_value)
+                        record["workflow_id"] = workflow_value
+                    else:
+                        record["workflow_id"] = workflow_id
 
-                    session_reference_value = state.get("session_reference")
+                    session_reference_value = self._coerce_text(
+                        state.get("session_reference")
+                    )
                     if session_reference_value:
                         record.setdefault("session_reference", session_reference_value)
 
+                    if "unique_id" in column_metadata:
+                        unique_value = None
+                        for key in (
+                            "unique_id",
+                            "uniqueId",
+                            "session_reference",
+                            "sessionReference",
+                            "session_id",
+                            "sessionId",
+                        ):
+                            unique_value = self._coerce_text(state.get(key))
+                            if unique_value:
+                                break
+                        if not unique_value:
+                            unique_value = session_reference_value or workflow_id
+
+                        unique_nullable = column_metadata["unique_id"].get(
+                            "nullable", True
+                        )
+                        if not unique_nullable:
+                            record.setdefault("unique_id", unique_value)
+                        elif unique_value:
+                            record.setdefault("unique_id", unique_value)
+
                     unique_columns = self._get_unique_constraint(
                         "negotiation_session_state",
-                        preferred=(column, "supplier_id"),
+                        preferred=("workflow_id", "supplier_id"),
                         fallbacks=(
-                            (column, "supplier_id"),
                             ("workflow_id", "supplier_id"),
-                            ("rfq_id", "supplier_id"),
+                            ("unique_id", "supplier_id"),
                             ("session_id", "supplier_id"),
                         ),
                     )
