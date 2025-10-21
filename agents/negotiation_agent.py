@@ -5,6 +5,7 @@ import os
 import re
 import binascii
 import threading
+from copy import deepcopy
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -938,6 +939,7 @@ class NegotiationAgent(BaseAgent):
         if supplier_id is not None:
             payload.setdefault("supplier_id", supplier_id)
             payload.setdefault("supplier", supplier_id)
+        payload["_batch_execution"] = True
         return payload
 
     def _execute_batch_entry(
@@ -1102,6 +1104,34 @@ class NegotiationAgent(BaseAgent):
                 )
                 try:
                     result = future.result()
+                    if isinstance(result, AgentOutput) and isinstance(result.data, dict):
+                        pending_task = result.data.get("pending_email")
+                        if result.data.get("deferred_email") and isinstance(pending_task, dict):
+                            identifier_info = pending_task.get("identifier") or {}
+                            identifier = NegotiationIdentifier(
+                                workflow_id=
+                                identifier_info.get("workflow_id")
+                                or payload.get("workflow_id")
+                                or context.workflow_id,
+                                supplier_id=
+                                identifier_info.get("supplier_id")
+                                or payload.get("supplier_id")
+                                or payload.get("supplier"),
+                                session_reference=
+                                identifier_info.get("session_reference")
+                                or session_reference,
+                                round_number=int(
+                                    identifier_info.get("round_number")
+                                    or payload.get("round")
+                                    or payload.get("round_number")
+                                    or 1
+                                ),
+                            )
+                            try:
+                                result = self._finalize_email_round(context, identifier, pending_task)
+                            except Exception:
+                                logger.exception("Failed to finalize deferred email drafting payload")
+                                raise
                 except Exception as exc:  # pragma: no cover - defensive aggregation
                     error_message = str(exc)
                     record = {
@@ -1762,8 +1792,8 @@ class NegotiationAgent(BaseAgent):
             round_no,
             supplier=supplier,
             supplier_name=supplier_name,
-            supplier_snippets=supplier_snippets,
             supplier_message=supplier_message,
+            supplier_snippets=supplier_snippets,
             playbook_context=playbook_context,
             signals=signals,
             zopa=zopa,
@@ -1933,6 +1963,64 @@ class NegotiationAgent(BaseAgent):
             state,
             negotiation_message,
         )
+
+        finalization_task = self._build_email_finalization_task(
+            context=context,
+            identifier=identifier,
+            state=state,
+            thread_state=thread_state,
+            draft_payload=draft_payload,
+            draft_stub=draft_stub,
+            email_payload=email_payload,
+            decision=decision,
+            negotiation_message=negotiation_message,
+            supplier_snippets=supplier_snippets,
+            supplier_name=supplier_name,
+            contact_name=contact_name,
+            session_reference=session_reference,
+            rfq_value=rfq_value,
+            round_no=round_no,
+            workflow_id=workflow_id,
+            supplier=supplier,
+            currency=currency,
+            volume_units=volume_units,
+            term_days=term_days,
+            valid_until=valid_until,
+            market_floor=market_floor,
+            normalised_inputs=normalised_inputs,
+            supplier_reply_registered=supplier_reply_registered,
+            state_identifier=state_identifier,
+            playbook_context=playbook_context,
+            recipients=recipients,
+            thread_headers=thread_headers,
+            counter_options=counter_options,
+            savings_score=savings_score,
+            decision_log=decision_log,
+        )
+
+        if bool(context.input_data.get("_batch_execution") if isinstance(context.input_data, dict) else False):
+            deferred_payload = {
+                "supplier": supplier,
+                "rfq_id": rfq_value,
+                "session_reference": session_reference,
+                "unique_id": session_reference,
+                "round": round_no,
+                "decision": decision,
+                "negotiation_message": negotiation_message,
+                "deferred_email": True,
+                "pending_email": finalization_task,
+            }
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data=deferred_payload,
+                    pass_fields={
+                        "pending_email": finalization_task,
+                        "deferred_email": True,
+                    },
+                ),
+            )
 
         email_output: Optional[AgentOutput] = None
         fallback_payload: Optional[Dict[str, Any]] = None
@@ -6730,4 +6818,471 @@ class NegotiationAgent(BaseAgent):
         except Exception:
             logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
             return None
+
+    def _build_email_finalization_task(
+        self,
+        *,
+        context: AgentContext,
+        identifier: NegotiationIdentifier,
+        state: Dict[str, Any],
+        thread_state: Optional[EmailThreadState],
+        draft_payload: Dict[str, Any],
+        draft_stub: Dict[str, Any],
+        email_payload: Optional[Dict[str, Any]],
+        decision: Dict[str, Any],
+        negotiation_message: Optional[str],
+        supplier_message: Optional[str],
+        supplier_snippets: Sequence[Any],
+        supplier_name: Optional[str],
+        contact_name: Optional[str],
+        session_reference: str,
+        rfq_value: Optional[str],
+        round_no: int,
+        workflow_id: Optional[str],
+        supplier: Optional[str],
+        currency: Optional[str],
+        volume_units: Any,
+        term_days: Any,
+        valid_until: Any,
+        market_floor: Any,
+        normalised_inputs: Dict[str, Any],
+        supplier_reply_registered: bool,
+        state_identifier: Optional[str],
+        playbook_context: Dict[str, Any],
+        recipients: Sequence[Any],
+        thread_headers: Any,
+        counter_options: Sequence[Any],
+        savings_score: Any,
+        decision_log: Optional[str],
+    ) -> Dict[str, Any]:
+        task: Dict[str, Any] = {
+            "identifier": {
+                "workflow_id": identifier.workflow_id,
+                "supplier_id": supplier,
+                "session_reference": session_reference,
+                "round_number": round_no,
+            },
+            "state": deepcopy(state) if isinstance(state, dict) else {},
+            "thread_state": thread_state.as_dict() if thread_state else None,
+            "draft_payload": deepcopy(draft_payload) if isinstance(draft_payload, dict) else {},
+            "draft_stub": deepcopy(draft_stub) if isinstance(draft_stub, dict) else {},
+            "email_payload": deepcopy(email_payload) if isinstance(email_payload, dict) else None,
+            "decision": deepcopy(decision) if isinstance(decision, dict) else {},
+            "negotiation_message": negotiation_message,
+            "supplier_snippets": list(supplier_snippets) if isinstance(supplier_snippets, Sequence) else [],
+            "supplier_name": supplier_name,
+            "contact_name": contact_name,
+            "supplier_message": supplier_message,
+            "rfq_value": rfq_value,
+            "round_no": round_no,
+            "workflow_id": workflow_id or identifier.workflow_id,
+            "supplier": supplier,
+            "currency": currency,
+            "volume_units": volume_units,
+            "term_days": term_days,
+            "valid_until": valid_until,
+            "market_floor": market_floor,
+            "normalised_inputs": deepcopy(normalised_inputs) if isinstance(normalised_inputs, dict) else {},
+            "supplier_reply_registered": supplier_reply_registered,
+            "state_identifier": state_identifier or identifier.workflow_id,
+            "playbook_context": deepcopy(playbook_context) if isinstance(playbook_context, dict) else {},
+            "recipients": list(recipients) if isinstance(recipients, Sequence) else [],
+            "thread_headers": deepcopy(thread_headers) if isinstance(thread_headers, dict) else thread_headers,
+            "context_input": deepcopy(context.input_data)
+            if isinstance(context.input_data, dict)
+            else {},
+            "counter_options": list(counter_options)
+            if isinstance(counter_options, Sequence)
+            else [],
+            "savings_score": savings_score,
+            "decision_log": decision_log,
+        }
+        response_timeout = None
+        if isinstance(context.input_data, dict):
+            response_timeout = context.input_data.get("response_timeout")
+        task["response_timeout"] = response_timeout
+        return task
+
+    def _finalize_email_round(
+        self,
+        parent_context: AgentContext,
+        identifier: NegotiationIdentifier,
+        task: Dict[str, Any],
+    ) -> AgentOutput:
+        context_input = task.get("context_input") if isinstance(task.get("context_input"), dict) else {}
+
+        state = deepcopy(task.get("state") or {})
+        workflow_id = task.get("workflow_id") or identifier.workflow_id
+        supplier = task.get("supplier") or identifier.supplier_id
+        session_reference = task.get("identifier", {}).get("session_reference") or identifier.session_reference
+        rfq_value = task.get("rfq_value")
+        round_no = int(task.get("round_no") or identifier.round_number or 1)
+        state_identifier = task.get("state_identifier") or workflow_id
+
+        thread_state_dict = task.get("thread_state")
+        thread_state: Optional[EmailThreadState] = None
+        if isinstance(thread_state_dict, dict) and thread_state_dict:
+            fallback_subject = self._normalise_base_subject(state.get("base_subject"))
+            if not fallback_subject:
+                fallback_subject = DEFAULT_NEGOTIATION_SUBJECT
+            thread_state = EmailThreadState.from_dict(
+                thread_state_dict, fallback_subject=fallback_subject
+            )
+        state["workflow_id"] = workflow_id
+        state["session_reference"] = session_reference
+        if supplier:
+            state["supplier_id"] = supplier
+
+        draft_payload = deepcopy(task.get("draft_payload") or {})
+        draft_stub = deepcopy(task.get("draft_stub") or {})
+        email_payload = deepcopy(task.get("email_payload") or {})
+        decision = deepcopy(task.get("decision") or {})
+        negotiation_message = task.get("negotiation_message")
+        supplier_snippets = list(task.get("supplier_snippets") or [])
+        supplier_message = task.get("supplier_message")
+        counter_options = list(task.get("counter_options") or [])
+        savings_score = task.get("savings_score")
+        decision_log = task.get("decision_log")
+        supplier_name = task.get("supplier_name")
+        contact_name = task.get("contact_name")
+        currency = task.get("currency")
+        volume_units = task.get("volume_units")
+        term_days = task.get("term_days")
+        valid_until = task.get("valid_until")
+        market_floor = task.get("market_floor")
+        normalised_inputs = deepcopy(task.get("normalised_inputs") or {})
+        playbook_context = deepcopy(task.get("playbook_context") or {})
+        recipients = list(task.get("recipients") or [])
+        thread_headers = task.get("thread_headers")
+        supplier_reply_registered = bool(task.get("supplier_reply_registered"))
+        response_timeout = task.get("response_timeout")
+
+        email_output: Optional[AgentOutput] = None
+        fallback_payload: Optional[Dict[str, Any]] = None
+        email_action_id: Optional[str] = None
+        email_subject: Optional[str] = None
+        email_body: Optional[str] = None
+        draft_records: List[Dict[str, Any]] = []
+        sent_message_id: Optional[str] = None
+        next_agents: List[str] = []
+
+        if email_payload and supplier and session_reference:
+            email_output = self._invoke_email_drafting_agent(parent_context, email_payload)
+            fallback_payload = dict(email_payload)
+
+        if email_output and email_output.status == AgentStatus.SUCCESS:
+            email_data = email_output.data or {}
+            email_action_id = email_output.action_id or email_data.get("action_id")
+            email_subject = email_data.get("subject")
+            email_body = email_data.get("body")
+            candidate_headers = email_data.get("thread_headers")
+            if isinstance(candidate_headers, dict):
+                candidate_headers = {
+                    key: value for key, value in candidate_headers.items() if value is not None
+                }
+                header_message_id = self._coerce_text(
+                    candidate_headers.get("Message-ID")
+                    or candidate_headers.get("message_id")
+                )
+                if header_message_id:
+                    sent_message_id = header_message_id
+                draft_payload["thread_headers"] = dict(candidate_headers)
+                state["last_thread_headers"] = dict(candidate_headers)
+            drafts_payload = email_data.get("drafts")
+            if isinstance(drafts_payload, list) and drafts_payload:
+                for draft in drafts_payload:
+                    if not isinstance(draft, dict):
+                        continue
+                    draft_copy = dict(draft)
+                    if email_action_id:
+                        draft_copy.setdefault("email_action_id", email_action_id)
+                    if not sent_message_id:
+                        candidate_id = self._coerce_text(
+                            draft_copy.get("message_id")
+                            or draft_copy.get("Message-ID")
+                        )
+                        if not candidate_id:
+                            headers_payload = draft_copy.get("headers") or draft_copy.get("thread_headers")
+                            if isinstance(headers_payload, dict):
+                                candidate_id = self._coerce_text(
+                                    headers_payload.get("Message-ID")
+                                    or headers_payload.get("message_id")
+                                )
+                        if candidate_id:
+                            sent_message_id = candidate_id
+                    draft_records.append(draft_copy)
+            else:
+                draft_records.append(dict(draft_stub))
+        else:
+            draft_records.append(dict(draft_stub))
+            next_agents = ["EmailDraftingAgent"]
+            if fallback_payload is None and email_payload:
+                fallback_payload = dict(email_payload)
+
+        subject_seed = self._coerce_text(draft_payload.get("subject"))
+        if subject_seed and not state.get("base_subject"):
+            base_from_email = self._normalise_base_subject(subject_seed)
+            if base_from_email:
+                state["base_subject"] = base_from_email
+
+        if email_subject and not state.get("base_subject"):
+            base_from_email = self._normalise_base_subject(email_subject)
+            if base_from_email:
+                state["base_subject"] = base_from_email
+        elif subject_seed and not state.get("base_subject"):
+            fallback_base = self._normalise_base_subject(subject_seed)
+            if fallback_base:
+                state["base_subject"] = fallback_base
+
+        if email_body and not state.get("initial_body"):
+            state["initial_body"] = email_body
+        elif not state.get("initial_body") and negotiation_message:
+            state["initial_body"] = negotiation_message
+
+        if not email_subject:
+            email_subject = subject_seed
+        if not email_body and negotiation_message:
+            email_body = negotiation_message
+
+        final_thread_headers = draft_payload.get("thread_headers")
+        if isinstance(final_thread_headers, dict):
+            if thread_state:
+                subject_hint = final_thread_headers.get("Subject")
+                base_subject_hint = self._normalise_base_subject(subject_hint)
+                if base_subject_hint:
+                    thread_state.subject_base = base_subject_hint
+            if not sent_message_id:
+                sent_message_id = self._coerce_text(
+                    final_thread_headers.get("Message-ID")
+                    or final_thread_headers.get("message_id")
+                )
+        elif isinstance(final_thread_headers, str) and not sent_message_id:
+            sent_message_id = self._coerce_text(final_thread_headers)
+
+        if sent_message_id and thread_state:
+            thread_state.update_after_send(sent_message_id)
+
+        state["status"] = "ACTIVE"
+        state["awaiting_response"] = True
+        state["current_round"] = round_no + 1
+        state["last_email_sent_at"] = datetime.now(timezone.utc)
+        if email_action_id:
+            state["last_agent_msg_id"] = email_action_id
+
+        self._persist_thread_state(state, thread_state)
+        self._save_session_state(identifier.workflow_id, supplier, state)
+        self._record_learning_snapshot(
+            parent_context,
+            identifier.workflow_id or state_identifier,
+            supplier,
+            decision,
+            state,
+            True,
+            supplier_reply_registered,
+            rfq_id=rfq_value,
+        )
+
+        if self.response_matcher and supplier:
+            try:
+                timeout = 900
+                if response_timeout is not None:
+                    try:
+                        timeout = int(response_timeout)
+                    except Exception:
+                        timeout = 900
+                self.response_matcher.register_expected_response(
+                    identifier=NegotiationIdentifier(
+                        workflow_id=identifier.workflow_id,
+                        session_reference=session_reference,
+                        supplier_id=supplier,
+                        round_number=round_no,
+                    ),
+                    email_action_id=email_action_id,
+                    expected_unique_id=session_reference,
+                    timeout_seconds=timeout,
+                )
+            except Exception:
+                logger.debug("Failed to register expected response", exc_info=True)
+
+        cache_key: Optional[Tuple[str, str]] = None
+        if state_identifier and supplier:
+            cache_key = (str(state_identifier), str(supplier))
+        cached_state = self._get_cached_state(cache_key)
+        public_state = self._public_state(cached_state or state)
+
+        supplier_watch_fields = self._build_supplier_watch_fields(
+            context=parent_context,
+            workflow_id=workflow_id,
+            supplier=supplier,
+            drafts=draft_records,
+            state=state,
+            session_reference=session_reference,
+            rfq_id=rfq_value,
+        )
+
+        supplier_responses: List[Dict[str, Any]] = []
+        if supplier_watch_fields:
+            await_response = bool(supplier_watch_fields.get("await_response"))
+            awaiting_email_drafting = "EmailDraftingAgent" in next_agents
+            if await_response and not awaiting_email_drafting:
+                wait_results = self._await_supplier_responses(
+                    context=parent_context,
+                    watch_payload=supplier_watch_fields,
+                    state=state,
+                )
+                watch_unique_ids = [
+                    self._coerce_text(entry.get("unique_id"))
+                    for entry in supplier_watch_fields.get("drafts", [])
+                    if isinstance(entry, dict) and self._coerce_text(entry.get("unique_id"))
+                ]
+                if wait_results is None:
+                    logger.error(
+                        "Supplier responses not received before timeout (workflow_id=%s supplier=%s unique_ids=%s)",
+                        workflow_id,
+                        supplier,
+                        watch_unique_ids or None,
+                    )
+                    error_payload = {
+                        "supplier": supplier,
+                        "rfq_id": rfq_value,
+                        "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "round": round_no,
+                        "decision": decision,
+                        "message": "Supplier response not received before timeout.",
+                        "unique_ids": watch_unique_ids,
+                    }
+                    return self._with_plan(
+                        parent_context,
+                        AgentOutput(
+                            status=AgentStatus.FAILED,
+                            data=error_payload,
+                            error="supplier response timeout",
+                        ),
+                    )
+                wait_thread_headers: Optional[Dict[str, Any]] = None
+                if isinstance(wait_results, dict):
+                    candidate_headers = wait_results.get("thread_headers")
+                    if isinstance(candidate_headers, dict) and candidate_headers:
+                        wait_thread_headers = dict(candidate_headers)
+                elif isinstance(wait_results, list):
+                    for candidate in wait_results:
+                        if not isinstance(candidate, dict):
+                            continue
+                        candidate_headers = candidate.get("thread_headers")
+                        if isinstance(candidate_headers, dict) and candidate_headers:
+                            wait_thread_headers = dict(candidate_headers)
+                            break
+                if wait_thread_headers:
+                    state["last_thread_headers"] = dict(wait_thread_headers)
+                    wait_message_id = self._coerce_text(
+                        wait_thread_headers.get("Message-ID")
+                        or wait_thread_headers.get("message_id")
+                    )
+                    if wait_message_id:
+                        if thread_state:
+                            thread_state.update_after_receive(wait_message_id)
+                supplier_responses = [res for res in wait_results if isinstance(res, dict)]
+                if not supplier_responses:
+                    logger.error(
+                        "No supplier responses received while waiting (workflow_id=%s supplier=%s unique_ids=%s)",
+                        workflow_id,
+                        supplier,
+                        watch_unique_ids or None,
+                    )
+                    error_payload = {
+                        "supplier": supplier,
+                        "rfq_id": rfq_value,
+                        "workflow_id": workflow_id,
+                        "session_reference": session_reference,
+                        "unique_id": session_reference,
+                        "round": round_no,
+                        "decision": decision,
+                        "message": "Missing supplier responses after wait.",
+                        "unique_ids": watch_unique_ids,
+                    }
+                    return self._with_plan(
+                        parent_context,
+                        AgentOutput(
+                            status=AgentStatus.FAILED,
+                            data=error_payload,
+                            error="missing_supplier_responses",
+                        ),
+                    )
+
+        data = {
+            "supplier": supplier,
+            "rfq_id": rfq_value,
+            "session_reference": session_reference,
+            "unique_id": session_reference,
+            "round": round_no,
+            "decision": decision,
+            "counter_proposals": counter_options,
+            "savings_score": savings_score,
+            "decision_log": decision_log,
+            "message": negotiation_message,
+            "email_subject": email_subject,
+            "email_body": email_body,
+            "supplier_snippets": supplier_snippets,
+            "negotiation_allowed": True,
+            "interaction_type": "negotiation",
+            "intent": "NEGOTIATION_COUNTER",
+            "draft_payload": draft_payload,
+            "drafts": draft_records,
+            "session_state": public_state,
+            "currency": currency,
+            "current_offer": normalised_inputs.get("current_offer"),
+            "target_price": normalised_inputs.get("target_price"),
+            "supplier_message": supplier_message
+            if supplier_message is not None
+            else (
+                context_input.get("supplier_message")
+                if isinstance(context_input, dict)
+                else None
+            ),
+            "sent_status": False,
+            "awaiting_response": True,
+            "play_recommendations": playbook_context.get("plays"),
+            "playbook_descriptor": playbook_context.get("descriptor"),
+            "playbook_examples": playbook_context.get("examples"),
+            "volume_units": volume_units,
+            "term_days": term_days,
+            "valid_until": valid_until,
+            "market_floor_price": market_floor,
+            "normalised_inputs": normalised_inputs,
+            "thread_state": thread_state.as_dict() if thread_state else None,
+            "supplier_responses": supplier_responses,
+        }
+
+        if email_subject:
+            data["email_subject"] = email_subject
+        if email_body:
+            data["email_body"] = email_body
+        if email_action_id:
+            data["email_action_id"] = email_action_id
+
+        pass_fields: Dict[str, Any] = dict(data)
+
+        supplier_watch_fields = self._build_supplier_watch_fields(
+            context=parent_context,
+            workflow_id=workflow_id,
+            supplier=supplier,
+            drafts=draft_records,
+            state=state,
+            session_reference=session_reference,
+            rfq_id=rfq_value,
+        )
+        if supplier_watch_fields:
+            pass_fields.update(supplier_watch_fields)
+
+        output = AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data=data,
+            pass_fields=pass_fields,
+            next_agents=next_agents,
+        )
+        if fallback_payload:
+            output.pass_fields.setdefault("fallback_email_payload", fallback_payload)
+        return self._with_plan(parent_context, output)
 
