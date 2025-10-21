@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
+import hashlib
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
@@ -587,7 +588,8 @@ class ResponseMatcher:
             "email_action_id": email_action_id,
             "unique_id": expected_unique_id,
             "registered_at": datetime.now(timezone.utc),
-            "timeout_at": datetime.now(timezone.utc) + timedelta(seconds=max(timeout_seconds, 60)),
+            "timeout_at": datetime.now(timezone.utc)
+            + timedelta(seconds=max(timeout_seconds, 60)),
             "thread_key": identifier.thread_key,
         }
         with self._lock:
@@ -610,7 +612,9 @@ class ResponseMatcher:
             expected = workflow_bucket.get(supplier_id)
             if not expected:
                 return None
-            if datetime.now(timezone.utc) > expected.get("timeout_at", datetime.now(timezone.utc)):
+            if datetime.now(timezone.utc) > expected.get(
+                "timeout_at", datetime.now(timezone.utc)
+            ):
                 workflow_bucket.pop(supplier_id, None)
                 return None
             workflow_bucket.pop(supplier_id, None)
@@ -624,6 +628,717 @@ class ResponseMatcher:
         with self._lock:
             bucket = self._pending_responses.get(workflow_id) or {}
             return len(bucket)
+
+
+@dataclass
+class EmailHistoryEntry:
+    email_id: str
+    round_number: int
+    supplier_id: str
+    supplier_name: Optional[str]
+    subject: str
+    body_text: str
+    body_html: str
+    sender: str
+    recipients: List[str]
+    sent_at: datetime
+    message_id: Optional[str]
+    thread_headers: Dict[str, Any]
+    metadata: Dict[str, Any]
+    decision: Dict[str, Any]
+    negotiation_context: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "email_id": self.email_id,
+            "round_number": self.round_number,
+            "supplier_id": self.supplier_id,
+            "supplier_name": self.supplier_name,
+            "subject": self.subject,
+            "body_text": self.body_text,
+            "body_html": self.body_html,
+            "sender": self.sender,
+            "recipients": list(self.recipients),
+            "sent_at": self.sent_at.isoformat()
+            if isinstance(self.sent_at, datetime)
+            else self.sent_at,
+            "message_id": self.message_id,
+            "thread_headers": dict(self.thread_headers),
+            "metadata": dict(self.metadata),
+            "decision": dict(self.decision),
+            "negotiation_context": dict(self.negotiation_context),
+        }
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "EmailHistoryEntry":
+        sent_at = data.get("sent_at")
+        if isinstance(sent_at, str):
+            try:
+                sent_at = datetime.fromisoformat(sent_at)
+            except Exception:
+                sent_at = datetime.now(timezone.utc)
+        elif not isinstance(sent_at, datetime):
+            sent_at = datetime.now(timezone.utc)
+
+        return EmailHistoryEntry(
+            email_id=data.get("email_id") or str(uuid.uuid4()),
+            round_number=int(data.get("round_number", 1)),
+            supplier_id=str(data.get("supplier_id") or ""),
+            supplier_name=data.get("supplier_name"),
+            subject=data.get("subject", ""),
+            body_text=data.get("body_text", ""),
+            body_html=data.get("body_html", ""),
+            sender=data.get("sender", ""),
+            recipients=list(data.get("recipients") or []),
+            sent_at=sent_at,
+            message_id=data.get("message_id"),
+            thread_headers=dict(data.get("thread_headers") or {}),
+            metadata=dict(data.get("metadata") or {}),
+            decision=dict(data.get("decision") or {}),
+            negotiation_context=dict(data.get("negotiation_context") or {}),
+        )
+
+
+class EmailThreadManager:
+    """Manage negotiation email history keyed by workflow and supplier."""
+
+    def __init__(self) -> None:
+        self._threads: Dict[str, List[EmailHistoryEntry]] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _thread_key(workflow_id: str, supplier_id: str) -> str:
+        return f"{workflow_id}:{supplier_id}"
+
+    def set_thread(
+        self, workflow_id: str, supplier_id: str, entries: Sequence[EmailHistoryEntry]
+    ) -> None:
+        key = self._thread_key(workflow_id, supplier_id)
+        with self._lock:
+            ordered = sorted(entries, key=lambda entry: entry.sent_at)
+            self._threads[key] = ordered
+
+    def add_email(
+        self,
+        workflow_id: str,
+        supplier_id: str,
+        email_entry: EmailHistoryEntry,
+    ) -> None:
+        key = self._thread_key(workflow_id, supplier_id)
+        with self._lock:
+            bucket = self._threads.setdefault(key, [])
+            bucket.append(email_entry)
+            bucket.sort(key=lambda entry: entry.sent_at)
+
+    def get_thread(
+        self, workflow_id: str, supplier_id: str
+    ) -> List[EmailHistoryEntry]:
+        key = self._thread_key(workflow_id, supplier_id)
+        with self._lock:
+            entries = self._threads.get(key, [])
+            return list(entries)
+
+    def get_thread_summary(
+        self, workflow_id: str, supplier_id: str
+    ) -> Dict[str, Any]:
+        thread = self.get_thread(workflow_id, supplier_id)
+        if not thread:
+            return {
+                "total_emails": 0,
+                "rounds": [],
+                "first_sent": None,
+                "last_sent": None,
+                "thread_key": self._thread_key(workflow_id, supplier_id),
+            }
+
+        rounds = sorted({entry.round_number for entry in thread})
+        first_sent = thread[0].sent_at.isoformat()
+        last_sent = thread[-1].sent_at.isoformat()
+
+        return {
+            "total_emails": len(thread),
+            "rounds": rounds,
+            "first_sent": first_sent,
+            "last_sent": last_sent,
+            "thread_key": self._thread_key(workflow_id, supplier_id),
+        }
+
+
+class NegotiationEmailHTMLBuilder:
+    """Build professional HTML emails for negotiation rounds."""
+
+    BASE_STYLES = """
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333333;
+            max-width: 650px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .email-container {
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 30px;
+            margin: 20px auto;
+        }
+        .header {
+            border-bottom: 3px solid #0066cc;
+            padding-bottom: 15px;
+            margin-bottom: 25px;
+        }
+        .header h1 {
+            color: #0066cc;
+            font-size: 24px;
+            margin: 0 0 5px 0;
+            font-weight: 600;
+        }
+        .round-badge {
+            display: inline-block;
+            background-color: #0066cc;
+            color: #ffffff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .greeting {
+            font-size: 16px;
+            margin-bottom: 20px;
+            color: #333333;
+        }
+        .section {
+            margin: 25px 0;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-left: 4px solid #0066cc;
+            border-radius: 4px;
+        }
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #0066cc;
+            margin: 0 0 12px 0;
+        }
+        .pricing-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            background-color: #ffffff;
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .pricing-table th {
+            background-color: #0066cc;
+            color: #ffffff;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .pricing-table td {
+            padding: 12px;
+            border-bottom: 1px solid #e9ecef;
+            font-size: 14px;
+        }
+        .pricing-table tr:last-child td {
+            border-bottom: none;
+        }
+        .pricing-table .label {
+            font-weight: 600;
+            color: #495057;
+        }
+        .pricing-table .value {
+            color: #212529;
+        }
+        .pricing-table .highlight {
+            background-color: #fff3cd;
+            font-weight: 600;
+            color: #856404;
+        }
+        .asks-list {
+            margin: 15px 0;
+            padding: 0;
+            list-style: none;
+        }
+        .asks-list li {
+            padding: 10px 15px;
+            margin: 8px 0;
+            background-color: #ffffff;
+            border-left: 3px solid #28a745;
+            border-radius: 4px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .asks-list li:before {
+            content: "✓";
+            color: #28a745;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .callout {
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .callout-info {
+            background-color: #d1ecf1;
+            border-left: 4px solid #0c5460;
+            color: #0c5460;
+        }
+        .callout-warning {
+            background-color: #fff3cd;
+            border-left: 4px solid #856404;
+            color: #856404;
+        }
+        .callout-success {
+            background-color: #d4edda;
+            border-left: 4px solid #155724;
+            color: #155724;
+        }
+        .playbook-recommendations {
+            margin: 20px 0;
+            padding: 0;
+        }
+        .recommendation-item {
+            padding: 15px;
+            margin: 10px 0;
+            background-color: #e7f3ff;
+            border-left: 4px solid #0066cc;
+            border-radius: 4px;
+        }
+        .recommendation-item .lever {
+            font-weight: 600;
+            color: #0066cc;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+        .recommendation-item .description {
+            color: #495057;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 2px solid #e9ecef;
+            font-size: 14px;
+            color: #6c757d;
+        }
+        .signature {
+            margin-top: 25px;
+            font-size: 15px;
+            color: #333333;
+        }
+        .signature .name {
+            font-weight: 600;
+            color: #0066cc;
+        }
+        .button {
+            display: inline-block;
+            padding: 12px 24px;
+            background-color: #0066cc;
+            color: #ffffff !important;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 14px;
+            text-align: center;
+            margin: 15px 0;
+        }
+        .button:hover {
+            background-color: #0052a3;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .metric-card {
+            background-color: #ffffff;
+            padding: 15px;
+            border-radius: 6px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .metric-card .label {
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+        .metric-card .value {
+            font-size: 20px;
+            font-weight: 600;
+            color: #0066cc;
+        }
+        @media only screen and (max-width: 600px) {
+            body {
+                padding: 10px;
+            }
+            .email-container {
+                padding: 20px;
+            }
+            .pricing-table {
+                font-size: 12px;
+            }
+            .metrics-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+    """
+
+    @staticmethod
+    def build_negotiation_email(
+        *,
+        round_number: int,
+        contact_name: Optional[str],
+        supplier_name: Optional[str],
+        decision: Dict[str, Any],
+        positions: Optional[Dict[str, Any]],
+        currency: Optional[str],
+        playbook_recommendations: Optional[List[Dict[str, Any]]],
+        negotiation_message: str,
+        sender_name: Optional[str] = None,
+        company_name: Optional[str] = "Procwise",
+    ) -> str:
+        strategy = decision.get("strategy", "counter")
+        counter_price = decision.get("counter_price")
+        asks = decision.get("asks", [])
+        lead_time_request = decision.get("lead_time_request")
+
+        greeting = NegotiationEmailHTMLBuilder._build_greeting(
+            contact_name=contact_name,
+            supplier_name=supplier_name,
+            round_number=round_number,
+        )
+
+        header = NegotiationEmailHTMLBuilder._build_header(
+            round_number=round_number,
+            strategy=strategy,
+        )
+
+        pricing_section = ""
+        if counter_price is not None and positions:
+            pricing_section = NegotiationEmailHTMLBuilder._build_pricing_section(
+                counter_price=counter_price,
+                positions=positions,
+                currency=currency,
+            )
+
+        message_section = NegotiationEmailHTMLBuilder._build_message_section(
+            negotiation_message=negotiation_message,
+            round_number=round_number,
+        )
+
+        asks_section = ""
+        if asks or lead_time_request:
+            asks_section = NegotiationEmailHTMLBuilder._build_asks_section(
+                asks=asks,
+                lead_time_request=lead_time_request,
+            )
+
+        playbook_section = ""
+        if playbook_recommendations:
+            playbook_section = NegotiationEmailHTMLBuilder._build_playbook_section(
+                recommendations=playbook_recommendations[:3],
+            )
+
+        footer = NegotiationEmailHTMLBuilder._build_footer(
+            sender_name=sender_name,
+            company_name=company_name,
+            round_number=round_number,
+        )
+
+        html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>Negotiation Round {round_number}</title>
+    {NegotiationEmailHTMLBuilder.BASE_STYLES}
+</head>
+<body>
+    <div class="email-container">
+        {header}
+        {greeting}
+        {message_section}
+        {pricing_section}
+        {asks_section}
+        {playbook_section}
+        {footer}
+    </div>
+</body>
+</html>
+        """
+
+        return html
+
+    @staticmethod
+    def _build_greeting(
+        *,
+        contact_name: Optional[str],
+        supplier_name: Optional[str],
+        round_number: int,
+    ) -> str:
+        name = contact_name or supplier_name or "there"
+
+        if round_number == 1:
+            greeting_text = f"Dear {name},"
+        elif round_number == 2:
+            greeting_text = f"Dear {name},<br><br>Thank you for your response."
+        else:
+            greeting_text = (
+                f"Dear {name},<br><br>Thank you for continuing our discussion."
+            )
+
+        return f'<div class="greeting">{greeting_text}</div>'
+
+    @staticmethod
+    def _build_header(*, round_number: int, strategy: str) -> str:
+        strategy_titles = {
+            "counter": "Negotiation Proposal",
+            "accept": "Agreement Confirmation",
+            "decline": "Negotiation Status",
+            "clarify": "Request for Information",
+            "review": "Review Required",
+        }
+
+        title = strategy_titles.get(strategy, "Negotiation Update")
+
+        return f"""
+        <div class="header">
+            <h1>{title}</h1>
+            <span class="round-badge">Round {round_number}</span>
+        </div>
+        """
+
+    @staticmethod
+    def _build_pricing_section(
+        *,
+        counter_price: float,
+        positions: Dict[str, Any],
+        currency: Optional[str],
+    ) -> str:
+        def format_price(value: Optional[float]) -> str:
+            if value is None:
+                return "—"
+            symbol = (
+                "£"
+                if currency == "GBP"
+                else "$"
+                if currency == "USD"
+                else "€"
+                if currency == "EUR"
+                else ""
+            )
+            return f"{symbol}{value:,.2f}"
+
+        current_offer = positions.get("supplier_offer")
+        target = positions.get("desired")
+
+        rows = []
+
+        if current_offer is not None:
+            rows.append(
+                f"""
+            <tr>
+                <td class="label">Your Current Offer</td>
+                <td class="value">{format_price(current_offer)}</td>
+            </tr>
+            """
+            )
+
+        rows.append(
+            f"""
+        <tr class="highlight">
+            <td class="label">Our Counter Proposal</td>
+            <td class="value">{format_price(counter_price)}</td>
+        </tr>
+        """
+        )
+
+        if target is not None:
+            rows.append(
+                f"""
+            <tr>
+                <td class="label">Target Price</td>
+                <td class="value">{format_price(target)}</td>
+            </tr>
+            """
+            )
+
+        if current_offer is not None and counter_price is not None:
+            gap = current_offer - counter_price
+            gap_pct = (gap / current_offer) * 100 if current_offer else 0
+            rows.append(
+                f"""
+            <tr>
+                <td class="label">Price Adjustment</td>
+                <td class="value">{format_price(gap)} ({gap_pct:.1f}%)</td>
+            </tr>
+            """
+            )
+
+        return f"""
+        <div class="section">
+            <div class="section-title">💰 Pricing Proposal</div>
+            <table class="pricing-table">
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th>Amount</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(rows)}
+                </tbody>
+            </table>
+        </div>
+        """
+
+    @staticmethod
+    def _build_message_section(
+        *,
+        negotiation_message: str,
+        round_number: int,
+    ) -> str:
+        paragraphs = negotiation_message.split("\n\n")
+        html_paragraphs = [
+            f"<p>{escape(p.strip())}</p>" for p in paragraphs if p.strip()
+        ]
+
+        callout_type = "callout-info" if round_number <= 2 else "callout-warning"
+
+        return f"""
+        <div class="section">
+            <div class="section-title">📋 Proposal Details</div>
+            <div class="callout {callout_type}">
+                {''.join(html_paragraphs)}
+            </div>
+        </div>
+        """
+
+    @staticmethod
+    def _build_asks_section(
+        *,
+        asks: List[str],
+        lead_time_request: Optional[str],
+    ) -> str:
+        items: List[str] = []
+
+        if lead_time_request:
+            items.append(
+                f"<li><strong>Lead Time:</strong> {escape(lead_time_request)}</li>"
+            )
+
+        for ask in asks:
+            if ask and isinstance(ask, str):
+                items.append(f"<li>{escape(ask)}</li>")
+
+        if not items:
+            return ""
+
+        return f"""
+        <div class="section">
+            <div class="section-title">✓ Key Requirements</div>
+            <ul class="asks-list">
+                {''.join(items)}
+            </ul>
+        </div>
+        """
+
+    @staticmethod
+    def _build_playbook_section(
+        *,
+        recommendations: List[Dict[str, Any]],
+    ) -> str:
+        if not recommendations:
+            return ""
+
+        items: List[str] = []
+        for rec in recommendations[:3]:
+            if not isinstance(rec, dict):
+                continue
+
+            lever = escape(str(rec.get("lever", "")))
+            description = escape(str(rec.get("play", "")))
+
+            if lever and description:
+                items.append(
+                    f"""
+                <div class="recommendation-item">
+                    <div class="lever">{lever}</div>
+                    <div class="description">{description}</div>
+                </div>
+                """
+                )
+
+        if not items:
+            return ""
+
+        return f"""
+        <div class="section">
+            <div class="section-title">💡 Value Creation Opportunities</div>
+            <div class="playbook-recommendations">
+                {''.join(items)}
+            </div>
+        </div>
+        """
+
+    @staticmethod
+    def _build_footer(
+        *,
+        sender_name: Optional[str],
+        company_name: str,
+        round_number: int,
+    ) -> str:
+        sender = sender_name or "The Procurement Team"
+
+        if round_number >= 3:
+            next_steps = """
+            <div class="callout callout-warning">
+                <strong>⏰ Closing Round:</strong> We're working to finalize this agreement. \
+                Please respond at your earliest convenience to keep the process moving forward.
+            </div>
+            """
+        else:
+            next_steps = """
+            <div class="callout callout-info">
+                <strong>Next Steps:</strong> We look forward to your response and are happy to \
+                discuss any aspects of this proposal in more detail.
+            </div>
+            """
+
+        return f"""
+        {next_steps}
+
+        <div class="signature">
+            <p>Best regards,<br>
+            <span class="name">{escape(sender)}</span><br>
+            {escape(company_name)}</p>
+        </div>
+
+        <div class="footer">
+            <p style="font-size: 12px; color: #6c757d;">
+                This is an automated negotiation communication generated as part of our procurement workflow.
+                For questions or concerns, please reply directly to this email.
+            </p>
+        </div>
+        """
 
 
 @dataclass
@@ -803,11 +1518,15 @@ class NegotiationAgent(BaseAgent):
         self._negotiation_session_state_identifier_column: Optional[str] = None
         self._negotiation_sessions_identifier_column: Optional[str] = None
         self.response_matcher = ResponseMatcher(getattr(self.agent_nick, "get_db_connection", None))
+        self._email_thread_manager = EmailThreadManager()
 
         # Feature flag for enhanced negotiation message composition
         self._use_enhanced_messages = (
             os.getenv("NEG_USE_ENHANCED_MESSAGES", "false").lower() == "true"
         )
+
+        self._email_thread_manager = EmailThreadManager()
+        self._html_builder = NegotiationEmailHTMLBuilder()
 
     @contextmanager
     def _session_lock(self, workflow_id: str, supplier_id: str, round_no: int):
@@ -2840,6 +3559,13 @@ class NegotiationAgent(BaseAgent):
             stop_message = self._build_stop_message(new_status, halt_reason, round_no)
             decision.setdefault("status_reason", halt_reason)
             self._persist_thread_state(state, thread_state)
+            email_thread_history = self._get_email_thread_history(
+                identifier.workflow_id, supplier
+            )
+            email_thread_summary = self._get_email_thread_summary(
+                identifier.workflow_id, supplier
+            )
+            state["email_history"] = email_thread_history
             self._save_session_state(identifier.workflow_id, supplier, state)
             self._record_learning_snapshot(
                 context,
@@ -2894,7 +3620,19 @@ class NegotiationAgent(BaseAgent):
                 "flags": decision.get("flags"),
                 "market_floor_price": market_floor,
                 "normalised_inputs": normalised_inputs,
+                "email_history": email_thread_history,
+                "email_thread_summary": email_thread_summary,
+                "current_email": draft_records[0] if draft_records else None,
+                "all_emails_sent": len(email_thread_history),
             }
+            history_payload, history_summary, all_sent = self._compose_email_history_payload(
+                identifier.workflow_id,
+                supplier,
+                state,
+            )
+            data["email_history"] = history_payload
+            data["email_thread_summary"] = history_summary
+            data["all_emails_sent"] = all_sent
             logger.info(
                 "NegotiationAgent halted negotiation for supplier=%s session_id=%s reason=%s",
                 supplier,
@@ -3143,6 +3881,10 @@ class NegotiationAgent(BaseAgent):
             rfq_id=rfq_value,
             recipients=recipients,
             thread_headers=thread_headers if isinstance(thread_headers, dict) else None,
+            round_number=round_no,
+            decision=decision,
+            currency=currency,
+            playbook_context=playbook_context,
         )
         draft_stub.setdefault("intent", "NEGOTIATION_COUNTER")
         draft_stub["negotiation_message"] = negotiation_message
@@ -3315,6 +4057,37 @@ class NegotiationAgent(BaseAgent):
         if not email_body and negotiation_message:
             email_body = negotiation_message
 
+        for draft_record in draft_records:
+            if not isinstance(draft_record, dict):
+                continue
+            if not draft_record.get("html"):
+                draft_record["html"] = self._build_enhanced_html_email(
+                    round_number=round_no,
+                    contact_name=contact_name,
+                    supplier_name=supplier_name,
+                    decision=decision,
+                    negotiation_message=negotiation_message or "",
+                    currency=currency,
+                    playbook_context=playbook_context,
+                    sender_name=getattr(
+                        getattr(self.agent_nick, "settings", None),
+                        "sender_name",
+                        None,
+                    ),
+                )
+            self._capture_email_to_history(
+                workflow_id=workflow_id,
+                supplier_id=supplier,
+                round_number=round_no,
+                draft=draft_record,
+                decision=decision,
+                state=state,
+            )
+
+        email_thread_history = self._get_email_thread_history(workflow_id, supplier)
+        email_thread_summary = self._get_email_thread_summary(workflow_id, supplier)
+        state["email_history"] = email_thread_history
+
         final_thread_headers = draft_payload.get("thread_headers")
         if isinstance(final_thread_headers, dict):
             if thread_state:
@@ -3329,6 +4102,26 @@ class NegotiationAgent(BaseAgent):
                 )
         elif isinstance(final_thread_headers, str) and not sent_message_id:
             sent_message_id = self._coerce_text(final_thread_headers)
+
+        self._capture_email_to_history(
+            workflow_id=identifier.workflow_id,
+            supplier_id=supplier,
+            state=state,
+            draft_records=draft_records,
+            subject=email_subject or draft_payload.get("subject"),
+            body=email_body or negotiation_message,
+            thread_headers=final_thread_headers,
+            email_action_id=email_action_id,
+            message_id=sent_message_id,
+            recipients=draft_payload.get("recipients") or recipients,
+            cc=draft_payload.get("cc"),
+            sender=(
+                draft_payload.get("from_address")
+                or draft_payload.get("sender")
+                or context.input_data.get("sender")
+            ),
+            session_reference=session_reference,
+        )
 
         if sent_message_id and thread_state:
             thread_state.update_after_send(sent_message_id)
@@ -3412,7 +4205,20 @@ class NegotiationAgent(BaseAgent):
             "market_floor_price": market_floor,
             "normalised_inputs": normalised_inputs,
             "thread_state": thread_state.as_dict() if thread_state else None,
+            "email_history": email_thread_history,
+            "email_thread_summary": email_thread_summary,
+            "current_email": draft_records[0] if draft_records else None,
+            "all_emails_sent": len(email_thread_history),
         }
+
+        history_payload, history_summary, all_sent = self._compose_email_history_payload(
+            identifier.workflow_id,
+            supplier,
+            state,
+        )
+        data["email_history"] = history_payload
+        data["email_thread_summary"] = history_summary
+        data["all_emails_sent"] = all_sent
 
         if email_subject:
             data["email_subject"] = email_subject
@@ -4001,6 +4807,7 @@ class NegotiationAgent(BaseAgent):
             "thread_state": None,
             "workflow_id": None,
             "session_reference": None,
+            "email_history": [],
         }
 
     def _public_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -4057,6 +4864,33 @@ class NegotiationAgent(BaseAgent):
             return
         state["thread_state"] = thread_state.as_dict()
 
+    def _rehydrate_email_history(
+        self,
+        *,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        history: Any,
+    ) -> None:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return
+        if not isinstance(history, list):
+            return
+
+        entries: List[EmailHistoryEntry] = []
+        for item in history:
+            if isinstance(item, EmailHistoryEntry):
+                entries.append(item)
+            elif isinstance(item, dict):
+                try:
+                    entries.append(EmailHistoryEntry.from_dict(item))
+                except Exception:
+                    continue
+
+        if entries:
+            self._email_thread_manager.set_thread(workflow_key, supplier_key, entries)
+
     def _get_cached_state(
         self, cache_key: Optional[Tuple[str, str]]
     ) -> Optional[Dict[str, Any]]:
@@ -4091,6 +4925,7 @@ class NegotiationAgent(BaseAgent):
                             base_subject TEXT,
                             initial_body TEXT,
                             thread_state JSONB,
+                            email_history JSONB,
                             session_reference VARCHAR(255),
                             unique_id VARCHAR(255),
                             rfq_id TEXT,
@@ -4108,6 +4943,9 @@ class NegotiationAgent(BaseAgent):
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS thread_state JSONB"
                     )
                     cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS email_history JSONB"
+                    )
+                    cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS workflow_id VARCHAR(255)"
                     )
                     cur.execute(
@@ -4118,6 +4956,9 @@ class NegotiationAgent(BaseAgent):
                     )
                     cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS rfq_id TEXT"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS email_history JSONB"
                     )
                     # Deprecate rfq_id requirements in favour of workflow/unique identifiers
                     cur.execute(
@@ -4141,6 +4982,12 @@ class NegotiationAgent(BaseAgent):
                         CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_unique_supplier_idx
                             ON proc.negotiation_session_state (unique_id, supplier_id)
                             WHERE unique_id IS NOT NULL
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_negotiation_state_email_history
+                            ON proc.negotiation_session_state USING GIN(email_history)
                         """
                     )
                 conn.commit()
@@ -4449,7 +5296,8 @@ class NegotiationAgent(BaseAgent):
                         f"""
                         SELECT supplier_reply_count, current_round, status, awaiting_response,
                                last_supplier_msg_id, last_agent_msg_id, last_email_sent_at,
-                               base_subject, initial_body, thread_state, workflow_id, session_reference
+                               base_subject, initial_body, thread_state, workflow_id, session_reference,
+                               email_history
                           FROM proc.negotiation_session_state
                          WHERE workflow_id = %s AND supplier_id = %s
                         """,
@@ -4468,8 +5316,10 @@ class NegotiationAgent(BaseAgent):
                             base_subject,
                             initial_body,
                             thread_state_raw,
+                            email_history_raw,
                             workflow_value,
                             session_reference_value,
+                            email_history_raw,
                         ) = row
                         if isinstance(base_subject, (bytes, bytearray, memoryview)):
                             try:
@@ -4496,16 +5346,59 @@ class NegotiationAgent(BaseAgent):
                                     state["thread_state"] = None
                             elif isinstance(thread_state_raw, dict):
                                 state["thread_state"] = dict(thread_state_raw)
+                        if email_history_raw:
+                            parsed_history: List[Dict[str, Any]] = []
+                            if isinstance(email_history_raw, (bytes, bytearray, memoryview)):
+                                try:
+                                    email_history_raw = email_history_raw.tobytes().decode("utf-8")
+                                except Exception:
+                                    email_history_raw = None
+                            if isinstance(email_history_raw, str):
+                                try:
+                                    parsed_history = json.loads(email_history_raw)
+                                except Exception:
+                                    parsed_history = []
+                            elif isinstance(email_history_raw, list):
+                                parsed_history = [
+                                    item
+                                    for item in email_history_raw
+                                    if isinstance(item, dict)
+                                ]
+                            state["email_history"] = parsed_history
                         if workflow_value:
                             state["workflow_id"] = self._coerce_text(workflow_value)
                         if session_reference_value:
                             state["session_reference"] = self._coerce_text(
                                 session_reference_value
                             )
+                        if email_history_raw:
+                            if isinstance(email_history_raw, (bytes, bytearray, memoryview)):
+                                try:
+                                    email_history_raw = email_history_raw.tobytes().decode(
+                                        "utf-8"
+                                    )
+                                except Exception:
+                                    email_history_raw = None
+                            if isinstance(email_history_raw, str):
+                                try:
+                                    state["email_history"] = json.loads(email_history_raw)
+                                except Exception:
+                                    state["email_history"] = []
+                            elif isinstance(email_history_raw, list):
+                                state["email_history"] = list(email_history_raw)
+                            elif isinstance(email_history_raw, dict):
+                                state["email_history"] = [email_history_raw]
+                        else:
+                            state.setdefault("email_history", [])
                         exists = True
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to load negotiation session state")
         state.setdefault("workflow_id", workflow_id)
+        self._rehydrate_email_history(
+            workflow_id=workflow_id,
+            supplier_id=supplier_id,
+            history=state.get("email_history"),
+        )
         with self._state_lock:
             self._state_cache[key] = dict(state)
         return dict(state), exists
@@ -4560,6 +5453,15 @@ class NegotiationAgent(BaseAgent):
                             )
                         except Exception:
                             record["thread_state"] = None
+
+                    email_history_payload = state.get("email_history")
+                    if email_history_payload is not None:
+                        try:
+                            record["email_history"] = json.dumps(
+                                email_history_payload, ensure_ascii=False, default=str
+                            )
+                        except Exception:
+                            record["email_history"] = None
 
                     workflow_value = self._coerce_text(state.get("workflow_id"))
                     if workflow_value:
@@ -8235,19 +9137,33 @@ class NegotiationAgent(BaseAgent):
         rfq_id: Optional[str],
         recipients: Optional[Sequence[Any]],
         thread_headers: Optional[Any],
+        round_number: int,
+        decision: Dict[str, Any],
+        currency: Optional[str],
+        playbook_context: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         workflow_id = getattr(context, "workflow_id", None)
         subject_seed = self._coerce_text(draft_payload.get("subject"))
         subject = subject_seed or DEFAULT_NEGOTIATION_SUBJECT
 
         message_body = self._coerce_text(negotiation_message) or ""
-        greeting_line = self._build_personal_greeting(contact_name, supplier_name)
-        if greeting_line and not self._has_explicit_greeting(message_body):
-            message_body = greeting_line if not message_body else f"{greeting_line}\n\n{message_body}".strip()
         cleaned_body = EmailDraftingAgent._clean_body_text(message_body)
 
+        enhanced_html = self._build_enhanced_html_email(
+            round_number=round_number,
+            contact_name=contact_name,
+            supplier_name=supplier_name,
+            decision=decision or {},
+            negotiation_message=cleaned_body,
+            currency=currency,
+            playbook_context=playbook_context,
+            sender_name=getattr(
+                getattr(self.agent_nick, "settings", None), "sender_name", None
+            ),
+        )
+
         email_agent = self._ensure_email_agent()
-        sanitised_html = ""
+        sanitised_html = enhanced_html or ""
         plain_text = cleaned_body
         if cleaned_body:
             try:
@@ -8280,7 +9196,9 @@ class NegotiationAgent(BaseAgent):
 
         to_candidates = self._normalise_recipient_list(recipients)
         if not to_candidates:
-            to_candidates = self._normalise_recipient_list(draft_payload.get("recipients"))
+            to_candidates = self._normalise_recipient_list(
+                draft_payload.get("recipients")
+            )
         cc_candidates = self._normalise_recipient_list(draft_payload.get("cc"))
         deduped_cc = self._merge_recipients_basic([], cc_candidates)
         if to_candidates:
@@ -8295,8 +9213,16 @@ class NegotiationAgent(BaseAgent):
             merged = self._merge_recipients_basic(to_candidates, cc_candidates)
         recipients_list = merged
 
-        receiver = to_candidates[0] if to_candidates else (recipients_list[0] if recipients_list else None)
-        sender = context.input_data.get("sender") if isinstance(context.input_data, dict) else None
+        receiver = (
+            to_candidates[0]
+            if to_candidates
+            else (recipients_list[0] if recipients_list else None)
+        )
+        sender = (
+            context.input_data.get("sender")
+            if isinstance(context.input_data, dict)
+            else None
+        )
         if not sender:
             sender = getattr(self.agent_nick.settings, "ses_default_sender", None)
 
@@ -8347,6 +9273,158 @@ class NegotiationAgent(BaseAgent):
             stub["thread_headers"] = dict(thread_headers)
 
         return stub
+
+    def _build_enhanced_html_email(
+        self,
+        *,
+        round_number: int,
+        contact_name: Optional[str],
+        supplier_name: Optional[str],
+        decision: Dict[str, Any],
+        negotiation_message: str,
+        currency: Optional[str],
+        playbook_context: Optional[Dict[str, Any]],
+        sender_name: Optional[str] = None,
+    ) -> str:
+        decision_payload = decision or {}
+        positions = decision_payload.get("positions")
+        if not isinstance(positions, dict):
+            positions = {}
+
+        recommendations: Optional[List[Dict[str, Any]]] = None
+        if isinstance(playbook_context, dict):
+            plays = playbook_context.get("plays")
+            if isinstance(plays, list):
+                recommendations = [rec for rec in plays if isinstance(rec, dict)]
+
+        company_name = getattr(
+            getattr(self.agent_nick, "settings", None), "company_name", "Procwise"
+        )
+
+        return self._html_builder.build_negotiation_email(
+            round_number=round_number,
+            contact_name=contact_name,
+            supplier_name=supplier_name,
+            decision=decision_payload,
+            positions=positions,
+            currency=currency,
+            playbook_recommendations=recommendations,
+            negotiation_message=negotiation_message,
+            sender_name=sender_name,
+            company_name=company_name or "Procwise",
+        )
+
+    def _capture_email_to_history(
+        self,
+        *,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        round_number: int,
+        draft: Dict[str, Any],
+        decision: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Optional[EmailHistoryEntry]:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return None
+
+        email_entry = EmailHistoryEntry(
+            email_id=self._coerce_text(draft.get("id")) or str(uuid.uuid4()),
+            round_number=round_number,
+            supplier_id=supplier_key,
+            supplier_name=draft.get("supplier_name"),
+            subject=self._coerce_text(draft.get("subject")) or "",
+            body_text=self._coerce_text(draft.get("text")) or "",
+            body_html=self._coerce_text(draft.get("html")) or "",
+            sender=self._coerce_text(draft.get("sender")) or "",
+            recipients=list(draft.get("recipients") or []),
+            sent_at=datetime.now(timezone.utc),
+            message_id=self._coerce_text(
+                draft.get("message_id") or draft.get("Message-ID")
+            ),
+            thread_headers=dict(draft.get("thread_headers") or {}),
+            metadata=dict(draft.get("metadata") or {}),
+            decision=dict(decision or {}),
+            negotiation_context={
+                "positions": decision.get("positions"),
+                "counter_price": decision.get("counter_price"),
+                "strategy": decision.get("strategy"),
+                "play_recommendations": decision.get("play_recommendations"),
+            },
+        )
+
+        self._email_thread_manager.add_email(
+            workflow_key, supplier_key, email_entry
+        )
+
+        history = state.get("email_history")
+        if not isinstance(history, list):
+            history = []
+
+        existing_index: Optional[int] = None
+        for idx, entry in enumerate(history):
+            if isinstance(entry, dict) and entry.get("email_id") == email_entry.email_id:
+                existing_index = idx
+                break
+
+        entry_payload = email_entry.to_dict()
+        if existing_index is not None:
+            history[existing_index] = entry_payload
+        else:
+            history.append(entry_payload)
+
+        state["email_history"] = history
+        return email_entry
+
+    def _get_email_thread_history(
+        self, workflow_id: Optional[str], supplier_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return []
+        thread = self._email_thread_manager.get_thread(workflow_key, supplier_key)
+        return [entry.to_dict() for entry in thread]
+
+    def _get_email_thread_summary(
+        self, workflow_id: Optional[str], supplier_id: Optional[str]
+    ) -> Dict[str, Any]:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return {
+                "total_emails": 0,
+                "rounds": [],
+                "first_sent": None,
+                "last_sent": None,
+                "thread_key": None,
+            }
+        return self._email_thread_manager.get_thread_summary(
+            workflow_key, supplier_key
+        )
+
+    def generate_email_preview(
+        self,
+        *,
+        round_number: int,
+        decision: Dict[str, Any],
+        negotiation_message: str,
+        supplier_name: Optional[str] = None,
+        contact_name: Optional[str] = None,
+        currency: Optional[str] = None,
+        playbook_recommendations: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        return self._html_builder.build_negotiation_email(
+            round_number=round_number,
+            contact_name=contact_name,
+            supplier_name=supplier_name,
+            decision=decision or {},
+            positions=(decision or {}).get("positions") or {},
+            currency=currency,
+            playbook_recommendations=playbook_recommendations,
+            negotiation_message=negotiation_message,
+        )
 
     def _build_email_agent_payload(
         self,
@@ -8672,6 +9750,37 @@ class NegotiationAgent(BaseAgent):
         if not email_body and negotiation_message:
             email_body = negotiation_message
 
+        for draft_record in draft_records:
+            if not isinstance(draft_record, dict):
+                continue
+            if not draft_record.get("html"):
+                draft_record["html"] = self._build_enhanced_html_email(
+                    round_number=round_no,
+                    contact_name=contact_name,
+                    supplier_name=supplier_name,
+                    decision=decision,
+                    negotiation_message=negotiation_message or "",
+                    currency=currency,
+                    playbook_context=playbook_context,
+                    sender_name=getattr(
+                        getattr(self.agent_nick, "settings", None),
+                        "sender_name",
+                        None,
+                    ),
+                )
+            self._capture_email_to_history(
+                workflow_id=workflow_id,
+                supplier_id=supplier,
+                round_number=round_no,
+                draft=draft_record,
+                decision=decision,
+                state=state,
+            )
+
+        email_thread_history = self._get_email_thread_history(workflow_id, supplier)
+        email_thread_summary = self._get_email_thread_summary(workflow_id, supplier)
+        state["email_history"] = email_thread_history
+
         final_thread_headers = draft_payload.get("thread_headers")
         if isinstance(final_thread_headers, dict):
             if thread_state:
@@ -8897,6 +10006,10 @@ class NegotiationAgent(BaseAgent):
             "normalised_inputs": normalised_inputs,
             "thread_state": thread_state.as_dict() if thread_state else None,
             "supplier_responses": supplier_responses,
+            "email_history": email_thread_history,
+            "email_thread_summary": email_thread_summary,
+            "current_email": draft_records[0] if draft_records else None,
+            "all_emails_sent": len(email_thread_history),
         }
 
         if email_subject:
