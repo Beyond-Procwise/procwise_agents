@@ -3998,7 +3998,7 @@ class NegotiationAgent(BaseAgent):
                     )
                     cur.execute(
                         """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_workflow_supplier_idx
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_negotiation_session_state_workflow_supplier
                             ON proc.negotiation_session_state (workflow_id, supplier_id)
                             WHERE workflow_id IS NOT NULL
                         """
@@ -4060,7 +4060,7 @@ class NegotiationAgent(BaseAgent):
                     )
                     cur.execute(
                         """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_sessions_workflow_supplier_round_idx
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_negotiation_sessions_workflow_supplier_round
                             ON proc.negotiation_sessions (workflow_id, supplier_id, round)
                             WHERE workflow_id IS NOT NULL
                         """
