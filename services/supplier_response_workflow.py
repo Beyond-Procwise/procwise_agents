@@ -325,7 +325,7 @@ class SupplierResponseWorkflow:
             unique_ids=unique_ids,
             timeout=dispatch_timeout,
             poll_interval=dispatch_poll_interval,
-            wait_for_all=False,
+            wait_for_all=True,
         )
 
         response_info = self.await_response_population(

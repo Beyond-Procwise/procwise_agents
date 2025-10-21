@@ -1194,6 +1194,80 @@ class NegotiationAgent(BaseAgent):
         any_success = any(record["status"] == AgentStatus.SUCCESS.value for record in aggregated_results)
         any_failure = any(record["status"] != AgentStatus.SUCCESS.value for record in aggregated_results)
 
+        round_groups: Dict[str, Dict[str, Any]] = {}
+        for record in aggregated_results:
+            output_payload = record.get("output") or {}
+            round_value_raw = (
+                output_payload.get("round")
+                or output_payload.get("round_number")
+                or output_payload.get("round_no")
+            )
+            numeric_round: Optional[int] = None
+            if round_value_raw is not None:
+                try:
+                    numeric_round = int(float(round_value_raw))
+                except Exception:
+                    numeric_round = None
+            group_key = (
+                str(numeric_round)
+                if numeric_round is not None
+                else str(round_value_raw)
+                if round_value_raw is not None
+                else "unknown"
+            )
+            if group_key not in round_groups:
+                round_groups[group_key] = {
+                    "round": numeric_round if numeric_round is not None else round_value_raw,
+                    "suppliers": [],
+                    "results": [],
+                    "drafts": [],
+                }
+            group_entry = round_groups[group_key]
+            supplier_ref = record.get("supplier_id") or output_payload.get("supplier")
+            if supplier_ref:
+                try:
+                    supplier_text = str(supplier_ref).strip()
+                except Exception:
+                    supplier_text = None
+                if supplier_text:
+                    group_entry["suppliers"].append(supplier_text)
+            group_entry["results"].append(record)
+            draft_entries = output_payload.get("drafts")
+            if isinstance(draft_entries, list):
+                group_entry["drafts"].extend(
+                    [draft for draft in draft_entries if isinstance(draft, dict)]
+                )
+
+        round_summaries: List[Dict[str, Any]] = []
+        for group_entry in round_groups.values():
+            seen_suppliers: Set[str] = set()
+            ordered_suppliers: List[str] = []
+            for supplier_ref in group_entry["suppliers"]:
+                if supplier_ref not in seen_suppliers:
+                    seen_suppliers.add(supplier_ref)
+                    ordered_suppliers.append(supplier_ref)
+            round_summaries.append(
+                {
+                    "round": group_entry["round"],
+                    "suppliers": ordered_suppliers,
+                    "results": list(group_entry["results"]),
+                    "drafts": list(group_entry["drafts"]),
+                }
+            )
+
+        if round_summaries:
+            round_summaries.sort(
+                key=lambda entry: (
+                    0,
+                    entry["round"],
+                )
+                if isinstance(entry.get("round"), int)
+                else (
+                    1,
+                    str(entry.get("round") or ""),
+                )
+            )
+
         overall_status = AgentStatus.SUCCESS
         error_text = None
         if any_failure and not any_success:
@@ -1215,6 +1289,8 @@ class NegotiationAgent(BaseAgent):
             "results_by_supplier": supplier_map,
             "batch_size": len(aggregated_results),
         }
+        if round_summaries:
+            data["round_summaries"] = round_summaries
 
         pass_fields = {
             "negotiation_batch": True,
@@ -1222,6 +1298,8 @@ class NegotiationAgent(BaseAgent):
         }
         if drafts:
             pass_fields["drafts"] = drafts
+        if round_summaries:
+            pass_fields["round_summaries"] = deepcopy(round_summaries)
 
         return self._with_plan(
             context,
@@ -1974,6 +2052,7 @@ class NegotiationAgent(BaseAgent):
             email_payload=email_payload,
             decision=decision,
             negotiation_message=negotiation_message,
+            supplier_message=supplier_message,
             supplier_snippets=supplier_snippets,
             supplier_name=supplier_name,
             contact_name=contact_name,
