@@ -1540,12 +1540,31 @@ class EmailDraftingAgent(BaseAgent):
             unique_id=unique_id,
         )
 
+        plain_text = self._clean_body_text(body)
+        html_candidate = self._render_html_from_text(plain_text)
+        sanitised_html = self._sanitise_generated_body(html_candidate)
+        if not sanitised_html:
+            sanitised_html = html_candidate
+
         sender_email = combined_data.get("sender") or self.agent_nick.settings.ses_default_sender
-        recipients = self._normalise_recipients(
+        to_recipients = self._normalise_recipients(
             combined_data.get("recipients") or combined_data.get("to")
         )
-        receiver = recipients[0] if recipients else None
-        contact_level = 1 if recipients else 0
+        cc_recipients = self._normalise_recipients(combined_data.get("cc"))
+        recipients = self._merge_recipients(to_recipients, cc_recipients)
+        receiver = to_recipients[0] if to_recipients else (recipients[0] if recipients else None)
+        contact_level = 1 if receiver else 0
+
+        session_reference = (
+            combined_data.get("session_reference")
+            or combined_data.get("unique_id")
+            or unique_id
+        )
+        rfq_id = combined_data.get("rfq_id") or combined_data.get("rfq")
+        closing_round = bool(
+            combined_data.get("closing_round")
+            or (isinstance(round_int, int) and round_int >= 3)
+        )
 
         metadata = {
             "unique_id": unique_id,
@@ -1565,6 +1584,18 @@ class EmailDraftingAgent(BaseAgent):
             "intent": "NEGOTIATION_COUNTER",
             "dispatch_token": marker_token,
             "workflow_id": workflow_hint,
+            "contact_name": contact_name,
+            "supplier_contact": contact_name,
+            "session_reference": session_reference,
+            "rfq_id": rfq_id,
+            "closing_round": closing_round,
+            "play_recommendations": combined_data.get("play_recommendations"),
+            "playbook_descriptor": combined_data.get("playbook_descriptor"),
+            "playbook_examples": combined_data.get("playbook_examples"),
+            "outlier_alerts": combined_data.get("outlier_alerts"),
+            "validation_issues": combined_data.get("validation_issues"),
+            "flags": combined_data.get("flags"),
+            "rationale": combined_data.get("rationale"),
         }
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
@@ -1576,6 +1607,7 @@ class EmailDraftingAgent(BaseAgent):
         headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
         if workflow_hint:
             headers["X-Procwise-Workflow-Id"] = workflow_hint
+        headers["Subject"] = subject
 
         message_id = None
         if resolved_thread_headers:
@@ -1598,21 +1630,42 @@ class EmailDraftingAgent(BaseAgent):
             elif isinstance(references, str) and references.strip():
                 headers["References"] = references.strip()
 
+        if not message_id:
+            message_id = f"<{uuid.uuid4()}@procwise.co.uk>"
+            headers.setdefault("Message-ID", message_id)
+
+        if subject:
+            resolved_thread_headers.setdefault("Subject", subject)
+        if message_id:
+            resolved_thread_headers.setdefault("Message-ID", message_id)
+        if workflow_hint:
+            resolved_thread_headers.setdefault("X-Procwise-Workflow-Id", workflow_hint)
+
         draft: Dict[str, Any] = {
             "supplier_id": supplier_id,
             "supplier_name": supplier_name,
+            "contact_name": contact_name,
+            "supplier_contact": contact_name,
             "unique_id": unique_id,
             "subject": subject,
             "body": body,
+            "text": plain_text,
+            "html": sanitised_html,
             "sent_status": False,
             "sender": sender_email,
             "recipients": recipients,
             "receiver": receiver,
+            "to": receiver,
+            "cc": cc_recipients,
             "contact_level": contact_level,
             "metadata": metadata,
             "headers": headers,
             "workflow_id": workflow_hint,
             "intent": "NEGOTIATION_COUNTER",
+            "session_reference": session_reference,
+            "rfq_id": rfq_id,
+            "thread_index": round_int,
+            "closing_round": closing_round,
         }
 
         if resolved_thread_headers:
@@ -1624,11 +1677,12 @@ class EmailDraftingAgent(BaseAgent):
         if action_id:
             draft["action_id"] = action_id
 
-        thread_index = combined_data.get("thread_index", 1)
-        try:
-            draft["thread_index"] = max(1, int(thread_index))
-        except Exception:
-            draft["thread_index"] = 1
+        thread_index = combined_data.get("thread_index")
+        if thread_index is not None:
+            try:
+                draft["thread_index"] = max(1, int(thread_index))
+            except Exception:
+                draft["thread_index"] = round_int or 1
 
         negotiation_extra = {
             "counter_price": combined_data.get("counter_price"),
@@ -1650,12 +1704,16 @@ class EmailDraftingAgent(BaseAgent):
             "drafts": [draft],
             "subject": subject,
             "body": body,
+            "text": plain_text,
+            "html": sanitised_html,
             "sender": sender_email,
             "intent": "NEGOTIATION_COUNTER",
+            "session_reference": session_reference,
+            "workflow_id": workflow_hint,
         }
 
-        if recipients:
-            output_data["recipients"] = recipients
+        output_data["recipients"] = recipients
+        output_data["cc"] = cc_recipients
         if action_id:
             output_data["action_id"] = action_id
         if message_id:
