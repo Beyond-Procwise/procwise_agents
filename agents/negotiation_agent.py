@@ -3302,7 +3302,21 @@ class NegotiationAgent(BaseAgent):
             pass_fields.update(supplier_watch_fields)
             await_response = bool(supplier_watch_fields.get("await_response"))
             awaiting_email_drafting = "EmailDraftingAgent" in next_agents
-            if await_response and not awaiting_email_drafting:
+            input_payload = (
+                context.input_data if isinstance(context.input_data, dict) else {}
+            )
+            should_wait = (
+                await_response
+                and not awaiting_email_drafting
+                and not bool(input_payload.get("_batch_execution"))
+            )
+            if should_wait:
+                self._log_response_wait_diagnostics(
+                    workflow_id=workflow_id,
+                    supplier_id=supplier,
+                    drafts=draft_records,
+                    watch_payload=supplier_watch_fields,
+                )
                 wait_results = self._await_supplier_responses(
                     context=context,
                     watch_payload=supplier_watch_fields,
@@ -6292,6 +6306,12 @@ class NegotiationAgent(BaseAgent):
         if not workflow_id:
             return None
 
+        supplier_id = self._coerce_text(supplier)
+        if not supplier_id:
+            logger.error("Cannot build watch fields without supplier_id")
+            return None
+        supplier = supplier_id
+
         candidate_drafts: List[Dict[str, Any]] = []
         observed_unique_ids: List[str] = []
         unique_id_set: Set[str] = set()
@@ -6350,44 +6370,32 @@ class NegotiationAgent(BaseAgent):
                         draft_copy.setdefault("unique_id", unique_value)
                     candidate_drafts.append(draft_copy)
 
-        filtered_drafts: List[Dict[str, Any]] = []
-        dropped_due_to_missing_supplier: List[Dict[str, Any]] = []
-
-        for entry in candidate_drafts:
-            if not isinstance(entry, dict):
-                continue
-
-            supplier_hint: Optional[Any] = entry.get("supplier_id") or entry.get("supplier")
-            if not supplier_hint and isinstance(entry.get("metadata"), dict):
-                meta = cast(Dict[str, Any], entry["metadata"])
-                supplier_hint = meta.get("supplier_id") or meta.get("supplier")
-
-            supplier_text = self._coerce_text(supplier_hint)
-            if supplier_text:
-                filtered_drafts.append(entry)
-                continue
-
-            dropped_due_to_missing_supplier.append(entry)
-
-        if filtered_drafts:
-            candidate_drafts = filtered_drafts
-        elif dropped_due_to_missing_supplier:
-            logger.info(
-                "Ignoring %s draft(s) without supplier identifiers while preparing watch list",
-                len(dropped_due_to_missing_supplier),
-            )
-            candidate_drafts = []
+        candidate_drafts = self._ensure_supplier_id_in_drafts(candidate_drafts, supplier_id)
 
         if not candidate_drafts:
-            fallback_entry = {"workflow_id": workflow_id}
+            logger.warning(
+                "No valid drafts after supplier_id correction for workflow=%s, supplier=%s",
+                workflow_id,
+                supplier_id,
+            )
+            fallback_unique = session_reference or str(uuid.uuid4())
+            fallback_entry = {
+                "workflow_id": workflow_id,
+                "supplier_id": supplier_id,
+                "supplier": supplier_id,
+                "unique_id": fallback_unique,
+                "metadata": {
+                    "supplier_id": supplier_id,
+                    "supplier": supplier_id,
+                    "workflow_id": workflow_id,
+                },
+            }
             if rfq_id:
                 fallback_entry["rfq_id"] = rfq_id
-            if supplier:
-                fallback_entry["supplier_id"] = supplier
+                fallback_entry["metadata"]["rfq_id"] = rfq_id
             if session_reference:
                 fallback_entry["session_reference"] = session_reference
-                fallback_entry.setdefault("unique_id", session_reference)
-            candidate_drafts.append(fallback_entry)
+            candidate_drafts = [fallback_entry]
 
         poll_interval = getattr(self.agent_nick.settings, "email_response_poll_seconds", 60)
 
@@ -6496,6 +6504,43 @@ class NegotiationAgent(BaseAgent):
             watch_payload.setdefault("sender", sender)
 
         return watch_payload
+
+    def _log_response_wait_diagnostics(
+        self,
+        *,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        drafts: List[Dict[str, Any]],
+        watch_payload: Dict[str, Any],
+    ) -> None:
+        """Log detailed diagnostics for response waiting."""
+
+        logger.info("=" * 80)
+        logger.info("RESPONSE WAIT DIAGNOSTICS")
+        logger.info("Workflow ID: %s", workflow_id)
+        logger.info("Supplier ID: %s", supplier_id)
+        logger.info("Number of drafts: %d", len(drafts))
+        logger.info("Expected responses: %d", watch_payload.get("expected_email_count", 0))
+        logger.info("Unique IDs being tracked: %s", watch_payload.get("unique_ids", []))
+        logger.info("Await response flag: %s", watch_payload.get("await_response"))
+        logger.info(
+            "Await all responses flag: %s", watch_payload.get("await_all_responses")
+        )
+
+        for idx, draft in enumerate(drafts[:3]):
+            logger.info("Draft %d:", idx)
+            logger.info("  - unique_id: %s", draft.get("unique_id"))
+            logger.info("  - supplier_id: %s", draft.get("supplier_id"))
+            logger.info("  - workflow_id: %s", draft.get("workflow_id"))
+            metadata = (
+                draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+            )
+            if isinstance(metadata, dict):
+                logger.info(
+                    "  - metadata.supplier_id: %s",
+                    metadata.get("supplier_id"),
+                )
+        logger.info("=" * 80)
 
     def _await_supplier_responses(
         self,
@@ -6804,60 +6849,162 @@ class NegotiationAgent(BaseAgent):
     def _store_session(
         self, session_id: str, supplier: str, round_no: int, counter_price: Optional[float]
     ) -> None:
-        """Persist negotiation round details."""
+        """Persist negotiation round details with proper constraint handling."""
         identifier = self._coerce_text(session_id)
         supplier_id = self._coerce_text(supplier)
         if not identifier or not supplier_id:
+            logger.warning(
+                "Cannot store session without identifier=%s and supplier=%s", identifier, supplier_id
+            )
             return
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    column = self._get_identifier_column("negotiation_sessions")
-                    unique_columns = self._get_unique_constraint(
-                        "negotiation_sessions",
-                        preferred=(column, "supplier_id", "round"),
-                        fallbacks=((column, "supplier_id"), ("rfq_id", "supplier_id", "round")),
+                    cur.execute(
+                        """
+                            SELECT constraint_name, constraint_type
+                            FROM information_schema.table_constraints
+                            WHERE table_schema = 'proc'
+                              AND table_name = 'negotiation_sessions'
+                              AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                        """
+                    )
+                    constraints = cur.fetchall()
+
+                    constraint_columns: Dict[str, Tuple[str, ...]] = {}
+                    for constraint_name, _ in constraints:
+                        cur.execute(
+                            """
+                                SELECT column_name
+                                FROM information_schema.key_column_usage
+                                WHERE table_schema = 'proc'
+                                  AND table_name = 'negotiation_sessions'
+                                  AND constraint_name = %s
+                                ORDER BY ordinal_position
+                            """,
+                            (constraint_name,),
+                        )
+                        cols = tuple(row[0] for row in cur.fetchall())
+                        if cols:
+                            constraint_columns[constraint_name] = cols
+
+                    cur.execute(
+                        """
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = 'proc'
+                              AND table_name = 'negotiation_sessions'
+                              AND column_name IN ('workflow_id', 'rfq_id', 'unique_id', 'session_id')
+                        """
+                    )
+                    available_id_columns = [row[0] for row in cur.fetchall()]
+
+                    if not available_id_columns:
+                        logger.error("No identifier column found in negotiation_sessions table")
+                        return
+
+                    id_column = next(
+                        (
+                            col
+                            for col in [
+                                "workflow_id",
+                                "rfq_id",
+                                "unique_id",
+                                "session_id",
+                            ]
+                            if col in available_id_columns
+                        ),
+                        available_id_columns[0],
                     )
 
                     record: Dict[str, Any] = {
-                        column: identifier,
+                        id_column: identifier,
                         "supplier_id": supplier_id,
                         "round": int(round_no or 1),
                         "counter_offer": counter_price,
                         "created_on": datetime.now(timezone.utc),
                     }
 
-                    if "workflow_id" in unique_columns and "workflow_id" not in record:
-                        record["workflow_id"] = identifier
+                    conflict_columns: Optional[Tuple[str, ...]] = None
+                    for cols in constraint_columns.values():
+                        if all(col in record for col in cols):
+                            conflict_columns = cols
+                            break
 
-                    columns = list(record.keys())
-                    values = [record[col] for col in columns]
-                    conflict_clause = ", ".join(unique_columns)
-                    unique_set = set(unique_columns)
-                    update_targets = [
-                        col for col in columns if col not in unique_set and col != "created_on"
-                    ]
-
-                    insert_sql = (
-                        f"INSERT INTO proc.negotiation_sessions ({', '.join(columns)}) "
-                        f"VALUES ({', '.join(['%s'] * len(columns))})"
-                    )
-                    if update_targets:
-                        update_sql = ", ".join(
-                            f"{col} = EXCLUDED.{col}" for col in update_targets
+                    if not conflict_columns:
+                        logger.warning(
+                            "No matching unique constraint for negotiation_sessions; using INSERT with duplicate check"
                         )
-                        insert_sql = (
-                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_sql}"
+                        cur.execute(
+                            f"""
+                                SELECT 1 FROM proc.negotiation_sessions
+                                WHERE {id_column} = %s AND supplier_id = %s AND round = %s
+                            """,
+                            (identifier, supplier_id, int(round_no or 1)),
                         )
+                        if cur.fetchone():
+                            cur.execute(
+                                f"""
+                                    UPDATE proc.negotiation_sessions
+                                    SET counter_offer = %s
+                                    WHERE {id_column} = %s AND supplier_id = %s AND round = %s
+                                """,
+                                (counter_price, identifier, supplier_id, int(round_no or 1)),
+                            )
+                        else:
+                            columns = list(record.keys())
+                            values = [record[col] for col in columns]
+                            cur.execute(
+                                f"""
+                                    INSERT INTO proc.negotiation_sessions ({', '.join(columns)})
+                                    VALUES ({', '.join(['%s'] * len(columns))})
+                                """,
+                                tuple(values),
+                            )
                     else:
-                        insert_sql = (
-                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO NOTHING"
-                        )
+                        columns = list(record.keys())
+                        values = [record[col] for col in columns]
+                        conflict_clause = ", ".join(conflict_columns)
+                        update_cols = [
+                            col
+                            for col in columns
+                            if col not in conflict_columns and col != "created_on"
+                        ]
 
-                    cur.execute(insert_sql, tuple(values))
+                        if update_cols:
+                            update_clause = ", ".join(
+                                f"{col} = EXCLUDED.{col}" for col in update_cols
+                            )
+                            sql = f"""
+                                INSERT INTO proc.negotiation_sessions ({', '.join(columns)})
+                                VALUES ({', '.join(['%s'] * len(columns))})
+                                ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause}
+                            """
+                        else:
+                            sql = f"""
+                                INSERT INTO proc.negotiation_sessions ({', '.join(columns)})
+                                VALUES ({', '.join(['%s'] * len(columns))})
+                                ON CONFLICT ({conflict_clause}) DO NOTHING
+                            """
+
+                        cur.execute(sql, tuple(values))
+
                 conn.commit()
-        except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to store negotiation session")
+                logger.info(
+                    "Successfully stored negotiation session: %s, supplier=%s, round=%s",
+                    identifier,
+                    supplier_id,
+                    round_no,
+                )
+        except Exception as e:  # pragma: no cover - best effort
+            logger.exception(
+                "Failed to store negotiation session (id=%s, supplier=%s, round=%s): %s",
+                identifier,
+                supplier_id,
+                round_no,
+                str(e),
+            )
 
     def _record_learning_snapshot(
         self,
@@ -6950,6 +7097,48 @@ class NegotiationAgent(BaseAgent):
             elif isinstance(value, str) and value.strip():
                 snippets.append(value.strip())
         return snippets[:5]
+
+    def _ensure_supplier_id_in_drafts(
+        self,
+        drafts: List[Dict[str, Any]],
+        fallback_supplier_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Ensure all drafts have supplier_id populated."""
+
+        corrected_drafts: List[Dict[str, Any]] = []
+
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+
+            draft_copy = dict(draft)
+
+            supplier_id = draft_copy.get("supplier_id") or draft_copy.get("supplier")
+
+            metadata = draft_copy.get("metadata")
+            if not supplier_id and isinstance(metadata, dict):
+                supplier_id = metadata.get("supplier_id") or metadata.get("supplier")
+
+            if not supplier_id:
+                supplier_id = fallback_supplier_id
+
+            if not supplier_id:
+                logger.warning("Draft missing supplier_id even after fallback: %s", draft_copy)
+                continue
+
+            draft_copy["supplier_id"] = supplier_id
+            draft_copy.setdefault("supplier", supplier_id)
+
+            if "metadata" not in draft_copy or not isinstance(draft_copy["metadata"], dict):
+                draft_copy["metadata"] = {}
+
+            draft_metadata = cast(Dict[str, Any], draft_copy["metadata"])
+            draft_metadata["supplier_id"] = supplier_id
+            draft_metadata.setdefault("supplier", supplier_id)
+
+            corrected_drafts.append(draft_copy)
+
+        return corrected_drafts
 
     def _resolve_contact_name(
         self, payload: Optional[Dict[str, Any]], *, fallback: Optional[str] = None
@@ -8281,7 +8470,23 @@ class NegotiationAgent(BaseAgent):
         if supplier_watch_fields:
             await_response = bool(supplier_watch_fields.get("await_response"))
             awaiting_email_drafting = "EmailDraftingAgent" in next_agents
-            if await_response and not awaiting_email_drafting:
+            input_payload = (
+                parent_context.input_data
+                if isinstance(parent_context.input_data, dict)
+                else {}
+            )
+            should_wait = (
+                await_response
+                and not awaiting_email_drafting
+                and not bool(input_payload.get("_batch_execution"))
+            )
+            if should_wait:
+                self._log_response_wait_diagnostics(
+                    workflow_id=workflow_id,
+                    supplier_id=supplier,
+                    drafts=draft_records,
+                    watch_payload=supplier_watch_fields,
+                )
                 wait_results = self._await_supplier_responses(
                     context=parent_context,
                     watch_payload=supplier_watch_fields,
