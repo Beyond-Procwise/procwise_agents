@@ -72,6 +72,139 @@ TRADE_OFF_HINTS = {
 }
 
 
+class NegotiationEmailHTMLBuilder:
+    """Render negotiation drafts into a modern email-safe HTML shell."""
+
+    BRAND_LABEL = "Beyond Procwise"
+    MAX_PREHEADER = 160
+    PARAGRAPH_STYLE = (
+        "margin:0 0 16px 0;" "font-size:15px;" "line-height:1.6;" "color:#1f2937;"
+    )
+    LIST_STYLE = "margin:0 0 16px 24px;padding:0;"
+    LIST_ITEM_STYLE = (
+        "margin:0 0 8px 0;" "padding:0;" "font-size:15px;" "line-height:1.6;" "color:#1f2937;"
+    )
+
+    def __init__(self, *, brand_label: Optional[str] = None) -> None:
+        self.brand_label = (brand_label or self.BRAND_LABEL).strip() or self.BRAND_LABEL
+
+    @staticmethod
+    def _parse_blocks(text: str) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
+        bullets: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if bullets:
+                    blocks.append({"type": "list", "items": list(bullets)})
+                    bullets.clear()
+                continue
+            bullet_match = re.match(r"^[-*•]\s+(.*)$", stripped)
+            if bullet_match:
+                bullets.append(bullet_match.group(1).strip())
+                continue
+            if bullets:
+                blocks.append({"type": "list", "items": list(bullets)})
+                bullets.clear()
+            blocks.append({"type": "paragraph", "text": stripped})
+        if bullets:
+            blocks.append({"type": "list", "items": list(bullets)})
+        return blocks
+
+    @classmethod
+    def _render_blocks(cls, blocks: List[Dict[str, Any]]) -> str:
+        html_parts: List[str] = []
+        for block in blocks:
+            block_type = block.get("type")
+            if block_type == "list":
+                items = block.get("items") or []
+                if not isinstance(items, Sequence):
+                    continue
+                rendered_items = "".join(
+                    f'<li style="{cls.LIST_ITEM_STYLE}">{escape(str(item))}</li>'
+                    for item in items
+                )
+                if rendered_items:
+                    html_parts.append(f'<ul style="{cls.LIST_STYLE}">{rendered_items}</ul>')
+            elif block_type == "paragraph":
+                text = block.get("text")
+                if not isinstance(text, str):
+                    continue
+                html_parts.append(f'<p style="{cls.PARAGRAPH_STYLE}">{escape(text)}</p>')
+        return "".join(html_parts)
+
+    @staticmethod
+    def _build_preheader(text: str) -> str:
+        if not text:
+            return ""
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if not collapsed:
+            return ""
+        if len(collapsed) <= NegotiationEmailHTMLBuilder.MAX_PREHEADER:
+            return collapsed
+        truncated = collapsed[: NegotiationEmailHTMLBuilder.MAX_PREHEADER - 1].rstrip()
+        return f"{truncated}…"
+
+    def build(self, *, subject: Optional[str], body_text: str, preheader: Optional[str] = None) -> str:
+        if not isinstance(body_text, str):
+            return ""
+        trimmed_body = body_text.strip()
+        if not trimmed_body:
+            return ""
+
+        safe_subject = escape((subject or "Negotiation Update").strip() or "Negotiation Update")
+        blocks = self._parse_blocks(trimmed_body)
+        body_html = self._render_blocks(blocks)
+        if not body_html:
+            return ""
+
+        preheader_source = preheader if isinstance(preheader, str) else trimmed_body
+        preheader_text = escape(self._build_preheader(preheader_source))
+        brand_html = escape(self.brand_label)
+
+        return (
+            "<!DOCTYPE html>\n"
+            "<html lang=\"en\">\n"
+            "<head>\n"
+            "  <meta charset=\"utf-8\"/>\n"
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"/>\n"
+            f"  <title>{safe_subject}</title>\n"
+            "</head>\n"
+            '<body style="margin:0;padding:0;background-color:#f5f6fa;">\n'
+            f"  <div style=\"display:none;font-size:1px;color:#f5f6fa;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;\">{preheader_text}</div>\n"
+            '  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f5f6fa;">\n'
+            "    <tr>\n"
+            '      <td align="center" style="padding:24px 16px;">\n'
+            '        <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:640px;background-color:#ffffff;border-radius:14px;border:1px solid #e2e8f0;overflow:hidden;">\n'
+            "          <tr>\n"
+            '            <td style="padding:24px 32px;background-color:#0f172a;color:#f8fafc;font-family:\'Segoe UI\',Arial,sans-serif;font-size:16px;font-weight:600;letter-spacing:0.02em;">\n'
+            f"              {brand_html}\n"
+            "            </td>\n"
+            "          </tr>\n"
+            "          <tr>\n"
+            '            <td style="padding:24px 32px 8px 32px;font-family:\'Segoe UI\',Arial,sans-serif;font-size:22px;font-weight:600;color:#0f172a;">\n'
+            f"              {safe_subject}\n"
+            "            </td>\n"
+            "          </tr>\n"
+            "          <tr>\n"
+            '            <td style="padding:0 32px 32px 32px;font-family:\'Segoe UI\',Arial,sans-serif;">\n'
+            f"              {body_html}\n"
+            "            </td>\n"
+            "          </tr>\n"
+            "          <tr>\n"
+            '            <td style="padding:20px 32px 28px 32px;background-color:#f8fafc;font-family:\'Segoe UI\',Arial,sans-serif;font-size:12px;line-height:1.6;color:#64748b;border-top:1px solid #e2e8f0;">\n'
+            "              <p style=\"margin:0 0 6px 0;font-weight:600;color:#0f172a;\">Human review required</p>\n"
+            "              <p style=\"margin:0;\">This negotiation draft was prepared by Beyond Procwise’s agentic framework and must be validated by a procurement lead before sending to the supplier.</p>\n"
+            "            </td>\n"
+            "          </tr>\n"
+            "        </table>\n"
+            "      </td>\n"
+            "    </tr>\n"
+            "  </table>\n"
+            "</body>\n"
+            "</html>"
+        )
+
 @dataclass
 class NegotiationContext:
     current_offer: float
@@ -8052,6 +8185,42 @@ class NegotiationAgent(BaseAgent):
             merged.append(candidate)
         return merged
 
+    def _build_enhanced_html_email(
+        self,
+        *,
+        subject: Optional[str],
+        cleaned_body: str,
+        email_agent: Optional[EmailDraftingAgent],
+    ) -> Tuple[str, str]:
+        if not cleaned_body:
+            return "", ""
+
+        builder = NegotiationEmailHTMLBuilder()
+        html_candidate = builder.build(subject=subject, body_text=cleaned_body)
+        if not html_candidate:
+            html_candidate = self._simple_html_from_text(cleaned_body)
+
+        sanitised_html = html_candidate or ""
+        if email_agent and sanitised_html:
+            try:
+                sanitised_html = email_agent._sanitise_generated_body(sanitised_html) or sanitised_html
+            except Exception:
+                logger.debug("Failed to sanitise enhanced negotiation HTML", exc_info=True)
+
+        if not sanitised_html:
+            return "", cleaned_body
+
+        plain_text = cleaned_body
+        if email_agent:
+            try:
+                extracted = email_agent._html_to_plain_text(sanitised_html)
+                if extracted:
+                    plain_text = extracted
+            except Exception:
+                logger.debug("Failed to derive plain text from negotiation HTML", exc_info=True)
+
+        return sanitised_html, plain_text
+
     def _build_email_draft_stub(
         self,
         *,
@@ -8080,22 +8249,19 @@ class NegotiationAgent(BaseAgent):
         email_agent = self._ensure_email_agent()
         sanitised_html = ""
         plain_text = cleaned_body
-        if email_agent and cleaned_body:
+        if cleaned_body:
             try:
-                html_candidate = email_agent._render_html_from_text(cleaned_body)
-                sanitised_html = email_agent._sanitise_generated_body(html_candidate)
-                if not sanitised_html:
-                    sanitised_html = email_agent._render_html_from_text(cleaned_body)
+                sanitised_html, derived_plain = self._build_enhanced_html_email(
+                    subject=subject,
+                    cleaned_body=cleaned_body,
+                    email_agent=email_agent,
+                )
                 if sanitised_html:
-                    extracted = email_agent._html_to_plain_text(sanitised_html)
-                    if extracted:
-                        plain_text = EmailDraftingAgent._clean_body_text(extracted)
+                    plain_text = EmailDraftingAgent._clean_body_text(derived_plain or cleaned_body)
             except Exception:
-                logger.debug("Failed to render negotiation draft HTML", exc_info=True)
+                logger.debug("Failed to build enhanced negotiation HTML", exc_info=True)
                 sanitised_html = ""
-        if not sanitised_html and cleaned_body:
-            sanitised_html = self._simple_html_from_text(cleaned_body)
-            plain_text = cleaned_body
+                plain_text = cleaned_body
 
         if plain_text:
             plain_text = EmailDraftingAgent._clean_body_text(plain_text)
