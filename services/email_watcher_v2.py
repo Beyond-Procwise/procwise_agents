@@ -692,6 +692,12 @@ class EmailWatcherV2:
         return result
 
     def _process_agents(self, tracker: WorkflowTracker) -> None:
+        if not tracker.all_dispatched or not tracker.all_responded:
+            logger.debug(
+                "Skipping agent processing for workflow %s until all dispatches and responses are ready",
+                tracker.workflow_id,
+            )
+            return
         pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
         if not pending_rows:
             return
