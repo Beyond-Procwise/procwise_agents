@@ -662,6 +662,7 @@ class NegotiationAgent(BaseAgent):
         self._email_agent: Optional[EmailDraftingAgent] = None
         self._supplier_agent: Optional["SupplierInteractionAgent"] = None
         self._state_schema_checked = False
+        self._sessions_schema_checked = False
         self._playbook_cache: Optional[Dict[str, Any]] = None
         self._state_lock = threading.RLock()
         self._email_agent_lock = threading.Lock()
@@ -3943,6 +3944,28 @@ class NegotiationAgent(BaseAgent):
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.negotiation_session_state (
+                            workflow_id VARCHAR(255),
+                            supplier_id VARCHAR(255) NOT NULL,
+                            supplier_reply_count INTEGER DEFAULT 0,
+                            current_round INTEGER DEFAULT 1,
+                            status VARCHAR(64),
+                            awaiting_response BOOLEAN DEFAULT FALSE,
+                            last_supplier_msg_id TEXT,
+                            last_agent_msg_id TEXT,
+                            last_email_sent_at TIMESTAMPTZ,
+                            base_subject TEXT,
+                            initial_body TEXT,
+                            thread_state JSONB,
+                            session_reference VARCHAR(255),
+                            unique_id VARCHAR(255),
+                            rfq_id TEXT,
+                            updated_on TIMESTAMPTZ DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS base_subject TEXT"
                     )
                     cur.execute(
@@ -3955,7 +3978,37 @@ class NegotiationAgent(BaseAgent):
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS workflow_id VARCHAR(255)"
                     )
                     cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS unique_id VARCHAR(255)"
+                    )
+                    cur.execute(
                         "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS session_reference VARCHAR(255)"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ADD COLUMN IF NOT EXISTS rfq_id TEXT"
+                    )
+                    # Deprecate rfq_id requirements in favour of workflow/unique identifiers
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state DROP CONSTRAINT IF EXISTS negotiation_session_state_pk"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state DROP CONSTRAINT IF EXISTS negotiation_session_state_pkey"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_session_state ALTER COLUMN rfq_id DROP NOT NULL"
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_workflow_supplier_idx
+                            ON proc.negotiation_session_state (workflow_id, supplier_id)
+                            WHERE workflow_id IS NOT NULL
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_unique_supplier_idx
+                            ON proc.negotiation_session_state (unique_id, supplier_id)
+                            WHERE unique_id IS NOT NULL
+                        """
                     )
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
@@ -3963,6 +4016,69 @@ class NegotiationAgent(BaseAgent):
         finally:
             setattr(self, "_proc_negotiation_session_state_column_metadata", None)
             self._state_schema_checked = True
+
+    def _ensure_sessions_schema(self) -> None:
+        if getattr(self, "_sessions_schema_checked", False):
+            return
+        get_conn = getattr(self.agent_nick, "get_db_connection", None)
+        if not callable(get_conn):
+            self._sessions_schema_checked = True
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.negotiation_sessions (
+                            workflow_id VARCHAR(255),
+                            unique_id VARCHAR(255),
+                            supplier_id VARCHAR(255) NOT NULL,
+                            round INTEGER NOT NULL DEFAULT 1,
+                            counter_offer NUMERIC,
+                            created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            rfq_id TEXT
+                        )
+                        """
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions ADD COLUMN IF NOT EXISTS workflow_id VARCHAR(255)"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions ADD COLUMN IF NOT EXISTS unique_id VARCHAR(255)"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions ADD COLUMN IF NOT EXISTS rfq_id TEXT"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions DROP CONSTRAINT IF EXISTS negotiation_sessions_pk"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions DROP CONSTRAINT IF EXISTS negotiation_sessions_pkey"
+                    )
+                    cur.execute(
+                        "ALTER TABLE proc.negotiation_sessions ALTER COLUMN rfq_id DROP NOT NULL"
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_sessions_workflow_supplier_round_idx
+                            ON proc.negotiation_sessions (workflow_id, supplier_id, round)
+                            WHERE workflow_id IS NOT NULL
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_sessions_unique_supplier_round_idx
+                            ON proc.negotiation_sessions (unique_id, supplier_id, round)
+                            WHERE unique_id IS NOT NULL
+                        """
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("failed to ensure negotiation sessions schema", exc_info=True)
+        finally:
+            setattr(self, "_proc_negotiation_sessions_column_metadata", None)
+            self._negotiation_sessions_identifier_column = None
+            self._sessions_schema_checked = True
 
     def _get_identifier_column(
         self,
