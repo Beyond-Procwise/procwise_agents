@@ -3585,6 +3585,31 @@ class EmailDraftingAgent(BaseAgent):
 
     def _store_draft(self, draft: dict) -> None:
         """Persist email draft to ``proc.draft_rfq_emails``."""
+        if not isinstance(draft, dict):
+            return
+
+        metadata_source = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+        supplier_candidates = (
+            draft.get("supplier_id"),
+            metadata_source.get("supplier_id"),
+            draft.get("supplier"),
+            metadata_source.get("supplier"),
+        )
+        supplier_id: Optional[str] = None
+        for candidate in supplier_candidates:
+            text = self._coerce_text(candidate)
+            if text:
+                supplier_id = text
+                break
+
+        if not supplier_id:
+            raise ValueError("EmailDraftingAgent requires supplier_id before storing draft")
+
+        metadata = dict(metadata_source)
+        metadata["supplier_id"] = supplier_id
+        draft["supplier_id"] = supplier_id
+        draft["metadata"] = metadata
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 self._ensure_table_exists(conn)
