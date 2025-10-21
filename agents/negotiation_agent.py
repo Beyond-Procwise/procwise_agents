@@ -73,7 +73,7 @@ TRADE_OFF_HINTS = {
 }
 
 
-class NegotiationEmailHTMLBuilder:
+class NegotiationEmailHTMLShellBuilder:
     """Render negotiation drafts into a modern email-safe HTML shell."""
 
     BRAND_LABEL = "Beyond Procwise"
@@ -141,9 +141,9 @@ class NegotiationEmailHTMLBuilder:
         collapsed = re.sub(r"\s+", " ", text).strip()
         if not collapsed:
             return ""
-        if len(collapsed) <= NegotiationEmailHTMLBuilder.MAX_PREHEADER:
+        if len(collapsed) <= NegotiationEmailHTMLShellBuilder.MAX_PREHEADER:
             return collapsed
-        truncated = collapsed[: NegotiationEmailHTMLBuilder.MAX_PREHEADER - 1].rstrip()
+        truncated = collapsed[: NegotiationEmailHTMLShellBuilder.MAX_PREHEADER - 1].rstrip()
         return f"{truncated}…"
 
     def build(self, *, subject: Optional[str], body_text: str, preheader: Optional[str] = None) -> str:
@@ -205,6 +205,7 @@ class NegotiationEmailHTMLBuilder:
             "</body>\n"
             "</html>"
         )
+
 
 @dataclass
 class NegotiationContext:
@@ -9087,7 +9088,7 @@ class NegotiationAgent(BaseAgent):
             merged.append(candidate)
         return merged
 
-    def _build_enhanced_html_email(
+    def _build_negotiation_html_shell(
         self,
         *,
         subject: Optional[str],
@@ -9097,10 +9098,37 @@ class NegotiationAgent(BaseAgent):
         if not cleaned_body:
             return "", ""
 
-        builder = NegotiationEmailHTMLBuilder()
-        html_candidate = builder.build(subject=subject, body_text=cleaned_body)
+        safe_subject = escape((subject or "Negotiation Update").strip() or "Negotiation Update")
+
+        html_candidate = ""
+        builder_cls = NegotiationEmailHTMLShellBuilder
+        if builder_cls and hasattr(builder_cls, "build"):
+            try:
+                builder = builder_cls()
+                html_candidate = builder.build(subject=subject, body_text=cleaned_body)
+            except Exception:
+                logger.debug(
+                    "Failed to render negotiation HTML shell with shell builder",
+                    exc_info=True,
+                )
+
         if not html_candidate:
-            html_candidate = self._simple_html_from_text(cleaned_body)
+            body_markup = self._simple_html_from_text(cleaned_body)
+            if not body_markup and cleaned_body:
+                body_markup = f"<p>{escape(cleaned_body)}</p>"
+            html_candidate = (
+                "<!DOCTYPE html>\n"
+                "<html lang=\"en\">\n"
+                "<head>\n"
+                "  <meta charset=\"utf-8\"/>\n"
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"/>\n"
+                f"  <title>{safe_subject}</title>\n"
+                "</head>\n"
+                "<body>\n"
+                f"{body_markup}\n"
+                "</body>\n"
+                "</html>\n"
+            )
 
         sanitised_html = html_candidate or ""
         if email_agent and sanitised_html:
@@ -9167,7 +9195,7 @@ class NegotiationAgent(BaseAgent):
         plain_text = cleaned_body
         if cleaned_body:
             try:
-                sanitised_html, derived_plain = self._build_enhanced_html_email(
+                sanitised_html, derived_plain = self._build_negotiation_html_shell(
                     subject=subject,
                     cleaned_body=cleaned_body,
                     email_agent=email_agent,
