@@ -4038,12 +4038,10 @@ class NegotiationAgent(BaseAgent):
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
 
         supplier_name = context.input_data.get("supplier_name")
+        supplier_name = supplier_name or supplier
         decision["supplier_id"] = supplier
-        if supplier_name:
-            decision.setdefault("supplier_name", supplier_name)
-        else:
-            decision.setdefault("supplier_name", supplier)
-        decision.setdefault("supplier", decision.get("supplier_name"))
+        decision.setdefault("supplier_name", supplier_name)
+        decision.setdefault("supplier", supplier_name)
         decision.setdefault("workflow_id", identifier.workflow_id)
         decision.setdefault("workflow_ref", identifier.workflow_id)
         decision.setdefault("session_reference", session_reference)
@@ -4053,7 +4051,7 @@ class NegotiationAgent(BaseAgent):
 
         contact_name = self._resolve_contact_name(
             context.input_data if isinstance(context.input_data, dict) else {},
-            fallback=supplier_name or supplier,
+            fallback=supplier_name,
         )
         supplier_identifier = context.input_data.get("supplier_id") or supplier
         procurement_summary = self._retrieve_procurement_summary(
@@ -4109,6 +4107,7 @@ class NegotiationAgent(BaseAgent):
             "unique_id": session_reference,
             "supplier_id": supplier,
             "workflow_id": identifier.workflow_id,
+            "supplier_name": supplier_name,
             "rfq_id": rfq_value,
             "current_offer": price_raw,
             "current_offer_numeric": price,
@@ -4780,7 +4779,6 @@ class NegotiationAgent(BaseAgent):
                 merge_payload.setdefault("session_reference", session_reference)
             if supplier is not None:
                 merge_payload.setdefault("supplier_id", supplier)
-            supplier_name = context.input_data.get("supplier_name")
             if supplier_name:
                 merge_payload.setdefault("supplier_name", supplier_name)
             merge_payload.setdefault("round", round_no)
