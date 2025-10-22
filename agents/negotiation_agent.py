@@ -3243,6 +3243,10 @@ class NegotiationAgent(BaseAgent):
             round_number=round_num,
             drafts=drafts,
             draft_bundles=draft_bundles,
+            aggregated_results=aggregated_results,
+            failed_records=failed_records,
+            success_ids=success_ids,
+            next_agents=next_agents,
         )
 
         round_result = {
