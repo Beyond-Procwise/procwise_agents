@@ -38,11 +38,14 @@ _stub_orchestration_pkg.__path__ = []  # type: ignore[attr-defined]
 sys.modules.setdefault("orchestration", _stub_orchestration_pkg)
 sys.modules.setdefault("orchestration.prompt_engine", _stub_prompt_module)
 
+import agents.negotiation_agent as negotiation_module
+
 from agents.negotiation_agent import (
     EmailHistoryEntry,
     NegotiationAgent,
     NegotiationEmailHTMLShellBuilder,
     NegotiationIdentifier,
+    NegotiationPositions,
 )
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
@@ -196,6 +199,166 @@ def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
     assert "alex@example.com" in stub["text"]
     assert "Initial Terms from Alex" in stub["html"]
     assert "data-procwise-thread-history" in stub["html"]
+
+
+def test_negotiation_agent_greets_supplier_with_supplier_field(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+    agent.response_matcher = None
+
+    workflow_id = "WF-greet"
+    supplier_token = "Acme Supplies"
+
+    context = AgentContext(
+        workflow_id=workflow_id,
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={
+            "supplier": supplier_token,
+            "current_offer": 1000.0,
+            "target_price": 900.0,
+            "currency": "USD",
+            "round": 1,
+            "supplier_message": "Here is our latest offer.",
+        },
+    )
+
+    identifier = NegotiationIdentifier(
+        workflow_id=workflow_id,
+        session_reference=workflow_id,
+        supplier_id=supplier_token,
+        round_number=1,
+    )
+
+    monkeypatch.setattr(
+        negotiation_module,
+        "decide_strategy",
+        lambda *_, **__: {
+            "strategy": "counter",
+            "counter_price": 880.0,
+            "asks": [],
+            "lead_time_request": None,
+            "rationale": "Base rationale",
+        },
+    )
+    monkeypatch.setattr(agent, "_adaptive_strategy", lambda base_decision, **_: base_decision)
+    monkeypatch.setattr(
+        agent,
+        "_normalise_negotiation_inputs",
+        lambda payload: (
+            {
+                "current_offer": 1000.0,
+                "target_price": 900.0,
+                "walkaway_price": 850.0,
+                "currency": "USD",
+                "lead_time_weeks": 0,
+                "volume_units": None,
+                "term_days": None,
+                "valid_until": None,
+                "market_floor_price": None,
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(agent, "_collect_supplier_snippets", lambda *_: [])
+    monkeypatch.setattr(
+        agent,
+        "_load_session_state",
+        lambda *_: (
+            {"current_round": 1, "supplier_reply_count": 0, "positions": {}},
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_load_thread_state",
+        lambda *_, **__: SimpleNamespace(
+            to_headers=lambda round_no: {},
+            update_after_receive=lambda *_: None,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_build_positions",
+        lambda **_: NegotiationPositions(
+            start=1000.0,
+            desired=900.0,
+            no_deal=850.0,
+            supplier_offer=1000.0,
+            history=[],
+        ),
+    )
+    monkeypatch.setattr(agent, "_extract_negotiation_signals", lambda **_: {})
+    monkeypatch.setattr(agent, "_estimate_zopa", lambda **_: {})
+    monkeypatch.setattr(agent, "_detect_outliers", lambda **_: {})
+    monkeypatch.setattr(agent, "_compose_rationale", lambda **_: "Structured rationale.")
+    monkeypatch.setattr(agent, "_resolve_playbook_context", lambda *_, **__: {})
+    monkeypatch.setattr(agent, "_detect_final_offer", lambda *_, **__: None)
+    monkeypatch.setattr(agent, "_should_continue", lambda *_, **__: (True, "ACTIVE", None))
+    monkeypatch.setattr(agent, "_build_decision_log", lambda *_, **__: "Decision log")
+    monkeypatch.setattr(agent, "_collect_vector_snippets", lambda **_: [])
+    monkeypatch.setattr(agent, "_retrieve_procurement_summary", lambda **_: {})
+    monkeypatch.setattr(agent, "_build_summary", lambda *_, **__: "Summary body.")
+    monkeypatch.setattr(agent, "_append_playbook_recommendations", lambda msg, *_, **__: msg)
+    monkeypatch.setattr(agent, "_store_session", lambda *_, **__: None)
+    monkeypatch.setattr(agent, "_collect_recipient_candidates", lambda *_: [])
+    monkeypatch.setattr(agent, "_format_negotiation_subject", lambda *_: "Negotiation Update")
+    monkeypatch.setattr(agent, "_build_email_agent_payload", lambda *_, **__: {})
+    monkeypatch.setattr(agent, "_with_plan", lambda _, output: output)
+    monkeypatch.setattr(agent, "_build_email_context_snapshot", lambda *_: {})
+    monkeypatch.setattr(agent, "_queue_email_draft_action", lambda *_, **__: None)
+    monkeypatch.setattr(agent, "_invoke_email_drafting_agent", lambda *_, **__: None)
+
+    captured: Dict[str, Any] = {}
+
+    def fake_build_stub(**kwargs):
+        name = kwargs.get("supplier_name")
+        greeting = f"Dear {name or 'there'},"
+        captured["greeting"] = greeting
+        return {
+            "supplier_id": kwargs.get("supplier_id"),
+            "supplier_name": name,
+            "subject": "Negotiation Update",
+            "body": greeting,
+            "text": greeting,
+            "html": greeting,
+            "recipients": [],
+            "receiver": None,
+            "to": [],
+            "cc": [],
+            "contact_level": 0,
+            "sent_status": False,
+            "metadata": {},
+            "headers": {},
+            "unique_id": kwargs.get("session_reference"),
+            "session_reference": kwargs.get("session_reference"),
+            "rfq_id": kwargs.get("rfq_id"),
+            "payload": kwargs.get("draft_payload"),
+            "workflow_id": workflow_id,
+        }
+
+    monkeypatch.setattr(agent, "_build_email_draft_stub", fake_build_stub)
+
+    def fake_finalization(**kwargs):
+        captured["final_supplier_name"] = kwargs.get("supplier_name")
+        raise StopIteration
+
+    monkeypatch.setattr(agent, "_build_email_finalization_task", fake_finalization)
+
+    with pytest.raises(StopIteration):
+        agent._run_single_negotiation_locked(
+            context=context,
+            identifier=identifier,
+            payload=dict(context.input_data),
+            session_reference=identifier.session_reference,
+            supplier=supplier_token,
+            workflow_id=workflow_id,
+            session_id=workflow_id,
+            raw_round_hint=1,
+        )
+
+    assert captured["greeting"] == "Dear Acme Supplies,"
+    assert captured["final_supplier_name"] == supplier_token
 
 
 def test_negotiation_agent_draft_stub_preserves_html_shell(monkeypatch):
