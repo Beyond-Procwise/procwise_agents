@@ -810,7 +810,7 @@ def test_negotiation_agent_stays_active_while_waiting(monkeypatch):
     assert saved.get("awaiting_response") is True
     assert saved.get("status") == "AWAITING_SUPPLIER"
     assert output.next_agents == ["SupplierInteractionAgent"]
-    assert output.pass_fields["drafts"][0]["rfq_id"] == "RFQ-890"
+    assert output.pass_fields["draft_records"][0]["rfq_id"] == "RFQ-890"
 
 
 def test_save_session_state_uses_workflow_supplier_unique_key(monkeypatch):
@@ -1194,7 +1194,9 @@ def test_negotiation_agent_runs_batch_in_parallel(monkeypatch):
     assert output.data["negotiation_batch"] is True
     assert len(output.data["results"]) == 2
     assert sorted(processed) == ["S1", "S2"]
-    assert len(output.data["drafts"]) == 2
+    assert output.data["drafts"] == []
+    draft_records = output.data["draft_records"]
+    assert len(draft_records) == 2
     assert output.data["results_by_supplier"]["S1"]["output"]["rfq_id"] == "RFQ-1"
     assert output.data["successful_suppliers"] == ["S1", "S2"]
     assert output.data["failed_suppliers"] == []
@@ -1265,7 +1267,9 @@ def test_negotiation_agent_batch_records_failures(monkeypatch):
     assert failures[0]["supplier_id"] == "S2"
     assert output.data["failed_suppliers"]
     assert output.data["successful_suppliers"] == ["S1"]
-    assert len(output.data["drafts"]) == 1
+    assert output.data["drafts"] == []
+    draft_records = output.data["draft_records"]
+    assert len(draft_records) == 1
     summaries = output.data.get("round_summaries")
     assert summaries and set(summaries[0]["suppliers"]) == {"S1", "S2"}
     email_actions = [entry for entry in nick.action_logs if entry.get("agent_type") == "EmailDraftingAgent"]
