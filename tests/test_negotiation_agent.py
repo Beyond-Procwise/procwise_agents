@@ -1522,6 +1522,89 @@ def test_capture_email_history_multi_draft_aggregated_metadata():
     assert all(entry.message_id == "<thread@procwise>" for entry in thread)
 
 
+def test_process_round_responses_records_supplier_reply_in_thread():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state: Dict[str, Any] = {
+        "workflow_id": "wf-thread",
+        "current_round": 1,
+        "active_suppliers": {
+            "SUP-1": {
+                "entry": {"supplier_id": "SUP-1"},
+                "responses": [],
+                "decisions": [],
+                "status": "PENDING",
+            }
+        },
+    }
+
+    agent._capture_email_to_history(
+        workflow_id="wf-thread",
+        supplier_id="SUP-1",
+        round_number=1,
+        draft={
+            "id": "draft-thread",
+            "subject": "Re: RFQ-11 – Update",
+            "text": "Buyer draft body",
+            "thread_headers": {"Message-ID": "<draft-thread@procwise>"},
+            "sender": "buyer@example.com",
+            "recipients": ["supplier@example.com"],
+        },
+        decision={"counter_price": 950.0},
+        state=state,
+    )
+
+    response_payload = {
+        "workflow_id": "wf-thread",
+        "supplier_id": "SUP-1",
+        "message_id": "<reply-thread@procwise>",
+        "subject": "Re: RFQ-11 – Update",
+        "body_text": "Here is our revised quote.",
+        "from_addr": "supplier@example.com",
+        "recipients": ["buyer@example.com"],
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "price": 930.0,
+        "metadata": {"match_confidence": 0.92},
+        "thread_headers": {
+            "Message-ID": "<reply-thread@procwise>",
+            "In-Reply-To": "<draft-thread@procwise>",
+        },
+    }
+
+    agent._process_round_responses(
+        {"SUP-1": [response_payload]},
+        state,
+        1,
+    )
+
+    history = agent._get_email_thread_history("wf-thread", "SUP-1")
+    assert len(history) == 2
+    senders = {entry["sender"] for entry in history}
+    assert "buyer@example.com" in senders
+    assert "supplier@example.com" in senders
+
+    supplier_entry = next(
+        entry for entry in history if entry["sender"] == "supplier@example.com"
+    )
+    assert supplier_entry["body_text"] == "Here is our revised quote."
+    assert supplier_entry["round_number"] == 1
+    assert supplier_entry["recipients"] == ["buyer@example.com"]
+    assert supplier_entry["metadata"]["price"] == 930.0
+    assert supplier_entry["metadata"]["match_confidence"] == 0.92
+    assert (
+        supplier_entry["negotiation_context"].get("entry_type") == "supplier_response"
+    )
+
+    plain_transcript = agent._format_thread_history_plain(history)
+    assert "Here is our revised quote." in plain_transcript
+    assert "supplier@example.com" in plain_transcript
+
+    html_transcript = agent._format_thread_history_html(history)
+    assert "Here is our revised quote." in html_transcript
+    assert "supplier@example.com" in html_transcript
+
+
 def test_compose_email_history_payload_merges_cached_state_metadata():
     nick = DummyNick()
     agent = NegotiationAgent(nick)
