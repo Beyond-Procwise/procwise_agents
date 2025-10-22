@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from datetime import datetime
 from typing import Dict, Iterable, Optional, Sequence
 
@@ -69,6 +70,7 @@ def record_dispatch(
     message_id: str,
     subject: str,
     dispatched_at: datetime,
+    dispatch_key: Optional[str] = None,
     **kwargs,
 ) -> None:
     """Record dispatch metadata in workflow tracking."""
@@ -103,6 +105,7 @@ def record_dispatch(
                 WorkflowDispatchRow(
                     workflow_id=workflow_id,
                     unique_id=unique_id,
+                    dispatch_key=str(dispatch_key or message_id or uuid.uuid4().hex),
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
                     message_id=message_id,

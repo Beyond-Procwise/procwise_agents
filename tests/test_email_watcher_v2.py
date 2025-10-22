@@ -10,10 +10,25 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+import types
+
+prompt_engine_stub = types.ModuleType("orchestration.prompt_engine")
+prompt_engine_stub.PromptEngine = object
+sys.modules.setdefault("orchestration.prompt_engine", prompt_engine_stub)
+
+orchestrator_stub = types.ModuleType("orchestration.orchestrator")
+orchestrator_stub.WorkflowOrchestrator = object
+sys.modules.setdefault("orchestration.orchestrator", orchestrator_stub)
+
+orchestration_pkg = sys.modules.setdefault("orchestration", types.ModuleType("orchestration"))
+setattr(orchestration_pkg, "prompt_engine", prompt_engine_stub)
+setattr(orchestration_pkg, "orchestrator", orchestrator_stub)
+
 from agents.base_agent import AgentOutput, AgentStatus
 from decimal import Decimal
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from utils.email_tracking import (
     embed_unique_id_in_email_body,
@@ -84,6 +99,60 @@ def test_embed_unique_id_is_recoverable():
     body = embed_unique_id_in_email_body("Hello Supplier", uid)
     assert uid in body
     assert extract_unique_id_from_body(body) == uid
+
+
+def test_workflow_tracking_preserves_multiple_dispatches():
+    workflow_id = "wf-multi-dispatch"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    now = datetime.now(timezone.utc)
+    first = WorkflowDispatchRow(
+        workflow_id=workflow_id,
+        unique_id="uid-shared",
+        dispatch_key="msg-first",
+        supplier_id="sup-1",
+        supplier_email="supplier@example.com",
+        message_id="msg-first",
+        subject="Round 1",
+        dispatched_at=now,
+        responded_at=None,
+        response_message_id=None,
+        matched=False,
+        thread_headers=None,
+    )
+    second = WorkflowDispatchRow(
+        workflow_id=workflow_id,
+        unique_id="uid-shared",
+        dispatch_key="msg-second",
+        supplier_id="sup-1",
+        supplier_email="supplier@example.com",
+        message_id="msg-second",
+        subject="Round 2",
+        dispatched_at=now + timedelta(minutes=10),
+        responded_at=None,
+        response_message_id=None,
+        matched=False,
+        thread_headers=None,
+    )
+
+    workflow_email_tracking_repo.record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[first],
+    )
+    workflow_email_tracking_repo.record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[second],
+    )
+
+    rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
+
+    assert len(rows) == 2
+    assert [row.dispatch_key for row in rows] == ["msg-first", "msg-second"]
+    assert [row.subject for row in rows] == ["Round 1", "Round 2"]
+    assert rows[0].dispatched_at <= rows[1].dispatched_at
 
 
 def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):

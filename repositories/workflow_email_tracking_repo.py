@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ CREATE SCHEMA IF NOT EXISTS proc;
 CREATE TABLE IF NOT EXISTS proc.workflow_email_tracking (
     workflow_id TEXT NOT NULL,
     unique_id TEXT NOT NULL,
+    dispatch_key TEXT NOT NULL,
     supplier_id TEXT,
     supplier_email TEXT,
     message_id TEXT,
@@ -27,23 +29,37 @@ CREATE TABLE IF NOT EXISTS proc.workflow_email_tracking (
     matched BOOLEAN DEFAULT FALSE,
     thread_headers JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (workflow_id, unique_id)
+    PRIMARY KEY (workflow_id, unique_id, dispatch_key)
 );
 
 ALTER TABLE proc.workflow_email_tracking
     ADD COLUMN IF NOT EXISTS thread_headers JSONB;
+ALTER TABLE proc.workflow_email_tracking
+    ADD COLUMN IF NOT EXISTS dispatch_key TEXT;
+UPDATE proc.workflow_email_tracking
+SET dispatch_key = COALESCE(dispatch_key, NULLIF(message_id, ''), unique_id || '::legacy')
+WHERE dispatch_key IS NULL;
+ALTER TABLE proc.workflow_email_tracking
+    ALTER COLUMN dispatch_key SET NOT NULL;
+ALTER TABLE proc.workflow_email_tracking
+    DROP CONSTRAINT IF EXISTS workflow_email_tracking_pkey;
+ALTER TABLE proc.workflow_email_tracking
+    ADD PRIMARY KEY (workflow_id, unique_id, dispatch_key);
 
 CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf
 ON proc.workflow_email_tracking (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_unique
 ON proc.workflow_email_tracking (unique_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_dispatch
+ON proc.workflow_email_tracking (workflow_id, unique_id, dispatched_at);
 """
 
 @dataclass
 class WorkflowDispatchRow:
     workflow_id: str
     unique_id: str
+    dispatch_key: str
     supplier_id: Optional[str]
     supplier_email: Optional[str]
     message_id: Optional[str]
@@ -150,25 +166,24 @@ def record_dispatches(
     if not rows:
         return
 
+    for row in rows:
+        if not getattr(row, "dispatch_key", None):
+            candidate = row.message_id or f"dispatch-{uuid.uuid4().hex}"
+            row.dispatch_key = str(candidate)
+
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.workflow_email_tracking "
-            "(workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (workflow_id, unique_id) DO UPDATE SET "
-            "supplier_id=EXCLUDED.supplier_id, "
-            "supplier_email=EXCLUDED.supplier_email, "
-            "message_id=EXCLUDED.message_id, "
-            "subject=EXCLUDED.subject, "
-            "dispatched_at=EXCLUDED.dispatched_at, "
-            "thread_headers=EXCLUDED.thread_headers"
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         )
         params = [
             (
                 row.workflow_id,
                 row.unique_id,
+                row.dispatch_key,
                 row.supplier_id,
                 row.supplier_email,
                 row.message_id,
@@ -189,9 +204,10 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
-            "FROM proc.workflow_email_tracking WHERE workflow_id=%s"
+            "FROM proc.workflow_email_tracking WHERE workflow_id=%s "
+            "ORDER BY dispatched_at ASC NULLS LAST, created_at ASC NULLS LAST, dispatch_key ASC"
         )
         cur.execute(q, (workflow_id,))
         fetched = cur.fetchall()
@@ -204,6 +220,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
                 WorkflowDispatchRow(
                     workflow_id=data["workflow_id"],
                     unique_id=data["unique_id"],
+                    dispatch_key=data["dispatch_key"],
                     supplier_id=data.get("supplier_id"),
                     supplier_email=data.get("supplier_email"),
                     message_id=data.get("message_id"),
@@ -225,11 +242,11 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking "
             "WHERE workflow_id=%s AND unique_id=%s "
-            "ORDER BY dispatched_at DESC NULLS LAST "
+            "ORDER BY dispatched_at DESC NULLS LAST, created_at DESC NULLS LAST "
             "LIMIT 1"
         )
         cur.execute(q, (workflow_id, unique_id))
@@ -242,6 +259,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     cols = (
         "workflow_id",
         "unique_id",
+        "dispatch_key",
         "supplier_id",
         "supplier_email",
         "message_id",
@@ -256,6 +274,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     return WorkflowDispatchRow(
         workflow_id=data["workflow_id"],
         unique_id=data["unique_id"],
+        dispatch_key=data["dispatch_key"],
         supplier_id=data.get("supplier_id"),
         supplier_email=data.get("supplier_email"),
         message_id=data.get("message_id"),
@@ -276,7 +295,7 @@ def load_workflow_unique_ids(*, workflow_id: str) -> List[str]:
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT unique_id FROM proc.workflow_email_tracking WHERE workflow_id=%s",
+            "SELECT DISTINCT unique_id FROM proc.workflow_email_tracking WHERE workflow_id=%s",
             (workflow_id,),
         )
         rows = [row[0] for row in cur.fetchall() if row and row[0]]
@@ -296,10 +315,26 @@ def mark_response(
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
+            "WITH latest AS ("
+            "    SELECT dispatch_key FROM proc.workflow_email_tracking "
+            "    WHERE workflow_id=%s AND unique_id=%s "
+            "    ORDER BY dispatched_at DESC NULLS LAST, created_at DESC NULLS LAST "
+            "    LIMIT 1"
+            ") "
             "UPDATE proc.workflow_email_tracking SET responded_at=%s, response_message_id=%s, matched=TRUE "
-            "WHERE workflow_id=%s AND unique_id=%s"
+            "WHERE workflow_id=%s AND unique_id=%s AND dispatch_key IN (SELECT dispatch_key FROM latest)"
         )
-        cur.execute(q, (responded, response_message_id, workflow_id, unique_id))
+        cur.execute(
+            q,
+            (
+                workflow_id,
+                unique_id,
+                responded,
+                response_message_id,
+                workflow_id,
+                unique_id,
+            ),
+        )
         cur.close()
 
 
@@ -324,7 +359,7 @@ def lookup_workflow_for_unique(*, unique_id: str) -> Optional[str]:
             "SELECT workflow_id "
             "FROM proc.workflow_email_tracking "
             "WHERE unique_id=%s "
-            "ORDER BY dispatched_at DESC NULLS LAST "
+            "ORDER BY dispatched_at DESC NULLS LAST, created_at DESC NULLS LAST "
             "LIMIT 1"
         )
         cur.execute(q, (unique_id,))
