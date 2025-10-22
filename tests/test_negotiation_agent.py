@@ -693,6 +693,8 @@ def test_save_session_state_uses_workflow_supplier_unique_key(monkeypatch):
                 self._result = []
             elif "information_schema.key_column_usage" in normalized:
                 self._result = []
+            elif "pg_indexes" in normalized:
+                self._result = []
             else:
                 executed["sql"] = sql
                 executed["params"] = params
@@ -751,6 +753,98 @@ def test_save_session_state_uses_workflow_supplier_unique_key(monkeypatch):
 
     assert "sql" in executed
     assert "ON CONFLICT (workflow_id, supplier_id)" in executed["sql"]
+
+
+def test_save_session_state_honors_partial_unique_index_predicate(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    executed: Dict[str, Any] = {}
+
+    class RecordingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.strip().split())
+            if "information_schema.table_constraints" in normalized:
+                self._result = []
+            elif "information_schema.key_column_usage" in normalized:
+                self._result = []
+            elif "pg_indexes" in normalized:
+                self._result = [
+                    (
+                        "negotiation_session_state_workflow_supplier_idx",
+                        "CREATE UNIQUE INDEX negotiation_session_state_workflow_supplier_idx "
+                        "ON proc.negotiation_session_state USING btree (workflow_id, supplier_id) "
+                        "WHERE ((workflow_id IS NOT NULL))",
+                    )
+                ]
+            else:
+                executed["sql"] = sql
+                executed["params"] = params
+                self._result = []
+
+        def fetchall(self):
+            return getattr(self, "_result", [])
+
+        def fetchone(self):
+            return None
+
+    class RecordingConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def cursor(self):
+            return RecordingCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    nick.get_db_connection = lambda: RecordingConn()
+
+    monkeypatch.setattr(agent, "_ensure_state_schema", lambda: None)
+    monkeypatch.setattr(
+        agent,
+        "_get_column_metadata",
+        lambda table: {
+            "workflow_id": {"nullable": False},
+            "supplier_id": {"nullable": False},
+            "supplier_reply_count": {"nullable": True},
+            "current_round": {"nullable": True},
+            "status": {"nullable": True},
+            "awaiting_response": {"nullable": True},
+            "last_supplier_msg_id": {"nullable": True},
+            "last_agent_msg_id": {"nullable": True},
+            "last_email_sent_at": {"nullable": True},
+            "base_subject": {"nullable": True},
+            "initial_body": {"nullable": True},
+            "thread_state": {"nullable": True},
+            "email_history": {"nullable": True},
+            "session_reference": {"nullable": True},
+            "unique_id": {"nullable": True},
+            "rfq_id": {"nullable": True},
+            "updated_on": {"nullable": True},
+        },
+    )
+
+    agent._save_session_state("wf-201", "SUP-10", {"status": "ACTIVE"})
+
+    assert "sql" in executed
+    normalized_sql = " ".join(executed["sql"].split())
+    assert (
+        "ON CONFLICT (workflow_id, supplier_id) WHERE workflow_id IS NOT NULL"
+        in normalized_sql
+    )
 
 
 def test_negotiation_agent_falls_back_to_email_agent_queue(monkeypatch):
