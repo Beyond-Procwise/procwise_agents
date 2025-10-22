@@ -73,6 +73,14 @@ TRADE_OFF_HINTS = {
 }
 
 
+@dataclass(frozen=True)
+class UniqueConstraintInfo:
+    columns: Tuple[str, ...]
+    constraint_name: Optional[str] = None
+    predicate: Optional[str] = None
+    index_name: Optional[str] = None
+
+
 class NegotiationEmailHTMLShellBuilder:
     """Render negotiation drafts into a modern email-safe HTML shell."""
 
@@ -5171,14 +5179,18 @@ class NegotiationAgent(BaseAgent):
         *,
         preferred: Sequence[str],
         fallbacks: Sequence[Sequence[str]],
-    ) -> Tuple[str, ...]:
+    ) -> UniqueConstraintInfo:
         attr_name = f"_{table}_unique_constraint"
         cached = getattr(self, attr_name, None)
+        if isinstance(cached, UniqueConstraintInfo) and cached.columns:
+            return cached
         if isinstance(cached, (list, tuple)) and cached:
-            return tuple(cached)
+            cached_info = UniqueConstraintInfo(columns=tuple(cached))
+            setattr(self, attr_name, cached_info)
+            return cached_info
 
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
-        candidates: List[Tuple[str, ...]] = []
+        candidates: List[UniqueConstraintInfo] = []
         if callable(get_conn):
             try:
                 with get_conn() as conn:
@@ -5208,19 +5220,116 @@ class NegotiationAgent(BaseAgent):
                             )
                             cols = [row[0] for row in cur.fetchall() or []]
                             if cols:
-                                candidates.append(tuple(cols))
+                                candidates.append(
+                                    UniqueConstraintInfo(
+                                        columns=tuple(cols),
+                                        constraint_name=constraint,
+                                    )
+                                )
+
+                        cur.execute(
+                            """
+                            SELECT indexname, indexdef
+                              FROM pg_indexes
+                             WHERE schemaname = 'proc'
+                               AND tablename = %s
+                            """,
+                            (table,),
+                        )
+                        for index_name, index_def in cur.fetchall() or []:
+                            if not index_def:
+                                continue
+                            if "CREATE UNIQUE INDEX" not in index_def.upper():
+                                continue
+
+                            columns: List[str] = []
+                            predicate: Optional[str] = None
+
+                            match = re.search(
+                                r"USING\s+\w+\s*\((?P<columns>[^\)]+)\)",
+                                index_def,
+                                re.IGNORECASE,
+                            )
+                            if not match:
+                                continue
+                            column_segment = match.group("columns")
+
+                            def _strip_wrapping_parentheses(value: str) -> str:
+                                text = value.strip()
+                                while text.startswith("(") and text.endswith(")"):
+                                    depth = 0
+                                    balanced = True
+                                    for i, char in enumerate(text):
+                                        if char == "(":
+                                            depth += 1
+                                        elif char == ")":
+                                            depth -= 1
+                                            if depth < 0:
+                                                balanced = False
+                                                break
+                                            if depth == 0 and i < len(text) - 1:
+                                                balanced = False
+                                                break
+                                    if not balanced:
+                                        break
+                                    text = text[1:-1].strip()
+                                return text
+
+                            for part in column_segment.split(","):
+                                cleaned = part.strip()
+                                if not cleaned:
+                                    continue
+                                cleaned = _strip_wrapping_parentheses(cleaned)
+                                cleaned = re.sub(
+                                    r"\s+(ASC|DESC|NULLS\s+(FIRST|LAST))$",
+                                    "",
+                                    cleaned,
+                                    flags=re.IGNORECASE,
+                                )
+                                if cleaned.startswith('"') and cleaned.endswith('"'):
+                                    cleaned = cleaned[1:-1]
+                                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned):
+                                    columns.append(cleaned)
+                                else:
+                                    columns = []
+                                    break
+
+                            if not columns:
+                                continue
+
+                            predicate_match = re.search(
+                                r"\)\s*WHERE\s+(?P<predicate>.+)$",
+                                index_def,
+                                re.IGNORECASE,
+                            )
+                            if predicate_match:
+                                predicate = _strip_wrapping_parentheses(
+                                    predicate_match.group("predicate")
+                                ).rstrip(";").strip() or None
+
+                            candidates.append(
+                                UniqueConstraintInfo(
+                                    columns=tuple(columns),
+                                    predicate=predicate,
+                                    index_name=index_name,
+                                )
+                            )
                 conn.commit()
             except Exception:  # pragma: no cover - diagnostic only
                 logger.debug(
                     "Failed to introspect unique constraints for %s", table, exc_info=True
                 )
 
-        def _match(target: Sequence[str]) -> Optional[Tuple[str, ...]]:
+        def _match(target: Sequence[str]) -> Optional[UniqueConstraintInfo]:
             normalised = tuple(target)
+            best: Optional[UniqueConstraintInfo] = None
             for candidate in candidates:
-                if tuple(candidate) == normalised:
-                    return tuple(candidate)
-            return None
+                if candidate.columns == normalised:
+                    if candidate.predicate:
+                        return candidate
+                    if best is None:
+                        best = candidate
+            return best
 
         preferred_match = _match(preferred)
         if preferred_match:
@@ -5237,8 +5346,9 @@ class NegotiationAgent(BaseAgent):
             setattr(self, attr_name, candidates[0])
             return candidates[0]
 
-        setattr(self, attr_name, tuple(preferred))
-        return tuple(preferred)
+        fallback_info = UniqueConstraintInfo(columns=tuple(preferred))
+        setattr(self, attr_name, fallback_info)
+        return fallback_info
 
     @staticmethod
     def _normalise_base_subject(subject: Optional[str]) -> Optional[str]:
@@ -5500,7 +5610,7 @@ class NegotiationAgent(BaseAgent):
                         elif unique_value:
                             record.setdefault("unique_id", unique_value)
 
-                    unique_columns = self._get_unique_constraint(
+                    unique_info = self._get_unique_constraint(
                         "negotiation_session_state",
                         preferred=("workflow_id", "supplier_id"),
                         fallbacks=(
@@ -5512,7 +5622,11 @@ class NegotiationAgent(BaseAgent):
 
                     columns = list(record.keys())
                     values = [record[col] for col in columns]
-                    conflict_clause = ", ".join(unique_columns)
+                    unique_columns = unique_info.columns or (
+                        "workflow_id",
+                        "supplier_id",
+                    )
+                    conflict_columns = ", ".join(unique_columns)
                     unique_set = set(unique_columns)
                     update_targets = [col for col in columns if col not in unique_set]
 
@@ -5520,17 +5634,28 @@ class NegotiationAgent(BaseAgent):
                         f"INSERT INTO proc.negotiation_session_state ({', '.join(columns)}) "
                         f"VALUES ({', '.join(['%s'] * len(columns))})"
                     )
+                    if unique_info.predicate and conflict_columns:
+                        conflict_target = (
+                            f"ON CONFLICT ({conflict_columns}) WHERE {unique_info.predicate}"
+                        )
+                    elif unique_info.constraint_name:
+                        conflict_target = (
+                            f"ON CONFLICT ON CONSTRAINT {unique_info.constraint_name}"
+                        )
+                    elif conflict_columns:
+                        conflict_target = f"ON CONFLICT ({conflict_columns})"
+                    else:
+                        conflict_target = f"ON CONFLICT ({conflict_columns})"
+
                     if update_targets:
                         update_sql = ", ".join(
                             f"{col} = EXCLUDED.{col}" for col in update_targets
                         )
                         insert_sql = (
-                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_sql}"
+                            f"{insert_sql} {conflict_target} DO UPDATE SET {update_sql}"
                         )
                     else:
-                        insert_sql = (
-                            f"{insert_sql} ON CONFLICT ({conflict_clause}) DO NOTHING"
-                        )
+                        insert_sql = f"{insert_sql} {conflict_target} DO NOTHING"
 
                     cur.execute(insert_sql, tuple(values))
                 conn.commit()
