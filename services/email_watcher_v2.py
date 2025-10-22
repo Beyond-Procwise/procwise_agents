@@ -15,7 +15,7 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
@@ -74,6 +74,8 @@ class WorkflowTracker:
     responded_count: int = 0
     email_records: Dict[str, List[EmailDispatchRecord]] = field(default_factory=dict)
     matched_responses: Dict[str, EmailResponse] = field(default_factory=dict)
+    response_history: Dict[str, List[EmailResponse]] = field(default_factory=dict)
+    responded_unique_ids: Set[str] = field(default_factory=set)
     rfq_index: Dict[str, List[str]] = field(default_factory=dict)
     all_dispatched: bool = False
     all_responded: bool = False
@@ -94,14 +96,23 @@ class WorkflowTracker:
                 self.last_dispatched_at = dispatch.dispatched_at
         self.dispatched_count = len(self.email_records)
         self.all_dispatched = True
+        self.all_responded = self.responded_count >= self.dispatched_count > 0
 
     def record_response(self, unique_id: str, response: EmailResponse) -> None:
         if unique_id not in self.email_records:
             return
-        if unique_id in self.matched_responses:
-            return
+
+        history = self.response_history.setdefault(unique_id, [])
+        history.append(response)
         self.matched_responses[unique_id] = response
-        self.responded_count = len(self.matched_responses)
+
+        if unique_id not in self.responded_unique_ids:
+            self.responded_unique_ids.add(unique_id)
+            self.responded_count = len(self.responded_unique_ids)
+        else:
+            # keep counts consistent even if new dispatches arrive later
+            self.responded_count = len(self.responded_unique_ids)
+
         self.all_responded = self.responded_count >= self.dispatched_count > 0
 
     def latest_dispatch(self, unique_id: str) -> Optional[EmailDispatchRecord]:
@@ -583,14 +594,13 @@ class EmailWatcherV2:
                         best_score = max(best_score, self.match_threshold)
                         best_dispatch = tracker.latest_dispatch(matched_id)
 
-            if not matched_id and len([
-                uid for uid in tracker.email_records.keys() if uid not in tracker.matched_responses
-            ]) == 1:
-                remaining_uid = next(
-                    uid
-                    for uid in tracker.email_records.keys()
-                    if uid not in tracker.matched_responses
-                )
+            remaining_unresponded = [
+                uid
+                for uid in tracker.email_records.keys()
+                if uid not in tracker.responded_unique_ids
+            ]
+            if not matched_id and len(remaining_unresponded) == 1:
+                remaining_uid = remaining_unresponded[0]
                 matched_id = remaining_uid
                 logger.debug(
                     "Defaulting response assignment for workflow=%s to remaining unique_id=%s",
@@ -706,6 +716,7 @@ class EmailWatcherV2:
             "dispatched_count": tracker.dispatched_count,
             "responded_count": tracker.responded_count,
             "matched_responses": tracker.matched_responses,
+            "response_history": tracker.response_history,
         }
 
         self._process_agents(tracker)
@@ -733,15 +744,16 @@ class EmailWatcherV2:
         processed_ids: List[str] = []
         for row in pending_rows:
             unique_id = row.get("unique_id")
-            matched = tracker.matched_responses.get(unique_id) if unique_id else None
-            supplier_id = row.get("supplier_id") or (matched.supplier_id if matched else None)
-            subject = row.get("response_subject") or (matched.subject if matched else None)
-            message_id = row.get("response_message_id") or (matched.message_id if matched else None)
-            from_address = row.get("response_from") or (matched.from_address if matched else None)
-            body_text = row.get("response_body") or (matched.body if matched else "")
-            workflow_id = matched.workflow_id if matched and matched.workflow_id else tracker.workflow_id
-            rfq_id = matched.rfq_id if matched and matched.rfq_id else None
-            supplier_email = row.get("supplier_email") or (matched.supplier_email if matched else None)
+            latest = tracker.latest_response(unique_id) if unique_id else None
+            supplier_id = row.get("supplier_id") or (latest.supplier_id if latest else None)
+            subject = row.get("response_subject") or (latest.subject if latest else None)
+            message_id = row.get("response_message_id") or (latest.message_id if latest else None)
+            from_address = row.get("response_from") or (latest.from_address if latest else None)
+            body_text = row.get("response_body") or (latest.body if latest else "")
+            workflow_id = latest.workflow_id if latest and latest.workflow_id else tracker.workflow_id
+            rfq_id = latest.rfq_id if latest and latest.rfq_id else None
+            supplier_email = row.get("supplier_email") or (latest.supplier_email if latest else None)
+            history = tracker.response_history.get(unique_id, []) if unique_id else []
 
             input_payload = {
                 "message": body_text or "",
@@ -757,6 +769,20 @@ class EmailWatcherV2:
             }
             if rfq_id:
                 input_payload["rfq_id"] = rfq_id
+            if history:
+                input_payload.setdefault(
+                    "response_history",
+                    [
+                        {
+                            "message_id": item.message_id,
+                            "subject": item.subject,
+                            "body": item.body,
+                            "received_at": item.received_at,
+                            "from_address": item.from_address,
+                        }
+                        for item in history
+                    ],
+                )
 
             expected_ids = list(tracker.email_records.keys())
             if expected_ids:
