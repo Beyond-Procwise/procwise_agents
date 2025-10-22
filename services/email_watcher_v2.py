@@ -121,6 +121,13 @@ class WorkflowTracker:
             return None
         return records[-1]
 
+    def latest_response(self, unique_id: str) -> Optional[EmailResponse]:
+        """Return the most recent response recorded for a dispatch."""
+        history = self.response_history.get(unique_id)
+        if history:
+            return history[-1]
+        return self.matched_responses.get(unique_id)
+
 
 def _imap_client(
     host: str,
