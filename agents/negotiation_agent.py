@@ -9699,6 +9699,187 @@ class NegotiationAgent(BaseAgent):
             workflow_key, supplier_key
         )
 
+    def _compose_email_history_payload(
+        self,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        state: Optional[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], int]:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+
+        thread_history = self._get_email_thread_history(workflow_id, supplier_id)
+        thread_summary = self._get_email_thread_summary(workflow_id, supplier_id)
+
+        summary_payload: Dict[str, Any]
+        if isinstance(thread_summary, dict):
+            summary_payload = dict(thread_summary)
+        else:
+            summary_payload = {}
+
+        default_thread_key: Optional[str] = None
+        if workflow_key and supplier_key:
+            default_thread_key = f"{workflow_key}:{supplier_key}"
+
+        summary_payload.setdefault("total_emails", 0)
+        summary_payload.setdefault("rounds", [])
+        summary_payload.setdefault("first_sent", None)
+        summary_payload.setdefault("last_sent", None)
+        summary_payload.setdefault("thread_key", default_thread_key)
+
+        cached_history: List[Dict[str, Any]] = []
+        if isinstance(state, dict):
+            history_payload = state.get("email_history")
+            if isinstance(history_payload, list):
+                cached_history = [
+                    item for item in history_payload if isinstance(item, dict)
+                ]
+
+        def _normalise_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not isinstance(entry, dict):
+                return None
+            payload: Dict[str, Any] = dict(entry)
+
+            email_id = self._coerce_text(
+                payload.get("email_id") or payload.get("id")
+            )
+            if not email_id:
+                email_id = str(uuid.uuid4())
+            payload["email_id"] = email_id
+
+            try:
+                payload["round_number"] = int(payload.get("round_number", 0) or 0)
+            except Exception:
+                payload["round_number"] = 0
+
+            for key in ("metadata", "thread_headers", "decision", "negotiation_context"):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    payload[key] = dict(value)
+                elif value is None:
+                    payload[key] = {}
+                else:
+                    try:
+                        payload[key] = dict(value)
+                    except Exception:
+                        payload[key] = {}
+
+            recipients = payload.get("recipients")
+            if isinstance(recipients, list):
+                payload["recipients"] = [
+                    self._coerce_text(item)
+                    for item in recipients
+                    if self._coerce_text(item)
+                ]
+            elif recipients is None:
+                payload["recipients"] = []
+            else:
+                coerced_recipient = self._coerce_text(recipients)
+                payload["recipients"] = [coerced_recipient] if coerced_recipient else []
+
+            for key in ("subject", "body_text", "body_html", "sender"):
+                value = payload.get(key)
+                payload[key] = self._coerce_text(value) if value else ""
+
+            sent_at_value = payload.get("sent_at")
+            if isinstance(sent_at_value, datetime):
+                payload["sent_at"] = sent_at_value.isoformat()
+            elif isinstance(sent_at_value, str):
+                payload["sent_at"] = sent_at_value
+            else:
+                payload["sent_at"] = None
+
+            if supplier_key:
+                payload.setdefault("supplier_id", supplier_key)
+
+            return payload
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for entry in thread_history:
+            normalised = _normalise_entry(entry)
+            if not normalised:
+                continue
+            merged[normalised["email_id"]] = normalised
+
+        for entry in cached_history:
+            normalised = _normalise_entry(entry)
+            if not normalised:
+                continue
+            email_id = normalised["email_id"]
+            if email_id in merged:
+                existing = merged[email_id]
+                for key, value in normalised.items():
+                    if key in {"metadata", "thread_headers", "decision", "negotiation_context"}:
+                        if not isinstance(value, dict):
+                            continue
+                        existing_value = existing.get(key)
+                        if isinstance(existing_value, dict):
+                            merged_value = dict(value)
+                            merged_value.update(existing_value)
+                            existing[key] = merged_value
+                        else:
+                            existing[key] = dict(value)
+                    elif key == "recipients":
+                        if not existing.get("recipients") and value:
+                            existing["recipients"] = list(value)
+                    elif existing.get(key) in (None, "", [], {}):
+                        existing[key] = value
+            else:
+                merged[email_id] = normalised
+
+        def _parse_sent_at(value: Any) -> Optional[datetime]:
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str) and value:
+                try:
+                    return datetime.fromisoformat(value)
+                except ValueError:
+                    try:
+                        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except Exception:
+                        return None
+            return None
+
+        merged_entries = list(merged.values())
+        merged_entries.sort(
+            key=lambda item: (
+                _parse_sent_at(item.get("sent_at"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                item.get("round_number") or 0,
+                item.get("email_id"),
+            )
+        )
+
+        rounds = sorted(
+            {
+                int(entry.get("round_number") or 0)
+                for entry in merged_entries
+                if int(entry.get("round_number") or 0) > 0
+            }
+        )
+        if rounds:
+            summary_payload["rounds"] = rounds
+        elif not isinstance(summary_payload.get("rounds"), list):
+            summary_payload["rounds"] = []
+
+        sent_at_values = [
+            _parse_sent_at(entry.get("sent_at")) for entry in merged_entries if entry.get("sent_at")
+        ]
+        sent_at_values = [value for value in sent_at_values if value is not None]
+        if sent_at_values:
+            summary_payload["first_sent"] = sent_at_values[0].isoformat()
+            summary_payload["last_sent"] = sent_at_values[-1].isoformat()
+        else:
+            summary_payload["first_sent"] = summary_payload.get("first_sent") or None
+            summary_payload["last_sent"] = summary_payload.get("last_sent") or None
+
+        total_count = len(merged_entries)
+        summary_payload["total_emails"] = total_count
+        if not summary_payload.get("thread_key"):
+            summary_payload["thread_key"] = default_thread_key
+
+        return merged_entries, summary_payload, total_count
+
     def generate_email_preview(
         self,
         *,
