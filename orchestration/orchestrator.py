@@ -1,7 +1,7 @@
 import logging
 import uuid
 from typing import Dict, List, Optional, Any, Set, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -1699,6 +1699,131 @@ class Orchestrator:
         email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
+        def _coerce_dt(value):
+            if value in (None, ""):
+                return None
+            if isinstance(value, datetime):
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+                except Exception:
+                    return None
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                try:
+                    parsed = datetime.fromisoformat(text)
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
+            return None
+
+        def _coerce_int(value):
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        freshness_payload = (
+            draft_payload.get("dispatch_freshness")
+            if isinstance(draft_payload.get("dispatch_freshness"), dict)
+            else {}
+        )
+        wildcard_requirement: Dict[str, Any] = {}
+        if isinstance(freshness_payload, dict):
+            for wildcard in ("*", "__all__", "default"):
+                candidate = freshness_payload.get(wildcard)
+                if candidate is None and isinstance(wildcard, str):
+                    candidate = freshness_payload.get(wildcard.lower())
+                if isinstance(candidate, dict):
+                    wildcard_requirement = dict(candidate)
+                    break
+
+        default_min_dt = _coerce_dt(draft_payload.get("draft_created_at"))
+        default_thread_idx = _coerce_int(draft_payload.get("round"))
+
+        dispatch_context: Dict[str, Dict[str, Any]] = {}
+        for unique in unique_ids:
+            key = str(unique).strip() if unique not in (None, "") else ""
+            if not key:
+                continue
+
+            entry: Dict[str, Any] = {}
+            specific = None
+            if isinstance(freshness_payload, dict):
+                specific = freshness_payload.get(key)
+                if specific is None:
+                    specific = freshness_payload.get(key.lower())
+            if isinstance(specific, dict):
+                entry.update(specific)
+            elif specific is not None:
+                entry.setdefault("min_dispatched_at", specific)
+
+            if not entry and wildcard_requirement:
+                entry.update(wildcard_requirement)
+
+            if default_min_dt and "min_dispatched_at" not in entry:
+                entry["min_dispatched_at"] = default_min_dt
+
+            if default_thread_idx is not None and "thread_index" not in entry:
+                entry["thread_index"] = default_thread_idx
+
+            for draft in email_drafts:
+                if not isinstance(draft, dict):
+                    continue
+                draft_unique = str(draft.get("unique_id") or "").strip()
+                if draft_unique != key:
+                    continue
+                if "thread_index" not in entry:
+                    idx_val = _coerce_int(draft.get("thread_index"))
+                    if idx_val is not None:
+                        entry["thread_index"] = idx_val
+                if "min_dispatched_at" not in entry:
+                    dt_val = None
+                    for source_key in (
+                        "dispatch_freshness",
+                        "draft_created_at",
+                        "created_at",
+                        "generated_at",
+                        "updated_at",
+                    ):
+                        if source_key == "dispatch_freshness":
+                            candidate_payload = draft.get(source_key)
+                            if isinstance(candidate_payload, dict):
+                                dt_candidate = candidate_payload.get("min_dispatched_at")
+                            else:
+                                dt_candidate = None
+                        else:
+                            dt_candidate = draft.get(source_key)
+                        dt_val = _coerce_dt(dt_candidate)
+                        if dt_val:
+                            break
+                    if dt_val:
+                        entry["min_dispatched_at"] = dt_val
+
+            min_dt_val = _coerce_dt(entry.get("min_dispatched_at"))
+            if min_dt_val:
+                entry["min_dispatched_at"] = min_dt_val
+            else:
+                entry.pop("min_dispatched_at", None)
+
+            idx_final = _coerce_int(entry.get("thread_index"))
+            if idx_final is not None:
+                entry["thread_index"] = idx_final
+            else:
+                entry.pop("thread_index", None)
+
+            if entry:
+                dispatch_context[key] = entry
+
+        dispatch_context_payload = dispatch_context or None
+
         coordinator = SupplierResponseWorkflow()
         readiness = coordinator.ensure_ready(
             workflow_id=workflow_hint,
@@ -1707,6 +1832,7 @@ class Orchestrator:
             dispatch_poll_interval=dispatch_poll,
             response_timeout=response_timeout,
             response_poll_interval=response_poll,
+            dispatch_context=dispatch_context_payload,
         )
 
         supplier_input: Dict[str, Any] = {}

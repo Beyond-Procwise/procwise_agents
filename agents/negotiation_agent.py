@@ -3815,6 +3815,24 @@ class NegotiationAgent(BaseAgent):
             "supplier_contact": contact_name,
         }
 
+        created_at = datetime.now(timezone.utc)
+        draft_payload.setdefault("draft_created_at", created_at.isoformat())
+        if session_reference:
+            freshness_payload = (
+                draft_payload.get("dispatch_freshness")
+                if isinstance(draft_payload.get("dispatch_freshness"), dict)
+                else {}
+            )
+            existing_entry = freshness_payload.get(session_reference)
+            if isinstance(existing_entry, dict):
+                entry = dict(existing_entry)
+            else:
+                entry = {}
+            entry.setdefault("thread_index", round_no)
+            entry.setdefault("min_dispatched_at", draft_payload["draft_created_at"])
+            freshness_payload[session_reference] = entry
+            draft_payload["dispatch_freshness"] = freshness_payload
+
         draft_payload.setdefault("subject", self._format_negotiation_subject(state))
 
         recipients = self._collect_recipient_candidates(context)
