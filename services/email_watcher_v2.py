@@ -121,6 +121,12 @@ class WorkflowTracker:
             return None
         return records[-1]
 
+    def latest_response(self, unique_id: str) -> Optional[EmailResponse]:
+        responses = self.response_history.get(unique_id)
+        if not responses:
+            return None
+        return responses[-1]
+
 
 def _imap_client(
     host: str,
@@ -552,47 +558,86 @@ class EmailWatcherV2:
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
         for email in responses:
+            def _already_recorded(uid: str) -> bool:
+                if not email.message_id:
+                    return False
+                history = tracker.response_history.get(uid, [])
+                return any(
+                    response.message_id and response.message_id == email.message_id
+                    for response in history
+                )
+
             matched_id: Optional[str] = None
             best_score = 0.0
             best_dispatch: Optional[EmailDispatchRecord] = None
+            unique_match_found = False
             for unique_id, dispatch_list in tracker.email_records.items():
-                dispatch = dispatch_list[-1]
-                if unique_id in tracker.matched_responses:
+                if _already_recorded(unique_id):
                     continue
-                score = _calculate_match_score(dispatch, email)
-                if score > best_score:
-                    matched_id = unique_id
-                    best_score = score
-                    best_dispatch = dispatch
+                for dispatch in reversed(dispatch_list):
+                    score = _calculate_match_score(dispatch, email)
+                    if score > best_score:
+                        matched_id = unique_id
+                        best_score = score
+                        best_dispatch = dispatch
+                    if email.unique_id and email.unique_id == dispatch.unique_id:
+                        matched_id = dispatch.unique_id
+                        best_score = 1.0
+                        best_dispatch = dispatch
+                        unique_match_found = True
+                        break
+                if unique_match_found:
+                    break
             if (not matched_id or best_score < self.match_threshold) and email.supplier_id:
                 supplier_matches = [
                     uid
                     for uid, dispatch_list in tracker.email_records.items()
-                    if uid not in tracker.matched_responses
+                    if not _already_recorded(uid)
                     and dispatch_list
-                    and dispatch_list[-1].supplier_id
-                    and dispatch_list[-1].supplier_id == email.supplier_id
+                    and any(
+                        dispatch.supplier_id and dispatch.supplier_id == email.supplier_id
+                        for dispatch in dispatch_list
+                    )
                 ]
                 if len(supplier_matches) == 1:
                     matched_id = supplier_matches[0]
                     best_score = max(best_score, self.match_threshold)
-                    best_dispatch = tracker.latest_dispatch(matched_id)
+                    dispatches = tracker.email_records.get(matched_id, [])
+                    best_dispatch = next(
+                        (
+                            dispatch
+                            for dispatch in reversed(dispatches)
+                            if dispatch.supplier_id == email.supplier_id
+                        ),
+                        tracker.latest_dispatch(matched_id),
+                    )
             if (not matched_id or best_score < self.match_threshold) and email.rfq_id:
                 normalised_rfq = _normalise_identifier(email.rfq_id)
                 if normalised_rfq:
                     rfq_candidates = [
                         uid
                         for uid, dispatch_list in tracker.email_records.items()
-                        if uid not in tracker.matched_responses
+                        if not _already_recorded(uid)
                         and dispatch_list
-                        and dispatch_list[-1].rfq_id
-                        and _normalise_identifier(dispatch_list[-1].rfq_id)
-                        == normalised_rfq
+                        and any(
+                            dispatch.rfq_id
+                            and _normalise_identifier(dispatch.rfq_id) == normalised_rfq
+                            for dispatch in dispatch_list
+                        )
                     ]
                     if len(rfq_candidates) == 1:
                         matched_id = rfq_candidates[0]
                         best_score = max(best_score, self.match_threshold)
-                        best_dispatch = tracker.latest_dispatch(matched_id)
+                        dispatches = tracker.email_records.get(matched_id, [])
+                        best_dispatch = next(
+                            (
+                                dispatch
+                                for dispatch in reversed(dispatches)
+                                if dispatch.rfq_id
+                                and _normalise_identifier(dispatch.rfq_id) == normalised_rfq
+                            ),
+                            tracker.latest_dispatch(matched_id),
+                        )
 
             remaining_unresponded = [
                 uid
@@ -632,6 +677,7 @@ class EmailWatcherV2:
                     unique_id=matched_id,
                     responded_at=email.received_at,
                     response_message_id=email.message_id,
+                    dispatch_key=best_dispatch.dispatch_key,
                 )
                 supplier_email = (
                     email.supplier_email

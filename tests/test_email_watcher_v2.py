@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 import types
 
 import pytest
@@ -376,6 +376,106 @@ def test_email_watcher_tracks_multiple_responses_for_same_unique_id(monkeypatch)
     assert history[-1]["body"] == second_body
 
     assert fetcher.calls >= 1
+
+
+def test_email_watcher_considers_all_dispatch_history_for_thread_match(monkeypatch):
+    workflow_id = "wf-thread-history"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    supplier_agent = StubSupplierAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-3")
+
+    response = EmailResponse(
+        unique_id=None,
+        supplier_id="sup-3",
+        supplier_email="supplier@example.com",
+        from_address="Supplier <supplier@example.com>",
+        message_id="<reply-thread>",
+        subject="Re: Initial Quote",
+        body="Following up on the quote request",
+        received_at=now + timedelta(minutes=8),
+        in_reply_to=("msg-initial",),
+    )
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher([response])
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        match_threshold=0.45,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "dispatch_key": "dispatch-initial",
+                "supplier_id": "sup-3",
+                "supplier_email": "supplier@example.com",
+                "message_id": "msg-initial",
+                "subject": "Initial Quote",
+                "dispatched_at": now,
+            },
+            {
+                "unique_id": unique_id,
+                "dispatch_key": "dispatch-follow-up",
+                "supplier_id": "sup-3",
+                "supplier_email": "supplier@example.com",
+                "message_id": "msg-follow-up",
+                "subject": "Follow-up on Quote",
+                "dispatched_at": now + timedelta(minutes=5),
+            },
+        ],
+    )
+
+    mark_calls: List[Dict[str, object]] = []
+    original_mark = workflow_email_tracking_repo.mark_response
+
+    def _mark_response(**kwargs):
+        mark_calls.append(kwargs)
+        return original_mark(**kwargs)
+
+    monkeypatch.setattr(workflow_email_tracking_repo, "mark_response", _mark_response)
+
+    inserted_rows: List[SupplierResponseRow] = []
+    original_insert = supplier_response_repo.insert_response
+
+    def _insert_response(row: SupplierResponseRow) -> None:
+        inserted_rows.append(row)
+        return original_insert(row)
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", _insert_response)
+
+    watcher.wait_and_collect_responses(workflow_id)
+
+    assert mark_calls, "mark_response should be invoked"
+    assert mark_calls[0]["dispatch_key"] == "dispatch-initial"
+    assert inserted_rows, "response should be persisted"
+    assert inserted_rows[0].original_message_id == "msg-initial"
 
 
 def test_parse_email_recovers_tracking_headers():

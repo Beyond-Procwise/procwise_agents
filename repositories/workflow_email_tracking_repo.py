@@ -309,32 +309,50 @@ def mark_response(
     unique_id: str,
     responded_at: datetime,
     response_message_id: Optional[str],
+    dispatch_key: Optional[str] = None,
 ) -> None:
     responded = _normalise_dt(responded_at)
 
     with get_conn() as conn:
         cur = conn.cursor()
-        q = (
-            "WITH latest AS ("
-            "    SELECT dispatch_key FROM proc.workflow_email_tracking "
-            "    WHERE workflow_id=%s AND unique_id=%s "
-            "    ORDER BY dispatched_at DESC NULLS LAST, created_at DESC NULLS LAST "
-            "    LIMIT 1"
-            ") "
-            "UPDATE proc.workflow_email_tracking SET responded_at=%s, response_message_id=%s, matched=TRUE "
-            "WHERE workflow_id=%s AND unique_id=%s AND dispatch_key IN (SELECT dispatch_key FROM latest)"
-        )
-        cur.execute(
-            q,
-            (
-                workflow_id,
-                unique_id,
-                responded,
-                response_message_id,
-                workflow_id,
-                unique_id,
-            ),
-        )
+        if dispatch_key is not None:
+            q = (
+                "UPDATE proc.workflow_email_tracking "
+                "SET responded_at=%s, response_message_id=%s, matched=TRUE "
+                "WHERE workflow_id=%s AND unique_id=%s AND dispatch_key=%s"
+            )
+            cur.execute(
+                q,
+                (
+                    responded,
+                    response_message_id,
+                    workflow_id,
+                    unique_id,
+                    dispatch_key,
+                ),
+            )
+        else:
+            q = (
+                "WITH latest AS ("
+                "    SELECT dispatch_key FROM proc.workflow_email_tracking "
+                "    WHERE workflow_id=%s AND unique_id=%s "
+                "    ORDER BY dispatched_at DESC NULLS LAST, created_at DESC NULLS LAST "
+                "    LIMIT 1"
+                ") "
+                "UPDATE proc.workflow_email_tracking SET responded_at=%s, response_message_id=%s, matched=TRUE "
+                "WHERE workflow_id=%s AND unique_id=%s AND dispatch_key IN (SELECT dispatch_key FROM latest)"
+            )
+            cur.execute(
+                q,
+                (
+                    workflow_id,
+                    unique_id,
+                    responded,
+                    response_message_id,
+                    workflow_id,
+                    unique_id,
+                ),
+            )
         cur.close()
 
 
