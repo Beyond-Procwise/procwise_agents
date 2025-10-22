@@ -1742,6 +1742,10 @@ class NegotiationAgent(BaseAgent):
         finally:
             if hasattr(context, "_pending_email_actions"):
                 delattr(context, "_pending_email_actions")
+            if hasattr(context, "_pending_email_round_tasks"):
+                delattr(context, "_pending_email_round_tasks")
+            if hasattr(context, "_pending_email_round_lock"):
+                delattr(context, "_pending_email_round_lock")
         return result
 
     def run(self, context: AgentContext) -> AgentOutput:
@@ -1942,7 +1946,7 @@ class NegotiationAgent(BaseAgent):
     def _resolve_batch_entry_output(
         self, context: AgentContext, payload: Dict[str, Any]
     ):
-        """Execute a batch entry and hydrate deferred email tasks if present."""
+        """Execute a batch entry and capture deferred email tasks for later bundling."""
 
         result = self._execute_batch_entry(context, payload)
         if isinstance(result, AgentOutput) and isinstance(result.data, dict):
@@ -1950,18 +1954,21 @@ class NegotiationAgent(BaseAgent):
             if result.data.get("deferred_email") and isinstance(pending_task, dict):
                 identifier_info = pending_task.get("identifier") or {}
                 identifier = NegotiationIdentifier(
-                    workflow_id=
-                    identifier_info.get("workflow_id")
-                    or payload.get("workflow_id")
-                    or context.workflow_id,
-                    supplier_id=
-                    identifier_info.get("supplier_id")
-                    or payload.get("supplier_id")
-                    or payload.get("supplier"),
-                    session_reference=
-                    identifier_info.get("session_reference")
-                    or payload.get("session_reference")
-                    or payload.get("unique_id"),
+                    workflow_id=(
+                        identifier_info.get("workflow_id")
+                        or payload.get("workflow_id")
+                        or context.workflow_id
+                    ),
+                    supplier_id=(
+                        identifier_info.get("supplier_id")
+                        or payload.get("supplier_id")
+                        or payload.get("supplier")
+                    ),
+                    session_reference=(
+                        identifier_info.get("session_reference")
+                        or payload.get("session_reference")
+                        or payload.get("unique_id")
+                    ),
                     round_number=int(
                         identifier_info.get("round_number")
                         or payload.get("round")
@@ -1969,8 +1976,83 @@ class NegotiationAgent(BaseAgent):
                         or 1
                     ),
                 )
-                result = self._finalize_email_round(context, identifier, pending_task)
+                self._register_pending_email_task(
+                    context=context,
+                    identifier=identifier,
+                    task=pending_task,
+                    result=result,
+                )
         return result
+
+    def _register_pending_email_task(
+        self,
+        *,
+        context: AgentContext,
+        identifier: NegotiationIdentifier,
+        task: Dict[str, Any],
+        result: AgentOutput,
+    ) -> None:
+        """Record deferred email finalisation tasks for later round bundling."""
+
+        try:
+            lock = getattr(context, "_pending_email_round_lock")
+        except AttributeError:
+            lock = threading.Lock()
+            setattr(context, "_pending_email_round_lock", lock)
+
+        try:
+            task_map = getattr(context, "_pending_email_round_tasks")
+        except AttributeError:
+            task_map = defaultdict(list)
+            setattr(context, "_pending_email_round_tasks", task_map)
+
+        try:
+            round_key = int(identifier.round_number)
+        except Exception:
+            round_key = 1
+
+        entry = {
+            "identifier": identifier,
+            "task": deepcopy(task),
+            "result": result,
+        }
+
+        if lock:
+            with lock:
+                task_map[round_key].append(entry)
+        else:  # pragma: no cover - defensive fallback
+            task_map[round_key].append(entry)
+
+    def _drain_pending_email_tasks(
+        self, context: AgentContext, round_number: Optional[int]
+    ) -> List[Dict[str, Any]]:
+        """Retrieve and clear pending email tasks for a negotiation round."""
+
+        try:
+            task_map = getattr(context, "_pending_email_round_tasks")
+        except AttributeError:
+            return []
+
+        if not task_map:
+            return []
+
+        try:
+            lock = getattr(context, "_pending_email_round_lock")
+        except AttributeError:
+            lock = None
+
+        try:
+            round_key = int(round_number) if round_number is not None else None
+        except Exception:
+            round_key = None
+
+        if round_key is None:
+            return []
+
+        if lock:
+            with lock:
+                return list(task_map.pop(round_key, []))
+        return list(task_map.pop(round_key, []))
 
     def _combine_supplier_responses(
         self, responses: Sequence[Dict[str, Any]]
@@ -2112,6 +2194,7 @@ class NegotiationAgent(BaseAgent):
         entries: Sequence[Dict[str, Any]],
         aggregated_results: List[Dict[str, Any]],
         drafts: List[Dict[str, Any]],
+        draft_bundles: List[Dict[str, Any]],
         failed_records: List[Dict[str, Any]],
         success_ids: List[str],
         next_agents: Set[str],
@@ -2150,6 +2233,18 @@ class NegotiationAgent(BaseAgent):
                 success_ids=success_ids,
                 next_agents=next_agents,
                 supplier_history=supplier_history,
+            )
+            self._queue_round_action_for_immediate_drafts(
+                context=context,
+                payload=payload,
+                result=result,
+            )
+            round_number = entries[0].get("round") if entries else None
+            self._finalize_round_email_bundle(
+                context=context,
+                round_number=round_number,
+                drafts=drafts,
+                draft_bundles=draft_bundles,
             )
             return
 
@@ -2192,6 +2287,25 @@ class NegotiationAgent(BaseAgent):
                     next_agents=next_agents,
                     supplier_history=supplier_history,
                 )
+                self._queue_round_action_for_immediate_drafts(
+                    context=context,
+                    payload=payload,
+                    result=result,
+                )
+
+        round_number = None
+        for entry in entries:
+            round_value = entry.get("round")
+            if round_value is not None:
+                round_number = round_value
+                break
+
+        self._finalize_round_email_bundle(
+            context=context,
+            round_number=round_number,
+            drafts=drafts,
+            draft_bundles=draft_bundles,
+        )
 
     def _execute_batch_entry(
         self, parent_context: AgentContext, payload: Dict[str, Any]
@@ -2207,6 +2321,159 @@ class NegotiationAgent(BaseAgent):
             routing_history=list(parent_context.routing_history),
         )
         return self.execute(sub_context)
+
+    def _finalize_round_email_bundle(
+        self,
+        *,
+        context: AgentContext,
+        round_number: Optional[int],
+        drafts: List[Dict[str, Any]],
+        draft_bundles: List[Dict[str, Any]],
+    ) -> None:
+        """Finalize deferred emails for a negotiation round after all suppliers complete."""
+
+        if round_number is None:
+            return
+
+        pending_entries = self._drain_pending_email_tasks(context, round_number)
+        if not pending_entries:
+            return
+
+        primary_identifier = None
+        for entry in pending_entries:
+            candidate = entry.get("identifier")
+            if isinstance(candidate, NegotiationIdentifier):
+                primary_identifier = candidate
+                break
+
+        if primary_identifier is None:
+            sample_task = pending_entries[0].get("task", {}) if pending_entries else {}
+            workflow_id = None
+            supplier_id = None
+            session_reference = None
+            if isinstance(sample_task, dict):
+                identifier_data = sample_task.get("identifier") or {}
+                if isinstance(identifier_data, dict):
+                    workflow_id = identifier_data.get("workflow_id")
+                    supplier_id = identifier_data.get("supplier_id") or identifier_data.get("supplier")
+                    session_reference = identifier_data.get("session_reference")
+            primary_identifier = NegotiationIdentifier(
+                workflow_id=workflow_id or context.workflow_id,
+                supplier_id=supplier_id or "SUP-BUNDLE",
+                session_reference=session_reference or f"bundle-{round_number}",
+                round_number=round_number,
+            )
+
+        bundle_task = {"bundle": pending_entries, "round_no": round_number}
+        bundle_output = self._finalize_email_round(context, primary_identifier, bundle_task)
+
+        if not isinstance(bundle_output, AgentOutput):
+            return
+
+        bundle_data = bundle_output.data if isinstance(bundle_output.data, dict) else {}
+        bundle_drafts = bundle_data.get("drafts") if isinstance(bundle_data, dict) else None
+        if isinstance(bundle_drafts, list):
+            for draft in bundle_drafts:
+                if isinstance(draft, dict):
+                    drafts.append(draft)
+
+        if isinstance(bundle_data, dict) and bundle_data:
+            draft_bundles.append(deepcopy(bundle_data))
+
+    def _queue_round_action_for_immediate_drafts(
+        self,
+        *,
+        context: AgentContext,
+        payload: Dict[str, Any],
+        result: AgentOutput,
+    ) -> None:
+        """Queue email draft actions for non-deferred negotiation outputs."""
+
+        if not isinstance(result, AgentOutput):
+            return
+        if result.status != AgentStatus.SUCCESS:
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        if not data or data.get("deferred_email") or data.get("pending_email"):
+            return
+
+        drafts_payload = data.get("drafts")
+        if not isinstance(drafts_payload, list):
+            return
+
+        draft_records = [draft for draft in drafts_payload if isinstance(draft, dict)]
+        if not draft_records:
+            return
+
+        supplier_id = (
+            data.get("supplier")
+            or payload.get("supplier_id")
+            or payload.get("supplier")
+        )
+        supplier_name = data.get("supplier_name") or payload.get("supplier_name")
+        round_number = (
+            data.get("round")
+            or data.get("round_no")
+            or payload.get("round")
+            or payload.get("round_number")
+        )
+
+        subject = None
+        draft_payload = data.get("draft_payload")
+        if isinstance(draft_payload, dict):
+            subject = draft_payload.get("subject")
+
+        body = data.get("negotiation_message")
+        if not body and draft_records:
+            primary = draft_records[0]
+            body = (
+                primary.get("body")
+                or primary.get("text")
+                or primary.get("html")
+            )
+
+        decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
+        negotiation_message = data.get("negotiation_message")
+
+        try:
+            self._queue_email_draft_action(
+                context,
+                supplier_id=supplier_id,
+                supplier_name=supplier_name,
+                round_number=round_number,
+                subject=subject,
+                body=body,
+                drafts=draft_records,
+                decision=decision,
+                negotiation_message=negotiation_message,
+                agentic_plan=result.agentic_plan,
+                context_snapshot=self._build_email_context_snapshot(context),
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to queue immediate negotiation draft action")
+            return
+
+        if getattr(context, "process_id", None) is None:
+            routing = getattr(self.agent_nick, "process_routing_service", None)
+            if routing and hasattr(routing, "log_action"):
+                pending: List[Dict[str, Any]] = getattr(
+                    context, "_pending_email_actions", []
+                )
+                entry = pending.pop() if pending else None
+                if entry and entry.get("process_output"):
+                    try:
+                        routing.log_action(
+                            process_id=None,
+                            agent_type="EmailDraftingAgent",
+                            action_desc=entry.get("description"),
+                            process_output=entry.get("process_output"),
+                            status="completed",
+                            run_id=None,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception(
+                            "Failed to log immediate negotiation draft action"
+                        )
 
     def _run_batch_negotiations(
         self,
@@ -2305,6 +2572,7 @@ class NegotiationAgent(BaseAgent):
 
         aggregated_results: List[Dict[str, Any]] = []
         drafts: List[Dict[str, Any]] = []
+        draft_bundles: List[Dict[str, Any]] = []
         failed_records: List[Dict[str, Any]] = []
         success_ids: List[str] = []
         supplier_history: Dict[str, Dict[str, Any]] = {}
@@ -2319,6 +2587,7 @@ class NegotiationAgent(BaseAgent):
                 entries=entries,
                 aggregated_results=aggregated_results,
                 drafts=drafts,
+                draft_bundles=draft_bundles,
                 failed_records=failed_records,
                 success_ids=success_ids,
                 next_agents=next_agents,
@@ -2443,7 +2712,8 @@ class NegotiationAgent(BaseAgent):
         data = {
             "negotiation_batch": True,
             "results": aggregated_results,
-            "drafts": drafts,
+            "drafts": draft_bundles,
+            "draft_records": drafts,
             "successful_suppliers": success_ids,
             "failed_suppliers": failed_records,
             "results_by_supplier": supplier_map,
@@ -2456,8 +2726,10 @@ class NegotiationAgent(BaseAgent):
             "negotiation_batch": True,
             "batch_results": aggregated_results,
         }
+        if draft_bundles:
+            pass_fields["drafts"] = draft_bundles
         if drafts:
-            pass_fields["drafts"] = drafts
+            pass_fields["draft_records"] = drafts
         if round_summaries:
             pass_fields["round_summaries"] = deepcopy(round_summaries)
 
@@ -2657,13 +2929,14 @@ class NegotiationAgent(BaseAgent):
 
         aggregated_results: List[Dict[str, Any]] = []
         drafts: List[Dict[str, Any]] = []
+        draft_bundles: List[Dict[str, Any]] = []
         failed_records: List[Dict[str, Any]] = []
 
         max_workers = self._compute_batch_workers(round_entries)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                (entry, executor.submit(self._execute_batch_entry, context, entry))
+                (entry, executor.submit(self._resolve_batch_entry_output, context, entry))
                 for entry in round_entries
             ]
 
@@ -2762,11 +3035,19 @@ class NegotiationAgent(BaseAgent):
                     if supplier_state is not None:
                         supplier_state["status"] = "FAILED"
 
+        self._finalize_round_email_bundle(
+            context=context,
+            round_number=round_num,
+            drafts=drafts,
+            draft_bundles=draft_bundles,
+        )
+
         round_result = {
             "round": round_num,
             "workflow_id": workflow_id,
             "results": aggregated_results,
             "drafts": drafts,
+            "draft_bundles": draft_bundles,
             "failed": failed_records,
             "suppliers_processed": len(round_entries),
             "suppliers_succeeded": len(
@@ -10306,6 +10587,149 @@ class NegotiationAgent(BaseAgent):
         identifier: NegotiationIdentifier,
         task: Dict[str, Any],
     ) -> AgentOutput:
+        bundle_entries = task.get("bundle") if isinstance(task, dict) else None
+        if isinstance(bundle_entries, list) and bundle_entries:
+            return self._finalize_email_round_bundle(
+                parent_context=parent_context,
+                identifier=identifier,
+                task=task,
+                bundle_entries=bundle_entries,
+            )
+        return self._finalize_single_email_round(parent_context, identifier, task)
+
+    def _finalize_email_round_bundle(
+        self,
+        *,
+        parent_context: AgentContext,
+        identifier: NegotiationIdentifier,
+        task: Dict[str, Any],
+        bundle_entries: Sequence[Dict[str, Any]],
+    ) -> AgentOutput:
+        combined_drafts: List[Dict[str, Any]] = []
+        combined_entries: List[Dict[str, Any]] = []
+        combined_pass_entries: List[Dict[str, Any]] = []
+        combined_suppliers: List[str] = []
+        aggregated_next_agents: Set[str] = set()
+        aggregated_status = AgentStatus.SUCCESS
+        aggregated_errors: List[str] = []
+
+        round_number = task.get("round_no") if isinstance(task, dict) else None
+        try:
+            round_number = int(round_number) if round_number is not None else identifier.round_number
+        except Exception:
+            round_number = identifier.round_number
+
+        bundle_results: List[Tuple[Dict[str, Any], AgentOutput, NegotiationIdentifier]] = []
+
+        for entry in bundle_entries:
+            entry_task = entry.get("task") if isinstance(entry, dict) else entry
+            if not isinstance(entry_task, dict):
+                continue
+            entry_identifier = entry.get("identifier") if isinstance(entry, dict) else None
+            if not isinstance(entry_identifier, NegotiationIdentifier):
+                identifier_payload = entry_task.get("identifier")
+                identifier_info = identifier_payload if isinstance(identifier_payload, dict) else {}
+                entry_identifier = NegotiationIdentifier(
+                    workflow_id=identifier_info.get("workflow_id") or identifier.workflow_id,
+                    supplier_id=identifier_info.get("supplier_id")
+                    or identifier_info.get("supplier")
+                    or identifier.supplier_id,
+                    session_reference=identifier_info.get("session_reference")
+                    or identifier.session_reference,
+                    round_number=identifier_info.get("round_number")
+                    or round_number,
+                )
+            result = self._finalize_single_email_round(parent_context, entry_identifier, dict(entry_task))
+            bundle_results.append((entry, result, entry_identifier))
+
+        for entry, result, entry_identifier in bundle_results:
+            if not isinstance(result, AgentOutput):
+                continue
+            entry_data = result.data if isinstance(result.data, dict) else {}
+            entry_pass_fields = result.pass_fields if isinstance(result.pass_fields, dict) else {}
+            drafts_payload = entry_data.get("drafts") if isinstance(entry_data, dict) else None
+            if isinstance(drafts_payload, list):
+                combined_drafts.extend([draft for draft in drafts_payload if isinstance(draft, dict)])
+            combined_suppliers.append(entry_identifier.supplier_id)
+            aggregated_next_agents.update(result.next_agents or [])
+            if result.status != AgentStatus.SUCCESS and aggregated_status == AgentStatus.SUCCESS:
+                aggregated_status = result.status
+            if result.error:
+                aggregated_errors.append(result.error)
+
+            combined_entries.append(
+                {
+                    "identifier": {
+                        "workflow_id": entry_identifier.workflow_id,
+                        "supplier_id": entry_identifier.supplier_id,
+                        "session_reference": entry_identifier.session_reference,
+                        "round_number": entry_identifier.round_number,
+                    },
+                    "data": deepcopy(entry_data),
+                    "pass_fields": deepcopy(entry_pass_fields),
+                    "status": result.status.value,
+                    "next_agents": list(result.next_agents),
+                    "error": result.error,
+                }
+            )
+            combined_pass_entries.append(
+                {
+                    "identifier": {
+                        "workflow_id": entry_identifier.workflow_id,
+                        "supplier_id": entry_identifier.supplier_id,
+                        "session_reference": entry_identifier.session_reference,
+                        "round_number": entry_identifier.round_number,
+                    },
+                    "pass_fields": deepcopy(entry_pass_fields),
+                }
+            )
+
+            stored_result = entry.get("result") if isinstance(entry, dict) else None
+            if isinstance(stored_result, AgentOutput):
+                stored_result.status = result.status
+                stored_result.data = result.data
+                stored_result.pass_fields = result.pass_fields
+                stored_result.error = result.error
+                stored_result.next_agents = list(result.next_agents)
+                stored_result.action_id = result.action_id
+                stored_result.agentic_plan = result.agentic_plan
+                stored_result.context_snapshot = result.context_snapshot
+
+        bundle_payload = {
+            "round": round_number,
+            "workflow_id": identifier.workflow_id,
+            "bundled": True,
+            "suppliers": combined_suppliers,
+            "entries": combined_entries,
+            "drafts": combined_drafts,
+        }
+
+        bundle_pass_fields = {
+            "round": round_number,
+            "bundled": True,
+            "suppliers": combined_suppliers,
+            "entries": deepcopy(combined_pass_entries),
+            "drafts": deepcopy(combined_drafts),
+        }
+
+        error_text = None
+        if aggregated_status != AgentStatus.SUCCESS and aggregated_errors:
+            error_text = "; ".join({err for err in aggregated_errors if err})
+
+        return AgentOutput(
+            status=aggregated_status,
+            data=bundle_payload,
+            pass_fields=bundle_pass_fields,
+            next_agents=sorted(aggregated_next_agents),
+            error=error_text,
+        )
+
+    def _finalize_single_email_round(
+        self,
+        parent_context: AgentContext,
+        identifier: NegotiationIdentifier,
+        task: Dict[str, Any],
+    ) -> AgentOutput:
         context_input = task.get("context_input") if isinstance(task.get("context_input"), dict) else {}
 
         state = deepcopy(task.get("state") or {})
@@ -10950,8 +11374,9 @@ class NegotiationAgent(BaseAgent):
 
         process_id = getattr(context, "process_id", None)
         if not process_id:
-            logger.debug("No process_id available for negotiation email draft logging")
-            return
+            logger.debug(
+                "No process_id available for negotiation email draft logging; using ad-hoc logging"
+            )
 
         status_value = "completed" if result.status == AgentStatus.SUCCESS else "failed"
 
