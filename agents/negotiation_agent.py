@@ -38,6 +38,9 @@ LLM_ENABLED = os.getenv("NEG_ENABLE_LLM", "1").strip() not in {"0", "false", "Fa
 LLM_MODEL = os.getenv("NEG_LLM_MODEL", "llama3.2:latest")
 COST_OF_CAPITAL_APR = float(os.getenv("NEG_COST_OF_CAPITAL_APR", "0.12"))
 LEAD_TIME_VALUE_PCT_PER_WEEK = float(os.getenv("NEG_LT_VALUE_PCT_PER_WEEK", "0.01"))
+THREAD_HISTORY_TRANSCRIPT_LIMIT = int(
+    os.getenv("NEG_THREAD_TRANSCRIPT_LIMIT", "10")
+)
 AGGRESSIVE_FIRST_COUNTER_PCT = float(os.getenv("NEG_FIRST_COUNTER_AGGR_PCT", "0.12"))
 FINAL_OFFER_PATTERNS = (
     "best and final",
@@ -9335,6 +9338,26 @@ class NegotiationAgent(BaseAgent):
         if plain_text:
             plain_text = EmailDraftingAgent._clean_body_text(plain_text)
 
+        thread_history_entries = self._get_email_thread_history(
+            workflow_id, supplier_id
+        )
+
+        transcript_plain = self._format_thread_history_plain(thread_history_entries)
+        if transcript_plain:
+            combined_plain = (
+                f"{plain_text}\n\n{transcript_plain}" if plain_text else transcript_plain
+            )
+            plain_text = EmailDraftingAgent._clean_body_text(combined_plain)
+
+        transcript_html = self._format_thread_history_html(thread_history_entries)
+        if transcript_html:
+            if sanitised_html:
+                sanitised_html = self._inject_history_into_html(
+                    sanitised_html, transcript_html
+                )
+            else:
+                sanitised_html = transcript_html
+
         unique_id = self._coerce_text(session_reference) or self._coerce_text(
             draft_payload.get("unique_id")
         )
@@ -9681,6 +9704,158 @@ class NegotiationAgent(BaseAgent):
             return []
         thread = self._email_thread_manager.get_thread(workflow_key, supplier_key)
         return [entry.to_dict() for entry in thread]
+
+    def _format_thread_history_plain(
+        self, entries: Sequence[Dict[str, Any]]
+    ) -> str:
+        if not entries:
+            return ""
+
+        recent_entries = list(entries)[-THREAD_HISTORY_TRANSCRIPT_LIMIT:]
+        lines: List[str] = ["--- Prior Thread History ---"]
+
+        for entry in recent_entries:
+            if not isinstance(entry, dict):
+                continue
+
+            round_number = entry.get("round_number")
+            round_display = (
+                f"Round {round_number}"
+                if isinstance(round_number, int)
+                else "Previous"
+            )
+
+            sent_at = self._coerce_text(entry.get("sent_at")) or "Unknown time"
+            sender = self._coerce_text(entry.get("sender")) or "Unknown sender"
+
+            recipients_payload = entry.get("recipients")
+            recipients_list: List[str] = []
+            if isinstance(recipients_payload, (list, tuple, set)):
+                recipients_list = [
+                    self._coerce_text(candidate) or ""
+                    for candidate in recipients_payload
+                ]
+            recipients = ", ".join(filter(None, recipients_list))
+
+            subject = self._coerce_text(entry.get("subject")) or "(no subject)"
+            raw_body = entry.get("body_text") or entry.get("body") or ""
+            cleaned_body = EmailDraftingAgent._clean_body_text(str(raw_body))
+            if len(cleaned_body) > 500:
+                cleaned_body = f"{cleaned_body[:499].rstrip()}…"
+
+            lines.extend(
+                [
+                    "",
+                    f"{round_display} • {sent_at}",
+                    f"From {sender}" + (f" → {recipients}" if recipients else ""),
+                    f"Subject: {subject}",
+                ]
+            )
+            if cleaned_body:
+                lines.append(cleaned_body)
+
+        return "\n".join(lines).strip()
+
+    def _format_thread_history_html(
+        self, entries: Sequence[Dict[str, Any]]
+    ) -> str:
+        if not entries:
+            return ""
+
+        recent_entries = list(entries)[-THREAD_HISTORY_TRANSCRIPT_LIMIT:]
+        sections: List[str] = []
+
+        for entry in recent_entries:
+            if not isinstance(entry, dict):
+                continue
+
+            round_number = entry.get("round_number")
+            round_display = (
+                f"Round {round_number}"
+                if isinstance(round_number, int)
+                else "Previous"
+            )
+
+            sent_at = self._coerce_text(entry.get("sent_at")) or "Unknown time"
+            sender = self._coerce_text(entry.get("sender")) or "Unknown sender"
+
+            recipients_payload = entry.get("recipients")
+            recipients_list: List[str] = []
+            if isinstance(recipients_payload, (list, tuple, set)):
+                recipients_list = [
+                    self._coerce_text(candidate) or ""
+                    for candidate in recipients_payload
+                ]
+            recipients = ", ".join(filter(None, recipients_list))
+
+            subject = self._coerce_text(entry.get("subject")) or "(no subject)"
+            raw_body = entry.get("body_text") or entry.get("body") or ""
+            cleaned_body = EmailDraftingAgent._clean_body_text(str(raw_body))
+            if len(cleaned_body) > 500:
+                cleaned_body = f"{cleaned_body[:499].rstrip()}…"
+
+            escaped_body = (
+                escape(cleaned_body).replace("\n", "<br/>") if cleaned_body else ""
+            )
+            escaped_recipients = escape(recipients) if recipients else ""
+
+            sections.append(
+                (
+                    '<div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #e2e8f0;">\n'
+                    f'  <div style="font-family:\'Segoe UI\',Arial,sans-serif;font-size:14px;font-weight:600;color:#0f172a;">{escape(round_display)} • {escape(sent_at)}</div>\n'
+                    f'  <div style="font-family:\'Segoe UI\',Arial,sans-serif;font-size:14px;color:#475569;margin-top:4px;">From {escape(sender)}'
+                    + (f" → {escaped_recipients}" if escaped_recipients else "")
+                    + '</div>\n'
+                    f'  <div style="font-family:\'Segoe UI\',Arial,sans-serif;font-size:14px;color:#0f172a;font-weight:600;margin-top:8px;">Subject: {escape(subject)}</div>\n'
+                    + (
+                        f'  <div style="font-family:\'Segoe UI\',Arial,sans-serif;font-size:14px;color:#1f2937;margin-top:6px;white-space:pre-wrap;">{escaped_body}</div>\n'
+                        if escaped_body
+                        else ""
+                    )
+                    + "</div>"
+                )
+            )
+
+        if not sections:
+            return ""
+
+        history_container = (
+            '<div data-procwise-thread-history="1" '
+            'style="margin-top:24px;padding-top:16px;border-top:1px solid #e2e8f0;">\n'
+            '  <h2 style="margin:0 0 16px 0;font-family:\'Segoe UI\',Arial,sans-serif;font-size:18px;color:#0f172a;">Prior Thread History</h2>\n'
+            f"  {''.join(sections)}\n"
+            "</div>"
+        )
+        return history_container
+
+    def _inject_history_into_html(self, html: str, transcript_html: str) -> str:
+        if not html or not transcript_html:
+            return html
+
+        insertion_marker = (
+            "          <tr>\n"
+            "            <td style=\"padding:20px 32px 28px 32px;background-color:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;font-size:12px;line-height:1.6;color:#64748b;border-top:1px solid #e2e8f0;\">\n"
+        )
+
+        history_row = (
+            "          <tr>\n"
+            "            <td style=\"padding:0 32px 32px 32px;font-family:'Segoe UI',Arial,sans-serif;\">\n"
+            f"              {transcript_html}\n"
+            "            </td>\n"
+            "          </tr>\n"
+        )
+
+        marker_index = html.find(insertion_marker)
+        if marker_index == -1:
+            closing_body = "</body>"
+            body_index = html.lower().rfind(closing_body)
+            if body_index == -1:
+                return f"{html}\n{transcript_html}"
+            return (
+                f"{html[:body_index]}\n{transcript_html}\n{html[body_index:]}"
+            )
+
+        return html[:marker_index] + history_row + html[marker_index:]
 
     def _get_email_thread_summary(
         self, workflow_id: Optional[str], supplier_id: Optional[str]
