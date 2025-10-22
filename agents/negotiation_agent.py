@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import hashlib
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from html import escape
 
@@ -9347,63 +9347,199 @@ class NegotiationAgent(BaseAgent):
         *,
         workflow_id: Optional[str],
         supplier_id: Optional[str],
-        round_number: int,
-        draft: Dict[str, Any],
-        decision: Dict[str, Any],
-        state: Dict[str, Any],
+        round_number: Optional[int] = None,
+        draft: Optional[Dict[str, Any]] = None,
+        decision: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
+        draft_records: Optional[Sequence[Dict[str, Any]]] = None,
+        subject: Optional[str] = None,
+        body: Optional[str] = None,
+        thread_headers: Optional[Union[Dict[str, Any], str]] = None,
+        email_action_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        recipients: Optional[Sequence[str]] = None,
+        cc: Optional[Sequence[str]] = None,
+        sender: Optional[str] = None,
+        session_reference: Optional[str] = None,
     ) -> Optional[EmailHistoryEntry]:
         workflow_key = self._coerce_text(workflow_id)
         supplier_key = self._coerce_text(supplier_id)
         if not workflow_key or not supplier_key:
             return None
 
-        email_entry = EmailHistoryEntry(
-            email_id=self._coerce_text(draft.get("id")) or str(uuid.uuid4()),
-            round_number=round_number,
-            supplier_id=supplier_key,
-            supplier_name=draft.get("supplier_name"),
-            subject=self._coerce_text(draft.get("subject")) or "",
-            body_text=self._coerce_text(draft.get("text")) or "",
-            body_html=self._coerce_text(draft.get("html")) or "",
-            sender=self._coerce_text(draft.get("sender")) or "",
-            recipients=list(draft.get("recipients") or []),
-            sent_at=datetime.now(timezone.utc),
-            message_id=self._coerce_text(
-                draft.get("message_id") or draft.get("Message-ID")
-            ),
-            thread_headers=dict(draft.get("thread_headers") or {}),
-            metadata=dict(draft.get("metadata") or {}),
-            decision=dict(decision or {}),
-            negotiation_context={
-                "positions": decision.get("positions"),
-                "counter_price": decision.get("counter_price"),
-                "strategy": decision.get("strategy"),
-                "play_recommendations": decision.get("play_recommendations"),
-            },
-        )
+        decision = dict(decision or {})
+        state = state if isinstance(state, dict) else {}
 
-        self._email_thread_manager.add_email(
-            workflow_key, supplier_key, email_entry
-        )
+        resolved_round = None
+        if round_number is not None:
+            try:
+                resolved_round = int(round_number)
+            except Exception:
+                resolved_round = None
+        if resolved_round is None:
+            try:
+                resolved_round = int(state.get("current_round", 1))
+            except Exception:
+                resolved_round = 1
+
+        aggregated_records: List[Dict[str, Any]] = []
+        if isinstance(draft, dict):
+            aggregated_records.append(draft)
+        if draft_records:
+            for record in draft_records:
+                if isinstance(record, dict):
+                    aggregated_records.append(record)
+
+        if not aggregated_records:
+            return None
+
+        subject_fallback = self._coerce_text(subject) or ""
+        body_fallback = self._coerce_text(body) or ""
+        sender_fallback = self._coerce_text(sender) or ""
+        recipients_fallback = list(recipients or [])
+        message_id_fallback = self._coerce_text(message_id)
+
+        thread_headers_fallback: Dict[str, Any] = {}
+        if isinstance(thread_headers, dict):
+            thread_headers_fallback = dict(thread_headers)
+        elif isinstance(thread_headers, str) and thread_headers:
+            thread_headers_fallback = {"raw": thread_headers}
+
+        cc_payload = list(cc or []) if cc else []
 
         history = state.get("email_history")
         if not isinstance(history, list):
             history = []
 
-        existing_index: Optional[int] = None
+        existing_history_map: Dict[str, Tuple[int, Dict[str, Any]]] = {}
         for idx, entry in enumerate(history):
-            if isinstance(entry, dict) and entry.get("email_id") == email_entry.email_id:
-                existing_index = idx
-                break
+            if isinstance(entry, dict) and entry.get("email_id"):
+                existing_history_map[str(entry["email_id"])] = (idx, entry)
 
-        entry_payload = email_entry.to_dict()
-        if existing_index is not None:
-            history[existing_index] = entry_payload
-        else:
-            history.append(entry_payload)
+        thread_entries = self._email_thread_manager.get_thread(
+            workflow_key, supplier_key
+        )
+        thread_entry_map: Dict[str, EmailHistoryEntry] = {
+            entry.email_id: entry for entry in thread_entries if entry.email_id
+        }
+
+        last_entry: Optional[EmailHistoryEntry] = None
+
+        for record in aggregated_records:
+            email_id = self._coerce_text(record.get("id")) or str(uuid.uuid4())
+            record_subject = (
+                self._coerce_text(record.get("subject")) or subject_fallback
+            )
+            record_text = self._coerce_text(record.get("text")) or body_fallback
+            record_html = self._coerce_text(record.get("html")) or body_fallback
+            record_sender = (
+                self._coerce_text(record.get("sender"))
+                or self._coerce_text(record.get("from"))
+                or sender_fallback
+            )
+            record_recipients = list(record.get("recipients") or [])
+            if not record_recipients and recipients_fallback:
+                record_recipients = list(recipients_fallback)
+
+            record_message_id = self._coerce_text(
+                record.get("message_id")
+                or record.get("Message-ID")
+                or message_id_fallback
+            )
+
+            record_headers: Dict[str, Any]
+            headers_candidate = record.get("thread_headers")
+            if isinstance(headers_candidate, dict):
+                record_headers = dict(headers_candidate)
+            elif isinstance(headers_candidate, str) and headers_candidate:
+                record_headers = {"raw": headers_candidate}
+            else:
+                record_headers = {}
+            if thread_headers_fallback:
+                record_headers = {**thread_headers_fallback, **record_headers}
+
+            record_metadata = dict(record.get("metadata") or {})
+            if email_action_id:
+                record_metadata.setdefault("email_action_id", email_action_id)
+            if session_reference:
+                record_metadata.setdefault("session_reference", session_reference)
+            if cc_payload:
+                record_metadata.setdefault("cc", list(cc_payload))
+
+            if not record_message_id:
+                record_message_id = self._coerce_text(
+                    record_headers.get("Message-ID")
+                    if isinstance(record_headers, dict)
+                    else None
+                ) or self._coerce_text(
+                    record_headers.get("message_id")
+                    if isinstance(record_headers, dict)
+                    else None
+                )
+
+            entry = EmailHistoryEntry(
+                email_id=email_id,
+                round_number=resolved_round,
+                supplier_id=supplier_key,
+                supplier_name=record.get("supplier_name"),
+                subject=record_subject,
+                body_text=record_text,
+                body_html=record_html,
+                sender=record_sender,
+                recipients=record_recipients,
+                sent_at=datetime.now(timezone.utc),
+                message_id=record_message_id,
+                thread_headers=record_headers,
+                metadata=record_metadata,
+                decision=dict(decision),
+                negotiation_context={
+                    "positions": decision.get("positions"),
+                    "counter_price": decision.get("counter_price"),
+                    "strategy": decision.get("strategy"),
+                    "play_recommendations": decision.get("play_recommendations"),
+                },
+            )
+
+            if email_id in thread_entry_map:
+                existing_entry = thread_entry_map[email_id]
+                entry.sent_at = existing_entry.sent_at
+                updated_entries = list(thread_entries)
+                for idx, existing in enumerate(updated_entries):
+                    if existing.email_id == email_id:
+                        updated_entries[idx] = entry
+                        break
+                self._email_thread_manager.set_thread(
+                    workflow_key, supplier_key, updated_entries
+                )
+            else:
+                self._email_thread_manager.add_email(
+                    workflow_key, supplier_key, entry
+                )
+                thread_entries = self._email_thread_manager.get_thread(
+                    workflow_key, supplier_key
+                )
+                thread_entry_map = {
+                    existing.email_id: existing for existing in thread_entries
+                }
+
+            entry_payload = entry.to_dict()
+            history_index: Optional[int] = None
+            if email_id in existing_history_map:
+                history_index = existing_history_map[email_id][0]
+                existing_history_map[email_id] = (history_index, entry_payload)
+            else:
+                existing_history_map[email_id] = (len(history), entry_payload)
+
+            if history_index is not None:
+                history[history_index] = entry_payload
+            else:
+                history.append(entry_payload)
+
+            last_entry = entry
 
         state["email_history"] = history
-        return email_entry
+
+        return last_entry
 
     def _get_email_thread_history(
         self, workflow_id: Optional[str], supplier_id: Optional[str]
