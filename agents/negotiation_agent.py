@@ -3008,6 +3008,16 @@ class NegotiationAgent(BaseAgent):
                 if self._detect_final_offer(message_text, []):
                     supplier_state["entry"]["final_offer_signaled"] = True
 
+            if responses:
+                try:
+                    current_round_value = int(
+                        supplier_state.get("current_round", round_num)
+                    )
+                except (TypeError, ValueError):
+                    current_round_value = round_num
+                if current_round_value <= round_num:
+                    supplier_state["current_round"] = round_num + 1
+
             logger.info(
                 "Processed %s response(s) for supplier %s in round %s",
                 len(responses),
@@ -3510,6 +3520,12 @@ class NegotiationAgent(BaseAgent):
                 state["supplier_reply_count"] = int(state.get("supplier_reply_count", 0))
             state["last_supplier_msg_id"] = message_id
             state["awaiting_response"] = False
+            try:
+                current_round_value = int(state.get("current_round", round_no))
+            except (TypeError, ValueError):
+                current_round_value = round_no
+            if current_round_value <= round_no:
+                state["current_round"] = round_no + 1
             supplier_reply_registered = True
             if thread_state:
                 thread_state.update_after_receive(message_id)
@@ -4158,7 +4174,6 @@ class NegotiationAgent(BaseAgent):
 
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
-        state["current_round"] = round_no + 1
         state["last_email_sent_at"] = datetime.now(timezone.utc)
         if email_action_id:
             state["last_agent_msg_id"] = email_action_id
@@ -4411,6 +4426,13 @@ class NegotiationAgent(BaseAgent):
                         state["last_supplier_msg_id"] = last_message_id
                 supplier_responses = new_responses or supplier_responses
                 state["awaiting_response"] = False
+                if increment_count or supplier_reply_registered:
+                    try:
+                        current_round_value = int(state.get("current_round", round_no))
+                    except (TypeError, ValueError):
+                        current_round_value = round_no
+                    if current_round_value <= round_no:
+                        state["current_round"] = round_no + 1
                 self._persist_thread_state(state, thread_state)
                 self._save_session_state(identifier.workflow_id, supplier, state)
                 public_state = self._public_state(state)
@@ -10470,7 +10492,6 @@ class NegotiationAgent(BaseAgent):
 
         state["status"] = "ACTIVE"
         state["awaiting_response"] = True
-        state["current_round"] = round_no + 1
         state["last_email_sent_at"] = datetime.now(timezone.utc)
         if email_action_id:
             state["last_agent_msg_id"] = email_action_id
