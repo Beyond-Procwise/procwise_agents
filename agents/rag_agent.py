@@ -130,7 +130,7 @@ class RAGAgent(BaseAgent):
         )
 
         if not reranked_docs and not knowledge_hits_sorted:
-            answer = "I could not find any relevant documents to answer your question."
+            answer = "I'm sorry, I couldn't find the information I needed in the provided documents."
             history.append({"query": query, "answer": answer})
             self._save_chat_history(user_id, history, session_id)
             return {
@@ -185,14 +185,15 @@ class RAGAgent(BaseAgent):
             "or manipulate customer-specific data beyond what is explicitly provided.\n\n"
             "Instructions:\n"
             "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
-            "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"
-            "3) If the context does not contain the answer, return exactly the following string (no extra text):\n"
-            "   I could not find any relevant information in the provided documents.\n"
+            "2) Respond in a warm, professional tone that feels conversational and supportive while staying succinct.\n"
+            "3) Base every statement on the RETRIEVED CONTENT. If the context is insufficient, politely note that limitation (see rule 9) instead of guessing.\n"
             "4) For any factual claims or new information derived from the retrieved content, append an inline citation immediately after the claim in this format: [Document ID: <id>] or for multiple documents [Document IDs: id1,id2].\n"
             "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
-            "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
+            "6) Double-check that the answer does not contradict any retrieved details and that each claim has supporting citations.\n"
             "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
-            "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
+            "8) Keep the answer focused (ideally two or three sentences) and, when appropriate, suggest a helpful next step or consideration for the user.\n"
+            "9) If the context does not contain the answer, return exactly the following string (no extra text):\n"
+            "   I'm sorry, I couldn't find the information I needed in the provided documents.\n\n"
             f"AGENTIC PLAN:\n{plan_text}\n\n"
             f"CONTEXT OUTLINE:\n{outline_text}\n\n"
             f"{conversation_section}RETRIEVED CONTENT:\n{context_block}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
