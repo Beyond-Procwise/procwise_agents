@@ -42,6 +42,7 @@ from agents.negotiation_agent import (
     EmailHistoryEntry,
     NegotiationAgent,
     NegotiationEmailHTMLShellBuilder,
+    NegotiationIdentifier,
 )
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
@@ -406,6 +407,119 @@ def test_negotiation_agent_detects_final_offer(monkeypatch):
     assert output.data["session_state"]["status"].upper() == "COMPLETED"
     assert output.data["awaiting_response"] is False
     assert output.data["drafts"] == []
+
+
+def test_finalize_email_round_waits_before_advancing_round(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+    agent.response_matcher = None
+
+    saved_states: List[Dict[str, Any]] = []
+
+    monkeypatch.setattr(agent, "_capture_email_to_history", lambda **_: None)
+    monkeypatch.setattr(agent, "_persist_thread_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        agent,
+        "_invoke_email_drafting_agent",
+        lambda ctx, payload: AgentOutput(
+            status=AgentStatus.SUCCESS,
+            data={
+                "drafts": [
+                    {
+                        "html": "<p>stub</p>",
+                        "unique_id": payload.get("session_reference", "session-100"),
+                        "thread_headers": {"Message-ID": "<draft@procwise>"},
+                        "supplier_id": "sup-42",
+                    }
+                ],
+                "subject": payload.get("subject"),
+                "body": payload.get("body", "Body"),
+                "thread_headers": {"Message-ID": "<draft@procwise>"},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_save_session_state",
+        lambda workflow_id, supplier, state: saved_states.append(dict(state)),
+    )
+    monkeypatch.setattr(agent, "_record_learning_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_get_email_thread_history", lambda *args, **kwargs: [])
+    monkeypatch.setattr(agent, "_get_email_thread_summary", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        agent,
+        "_compose_email_history_payload",
+        lambda *args, **kwargs: ([], {}, 0),
+    )
+    monkeypatch.setattr(agent, "_build_supplier_watch_fields", lambda **_: {})
+    monkeypatch.setattr(agent, "_public_state", lambda state: state)
+    monkeypatch.setattr(agent, "_get_cached_state", lambda *args, **kwargs: None)
+
+    context = AgentContext(
+        workflow_id="wf4",
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+    identifier = NegotiationIdentifier("wf4", "session-100", "sup-42", round_number=1)
+
+    task = {
+        "state": {"current_round": 1, "status": "ACTIVE"},
+        "workflow_id": "wf4",
+        "supplier": "sup-42",
+        "identifier": {"session_reference": "session-100"},
+        "round_no": 1,
+        "draft_payload": {
+            "subject": "Re: RFQ-200",
+            "recipients": ["quotes@example.com"],
+            "thread_headers": {"Message-ID": "<test@procwise>"},
+        },
+        "draft_stub": {"html": "<p>stub</p>", "unique_id": "session-100"},
+        "decision": {},
+        "email_payload": {
+            "subject": "Re: RFQ-200",
+            "body": "Body",
+            "session_reference": "session-100",
+        },
+        "negotiation_message": "Body",
+        "supplier_snippets": [],
+        "context_input": {},
+        "state_identifier": "wf4",
+    }
+
+    output = agent._finalize_email_round(context, identifier, task)
+
+    assert saved_states, "state persistence should be invoked"
+    persisted = saved_states[-1]
+    assert persisted["current_round"] == 1
+    assert persisted["awaiting_response"] is True
+    assert output.data["session_state"]["current_round"] == 1
+    assert output.data["awaiting_response"] is True
+
+
+def test_process_round_responses_advances_round_counter():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    negotiation_state = {
+        "active_suppliers": {
+            "sup-7": {
+                "entry": {"supplier_id": "sup-7"},
+                "current_round": 1,
+                "responses": [],
+                "decisions": [],
+                "status": "PENDING",
+            }
+        }
+    }
+
+    agent._process_round_responses(
+        {"sup-7": [{"message": "New offer", "price": 915.5}]}, negotiation_state, 1
+    )
+
+    supplier_state = negotiation_state["active_suppliers"]["sup-7"]
+    assert supplier_state["current_round"] == 2
+    assert supplier_state["entry"]["current_offer"] == 915.5
 
 
 def test_negotiation_playbook_policy_ranking(monkeypatch):
