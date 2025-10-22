@@ -1201,3 +1201,85 @@ def test_negotiation_agent_adopts_workflow_from_drafts_when_mismatched(monkeypat
     assert len(entries) == 3
     assert all(entry.get("workflow_id") == "draft-workflow" for entry in entries)
     assert kwargs["enable_negotiation"] is False
+
+
+def test_capture_email_history_single_draft_updates_state():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state: Dict[str, Any] = {"current_round": 1}
+    decision = {"positions": ["Commercial"], "counter_price": 1200.0}
+    draft = {
+        "id": "draft-single",
+        "subject": "Re: RFQ-1 – Updated offer",
+        "text": "Plain text body",
+        "html": "<p>HTML body</p>",
+        "sender": "buyer@example.com",
+        "recipients": ["supplier@example.com"],
+        "metadata": {"note": "first pass"},
+        "thread_headers": {"Message-ID": "<draft-single@procwise>"},
+    }
+
+    entry = agent._capture_email_to_history(
+        workflow_id="wf-single",
+        supplier_id="SUP-1",
+        round_number=1,
+        draft=draft,
+        decision=decision,
+        state=state,
+    )
+
+    assert entry is not None
+    assert entry.subject == "Re: RFQ-1 – Updated offer"
+    assert state["email_history"][0]["decision"]["counter_price"] == 1200.0
+    thread = agent._email_thread_manager.get_thread("wf-single", "SUP-1")
+    assert len(thread) == 1
+    assert thread[0].message_id == "<draft-single@procwise>"
+
+
+def test_capture_email_history_multi_draft_aggregated_metadata():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state: Dict[str, Any] = {"current_round": 2}
+    draft_records = [
+        {
+            "id": "draft-1",
+            "html": "<p>First draft</p>",
+            "metadata": {"variant": "a"},
+        },
+        {
+            "id": "draft-2",
+            "text": "Second plain text",
+        },
+    ]
+
+    agent._capture_email_to_history(
+        workflow_id="wf-multi",
+        supplier_id="SUP-2",
+        decision={"strategy": "Bundle"},
+        state=state,
+        draft_records=draft_records,
+        subject="Re: RFQ-9 – Negotiation update",
+        body="Fallback plain",
+        thread_headers={"Message-ID": "<thread@procwise>", "Subject": "Re: RFQ-9"},
+        email_action_id="email-action-9",
+        message_id="<thread@procwise>",
+        recipients=["primary@supplier.test"],
+        cc=["secondary@supplier.test"],
+        sender="buyer@example.com",
+        session_reference="session-xyz",
+    )
+
+    history = state.get("email_history")
+    assert isinstance(history, list) and len(history) == 2
+    for item in history:
+        assert item["subject"] == "Re: RFQ-9 – Negotiation update"
+        assert item["recipients"] == ["primary@supplier.test"]
+        assert item["metadata"]["email_action_id"] == "email-action-9"
+        assert item["metadata"]["cc"] == ["secondary@supplier.test"]
+        assert item["metadata"]["session_reference"] == "session-xyz"
+
+    thread = agent._email_thread_manager.get_thread("wf-multi", "SUP-2")
+    assert len(thread) == 2
+    assert all(entry.message_id == "<thread@procwise>" for entry in thread)
