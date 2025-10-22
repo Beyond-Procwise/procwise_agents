@@ -9703,14 +9703,21 @@ class NegotiationAgent(BaseAgent):
                 merged[email_id] = normalised
 
         def _parse_sent_at(value: Any) -> Optional[datetime]:
+            def _ensure_timezone(dt: datetime) -> datetime:
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+
             if isinstance(value, datetime):
-                return value
+                return _ensure_timezone(value)
             if isinstance(value, str) and value:
                 try:
-                    return datetime.fromisoformat(value)
+                    return _ensure_timezone(datetime.fromisoformat(value))
                 except ValueError:
                     try:
-                        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        return _ensure_timezone(
+                            datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        )
                     except Exception:
                         return None
             return None
