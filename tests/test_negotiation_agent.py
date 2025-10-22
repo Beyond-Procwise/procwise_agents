@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -1283,3 +1284,89 @@ def test_capture_email_history_multi_draft_aggregated_metadata():
     thread = agent._email_thread_manager.get_thread("wf-multi", "SUP-2")
     assert len(thread) == 2
     assert all(entry.message_id == "<thread@procwise>" for entry in thread)
+
+
+def test_compose_email_history_payload_merges_cached_state_metadata():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    state: Dict[str, Any] = {"current_round": 1}
+    decision = {"positions": ["Commercial"], "counter_price": 1200.0}
+    draft = {
+        "id": "draft-merge",
+        "subject": "Re: RFQ-2 – Updated terms",
+        "text": "Plain text body",
+        "html": "<p>HTML body</p>",
+        "sender": "buyer@example.com",
+        "recipients": ["supplier@example.com"],
+        "metadata": {"note": "initial"},
+        "thread_headers": {"Message-ID": "<draft-merge@procwise>"},
+    }
+
+    agent._capture_email_to_history(
+        workflow_id="wf-merge",
+        supplier_id="SUP-merge",
+        round_number=1,
+        draft=draft,
+        decision=decision,
+        state=state,
+    )
+
+    state_entry = state["email_history"][0]
+    state_entry.setdefault("metadata", {})["review_note"] = "Need review"
+    state_entry.setdefault("thread_headers", {})["X-Trace"] = "trace-123"
+
+    history_payload, summary_payload, total_count = agent._compose_email_history_payload(
+        "wf-merge",
+        "SUP-merge",
+        state,
+    )
+
+    assert total_count == 1
+    assert summary_payload["total_emails"] == 1
+    assert summary_payload["thread_key"] == "wf-merge:SUP-merge"
+    assert history_payload[0]["metadata"]["note"] == "initial"
+    assert history_payload[0]["metadata"]["review_note"] == "Need review"
+    assert history_payload[0]["thread_headers"]["Message-ID"] == "<draft-merge@procwise>"
+    assert history_payload[0]["thread_headers"]["X-Trace"] == "trace-123"
+
+
+def test_compose_email_history_payload_handles_missing_thread_entries():
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    sent_at = datetime(2024, 5, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat()
+    state = {
+        "email_history": [
+            {
+                "email_id": "state-only",
+                "round_number": 2,
+                "subject": "Follow-up",
+                "body_text": "Hi team",
+                "body_html": "<p>Hi team</p>",
+                "sender": "buyer@example.com",
+                "recipients": ["supplier@example.com"],
+                "sent_at": sent_at,
+                "metadata": {"origin": "cached"},
+                "thread_headers": {},
+                "decision": {"strategy": "Review"},
+                "negotiation_context": {},
+            }
+        ]
+    }
+
+    history_payload, summary_payload, total_count = agent._compose_email_history_payload(
+        "wf-state",
+        "SUP-state",
+        state,
+    )
+
+    assert total_count == 1
+    assert summary_payload["total_emails"] == 1
+    assert summary_payload["rounds"] == [2]
+    assert summary_payload["thread_key"] == "wf-state:SUP-state"
+    assert summary_payload["first_sent"] == sent_at
+    assert summary_payload["last_sent"] == sent_at
+    assert history_payload[0]["email_id"] == "state-only"
+    assert history_payload[0]["metadata"]["origin"] == "cached"
+    assert history_payload[0]["supplier_id"] == "SUP-state"
