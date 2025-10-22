@@ -133,6 +133,12 @@ class EmailDispatchService:
                     "Draft found but missing unique_id. Draft data may be corrupted."
                 )
 
+            review_status = str(draft.get("review_status") or "").upper()
+            if review_status not in {"APPROVED", "SENT"}:
+                raise ValueError(
+                    "Draft must be approved (review_status=APPROVED) before dispatch"
+                )
+
             rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
 
             recipient_list = self._normalise_recipients(
@@ -366,7 +372,7 @@ class EmailDispatchService:
             cur.execute(
                 """
                 SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
                        workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
                 FROM proc.draft_rfq_emails
                 WHERE unique_id = %s
@@ -384,7 +390,7 @@ class EmailDispatchService:
             cur.execute(
                 """
                 SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
                        workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
                 FROM proc.draft_rfq_emails
                 WHERE rfq_id = %s
@@ -397,8 +403,8 @@ class EmailDispatchService:
 
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
         values = list(row)
-        if len(values) < 19:
-            values.extend([None] * (19 - len(values)))
+        if len(values) < 20:
+            values.extend([None] * (20 - len(values)))
 
         (
             draft_id,
@@ -408,6 +414,7 @@ class EmailDispatchService:
             subject,
             body,
             sent,
+            review_status,
             recipient_email,
             contact_level,
             thread_index,
@@ -420,7 +427,7 @@ class EmailDispatchService:
             mailbox,
             dispatch_run_id,
             dispatched_at,
-        ) = values[:19]
+        ) = values[:20]
 
         hydrated: Dict[str, Any]
         if isinstance(payload, dict):
@@ -439,6 +446,7 @@ class EmailDispatchService:
             "subject": subject,
             "body": body,
             "sent_status": bool(sent),
+            "review_status": (review_status or "PENDING"),
             "receiver": recipient_email,
             "contact_level": contact_level,
             "thread_index": thread_index,
@@ -464,6 +472,8 @@ class EmailDispatchService:
             hydrated["recipients"] = []
         if not hydrated.get("sender"):
             hydrated["sender"] = getattr(self.settings, "ses_default_sender", "")
+        if not hydrated.get("review_status"):
+            hydrated["review_status"] = (review_status or "PENDING")
         return hydrated
 
     @staticmethod
@@ -493,8 +503,8 @@ class EmailDispatchService:
         sent: bool,
     ) -> None:
         values = list(row)
-        if len(values) < 19:
-            values.extend([None] * (19 - len(values)))
+        if len(values) < 20:
+            values.extend([None] * (20 - len(values)))
 
         draft_id = values[0]
         recipient = recipients[0] if recipients else payload.get("receiver")
@@ -509,11 +519,11 @@ class EmailDispatchService:
         supplier_id = payload.get("supplier_id") or values[2]
         supplier_name = payload.get("supplier_name") or values[3]
         rfq_value = payload.get("rfq_id") or values[1]
-        workflow_id = payload.get("workflow_id") or values[13]
-        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or values[14]
-        unique_id = payload.get("unique_id") or values[15] or uuid.uuid4().hex
-        mailbox = payload.get("mailbox") or values[16]
-        dispatch_run_id = payload.get("dispatch_run_id") or values[17]
+        workflow_id = payload.get("workflow_id") or values[14]
+        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or values[15]
+        unique_id = payload.get("unique_id") or values[16] or uuid.uuid4().hex
+        mailbox = payload.get("mailbox") or values[17]
+        dispatch_run_id = payload.get("dispatch_run_id") or values[18]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -533,6 +543,7 @@ class EmailDispatchService:
                     unique_id = %s,
                     mailbox = %s,
                     dispatch_run_id = %s,
+                    review_status = CASE WHEN %s THEN 'SENT' ELSE review_status END,
                     dispatched_at = CASE WHEN %s THEN NOW() ELSE dispatched_at END,
                     sent_on = CASE WHEN %s THEN NOW() ELSE sent_on END,
                     updated_on = NOW()
@@ -553,6 +564,7 @@ class EmailDispatchService:
                     unique_id,
                     mailbox,
                     dispatch_run_id,
+                    bool(sent),
                     bool(sent),
                     bool(sent),
                     draft_id,

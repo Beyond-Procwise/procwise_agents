@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import types
 from types import SimpleNamespace
 
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
@@ -9,7 +10,23 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
+_backend_scheduler_stub = types.ModuleType("services.backend_scheduler")
+
+
+class _DummyScheduler:
+    @classmethod
+    def ensure(cls, *_args, **_kwargs):
+        return cls()
+
+    def notify_email_dispatch(self, *args, **kwargs):  # pragma: no cover - stub
+        return None
+
+
+_backend_scheduler_stub.BackendScheduler = _DummyScheduler
+sys.modules.setdefault("services.backend_scheduler", _backend_scheduler_stub)
+
+DEFAULT_RFQ_SUBJECT = "Sourcing Request – Pricing Discussion"
+
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
 from repositories import workflow_email_tracking_repo
@@ -24,6 +41,7 @@ class InMemoryDraftStore:
     def add(self, record):
         record = dict(record)
         record.setdefault("id", self.next_id)
+        record.setdefault("review_status", "PENDING")
         self.rows[record["id"]] = record
         self.next_id += 1
         return record["id"]
@@ -47,6 +65,7 @@ class InMemoryDraftStore:
             row["subject"],
             row["body"],
             row["sent"],
+            row.get("review_status", "PENDING"),
             row.get("recipient_email"),
             row.get("contact_level", 0),
             row.get("thread_index", 1),
@@ -111,6 +130,7 @@ class DummyCursor:
                 unique_id,
                 mailbox,
                 dispatch_run_id,
+                review_toggle,
                 dispatched_toggle,
                 sent_toggle,
                 draft_id,
@@ -131,6 +151,8 @@ class DummyCursor:
             updates["supplier_id"] = supplier_id
             updates["supplier_name"] = supplier_name
             updates["rfq_id"] = rfq_value
+            if review_toggle:
+                updates["review_status"] = "SENT"
             if sent_toggle:
                 updates["sent_on"] = "now"
             self.store.update(draft_id, **updates)
@@ -195,6 +217,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "thread_index": 1,
         "contact_level": 1,
         "sent_status": False,
+        "review_status": "APPROVED",
         "action_id": "action-1",
         "workflow_id": "wf-test-1",
         "unique_id": unique_id,
