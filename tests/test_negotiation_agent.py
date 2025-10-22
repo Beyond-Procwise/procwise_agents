@@ -39,6 +39,7 @@ sys.modules.setdefault("orchestration", _stub_orchestration_pkg)
 sys.modules.setdefault("orchestration.prompt_engine", _stub_prompt_module)
 
 from agents.negotiation_agent import (
+    EmailHistoryEntry,
     NegotiationAgent,
     NegotiationEmailHTMLShellBuilder,
 )
@@ -137,6 +138,25 @@ def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
 
     monkeypatch.setattr(agent, "_ensure_email_agent", lambda: StubEmailAgent())
 
+    history_entry = EmailHistoryEntry(
+        email_id="hist-1",
+        round_number=1,
+        supplier_id="SUP-1",
+        supplier_name="Acme Supplies",
+        subject="Initial Terms from Alex",
+        body_text="Alex: We're offering a 5% discount on the order.",
+        body_html="<p>Alex offer</p>",
+        sender="alex@example.com",
+        recipients=["buyer@example.com"],
+        sent_at=datetime(2024, 1, 5, 13, 30, tzinfo=timezone.utc),
+        message_id="<m1@procwise.test>",
+        thread_headers={},
+        metadata={},
+        decision={},
+        negotiation_context={},
+    )
+    agent._email_thread_manager.set_thread("wf-html", "SUP-1", [history_entry])
+
     context = AgentContext(
         workflow_id="wf-html",
         agent_id="negotiation",
@@ -171,6 +191,10 @@ def test_negotiation_agent_builds_enhanced_html_stub(monkeypatch):
     assert "Hold pricing for 12 months" in stub["html"]
     assert stub["text"].startswith("Hello Alex")
     assert "<html" not in stub["text"].lower()
+    assert "Prior Thread History" in stub["text"]
+    assert "alex@example.com" in stub["text"]
+    assert "Initial Terms from Alex" in stub["html"]
+    assert "data-procwise-thread-history" in stub["html"]
 
 
 def test_negotiation_agent_draft_stub_preserves_html_shell(monkeypatch):
