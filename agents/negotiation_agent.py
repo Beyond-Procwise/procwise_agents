@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from html import escape
+from email.utils import parsedate_to_datetime
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
@@ -3259,6 +3260,8 @@ class NegotiationAgent(BaseAgent):
     ) -> None:
         """Update negotiation state with supplier responses."""
 
+        workflow_hint = self._coerce_text(negotiation_state.get("workflow_id"))
+
         for supplier_id, responses in supplier_responses.items():
             supplier_state = negotiation_state["active_suppliers"].get(supplier_id)
             if not supplier_state:
@@ -3268,6 +3271,17 @@ class NegotiationAgent(BaseAgent):
                     round_num,
                 )
                 continue
+
+            entry_payload = supplier_state.get("entry")
+            if not isinstance(entry_payload, dict):
+                entry_payload = {}
+                supplier_state["entry"] = entry_payload
+
+            supplier_workflow = (
+                workflow_hint
+                or self._coerce_text(entry_payload.get("workflow_id"))
+                or self._coerce_text(entry_payload.get("workflow"))
+            )
 
             supplier_state.setdefault("responses", []).extend(
                 [response for response in responses if isinstance(response, dict)]
@@ -3288,6 +3302,24 @@ class NegotiationAgent(BaseAgent):
 
                 if self._detect_final_offer(message_text, []):
                     supplier_state["entry"]["final_offer_signaled"] = True
+
+                response_workflow = supplier_workflow or self._coerce_text(
+                    response.get("workflow_id")
+                )
+                if response_workflow:
+                    if not supplier_workflow:
+                        supplier_workflow = response_workflow
+                    if not workflow_hint:
+                        workflow_hint = response_workflow
+                        negotiation_state.setdefault("workflow_id", response_workflow)
+                    if "workflow_id" not in entry_payload:
+                        entry_payload["workflow_id"] = response_workflow
+                self._capture_supplier_response(
+                    workflow_id=response_workflow,
+                    supplier_id=supplier_id,
+                    round_number=round_num,
+                    response=response,
+                )
 
             if responses:
                 try:
@@ -9810,6 +9842,254 @@ class NegotiationAgent(BaseAgent):
             sender_name=sender_name,
             company_name=company_name or "Procwise",
         )
+
+    def _capture_supplier_response(
+        self,
+        *,
+        workflow_id: Optional[str],
+        supplier_id: Optional[str],
+        round_number: Optional[int],
+        response: Optional[Dict[str, Any]],
+    ) -> Optional[EmailHistoryEntry]:
+        workflow_key = self._coerce_text(workflow_id)
+        supplier_key = self._coerce_text(supplier_id)
+        if not workflow_key or not supplier_key:
+            return None
+        if not isinstance(response, dict):
+            return None
+
+        metadata_payload = dict(response.get("metadata") or {})
+
+        def _resolve_round() -> int:
+            candidates = [
+                round_number,
+                response.get("round_number"),
+                response.get("round"),
+                (metadata_payload.get("round") if isinstance(metadata_payload, dict) else None),
+            ]
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                try:
+                    parsed = int(candidate)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    return parsed
+            return 1
+
+        resolved_round = _resolve_round()
+
+        def _resolve_timestamp(*values: Any) -> datetime:
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, datetime):
+                    if value.tzinfo is None:
+                        return value.replace(tzinfo=timezone.utc)
+                    return value
+                if isinstance(value, (int, float)):
+                    try:
+                        return datetime.fromtimestamp(value, tz=timezone.utc)
+                    except Exception:
+                        continue
+                text_value = self._coerce_text(value)
+                if not text_value:
+                    continue
+                try:
+                    return datetime.fromisoformat(text_value)
+                except ValueError:
+                    pass
+                try:
+                    return datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+                try:
+                    parsed_dt = parsedate_to_datetime(text_value)
+                except Exception:
+                    parsed_dt = None
+                if parsed_dt:
+                    if parsed_dt.tzinfo is None:
+                        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                    return parsed_dt
+            return datetime.now(timezone.utc)
+
+        sent_at = _resolve_timestamp(
+            response.get("sent_at"),
+            response.get("received_at"),
+            response.get("received_time"),
+            response.get("response_date"),
+            response.get("timestamp"),
+            response.get("date"),
+            metadata_payload.get("sent_at") if isinstance(metadata_payload, dict) else None,
+            metadata_payload.get("received_at") if isinstance(metadata_payload, dict) else None,
+            metadata_payload.get("timestamp") if isinstance(metadata_payload, dict) else None,
+        )
+
+        message_id = self._coerce_text(
+            response.get("message_id")
+            or response.get("response_message_id")
+            or response.get("Message-ID")
+        )
+
+        thread_headers_candidate = response.get("thread_headers") or response.get("headers")
+        if isinstance(thread_headers_candidate, dict):
+            thread_headers: Dict[str, Any] = dict(thread_headers_candidate)
+        elif isinstance(thread_headers_candidate, str) and thread_headers_candidate:
+            thread_headers = {"raw": thread_headers_candidate}
+        else:
+            thread_headers = {}
+
+        if isinstance(thread_headers, dict):
+            if not message_id:
+                message_id = self._coerce_text(
+                    thread_headers.get("Message-ID") or thread_headers.get("message_id")
+                )
+            in_reply_to = self._coerce_text(
+                thread_headers.get("In-Reply-To")
+                or response.get("in_reply_to")
+                or response.get("original_message_id")
+            )
+            if in_reply_to and "In-Reply-To" not in thread_headers:
+                thread_headers["In-Reply-To"] = in_reply_to
+            references = response.get("references")
+            if references and "References" not in thread_headers:
+                thread_headers["References"] = references
+        else:
+            thread_headers = {}
+
+        email_id = (
+            message_id
+            or self._coerce_text(response.get("email_id"))
+            or str(uuid.uuid4())
+        )
+        if not message_id:
+            message_id = email_id
+        if message_id and "Message-ID" not in thread_headers:
+            thread_headers["Message-ID"] = message_id
+
+        subject = (
+            self._coerce_text(response.get("subject"))
+            or self._coerce_text(response.get("response_subject"))
+            or self._coerce_text(thread_headers.get("Subject"))
+            or "Supplier response"
+        )
+
+        body_text = (
+            self._extract_message_from_response(response)
+            or self._coerce_text(response.get("body_text"))
+            or self._coerce_text(response.get("response_text"))
+            or ""
+        )
+
+        body_html = (
+            self._coerce_text(response.get("body_html"))
+            or self._coerce_text(response.get("html"))
+            or self._coerce_text(response.get("response_body"))
+            or ""
+        )
+        if not body_html and body_text:
+            body_html = self._simple_html_from_text(body_text)
+
+        sender = (
+            self._coerce_text(response.get("sender"))
+            or self._coerce_text(response.get("from"))
+            or self._coerce_text(response.get("from_addr"))
+            or self._coerce_text(response.get("response_from"))
+            or self._coerce_text(response.get("supplier_email"))
+            or ""
+        )
+
+        recipient_candidates: List[str] = []
+        for candidate in (
+            response.get("recipients"),
+            response.get("to"),
+            response.get("to_addr"),
+            response.get("buyer_email"),
+            response.get("original_recipients"),
+        ):
+            recipient_candidates.extend(self._normalise_recipient_list(candidate))
+        if isinstance(metadata_payload, dict):
+            recipient_candidates.extend(
+                self._normalise_recipient_list(metadata_payload.get("recipients"))
+            )
+            recipient_candidates.extend(
+                self._normalise_recipient_list(metadata_payload.get("cc"))
+            )
+        buyer_address = self._coerce_text(response.get("buyer_address"))
+        if buyer_address:
+            recipient_candidates.extend(self._normalise_recipient_list(buyer_address))
+
+        deduped_recipients: List[str] = []
+        seen_recipients: Set[str] = set()
+        for addr in recipient_candidates:
+            lowered = addr.lower()
+            if lowered in seen_recipients:
+                continue
+            seen_recipients.add(lowered)
+            deduped_recipients.append(addr)
+
+        extra_metadata_keys = (
+            "workflow_id",
+            "unique_id",
+            "rfq_id",
+            "mailbox",
+            "imap_uid",
+            "price",
+            "lead_time",
+            "match_confidence",
+            "response_time",
+            "supplier_email",
+            "from_addr",
+            "response_from",
+            "original_message_id",
+            "original_subject",
+        )
+        for key in extra_metadata_keys:
+            if isinstance(metadata_payload, dict) and key in metadata_payload:
+                continue
+            value = response.get(key)
+            if value is not None:
+                metadata_payload[key] = value
+
+        if isinstance(metadata_payload, dict):
+            metadata_payload.setdefault("source", "supplier_response")
+            if message_id and "message_id" not in metadata_payload:
+                metadata_payload["message_id"] = message_id
+
+        negotiation_context = {
+            "entry_type": "supplier_response",
+            "round_number": resolved_round,
+        }
+
+        entry = EmailHistoryEntry(
+            email_id=email_id,
+            round_number=resolved_round,
+            supplier_id=supplier_key,
+            supplier_name=self._coerce_text(response.get("supplier_name")),
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            sender=sender,
+            recipients=deduped_recipients,
+            sent_at=sent_at,
+            message_id=message_id,
+            thread_headers=thread_headers,
+            metadata=dict(metadata_payload) if isinstance(metadata_payload, dict) else {},
+            decision={},
+            negotiation_context=negotiation_context,
+        )
+
+        thread_entries = self._email_thread_manager.get_thread(workflow_key, supplier_key)
+        for idx, existing in enumerate(thread_entries):
+            if existing.email_id == email_id:
+                updated_entries = list(thread_entries)
+                updated_entries[idx] = entry
+                self._email_thread_manager.set_thread(workflow_key, supplier_key, updated_entries)
+                return entry
+
+        self._email_thread_manager.add_email(workflow_key, supplier_key, entry)
+        return entry
 
     def _capture_email_to_history(
         self,
