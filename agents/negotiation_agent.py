@@ -9511,6 +9511,12 @@ class NegotiationAgent(BaseAgent):
                 self._email_thread_manager.set_thread(
                     workflow_key, supplier_key, updated_entries
                 )
+                thread_entries = self._email_thread_manager.get_thread(
+                    workflow_key, supplier_key
+                )
+                thread_entry_map = {
+                    existing.email_id: existing for existing in thread_entries
+                }
             else:
                 self._email_thread_manager.add_email(
                     workflow_key, supplier_key, entry
