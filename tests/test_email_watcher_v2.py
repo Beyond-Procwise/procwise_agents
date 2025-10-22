@@ -1,19 +1,49 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from enum import Enum
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+import types
 
 import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from agents.base_agent import AgentOutput, AgentStatus
-from decimal import Decimal
+
+_orchestration_module = sys.modules.setdefault("orchestration", types.ModuleType("orchestration"))
+prompt_engine_stub = types.ModuleType("orchestration.prompt_engine")
+
+
+class PromptEngine:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    def render(self, *_, **__):
+        return {}
+
+
+prompt_engine_stub.PromptEngine = PromptEngine
+sys.modules["orchestration.prompt_engine"] = prompt_engine_stub
+setattr(_orchestration_module, "prompt_engine", prompt_engine_stub)
+
+
+class AgentStatus(str, Enum):
+    SUCCESS = "success"
+
+
+@dataclass
+class AgentOutput:
+    status: AgentStatus
+    data: dict
+    next_agents: Optional[List[str]] = None
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.supplier_response_repo import SupplierResponseRow
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from utils.email_tracking import (
     embed_unique_id_in_email_body,
@@ -32,27 +62,55 @@ class StubSupplierAgent:
         if action == "await_workflow_batch":
             workflow_id = context.input_data.get("workflow_id")
             pending = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
-            first_row = pending[0] if pending else {}
-            unique_id = first_row.get("unique_id") or workflow_id
-            response = {
-                "unique_id": unique_id,
-                "workflow_id": workflow_id,
-                "supplier_id": first_row.get("supplier_id"),
-            }
+            if not pending:
+                return AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data={
+                        "workflow_id": workflow_id,
+                        "batch_ready": False,
+                        "expected_responses": 0,
+                        "collected_responses": 0,
+                        "supplier_responses": [],
+                        "supplier_responses_batch": [],
+                        "supplier_responses_count": 0,
+                        "unique_ids": [],
+                        "batch_metadata": {"expected": 0, "collected": 0, "ready": False},
+                        "negotiation_batch": False,
+                    },
+                    next_agents=[],
+                )
+
+            latest_by_uid = {}
+            for row in pending:
+                uid = row.get("unique_id") or workflow_id
+                latest_by_uid[uid] = row
+
+            unique_ids = list(latest_by_uid.keys())
+            responses = []
+            for uid in unique_ids:
+                row = latest_by_uid[uid]
+                responses.append(
+                    {
+                        "unique_id": uid,
+                        "workflow_id": workflow_id,
+                        "supplier_id": row.get("supplier_id"),
+                    }
+                )
+            expected = len(unique_ids)
             return AgentOutput(
                 status=AgentStatus.SUCCESS,
                 data={
                     "workflow_id": workflow_id,
                     "batch_ready": True,
-                    "expected_responses": 1,
-                    "collected_responses": 1,
-                    "supplier_responses": [response],
-                    "supplier_responses_batch": [response],
-                    "supplier_responses_count": 1,
-                    "unique_ids": [unique_id],
+                    "expected_responses": expected,
+                    "collected_responses": expected,
+                    "supplier_responses": responses,
+                    "supplier_responses_batch": responses,
+                    "supplier_responses_count": expected,
+                    "unique_ids": unique_ids,
                     "batch_metadata": {
-                        "expected": 1,
-                        "collected": 1,
+                        "expected": expected,
+                        "collected": expected,
                         "ready": True,
                     },
                     "negotiation_batch": True,
@@ -167,6 +225,115 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
 
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []
+
+
+def test_email_watcher_tracks_multiple_responses_for_same_unique_id(monkeypatch):
+    workflow_id = "wf-double-response"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    supplier_agent = StubSupplierAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-2")
+    original_subject = "Request details"
+    original_message_id = "<orig-message>"
+
+    first_body = embed_unique_id_in_email_body("Thanks for reaching out", unique_id)
+    second_body = embed_unique_id_in_email_body("Updated pricing attached", unique_id)
+
+    responses = [
+        EmailResponse(
+            unique_id=unique_id,
+            supplier_id="sup-2",
+            supplier_email="supplier@example.com",
+            from_address="supplier@example.com",
+            message_id="<reply-first>",
+            subject=f"Re: {original_subject}",
+            body=first_body,
+            received_at=now + timedelta(minutes=3),
+            in_reply_to=(original_message_id,),
+        ),
+        EmailResponse(
+            unique_id=unique_id,
+            supplier_id="sup-2",
+            supplier_email="supplier@example.com",
+            from_address="supplier@example.com",
+            message_id="<reply-second>",
+            subject=f"Re: {original_subject}",
+            body=second_body,
+            received_at=now + timedelta(minutes=9),
+            in_reply_to=(original_message_id,),
+        ),
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    insert_calls: List[SupplierResponseRow] = []
+    original_insert = supplier_response_repo.insert_response
+
+    def _tracking_insert(row: SupplierResponseRow) -> None:
+        insert_calls.append(row)
+        return original_insert(row)
+
+    monkeypatch.setattr(supplier_response_repo, "insert_response", _tracking_insert)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-2",
+                "supplier_email": "supplier@example.com",
+                "message_id": original_message_id,
+                "subject": original_subject,
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["responded_count"] == 1
+    assert unique_id in result["response_history"]
+    assert len(result["response_history"][unique_id]) == 2
+
+    assert len(insert_calls) == 2
+    assert insert_calls[-1].response_text == second_body
+
+    assert supplier_agent.contexts, "Supplier agent should receive the batched response"
+    context = supplier_agent.contexts[-1]
+    assert context.input_data.get("body") == second_body
+    history = context.input_data.get("response_history")
+    assert isinstance(history, list) and len(history) == 2
+    assert history[-1]["body"] == second_body
+
+    assert fetcher.calls >= 1
 
 
 def test_parse_email_recovers_tracking_headers():
