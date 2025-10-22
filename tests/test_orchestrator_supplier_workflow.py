@@ -6,8 +6,10 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.base_agent import AgentOutput, AgentStatus
+from datetime import datetime, timezone
+
 from orchestration.orchestrator import Orchestrator
+from agents.base_agent import AgentOutput, AgentStatus
 
 
 class StubEmailAgent:
@@ -57,6 +59,7 @@ class StubCoordinator:
         dispatch_poll_interval,
         response_timeout,
         response_poll_interval,
+        dispatch_context=None,
     ):
         self.calls.append(
             {
@@ -66,6 +69,7 @@ class StubCoordinator:
                 "dispatch_poll_interval": dispatch_poll_interval,
                 "response_timeout": response_timeout,
                 "response_poll_interval": response_poll_interval,
+                "dispatch_context": dispatch_context,
             }
         )
         return {
@@ -182,10 +186,51 @@ def test_supplier_workflow_coordinates_agents(monkeypatch):
     assert supplier_input.get("await_all_responses") is True
     assert len(supplier_input.get("drafts", [])) == 2
     assert sorted(set(coordinator.calls[0]["unique_ids"])) == ["uid-1", "uid-2"]
+    assert coordinator.calls[0]["dispatch_context"] is None
     assert result["activation_monitor"]["activated"] is True
     assert result["dispatch_monitor"]["complete"] is True
     assert result["response_monitor"]["complete"] is False
     assert result["supplier_interaction"]["processed"] is True
+
+
+def test_supplier_workflow_passes_dispatch_freshness(monkeypatch):
+    email_agent = StubEmailAgent()
+    supplier_agent = StubSupplierAgent()
+    coordinator = StubCoordinator()
+
+    monkeypatch.setattr(
+        patch_dependencies, "coordinator", coordinator, raising=False
+    )
+
+    nick = StubNick(email_agent, supplier_agent)
+    orchestrator = Orchestrator(nick)
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "draft_payload": {
+            "subject": "RFQ",
+            "dispatch_freshness": {
+                "uid-1": {
+                    "min_dispatched_at": now.isoformat(),
+                    "thread_index": 3,
+                }
+            },
+            "draft_created_at": now.isoformat(),
+            "round": 3,
+        }
+    }
+
+    orchestrator.execute_workflow("supplier_interaction", payload)
+
+    context = coordinator.calls[0]["dispatch_context"]
+    assert context is not None
+    uid1_context = context.get("uid-1")
+    assert uid1_context is not None
+    assert uid1_context.get("thread_index") == 3
+    min_dt = uid1_context.get("min_dispatched_at")
+    assert isinstance(min_dt, datetime)
+    if "uid-2" in context:
+        assert isinstance(context["uid-2"].get("min_dispatched_at"), datetime)
 
 
 def test_supplier_workflow_realigns_draft_workflow_ids(monkeypatch):
@@ -252,6 +297,7 @@ def test_supplier_workflow_realigns_draft_workflow_ids(monkeypatch):
     coordinator_call = coordinator.calls[0]
     assert coordinator_call["workflow_id"] == canonical_workflow_id
     assert sorted(coordinator_call["unique_ids"]) == ["uid-1", "uid-2"]
+    assert coordinator_call["dispatch_context"] is None
     assert result["supplier_interaction"]["processed"] is True
 
 

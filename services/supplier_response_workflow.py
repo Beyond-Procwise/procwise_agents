@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 
@@ -48,6 +49,115 @@ class SupplierResponseWorkflow:
             normalised.append(candidate)
         return normalised
 
+    @staticmethod
+    def _coerce_timestamp(value: object) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                try:
+                    parsed = datetime.utcfromtimestamp(float(text))
+                except Exception:
+                    return None
+                return parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        return None
+
+    @classmethod
+    def _normalise_dispatch_context(
+        cls, context: Optional[Dict[object, object]]
+    ) -> Tuple[Dict[str, Dict[str, object]], Optional[Dict[str, object]]]:
+        """Coerce dispatch freshness requirements into a normalised mapping."""
+
+        if not isinstance(context, dict):
+            return {}, None
+
+        mapping: Dict[str, Dict[str, object]] = {}
+        default_entry: Optional[Dict[str, object]] = None
+
+        for key, raw in context.items():
+            if isinstance(raw, dict):
+                raw_entry = dict(raw)
+            else:
+                raw_entry = {"min_dispatched_at": raw}
+
+            min_dt = cls._coerce_timestamp(raw_entry.get("min_dispatched_at"))
+            thread_idx_raw = raw_entry.get("thread_index")
+            thread_idx: Optional[int]
+            try:
+                thread_idx = int(thread_idx_raw) if thread_idx_raw is not None else None
+            except Exception:
+                thread_idx = None
+
+            if min_dt is None and thread_idx is None:
+                continue
+
+            entry: Dict[str, object] = {}
+            if min_dt is not None:
+                entry["min_dispatched_at"] = min_dt
+            if thread_idx is not None:
+                entry["thread_index"] = thread_idx
+
+            if isinstance(key, str):
+                key_text = key.strip()
+            else:
+                key_text = str(key).strip()
+
+            if not key_text:
+                continue
+
+            lowered = key_text.lower()
+            if lowered in {"*", "__all__", "default"}:
+                default_entry = entry
+                continue
+
+            mapping[lowered] = entry
+
+        return mapping, default_entry
+
+    @staticmethod
+    def _extract_thread_index(row: object) -> Optional[int]:
+        headers = getattr(row, "thread_headers", None)
+        if isinstance(headers, dict):
+            candidates = (
+                "X-Procwise-Thread-Index",
+                "X-Thread-Index",
+                "Thread-Index",
+                "thread_index",
+            )
+            for key in candidates:
+                value = headers.get(key)
+                if value in (None, ""):
+                    continue
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        try:
+                            return int(str(item).strip())
+                        except Exception:
+                            continue
+                else:
+                    try:
+                        return int(str(value).strip())
+                    except Exception:
+                        continue
+        return None
+
     def await_dispatch_completion(
         self,
         *,
@@ -56,6 +166,7 @@ class SupplierResponseWorkflow:
         timeout: Optional[int] = None,
         poll_interval: Optional[int] = None,
         wait_for_all: bool = True,
+        dispatch_context: Optional[Dict[object, object]] = None,
     ) -> Dict[str, object]:
         """Wait until tracked dispatches have recorded message IDs."""
 
@@ -91,6 +202,7 @@ class SupplierResponseWorkflow:
         start = time.monotonic()
 
         completed: Set[str] = set()
+        context_map, default_context = self._normalise_dispatch_context(dispatch_context)
         while True:
             try:
                 rows = self._workflow_repo.load_workflow_rows(workflow_id=workflow_id)
@@ -103,10 +215,45 @@ class SupplierResponseWorkflow:
             completed = {
                 str(getattr(row, "unique_id", "")).strip()
                 for row in rows
-                if getattr(row, "dispatched_at", None) is not None
-                and getattr(row, "message_id", None)
-                and str(getattr(row, "unique_id", "")).strip()
+                if getattr(row, "message_id", None)
             }
+
+            filtered: Set[str] = set()
+            for candidate in completed:
+                lowered = candidate.lower()
+                requirement = context_map.get(lowered) or default_context
+                if requirement:
+                    min_dt = requirement.get("min_dispatched_at")
+                    thread_requirement = requirement.get("thread_index")
+                    row_candidates = [
+                        row
+                        for row in rows
+                        if str(getattr(row, "unique_id", "")).strip() == candidate
+                        and getattr(row, "message_id", None)
+                    ]
+                    row_valid = False
+                    for row in row_candidates:
+                        row_dt = self._coerce_timestamp(
+                            getattr(row, "dispatched_at", None)
+                        )
+                        if min_dt and (row_dt is None or row_dt < min_dt):
+                            continue
+
+                        if thread_requirement is not None:
+                            row_thread = self._extract_thread_index(row)
+                            if row_thread is None and min_dt is None:
+                                continue
+                            if row_thread is not None and row_thread < thread_requirement:
+                                continue
+                        row_valid = True
+                        break
+
+                    if not row_valid:
+                        continue
+
+                filtered.add(candidate)
+
+            completed = filtered
             completed &= set(expected_ids)
 
             if len(completed) >= expected_total:
@@ -306,6 +453,7 @@ class SupplierResponseWorkflow:
         dispatch_poll_interval: Optional[int] = None,
         response_timeout: Optional[int] = None,
         response_poll_interval: Optional[int] = None,
+        dispatch_context: Optional[Dict[object, object]] = None,
     ) -> Dict[str, Dict[str, object]]:
         """Ensure dispatch and responses are ready for processing."""
 
@@ -326,6 +474,7 @@ class SupplierResponseWorkflow:
             timeout=dispatch_timeout,
             poll_interval=dispatch_poll_interval,
             wait_for_all=True,
+            dispatch_context=dispatch_context,
         )
 
         response_info = self.await_response_population(
