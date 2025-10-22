@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS proc.draft_rfq_emails (
     supplier_id TEXT,
     dispatched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- status fields (optional)
-    sent BOOLEAN DEFAULT TRUE
+    sent BOOLEAN DEFAULT TRUE,
+    review_status TEXT NOT NULL DEFAULT 'PENDING'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_rfq_emails_wf_uid
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS draft_rfq_emails (
     unique_id TEXT NOT NULL,
     supplier_id TEXT,
     dispatched_at TEXT NOT NULL,
-    sent INTEGER DEFAULT 1
+    sent INTEGER DEFAULT 1,
+    review_status TEXT NOT NULL DEFAULT 'PENDING'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_rfq_emails_wf_uid
@@ -123,14 +125,14 @@ def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:
         with get_conn() as conn:
             if isinstance(conn, sqlite3.Connection):
                 query = (
-                    "SELECT id, NULL, supplier_id, NULL, NULL, NULL, dispatched_at, sent, NULL, NULL, "
+                    "SELECT id, NULL, supplier_id, NULL, NULL, NULL, dispatched_at, sent, 'PENDING', NULL, NULL, "
                     "workflow_id, run_id, unique_id, NULL FROM draft_rfq_emails "
                     "WHERE unique_id = ? ORDER BY dispatched_at DESC LIMIT 1"
                 )
                 params = (unique_id,)
             else:
                 query = (
-                    "SELECT id, rfq_id, supplier_id, supplier_name, subject, body, created_on, sent, sender, payload, "
+                    "SELECT id, rfq_id, supplier_id, supplier_name, subject, body, created_on, sent, review_status, sender, payload, "
                     "workflow_id, run_id, unique_id, mailbox FROM proc.draft_rfq_emails "
                     "WHERE unique_id = %s ORDER BY created_on DESC LIMIT 1"
                 )
@@ -156,10 +158,11 @@ def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:
         "body": row[5],
         "created_on": row[6],
         "sent": row[7],
-        "sender": row[8],
-        "payload": row[9],
-        "workflow_id": row[10],
-        "run_id": row[11],
-        "unique_id": row[12],
-        "mailbox": row[13],
+        "review_status": row[8],
+        "sender": row[9],
+        "payload": row[10],
+        "workflow_id": row[11],
+        "run_id": row[12],
+        "unique_id": row[13],
+        "mailbox": row[14],
     }
