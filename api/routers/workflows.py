@@ -324,6 +324,7 @@ class EmailDispatchRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _extract_identifier(cls, values: Any) -> Any:
+        """Extract identifier with special handling for batch requests."""
         if not isinstance(values, dict):
             return values
 
@@ -337,7 +338,7 @@ class EmailDispatchRequest(BaseModel):
                 values["unique_id"] = unique_id
                 return values
 
-        drafts_array = values.get("drafts")
+        drafts_array = values.get("drafts") or values.get("draft_records")
         if isinstance(drafts_array, list) and drafts_array:
             first_draft = drafts_array[0]
             if isinstance(first_draft, dict):
@@ -346,23 +347,17 @@ class EmailDispatchRequest(BaseModel):
                     values["unique_id"] = unique_id
                     return values
 
-        draft_records = values.get("draft_records")
-        if isinstance(draft_records, list) and draft_records:
-            first_record = draft_records[0]
-            if isinstance(first_record, dict):
-                unique_id = first_record.get("unique_id") or first_record.get("rfq_id")
-                if unique_id:
-                    values["unique_id"] = unique_id
-                    return values
-
-        if "unique_id" in values or "supplier_id" in values:
+        if values.get("drafts") or values.get("draft_records"):
             return values
 
-        available_fields = list(values.keys())
-        raise ValueError(
-            "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
-            f"Available fields: {available_fields}"
-        )
+        if "unique_id" not in values and "supplier_id" not in values:
+            available_fields = list(values.keys())
+            raise ValueError(
+                "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
+                f"Available fields: {available_fields}"
+            )
+
+        return values
 
     @field_validator("unique_id", "rfq_id", "action_id", mode="before")
     @classmethod
@@ -609,17 +604,30 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
     raw_payload: Any
 
     if not body_bytes:
-        raw_payload = {}
-    else:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Empty Request Body",
+                "message": "Request body is required",
+                "hint": "Send JSON: {\"unique_id\": \"PROC-WF-xxx\"} or {\"drafts\": [{...}]}"
+            },
+        )
+
+    try:
+        raw_payload = json.loads(body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         try:
-            raw_payload = json.loads(body_bytes)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            try:
-                form = await request.form()
-            except Exception:
-                raw_payload = {}
-            else:
-                raw_payload = _merge_form_values(form)
+            form = await request.form()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Invalid Request Format",
+                    "message": "Request must be valid JSON or form data"
+                }
+            )
+        else:
+            raw_payload = _merge_form_values(form)
 
     if not isinstance(raw_payload, dict):
         raw_payload = {}
@@ -848,10 +856,75 @@ async def send_email(
     orchestrator: Orchestrator = Depends(get_orchestrator),
     agent_nick=Depends(get_agent_nick),
 ):
-    """Send a previously drafted RFQ email using the dispatch service."""
+    """Send previously drafted RFQ email(s) via Amazon SES.
+
+    **Supported Request Formats:**
+
+    1. Single draft by unique_id:
+       ```json
+       {"unique_id": "PROC-WF-123456"}
+       ```
+
+    2. Single draft by rfq_id (legacy):
+       ```json
+       {"rfq_id": "RFQ-2024-001"}
+       ```
+
+    3. Single draft with overrides:
+       ```json
+       {
+           "unique_id": "PROC-WF-123456",
+           "recipients": ["supplier@example.com"],
+           "subject": "Updated Subject"
+       }
+       ```
+
+    4. Single draft object:
+       ```json
+       {
+           "draft": {
+               "unique_id": "PROC-WF-123456",
+               "subject": "RFQ Request",
+               "recipients": ["supplier@example.com"]
+           }
+       }
+       ```
+
+    5. Multiple drafts (batch):
+       ```json
+       {
+           "drafts": [
+               {"unique_id": "PROC-WF-123456", ...},
+               {"unique_id": "PROC-WF-123457", ...}
+           ]
+       }
+       ```
+
+    **Response:**
+    - Single draft: Returns dispatch details with sent status
+    - Batch: Returns summary with individual results array
+
+    **Status Codes:**
+    - 200: Success (check 'sent' field for actual delivery status)
+    - 400: Invalid request or missing identifier
+    - 404: Draft not found
+    - 409: Workflow mismatch
+    - 500: Server error
+    """
 
     if dispatch_request.drafts:
         expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+
+        if not expanded_requests:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Invalid Batch Request",
+                    "message": "No valid drafts found in request",
+                    "hint": "Ensure each draft has 'unique_id' or 'rfq_id'"
+                },
+            )
+
         if len(expanded_requests) == 1:
             dispatch_request = expanded_requests[0]
         else:
@@ -868,7 +941,7 @@ async def send_email(
             detail={
                 "error": "Missing Identifier",
                 "message": "No unique_id or rfq_id provided",
-                "hint": "Send: {\"unique_id\": \"PROC-WF-xxx\"}",
+                "hint": "Send: {\"unique_id\": \"PROC-WF-xxx\"} or {\"draft\": {\"unique_id\": \"PROC-WF-xxx\"}}",
             },
         )
 
@@ -1078,9 +1151,26 @@ def _expand_batch_dispatch_requests(
 
     if request_model.drafts:
         for draft in request_model.drafts:
+            draft_id = draft.resolved_identifier()
+            if not draft_id:
+                logger.warning(
+                    "Skipping draft without identifier in batch request: %s",
+                    draft.model_dump(exclude_none=True)
+                )
+                continue
+
             payload: Dict[str, Any] = dict(overrides)
             payload["draft"] = draft.model_dump(exclude_none=True)
-            requests.append(EmailDispatchRequest.model_validate(payload))
+
+            try:
+                requests.append(EmailDispatchRequest.model_validate(payload))
+            except Exception as e:
+                logger.error(
+                    "Failed to validate draft %s in batch: %s",
+                    draft_id,
+                    str(e)
+                )
+                continue
     elif request_model.draft:
         payload: Dict[str, Any] = dict(overrides)
         payload["draft"] = request_model.draft.model_dump(exclude_none=True)
@@ -1184,21 +1274,6 @@ async def _execute_batch_dispatch(
         "failed": total - success_count,
         "results": results,
     }
-
-
-@router.post("/email/batch")
-async def dispatch_batch_emails(
-    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
-    orchestrator: Orchestrator = Depends(get_orchestrator),
-    agent_nick=Depends(get_agent_nick),
-):
-    expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
-
-    return await _execute_batch_dispatch(
-        expanded_requests=expanded_requests,
-        orchestrator=orchestrator,
-        agent_nick=agent_nick,
-    )
 
 
 @router.post("/{workflow_id}/email/dispatch-all")
