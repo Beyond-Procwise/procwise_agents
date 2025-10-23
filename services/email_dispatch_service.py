@@ -604,20 +604,7 @@ class EmailDispatchService:
         if row:
             return row
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
-                       workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
-                FROM proc.draft_rfq_emails
-                WHERE workflow_id = %s
-                ORDER BY sent ASC, thread_index DESC, id DESC
-                LIMIT 1
-                """,
-                (workflow_id,),
-            )
-            return cur.fetchone()
+        return None
 
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
         values = list(row)
