@@ -249,6 +249,9 @@ class EmailDispatchService:
                 body_override if body_override is not None else draft.get("body")
             )
             body_text = str(body_source).strip() if body_source else ""
+            subject = subject.strip()
+            if not subject or not body_text:
+                raise ValueError("Both subject and body are required")
 
             draft_metadata_source = (
                 draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
@@ -832,6 +835,8 @@ class EmailDispatchService:
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:
             return []
+        if isinstance(recipients, str):
+            recipients = [recipients]
         values: List[str] = []
         seen: set[str] = set()
         for value in recipients:
