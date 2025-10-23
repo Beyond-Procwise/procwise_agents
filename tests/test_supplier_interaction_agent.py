@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import threading
+import types
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,6 +13,27 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+_stub_prompt_module = types.ModuleType("orchestration.prompt_engine")
+
+
+class _StubPromptEngine:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get_prompt(self, *_args, **_kwargs):
+        return {}
+
+    def prompts_for_agent(self, *_args, **_kwargs):
+        return []
+
+
+_stub_prompt_module.PromptEngine = _StubPromptEngine
+_stub_orchestration_pkg = types.ModuleType("orchestration")
+_stub_orchestration_pkg.prompt_engine = _stub_prompt_module
+_stub_orchestration_pkg.__path__ = []  # type: ignore[attr-defined]
+sys.modules.setdefault("orchestration", _stub_orchestration_pkg)
+sys.modules.setdefault("orchestration.prompt_engine", _stub_prompt_module)
 
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
@@ -328,7 +350,7 @@ def test_waits_for_dispatch_metadata_before_polling(monkeypatch):
     monkeypatch.setattr(
         agent,
         "_process_responses_concurrently",
-        lambda rows: list(rows),
+        lambda rows, **kwargs: list(rows),
     )
     monkeypatch.setattr(
         agent,
@@ -666,6 +688,35 @@ def test_wait_for_response_requires_available_payload(monkeypatch):
     assert sleep_calls and sleep_calls[0] == pytest.approx(1.0)
 
 
+def test_process_responses_concurrently_flags_missing_fields():
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    rows = [
+        {
+            "workflow_id": "wf-validate",
+            "unique_id": "uid-validate",
+            "supplier_id": "SUP-VALID",
+            "response_text": "Thank you",
+            "subject": "Re: RFQ",
+            "message_id": "m-validate",
+            "from_addr": "supplier@example.com",
+            "received_time": datetime.utcnow(),
+        }
+    ]
+
+    responses = agent._process_responses_concurrently(
+        rows,
+        workflow_id="wf-validate",
+        expected_unique_ids=["uid-validate"],
+    )
+
+    assert responses
+    response = responses[0]
+    assert response["requires_review"] is True
+    assert any("missing" in issue for issue in response["validation_errors"])
+
+
 def test_supplier_interaction_waits_using_drafts():
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
@@ -926,7 +977,7 @@ def test_wait_for_multiple_responses_realigns_mixed_workflows(monkeypatch):
     monkeypatch.setattr(
         agent,
         "_process_responses_concurrently",
-        lambda rows: list(rows),
+        lambda rows, **kwargs: list(rows),
     )
 
     drafts = [
@@ -2175,7 +2226,11 @@ def test_await_full_response_batch_returns_responses_when_ready(monkeypatch):
         return responses
 
     monkeypatch.setattr(agent, "_poll_supplier_response_rows", fake_poll)
-    monkeypatch.setattr(agent, "_process_responses_concurrently", lambda rows: list(rows))
+    monkeypatch.setattr(
+        agent,
+        "_process_responses_concurrently",
+        lambda rows, **kwargs: list(rows),
+    )
 
     class DummyCoordinator:
         def __init__(self):
@@ -2206,3 +2261,52 @@ def test_await_full_response_batch_returns_responses_when_ready(monkeypatch):
     assert {resp.get("unique_id") for resp in result["responses"]} == {"uid-1", "uid-2"}
     assert coordinator.response_calls and coordinator.response_calls[0]["wait_for_all"] is True
     assert poll_calls and poll_calls[0]["include_processed"] is False
+
+
+def test_await_full_response_batch_flags_unresponsive_suppliers(monkeypatch):
+    nick = DummyNick()
+    agent = SupplierInteractionAgent(nick)
+
+    dispatch_rows = [
+        {"unique_id": "uid-1", "supplier_id": "SUP-1"},
+        {"unique_id": "uid-2", "supplier_id": "SUP-2"},
+    ]
+
+    monkeypatch.setattr(
+        agent,
+        "_await_dispatch_gate",
+        lambda *_, **__: {
+            "workflow_id": "wf-late",
+            "unique_ids": ["uid-1", "uid-2"],
+            "expected_dispatches": 2,
+            "completed_dispatches": 2,
+            "complete": True,
+            "dispatch_rows": dispatch_rows,
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_await_response_gate",
+        lambda *_, **__: {
+            "complete": False,
+            "responses": [
+                {
+                    "workflow_id": "wf-late",
+                    "unique_id": "uid-1",
+                    "supplier_id": "SUP-1",
+                    "supplier_output": {"price": "100", "lead_time": "5"},
+                }
+            ],
+            "collected_count": 1,
+        },
+    )
+
+    result = agent._await_full_response_batch(
+        "wf-late",
+        timeout=1,
+        poll_interval=1,
+    )
+
+    assert result["ready"] is False
+    assert result["unresponsive_suppliers"]
+    assert any(item["unique_id"] == "uid-2" for item in result["unresponsive_suppliers"])
