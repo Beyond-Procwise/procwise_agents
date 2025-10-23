@@ -46,25 +46,17 @@ class InMemoryDraftStore:
         self.next_id += 1
         return record["id"]
 
-    def get_latest(self, identifier):
-        candidates = [
-            row
-            for row in self.rows.values()
-            if row.get("unique_id") == identifier or row["rfq_id"] == identifier
-        ]
-        if not candidates:
+    def _row_to_tuple(self, row):
+        if row is None:
             return None
-        # Order by sent flag then thread index then id to mirror SQL
-        candidates.sort(key=lambda row: (row["sent"], -row["thread_index"], -row["id"]))
-        row = candidates[0]
         return (
             row["id"],
             row["rfq_id"],
             row.get("supplier_id"),
             row.get("supplier_name"),
-            row["subject"],
-            row["body"],
-            row["sent"],
+            row.get("subject"),
+            row.get("body"),
+            row.get("sent", False),
             row.get("review_status", "PENDING"),
             row.get("recipient_email"),
             row.get("contact_level", 0),
@@ -79,6 +71,47 @@ class InMemoryDraftStore:
             row.get("dispatch_run_id"),
             row.get("dispatched_at"),
         )
+
+    def get_latest(self, identifier):
+        candidates = [
+            row
+            for row in self.rows.values()
+            if row.get("unique_id") == identifier or row["rfq_id"] == identifier
+        ]
+        if not candidates:
+            return None
+        # Order by sent flag then thread index then id to mirror SQL
+        candidates.sort(key=lambda row: (row["sent"], -row["thread_index"], -row["id"]))
+        return self._row_to_tuple(candidates[0])
+
+    def get_latest_by_workflow(self, workflow_id, *, unsent_only=False):
+        candidates = [
+            row for row in self.rows.values() if row.get("workflow_id") == workflow_id
+        ]
+        if unsent_only:
+            candidates = [row for row in candidates if not row.get("sent")]
+        if not candidates:
+            return None
+
+        if unsent_only:
+            candidates.sort(
+                key=lambda row: (
+                    0
+                    if str(row.get("review_status", "")).upper() in {"APPROVED", "SAVED"}
+                    else 1,
+                    -row.get("thread_index", 0),
+                    -row["id"],
+                )
+            )
+        else:
+            candidates.sort(
+                key=lambda row: (
+                    row.get("sent", False),
+                    -row.get("thread_index", 0),
+                    -row["id"],
+                )
+            )
+        return self._row_to_tuple(candidates[0])
 
     def update(self, draft_id, **updates):
         if draft_id in self.rows:
@@ -111,8 +144,15 @@ class DummyCursor:
     def execute(self, query, params=None):
         normalized = " ".join(query.split())
         if normalized.startswith("SELECT id, rfq_id"):
-            rfq_id = params[0]
-            row = self.store.get_latest(rfq_id)
+            if "WHERE workflow_id = %s AND (sent = FALSE OR sent IS NULL)" in normalized:
+                workflow_id = params[0]
+                row = self.store.get_latest_by_workflow(workflow_id, unsent_only=True)
+            elif "WHERE workflow_id = %s" in normalized:
+                workflow_id = params[0]
+                row = self.store.get_latest_by_workflow(workflow_id, unsent_only=False)
+            else:
+                rfq_id = params[0]
+                row = self.store.get_latest(rfq_id)
             self._result = [row] if row else []
         elif normalized.startswith("UPDATE proc.draft_rfq_emails SET"):
             (
@@ -350,3 +390,114 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         row.unique_id == unique_id and row.message_id == "<message-id-1>"
         for row in stored_rows
     )
+
+
+def test_dispatch_from_context_resolves_workflow_and_normalises(monkeypatch):
+    store = InMemoryDraftStore()
+    workflow_id = "wf-context-42"
+    unique_unsent = "PROC-WF-CONTEXT-001"
+    unsent_payload = {
+        "rfq_id": "RFQ-CONTEXT",
+        "subject": "Stored Subject",
+        "body": "<p>Stored Body</p>",
+        "recipients": [" buyer@example.com ", "Buyer@example.com"],
+        "sender": "stored@example.com",
+        "thread_index": 2,
+        "workflow_id": workflow_id,
+        "unique_id": unique_unsent,
+    }
+
+    store.add(
+        {
+            "rfq_id": "RFQ-CONTEXT",
+            "supplier_id": "SUP-CTX",
+            "supplier_name": "Context Corp",
+            "subject": unsent_payload["subject"],
+            "body": unsent_payload["body"],
+            "sent": False,
+            "recipient_email": None,
+            "contact_level": 0,
+            "thread_index": 2,
+            "sender": unsent_payload["sender"],
+            "payload": json.dumps(unsent_payload),
+            "workflow_id": workflow_id,
+            "unique_id": unique_unsent,
+            "review_status": "APPROVED",
+        }
+    )
+
+    store.add(
+        {
+            "rfq_id": "RFQ-CONTEXT",
+            "supplier_id": "SUP-CTX",
+            "supplier_name": "Context Corp",
+            "subject": "Older Subject",
+            "body": "Older Body",
+            "sent": True,
+            "recipient_email": "old@example.com",
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": "old@example.com",
+            "payload": json.dumps({"unique_id": "PROC-WF-CONTEXT-OLD"}),
+            "workflow_id": workflow_id,
+            "unique_id": "PROC-WF-CONTEXT-OLD",
+            "review_status": "SENT",
+        }
+    )
+
+    nick = DummyNick(store, InMemoryActionStore())
+    service = EmailDispatchService(nick)
+
+    captured = {}
+
+    def fake_send_draft(
+        identifier,
+        recipients=None,
+        sender=None,
+        subject_override=None,
+        body_override=None,
+        attachments=None,
+    ):
+        captured.update(
+            {
+                "identifier": identifier,
+                "recipients": recipients,
+                "sender": sender,
+                "subject_override": subject_override,
+                "body_override": body_override,
+                "attachments": attachments,
+            }
+        )
+        return {
+            "identifier": identifier,
+            "recipients": recipients,
+            "sender": sender,
+            "subject_override": subject_override,
+            "body_override": body_override,
+            "attachments": attachments,
+        }
+
+    monkeypatch.setattr(service, "send_draft", fake_send_draft)
+
+    overrides = {
+        "recipients": " Buyer@example.com ",
+        "sender": "  sender2@example.com ",
+        "subject_override": "  Negotiation Update  ",
+        "body_override": "  <p>Body</p>  ",
+        "attachments": [(b"data", "quote.pdf")],
+    }
+
+    result = service.dispatch_from_context(workflow_id, overrides=overrides)
+
+    assert captured["identifier"] == unique_unsent
+    assert captured["recipients"] == ["Buyer@example.com"]
+    assert captured["sender"] == "sender2@example.com"
+    assert captured["subject_override"] == "Negotiation Update"
+    assert captured["body_override"] == "<p>Body</p>"
+    assert captured["attachments"] == overrides["attachments"]
+
+    assert result["identifier"] == unique_unsent
+    assert result["recipients"] == ["Buyer@example.com"]
+    assert result["sender"] == "sender2@example.com"
+    assert result["subject_override"] == "Negotiation Update"
+    assert result["body_override"] == "<p>Body</p>"
