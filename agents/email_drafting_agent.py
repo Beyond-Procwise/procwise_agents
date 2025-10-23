@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html import escape
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from jinja2 import Template
 
@@ -1386,6 +1386,84 @@ class EmailDraftingAgent(BaseAgent):
         if not self.prompt_template:
             self.prompt_template = DEFAULT_PROMPT_TEMPLATE
 
+    def _needs_polish(self, body: str) -> bool:
+        if not body:
+            return False
+        word_count = len(re.findall(r"\b\w+\b", body))
+        if word_count < 120:
+            return True
+        if not re.search(r"\b(thank|appreciat)", body, re.IGNORECASE):
+            return True
+        return False
+
+    def _maybe_polish_negotiation_email(
+        self, subject: Optional[str], body: str
+    ) -> Tuple[Optional[str], str]:
+        if not self.polish_model or not self._needs_polish(body):
+            return subject, body
+
+        polish_enabled = (
+            os.getenv("EMAIL_POLISH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+        )
+        if not polish_enabled:
+            return subject, body
+
+        payload = {
+            "subject": subject or "Negotiation Update",
+            "body": body,
+        }
+        polish_prompt = (
+            f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+            "Please refine this procurement negotiation email for tone and completeness. "
+            "Preserve any factual data, prices, deadlines, and leverage points. Return the "
+            "result starting with a Subject line followed by the body."
+        )
+
+        try:
+            polished = _chat(
+                self.polish_model,
+                SYSTEM_POLISH,
+                polish_prompt,
+                agent=self,
+            )
+        except Exception:
+            logger.exception("Failed to polish negotiation email draft")
+            return subject, body
+
+        clean_subject, clean_body = self._split_subject_and_body(polished)
+        if clean_subject:
+            subject = self._clean_subject_text(clean_subject, subject or DEFAULT_NEGOTIATION_SUBJECT)
+        if clean_body:
+            body = self._clean_body_text(clean_body)
+        return subject, body
+
+    @staticmethod
+    def _summarise_supplier_message(message: Optional[str]) -> Optional[str]:
+        if not message:
+            return None
+        text = EmailDraftingAgent._clean_body_text(str(message))
+        if not text:
+            return None
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) <= 280:
+            return text
+        return f"{text[:277].rstrip()}…"
+
+    @staticmethod
+    def _normalise_line_items(line_items: Any) -> Optional[List[Dict[str, Any]]]:
+        if not isinstance(line_items, list):
+            return None
+        normalised: List[Dict[str, Any]] = []
+        for item in line_items:
+            if isinstance(item, dict):
+                cleaned: Dict[str, Any] = {}
+                for key in ("description", "item", "sku", "quantity", "unit_price", "currency"):
+                    if key in item and item[key] is not None:
+                        cleaned[key] = item[key]
+                if cleaned:
+                    normalised.append(cleaned)
+        return normalised or None
+
     def _draft_intelligent_negotiation_email(
         self,
         context: AgentContext,
@@ -1403,6 +1481,9 @@ class EmailDraftingAgent(BaseAgent):
         target_price = data.get("target_price")
         if target_price is None:
             target_price = data.get("counter_price")
+        counter_price = data.get("counter_price")
+        walkaway_price = data.get("walkaway_price")
+        previous_counter = data.get("previous_counter") or data.get("previous_counter_price")
         currency = data.get("currency") or data.get("currency_code") or "GBP"
 
         gap_amount = None
@@ -1417,13 +1498,24 @@ class EmailDraftingAgent(BaseAgent):
                 gap_amount = None
                 gap_percentage = 0.0
 
-        supplier_name = data.get("supplier_name", "Supplier")
+        supplier_name = data.get("supplier_name") or data.get("metadata", {}).get("supplier_name") or "Supplier"
         current_offer_fmt = self._format_currency_value(current_offer, currency) or "Not specified"
         target_price_fmt = self._format_currency_value(target_price, currency) or "Not specified"
         gap_amount_fmt = (
             self._format_currency_value(gap_amount, currency)
             if gap_amount is not None
             else "TBD"
+        )
+        counter_price_fmt = self._format_currency_value(counter_price, currency) if counter_price is not None else None
+        walkaway_price_fmt = (
+            self._format_currency_value(walkaway_price, currency)
+            if walkaway_price is not None
+            else None
+        )
+        previous_counter_fmt = (
+            self._format_currency_value(previous_counter, currency)
+            if previous_counter is not None
+            else None
         )
 
         supplier_history = {
@@ -1432,6 +1524,23 @@ class EmailDraftingAgent(BaseAgent):
             "past_spend": data.get("total_spend"),
             "past_relationship": bool(data.get("total_spend")),
         }
+
+        supplier_message = data.get("supplier_message")
+        supplier_summary = self._summarise_supplier_message(supplier_message)
+        thread_summary = data.get("email_thread_summary")
+        if isinstance(thread_summary, dict):
+            thread_summary = {
+                key: thread_summary.get(key)
+                for key in (
+                    "total_emails",
+                    "rounds",
+                    "first_sent",
+                    "last_sent",
+                    "thread_key",
+                )
+            }
+
+        line_items = self._normalise_line_items(data.get("line_items"))
 
         negotiation_context = {
             "supplier_name": supplier_name,
@@ -1445,9 +1554,27 @@ class EmailDraftingAgent(BaseAgent):
             "round": round_no,
             "asks": data.get("asks", []),
             "lead_time_request": data.get("lead_time_request"),
-            "supplier_message": data.get("supplier_message"),
+            "supplier_message": supplier_message,
+            "supplier_message_summary": supplier_summary,
             "negotiation_message": data.get("negotiation_message"),
             "strategy": data.get("strategy"),
+            "counter_price": counter_price_fmt,
+            "previous_counter_price": previous_counter_fmt,
+            "walkaway_price": walkaway_price_fmt,
+            "volume_units": data.get("volume_units"),
+            "term_days": data.get("term_days"),
+            "valid_until": data.get("valid_until"),
+            "response_deadline": data.get("response_deadline") or data.get("deadline"),
+            "market_floor_price": self._format_currency_value(
+                data.get("market_floor_price"), currency
+            )
+            if data.get("market_floor_price") is not None
+            else None,
+            "final_offer_signaled": bool(data.get("final_offer_signaled")),
+            "closing_round": bool(data.get("closing_round") or round_no >= 3),
+            "email_thread_summary": thread_summary,
+            "line_items": line_items,
+            "play_recommendations": data.get("play_recommendations"),
         }
 
         objective = _determine_negotiation_objective(round_no, gap_percentage)
@@ -1544,6 +1671,21 @@ class EmailDraftingAgent(BaseAgent):
         body_content = self._sanitise_generated_body(body_text)
         body = self._clean_body_text(body_content)
 
+        subject_line, body = self._maybe_polish_negotiation_email(subject_line, body)
+
+        supplier_summary = combined_data.get("supplier_message_summary")
+        if not supplier_summary:
+            supplier_summary = self._summarise_supplier_message(
+                combined_data.get("supplier_message")
+            )
+
+        summary_block = None
+        if supplier_summary:
+            summary_block = f"**Recap of your last note**\n“{supplier_summary}”"
+
+        if summary_block:
+            body = f"{summary_block}\n\n{body}" if body else summary_block
+
         unique_id = self._resolve_unique_id(
             workflow_id=workflow_hint,
             supplier_id=supplier_id,
@@ -1566,7 +1708,12 @@ class EmailDraftingAgent(BaseAgent):
         if not subject:
             subject = DEFAULT_NEGOTIATION_SUBJECT
 
-        contact_name = combined_data.get("contact_name") or supplier_name
+        contact_name = (
+            combined_data.get("contact_name")
+            or combined_data.get("supplier_contact")
+            or combined_data.get("metadata", {}).get("supplier_contact")
+            or supplier_name
+        )
         greeting = f"Dear {contact_name},"
         if greeting not in body:
             body = f"{greeting}\n\n{body}" if body else greeting
@@ -1615,6 +1762,7 @@ class EmailDraftingAgent(BaseAgent):
             "supplier_message": combined_data.get("supplier_message"),
             "strategy": combined_data.get("strategy"),
             "round": round_int,
+            "round_number": round_int,
             "intent": "NEGOTIATION_COUNTER",
             "dispatch_token": marker_token,
             "workflow_id": workflow_hint,
@@ -1729,6 +1877,7 @@ class EmailDraftingAgent(BaseAgent):
             "lead_time_request": combined_data.get("lead_time_request"),
             "negotiation_message": combined_data.get("negotiation_message"),
             "supplier_message": combined_data.get("supplier_message"),
+            "supplier_message_summary": supplier_summary,
         }
         draft.update({k: v for k, v in negotiation_extra.items() if v})
 
