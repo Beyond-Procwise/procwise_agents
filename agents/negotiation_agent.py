@@ -2756,6 +2756,8 @@ class NegotiationAgent(BaseAgent):
 
         workflow_id = shared_context.get("workflow_id") or context.workflow_id
 
+        max_rounds = max(1, min(int(max_rounds), 3))
+
         negotiation_state: Dict[str, Any] = {
             "workflow_id": workflow_id,
             "total_suppliers": len(batch_entries),
@@ -3443,6 +3445,41 @@ class NegotiationAgent(BaseAgent):
             list(negotiation_state.get("failed_suppliers", {}).keys())
         )
 
+        final_positions: List[Dict[str, Any]] = []
+        for supplier_id, summary in supplier_summaries.items():
+            supplier_state = (
+                active_suppliers.get(supplier_id)
+                if isinstance(active_suppliers, dict)
+                else None
+            )
+            entry_payload = (
+                supplier_state.get("entry")
+                if isinstance(supplier_state, dict)
+                else {}
+            )
+            latest_decision = summary.get("latest_decision")
+            if isinstance(latest_decision, dict):
+                decision_copy = dict(latest_decision)
+            else:
+                decision_copy = {}
+            currency = (
+                decision_copy.get("currency")
+                or entry_payload.get("currency")
+                or entry_payload.get("currency_code")
+            )
+            final_positions.append(
+                {
+                    "supplier_id": supplier_id,
+                    "final_status": summary.get("final_status"),
+                    "rounds_completed": summary.get("total_rounds"),
+                    "final_supplier_offer": entry_payload.get("current_offer")
+                    or entry_payload.get("price"),
+                    "final_counter_offer": decision_copy.get("counter_price"),
+                    "currency": currency,
+                    "final_strategy": decision_copy.get("strategy"),
+                }
+            )
+
         data = {
             "workflow_id": negotiation_state.get("workflow_id"),
             "negotiation_type": "multi_round",
@@ -3454,8 +3491,11 @@ class NegotiationAgent(BaseAgent):
             "supplier_summaries": supplier_summaries,
             "round_history": negotiation_state.get("round_history", []),
             "all_drafts": all_drafts,
+            "final_positions": final_positions,
             "final_status": self._determine_overall_status(negotiation_state),
         }
+
+        self._log_final_negotiation_outcome(context, data)
 
         return self._with_plan(
             context,
@@ -3631,7 +3671,8 @@ class NegotiationAgent(BaseAgent):
                 round_no = max(round_no, int(raw_round))
             except (TypeError, ValueError):
                 round_no = max(round_no, 1)
-        state["current_round"] = max(round_no, 1)
+        round_no = max(1, min(round_no, 3))
+        state["current_round"] = round_no
         identifier.round_number = round_no
 
         previous_positions = state.get("positions") if isinstance(state.get("positions"), dict) else None
@@ -3895,6 +3936,7 @@ class NegotiationAgent(BaseAgent):
         sent_message_id: Optional[str] = None
 
         if not should_continue:
+            supplier_name = context.input_data.get("supplier_name") or supplier
             state["status"] = new_status
             state["awaiting_response"] = halt_reason == "Awaiting supplier response."
             stop_message = self._build_stop_message(new_status, halt_reason, round_no)
@@ -4002,13 +4044,19 @@ class NegotiationAgent(BaseAgent):
                 next_agents=next_agents,
             )
             output = self._with_plan(context, output)
+            subject_hint = None
+            if draft_records:
+                primary_draft = draft_records[0]
+                if isinstance(primary_draft, dict):
+                    subject_hint = primary_draft.get("subject")
+
             self._queue_email_draft_action(
                 context,
                 supplier_id=supplier,
                 supplier_name=supplier_name,
                 round_number=round_no,
-                subject=draft_payload.get("subject"),
-                body=email_body or negotiation_message,
+                subject=subject_hint,
+                body=stop_message,
                 drafts=draft_records,
                 decision=decision,
                 negotiation_message=stop_message,
@@ -4037,8 +4085,7 @@ class NegotiationAgent(BaseAgent):
         if not counter_options and decision.get("counter_price") is not None:
             counter_options = [{"price": decision["counter_price"], "terms": None, "bundle": None}]
 
-        supplier_name = context.input_data.get("supplier_name")
-        supplier_name = supplier_name or supplier
+        supplier_name = context.input_data.get("supplier_name") or supplier
         decision["supplier_id"] = supplier
         decision.setdefault("supplier_name", supplier_name)
         decision.setdefault("supplier", supplier_name)
@@ -4390,7 +4437,9 @@ class NegotiationAgent(BaseAgent):
                     state,
                     negotiation_message,
                 )
-        subject_candidate = email_subject or draft_payload.get("subject")
+        subject_seed = self._coerce_text(draft_payload.get("subject"))
+
+        subject_candidate = email_subject or subject_seed
         if subject_candidate and not state.get("base_subject"):
             base_from_email = self._normalise_base_subject(subject_candidate)
             if base_from_email:
@@ -11674,4 +11723,29 @@ class NegotiationAgent(BaseAgent):
                 )
             except Exception:
                 logger.exception("Failed to log negotiation email draft action")
+
+    def _log_final_negotiation_outcome(
+        self, context: AgentContext, summary: Dict[str, Any]
+    ) -> None:
+        routing = getattr(self.agent_nick, "process_routing_service", None)
+        if routing is None or not hasattr(routing, "log_action"):
+            return
+
+        try:
+            serialisable = json.loads(json.dumps(summary, default=str))
+        except Exception:
+            logger.debug("Unable to serialise negotiation summary for logging", exc_info=True)
+            serialisable = summary
+
+        try:
+            routing.log_action(
+                process_id=getattr(context, "process_id", None),
+                agent_type=self.__class__.__name__,
+                action_desc="Negotiation summary",
+                process_output=serialisable,
+                status="completed",
+                run_id=None,
+            )
+        except Exception:
+            logger.exception("Failed to log final negotiation outcome")
 
