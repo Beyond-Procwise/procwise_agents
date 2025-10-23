@@ -338,7 +338,7 @@ class EmailDispatchRequest(BaseModel):
                 values["unique_id"] = unique_id
                 return values
 
-        drafts_array = values.get("drafts") or values.get("draft_records")
+        drafts_array = values.get("drafts")
         if isinstance(drafts_array, list) and drafts_array:
             first_draft = drafts_array[0]
             if isinstance(first_draft, dict):
@@ -347,17 +347,23 @@ class EmailDispatchRequest(BaseModel):
                     values["unique_id"] = unique_id
                     return values
 
-        if values.get("drafts") or values.get("draft_records"):
+        draft_records = values.get("draft_records")
+        if isinstance(draft_records, list) and draft_records:
+            first_record = draft_records[0]
+            if isinstance(first_record, dict):
+                unique_id = first_record.get("unique_id") or first_record.get("rfq_id")
+                if unique_id:
+                    values["unique_id"] = unique_id
+                    return values
+
+        if "unique_id" in values or "supplier_id" in values:
             return values
 
-        if "unique_id" not in values and "supplier_id" not in values:
-            available_fields = list(values.keys())
-            raise ValueError(
-                "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
-                f"Available fields: {available_fields}"
-            )
-
-        return values
+        available_fields = list(values.keys())
+        raise ValueError(
+            "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
+            f"Available fields: {available_fields}"
+        )
 
     @field_validator("unique_id", "rfq_id", "action_id", mode="before")
     @classmethod
