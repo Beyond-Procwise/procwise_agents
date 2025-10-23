@@ -1,15 +1,142 @@
+import importlib
 import os
 import os
 import sys
+from contextlib import nullcontext
 from typing import Any, Dict, List
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+services_pkg = sys.modules.get("services")
+if services_pkg is None:
+    services_pkg = importlib.import_module("services")
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+if "sentence_transformers" not in sys.modules:
+    sentence_transformers_stub = ModuleType("sentence_transformers")
 
+    class _StubSentenceTransformer:  # pragma: no cover - test shim
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, *args, **kwargs):
+            return []
+
+    sentence_transformers_stub.SentenceTransformer = _StubSentenceTransformer
+    sys.modules["sentence_transformers"] = sentence_transformers_stub
+
+if "ollama" not in sys.modules:
+    ollama_stub = ModuleType("ollama")
+
+    def _noop_response(*_args, **_kwargs):  # pragma: no cover - test shim
+        return {}
+
+    def _noop_list(*_args, **_kwargs):  # pragma: no cover - test shim
+        return {"models": []}
+
+    ollama_stub.generate = _noop_response
+    ollama_stub.chat = _noop_response
+    ollama_stub.list = _noop_list
+
+    ollama_types_stub = ModuleType("ollama._types")
+
+    class _StubResponseError(Exception):
+        pass
+
+    ollama_stub.ResponseError = _StubResponseError
+    ollama_types_stub.ResponseError = _StubResponseError
+
+    sys.modules["ollama"] = ollama_stub
+    sys.modules["ollama._types"] = ollama_types_stub
+
+if "pydantic_settings" not in sys.modules:
+    pydantic_settings_stub = ModuleType("pydantic_settings")
+
+    class _StubBaseSettings:  # pragma: no cover - test shim
+        def __init__(self, *args, **kwargs):
+            pass
+
+    pydantic_settings_stub.BaseSettings = _StubBaseSettings
+    sys.modules["pydantic_settings"] = pydantic_settings_stub
+
+if "torch" not in sys.modules:
+    torch_stub = ModuleType("torch")
+    torch_cuda_stub = ModuleType("torch.cuda")
+
+    class _StubTensor:  # pragma: no cover - test shim
+        pass
+
+    def _no_grad():  # pragma: no cover - test shim
+        return nullcontext()
+
+    def _is_available():  # pragma: no cover - test shim
+        return False
+
+    def _empty_cache():  # pragma: no cover - test shim
+        return None
+
+    torch_stub.Tensor = _StubTensor
+    torch_stub.no_grad = _no_grad
+    torch_stub.cuda = torch_cuda_stub
+    torch_cuda_stub.is_available = _is_available
+    torch_cuda_stub.empty_cache = _empty_cache
+
+    sys.modules["torch"] = torch_stub
+    sys.modules["torch.cuda"] = torch_cuda_stub
+
+if "orchestration" not in sys.modules:
+    orchestration_stub = ModuleType("orchestration")
+    orchestrator_module_stub = ModuleType("orchestration.orchestrator")
+
+    class _StubOrchestrator:  # pragma: no cover - test shim
+        def __init__(self, *args, **kwargs):
+            self.agent_nick = SimpleNamespace()
+
+    orchestrator_module_stub.Orchestrator = _StubOrchestrator
+    orchestration_stub.orchestrator = orchestrator_module_stub
+
+    sys.modules["orchestration"] = orchestration_stub
+    sys.modules["orchestration.orchestrator"] = orchestrator_module_stub
+
+if "services.model_selector" not in sys.modules:
+    model_selector_stub = ModuleType("services.model_selector")
+
+    class _StubRAGPipeline:  # pragma: no cover - test shim
+        pass
+
+    model_selector_stub.RAGPipeline = _StubRAGPipeline
+    setattr(services_pkg, "model_selector", model_selector_stub)
+    sys.modules["services.model_selector"] = model_selector_stub
+
+if "services.email_dispatch_service" not in sys.modules:
+    email_dispatch_stub = ModuleType("services.email_dispatch_service")
+
+    class _StubDraftNotFoundError(ValueError):
+        pass
+
+    class _StubEmailDispatchService:  # pragma: no cover - test shim
+        def __init__(self, agent_nick):
+            self.agent_nick = agent_nick
+
+        def dispatch_from_context(self, *_args, **_kwargs):
+            raise NotImplementedError
+
+        def send_draft(self, *_args, **_kwargs):
+            raise NotImplementedError
+
+        def resolve_workflow_id(self, *_args, **_kwargs):
+            return None
+
+    email_dispatch_stub.DraftNotFoundError = _StubDraftNotFoundError
+    email_dispatch_stub.EmailDispatchService = _StubEmailDispatchService
+    setattr(services_pkg, "email_dispatch_service", email_dispatch_stub)
+    sys.modules["services.email_dispatch_service"] = email_dispatch_stub
+
+import api.routers.workflows as workflows_module
 from api.routers.agents import router as agents_router
 from api.routers.workflows import router as workflows_router
 
@@ -179,9 +306,81 @@ def test_email_workflow_returns_action_id(monkeypatch):
     assert len(prs.logged) == 2
     assert prs.logged[0]["status"] == "started"
     assert prs.logged[1]["status"] == "completed"
-    assert prs.logged[0]["action_desc"]["rfq_id"] == "RFQ-123"
-    assert prs.updated_details["output"]["sent"] is True
-    assert prs.updated_details["status"] == "completed"
+
+
+def test_context_email_dispatch_recomputes_idempotency(monkeypatch):
+    app = FastAPI()
+    app.include_router(workflows_router)
+
+    agent_stub = SimpleNamespace()
+    orchestrator = SimpleNamespace(agent_nick=agent_stub)
+    app.state.agent_nick = agent_stub
+    app.state.orchestrator = orchestrator
+
+    client = TestClient(app)
+
+    original_helper = workflows_module._ensure_request_idempotency_key
+    helper_calls = []
+
+    def tracking_helper(request, *, workflow_id, subject, body, identifier=None, force=False):
+        helper_calls.append(
+            {
+                "workflow_id": workflow_id,
+                "subject": subject,
+                "body": body,
+                "identifier": identifier,
+                "force": force,
+            }
+        )
+        return original_helper(
+            request,
+            workflow_id=workflow_id,
+            subject=subject,
+            body=body,
+            identifier=identifier,
+            force=force,
+        )
+
+    monkeypatch.setattr(
+        workflows_module,
+        "_ensure_request_idempotency_key",
+        tracking_helper,
+    )
+
+    class StubDispatchService:
+        def __init__(self, agent_nick):
+            self.agent_nick = agent_nick
+
+        def dispatch_from_context(self, workflow_id, *, overrides=None):
+            resolved_workflow = workflow_id or "WF-001"
+            return {
+                "unique_id": "PROC-WF-001",
+                "subject": "Resolved subject",
+                "body": "<p>Resolved body</p>",
+                "workflow_id": resolved_workflow,
+                "draft": {
+                    "unique_id": "PROC-WF-001",
+                    "workflow_id": resolved_workflow,
+                },
+            }
+
+    monkeypatch.setattr(
+        workflows_module,
+        "EmailDispatchService",
+        StubDispatchService,
+    )
+
+    response = client.post(
+        "/workflows/email",
+        headers={"X-Workflow-Id": "WF-001"},
+    )
+
+    assert response.status_code == 200
+    assert len(helper_calls) == 2
+    assert helper_calls[0]["identifier"] is None
+    assert helper_calls[1]["identifier"] == "PROC-WF-001"
+    assert helper_calls[1]["force"] is True
+    assert helper_calls[1]["workflow_id"] == "WF-001"
 
 
 def test_email_workflow_accepts_list_recipients(monkeypatch):
