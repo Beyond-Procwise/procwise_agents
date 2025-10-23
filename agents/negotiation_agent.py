@@ -2246,6 +2246,10 @@ class NegotiationAgent(BaseAgent):
                 round_number=round_number,
                 drafts=drafts,
                 draft_bundles=draft_bundles,
+                aggregated_results=aggregated_results,
+                failed_records=failed_records,
+                success_ids=success_ids,
+                next_agents=next_agents,
             )
             return
 
@@ -2306,6 +2310,10 @@ class NegotiationAgent(BaseAgent):
             round_number=round_number,
             drafts=drafts,
             draft_bundles=draft_bundles,
+            aggregated_results=aggregated_results,
+            failed_records=failed_records,
+            success_ids=success_ids,
+            next_agents=next_agents,
         )
 
     def _execute_batch_entry(
@@ -2330,13 +2338,40 @@ class NegotiationAgent(BaseAgent):
         round_number: Optional[int],
         drafts: List[Dict[str, Any]],
         draft_bundles: List[Dict[str, Any]],
+        aggregated_results: List[Dict[str, Any]],
+        failed_records: List[Dict[str, Any]],
+        success_ids: List[str],
+        next_agents: Set[str],
+        pending_entries: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Finalize deferred emails for a negotiation round after all suppliers complete."""
 
-        if round_number is None:
+        if pending_entries is None and round_number is None:
+            pending_rounds = self._drain_all_pending_email_tasks(context)
+            if not pending_rounds:
+                return
+            for pending_round, round_entries in sorted(pending_rounds.items()):
+                if not round_entries:
+                    continue
+                self._finalize_round_email_bundle(
+                    context=context,
+                    round_number=pending_round,
+                    drafts=drafts,
+                    draft_bundles=draft_bundles,
+                    aggregated_results=aggregated_results,
+                    failed_records=failed_records,
+                    success_ids=success_ids,
+                    next_agents=next_agents,
+                    pending_entries=list(round_entries),
+                )
             return
 
-        pending_entries = self._drain_pending_email_tasks(context, round_number)
+        if pending_entries is None:
+            pending_entries = self._drain_pending_email_tasks(context, round_number)
+
+        if round_number is None:
+            round_number = self._coerce_round_from_pending_entries(pending_entries)
+
         if not pending_entries:
             return
 
@@ -2368,18 +2403,186 @@ class NegotiationAgent(BaseAgent):
         bundle_task = {"bundle": pending_entries, "round_no": round_number}
         bundle_output = self._finalize_email_round(context, primary_identifier, bundle_task)
 
-        if not isinstance(bundle_output, AgentOutput):
-            return
+        if isinstance(bundle_output, AgentOutput):
+            bundle_data = bundle_output.data if isinstance(bundle_output.data, dict) else {}
+            bundle_drafts = bundle_data.get("drafts") if isinstance(bundle_data, dict) else None
+            if isinstance(bundle_drafts, list):
+                for draft in bundle_drafts:
+                    if isinstance(draft, dict):
+                        drafts.append(draft)
 
-        bundle_data = bundle_output.data if isinstance(bundle_output.data, dict) else {}
-        bundle_drafts = bundle_data.get("drafts") if isinstance(bundle_data, dict) else None
-        if isinstance(bundle_drafts, list):
-            for draft in bundle_drafts:
-                if isinstance(draft, dict):
-                    drafts.append(draft)
+            if isinstance(bundle_data, dict) and bundle_data:
+                draft_bundles.append(deepcopy(bundle_data))
 
-        if isinstance(bundle_data, dict) and bundle_data:
-            draft_bundles.append(deepcopy(bundle_data))
+        self._synchronise_finalized_pending_tasks(
+            pending_entries=pending_entries,
+            aggregated_results=aggregated_results,
+            failed_records=failed_records,
+            success_ids=success_ids,
+            next_agents=next_agents,
+        )
+
+    def _coerce_round_from_pending_entries(
+        self, pending_entries: Optional[Sequence[Dict[str, Any]]]
+    ) -> Optional[int]:
+        if not pending_entries:
+            return None
+
+        for entry in pending_entries:
+            if not isinstance(entry, dict):
+                continue
+            identifier = entry.get("identifier")
+            if isinstance(identifier, NegotiationIdentifier):
+                try:
+                    if identifier.round_number is not None:
+                        return int(identifier.round_number)
+                except Exception:
+                    continue
+            task = entry.get("task")
+            if isinstance(task, dict):
+                round_value = task.get("round_no") or task.get("round")
+                if round_value is not None:
+                    try:
+                        return int(round_value)
+                    except Exception:
+                        continue
+        return None
+
+    def _drain_all_pending_email_tasks(
+        self, context: AgentContext
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        try:
+            task_map = getattr(context, "_pending_email_round_tasks")
+        except AttributeError:
+            return {}
+
+        if not task_map:
+            return {}
+
+        try:
+            lock = getattr(context, "_pending_email_round_lock")
+        except AttributeError:
+            lock = None
+
+        drained: Dict[int, List[Dict[str, Any]]] = {}
+        if lock:
+            with lock:
+                for round_key, entries in list(task_map.items()):
+                    drained[round_key] = list(entries)
+                task_map.clear()
+        else:
+            for round_key, entries in list(task_map.items()):
+                drained[round_key] = list(entries)
+            task_map.clear()
+        return drained
+
+    def _synchronise_finalized_pending_tasks(
+        self,
+        *,
+        pending_entries: Sequence[Dict[str, Any]],
+        aggregated_results: List[Dict[str, Any]],
+        failed_records: List[Dict[str, Any]],
+        success_ids: List[str],
+        next_agents: Set[str],
+    ) -> None:
+        for entry in pending_entries:
+            if not isinstance(entry, dict):
+                continue
+            identifier = entry.get("identifier")
+            task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+            stored_result = entry.get("result")
+            if not isinstance(stored_result, AgentOutput):
+                continue
+
+            supplier_id = None
+            session_reference = None
+            if isinstance(identifier, NegotiationIdentifier):
+                supplier_id = identifier.supplier_id or task.get("supplier")
+                session_reference = identifier.session_reference or task.get("session_reference")
+            elif isinstance(task, dict):
+                identifier_payload = task.get("identifier")
+                if isinstance(identifier_payload, dict):
+                    supplier_id = identifier_payload.get("supplier_id") or identifier_payload.get("supplier")
+                    session_reference = identifier_payload.get("session_reference")
+                supplier_id = supplier_id or task.get("supplier")
+                session_reference = session_reference or task.get("session_reference")
+
+            supplier_key = self._coerce_text(supplier_id)
+            session_key = self._coerce_text(session_reference)
+
+            matching_records: List[Dict[str, Any]] = []
+            if session_key:
+                for record in aggregated_results:
+                    if self._coerce_text(record.get("session_reference")) == session_key:
+                        if not supplier_key or self._coerce_text(record.get("supplier_id")) == supplier_key:
+                            matching_records.append(record)
+            if not matching_records and supplier_key:
+                matching_records = [
+                    record
+                    for record in aggregated_results
+                    if self._coerce_text(record.get("supplier_id")) == supplier_key
+                ]
+
+            output_payload = stored_result.data if isinstance(stored_result.data, dict) else {}
+            pass_fields = stored_result.pass_fields if isinstance(stored_result.pass_fields, dict) else {}
+            next_agents.update(stored_result.next_agents or [])
+
+            for record in matching_records:
+                record["status"] = stored_result.status.value
+                record["output"] = deepcopy(output_payload)
+                record["pass_fields"] = deepcopy(pass_fields)
+                record["next_agents"] = list(stored_result.next_agents or [])
+                if stored_result.error:
+                    record["error"] = stored_result.error
+                elif "error" in record:
+                    record.pop("error", None)
+
+            if stored_result.status == AgentStatus.SUCCESS:
+                if supplier_key and supplier_key not in success_ids:
+                    success_ids.append(supplier_key)
+                if session_key or supplier_key:
+                    failed_records[:] = [
+                        record
+                        for record in failed_records
+                        if not (
+                            (session_key and self._coerce_text(record.get("session_reference")) == session_key)
+                            and (
+                                not supplier_key
+                                or self._coerce_text(record.get("supplier_id")) == supplier_key
+                            )
+                        )
+                    ]
+            else:
+                if supplier_key:
+                    success_ids[:] = [sid for sid in success_ids if sid != supplier_key]
+                failure_entry = {
+                    "supplier_id": supplier_id
+                    or (matching_records[0].get("supplier_id") if matching_records else supplier_id),
+                    "session_reference": session_reference,
+                    "status": stored_result.status.value,
+                    "error": stored_result.error,
+                }
+                updated = False
+                for record in failed_records:
+                    if (
+                        (not session_key or self._coerce_text(record.get("session_reference")) == session_key)
+                        and (
+                            not supplier_key
+                            or self._coerce_text(record.get("supplier_id")) == supplier_key
+                        )
+                    ):
+                        record.update(
+                            {
+                                "supplier_id": failure_entry["supplier_id"],
+                                "session_reference": failure_entry["session_reference"],
+                                "status": failure_entry["status"],
+                                "error": failure_entry["error"],
+                            }
+                        )
+                        updated = True
+                        break
+                if not updated:
+                    failed_records.append(failure_entry)
 
     def _queue_round_action_for_immediate_drafts(
         self,
@@ -3043,6 +3246,10 @@ class NegotiationAgent(BaseAgent):
             round_number=round_num,
             drafts=drafts,
             draft_bundles=draft_bundles,
+            aggregated_results=aggregated_results,
+            failed_records=failed_records,
+            success_ids=success_ids,
+            next_agents=next_agents,
         )
 
         round_result = {
