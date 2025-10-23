@@ -1590,19 +1590,33 @@ async def send_email(
 
     dispatch_service = EmailDispatchService(agent_nick)
 
+    overrides = overrides or {}
+    logger.info(
+        "email_dispatch.pre: workflow_id=%s identifier=%s overrides_keys=%s",
+        workflow_id_hint,
+        overrides.get("identifier"),
+        sorted(list(overrides.keys())),
+    )
+
     try:
         result = await run_in_threadpool(
             dispatch_service.dispatch_from_context,
             workflow_id_hint,
-            overrides=overrides or None,
+            overrides=overrides,
+            idempotency_key=idempotency_key,
         )
+        return {"status": "ok", "result": result}
     except DraftNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "DraftNotFound", "message": str(exc)},
+        )
     except ValueError as exc:
+        logger.warning("email_dispatch.failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "error": "ContextDispatchFailed",
+                "error": "DraftDispatchFailed",
                 "message": str(exc),
             },
         )

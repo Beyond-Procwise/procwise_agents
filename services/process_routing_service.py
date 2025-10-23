@@ -1016,8 +1016,19 @@ class ProcessRoutingService:
                             return existing_id
 
                     normalised_details = self.normalize_process_details(process_details)
+                    reason_meta: Dict[str, Any] = {}
                     if isinstance(normalised_details, dict):
                         normalised_details.setdefault("workflow_id", resolved_workflow_id)
+                        potential_reason = normalised_details.get("reason") or normalised_details.get("message")
+                        potential_error = normalised_details.get("error")
+                        reason_meta = {
+                            key: value
+                            for key, value in (
+                                ("reason", potential_reason),
+                                ("error", potential_error),
+                            )
+                            if value
+                        }
                     cursor.execute(
                         """
                         INSERT INTO proc.routing
@@ -1038,13 +1049,23 @@ class ProcessRoutingService:
                     )
                     process_id = cursor.fetchone()[0]
                     conn.commit()
-                    logger.info(
-                        "Logged process %s with id %s (workflow_id=%s, idempotency_key=%s)",
-                        process_name,
-                        process_id,
-                        resolved_workflow_id,
-                        idempotency_key,
-                    )
+                    if reason_meta:
+                        logger.info(
+                            "Logged process %s with id %s (workflow_id=%s, idempotency_key=%s) meta=%s",
+                            process_name,
+                            process_id,
+                            resolved_workflow_id,
+                            idempotency_key,
+                            reason_meta,
+                        )
+                    else:
+                        logger.info(
+                            "Logged process %s with id %s (workflow_id=%s, idempotency_key=%s)",
+                            process_name,
+                            process_id,
+                            resolved_workflow_id,
+                            idempotency_key,
+                        )
                     return process_id
         except Exception:
             logger.exception("Failed to log process %s", process_name)
@@ -1274,6 +1295,18 @@ class ProcessRoutingService:
         # Ensure the ``process_details`` blob reflects the new status.
         details = process_details or self.get_process_details(process_id, raw=True) or {}
         details["status"] = status_text
+        reason_meta: Dict[str, Any] = {}
+        if numeric_status < 0 or status_text == "failed":
+            potential_reason = details.get("reason") or details.get("message")
+            potential_error = details.get("error")
+            reason_meta = {
+                key: value
+                for key, value in (
+                    ("reason", potential_reason),
+                    ("error", potential_error),
+                )
+                if value
+            }
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -1294,12 +1327,21 @@ class ProcessRoutingService:
                         ),
                     )
                     conn.commit()
-                    logger.info(
-                        "Updated process %s to status %s (process_status=%s)",
-                        process_id,
-                        status_text,
-                        numeric_status,
-                    )
+                    if reason_meta:
+                        logger.info(
+                            "Updated process %s to status %s (process_status=%s) meta=%s",
+                            process_id,
+                            status_text,
+                            numeric_status,
+                            reason_meta,
+                        )
+                    else:
+                        logger.info(
+                            "Updated process %s to status %s (process_status=%s)",
+                            process_id,
+                            status_text,
+                            numeric_status,
+                        )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "Failed to update status for process %s", process_id
