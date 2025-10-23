@@ -588,57 +588,7 @@ class EmailDispatchService:
         if not workflow_token:
             return None
 
-        row: Optional[Tuple] = None
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                               review_status, recipient_email, contact_level, thread_index,
-                               payload, sender, sent_on, workflow_id, run_id, unique_id,
-                               mailbox, dispatch_run_id, dispatched_at
-                        FROM proc.draft_rfq_emails
-                        WHERE workflow_id = %s AND (sent = FALSE OR sent IS NULL)
-                        ORDER BY thread_index DESC, id DESC
-                        LIMIT 1
-                        """,
-                        (workflow_token,),
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        cur.execute(
-                            """
-                            SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                                   review_status, recipient_email, contact_level, thread_index,
-                                   payload, sender, sent_on, workflow_id, run_id, unique_id,
-                                   mailbox, dispatch_run_id, dispatched_at
-                            FROM proc.draft_rfq_emails
-                            WHERE workflow_id = %s
-                            ORDER BY sent ASC, dispatched_at DESC NULLS LAST, updated_on DESC, id DESC
-                            LIMIT 1
-                            """,
-                            (workflow_token,),
-                        )
-                        row = cur.fetchone()
-        except Exception:  # pragma: no cover - defensive logging
-            self.logger.exception(
-                "Failed to resolve draft for workflow %s", workflow_token
-            )
-            return None
-
-        if not row:
-            return None
-
-        return self._hydrate_draft(row)
-
-    def _resolve_identifier_for_workflow(self, workflow_id: str) -> Optional[str]:
-        draft = self._load_draft_for_workflow(workflow_id)
-        if not draft:
-            return None
-        return self._normalise_identifier(draft.get("unique_id")) or self._normalise_identifier(
-            draft.get("rfq_id")
-        )
+        return None
 
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
         values = list(row)
