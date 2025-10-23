@@ -1220,7 +1220,8 @@ class SupplierInteractionAgent(BaseAgent):
             dispatch_unique_ids = list(seed_ids)
         result["unique_ids"] = dispatch_unique_ids
 
-        dispatch_rows = dispatch_state.get("dispatch_rows") or list(metadata.get("rows") or [])
+        dispatch_records = dispatch_state.get("dispatch_records")
+        dispatch_rows = list(dispatch_records or metadata.get("rows") or [])
         dispatch_index: Dict[str, Dict[str, Any]] = {}
         for row in dispatch_rows:
             row_data = self._row_to_mapping(row)
