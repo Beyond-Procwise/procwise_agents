@@ -177,14 +177,27 @@ class EmailDispatchService:
             dispatch_run_id = uuid.uuid4().hex
             draft_metadata["dispatch_token"] = dispatch_run_id
             draft_metadata["run_id"] = dispatch_run_id
-            body, backend_metadata = self._ensure_tracking_annotation(
-                body_text,
-                unique_id=unique_id,
-                supplier_id=draft.get("supplier_id"),
-                dispatch_token=dispatch_run_id,
-                run_id=draft.get("run_id") or dispatch_run_id,
-                workflow_id=draft.get("workflow_id"),
-            )
+            try:
+                body, backend_metadata = self._ensure_tracking_annotation(
+                    body_text,
+                    unique_id=unique_id,
+                    supplier_id=draft.get("supplier_id"),
+                    dispatch_token=dispatch_run_id,
+                    run_id=draft.get("run_id") or dispatch_run_id,
+                    workflow_id=draft.get("workflow_id"),
+                )
+            except ValueError as err:
+                self.logger.warning(
+                    "Skipping tracking annotation for unique_id %s: %s",
+                    unique_id,
+                    err,
+                )
+                body = body_text
+                backend_metadata = {"unique_id": unique_id}
+                if draft.get("supplier_id"):
+                    backend_metadata["supplier_id"] = draft.get("supplier_id")
+                if draft.get("workflow_id"):
+                    backend_metadata["workflow_id"] = draft.get("workflow_id")
             backend_metadata["run_id"] = dispatch_run_id
 
             dispatch_payload = dict(draft)
