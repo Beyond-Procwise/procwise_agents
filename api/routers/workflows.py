@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator, ConfigDict
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
-from services.email_dispatch_service import EmailDispatchService
+from services.email_dispatch_service import DraftNotFoundError, EmailDispatchService
 from repositories import draft_rfq_emails_repo
 
 # Ensure GPU-related environment variables are set
@@ -27,17 +36,23 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 logger = logging.getLogger(__name__)
+
+
 def get_orchestrator(request: Request) -> Orchestrator:
     orchestrator = getattr(request.app.state, "orchestrator", None)
     if not orchestrator:
-        raise HTTPException(status_code=503, detail="Orchestrator service is not available.")
+        raise HTTPException(
+            status_code=503, detail="Orchestrator service is not available."
+        )
     return orchestrator
 
 
 def get_rag_pipeline(request: Request) -> RAGPipeline:
     pipeline = getattr(request.app.state, "rag_pipeline", None)
     if not pipeline:
-        raise HTTPException(status_code=503, detail="RAG Pipeline service is not available.")
+        raise HTTPException(
+            status_code=503, detail="RAG Pipeline service is not available."
+        )
     return pipeline
 
 
@@ -54,7 +69,11 @@ class AskRequest(BaseModel):
     model_name: Optional[str] = None
     doc_type: Optional[str] = None
     product_type: Optional[str] = None
-    file_path: Optional[str] = Field(default=None, description="Optional local file path", json_schema_extra={"example": None})
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Optional local file path",
+        json_schema_extra={"example": None},
+    )
 
     @field_validator("doc_type", "product_type", "file_path", mode="before")
     @classmethod
@@ -247,7 +266,9 @@ class EmailDraftPayload(BaseModel):
                 if text:
                     cleaned.append(text)
             return cleaned or None
-        raise TypeError("recipients must be a string, list, or tuple of email addresses")
+        raise TypeError(
+            "recipients must be a string, list, or tuple of email addresses"
+        )
 
     def resolved_identifier(self) -> Optional[str]:
         for candidate in (self.unique_id, self.rfq_id):
@@ -390,7 +411,9 @@ class EmailDispatchRequest(BaseModel):
                 if text:
                     cleaned.append(text)
             return cleaned or None
-        raise TypeError("recipients must be provided as a string, list, or tuple of emails")
+        raise TypeError(
+            "recipients must be provided as a string, list, or tuple of emails"
+        )
 
     def get_identifier(self) -> str:
         for candidate in (self.unique_id, self.rfq_id):
@@ -414,7 +437,9 @@ class EmailDispatchRequest(BaseModel):
 
     def resolve_recipients(self) -> Optional[List[str]]:
         if self.recipients:
-            return [str(email).strip() for email in self.recipients if str(email).strip()]
+            return [
+                str(email).strip() for email in self.recipients if str(email).strip()
+            ]
         if self.draft:
             recipients = self.draft.resolved_recipients()
             if recipients:
@@ -521,6 +546,49 @@ def _coerce_identifier(value: Any) -> Optional[str]:
     return text or None
 
 
+_RECIPIENT_SPLIT_RE = re.compile(r"[\s,;]+")
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _normalize_recipients(value: Any) -> List[str]:
+    """Normalise recipient values into a unique, ordered email list."""
+
+    if value is None:
+        return []
+
+    raw_tokens: List[Any] = []
+    if isinstance(value, str):
+        raw_tokens.extend(_RECIPIENT_SPLIT_RE.split(value))
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                raw_tokens.extend(_RECIPIENT_SPLIT_RE.split(item))
+            else:
+                raw_tokens.append(item)
+    else:
+        raise ValueError(
+            "Recipients must be provided as a string or sequence of strings"
+        )
+
+    normalised: List[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        candidate = str(token).strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        if not _EMAIL_PATTERN.match(candidate):
+            raise ValueError(f"Invalid email address: {candidate}")
+        seen.add(lowered)
+        normalised.append(candidate)
+
+    return normalised
+
+
 def _extract_workflow_token(payload: Any) -> Optional[str]:
     if payload is None:
         return None
@@ -604,43 +672,81 @@ def _resolve_dispatch_workflow_id(
 
 
 async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest:
-    """Load the dispatch request supporting both JSON and form submissions."""
+    """Parse and validate email dispatch requests across supported formats."""
 
-    body_bytes = await request.body()
-    raw_payload: Any
+    content_type_header = request.headers.get("content-type", "")
+    media_type = content_type_header.split(";", 1)[0].strip().lower()
+    supported_media_types = {
+        "application/json",
+        "multipart/form-data",
+        "application/x-www-form-urlencoded",
+    }
 
-    if not body_bytes:
+    if not media_type:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "error": "Empty Request Body",
-                "message": "Request body is required",
-                "hint": "Send JSON: {\"unique_id\": \"PROC-WF-xxx\"} or {\"drafts\": [{...}]}"
+                "error": "UnsupportedContentType",
+                "message": "Content-Type header is required.",
+                "supported": sorted(supported_media_types),
             },
         )
 
-    try:
-        raw_payload = json.loads(body_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    if media_type not in supported_media_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "UnsupportedContentType",
+                "message": f"Unsupported content type '{media_type}'.",
+                "supported": sorted(supported_media_types),
+            },
+        )
+
+    body_bytes = await request.body()
+    if not body_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "EmptyRequest",
+                "message": "Request body cannot be empty.",
+            },
+        )
+
+    raw_payload: Any
+    if media_type == "application/json":
+        try:
+            raw_payload = json.loads(body_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "InvalidJSON",
+                    "message": "Request body must be valid JSON.",
+                    "reason": str(exc),
+                },
+            ) from exc
+    else:
         try:
             form = await request.form()
-        except Exception:
+        except Exception as exc:
+            logger.exception("Failed to parse form data for email dispatch request")
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
-                    "error": "Invalid Request Format",
-                    "message": "Request must be valid JSON or form data"
-                }
-            )
-        else:
-            raw_payload = _merge_form_values(form)
+                    "error": "InvalidFormData",
+                    "message": "Request body could not be parsed as form data.",
+                },
+            ) from exc
+        raw_payload = _merge_form_values(form)
 
     if not isinstance(raw_payload, dict):
         raw_payload = {}
 
     _deserialise_structured_fields(raw_payload)
 
-    if "drafts" not in raw_payload and isinstance(raw_payload.get("draft_records"), list):
+    if "drafts" not in raw_payload and isinstance(
+        raw_payload.get("draft_records"), list
+    ):
         raw_payload["drafts"] = raw_payload["draft_records"]
 
     drafts_payload = raw_payload.get("drafts")
@@ -651,7 +757,139 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
     ):
         raw_payload["draft"] = drafts_payload[0]
 
-    return EmailDispatchRequest.model_validate(raw_payload)
+    def _apply_recipient_normalisation(
+        container: Optional[Dict[str, Any]], *, context: str
+    ) -> None:
+        if not isinstance(container, dict) or "recipients" not in container:
+            return
+        try:
+            normalised = _normalize_recipients(container.get("recipients"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "InvalidRecipients",
+                    "message": str(exc),
+                    "context": context,
+                },
+            ) from exc
+        container["recipients"] = normalised or None
+
+    _apply_recipient_normalisation(raw_payload, context="request")
+    _apply_recipient_normalisation(raw_payload.get("draft"), context="draft")
+
+    drafts_list = raw_payload.get("drafts")
+    if isinstance(drafts_list, list):
+        for index, entry in enumerate(drafts_list):
+            _apply_recipient_normalisation(entry, context=f"drafts[{index}]")
+
+    for key in (
+        "unique_id",
+        "rfq_id",
+        "workflow_id",
+        "sender",
+        "subject",
+        "body",
+        "action_id",
+    ):
+        value = raw_payload.get(key)
+        if not isinstance(value, str):
+            continue
+        stripped = value.strip()
+        if key == "body":
+            raw_payload[key] = value if stripped else None
+        else:
+            raw_payload[key] = stripped or None
+
+    if not raw_payload.get("unique_id") and not raw_payload.get("rfq_id"):
+        workflow_identifier = _coerce_identifier(raw_payload.get("workflow_id"))
+        if workflow_identifier:
+            raw_payload["unique_id"] = workflow_identifier
+
+    try:
+        dispatch_request = EmailDispatchRequest.model_validate(raw_payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "InvalidDispatchRequest",
+                "message": "Email dispatch payload validation failed.",
+                "issues": exc.errors(),
+            },
+        ) from exc
+
+    def _validate_inline_payload(
+        *,
+        recipients: Optional[List[str]],
+        sender: Optional[str],
+        subject: Optional[str],
+        body: Optional[str],
+        context: str,
+    ) -> None:
+        missing: List[str] = []
+        if not recipients:
+            missing.append("recipients")
+        if not sender:
+            missing.append("sender")
+        if not subject or not subject.strip():
+            missing.append("subject")
+        if body is None or not str(body).strip():
+            missing.append("body")
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "IncompleteEmailData",
+                    "message": (
+                        f"{context} is missing required fields: {', '.join(missing)}."
+                    ),
+                    "missing": missing,
+                    "context": context,
+                },
+            )
+
+    if dispatch_request.drafts:
+        for index, draft in enumerate(dispatch_request.drafts):
+            if not any(
+                getattr(draft, field) is not None
+                for field in ("recipients", "sender", "subject", "body")
+            ):
+                continue
+            _validate_inline_payload(
+                recipients=draft.resolved_recipients(),
+                sender=draft.resolved_sender(),
+                subject=draft.resolved_subject(),
+                body=draft.resolved_body(),
+                context=f"drafts[{index}]",
+            )
+    else:
+        draft_model = dispatch_request.draft
+        if draft_model and any(
+            getattr(draft_model, field) is not None
+            for field in ("recipients", "sender", "subject", "body")
+        ):
+            _validate_inline_payload(
+                recipients=draft_model.resolved_recipients(),
+                sender=draft_model.resolved_sender(),
+                subject=draft_model.resolved_subject(),
+                body=draft_model.resolved_body(),
+                context="draft",
+            )
+        else:
+            inline_overrides = {
+                field: raw_payload.get(field)
+                for field in ("recipients", "sender", "subject", "body")
+            }
+            if any(value is not None for value in inline_overrides.values()):
+                _validate_inline_payload(
+                    recipients=dispatch_request.resolve_recipients(),
+                    sender=dispatch_request.resolve_sender(),
+                    subject=dispatch_request.resolve_subject(),
+                    body=dispatch_request.resolve_body(),
+                    context="request",
+                )
+
+    return dispatch_request
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +903,9 @@ async def ask_question(
     file_data: List[tuple[bytes, str]] = []
     if req.file_path:
         if not os.path.isfile(req.file_path):
-            raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
+            raise HTTPException(
+                status_code=400, detail=f"File not found: {req.file_path}"
+            )
         try:
             with open(req.file_path, "rb") as f:
                 file_data.append((f.read(), os.path.basename(req.file_path)))
@@ -725,9 +965,7 @@ def mine_opportunities(
         status="started",
     )
     try:
-        result = orchestrator.execute_workflow(
-            "opportunity_mining", req.model_dump()
-        )
+        result = orchestrator.execute_workflow("opportunity_mining", req.model_dump())
         prs.log_action(
             process_id=process_id,
             agent_type="opportunity_miner",
@@ -770,8 +1008,12 @@ def reject_opportunity(
             metadata=req.metadata,
         )
     except Exception as exc:  # pragma: no cover - database/network
-        logger.exception("Failed to record rejection for opportunity %s", opportunity_id)
-        raise HTTPException(status_code=500, detail="Failed to record opportunity feedback") from exc
+        logger.exception(
+            "Failed to record rejection for opportunity %s", opportunity_id
+        )
+        raise HTTPException(
+            status_code=500, detail="Failed to record opportunity feedback"
+        ) from exc
 
     updated_on = record.get("updated_on")
     if isinstance(updated_on, (bytes, str)):
@@ -927,7 +1169,7 @@ async def send_email(
                 detail={
                     "error": "Invalid Batch Request",
                     "message": "No valid drafts found in request",
-                    "hint": "Ensure each draft has 'unique_id' or 'rfq_id'"
+                    "hint": "Ensure each draft has 'unique_id' or 'rfq_id'",
                 },
             )
 
@@ -947,7 +1189,7 @@ async def send_email(
             detail={
                 "error": "Missing Identifier",
                 "message": "No unique_id or rfq_id provided",
-                "hint": "Send: {\"unique_id\": \"PROC-WF-xxx\"} or {\"draft\": {\"unique_id\": \"PROC-WF-xxx\"}}",
+                "hint": 'Send: {"unique_id": "PROC-WF-xxx"} or {"draft": {"unique_id": "PROC-WF-xxx"}}',
             },
         )
 
@@ -957,7 +1199,11 @@ async def send_email(
     workflow_id_hint = _resolve_dispatch_workflow_id(dispatch_request, identifier)
     repository_workflow_id = dispatch_service.resolve_workflow_id(identifier)
 
-    if workflow_id_hint and repository_workflow_id and workflow_id_hint != repository_workflow_id:
+    if (
+        workflow_id_hint
+        and repository_workflow_id
+        and workflow_id_hint != repository_workflow_id
+    ):
         raise HTTPException(
             status_code=409,
             detail={
@@ -1039,7 +1285,11 @@ async def send_email(
             if isinstance(draft_payload, dict):
                 result_workflow_id = _extract_workflow_token(draft_payload)
 
-        if workflow_id_hint and result_workflow_id and workflow_id_hint != result_workflow_id:
+        if (
+            workflow_id_hint
+            and result_workflow_id
+            and workflow_id_hint != result_workflow_id
+        ):
             logger.error(
                 "Dispatch workflow mismatch for identifier=%s request_workflow=%s result_workflow=%s",
                 identifier,
@@ -1066,7 +1316,9 @@ async def send_email(
             message_id=result.get("message_id"),
             recipients=[str(r) for r in response_recipients],
             sender=str(result.get("sender") or dispatch_request.resolve_sender() or ""),
-            subject=str(result.get("subject") or dispatch_request.resolve_subject() or ""),
+            subject=str(
+                result.get("subject") or dispatch_request.resolve_subject() or ""
+            ),
             error=result.get("error"),
             workflow_id=workflow_id_final,
         )
@@ -1098,6 +1350,24 @@ async def send_email(
         prs.update_process_details(process_id, final_details)
         prs.update_process_status(process_id, 1 if response.sent else -1)
 
+    except DraftNotFoundError as exc:
+        prs.log_action(
+            process_id=process_id,
+            agent_type="email_dispatch",
+            action_desc=input_data,
+            status="failed",
+            action_id=action_id,
+        )
+        prs.update_process_status(process_id, -1)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "DraftNotFound",
+                "message": str(exc),
+                "identifier": identifier,
+            },
+        )
+
     except ValueError as exc:
         prs.log_action(
             process_id=process_id,
@@ -1107,14 +1377,11 @@ async def send_email(
             action_id=action_id,
         )
         prs.update_process_status(process_id, -1)
-
-        error_message = str(exc)
-        status_code = 404 if "No stored draft" in error_message else 400
         raise HTTPException(
-            status_code=status_code,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "error": "Draft Dispatch Failed",
-                "message": error_message,
+                "error": "DraftDispatchFailed",
+                "message": str(exc),
                 "identifier": identifier,
             },
         )
@@ -1128,7 +1395,16 @@ async def send_email(
             action_id=action_id,
         )
         prs.update_process_status(process_id, -1)
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("Unexpected error dispatching email for %s", identifier)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "EmailDispatchError",
+                "message": "Failed to dispatch email draft.",
+                "identifier": identifier,
+                "reason": str(exc),
+            },
+        )
 
     return {
         **response_payload,
@@ -1161,7 +1437,7 @@ def _expand_batch_dispatch_requests(
             if not draft_id:
                 logger.warning(
                     "Skipping draft without identifier in batch request: %s",
-                    draft.model_dump(exclude_none=True)
+                    draft.model_dump(exclude_none=True),
                 )
                 continue
 
@@ -1172,9 +1448,7 @@ def _expand_batch_dispatch_requests(
                 requests.append(EmailDispatchRequest.model_validate(payload))
             except Exception as e:
                 logger.error(
-                    "Failed to validate draft %s in batch: %s",
-                    draft_id,
-                    str(e)
+                    "Failed to validate draft %s in batch: %s", draft_id, str(e)
                 )
                 continue
     elif request_model.draft:
@@ -1221,7 +1495,11 @@ async def _execute_batch_dispatch(
                 agent_nick=agent_nick,
             )
         except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
+            detail = (
+                exc.detail
+                if isinstance(exc.detail, dict)
+                else {"error": str(exc.detail)}
+            )
             results.append(
                 {
                     "unique_id": entry.get_identifier() or None,
@@ -1237,7 +1515,9 @@ async def _execute_batch_dispatch(
             )
             continue
         except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("Batch dispatch failed for %s", entry.get_identifier(), exc_info=exc)
+            logger.exception(
+                "Batch dispatch failed for %s", entry.get_identifier(), exc_info=exc
+            )
             results.append(
                 {
                     "unique_id": entry.get_identifier() or None,
@@ -1365,7 +1645,6 @@ async def dispatch_workflow_drafts(
         )
 
 
-
 @router.post("/negotiate")
 def negotiate(
     req: NegotiationRequest,
@@ -1409,7 +1688,9 @@ def detect_discrepancy(
 )
 def get_agent_types():
     """Return the agent catalogue defined in ``agent_definitions.json``."""
-    file_path = os.path.join(os.path.dirname(__file__), "..", "..", "agent_definitions.json")
+    file_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "agent_definitions.json"
+    )
     with open(file_path, "r") as f:
         data = json.load(f)
     return [AgentType(**agent) for agent in data]
