@@ -4,6 +4,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
@@ -501,3 +503,43 @@ def test_dispatch_from_context_resolves_workflow_and_normalises(monkeypatch):
     assert result["sender"] == "sender2@example.com"
     assert result["subject_override"] == "Negotiation Update"
     assert result["body_override"] == "<p>Body</p>"
+
+
+def test_dispatch_from_context_rejects_draft_without_unique_identifier():
+    store = InMemoryDraftStore()
+    workflow_id = "PROC-WF-NO-UNIQUE"
+
+    payload = {
+        "subject": "Stored Subject",
+        "body": "<p>Stored Body</p>",
+        "recipients": ["buyer@example.com"],
+        "sender": "stored@example.com",
+        "workflow_id": workflow_id,
+    }
+
+    store.add(
+        {
+            "rfq_id": None,
+            "supplier_id": "SUP-CTX",
+            "supplier_name": "Context Corp",
+            "subject": payload["subject"],
+            "body": payload["body"],
+            "sent": False,
+            "recipient_email": None,
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": payload["sender"],
+            "payload": json.dumps(payload),
+            "workflow_id": workflow_id,
+            "unique_id": None,
+            "review_status": "APPROVED",
+        }
+    )
+
+    nick = DummyNick(store, InMemoryActionStore())
+    service = EmailDispatchService(nick)
+
+    with pytest.raises(ValueError) as exc:
+        service.dispatch_from_context(workflow_id, overrides={})
+
+    assert "unique identifiers" in str(exc.value)

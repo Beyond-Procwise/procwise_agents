@@ -139,12 +139,19 @@ class EmailDispatchService:
                 )
 
             identifier = (
-                draft.get("unique_id")
-                or draft.get("rfq_id")
-                or draft.get("id")
+                self._normalise_identifier(draft.get("unique_id"))
+                or self._normalise_identifier(draft.get("rfq_id"))
             )
             if not identifier:
-                raise ValueError("Draft record missing identifier (unique_id/rfq_id/id)")
+                legacy_identifier = draft.get("id")
+                if legacy_identifier is not None:
+                    raise ValueError(
+                        "Draft record is missing unique identifiers (unique_id/rfq_id); "
+                        "numeric ids cannot be dispatched"
+                    )
+                raise ValueError(
+                    "Draft record missing identifier (unique_id/rfq_id)"
+                )
 
         recipients: Any = (
             overrides.get("recipients")
