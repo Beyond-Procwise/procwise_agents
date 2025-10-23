@@ -107,6 +107,72 @@ class EmailDispatchService:
 
         return None
 
+    def dispatch_from_context(
+        self,
+        workflow_id: Optional[str],
+        *,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch a draft resolved from ``workflow_id`` with optional overrides."""
+
+        overrides = dict(overrides or {})
+
+        identifier = self._normalise_identifier(overrides.pop("identifier", None))
+        if not identifier:
+            identifier = self._normalise_identifier(overrides.pop("unique_id", None))
+        if not identifier:
+            identifier = self._normalise_identifier(overrides.pop("rfq_id", None))
+
+        workflow_hint = self._normalise_identifier(
+            overrides.pop("workflow_id", None) or workflow_id
+        )
+
+        recipients_override = overrides.pop("recipients", None)
+        if isinstance(recipients_override, str) or isinstance(
+            recipients_override, Sequence
+        ) and not isinstance(recipients_override, (bytes, bytearray)):
+            recipients = self._normalise_recipients(
+                recipients_override if isinstance(recipients_override, str) else recipients_override
+            )
+        else:
+            recipients = None
+
+        sender_override = overrides.pop("sender", None)
+        if sender_override is not None:
+            sender_override = str(sender_override).strip() or None
+
+        subject_override = overrides.pop("subject_override", None)
+        if subject_override is not None:
+            subject_override = str(subject_override).strip() or None
+
+        body_override = overrides.pop("body_override", None)
+        if body_override is not None:
+            body_override = str(body_override)
+
+        if overrides:
+            self.logger.debug(
+                "Ignoring unsupported dispatch overrides: %s", sorted(overrides.keys())
+            )
+
+        if not identifier:
+            if not workflow_hint:
+                raise ValueError(
+                    "workflow_id or identifier is required to dispatch an email draft"
+                )
+            identifier = self._resolve_identifier_for_workflow(workflow_hint)
+            if not identifier:
+                raise DraftNotFoundError(
+                    f"No dispatchable draft found for workflow {workflow_hint}"
+                )
+
+        return self.send_draft(
+            identifier=identifier,
+            recipients=recipients,
+            sender=sender_override,
+            subject_override=subject_override,
+            body_override=body_override,
+        )
+
     def send_draft(
         self,
         identifier: str,
@@ -454,6 +520,38 @@ class EmailDispatchService:
                 (identifier,),
             )
             return cur.fetchone()
+
+    def _resolve_identifier_for_workflow(self, workflow_id: str) -> Optional[str]:
+        workflow_id = self._normalise_identifier(workflow_id)
+        if not workflow_id:
+            return None
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT unique_id, rfq_id
+                        FROM proc.draft_rfq_emails
+                        WHERE workflow_id = %s
+                          AND review_status IN ('APPROVED', 'SENT')
+                        ORDER BY sent ASC, dispatched_at DESC NULLS LAST, updated_on DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (workflow_id,),
+                    )
+                    row = cur.fetchone()
+        except Exception:
+            self.logger.exception(
+                "Failed to resolve dispatch identifier for workflow %s", workflow_id
+            )
+            return None
+
+        if not row:
+            return None
+
+        unique_id, rfq_id = (row + (None, None))[:2]
+        return self._normalise_identifier(unique_id) or self._normalise_identifier(rfq_id)
 
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
         values = list(row)
