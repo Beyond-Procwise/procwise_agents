@@ -4,6 +4,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
@@ -27,7 +29,7 @@ sys.modules.setdefault("services.backend_scheduler", _backend_scheduler_stub)
 
 DEFAULT_RFQ_SUBJECT = "Sourcing Request – Pricing Discussion"
 
-from services.email_dispatch_service import EmailDispatchService
+from services.email_dispatch_service import EmailDispatchService, DraftNotFoundError
 from services.email_service import EmailSendResult
 from repositories import workflow_email_tracking_repo
 from utils.email_tracking import extract_tracking_metadata, extract_unique_id_from_body
@@ -501,3 +503,37 @@ def test_dispatch_from_context_resolves_workflow_and_normalises(monkeypatch):
     assert result["sender"] == "sender2@example.com"
     assert result["subject_override"] == "Negotiation Update"
     assert result["body_override"] == "<p>Body</p>"
+
+
+def test_dispatch_from_context_raises_when_workflow_only_has_sent(monkeypatch):
+    store = InMemoryDraftStore()
+    workflow_id = "wf-context-sent"
+    store.add(
+        {
+            "rfq_id": "RFQ-SENT",
+            "supplier_id": "SUP-SENT",
+            "supplier_name": "Sent Supplier",
+            "subject": "Sent Subject",
+            "body": "<p>Sent Body</p>",
+            "sent": True,
+            "recipient_email": "old@example.com",
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": "old@example.com",
+            "payload": json.dumps({"unique_id": "PROC-WF-SENT"}),
+            "workflow_id": workflow_id,
+            "unique_id": "PROC-WF-SENT",
+            "review_status": "SENT",
+        }
+    )
+
+    nick = DummyNick(store, InMemoryActionStore())
+    service = EmailDispatchService(nick)
+
+    def _unexpected_send(*_args, **_kwargs):  # pragma: no cover - defensive
+        raise AssertionError("send_draft should not be called")
+
+    monkeypatch.setattr(service, "send_draft", _unexpected_send)
+
+    with pytest.raises(DraftNotFoundError):
+        service.dispatch_from_context(workflow_id)
