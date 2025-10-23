@@ -113,7 +113,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)
 app.add_middleware(RequestIdMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+_cors_headers = ["*", "X-Workflow-Id", "Idempotency-Key", "X-Request-ID"]
+_cors_expose = ["X-Workflow-Id", "Idempotency-Key", "X-Request-ID"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=_cors_headers,
+    expose_headers=_cors_expose,
+)
 
 app.include_router(documents.router)
 app.include_router(workflows.router)
