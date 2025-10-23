@@ -436,3 +436,67 @@ def test_email_batch_dispatch_multiple_drafts(monkeypatch):
     assert {call["identifier"] for call in calls} == {"PROC-WF-1", "PROC-WF-2"}
 
 
+
+def test_email_batch_accepts_draft_records(monkeypatch):
+    app = FastAPI()
+    app.include_router(workflows_router)
+    orchestrator = DummyOrchestrator()
+    app.state.orchestrator = orchestrator
+    app.state.agent_nick = orchestrator.agent_nick
+    client = TestClient(app)
+
+    captured: Dict[str, Any] = {}
+
+    class StubDispatch:
+        def __init__(self, agent_nick):
+            captured.setdefault("agent_nick", agent_nick)
+
+        def resolve_workflow_id(self, identifier):
+            return f"wf-{identifier}" if identifier else None
+
+        def send_draft(
+            self,
+            identifier,
+            recipients=None,
+            sender=None,
+            subject_override=None,
+            body_override=None,
+            attachments=None,
+        ):
+            captured.setdefault("calls", []).append(
+                {
+                    "identifier": identifier,
+                    "recipients": recipients,
+                    "subject": subject_override,
+                    "body": body_override,
+                }
+            )
+            return {
+                "unique_id": identifier,
+                "sent": True,
+                "recipients": recipients or ["buyer@example.com"],
+                "sender": sender or "sender@example.com",
+                "subject": subject_override or "subject",
+            }
+
+    monkeypatch.setattr("api.routers.workflows.EmailDispatchService", StubDispatch)
+
+    payload = {
+        "draft_records": [
+            {
+                "unique_id": "PROC-WF-REC1",
+                "recipients": ["buyer@example.com"],
+                "subject": "Subject from record",
+                "body": "<p>Body</p>",
+            }
+        ]
+    }
+
+    resp = client.post("/workflows/email/batch", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["result"]["unique_id"] == "PROC-WF-REC1"
+    assert body["result"]["sent"] is True
+    assert captured["calls"][0]["identifier"] == "PROC-WF-REC1"

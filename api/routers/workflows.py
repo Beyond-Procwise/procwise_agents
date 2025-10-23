@@ -346,6 +346,15 @@ class EmailDispatchRequest(BaseModel):
                     values["unique_id"] = unique_id
                     return values
 
+        draft_records = values.get("draft_records")
+        if isinstance(draft_records, list) and draft_records:
+            first_record = draft_records[0]
+            if isinstance(first_record, dict):
+                unique_id = first_record.get("unique_id") or first_record.get("rfq_id")
+                if unique_id:
+                    values["unique_id"] = unique_id
+                    return values
+
         if "unique_id" in values or "supplier_id" in values:
             return values
 
@@ -491,7 +500,7 @@ def _maybe_parse_embedded_json(value: Any) -> Any:
 
 
 def _deserialise_structured_fields(payload: Dict[str, Any]) -> None:
-    for key in ("draft", "drafts"):
+    for key in ("draft", "drafts", "draft_records"):
         if key not in payload:
             continue
         value = payload[key]
@@ -616,6 +625,9 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
         raw_payload = {}
 
     _deserialise_structured_fields(raw_payload)
+
+    if "drafts" not in raw_payload and isinstance(raw_payload.get("draft_records"), list):
+        raw_payload["drafts"] = raw_payload["draft_records"]
 
     return EmailDispatchRequest.model_validate(raw_payload)
 
