@@ -8,7 +8,7 @@ import re
 import time
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
@@ -825,15 +825,18 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
         subject: Optional[str],
         body: Optional[str],
         context: str,
+        required_fields: Optional[Iterable[str]] = None,
     ) -> None:
+        required = set(required_fields or ("recipients", "sender", "subject", "body"))
         missing: List[str] = []
-        if not recipients:
+
+        if "recipients" in required and not recipients:
             missing.append("recipients")
-        if not sender:
+        if "sender" in required and not sender:
             missing.append("sender")
-        if not subject or not subject.strip():
+        if "subject" in required and (not subject or not subject.strip()):
             missing.append("subject")
-        if body is None or not str(body).strip():
+        if "body" in required and (body is None or not str(body).strip()):
             missing.append("body")
         if missing:
             raise HTTPException(
@@ -850,10 +853,12 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
 
     if dispatch_request.drafts:
         for index, draft in enumerate(dispatch_request.drafts):
-            if not any(
-                getattr(draft, field) is not None
+            provided_fields = [
+                field
                 for field in ("recipients", "sender", "subject", "body")
-            ):
+                if getattr(draft, field) is not None
+            ]
+            if not provided_fields:
                 continue
             _validate_inline_payload(
                 recipients=draft.resolved_recipients(),
@@ -861,6 +866,7 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
                 subject=draft.resolved_subject(),
                 body=draft.resolved_body(),
                 context=f"drafts[{index}]",
+                required_fields=provided_fields,
             )
     else:
         draft_model = dispatch_request.draft
@@ -868,25 +874,35 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
             getattr(draft_model, field) is not None
             for field in ("recipients", "sender", "subject", "body")
         ):
+            provided_fields = [
+                field
+                for field in ("recipients", "sender", "subject", "body")
+                if getattr(draft_model, field) is not None
+            ]
             _validate_inline_payload(
                 recipients=draft_model.resolved_recipients(),
                 sender=draft_model.resolved_sender(),
                 subject=draft_model.resolved_subject(),
                 body=draft_model.resolved_body(),
                 context="draft",
+                required_fields=provided_fields,
             )
         else:
             inline_overrides = {
                 field: raw_payload.get(field)
                 for field in ("recipients", "sender", "subject", "body")
             }
-            if any(value is not None for value in inline_overrides.values()):
+            provided_fields = [
+                field for field, value in inline_overrides.items() if value is not None
+            ]
+            if provided_fields:
                 _validate_inline_payload(
                     recipients=dispatch_request.resolve_recipients(),
                     sender=dispatch_request.resolve_sender(),
                     subject=dispatch_request.resolve_subject(),
                     body=dispatch_request.resolve_body(),
                     context="request",
+                    required_fields=provided_fields,
                 )
 
     return dispatch_request
