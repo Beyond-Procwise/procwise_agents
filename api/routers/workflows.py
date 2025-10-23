@@ -1626,6 +1626,39 @@ async def send_email(
         logger.exception("Unhandled error during context dispatch", exc_info=exc)
         raise HTTPException(status_code=500, detail="Internal Server Error") from exc
 
+    resolved_identifier = _coerce_identifier(result.get("unique_id"))
+    draft_candidate = result.get("draft")
+    resolved_draft = draft_candidate if isinstance(draft_candidate, dict) else None
+    if not resolved_identifier and resolved_draft:
+        resolved_identifier = _coerce_identifier(
+            resolved_draft.get("unique_id") or resolved_draft.get("rfq_id")
+        )
+
+    resolved_workflow_id = _coerce_identifier(
+        result.get("workflow_id")
+        or (resolved_draft.get("workflow_id") if resolved_draft else None)
+        or workflow_id_hint
+    )
+
+    resolved_subject = result.get("subject") or subject_material or ""
+    resolved_body = result.get("body") or body_material or ""
+
+    if resolved_identifier:
+        refined_key = _ensure_request_idempotency_key(
+            request,
+            workflow_id=resolved_workflow_id,
+            subject=resolved_subject,
+            body=resolved_body,
+            identifier=resolved_identifier,
+            force=True,
+        )
+        if refined_key and refined_key != idempotency_key:
+            logger.info(
+                "email_dispatch_context: refined idempotency key for workflow_id=%s identifier=%s",
+                resolved_workflow_id or "-",
+                resolved_identifier,
+            )
+
     return {"status": "ok", "result": result}
 
 
