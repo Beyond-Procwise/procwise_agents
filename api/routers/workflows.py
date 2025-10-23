@@ -2,6 +2,7 @@
 """API routes exposing the agent workflows."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,43 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_request_idempotency_key(
+    request: Request,
+    *,
+    workflow_id: Optional[str],
+    subject: Optional[str],
+    body: Optional[str],
+    identifier: Optional[str] = None,
+    force: bool = False,
+) -> Optional[str]:
+    """Ensure ``request.state.idempotency_key`` has a deterministic value."""
+
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+
+    existing = getattr(state, "idempotency_key", None)
+    if existing and not force:
+        return existing
+
+    method = getattr(request, "method", "").upper()
+    path = getattr(getattr(request, "url", None), "path", "")
+    material = {
+        "m": method,
+        "p": path,
+        "w": (workflow_id or "").strip(),
+        "s": (subject or "").strip(),
+        "b": (body or "").strip(),
+    }
+    if identifier:
+        material["i"] = identifier.strip()
+
+    payload = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    state.idempotency_key = digest
+    return digest
 
 
 def get_orchestrator(request: Request) -> Orchestrator:
@@ -1194,6 +1232,9 @@ async def _dispatch_email_request(
     dispatch_request: EmailDispatchRequest,
     orchestrator: Orchestrator,
     agent_nick,
+    request: Request,
+    workflow_hint: Optional[str] = None,
+    force_new_idempotency: bool = False,
 ) -> Dict[str, Any]:
     if dispatch_request.drafts:
         expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
@@ -1214,8 +1255,9 @@ async def _dispatch_email_request(
             return await _execute_batch_dispatch(
                 expanded_requests=expanded_requests,
                 orchestrator=orchestrator,
-            agent_nick=agent_nick,
-        )
+                agent_nick=agent_nick,
+                request=request,
+            )
 
     identifier = dispatch_request.get_identifier()
     if not identifier:
@@ -1231,7 +1273,9 @@ async def _dispatch_email_request(
     input_data = dispatch_request.model_dump(exclude_none=True)
     dispatch_service = EmailDispatchService(agent_nick)
 
-    workflow_id_hint = _resolve_dispatch_workflow_id(dispatch_request, identifier)
+    workflow_id_hint = workflow_hint or _resolve_dispatch_workflow_id(
+        dispatch_request, identifier
+    )
     repository_workflow_id = dispatch_service.resolve_workflow_id(identifier)
 
     if (
@@ -1250,6 +1294,30 @@ async def _dispatch_email_request(
         )
 
     workflow_id_hint = workflow_id_hint or repository_workflow_id
+
+    subject_material = dispatch_request.resolve_subject() or ""
+    body_material = dispatch_request.resolve_body() or ""
+    idempotency_key = _ensure_request_idempotency_key(
+        request,
+        workflow_id=workflow_id_hint,
+        subject=subject_material,
+        body=body_material,
+        identifier=identifier,
+        force=force_new_idempotency,
+    )
+
+    request_id = getattr(getattr(request, "state", object()), "request_id", "-")
+    method = getattr(request, "method", "?")
+    path = getattr(getattr(request, "url", None), "path", "?")
+    logger.info(
+        "email_dispatch: req_id=%s idem=%s method=%s path=%s workflow_id=%s identifier=%s",
+        request_id or "-",
+        idempotency_key or "-",
+        method,
+        path,
+        workflow_id_hint or "-",
+        identifier or "-",
+    )
 
     if not workflow_id_hint:
         raise HTTPException(
@@ -1274,6 +1342,7 @@ async def _dispatch_email_request(
         process_name="email_dispatch",
         process_details=initial_details,
         workflow_id=workflow_id_hint,
+        idempotency_key=idempotency_key,
     )
     if process_id is None:
         raise HTTPException(status_code=500, detail="Failed to log process")
@@ -1475,6 +1544,7 @@ async def send_email(
             dispatch_request=dispatch_request,
             orchestrator=orchestrator,
             agent_nick=agent_nick,
+            request=request,
         )
 
     payload = getattr(request.state, "email_dispatch_payload", {}) or {}
@@ -1494,6 +1564,29 @@ async def send_email(
         workflow_id_hint = overrides.pop("workflow_id")
     elif "workflow_id" in overrides:
         overrides.pop("workflow_id")
+
+    subject_material = overrides.get("subject_override") or ""
+    body_material = overrides.get("body_override") or ""
+    identifier_material = overrides.get("identifier")
+    idempotency_key = _ensure_request_idempotency_key(
+        request,
+        workflow_id=workflow_id_hint,
+        subject=subject_material,
+        body=body_material,
+        identifier=identifier_material,
+    )
+
+    request_id = getattr(getattr(request, "state", object()), "request_id", "-")
+    method = getattr(request, "method", "?")
+    path = getattr(getattr(request, "url", None), "path", "?")
+    logger.info(
+        "email_dispatch_context: req_id=%s idem=%s method=%s path=%s workflow_id=%s",
+        request_id or "-",
+        idempotency_key or "-",
+        method,
+        path,
+        workflow_id_hint or "-",
+    )
 
     dispatch_service = EmailDispatchService(agent_nick)
 
@@ -1590,6 +1683,7 @@ async def _execute_batch_dispatch(
     expanded_requests: List[EmailDispatchRequest],
     orchestrator: Orchestrator,
     agent_nick,
+    request: Request,
 ) -> Dict[str, Any]:
     if not expanded_requests:
         raise HTTPException(
@@ -1606,17 +1700,24 @@ async def _execute_batch_dispatch(
             dispatch_request=expanded_requests[0],
             orchestrator=orchestrator,
             agent_nick=agent_nick,
+            request=request,
         )
 
     results: List[Dict[str, Any]] = []
     success_count = 0
 
+    state = getattr(request, "state", None)
+    original_key = getattr(state, "idempotency_key", None) if state is not None else None
+
     for entry in expanded_requests:
         try:
+            force_new = not bool(original_key)
             response = await _dispatch_email_request(
                 dispatch_request=entry,
                 orchestrator=orchestrator,
                 agent_nick=agent_nick,
+                request=request,
+                force_new_idempotency=force_new,
             )
         except HTTPException as exc:
             detail = (
@@ -1671,6 +1772,9 @@ async def _execute_batch_dispatch(
                 "error": None,
             }
         )
+
+    if state is not None:
+        state.idempotency_key = original_key
 
     total = len(results)
     success = success_count == total and total > 0
