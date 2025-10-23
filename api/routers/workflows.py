@@ -629,6 +629,14 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
     if "drafts" not in raw_payload and isinstance(raw_payload.get("draft_records"), list):
         raw_payload["drafts"] = raw_payload["draft_records"]
 
+    drafts_payload = raw_payload.get("drafts")
+    if (
+        "draft" not in raw_payload
+        and isinstance(drafts_payload, list)
+        and len(drafts_payload) == 1
+    ):
+        raw_payload["draft"] = drafts_payload[0]
+
     return EmailDispatchRequest.model_validate(raw_payload)
 
 
@@ -841,6 +849,17 @@ async def send_email(
     agent_nick=Depends(get_agent_nick),
 ):
     """Send a previously drafted RFQ email using the dispatch service."""
+
+    if dispatch_request.drafts:
+        expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+        if len(expanded_requests) == 1:
+            dispatch_request = expanded_requests[0]
+        else:
+            return await _execute_batch_dispatch(
+                expanded_requests=expanded_requests,
+                orchestrator=orchestrator,
+                agent_nick=agent_nick,
+            )
 
     identifier = dispatch_request.get_identifier()
     if not identifier:
@@ -1072,14 +1091,12 @@ def _expand_batch_dispatch_requests(
     return requests
 
 
-@router.post("/email/batch")
-async def dispatch_batch_emails(
-    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
-    orchestrator: Orchestrator = Depends(get_orchestrator),
-    agent_nick=Depends(get_agent_nick),
-):
-    expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
-
+async def _execute_batch_dispatch(
+    *,
+    expanded_requests: List[EmailDispatchRequest],
+    orchestrator: Orchestrator,
+    agent_nick,
+) -> Dict[str, Any]:
     if not expanded_requests:
         raise HTTPException(
             status_code=400,
@@ -1090,8 +1107,6 @@ async def dispatch_batch_emails(
             },
         )
 
-    # For single dispatch requests we delegate to the standard endpoint to
-    # preserve identical behaviour (including error semantics).
     if len(expanded_requests) == 1:
         return await send_email(
             dispatch_request=expanded_requests[0],
@@ -1158,14 +1173,32 @@ async def dispatch_batch_emails(
         )
 
     total = len(results)
+    success = success_count == total and total > 0
+    status_label = "completed" if success else "failed"
 
     return {
-        "success": success_count == total if total else False,
+        "success": success,
+        "status": status_label,
         "total": total,
         "sent": success_count,
         "failed": total - success_count,
         "results": results,
     }
+
+
+@router.post("/email/batch")
+async def dispatch_batch_emails(
+    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+    agent_nick=Depends(get_agent_nick),
+):
+    expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+
+    return await _execute_batch_dispatch(
+        expanded_requests=expanded_requests,
+        orchestrator=orchestrator,
+        agent_nick=agent_nick,
+    )
 
 
 @router.post("/{workflow_id}/email/dispatch-all")
