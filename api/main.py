@@ -27,6 +27,7 @@ from agents.email_drafting_agent import EmailDraftingAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
+from api.middleware.request_ids import RequestIdMiddleware
 from api.routers import documents, run, stream, system, training, workflows
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -111,7 +112,17 @@ async def lifespan(app: FastAPI):
     logger.info("API shutting down.")
 
 app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(RequestIdMiddleware)
+_cors_headers = ["*", "X-Workflow-Id", "Idempotency-Key", "X-Request-ID"]
+_cors_expose = ["X-Workflow-Id", "Idempotency-Key", "X-Request-ID"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=_cors_headers,
+    expose_headers=_cors_expose,
+)
 
 app.include_router(documents.router)
 app.include_router(workflows.router)

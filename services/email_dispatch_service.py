@@ -109,118 +109,101 @@ class EmailDispatchService:
 
     def dispatch_from_context(
         self,
-        workflow_id: Optional[str],
+        workflow_id: str | None,
         *,
-        overrides: Optional[Dict[str, Any]] = None,
+        overrides: Dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> Dict[str, Any]:
-        """Dispatch a draft identified by ``workflow_id`` and optional overrides.
-
-        When ``identifier`` is provided within ``overrides`` it is used directly.
-        Otherwise the most recent unsent draft tagged with ``workflow_id`` is
-        resolved and dispatched.  Recipient, sender, subject, and body values are
-        normalised from overrides first and fall back to the hydrated draft
-        payload before delegating to :meth:`send_draft`.
+        """
+        Resolve identifier/recipients/sender/subject/body from context and overrides, then call send_draft.
         """
 
-        overrides = dict(overrides or {})
-        identifier_override = self._normalise_identifier(overrides.get("identifier"))
+        identifier = (overrides.get("identifier") or "").strip() or None
 
-        draft_row: Optional[Tuple] = None
-        with self.agent_nick.get_db_connection() as conn:
-            if identifier_override:
-                draft_row = self._fetch_latest_draft(conn, identifier_override)
-                if draft_row is None:
-                    raise DraftNotFoundError(
-                        f"No draft found for identifier={identifier_override}"
-                    )
-            else:
-                workflow_token = str(workflow_id or "").strip()
-                if not workflow_token:
-                    raise ValueError("workflow_id or identifier required")
-                draft_row = self._find_draft_for_workflow(conn, workflow_token)
-                if draft_row is None:
-                    raise DraftNotFoundError(
-                        f"No unsent draft found for workflow_id={workflow_token}"
-                    )
+        draft: Optional[Dict[str, Any]] = None
+        if identifier:
+            draft = self._load_draft_by_identifier(identifier)
+            if not draft:
+                raise DraftNotFoundError(f"No draft found for identifier={identifier}")
 
-        hydrated_draft = self._hydrate_draft(draft_row)
-        identifier = identifier_override or self._normalise_identifier(
-            hydrated_draft.get("unique_id")
+        if not draft:
+            workflow_hint = self._normalise_identifier(workflow_id)
+            if not workflow_hint:
+                raise ValueError("workflow_id or identifier required")
+
+            draft = self._load_draft_for_workflow(workflow_hint)
+
+            if not draft:
+                raise DraftNotFoundError(
+                    f"No unsent/saved draft found for workflow_id={workflow_hint}"
+                )
+
+            identifier = (
+                draft.get("unique_id")
+                or draft.get("rfq_id")
+                or draft.get("id")
+            )
+            if not identifier:
+                raise ValueError("Draft record missing identifier (unique_id/rfq_id/id)")
+
+        recipients: Any = (
+            overrides.get("recipients")
+            or draft.get("recipients")
+            or draft.get("to")
+            or []
         )
-        if not identifier:
-            identifier = self._normalise_identifier(hydrated_draft.get("rfq_id"))
-        if not identifier:
-            raise ValueError("Draft record missing unique identifier")
-
-        def _coerce_recipients(value: Any) -> Optional[Iterable[str]]:
-            if value is None:
-                return None
-            if isinstance(value, str):
-                return [value]
-            try:
-                return list(value)
-            except TypeError:
-                return None
-            return None
-
-        recipients_source: Optional[Iterable[str]]
-        if "recipients" in overrides:
-            recipients_source = _coerce_recipients(overrides.get("recipients"))
+        if isinstance(recipients, str):
+            recipients = [
+                r.strip()
+                for r in re.split(r"[,;\s]+", recipients)
+                if r and r.strip()
+            ]
         else:
-            recipients_source = hydrated_draft.get("recipients")
-            if not recipients_source and hydrated_draft.get("receiver"):
-                recipients_source = [hydrated_draft["receiver"]]
+            recipients = [
+                str(r).strip()
+                for r in recipients
+                if isinstance(r, str) and r.strip()
+            ]
+        seen: set[str] = set()
+        recipients = [r for r in recipients if not (r in seen or seen.add(r))]
 
-        recipients_override = (
-            self._normalise_recipients(recipients_source)
-            if recipients_source is not None
-            else None
+        sender = (
+            overrides.get("sender")
+            or draft.get("sender")
+            or draft.get("from")
+            or ""
         )
+        sender = str(sender).strip()
+        if not sender:
+            default_sender = getattr(self.settings, "DEFAULT_SENDER", None)
+            if default_sender:
+                sender = str(default_sender).strip()
 
-        if "sender" in overrides:
-            sender_candidate = overrides.get("sender")
-        else:
-            sender_candidate = hydrated_draft.get("sender")
-        sender_override = None
-        if sender_candidate is not None:
-            sender_override = str(sender_candidate).strip() or None
-
-        subject_candidate = None
-        if "subject_override" in overrides:
-            subject_candidate = overrides.get("subject_override")
-        elif "subject" in overrides:
-            subject_candidate = overrides.get("subject")
-        else:
-            subject_candidate = hydrated_draft.get("subject")
-        subject_override = (
-            str(subject_candidate).strip() if subject_candidate is not None else None
+        subject_candidate = (
+            overrides.get("subject_override")
+            or draft.get("subject")
+            or ""
         )
-        if subject_override == "":
-            subject_override = None
+        subject_override = str(subject_candidate).strip()
 
-        body_candidate = None
-        if "body_override" in overrides:
-            body_candidate = overrides.get("body_override")
-        elif "body" in overrides:
-            body_candidate = overrides.get("body")
-        else:
-            for key in ("body", "html", "text"):
-                if hydrated_draft.get(key):
-                    body_candidate = hydrated_draft.get(key)
-                    break
-        body_override = str(body_candidate).strip() if body_candidate is not None else None
-        if body_override == "":
-            body_override = None
+        body_candidate = (
+            overrides.get("body_override")
+            or draft.get("body")
+            or draft.get("html")
+            or draft.get("text")
+            or ""
+        )
+        body_override = str(body_candidate).strip()
 
-        attachments_override = overrides.get("attachments") if "attachments" in overrides else None
+        attachments = overrides.get("attachments")
 
         return self.send_draft(
-            identifier,
-            recipients=recipients_override,
-            sender=sender_override,
+            identifier=identifier,
+            recipients=recipients,
+            sender=sender,
             subject_override=subject_override,
             body_override=body_override,
-            attachments=attachments_override,
+            attachments=attachments,
         )
 
     def send_draft(
@@ -262,44 +245,60 @@ class EmailDispatchService:
 
             rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
 
-            recipient_source = (
-                recipients if recipients is not None else draft.get("recipients")
-            )
-            recipient_list = self._normalise_recipients(recipient_source)
-            if not recipient_list and draft.get("receiver"):
-                recipient_list = self._normalise_recipients([draft["receiver"]])
-
-            if not recipient_list:
-                raise ValueError(
-                    "At least one recipient email is required to send the draft"
+            recipient_source: Any
+            if recipients is not None:
+                recipient_source = recipients
+            else:
+                recipient_source = (
+                    draft.get("recipients")
+                    or draft.get("to")
+                    or draft.get("receiver")
+                    or []
                 )
+            if isinstance(recipient_source, str):
+                recipient_list = [
+                    r.strip()
+                    for r in re.split(r"[,;\s]+", recipient_source)
+                    if r and r.strip()
+                ]
+            else:
+                recipient_list = [
+                    str(r).strip()
+                    for r in recipient_source
+                    if isinstance(r, str) and r.strip()
+                ]
+            seen: set[str] = set()
+            recipient_list = [
+                r for r in recipient_list if not (r in seen or seen.add(r))
+            ]
+            if not recipient_list:
+                raise ValueError("At least one recipient is required")
 
-            sender_candidate = sender if sender is not None else draft.get("sender")
-            sender_email = (
-                str(sender_candidate).strip() if sender_candidate is not None else ""
+            sender_candidate = (
+                sender
+                if sender is not None
+                else draft.get("sender")
+                or draft.get("from")
+                or ""
             )
+            sender_email = str(sender_candidate).strip()
             if not sender_email:
                 default_sender = getattr(
                     self.settings, "DEFAULT_SENDER", None
                 ) or getattr(self.settings, "ses_default_sender", None)
-                sender_email = str(default_sender).strip() if default_sender else ""
+                if default_sender:
+                    sender_email = str(default_sender).strip()
             if not sender_email:
                 raise ValueError(
-                    "Sender email address is required and DEFAULT_SENDER is not configured"
+                    "Sender is required (configure settings.DEFAULT_SENDER or pass sender)"
                 )
 
-            if subject_override is not None:
-                subject_candidate = subject_override
-            else:
-                subject_candidate = draft.get("subject")
-            subject_str = str(subject_candidate).strip() if subject_candidate else ""
-            subject = subject_str or f"{unique_id} – Request for Quotation"
-
-            body_source = (
-                body_override if body_override is not None else draft.get("body")
-            )
-            body_text = str(body_source).strip() if body_source else ""
-            subject = subject.strip()
+            body_text = (
+                (body_override or draft.get("body") or draft.get("html") or draft.get("text") or "")
+            ).strip()
+            subject = (
+                (subject_override or draft.get("subject") or "")
+            ).strip()
             if not subject or not body_text:
                 raise ValueError("Both subject and body are required")
 
@@ -320,11 +319,7 @@ class EmailDispatchService:
                     workflow_id=draft.get("workflow_id"),
                 )
             except ValueError as err:
-                self.logger.warning(
-                    "Skipping tracking annotation for unique_id %s: %s",
-                    unique_id,
-                    err,
-                )
+                self.logger.warning("Skipping tracking annotation: %s", err)
                 body = body_text
                 backend_metadata = {"unique_id": identifier}
 
@@ -382,18 +377,15 @@ class EmailDispatchService:
                 headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
 
             payload_metadata = dict(backend_metadata)
-            provider_payload: Dict[str, Any] = {
+            payload: Dict[str, Any] = {
                 "to": list(recipient_list),
                 "from": sender_email,
                 "subject": subject,
                 "metadata": payload_metadata,
             }
-            if re.search(r"<[^>]+>", body):
-                provider_payload["html"] = body
-            else:
-                provider_payload["text"] = body
+            payload["html" if "<" in body and ">" in body else "text"] = body
 
-            dispatch_payload["payload"] = provider_payload
+            dispatch_payload["payload"] = payload
 
             send_result = self.email_service.send_email(
                 subject,
@@ -574,35 +566,27 @@ class EmailDispatchService:
             )
             return cur.fetchone()
 
-    def _find_draft_for_workflow(
-        self, conn, workflow_id: str
-    ) -> Optional[Tuple]:
-        if not workflow_id:
+    def _load_draft_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        resolved = self._normalise_identifier(identifier)
+        if not resolved:
             return None
 
-        unsent_query = """
-            SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                   review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
-                   workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
-            FROM proc.draft_rfq_emails
-            WHERE workflow_id = %s
-              AND (sent = FALSE OR sent IS NULL)
-            ORDER BY
-                CASE
-                    WHEN UPPER(COALESCE(review_status, 'PENDING')) IN ('APPROVED', 'SAVED') THEN 0
-                    ELSE 1
-                END,
-                thread_index DESC,
-                id DESC
-            LIMIT 1
-        """
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                draft_row = self._fetch_latest_draft(conn, resolved)
+                if not draft_row:
+                    return None
+                return self._hydrate_draft(draft_row)
+        except Exception:  # pragma: no cover - defensive logging
+            self.logger.exception(
+                "Failed to load draft for identifier %s", resolved
+            )
+            return None
 
-        with conn.cursor() as cur:
-            cur.execute(unsent_query, (workflow_id,))
-            row = cur.fetchone()
-
-        if row:
-            return row
+    def _load_draft_for_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        workflow_token = self._normalise_identifier(workflow_id)
+        if not workflow_token:
+            return None
 
         return None
 
