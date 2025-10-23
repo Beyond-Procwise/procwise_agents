@@ -346,6 +346,15 @@ class EmailDispatchRequest(BaseModel):
                     values["unique_id"] = unique_id
                     return values
 
+        draft_records = values.get("draft_records")
+        if isinstance(draft_records, list) and draft_records:
+            first_record = draft_records[0]
+            if isinstance(first_record, dict):
+                unique_id = first_record.get("unique_id") or first_record.get("rfq_id")
+                if unique_id:
+                    values["unique_id"] = unique_id
+                    return values
+
         if "unique_id" in values or "supplier_id" in values:
             return values
 
@@ -441,16 +450,6 @@ class EmailDispatchRequest(BaseModel):
         return None
 
 
-class EmailBatchDispatchRequest(BaseModel):
-    """Request payload for batch email dispatch operations."""
-
-    drafts: List[EmailDraftPayload] = Field(
-        ..., description="List of drafts to dispatch in a single batch operation."
-    )
-
-    model_config = ConfigDict(extra="allow")
-
-
 class EmailDispatchResponse(BaseModel):
     success: bool
     unique_id: str
@@ -501,7 +500,7 @@ def _maybe_parse_embedded_json(value: Any) -> Any:
 
 
 def _deserialise_structured_fields(payload: Dict[str, Any]) -> None:
-    for key in ("draft", "drafts"):
+    for key in ("draft", "drafts", "draft_records"):
         if key not in payload:
             continue
         value = payload[key]
@@ -626,6 +625,17 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
         raw_payload = {}
 
     _deserialise_structured_fields(raw_payload)
+
+    if "drafts" not in raw_payload and isinstance(raw_payload.get("draft_records"), list):
+        raw_payload["drafts"] = raw_payload["draft_records"]
+
+    drafts_payload = raw_payload.get("drafts")
+    if (
+        "draft" not in raw_payload
+        and isinstance(drafts_payload, list)
+        and len(drafts_payload) == 1
+    ):
+        raw_payload["draft"] = drafts_payload[0]
 
     return EmailDispatchRequest.model_validate(raw_payload)
 
@@ -840,6 +850,17 @@ async def send_email(
 ):
     """Send a previously drafted RFQ email using the dispatch service."""
 
+    if dispatch_request.drafts:
+        expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+        if len(expanded_requests) == 1:
+            dispatch_request = expanded_requests[0]
+        else:
+            return await _execute_batch_dispatch(
+                expanded_requests=expanded_requests,
+                orchestrator=orchestrator,
+                agent_nick=agent_nick,
+            )
+
     identifier = dispatch_request.get_identifier()
     if not identifier:
         raise HTTPException(
@@ -1039,12 +1060,44 @@ async def send_email(
     }
 
 
-@router.post("/email/batch")
-async def dispatch_batch_emails(
-    request: EmailBatchDispatchRequest,
-    agent_nick=Depends(get_agent_nick),
-):
-    if not request.drafts:
+def _expand_batch_dispatch_requests(
+    request_model: EmailDispatchRequest,
+) -> List[EmailDispatchRequest]:
+    """Normalise batch payloads into discrete dispatch requests."""
+
+    def _base_overrides() -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        for field in ("recipients", "sender", "subject", "body", "action_id"):
+            value = getattr(request_model, field, None)
+            if value is not None:
+                overrides[field] = value
+        return overrides
+
+    overrides = _base_overrides()
+    requests: List[EmailDispatchRequest] = []
+
+    if request_model.drafts:
+        for draft in request_model.drafts:
+            payload: Dict[str, Any] = dict(overrides)
+            payload["draft"] = draft.model_dump(exclude_none=True)
+            requests.append(EmailDispatchRequest.model_validate(payload))
+    elif request_model.draft:
+        payload: Dict[str, Any] = dict(overrides)
+        payload["draft"] = request_model.draft.model_dump(exclude_none=True)
+        requests.append(EmailDispatchRequest.model_validate(payload))
+    else:
+        requests.append(request_model)
+
+    return requests
+
+
+async def _execute_batch_dispatch(
+    *,
+    expanded_requests: List[EmailDispatchRequest],
+    orchestrator: Orchestrator,
+    agent_nick,
+) -> Dict[str, Any]:
+    if not expanded_requests:
         raise HTTPException(
             status_code=400,
             detail={
@@ -1054,65 +1107,98 @@ async def dispatch_batch_emails(
             },
         )
 
-    dispatch_service = EmailDispatchService(agent_nick)
+    if len(expanded_requests) == 1:
+        return await send_email(
+            dispatch_request=expanded_requests[0],
+            orchestrator=orchestrator,
+            agent_nick=agent_nick,
+        )
 
     results: List[Dict[str, Any]] = []
-    for draft in request.drafts:
-        identifier = draft.resolved_identifier()
-        if not identifier:
-            logger.warning(
-                "Skipping draft without identifier: supplier_id=%s", draft.supplier_id
+    success_count = 0
+
+    for entry in expanded_requests:
+        try:
+            response = await send_email(
+                dispatch_request=entry,
+                orchestrator=orchestrator,
+                agent_nick=agent_nick,
             )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
             results.append(
                 {
-                    "unique_id": None,
+                    "unique_id": entry.get_identifier() or None,
                     "sent": False,
-                    "error": "Draft missing unique identifier",
-                    "supplier_id": draft.supplier_id,
-                    "subject": draft.resolved_subject(),
+                    "message_id": None,
+                    "supplier_id": getattr(entry.draft, "supplier_id", None),
+                    "subject": entry.resolve_subject()
+                    or (entry.draft.resolved_subject() if entry.draft else None),
+                    "error": detail,
+                    "status_code": exc.status_code,
+                    "response": None,
+                }
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Batch dispatch failed for %s", entry.get_identifier(), exc_info=exc)
+            results.append(
+                {
+                    "unique_id": entry.get_identifier() or None,
+                    "sent": False,
+                    "message_id": None,
+                    "supplier_id": getattr(entry.draft, "supplier_id", None),
+                    "subject": entry.resolve_subject()
+                    or (entry.draft.resolved_subject() if entry.draft else None),
+                    "error": {"error": str(exc)},
+                    "response": None,
                 }
             )
             continue
 
-        try:
-            result = await run_in_threadpool(
-                dispatch_service.send_draft,
-                identifier=identifier,
-                recipients=draft.resolved_recipients(),
-                sender=draft.resolved_sender(),
-                subject_override=draft.resolved_subject(),
-                body_override=draft.resolved_body(),
-            )
-            results.append(
-                {
-                    "unique_id": identifier,
-                    "sent": bool(result.get("sent")),
-                    "message_id": result.get("message_id"),
-                    "supplier_id": draft.supplier_id,
-                    "subject": result.get("subject") or draft.resolved_subject(),
-                }
-            )
-        except Exception as exc:  # pragma: no cover - runtime dependent
-            logger.error("Failed to dispatch %s: %s", identifier, str(exc))
-            results.append(
-                {
-                    "unique_id": identifier,
-                    "sent": False,
-                    "error": str(exc),
-                    "supplier_id": draft.supplier_id,
-                    "subject": draft.resolved_subject(),
-                }
-            )
+        sent = bool(response.get("sent"))
+        if sent:
+            success_count += 1
 
-    success_count = sum(1 for r in results if r.get("sent"))
+        results.append(
+            {
+                "unique_id": response.get("unique_id"),
+                "sent": sent,
+                "message_id": response.get("message_id"),
+                "supplier_id": getattr(entry.draft, "supplier_id", None),
+                "subject": response.get("subject"),
+                "response": response,
+                "error": None,
+            }
+        )
+
+    total = len(results)
+    success = success_count == total and total > 0
+    status_label = "completed" if success else "failed"
 
     return {
-        "success": success_count == len(results) if results else False,
-        "total": len(results),
+        "success": success,
+        "status": status_label,
+        "total": total,
         "sent": success_count,
-        "failed": len(results) - success_count,
+        "failed": total - success_count,
         "results": results,
     }
+
+
+@router.post("/email/batch")
+async def dispatch_batch_emails(
+    dispatch_request: EmailDispatchRequest = Depends(build_email_dispatch_request),
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+    agent_nick=Depends(get_agent_nick),
+):
+    expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+
+    return await _execute_batch_dispatch(
+        expanded_requests=expanded_requests,
+        orchestrator=orchestrator,
+        agent_nick=agent_nick,
+    )
 
 
 @router.post("/{workflow_id}/email/dispatch-all")
