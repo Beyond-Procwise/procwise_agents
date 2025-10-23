@@ -4071,9 +4071,9 @@ class EmailDraftingAgent(BaseAgent):
                         """
                         INSERT INTO proc.draft_rfq_emails
                         (rfq_id, unique_id, supplier_id, supplier_name, subject, body, created_on, sent,
-                         review_status, recipient_email, contact_level, thread_index, sender, payload,
-                         workflow_id, run_id, mailbox)
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         review_status, recipient_email, contact_level, thread_index, sender, sender_email,
+                         payload, workflow_id, run_id, mailbox)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (workflow_id, unique_id) DO UPDATE SET
                             rfq_id = EXCLUDED.rfq_id,
                             unique_id = EXCLUDED.unique_id,
@@ -4087,6 +4087,7 @@ class EmailDraftingAgent(BaseAgent):
                             contact_level = EXCLUDED.contact_level,
                             thread_index = EXCLUDED.thread_index,
                             sender = EXCLUDED.sender,
+                            sender_email = EXCLUDED.sender_email,
                             payload = EXCLUDED.payload,
                             workflow_id = EXCLUDED.workflow_id,
                             run_id = EXCLUDED.run_id,
@@ -4106,6 +4107,7 @@ class EmailDraftingAgent(BaseAgent):
                             contact_level_int,
                             thread_index,
                             draft.get("sender"),
+                            draft.get("sender_email"),
                             payload,
                             workflow_id,
                             run_id,
@@ -4245,6 +4247,9 @@ class EmailDraftingAgent(BaseAgent):
                 )
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS sender TEXT"
+                )
+                cur.execute(
+                    "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS sender_email TEXT"
                 )
                 cur.execute(
                     "ALTER TABLE proc.draft_rfq_emails ADD COLUMN IF NOT EXISTS payload JSONB"
