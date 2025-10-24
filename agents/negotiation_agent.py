@@ -13,12 +13,27 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import uuid
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    cast,
+)
 
 from html import escape
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
+
+try:  # pragma: no cover - optional dependency during tests
+    import psycopg2  # type: ignore
+except Exception:  # pragma: no cover - fallback when psycopg2 unavailable
+    psycopg2 = None  # type: ignore
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -3997,19 +4012,71 @@ class NegotiationAgent(BaseAgent):
                         "ALTER TABLE proc.negotiation_session_state ALTER COLUMN rfq_id DROP NOT NULL"
                     )
                     cur.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_workflow_supplier_idx
-                            ON proc.negotiation_session_state (workflow_id, supplier_id)
-                            WHERE workflow_id IS NOT NULL
-                        """
+                        "DROP INDEX IF EXISTS proc.negotiation_session_state_workflow_supplier_idx"
                     )
                     cur.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS negotiation_session_state_unique_supplier_idx
-                            ON proc.negotiation_session_state (unique_id, supplier_id)
-                            WHERE unique_id IS NOT NULL
-                        """
+                        "DROP INDEX IF EXISTS proc.negotiation_session_state_unique_supplier_idx"
                     )
+
+                    constraint_exists_sql = """
+                        SELECT 1
+                          FROM information_schema.table_constraints
+                         WHERE table_schema = 'proc'
+                           AND table_name = 'negotiation_session_state'
+                           AND constraint_name = %s
+                    """
+
+                    cur.execute(
+                        constraint_exists_sql,
+                        ("negotiation_session_state_workflow_supplier_uk",),
+                    )
+                    workflow_constraint_exists = cur.fetchone() is not None
+                    if not workflow_constraint_exists:
+                        try:
+                            cur.execute(
+                                """
+                                ALTER TABLE proc.negotiation_session_state
+                                ADD CONSTRAINT negotiation_session_state_workflow_supplier_uk
+                                UNIQUE (workflow_id, supplier_id)
+                                """
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            if (
+                                psycopg2
+                                and hasattr(psycopg2, "errors")
+                                and isinstance(exc, psycopg2.errors.DuplicateObject)
+                            ):
+                                logger.debug(
+                                    "Constraint negotiation_session_state_workflow_supplier_uk already exists"
+                                )
+                            else:
+                                raise
+
+                    cur.execute(
+                        constraint_exists_sql,
+                        ("negotiation_session_state_unique_supplier_uk",),
+                    )
+                    unique_constraint_exists = cur.fetchone() is not None
+                    if not unique_constraint_exists:
+                        try:
+                            cur.execute(
+                                """
+                                ALTER TABLE proc.negotiation_session_state
+                                ADD CONSTRAINT negotiation_session_state_unique_supplier_uk
+                                UNIQUE (unique_id, supplier_id)
+                                """
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            if (
+                                psycopg2
+                                and hasattr(psycopg2, "errors")
+                                and isinstance(exc, psycopg2.errors.DuplicateObject)
+                            ):
+                                logger.debug(
+                                    "Constraint negotiation_session_state_unique_supplier_uk already exists"
+                                )
+                            else:
+                                raise
                 conn.commit()
         except Exception:  # pragma: no cover - best effort
             logger.debug("failed to ensure negotiation state schema", exc_info=True)
@@ -4190,11 +4257,14 @@ class NegotiationAgent(BaseAgent):
         *,
         preferred: Sequence[str],
         fallbacks: Sequence[Sequence[str]],
-    ) -> Tuple[str, ...]:
+    ) -> Optional[Tuple[str, ...]]:
         attr_name = f"_{table}_unique_constraint"
-        cached = getattr(self, attr_name, None)
+        _sentinel = object()
+        cached = getattr(self, attr_name, _sentinel)
         if isinstance(cached, (list, tuple)) and cached:
             return tuple(cached)
+        if cached is None:
+            return None
 
         get_conn = getattr(self.agent_nick, "get_db_connection", None)
         candidates: List[Tuple[str, ...]] = []
@@ -4256,8 +4326,8 @@ class NegotiationAgent(BaseAgent):
             setattr(self, attr_name, candidates[0])
             return candidates[0]
 
-        setattr(self, attr_name, tuple(preferred))
-        return tuple(preferred)
+        setattr(self, attr_name, None)
+        return None
 
     @staticmethod
     def _normalise_base_subject(subject: Optional[str]) -> Optional[str]:
@@ -4464,6 +4534,22 @@ class NegotiationAgent(BaseAgent):
                         elif unique_value:
                             record.setdefault("unique_id", unique_value)
 
+                    id_column = self._get_identifier_column(
+                        "negotiation_session_state"
+                    )
+                    identifier_value = record.get(id_column)
+                    if identifier_value is None:
+                        candidate_identifier = self._coerce_text(state.get(id_column))
+                        if candidate_identifier:
+                            record.setdefault(id_column, candidate_identifier)
+                            identifier_value = candidate_identifier
+                    if identifier_value is None and id_column == "workflow_id":
+                        identifier_value = workflow_id
+                        record.setdefault(id_column, workflow_id)
+
+                    columns = list(record.keys())
+                    values = [record[col] for col in columns]
+
                     unique_columns = self._get_unique_constraint(
                         "negotiation_session_state",
                         preferred=("workflow_id", "supplier_id"),
@@ -4474,8 +4560,60 @@ class NegotiationAgent(BaseAgent):
                         ),
                     )
 
-                    columns = list(record.keys())
-                    values = [record[col] for col in columns]
+                    if not unique_columns:
+                        identifier_for_log = (
+                            identifier_value if identifier_value is not None else workflow_id
+                        )
+                        logger.warning(
+                            "No unique constraint found for negotiation_session_state; "
+                            "using manual upsert for workflow_id=%s supplier_id=%s",
+                            identifier_for_log,
+                            supplier_id,
+                        )
+
+                        existing_row = False
+                        if identifier_value is not None:
+                            cur.execute(
+                                f"""
+                                SELECT 1 FROM proc.negotiation_session_state
+                                WHERE {id_column} = %s AND supplier_id = %s
+                                """,
+                                (identifier_value, supplier_id),
+                            )
+                            existing_row = cur.fetchone() is not None
+
+                        if existing_row:
+                            update_cols = [
+                                col
+                                for col in columns
+                                if col not in (id_column, "supplier_id", "created_on")
+                            ]
+                            if update_cols:
+                                update_clause = ", ".join(
+                                    f"{col} = %s" for col in update_cols
+                                )
+                                update_values = [record[col] for col in update_cols]
+                                cur.execute(
+                                    f"""
+                                    UPDATE proc.negotiation_session_state
+                                    SET {update_clause}
+                                    WHERE {id_column} = %s AND supplier_id = %s
+                                    """,
+                                    tuple(update_values + [identifier_value, supplier_id]),
+                                )
+                        else:
+                            insert_columns = ", ".join(columns)
+                            insert_placeholders = ", ".join(["%s"] * len(columns))
+                            cur.execute(
+                                f"""
+                                INSERT INTO proc.negotiation_session_state ({insert_columns})
+                                VALUES ({insert_placeholders})
+                                """,
+                                tuple(values),
+                            )
+                        conn.commit()
+                        return
+
                     conflict_clause = ", ".join(unique_columns)
                     unique_set = set(unique_columns)
                     update_targets = [col for col in columns if col not in unique_set]
