@@ -66,10 +66,64 @@ def _normalise_dt(value: Optional[datetime]) -> Optional[datetime]:
     raise TypeError("expected datetime for timestamp fields")
 
 
+def _dedupe_workflow_unique_pairs(cur) -> None:
+    """Remove duplicate (workflow_id, unique_id) rows before creating unique index."""
+
+    cur.execute("SELECT to_regclass('proc.workflow_email_tracking')")
+    table_name = cur.fetchone()[0]
+    if not table_name:
+        return
+
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'proc'
+          AND table_name = 'workflow_email_tracking'
+        """
+    )
+    available_columns = {row[0] for row in cur.fetchall()}
+
+    ordering_clauses = ["dispatched_at DESC NULLS LAST"]
+    if "responded_at" in available_columns:
+        ordering_clauses.append("responded_at DESC NULLS LAST")
+    if "created_at" in available_columns:
+        ordering_clauses.append("created_at DESC NULLS LAST")
+    if "message_id" in available_columns:
+        ordering_clauses.append("message_id DESC NULLS LAST")
+
+    ordering = ", ".join(ordering_clauses) if ordering_clauses else "dispatched_at DESC"
+
+    cur.execute(
+        f"""
+        WITH ranked AS (
+            SELECT
+                ctid,
+                ROW_NUMBER() OVER (
+                    PARTITION BY workflow_id, unique_id
+                    ORDER BY {ordering}
+                ) AS rn
+            FROM proc.workflow_email_tracking
+        )
+        DELETE FROM proc.workflow_email_tracking t
+        USING ranked
+        WHERE t.ctid = ranked.ctid
+        AND ranked.rn > 1;
+        """
+    )
+
+
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(DDL_PG)
+        _dedupe_workflow_unique_pairs(cur)
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf_unique
+            ON proc.workflow_email_tracking (workflow_id, unique_id);
+            """
+        )
         cur.close()
 
 
