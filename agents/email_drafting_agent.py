@@ -2868,7 +2868,9 @@ class EmailDraftingAgent(BaseAgent):
                 data["decision"] = decision_payload
         if isinstance(decision_payload, dict) and decision_payload:
             draft = self.from_decision(decision_payload)
-            draft = self._apply_workflow_context(draft, context)
+            draft = self._apply_workflow_context(
+                draft, context, source_payload=decision_payload
+            )
             self._store_draft(draft)
             source_snapshot = {**decision_payload, "intent": "NEGOTIATION_COUNTER"}
             self._record_learning_events(context, [draft], source_snapshot)
@@ -2901,7 +2903,7 @@ class EmailDraftingAgent(BaseAgent):
                 prompt_text = decision_log
         if prompt_text:
             draft = self.from_prompt(prompt_text, context=data)
-            draft = self._apply_workflow_context(draft, context)
+            draft = self._apply_workflow_context(draft, context, source_payload=data)
             self._store_draft(draft)
             self._record_learning_events(context, [draft], data)
             output_data = {
@@ -3227,7 +3229,7 @@ class EmailDraftingAgent(BaseAgent):
             if marker_token:
                 metadata["dispatch_token"] = marker_token
             draft["metadata"] = metadata
-            draft = self._apply_workflow_context(draft, context)
+            draft = self._apply_workflow_context(draft, context, source_payload=data)
             drafts.append(draft)
             self._store_draft(draft)
             logger.debug(
@@ -3282,7 +3284,9 @@ class EmailDraftingAgent(BaseAgent):
             if default_action_id:
                 manual_draft["action_id"] = default_action_id
             manual_draft.setdefault("thread_index", 1)
-            manual_draft = self._apply_workflow_context(manual_draft, context)
+            manual_draft = self._apply_workflow_context(
+                manual_draft, context, source_payload=data
+            )
             drafts.append(manual_draft)
             self._store_draft(manual_draft)
 
@@ -3619,25 +3623,113 @@ class EmailDraftingAgent(BaseAgent):
             logger.exception("failed to synchronise draft action metadata")
         return result
 
+    @staticmethod
+    def _normalise_workflow_context_payload(
+        candidate: Optional[Mapping[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(candidate, Mapping):
+            return None
+
+        normalised: Dict[str, Any] = {}
+        for key, value in candidate.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                normalised[str(key)] = value
+            else:
+                text = str(value).strip()
+                if text:
+                    normalised[str(key)] = text
+        return normalised or None
+
     def _apply_workflow_context(
-        self, draft: Dict[str, Any], context: AgentContext
+        self,
+        draft: Dict[str, Any],
+        context: AgentContext,
+        source_payload: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Ensure drafts inherit the workflow identifier from ``context``."""
+        """Ensure drafts inherit workflow metadata and invocation context."""
 
         if not isinstance(draft, dict):
             return draft
 
-        workflow_id = getattr(context, "workflow_id", None)
-        if not workflow_id:
-            return draft
+        metadata_source = draft.get("metadata")
+        metadata: Dict[str, Any]
+        if isinstance(metadata_source, Mapping):
+            metadata = dict(metadata_source)
+        else:
+            metadata = {}
 
-        draft.setdefault("workflow_id", workflow_id)
-
-        metadata = draft.get("metadata")
-        if metadata is None:
-            draft["metadata"] = {"workflow_id": workflow_id}
-        elif isinstance(metadata, dict):
+        workflow_id = getattr(context, "workflow_id", None) or metadata.get("workflow_id")
+        if workflow_id:
+            draft.setdefault("workflow_id", workflow_id)
             metadata.setdefault("workflow_id", workflow_id)
+
+        parent_agent = getattr(context, "parent_agent", None)
+        if parent_agent:
+            metadata.setdefault("parent_agent", parent_agent)
+
+        workflow_context_candidate: Optional[Mapping[str, Any]] = None
+        if isinstance(source_payload, Mapping):
+            workflow_context_candidate = (
+                source_payload.get("workflow_dispatch_context")
+                or source_payload.get("workflow_context")
+            )
+            if workflow_context_candidate is None and isinstance(
+                source_payload.get("metadata"), Mapping
+            ):
+                inner_meta = source_payload.get("metadata")
+                if isinstance(inner_meta, Mapping):
+                    workflow_context_candidate = (
+                        workflow_context_candidate
+                        or inner_meta.get("workflow_dispatch_context")
+                        or inner_meta.get("workflow_context")
+                    )
+
+        if workflow_context_candidate is None and isinstance(context.input_data, Mapping):
+            workflow_context_candidate = (
+                context.input_data.get("workflow_dispatch_context")
+                or context.input_data.get("workflow_context")
+            )
+
+        if workflow_context_candidate is None and metadata.get("workflow_context"):
+            existing_context = metadata.get("workflow_context")
+            if isinstance(existing_context, Mapping):
+                workflow_context_candidate = existing_context
+
+        workflow_context = self._normalise_workflow_context_payload(
+            workflow_context_candidate
+        )
+        if workflow_context:
+            metadata.setdefault("workflow_context", workflow_context)
+            draft.setdefault("workflow_context", workflow_context)
+
+        workflow_email_flag: Optional[Any] = None
+        if isinstance(source_payload, Mapping):
+            if "workflow_email" in source_payload:
+                workflow_email_flag = source_payload.get("workflow_email")
+            elif "is_workflow_email" in source_payload:
+                workflow_email_flag = source_payload.get("is_workflow_email")
+        if workflow_email_flag is None and isinstance(context.input_data, Mapping):
+            input_meta = context.input_data
+            if "workflow_email" in input_meta:
+                workflow_email_flag = input_meta.get("workflow_email")
+            elif "is_workflow_email" in input_meta:
+                workflow_email_flag = input_meta.get("is_workflow_email")
+        if workflow_email_flag is None and "workflow_email" in metadata:
+            workflow_email_flag = metadata.get("workflow_email")
+        if (
+            workflow_email_flag is None
+            and workflow_context
+            and isinstance(parent_agent, str)
+            and parent_agent.lower() == "negotiationagent"
+        ):
+            workflow_email_flag = True
+        if workflow_email_flag is not None:
+            metadata["workflow_email"] = bool(workflow_email_flag)
+            draft.setdefault("workflow_email", bool(workflow_email_flag))
+
+        draft["metadata"] = metadata
 
         return draft
 

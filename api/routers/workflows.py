@@ -219,6 +219,14 @@ class EmailDraftPayload(BaseModel):
         default=None,
         description="Arbitrary metadata captured alongside the draft for auditing.",
     )
+    workflow_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Workflow context metadata propagated from the calling agent.",
+    )
+    workflow_email: Optional[bool] = Field(
+        default=None,
+        description="Indicates whether the draft participates in workflow tracking.",
+    )
 
     model_config = ConfigDict(extra="allow")
 
@@ -278,6 +286,56 @@ class EmailDraftPayload(BaseModel):
             return None
         return str(self.body)
 
+    @staticmethod
+    def _coerce_bool_flag(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        return None
+
+    def resolved_workflow_context(self) -> Optional[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(self.workflow_context, dict):
+            candidates.append(self.workflow_context)
+        if isinstance(self.metadata, dict):
+            meta_ctx = self.metadata.get("workflow_context") or self.metadata.get(
+                "workflow_dispatch_context"
+            )
+            if isinstance(meta_ctx, dict):
+                candidates.append(meta_ctx)
+        for candidate in candidates:
+            cleaned = {
+                str(key): value
+                for key, value in candidate.items()
+                if value is not None and value != ""
+            }
+            if cleaned:
+                return cleaned
+        return None
+
+    def resolved_workflow_email(self) -> Optional[bool]:
+        candidates: List[Any] = []
+        if self.workflow_email is not None:
+            candidates.append(self.workflow_email)
+        if isinstance(self.metadata, dict):
+            for key in ("workflow_email", "is_workflow_email"):
+                if key in self.metadata:
+                    candidates.append(self.metadata.get(key))
+        for candidate in candidates:
+            flag = self._coerce_bool_flag(candidate)
+            if flag is not None:
+                return flag
+        return None
+
 
 class EmailDispatchRequest(BaseModel):
     """Request payload for dispatching stored RFQ drafts."""
@@ -317,6 +375,14 @@ class EmailDispatchRequest(BaseModel):
     drafts: Optional[List[EmailDraftPayload]] = Field(
         default=None,
         description="Collection of draft payloads for batch dispatch scenarios.",
+    )
+    workflow_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Explicit workflow context for the dispatch request.",
+    )
+    is_workflow_email: Optional[bool] = Field(
+        default=None,
+        description="Flag indicating whether this dispatch participates in workflow tracking.",
     )
 
     model_config = ConfigDict(extra="allow")
@@ -417,6 +483,62 @@ class EmailDispatchRequest(BaseModel):
             return sender or None
         if self.draft:
             return self.draft.resolved_sender()
+        return None
+
+    def resolve_workflow_context(self) -> Optional[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(self.workflow_context, dict):
+            candidates.append(self.workflow_context)
+        if self.draft:
+            ctx = self.draft.resolved_workflow_context()
+            if ctx:
+                candidates.append(ctx)
+        if self.drafts:
+            for draft in self.drafts:
+                ctx = draft.resolved_workflow_context()
+                if ctx:
+                    candidates.append(ctx)
+                    break
+        for candidate in candidates:
+            cleaned = {
+                str(key): value
+                for key, value in candidate.items()
+                if value is not None and value != ""
+            }
+            if cleaned:
+                return cleaned
+        return None
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        return None
+
+    def resolve_is_workflow_email(self) -> Optional[bool]:
+        candidates: List[Any] = [self.is_workflow_email]
+        if self.draft:
+            candidates.append(self.draft.resolved_workflow_email())
+        if self.drafts:
+            for draft in self.drafts:
+                flag = draft.resolved_workflow_email()
+                if flag is not None:
+                    candidates.append(flag)
+                    break
+        for candidate in candidates:
+            flag = self._coerce_bool(candidate)
+            if flag is not None:
+                return flag
         return None
 
     def resolve_subject(self) -> Optional[str]:
@@ -917,6 +1039,8 @@ async def send_email(
             sender=dispatch_request.resolve_sender(),
             subject_override=dispatch_request.resolve_subject(),
             body_override=dispatch_request.resolve_body(),
+            is_workflow_email=dispatch_request.resolve_is_workflow_email(),
+            workflow_dispatch_context=dispatch_request.resolve_workflow_context(),
         )
 
         dispatch_timestamp = time.time()
