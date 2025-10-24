@@ -154,19 +154,28 @@ def _ensure_primary_key(cur) -> None:
     if columns == expected:
         return
 
-    safe_name = constraint_name.replace('"', '""')
-    cur.execute(
-        f"""
-        ALTER TABLE proc.workflow_email_tracking
-            DROP CONSTRAINT "{safe_name}"
-        """
-    )
-    cur.execute(
-        """
-        ALTER TABLE proc.workflow_email_tracking
-            ADD PRIMARY KEY (workflow_id, unique_id)
-        """
-    )
+    safe_name = constraint_name.replace('"', '""') if constraint_name else None
+
+    if safe_name:
+        cur.execute(
+            f"""
+            ALTER TABLE proc.workflow_email_tracking
+                DROP CONSTRAINT IF EXISTS "{safe_name}"
+            """
+        )
+
+    try:
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ADD PRIMARY KEY (workflow_id, unique_id)
+            """
+        )
+    except Exception as exc:  # pragma: no cover - defensive for race conditions
+        pgcode = getattr(exc, "pgcode", None)
+        # ``42P16`` == multiple primary keys (already corrected elsewhere).
+        if pgcode != "42P16":
+            raise
 
 
 def init_schema() -> None:
