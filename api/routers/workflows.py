@@ -37,6 +37,7 @@ from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
 from services.email_dispatch_service import DraftNotFoundError, EmailDispatchService
 from repositories import draft_rfq_emails_repo
+from api.models.email_dispatch import EmailDispatchRequestV2, EmailDraftV2
 
 # Ensure GPU-related environment variables are set
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -253,286 +254,22 @@ class OpportunityRejectionRequest(BaseModel):
 router = APIRouter(prefix="/workflows", tags=["Agent Workflows"])
 
 
-class EmailDraftPayload(BaseModel):
-    """Structured representation of a stored RFQ draft."""
+EmailDraftPayload = EmailDraftV2
+EmailDispatchRequest = EmailDispatchRequestV2
 
-    unique_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier assigned to the draft (PROC-WF-XXXXXX).",
-    )
-    rfq_id: Optional[str] = Field(
-        default=None,
-        description="Legacy RFQ identifier used as a fallback when unique_id is absent.",
-    )
-    supplier_id: Optional[str] = Field(
-        default=None,
-        description="Supplier reference associated with the draft.",
-    )
-    recipients: Optional[List[str]] = Field(
-        default=None,
-        description="Explicit list of recipient email addresses to override the stored draft values.",
-    )
-    sender: Optional[EmailStr] = Field(
-        default=None,
-        description="Sender email address override.",
-    )
-    subject: Optional[str] = Field(
-        default=None,
-        description="Subject override to apply when dispatching the draft.",
-    )
-    body: Optional[str] = Field(
-        default=None,
-        description="Body override to apply when dispatching the draft.",
-    )
-    action_id: Optional[str] = Field(
-        default=None,
-        description="Action identifier emitted by upstream orchestration steps.",
-    )
-    metadata: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Arbitrary metadata captured alongside the draft for auditing.",
-    )
+EMAIL_DISPATCH_REQUEST_SCHEMA = EmailDispatchRequest.model_json_schema(
+    ref_template="#/components/schemas/{model}"
+)
 
-    model_config = ConfigDict(extra="allow")
-
-    @field_validator("unique_id", "rfq_id", "supplier_id", "action_id", mode="before")
-    @classmethod
-    def _strip_text(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    @field_validator("recipients", mode="before")
-    @classmethod
-    def _normalise_recipients(cls, value: Any) -> Optional[List[str]]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            emails = [part.strip() for part in value.split(",") if part.strip()]
-            return emails or None
-        if isinstance(value, (list, tuple)):
-            cleaned = []
-            for item in value:
-                if item is None:
-                    continue
-                text = str(item).strip()
-                if text:
-                    cleaned.append(text)
-            return cleaned or None
-        raise TypeError(
-            "recipients must be a string, list, or tuple of email addresses"
-        )
-
-    def resolved_identifier(self) -> Optional[str]:
-        for candidate in (self.unique_id, self.rfq_id):
-            if candidate:
-                identifier = candidate.strip()
-                if identifier:
-                    return identifier
-        return None
-
-    def resolved_recipients(self) -> Optional[List[str]]:
-        if not self.recipients:
-            return None
-        return [str(email).strip() for email in self.recipients if str(email).strip()]
-
-    def resolved_sender(self) -> Optional[str]:
-        if self.sender is None:
-            return None
-        sender = str(self.sender).strip()
-        return sender or None
-
-    def resolved_subject(self) -> Optional[str]:
-        if self.subject is None:
-            return None
-        return str(self.subject).strip()
-
-    def resolved_body(self) -> Optional[str]:
-        if self.body is None:
-            return None
-        return str(self.body)
-
-
-class EmailDispatchRequest(BaseModel):
-    """Request payload for dispatching stored RFQ drafts."""
-
-    unique_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier for the draft to dispatch (PROC-WF-XXXXXX).",
-    )
-    rfq_id: Optional[str] = Field(
-        default=None,
-        description="Fallback RFQ identifier when unique_id is unavailable.",
-    )
-    recipients: Optional[List[str]] = Field(
-        default=None,
-        description="Override recipient list for the dispatched email.",
-    )
-    sender: Optional[EmailStr] = Field(
-        default=None,
-        description="Override sender email address.",
-    )
-    subject: Optional[str] = Field(
-        default=None,
-        description="Optional subject override.",
-    )
-    body: Optional[str] = Field(
-        default=None,
-        description="Optional body override.",
-    )
-    action_id: Optional[str] = Field(
-        default=None,
-        description="Identifier linking this dispatch request to upstream workflow actions.",
-    )
-    draft: Optional[EmailDraftPayload] = Field(
-        default=None,
-        description="Single draft payload when the request originates from the drafting agent.",
-    )
-    drafts: Optional[List[EmailDraftPayload]] = Field(
-        default=None,
-        description="Collection of draft payloads for batch dispatch scenarios.",
-    )
-
-    model_config = ConfigDict(extra="allow")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _extract_identifier(cls, values: Any) -> Any:
-        """Extract identifier with special handling for batch requests."""
-        if not isinstance(values, dict):
-            return values
-
-        if values.get("unique_id") or values.get("rfq_id"):
-            return values
-
-        draft_obj = values.get("draft")
-        if isinstance(draft_obj, dict):
-            unique_id = draft_obj.get("unique_id") or draft_obj.get("rfq_id")
-            if unique_id:
-                values["unique_id"] = unique_id
-                return values
-
-        drafts_array = values.get("drafts")
-        if isinstance(drafts_array, list) and drafts_array:
-            first_draft = drafts_array[0]
-            if isinstance(first_draft, dict):
-                unique_id = first_draft.get("unique_id") or first_draft.get("rfq_id")
-                if unique_id:
-                    values["unique_id"] = unique_id
-                    return values
-
-        draft_records = values.get("draft_records")
-        if isinstance(draft_records, list) and draft_records:
-            first_record = draft_records[0]
-            if isinstance(first_record, dict):
-                unique_id = first_record.get("unique_id") or first_record.get("rfq_id")
-                if unique_id:
-                    values["unique_id"] = unique_id
-                    return values
-
-        if "unique_id" in values or "supplier_id" in values:
-            return values
-
-        available_fields = list(values.keys())
-        raise ValueError(
-            "No identifier found in request. Provide 'unique_id' or 'rfq_id'. "
-            f"Available fields: {available_fields}"
-        )
-
-    @field_validator("unique_id", "rfq_id", "action_id", mode="before")
-    @classmethod
-    def _strip_identifiers(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    @field_validator("recipients", mode="before")
-    @classmethod
-    def _normalise_recipients(cls, value: Any) -> Optional[List[str]]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            emails = [part.strip() for part in value.split(",") if part.strip()]
-            return emails or None
-        if isinstance(value, (list, tuple)):
-            cleaned: List[str] = []
-            for item in value:
-                if item is None:
-                    continue
-                text = str(item).strip()
-                if text:
-                    cleaned.append(text)
-            return cleaned or None
-        raise TypeError(
-            "recipients must be provided as a string, list, or tuple of emails"
-        )
-
-    def get_identifier(self) -> str:
-        for candidate in (self.unique_id, self.rfq_id):
-            if candidate:
-                identifier = candidate.strip()
-                if identifier:
-                    return identifier
-
-        if self.draft:
-            identifier = self.draft.resolved_identifier()
-            if identifier:
-                return identifier
-
-        if self.drafts:
-            for draft in self.drafts:
-                identifier = draft.resolved_identifier()
-                if identifier:
-                    return identifier
-
-        return ""
-
-    def resolve_identifier(self) -> Optional[str]:
-        identifier = self.get_identifier()
-        return identifier or None
-
-    def resolve_recipients(self) -> Optional[List[str]]:
-        if self.recipients:
-            return [
-                str(email).strip() for email in self.recipients if str(email).strip()
-            ]
-        if self.draft:
-            recipients = self.draft.resolved_recipients()
-            if recipients:
-                return recipients
-        return None
-
-    def resolve_sender(self) -> Optional[str]:
-        if self.sender is not None:
-            sender = str(self.sender).strip()
-            return sender or None
-        if self.draft:
-            return self.draft.resolved_sender()
-        return None
-
-    def resolve_subject(self) -> Optional[str]:
-        if self.subject is not None:
-            return str(self.subject).strip()
-        if self.draft:
-            return self.draft.resolved_subject()
-        return None
-
-    def resolve_body(self) -> Optional[str]:
-        if self.body is not None:
-            return str(self.body)
-        if self.draft:
-            return self.draft.resolved_body()
-        return None
-
-    def resolve_action_id(self) -> Optional[str]:
-        if self.action_id:
-            return self.action_id
-        if self.draft and self.draft.action_id:
-            return self.draft.action_id
-        return None
-
+EMAIL_DISPATCH_REQUEST_BODY = {
+    "required": False,
+    "content": {
+        "application/json": {"schema": EMAIL_DISPATCH_REQUEST_SCHEMA},
+        "application/x-www-form-urlencoded": {
+            "schema": EMAIL_DISPATCH_REQUEST_SCHEMA
+        },
+    },
+}
 
 class EmailDispatchResponse(BaseModel):
     success: bool
@@ -713,6 +450,11 @@ def _resolve_dispatch_workflow_id(
 ) -> Optional[str]:
     candidate = None
 
+    direct_workflow = getattr(request_model, "workflow_id", None)
+    direct_token = _coerce_identifier(direct_workflow)
+    if direct_token:
+        return direct_token
+
     extras = getattr(request_model, "model_extra", None)
     if isinstance(extras, dict):
         candidate = _extract_workflow_token(extras)
@@ -820,8 +562,8 @@ def _coerce_dispatch_request(raw_payload: Dict[str, Any]) -> EmailDispatchReques
             _apply_recipient_normalisation(entry, context=f"drafts[{index}]")
 
     for key in (
+        "identifier",
         "unique_id",
-        "rfq_id",
         "workflow_id",
         "sender",
         "subject",
@@ -837,31 +579,31 @@ def _coerce_dispatch_request(raw_payload: Dict[str, Any]) -> EmailDispatchReques
         else:
             raw_payload[key] = stripped or None
 
-    if not raw_payload.get("unique_id") and not raw_payload.get("rfq_id"):
+    if "rfq_id" in raw_payload and raw_payload.get("rfq_id"):
+        raw_payload.setdefault("identifier", raw_payload.pop("rfq_id"))
+
+    if raw_payload.get("unique_id") and not raw_payload.get("identifier"):
+        raw_payload["identifier"] = raw_payload["unique_id"]
+
+    if not raw_payload.get("identifier"):
         workflow_identifier = _coerce_identifier(raw_payload.get("workflow_id"))
         if workflow_identifier:
-            raw_payload["unique_id"] = workflow_identifier
+            raw_payload["identifier"] = workflow_identifier
 
     try:
         dispatch_request = EmailDispatchRequest.model_validate(raw_payload)
     except ValidationError as exc:
-        errors = exc.errors()
-        missing_identifier = bool(errors) and all(
-            err.get("type") == "value_error"
-            and isinstance(err.get("msg"), str)
-            and "No identifier found in request" in err.get("msg")
-            for err in errors
-        )
-        if missing_identifier:
-            raise MissingDispatchIdentifierError() from exc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "error": "InvalidDispatchRequest",
                 "message": "Email dispatch payload validation failed.",
-                "issues": errors,
+                "issues": exc.errors(),
             },
         ) from exc
+
+    if not dispatch_request.resolve_identifier() and not dispatch_request.workflow_id:
+        raise MissingDispatchIdentifierError()
 
     def _validate_inline_payload(
         *,
@@ -962,7 +704,6 @@ def _extract_context_overrides(payload: Any) -> Dict[str, Any]:
     identifier = (
         _coerce_identifier(payload.get("identifier"))
         or _coerce_identifier(payload.get("unique_id"))
-        or _coerce_identifier(payload.get("rfq_id"))
     )
     if identifier:
         overrides["identifier"] = identifier
@@ -1308,7 +1049,7 @@ async def _dispatch_email_request(
                 detail={
                     "error": "Invalid Batch Request",
                     "message": "No valid drafts found in request",
-                    "hint": "Ensure each draft has 'unique_id' or 'rfq_id'",
+                    "hint": "Ensure each draft has an 'identifier' (alias: unique_id)",
                 },
             )
 
@@ -1328,8 +1069,8 @@ async def _dispatch_email_request(
             status_code=400,
             detail={
                 "error": "Missing Identifier",
-                "message": "No unique_id or rfq_id provided",
-                "hint": 'Send: {"unique_id": "PROC-WF-xxx"} or {"draft": {"unique_id": "PROC-WF-xxx"}}',
+                "message": "No identifier provided",
+                "hint": 'Send: {"identifier": "PROC-WF-xxx"} or {"draft": {"identifier": "PROC-WF-xxx"}}',
             },
         )
 
@@ -1585,6 +1326,7 @@ async def _dispatch_email_request(
 @router.post(
     "/email",
     summary="Send previously drafted RFQ email(s) or resolve context-aware dispatches.",
+    openapi_extra={"requestBody": EMAIL_DISPATCH_REQUEST_BODY},
 )
 async def send_email(
     request: Request,
@@ -1609,12 +1351,8 @@ async def send_email(
         alias="X-Request-ID",
         description="Optional client request id for tracing.",
     ),
-    body: EmailDispatchRequest | None = Body(
-        default=None,
-        description="Legacy email dispatch request (single/batch/overrides).",
-    ),
 ):
-    """Endpoint supporting both legacy EmailDispatchRequest and context dispatches.
+    """Endpoint supporting both EmailDispatchRequestV2 payloads and context dispatches.
 
     Parameters
     ----------
@@ -1626,8 +1364,8 @@ async def send_email(
         Optional idempotency key to avoid duplicate sends.
     X-Request-ID: Header
         Optional client request id for tracing.
-    EmailDispatchRequest: Body (optional)
-        Legacy email dispatch request supporting single/batch dispatch or overrides.
+    EmailDispatchRequestV2: Body (optional)
+        Email dispatch request supporting single/batch dispatch or overrides.
     """
 
     try:
@@ -1635,15 +1373,31 @@ async def send_email(
         workflow_id = workflow_id or x_workflow_id or q_workflow_id
 
         overrides: Dict[str, Any] = {}
-        if body is not None:
-            identifier = body.resolve_identifier()
-            recipients = body.resolve_recipients()
-            sender = body.resolve_sender()
-            subject = body.resolve_subject()
-            content = body.resolve_body()
+        dispatch_request = await build_email_dispatch_request(request)
+        if dispatch_request is not None:
+            expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+
+            if len(expanded_requests) > 1:
+                orchestrator = get_orchestrator(request)
+                agent_nick = get_agent_nick(request)
+                return await _execute_batch_dispatch(
+                    expanded_requests=expanded_requests,
+                    orchestrator=orchestrator,
+                    agent_nick=agent_nick,
+                    request=request,
+                )
+
+            if expanded_requests:
+                dispatch_request = expanded_requests[0]
+
+            identifier = dispatch_request.resolve_identifier()
+            recipients = dispatch_request.resolve_recipients()
+            sender = dispatch_request.resolve_sender()
+            subject = dispatch_request.resolve_subject()
+            content = dispatch_request.resolve_body()
 
             material = {
-                "mode": "legacy",
+                "mode": "legacy_v2",
                 "m": request.method,
                 "p": request.url.path,
                 "w": workflow_id or "",
@@ -1656,7 +1410,7 @@ async def send_email(
             ).hexdigest()
 
             logger.info(
-                "email_dispatch.legacy: req_id=%s idem=%s workflow_id=%s identifier=%s",
+                "email_dispatch.legacy_v2: req_id=%s idem=%s workflow_id=%s identifier=%s",
                 request_id_hdr or "-",
                 idem,
                 workflow_id or "-",
@@ -1667,9 +1421,9 @@ async def send_email(
                 svc.send_draft,
                 identifier=identifier,
                 recipients=recipients,
-                sender=sender,
-                subject_override=subject,
-                body_override=content,
+                sender=str(sender) if sender else "",
+                subject_override=subject or "",
+                body_override=content or "",
             )
             return {"status": "ok", "result": result}
 
@@ -1703,18 +1457,17 @@ async def send_email(
                 },
             )
 
-        material = {
-            "mode": "context",
-            "m": request.method,
-            "p": request.url.path,
-            "w": workflow_id or "",
-            "i": overrides.get("identifier") or "",
-            "s": overrides.get("subject_override") or "",
-            "b": (overrides.get("body_override") or "")[:256],
-        }
-        idem = idempotency_key_hdr or hashlib.sha256(
-            json.dumps(material, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        subject_override = overrides.get("subject_override") or ""
+        body_override = overrides.get("body_override") or ""
+        identifier_override = overrides.get("identifier")
+
+        idem = idempotency_key_hdr or _ensure_request_idempotency_key(
+            request,
+            workflow_id=workflow_id,
+            subject=subject_override,
+            body=body_override,
+            identifier=identifier_override,
+        )
 
         logger.info(
             "email_dispatch: req_id=%s idem=%s method=%s path=%s workflow_id=%s identifier=%s",
@@ -1730,8 +1483,20 @@ async def send_email(
             svc.dispatch_from_context,
             workflow_id,
             overrides=overrides,
-            idempotency_key=idem,
         )
+
+        if not idempotency_key_hdr:
+            resolved_identifier = result.get("unique_id") or identifier_override
+            resolved_subject = subject_override or str(result.get("subject") or "")
+            resolved_body = body_override or str(result.get("body") or "")
+            _ensure_request_idempotency_key(
+                request,
+                workflow_id=workflow_id or result.get("workflow_id"),
+                subject=resolved_subject,
+                body=resolved_body,
+                identifier=resolved_identifier,
+                force=True,
+            )
         return {"status": "ok", "result": result}
 
     except DraftNotFoundError as exc:
@@ -1757,7 +1522,10 @@ async def send_email(
         raise HTTPException(status_code=500, detail="Internal Server Error") from exc
 
 
-@router.post("/email/batch")
+@router.post(
+    "/email/batch",
+    openapi_extra={"requestBody": EMAIL_DISPATCH_REQUEST_BODY},
+)
 async def send_email_batch(
     request: Request,
     svc: EmailDispatchService = Depends(get_email_dispatch_service),
@@ -1781,19 +1549,28 @@ async def send_email_batch(
         alias="X-Request-ID",
         description="Optional client request id for tracing.",
     ),
-    body: EmailDispatchRequest | None = Body(
-        default=None,
-        description="Legacy email dispatch request (single/batch/overrides).",
-    ),
 ):
-    return await send_email(
+    dispatch_request = await build_email_dispatch_request(request)
+
+    if dispatch_request is None:
+        return await send_email(
+            request=request,
+            svc=svc,
+            x_workflow_id=x_workflow_id,
+            q_workflow_id=q_workflow_id,
+            idempotency_key_hdr=idempotency_key_hdr,
+            request_id_hdr=request_id_hdr,
+        )
+
+    orchestrator = get_orchestrator(request)
+    agent_nick = get_agent_nick(request)
+
+    expanded_requests = _expand_batch_dispatch_requests(dispatch_request)
+    return await _execute_batch_dispatch(
+        expanded_requests=expanded_requests,
+        orchestrator=orchestrator,
+        agent_nick=agent_nick,
         request=request,
-        svc=svc,
-        x_workflow_id=x_workflow_id,
-        q_workflow_id=q_workflow_id,
-        idempotency_key_hdr=idempotency_key_hdr,
-        request_id_hdr=request_id_hdr,
-        body=body,
     )
 
 
