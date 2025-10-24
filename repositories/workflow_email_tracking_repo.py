@@ -17,6 +17,7 @@ CREATE SCHEMA IF NOT EXISTS proc;
 CREATE TABLE IF NOT EXISTS proc.workflow_email_tracking (
     workflow_id TEXT NOT NULL,
     unique_id TEXT NOT NULL,
+    dispatch_key TEXT,
     supplier_id TEXT,
     supplier_email TEXT,
     message_id TEXT,
@@ -44,14 +45,15 @@ ON proc.workflow_email_tracking (unique_id);
 class WorkflowDispatchRow:
     workflow_id: str
     unique_id: str
-    supplier_id: Optional[str]
-    supplier_email: Optional[str]
-    message_id: Optional[str]
-    subject: Optional[str]
     dispatched_at: datetime
-    responded_at: Optional[datetime]
-    response_message_id: Optional[str]
-    matched: bool
+    supplier_id: Optional[str] = None
+    supplier_email: Optional[str] = None
+    message_id: Optional[str] = None
+    subject: Optional[str] = None
+    dispatch_key: Optional[str] = None
+    responded_at: Optional[datetime] = None
+    response_message_id: Optional[str] = None
+    matched: bool = False
     thread_headers: Optional[Dict[str, Sequence[str]]] = None
 
 
@@ -110,11 +112,81 @@ def _dedupe_workflow_unique_pairs(cur) -> None:
     )
 
 
+def _ensure_primary_key(cur) -> None:
+    """Ensure the table primary key matches (workflow_id, unique_id)."""
+
+    cur.execute("SELECT to_regclass('proc.workflow_email_tracking')")
+    table_name = cur.fetchone()[0]
+    if not table_name:
+        return
+
+    cur.execute(
+        """
+        SELECT
+            tc.constraint_name,
+            kcu.column_name,
+            kcu.ordinal_position
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.table_schema = 'proc'
+          AND tc.table_name = 'workflow_email_tracking'
+          AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+        """
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ADD PRIMARY KEY (workflow_id, unique_id)
+            """
+        )
+        return
+
+    constraint_name = rows[0][0]
+    columns = [row[1] for row in rows]
+    expected = ["workflow_id", "unique_id"]
+
+    if columns == expected:
+        return
+
+    safe_name = constraint_name.replace('"', '""')
+    cur.execute(
+        f"""
+        ALTER TABLE proc.workflow_email_tracking
+            DROP CONSTRAINT "{safe_name}"
+        """
+    )
+    cur.execute(
+        """
+        ALTER TABLE proc.workflow_email_tracking
+            ADD PRIMARY KEY (workflow_id, unique_id)
+        """
+    )
+
+
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(DDL_PG)
         _dedupe_workflow_unique_pairs(cur)
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ADD COLUMN IF NOT EXISTS dispatch_key TEXT
+            """
+        )
+        _ensure_primary_key(cur)
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ALTER COLUMN dispatch_key DROP NOT NULL
+            """
+        )
         cur.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf_unique
@@ -211,10 +283,11 @@ def record_dispatches(
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.workflow_email_tracking "
-            "(workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (workflow_id, unique_id) DO UPDATE SET "
+            "dispatch_key=EXCLUDED.dispatch_key, "
             "supplier_id=EXCLUDED.supplier_id, "
             "supplier_email=EXCLUDED.supplier_email, "
             "message_id=EXCLUDED.message_id, "
@@ -226,6 +299,7 @@ def record_dispatches(
             (
                 row.workflow_id,
                 row.unique_id,
+                row.dispatch_key,
                 row.supplier_id,
                 row.supplier_email,
                 row.message_id,
@@ -246,7 +320,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking WHERE workflow_id=%s"
         )
@@ -261,6 +335,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
                 WorkflowDispatchRow(
                     workflow_id=data["workflow_id"],
                     unique_id=data["unique_id"],
+                    dispatch_key=data.get("dispatch_key"),
                     supplier_id=data.get("supplier_id"),
                     supplier_email=data.get("supplier_email"),
                     message_id=data.get("message_id"),
@@ -282,7 +357,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking "
             "WHERE workflow_id=%s AND unique_id=%s "
@@ -299,6 +374,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     cols = (
         "workflow_id",
         "unique_id",
+        "dispatch_key",
         "supplier_id",
         "supplier_email",
         "message_id",
@@ -313,6 +389,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     return WorkflowDispatchRow(
         workflow_id=data["workflow_id"],
         unique_id=data["unique_id"],
+        dispatch_key=data.get("dispatch_key"),
         supplier_id=data.get("supplier_id"),
         supplier_email=data.get("supplier_email"),
         message_id=data.get("message_id"),

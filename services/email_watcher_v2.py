@@ -456,6 +456,7 @@ class EmailWatcherV2:
             subject = payload.get("subject")
             dispatched_at = payload.get("dispatched_at")
             rfq_id = payload.get("rfq_id")
+            dispatch_key = payload.get("dispatch_key")
             raw_thread_headers = (
                 payload.get("thread_headers") if isinstance(payload.get("thread_headers"), dict) else {}
             )
@@ -481,6 +482,7 @@ class EmailWatcherV2:
                 WorkflowDispatchRow(
                     workflow_id=workflow_id,
                     unique_id=unique_id,
+                    dispatch_key=str(dispatch_key).strip() if dispatch_key else None,
                     supplier_id=record.supplier_id,
                     supplier_email=record.supplier_email,
                     message_id=record.message_id,
