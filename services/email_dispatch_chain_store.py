@@ -69,6 +69,7 @@ def record_dispatch(
     message_id: str,
     subject: str,
     dispatched_at: datetime,
+    dispatch_key: Optional[str] = None,
     **kwargs,
 ) -> None:
     """Record dispatch metadata in workflow tracking."""
@@ -103,6 +104,7 @@ def record_dispatch(
                 WorkflowDispatchRow(
                     workflow_id=workflow_id,
                     unique_id=unique_id,
+                    dispatch_key=dispatch_key,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
                     message_id=message_id,
