@@ -2,7 +2,6 @@ import os
 import sys
 from types import SimpleNamespace
 from collections import deque
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -155,70 +154,3 @@ def test_workflow_snapshot_returns_partial_response_progress():
     assert summary["activation"]["activated"] is True
     assert summary["dispatch"]["complete"] is True
     assert summary["responses"]["complete"] is False
-
-
-def test_dispatch_completion_respects_min_dispatched_at():
-    workflow_id = "wf-reuse"
-    now = datetime.now(timezone.utc)
-    earlier = now - timedelta(minutes=30)
-
-    dispatch_batches = [
-        [
-            SimpleNamespace(unique_id="uid-1", dispatched_at=earlier, message_id="m-old"),
-        ]
-    ]
-
-    helper = SupplierResponseWorkflow(
-        workflow_repo=DummyWorkflowRepo(dispatch_batches),
-        response_repo=DummyResponseRepo([[]]),
-        sleep_fn=lambda *_: None,
-    )
-
-    summary = helper.await_dispatch_completion(
-        workflow_id=workflow_id,
-        unique_ids=["uid-1"],
-        timeout=0,
-        poll_interval=0,
-        wait_for_all=True,
-        dispatch_context={"uid-1": {"min_dispatched_at": now.isoformat()}},
-    )
-
-    assert summary["completed_dispatches"] == 0
-    assert summary["complete"] is False
-
-
-def test_dispatch_completion_waits_for_newer_dispatch():
-    workflow_id = "wf-refresh"
-    now = datetime.now(timezone.utc)
-    earlier = now - timedelta(minutes=5)
-    later = now + timedelta(seconds=1)
-
-    dispatch_batches = [
-        [
-            SimpleNamespace(unique_id="uid-1", dispatched_at=earlier, message_id="m-old"),
-        ],
-        [
-            SimpleNamespace(unique_id="uid-1", dispatched_at=later, message_id="m-new"),
-        ],
-    ]
-
-    sleep = SleepRecorder()
-
-    helper = SupplierResponseWorkflow(
-        workflow_repo=DummyWorkflowRepo(dispatch_batches),
-        response_repo=DummyResponseRepo([[]]),
-        sleep_fn=sleep,
-    )
-
-    summary = helper.await_dispatch_completion(
-        workflow_id=workflow_id,
-        unique_ids=["uid-1"],
-        timeout=5,
-        poll_interval=0,
-        wait_for_all=True,
-        dispatch_context={"uid-1": {"min_dispatched_at": now}},
-    )
-
-    assert summary["completed_dispatches"] == 1
-    assert summary["complete"] is True
-    assert sleep.calls, "expected polling to sleep while awaiting fresh dispatch"

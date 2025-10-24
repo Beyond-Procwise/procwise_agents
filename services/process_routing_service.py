@@ -96,8 +96,7 @@ class ProcessRoutingService:
                             modified_by TEXT,
                             user_id TEXT,
                             user_name TEXT,
-                            raw_data JSON,
-                            idempotency_key TEXT
+                            raw_data JSON
                         )
                         """
                     )
@@ -115,21 +114,6 @@ class ProcessRoutingService:
                     if column_missing:
                         cursor.execute(
                             "ALTER TABLE proc.routing ADD COLUMN workflow_id TEXT"
-                        )
-
-                    cursor.execute(
-                        """
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = 'proc'
-                          AND table_name = 'routing'
-                          AND column_name = 'idempotency_key'
-                        """
-                    )
-                    idempotency_missing = cursor.fetchone() is None
-                    if idempotency_missing:
-                        cursor.execute(
-                            "ALTER TABLE proc.routing ADD COLUMN idempotency_key TEXT"
                         )
 
                     cursor.execute(
@@ -906,48 +890,6 @@ class ProcessRoutingService:
             if branch in node:
                 self._enrich_node(node[branch], agent_defs, prompt_map, policy_map)
 
-    def _find_recent_process(
-        self,
-        cursor,
-        process_name: str,
-        workflow_id: Optional[str],
-        idempotency_key: str,
-        within_seconds: int = 10,
-    ) -> Optional[int]:
-        """Return the most recent process matching the idempotency key."""
-
-        if within_seconds <= 0:
-            within_seconds = 1
-
-        workflow_clause = "workflow_id IS NULL" if workflow_id is None else "workflow_id = %s"
-        params: List[Any] = [process_name]
-        if workflow_id is not None:
-            params.append(workflow_id)
-        params.append(idempotency_key)
-
-        query = f"""
-            SELECT process_id
-            FROM proc.routing
-            WHERE process_name = %s
-              AND {workflow_clause}
-              AND idempotency_key = %s
-              AND created_on >= (CURRENT_TIMESTAMP - INTERVAL '{int(within_seconds)} seconds')
-            ORDER BY created_on DESC
-            LIMIT 1
-        """
-
-        cursor.execute(query, tuple(params))
-        row = cursor.fetchone()
-        if row:
-            process_id = row[0]
-            if isinstance(process_id, int):
-                return process_id
-            try:
-                return int(process_id)
-            except (TypeError, ValueError):
-                return None
-        return None
-
     def log_process(
         self,
         process_name: str,
@@ -957,7 +899,6 @@ class ProcessRoutingService:
         created_by: Optional[str] = None,
         process_status: Optional[int] = None,
         workflow_id: Optional[str] = None,
-        idempotency_key: Optional[str] = None,
     ) -> Optional[int]:
         """Insert a process routing record and return the new ``process_id``.
 
@@ -991,49 +932,14 @@ class ProcessRoutingService:
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
-                    if idempotency_key:
-                        try:
-                            existing_id = self._find_recent_process(
-                                cursor,
-                                process_name,
-                                resolved_workflow_id,
-                                idempotency_key,
-                                within_seconds=10,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Failed to query for existing idempotent process"
-                            )
-                            existing_id = None
-                        if existing_id is not None:
-                            logger.info(
-                                "Reusing process %s for %s (workflow_id=%s, idempotency_key=%s)",
-                                existing_id,
-                                process_name,
-                                resolved_workflow_id,
-                                idempotency_key,
-                            )
-                            return existing_id
-
                     normalised_details = self.normalize_process_details(process_details)
-                    reason_meta: Dict[str, Any] = {}
                     if isinstance(normalised_details, dict):
                         normalised_details.setdefault("workflow_id", resolved_workflow_id)
-                        potential_reason = normalised_details.get("reason") or normalised_details.get("message")
-                        potential_error = normalised_details.get("error")
-                        reason_meta = {
-                            key: value
-                            for key, value in (
-                                ("reason", potential_reason),
-                                ("error", potential_error),
-                            )
-                            if value
-                        }
                     cursor.execute(
                         """
                         INSERT INTO proc.routing
-                            (process_name, workflow_id, process_details, created_by, user_id, user_name, process_status, idempotency_key)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            (process_name, workflow_id, process_details, created_by, user_id, user_name, process_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         RETURNING process_id
                         """,
                         (
@@ -1044,28 +950,16 @@ class ProcessRoutingService:
                             user_id,
                             user_name,
                             process_status,
-                            idempotency_key,
                         ),
                     )
                     process_id = cursor.fetchone()[0]
                     conn.commit()
-                    if reason_meta:
-                        logger.info(
-                            "Logged process %s with id %s (workflow_id=%s, idempotency_key=%s) meta=%s",
-                            process_name,
-                            process_id,
-                            resolved_workflow_id,
-                            idempotency_key,
-                            reason_meta,
-                        )
-                    else:
-                        logger.info(
-                            "Logged process %s with id %s (workflow_id=%s, idempotency_key=%s)",
-                            process_name,
-                            process_id,
-                            resolved_workflow_id,
-                            idempotency_key,
-                        )
+                    logger.info(
+                        "Logged process %s with id %s (workflow_id=%s)",
+                        process_name,
+                        process_id,
+                        resolved_workflow_id,
+                    )
                     return process_id
         except Exception:
             logger.exception("Failed to log process %s", process_name)
@@ -1295,18 +1189,6 @@ class ProcessRoutingService:
         # Ensure the ``process_details`` blob reflects the new status.
         details = process_details or self.get_process_details(process_id, raw=True) or {}
         details["status"] = status_text
-        reason_meta: Dict[str, Any] = {}
-        if numeric_status < 0 or status_text == "failed":
-            potential_reason = details.get("reason") or details.get("message")
-            potential_error = details.get("error")
-            reason_meta = {
-                key: value
-                for key, value in (
-                    ("reason", potential_reason),
-                    ("error", potential_error),
-                )
-                if value
-            }
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -1327,21 +1209,12 @@ class ProcessRoutingService:
                         ),
                     )
                     conn.commit()
-                    if reason_meta:
-                        logger.info(
-                            "Updated process %s to status %s (process_status=%s) meta=%s",
-                            process_id,
-                            status_text,
-                            numeric_status,
-                            reason_meta,
-                        )
-                    else:
-                        logger.info(
-                            "Updated process %s to status %s (process_status=%s)",
-                            process_id,
-                            status_text,
-                            numeric_status,
-                        )
+                    logger.info(
+                        "Updated process %s to status %s (process_status=%s)",
+                        process_id,
+                        status_text,
+                        numeric_status,
+                    )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "Failed to update status for process %s", process_id

@@ -23,7 +23,6 @@ def _sample_row(message_id: str | None = "msg-123") -> WorkflowDispatchRow:
     return WorkflowDispatchRow(
         workflow_id="wf-test",
         unique_id="uid-123",
-        dispatch_key=message_id or "dispatch-uid-123",
         supplier_id="sup-1",
         supplier_email="supplier@example.com",
         message_id=message_id,
