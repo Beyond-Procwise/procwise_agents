@@ -676,6 +676,18 @@ class NegotiationAgent(BaseAgent):
             os.getenv("NEG_USE_ENHANCED_MESSAGES", "false").lower() == "true"
         )
 
+        settings = getattr(self.agent_nick, "settings", None)
+        if settings is not None:
+            default_settings = {
+                "negotiation_multi_round_enabled": True,
+                "negotiation_max_rounds": 3,
+                "negotiation_round_base_timeout": 900,
+                "negotiation_per_supplier_timeout": 300,
+            }
+            for attr, default_value in default_settings.items():
+                if not hasattr(settings, attr):
+                    setattr(settings, attr, default_value)
+
     @contextmanager
     def _session_lock(self, workflow_id: str, supplier_id: str, round_no: int):
         """Cross-process advisory lock to avoid duplicate negotiation runs."""
@@ -880,21 +892,89 @@ class NegotiationAgent(BaseAgent):
                 delattr(context, "_pending_email_actions")
         return result
 
+    def _should_use_multi_round_orchestration(
+        self,
+        batch_entries: List[Dict[str, Any]],
+        shared_context: Dict[str, Any],
+        input_payload: Dict[str, Any],
+    ) -> bool:
+        """Determine whether multi-round orchestration should be used."""
+
+        explicit_flag = bool(
+            shared_context.get("multi_round_enabled")
+            or input_payload.get("multi_round_enabled")
+            or getattr(self.agent_nick.settings, "negotiation_multi_round_enabled", False)
+        )
+        if explicit_flag:
+            logger.info("Multi-round orchestration explicitly enabled")
+            return True
+
+        rounds_detected: Set[int] = set()
+        for entry in batch_entries:
+            if not isinstance(entry, dict):
+                continue
+            round_hint = (
+                entry.get("round")
+                or entry.get("round_number")
+                or entry.get("round_no")
+            )
+            if round_hint is None:
+                continue
+            try:
+                rounds_detected.add(int(float(round_hint)))
+            except (TypeError, ValueError):
+                continue
+
+        if len(rounds_detected) > 1:
+            logger.info(
+                "Multi-round orchestration auto-enabled: detected %d distinct rounds in batch",
+                len(rounds_detected),
+            )
+            return True
+
+        max_rounds = (
+            shared_context.get("max_rounds")
+            or input_payload.get("max_rounds")
+            or getattr(self.agent_nick.settings, "negotiation_max_rounds", 3)
+            or 3
+        )
+        try:
+            max_rounds = int(max_rounds)
+        except Exception:
+            max_rounds = 3
+
+        unique_suppliers = {
+            self._coerce_text(entry.get("supplier_id") or entry.get("supplier"))
+            for entry in batch_entries
+            if isinstance(entry, dict)
+        }
+        unique_suppliers.discard(None)
+
+        if len(unique_suppliers) >= 1 and max_rounds > 1:
+            logger.info(
+                "Multi-round orchestration auto-enabled: %d suppliers with max_rounds=%d",
+                len(unique_suppliers),
+                max_rounds,
+            )
+            return True
+
+        logger.info("Multi-round orchestration not required; using parallel batch mode")
+        return False
+
     def run(self, context: AgentContext) -> AgentOutput:
         logger.info("NegotiationAgent starting")
 
         batch_entries, shared_context = self._extract_batch_inputs(context.input_data)
 
         if batch_entries:
-            # Determine if multi-round orchestration is enabled
             input_payload = context.input_data if isinstance(context.input_data, dict) else {}
-            multi_round_enabled = bool(
-                shared_context.get("multi_round_enabled")
-                or input_payload.get("multi_round_enabled")
-                or getattr(self.agent_nick.settings, "negotiation_multi_round_enabled", False)
+            use_multi_round = self._should_use_multi_round_orchestration(
+                batch_entries,
+                shared_context,
+                input_payload,
             )
 
-            if multi_round_enabled:
+            if use_multi_round:
                 max_rounds = (
                     shared_context.get("max_rounds")
                     or input_payload.get("max_rounds")
@@ -904,8 +984,14 @@ class NegotiationAgent(BaseAgent):
                 try:
                     max_rounds = int(max_rounds)
                 except Exception:
-                    logger.warning("Unable to coerce max_rounds=%s; defaulting to 3", max_rounds)
+                    logger.warning("Unable to coerce max_rounds; defaulting to 3")
                     max_rounds = 3
+
+                logger.info(
+                    "Starting multi-round negotiation: %d suppliers, %d max rounds",
+                    len(batch_entries),
+                    max_rounds,
+                )
 
                 return self._run_multi_round_negotiation(
                     context,
@@ -914,6 +1000,10 @@ class NegotiationAgent(BaseAgent):
                     max_rounds=max(1, max_rounds),
                 )
 
+            logger.info(
+                "Starting parallel batch negotiation: %d suppliers",
+                len(batch_entries),
+            )
             return self._run_batch_negotiations(context, batch_entries, shared_context)
 
         return self._run_single_negotiation(context)
@@ -1655,11 +1745,20 @@ class NegotiationAgent(BaseAgent):
         all_round_results: List[Dict[str, Any]] = []
 
         for round_num in range(1, max_rounds + 1):
+            active_suppliers = [
+                supplier_state
+                for supplier_state in negotiation_state["active_suppliers"].values()
+                if supplier_state.get("status")
+                not in {"COMPLETED", "ACCEPTED", "DECLINED", "FAILED"}
+            ]
             logger.info(
-                "Starting negotiation round %s/%s for workflow_id=%s",
+                "%s\nROUND %d/%d START\nWorkflow: %s\nActive Suppliers: %d\n%s",
+                "=" * 80,
                 round_num,
                 max_rounds,
                 workflow_id,
+                len(active_suppliers),
+                "=" * 80,
             )
 
             round_entries = self._prepare_round_entries(
@@ -1684,7 +1783,24 @@ class NegotiationAgent(BaseAgent):
 
             all_round_results.append(round_result)
 
+            logger.info(
+                "Round %d execution complete: %d succeeded, %d failed",
+                round_num,
+                round_result.get("suppliers_succeeded", 0),
+                round_result.get("suppliers_failed", 0),
+            )
+
             if round_num < max_rounds:
+                expected_responses = len(round_result.get("drafts", []))
+                logger.info(
+                    "%s\nWAITING FOR ROUND %d RESPONSES\nWorkflow: %s\nExpected responses: %d\n%s",
+                    "=" * 80,
+                    round_num,
+                    workflow_id,
+                    expected_responses,
+                    "=" * 80,
+                )
+
                 responses_received = self._wait_for_round_responses(
                     context=context,
                     round_result=round_result,
@@ -1699,6 +1815,12 @@ class NegotiationAgent(BaseAgent):
                     )
                     break
 
+                logger.info(
+                    "Round %d responses received: %d suppliers responded",
+                    round_num,
+                    len(responses_received),
+                )
+
                 self._process_round_responses(
                     responses_received,
                     negotiation_state,
@@ -1712,8 +1834,19 @@ class NegotiationAgent(BaseAgent):
                 not in {"COMPLETED", "ACCEPTED", "DECLINED", "FAILED"}
             ]
 
+            logger.info(
+                "%s\nROUND %d/%d COMPLETE\nRemaining active suppliers: %d\nCompleted: %d\nFailed: %d\n%s",
+                "=" * 80,
+                round_num,
+                max_rounds,
+                len(remaining_active),
+                len(negotiation_state.get("completed_suppliers", set())),
+                len(negotiation_state.get("failed_suppliers", {})),
+                "=" * 80,
+            )
+
             if not remaining_active:
-                logger.info("All supplier negotiations completed")
+                logger.info("All supplier negotiations completed after round %d", round_num)
                 break
 
         return self._consolidate_multi_round_results(
@@ -1933,6 +2066,18 @@ class NegotiationAgent(BaseAgent):
             logger.warning("No drafts to wait for in round %s", round_num)
             return {}
 
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            draft_workflow = draft.get("workflow_id")
+            if draft_workflow and draft_workflow != workflow_id:
+                logger.error(
+                    "CRITICAL: Draft workflow mismatch in round %d! Expected: %s, Got: %s",
+                    round_num,
+                    workflow_id,
+                    draft_workflow,
+                )
+
         logger.info(
             "Waiting for %s supplier responses for round %s (workflow_id=%s)",
             len(drafts),
@@ -1955,7 +2100,7 @@ class NegotiationAgent(BaseAgent):
             )
 
             logger.info(
-                "Initiating response wait: timeout=%ss, poll_interval=%ss, expected_count=%s",
+                "Response wait configuration: timeout=%ss, poll=%ss, expected=%d",
                 timeout,
                 poll_interval,
                 len(drafts),
@@ -1982,7 +2127,7 @@ class NegotiationAgent(BaseAgent):
             )
 
             logger.info(
-                "Received %s supplier responses for round %s",
+                "Successfully mapped %d supplier responses for round %d",
                 len(supplier_responses),
                 round_num,
             )
