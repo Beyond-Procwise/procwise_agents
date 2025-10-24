@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import types
 from types import SimpleNamespace
 
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
@@ -9,11 +10,25 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.email_drafting_agent import DEFAULT_RFQ_SUBJECT
+_backend_scheduler_stub = types.ModuleType("services.backend_scheduler")
+
+
+class _BackendSchedulerProxy:
+    @staticmethod
+    def ensure(agent_nick):
+        return SimpleNamespace(notify_email_dispatch=lambda *_, **__: None)
+
+
+_backend_scheduler_stub.BackendScheduler = _BackendSchedulerProxy
+sys.modules.setdefault("services.backend_scheduler", _backend_scheduler_stub)
+
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
 from repositories import workflow_email_tracking_repo
 from utils.email_tracking import extract_tracking_metadata, extract_unique_id_from_body
+
+
+DEFAULT_RFQ_SUBJECT = "Sourcing Request – Pricing Discussion"
 
 
 class InMemoryDraftStore:
@@ -263,7 +278,16 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     monkeypatch.setattr(service.email_service, "send_email", fake_send)
     monkeypatch.setattr(service, "_record_thread_mapping", fake_record_thread)
 
-    result = service.send_draft("RFQ-UNIT")
+    dispatch_context = {
+        "workflow_id": "wf-test-1",
+        "unique_id": unique_id,
+        "dispatch_key": "neg-round-1",
+    }
+    result = service.send_draft(
+        "RFQ-UNIT",
+        is_workflow_email=True,
+        workflow_dispatch_context=dispatch_context,
+    )
 
     assert result["sent"] is True
     assert result["unique_id"] == unique_id
@@ -299,6 +323,8 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         == result["draft"]["dispatch_metadata"].get("run_id")
     )
     assert result["draft"].get("dispatch_run_id") == result["draft"]["dispatch_metadata"]["run_id"]
+    assert result["workflow_email"] is True
+    assert result["workflow_context"] == dispatch_context
     visible_body = result["body"].split("-->", 2)[-1]
     assert "RFQ-UNIT" not in visible_body
     assert store.rows[draft_id]["sent"] is True
@@ -327,3 +353,78 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         row.unique_id == unique_id and row.message_id == "<message-id-1>"
         for row in stored_rows
     )
+
+
+def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
+    store = InMemoryDraftStore()
+    unique_id = "PROC-WF-NOLOG-001"
+    draft_payload = {
+        "rfq_id": "RFQ-NOLOG",
+        "subject": DEFAULT_RFQ_SUBJECT,
+        "body": "<p>Skip</p>",
+        "receiver": "buyer@example.com",
+        "recipients": ["buyer@example.com"],
+        "sender": "sender@example.com",
+        "thread_index": 1,
+        "contact_level": 1,
+        "sent_status": False,
+        "action_id": "action-2",
+        "workflow_id": "wf-no-track",
+        "unique_id": unique_id,
+    }
+    store.add(
+        {
+            "rfq_id": "RFQ-NOLOG",
+            "supplier_id": "S2",
+            "supplier_name": "NoTrack",
+            "subject": draft_payload["subject"],
+            "body": draft_payload["body"],
+            "sent": False,
+            "recipient_email": None,
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": "sender@example.com",
+            "payload": json.dumps(draft_payload),
+            "sent_on": None,
+            "workflow_id": "wf-no-track",
+            "unique_id": unique_id,
+        }
+    )
+
+    action_store = InMemoryActionStore()
+    action_store.update(
+        "action-2",
+        json.dumps(
+            {
+                "drafts": [draft_payload],
+                "rfq_id": "RFQ-NOLOG",
+                "unique_id": unique_id,
+                "sent_status": False,
+            }
+        ),
+    )
+
+    nick = DummyNick(store, action_store)
+    service = EmailDispatchService(nick)
+
+    def fake_send(subject, body, recipients, sender, attachments=None, **kwargs):
+        return EmailSendResult(True, "<message-id-nolog>")
+
+    monkeypatch.setattr(service.email_service, "send_email", fake_send)
+
+    result = service.send_draft(
+        "RFQ-NOLOG",
+        is_workflow_email=False,
+        workflow_dispatch_context={
+            "workflow_id": "wf-no-track",
+            "unique_id": unique_id,
+        },
+    )
+
+    assert result["workflow_email"] is False
+
+    workflow_email_tracking_repo.init_schema()
+    stored_rows = workflow_email_tracking_repo.load_workflow_rows(
+        workflow_id="wf-no-track"
+    )
+    assert not any(row.unique_id == unique_id for row in stored_rows)

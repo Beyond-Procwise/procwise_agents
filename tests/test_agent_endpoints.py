@@ -129,6 +129,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
             subject_override=None,
             body_override=None,
             attachments=None,
+            **kwargs,
         ):
             calls["args"] = (
                 identifier,
@@ -137,6 +138,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
                 subject_override,
                 body_override,
             )
+            calls["kwargs"] = kwargs
             unique_id = f"PROC-WF-{identifier}"
             return {
                 "unique_id": unique_id,
@@ -209,10 +211,12 @@ def test_email_workflow_accepts_list_recipients(monkeypatch):
             subject_override=None,
             body_override=None,
             attachments=None,
+            **kwargs,
         ):
             captured["call"] = {
                 "identifier": identifier,
                 "recipients": recipients,
+                "kwargs": kwargs,
             }
             return {
                 "unique_id": identifier,
@@ -261,6 +265,7 @@ def test_email_workflow_marks_failed_dispatch(monkeypatch):
             subject_override=None,
             body_override=None,
             attachments=None,
+            **kwargs,
         ):
             return {
                 "unique_id": f"PROC-WF-{identifier}",

@@ -60,8 +60,15 @@ class _FakeCursor:
             return
         if upper_stmt.startswith("CREATE TABLE") or upper_stmt.startswith(
             "CREATE INDEX"
-        ):
+        ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
             self._store.ensure_tables()
+            return
+        if "SELECT TO_REGCLASS" in upper_stmt:
+            # Return truthy result when workflow tracking table exists
+            target = params[0] if params else ""
+            exists = bool(getattr(self._store, "workflow_email_tracking", []))
+            self._results = [(target if exists else None,)]
+            self.description = [_ColumnDescriptor("to_regclass")]
             return
         if "INFORMATION_SCHEMA.COLUMNS" in upper_stmt:
             schema, table, column = params

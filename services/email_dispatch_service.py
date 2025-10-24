@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 from utils.email_tracking import (
     build_tracking_comment,
@@ -110,6 +110,9 @@ class EmailDispatchService:
         subject_override: Optional[str] = None,
         body_override: Optional[str] = None,
         attachments: Optional[List[Tuple[bytes, str]]] = None,
+        *,
+        is_workflow_email: Optional[bool] = None,
+        workflow_dispatch_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send the latest draft for ``identifier`` (unique_id preferred)."""
 
@@ -181,8 +184,55 @@ class EmailDispatchService:
             )
             backend_metadata["run_id"] = dispatch_run_id
 
+            workflow_context_payload = self._normalise_workflow_context(
+                workflow_dispatch_context
+                or draft.get("workflow_context")
+                or draft_metadata_source.get("workflow_context")
+                or draft_metadata_source.get("workflow_dispatch_context")
+            )
+            if workflow_context_payload:
+                draft_metadata.setdefault("workflow_context", workflow_context_payload)
+                dispatch_payload_context = dict(workflow_context_payload)
+            else:
+                dispatch_payload_context = None
+
+            workflow_email_flag = self._coerce_bool_flag(is_workflow_email)
+            if workflow_email_flag is None:
+                workflow_email_flag = self._coerce_bool_flag(draft.get("workflow_email"))
+            if workflow_email_flag is None:
+                workflow_email_flag = self._coerce_bool_flag(
+                    draft_metadata_source.get("workflow_email")
+                    if isinstance(draft_metadata_source, dict)
+                    else None
+                )
+            if workflow_email_flag is None:
+                workflow_email_flag = self._coerce_bool_flag(
+                    draft_metadata_source.get("is_workflow_email")
+                    if isinstance(draft_metadata_source, dict)
+                    else None
+                )
+            if workflow_email_flag is None:
+                workflow_email_flag = self._coerce_bool_flag(draft_metadata.get("workflow_email"))
+
+            parent_agent_hint = draft_metadata.get("parent_agent") or draft.get("parent_agent")
+            if (
+                workflow_email_flag is None
+                and dispatch_payload_context
+                and isinstance(parent_agent_hint, str)
+                and parent_agent_hint.lower() == "negotiationagent"
+            ):
+                workflow_email_flag = True
+
+            should_record_workflow = bool(workflow_email_flag) if workflow_email_flag is not None else False
+            if workflow_email_flag is not None:
+                draft_metadata["workflow_email"] = bool(workflow_email_flag)
+
             dispatch_payload = dict(draft)
             dispatch_payload["metadata"] = draft_metadata
+            if dispatch_payload_context:
+                dispatch_payload["workflow_context"] = dispatch_payload_context
+            if workflow_email_flag is not None:
+                dispatch_payload["workflow_email"] = bool(workflow_email_flag)
             dispatch_payload.update(
                 {
                     "subject": subject,
@@ -304,11 +354,26 @@ class EmailDispatchService:
                     )
 
                 workflow_identifier = backend_metadata.get("workflow_id")
-                if workflow_identifier and unique_id:
+                if (
+                    not workflow_identifier
+                    and dispatch_payload_context
+                    and dispatch_payload_context.get("workflow_id")
+                ):
+                    workflow_identifier = dispatch_payload_context.get("workflow_id")
+                    backend_metadata.setdefault("workflow_id", workflow_identifier)
+                if dispatch_payload_context:
+                    backend_metadata.setdefault(
+                        "workflow_context", dispatch_payload_context
+                    )
+                if should_record_workflow and workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
-                            unique_id=unique_id,
+                            unique_id=(
+                                dispatch_payload_context.get("unique_id")
+                                if dispatch_payload_context
+                                else unique_id
+                            ),
                             supplier_id=str(
                                 backend_metadata.get("supplier_id")
                                 or draft.get("supplier_id")
@@ -323,6 +388,11 @@ class EmailDispatchService:
                             message_id=message_id,
                             subject=subject,
                             dispatched_at=datetime.now(timezone.utc),
+                            dispatch_key=(
+                                dispatch_payload_context.get("dispatch_key")
+                                if dispatch_payload_context
+                                else None
+                            ),
                         )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
@@ -331,9 +401,9 @@ class EmailDispatchService:
                         )
                     else:
                         try:
-                            BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
-                                workflow_identifier
-                            )
+                            BackendScheduler.ensure(
+                                self.agent_nick
+                            ).notify_email_dispatch(workflow_identifier)
                         except Exception:  # pragma: no cover - defensive logging
                             logger.exception(
                                 "Failed to trigger email watcher for workflow %s",
@@ -355,12 +425,51 @@ class EmailDispatchService:
                 or dispatch_payload.get("workflow_id"),
                 "run_id": backend_metadata.get("run_id")
                 or dispatch_payload.get("run_id"),
+                "workflow_email": bool(workflow_email_flag)
+                if workflow_email_flag is not None
+                else False,
+                "workflow_context": dispatch_payload_context,
                 "draft": dispatch_payload,
             }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _coerce_bool_flag(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        return None
+
+    @staticmethod
+    def _normalise_workflow_context(
+        context: Optional[Mapping[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(context, Mapping):
+            return None
+
+        cleaned: Dict[str, Any] = {}
+        for key, value in context.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                cleaned[str(key)] = value
+            else:
+                text = str(value).strip()
+                if text:
+                    cleaned[str(key)] = text
+        return cleaned or None
+
     def _fetch_latest_draft(self, conn, identifier: str) -> Optional[Tuple]:
         with conn.cursor() as cur:
             cur.execute(
