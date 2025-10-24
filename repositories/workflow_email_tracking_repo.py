@@ -38,6 +38,9 @@ ON proc.workflow_email_tracking (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_unique
 ON proc.workflow_email_tracking (unique_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf_unique
+ON proc.workflow_email_tracking (workflow_id, unique_id);
 """
 
 @dataclass
