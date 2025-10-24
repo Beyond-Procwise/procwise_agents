@@ -12,72 +12,14 @@ CREATE SCHEMA IF NOT EXISTS proc;
 
 CREATE TABLE IF NOT EXISTS proc.draft_rfq_emails (
     id BIGSERIAL PRIMARY KEY,
-    rfq_id TEXT,
-    supplier_id TEXT,
-    supplier_name TEXT,
-    subject TEXT,
-    body TEXT,
-    created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent BOOLEAN NOT NULL DEFAULT FALSE,
-    review_status TEXT NOT NULL DEFAULT 'PENDING',
-    sent_on TIMESTAMPTZ,
-    recipient_email TEXT,
-    contact_level INTEGER NOT NULL DEFAULT 0,
-    thread_index INTEGER NOT NULL DEFAULT 1,
-    sender TEXT,
-    sender_email TEXT,
-    payload JSONB,
-    updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     workflow_id TEXT NOT NULL,
     run_id TEXT,
     unique_id TEXT NOT NULL,
-    mailbox TEXT,
-    dispatched_at TIMESTAMPTZ,
-    dispatch_run_id TEXT
+    supplier_id TEXT,
+    dispatched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- status fields (optional)
+    sent BOOLEAN DEFAULT TRUE
 );
-
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS rfq_id TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS supplier_name TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS subject TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS body TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS created_on TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS sent BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'PENDING';
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS sent_on TIMESTAMPTZ;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS recipient_email TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS contact_level INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS thread_index INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS sender TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS sender_email TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS payload JSONB;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS updated_on TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS workflow_id TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS run_id TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS unique_id TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS mailbox TEXT;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ;
-ALTER TABLE proc.draft_rfq_emails
-    ADD COLUMN IF NOT EXISTS dispatch_run_id TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_rfq_emails_wf_uid
 ON proc.draft_rfq_emails (workflow_id, unique_id);
@@ -91,28 +33,12 @@ logger = logging.getLogger(__name__)
 DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS draft_rfq_emails (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    rfq_id TEXT,
-    supplier_id TEXT,
-    supplier_name TEXT,
-    subject TEXT,
-    body TEXT,
-    created_on TEXT NOT NULL DEFAULT (datetime('now')),
-    sent INTEGER NOT NULL DEFAULT 0,
-    review_status TEXT NOT NULL DEFAULT 'PENDING',
-    sent_on TEXT,
-    recipient_email TEXT,
-    contact_level INTEGER NOT NULL DEFAULT 0,
-    thread_index INTEGER NOT NULL DEFAULT 1,
-    sender TEXT,
-    sender_email TEXT,
-    payload TEXT,
-    updated_on TEXT NOT NULL DEFAULT (datetime('now')),
     workflow_id TEXT NOT NULL,
     run_id TEXT,
     unique_id TEXT NOT NULL,
-    mailbox TEXT,
-    dispatched_at TEXT,
-    dispatch_run_id TEXT
+    supplier_id TEXT,
+    dispatched_at TEXT NOT NULL,
+    sent INTEGER DEFAULT 1
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_rfq_emails_wf_uid
@@ -122,49 +48,13 @@ CREATE INDEX IF NOT EXISTS idx_draft_rfq_emails_wf
 ON draft_rfq_emails (workflow_id);
 """
 
-SQLITE_COLUMN_DEFINITIONS: Dict[str, str] = {
-    "rfq_id": "TEXT",
-    "supplier_id": "TEXT",
-    "supplier_name": "TEXT",
-    "subject": "TEXT",
-    "body": "TEXT",
-    "created_on": "TEXT NOT NULL DEFAULT (datetime('now'))",
-    "sent": "INTEGER NOT NULL DEFAULT 0",
-    "review_status": "TEXT NOT NULL DEFAULT 'PENDING'",
-    "sent_on": "TEXT",
-    "recipient_email": "TEXT",
-    "contact_level": "INTEGER NOT NULL DEFAULT 0",
-    "thread_index": "INTEGER NOT NULL DEFAULT 1",
-    "sender": "TEXT",
-    "sender_email": "TEXT",
-    "payload": "TEXT",
-    "updated_on": "TEXT NOT NULL DEFAULT (datetime('now'))",
-    "workflow_id": "TEXT NOT NULL",
-    "run_id": "TEXT",
-    "unique_id": "TEXT NOT NULL",
-    "mailbox": "TEXT",
-    "dispatched_at": "TEXT",
-    "dispatch_run_id": "TEXT",
-}
-
-
-def _ensure_sqlite_columns(cur: sqlite3.Cursor, table: str) -> None:
-    cur.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cur.fetchall() if row and len(row) > 1}
-    for column, definition in SQLITE_COLUMN_DEFINITIONS.items():
-        if column in existing:
-            continue
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
         if isinstance(conn, sqlite3.Connection):
             cur.executescript(DDL_SQLITE)
-            _ensure_sqlite_columns(cur, "draft_rfq_emails")
         else:
-            for statement in filter(None, (stmt.strip() for stmt in DDL_PG.split(";"))):
-                cur.execute(statement)
+            cur.execute(DDL_PG)
         cur.close()
 
 def _parse_dt(dt) -> datetime:
@@ -229,44 +119,20 @@ def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:
     if not unique_id:
         return None
 
-    columns = (
-        "id",
-        "rfq_id",
-        "supplier_id",
-        "supplier_name",
-        "subject",
-        "body",
-        "created_on",
-        "sent",
-        "review_status",
-        "sender",
-        "sender_email",
-        "payload",
-        "workflow_id",
-        "run_id",
-        "unique_id",
-        "mailbox",
-        "thread_index",
-        "dispatched_at",
-        "recipient_email",
-        "contact_level",
-        "sent_on",
-        "updated_on",
-        "dispatch_run_id",
-    )
-
     try:
         with get_conn() as conn:
             if isinstance(conn, sqlite3.Connection):
                 query = (
-                    f"SELECT {', '.join(columns)} FROM draft_rfq_emails "
-                    "WHERE unique_id = ? ORDER BY dispatched_at DESC, created_on DESC LIMIT 1"
+                    "SELECT id, NULL, supplier_id, NULL, NULL, NULL, dispatched_at, sent, NULL, NULL, "
+                    "workflow_id, run_id, unique_id, NULL FROM draft_rfq_emails "
+                    "WHERE unique_id = ? ORDER BY dispatched_at DESC LIMIT 1"
                 )
                 params = (unique_id,)
             else:
                 query = (
-                    f"SELECT {', '.join(columns)} FROM proc.draft_rfq_emails "
-                    "WHERE unique_id = %s ORDER BY dispatched_at DESC NULLS LAST, created_on DESC LIMIT 1"
+                    "SELECT id, rfq_id, supplier_id, supplier_name, subject, body, created_on, sent, sender, payload, "
+                    "workflow_id, run_id, unique_id, mailbox FROM proc.draft_rfq_emails "
+                    "WHERE unique_id = %s ORDER BY created_on DESC LIMIT 1"
                 )
                 params = (unique_id,)
 
@@ -290,19 +156,10 @@ def load_by_unique_id(unique_id: str) -> Optional[Dict[str, Any]]:
         "body": row[5],
         "created_on": row[6],
         "sent": row[7],
-        "review_status": row[8],
-        "sender": row[9],
-        "sender_email": row[10],
-        "payload": row[11],
-        "workflow_id": row[12],
-        "run_id": row[13],
-        "unique_id": row[14],
-        "mailbox": row[15],
-        "thread_index": row[16],
-        "dispatched_at": row[17],
-        "recipient_email": row[18],
-        "contact_level": row[19],
-        "sent_on": row[20],
-        "updated_on": row[21],
-        "dispatch_run_id": row[22],
+        "sender": row[8],
+        "payload": row[9],
+        "workflow_id": row[10],
+        "run_id": row[11],
+        "unique_id": row[12],
+        "mailbox": row[13],
     }
