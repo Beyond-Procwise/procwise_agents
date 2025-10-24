@@ -8505,6 +8505,33 @@ class NegotiationAgent(BaseAgent):
             },
         )
 
+        workflow_context: Dict[str, Any] = {}
+        if workflow_id:
+            workflow_context["workflow_id"] = workflow_id
+        unique_hint = (
+            payload.get("unique_id")
+            or payload.get("session_reference")
+            or decision_payload.get("unique_id")
+        )
+        if unique_hint:
+            workflow_context["unique_id"] = unique_hint
+        if supplier_token:
+            workflow_context["supplier_id"] = supplier_token
+        dispatch_key = payload.get("dispatch_key") or payload.get("session_reference")
+        if dispatch_key:
+            workflow_context["dispatch_key"] = dispatch_key
+        round_hint = (
+            payload.get("round")
+            if payload.get("round") is not None
+            else decision_payload.get("round")
+        )
+        if round_hint is not None:
+            workflow_context["round"] = round_hint
+        if workflow_context:
+            payload.setdefault("workflow_context", dict(workflow_context))
+            decision_payload.setdefault("workflow_context", dict(workflow_context))
+            payload.setdefault("workflow_email", True)
+
         thread_headers = (
             context.input_data.get("thread_headers")
             if isinstance(context.input_data, dict)
