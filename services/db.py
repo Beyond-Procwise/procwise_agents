@@ -174,7 +174,6 @@ class _FakeCursor:
             (
                 workflow_id,
                 unique_id,
-                dispatch_key,
                 supplier_id,
                 supplier_email,
                 message_id,
@@ -185,14 +184,12 @@ class _FakeCursor:
                 matched,
                 thread_headers,
             ) = params
-            self._store.insert_workflow_tracking(
+            self._store.upsert_workflow_tracking(
                 workflow_id,
                 unique_id,
-                dispatch_key,
                 {
                     "workflow_id": workflow_id,
                     "unique_id": unique_id,
-                    "dispatch_key": dispatch_key,
                     "supplier_id": supplier_id,
                     "supplier_email": supplier_email,
                     "message_id": message_id,
@@ -220,7 +217,6 @@ class _FakeCursor:
             columns = [
                 "workflow_id",
                 "unique_id",
-                "dispatch_key",
                 "supplier_id",
                 "supplier_email",
                 "message_id",
@@ -240,8 +236,8 @@ class _FakeCursor:
             ]
             return
 
-        if upper_stmt.startswith("WITH LATEST AS") and "UPDATE PROC.WORKFLOW_EMAIL_TRACKING SET RESPONDED_AT" in upper_stmt:
-            _, _, responded_at, response_message_id, workflow_id, unique_id = params
+        if upper_stmt.startswith("UPDATE PROC.WORKFLOW_EMAIL_TRACKING SET RESPONDED_AT"):
+            responded_at, response_message_id, workflow_id, unique_id = params
             self._store.mark_workflow_response(
                 workflow_id,
                 unique_id,
@@ -249,30 +245,6 @@ class _FakeCursor:
                 response_message_id,
             )
             return
-
-        if "UPDATE PROC.WORKFLOW_EMAIL_TRACKING" in upper_stmt and "RESPONDED_AT" in upper_stmt:
-            if len(params) == 6:
-                _, _, responded_at, response_message_id, workflow_id, unique_id = params
-            else:
-                responded_at, response_message_id, workflow_id, unique_id = params[-4:]
-            self._store.mark_workflow_response(
-                workflow_id,
-                unique_id,
-                responded_at,
-                response_message_id,
-            )
-            return
-
-        if "UPDATE PROC.WORKFLOW_EMAIL_TRACKING" in upper_stmt:
-            if len(params) >= 4:
-                responded_at, response_message_id, workflow_id, unique_id = params[-4:]
-                self._store.mark_workflow_response(
-                    workflow_id,
-                    unique_id,
-                    responded_at,
-                    response_message_id,
-                )
-                return
 
         if upper_stmt.startswith("DELETE FROM PROC.WORKFLOW_EMAIL_TRACKING"):
             (workflow_id,) = params
@@ -375,9 +347,6 @@ class _FakeCursor:
             self.description = [_ColumnDescriptor(col) for col in columns]
             return
 
-        if "UPDATE PROC.WORKFLOW_EMAIL_TRACKING" in upper_stmt:
-            return
-
         raise NotImplementedError(f"Unsupported fake query: {statement}")
 
 
@@ -421,7 +390,6 @@ class _FakePostgresStore:
             "proc.workflow_email_tracking": {
                 "workflow_id",
                 "unique_id",
-                "dispatch_key",
                 "supplier_id",
                 "supplier_email",
                 "message_id",
@@ -510,31 +478,16 @@ class _FakePostgresStore:
         return results
 
     # -- workflow tracking operations ------------------------------------
-    def insert_workflow_tracking(
-        self, workflow_id: str, unique_id: str, dispatch_key: str, row: Dict[str, Any]
+    def upsert_workflow_tracking(
+        self, workflow_id: str, unique_id: str, row: Dict[str, Any]
     ) -> None:
         self.ensure_tables()
         table = self.workflow_email_tracking  # type: ignore[attr-defined]
         for existing in table:
-            if (
-                existing["workflow_id"] == workflow_id
-                and existing["unique_id"] == unique_id
-                and existing.get("dispatch_key") == dispatch_key
-            ):
+            if existing["workflow_id"] == workflow_id and existing["unique_id"] == unique_id:
                 existing.update(row)
                 return
-        record = dict(row)
-        record.setdefault("dispatch_key", dispatch_key)
-        record.setdefault("created_at", datetime.utcnow())
-        table.append(record)
-        table.sort(
-            key=lambda item: (
-                item.get("workflow_id") or "",
-                item.get("dispatched_at") or datetime.min,
-                item.get("created_at") or datetime.min,
-                item.get("dispatch_key") or "",
-            )
-        )
+        table.append(dict(row))
 
     def distinct_active_workflow_ids(self) -> List[str]:
         self.ensure_tables()
@@ -552,15 +505,7 @@ class _FakePostgresStore:
     def fetch_workflow_tracking(self, workflow_id: str) -> List[Dict[str, Any]]:
         self.ensure_tables()
         table = self.workflow_email_tracking  # type: ignore[attr-defined]
-        rows = [row.copy() for row in table if row["workflow_id"] == workflow_id]
-        rows.sort(
-            key=lambda item: (
-                item.get("dispatched_at") or datetime.min,
-                item.get("created_at") or datetime.min,
-                item.get("dispatch_key") or "",
-            )
-        )
-        return rows
+        return [row.copy() for row in table if row["workflow_id"] == workflow_id]
 
     def mark_workflow_response(
         self,
@@ -571,24 +516,12 @@ class _FakePostgresStore:
     ) -> None:
         self.ensure_tables()
         table = self.workflow_email_tracking  # type: ignore[attr-defined]
-        candidates = [
-            row
-            for row in table
-            if row["workflow_id"] == workflow_id and row["unique_id"] == unique_id
-        ]
-        if not candidates:
-            return
-        candidates.sort(
-            key=lambda item: (
-                item.get("dispatched_at") or datetime.min,
-                item.get("created_at") or datetime.min,
-            ),
-            reverse=True,
-        )
-        target = candidates[0]
-        target["responded_at"] = responded_at
-        target["response_message_id"] = response_message_id
-        target["matched"] = True
+        for row in table:
+            if row["workflow_id"] == workflow_id and row["unique_id"] == unique_id:
+                row["responded_at"] = responded_at
+                row["response_message_id"] = response_message_id
+                row["matched"] = True
+                return
 
     def delete_workflow_rows(self, workflow_id: str) -> None:
         self.ensure_tables()

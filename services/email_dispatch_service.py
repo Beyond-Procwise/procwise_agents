@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,10 +35,6 @@ configure_gpu()
 logger = logging.getLogger(__name__)
 
 _DEFAULT_THREAD_TABLE = DEFAULT_THREAD_TABLE
-
-
-class DraftNotFoundError(ValueError):
-    """Raised when a draft cannot be located for dispatch."""
 
 
 class EmailDispatchService:
@@ -107,105 +102,6 @@ class EmailDispatchService:
 
         return None
 
-    def dispatch_from_context(
-        self,
-        workflow_id: str | None,
-        *,
-        overrides: Dict[str, Any],
-        idempotency_key: str | None = None,
-    ) -> Dict[str, Any]:
-        """
-        Resolve identifier/recipients/sender/subject/body from context and overrides, then call send_draft.
-        """
-
-        identifier = (overrides.get("identifier") or "").strip() or None
-
-        draft: Optional[Dict[str, Any]] = None
-        if identifier:
-            draft = self._load_draft_by_identifier(identifier)
-            if not draft:
-                raise DraftNotFoundError(f"No draft found for identifier={identifier}")
-
-        if not draft:
-            workflow_hint = self._normalise_identifier(workflow_id)
-            if not workflow_hint:
-                raise ValueError("workflow_id or identifier required")
-
-            draft = self._load_draft_for_workflow(workflow_hint)
-
-            if not draft:
-                raise DraftNotFoundError(
-                    f"No unsent/saved draft found for workflow_id={workflow_hint}"
-                )
-
-            identifier = (
-                draft.get("unique_id")
-                or draft.get("rfq_id")
-                or draft.get("id")
-            )
-            if not identifier:
-                raise ValueError("Draft record missing identifier (unique_id/rfq_id/id)")
-
-        recipients: Any = (
-            overrides.get("recipients")
-            or draft.get("recipients")
-            or draft.get("to")
-            or []
-        )
-        if isinstance(recipients, str):
-            recipients = [
-                r.strip()
-                for r in re.split(r"[,;\s]+", recipients)
-                if r and r.strip()
-            ]
-        else:
-            recipients = [
-                str(r).strip()
-                for r in recipients
-                if isinstance(r, str) and r.strip()
-            ]
-        seen: set[str] = set()
-        recipients = [r for r in recipients if not (r in seen or seen.add(r))]
-
-        sender = (
-            overrides.get("sender")
-            or draft.get("sender")
-            or draft.get("from")
-            or ""
-        )
-        sender = str(sender).strip()
-        if not sender:
-            default_sender = getattr(self.settings, "DEFAULT_SENDER", None)
-            if default_sender:
-                sender = str(default_sender).strip()
-
-        subject_candidate = (
-            overrides.get("subject_override")
-            or draft.get("subject")
-            or ""
-        )
-        subject_override = str(subject_candidate).strip()
-
-        body_candidate = (
-            overrides.get("body_override")
-            or draft.get("body")
-            or draft.get("html")
-            or draft.get("text")
-            or ""
-        )
-        body_override = str(body_candidate).strip()
-
-        attachments = overrides.get("attachments")
-
-        return self.send_draft(
-            identifier=identifier,
-            recipients=recipients,
-            sender=sender,
-            subject_override=subject_override,
-            body_override=body_override,
-            attachments=attachments,
-        )
-
     def send_draft(
         self,
         identifier: str,
@@ -224,7 +120,7 @@ class EmailDispatchService:
         with self.agent_nick.get_db_connection() as conn:
             draft_row = self._fetch_latest_draft(conn, identifier)
             if draft_row is None:
-                raise DraftNotFoundError(
+                raise ValueError(
                     f"No stored draft found for identifier {identifier}. "
                     "Please use unique_id format (PROC-WF-XXXXXX) or ensure the draft exists."
                 )
@@ -237,70 +133,36 @@ class EmailDispatchService:
                     "Draft found but missing unique_id. Draft data may be corrupted."
                 )
 
-            review_status = str(draft.get("review_status") or "").upper()
-            if review_status not in {"APPROVED", "SENT"}:
-                raise ValueError(
-                    "Draft must be approved (review_status=APPROVED) before dispatch"
-                )
-
             rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
 
-            recipient_source: Any
-            if recipients is not None:
-                recipient_source = recipients
-            else:
-                recipient_source = (
-                    draft.get("recipients")
-                    or draft.get("to")
-                    or draft.get("receiver")
-                    or []
-                )
-            if isinstance(recipient_source, str):
-                recipient_list = [
-                    r.strip()
-                    for r in re.split(r"[,;\s]+", recipient_source)
-                    if r and r.strip()
-                ]
-            else:
-                recipient_list = [
-                    str(r).strip()
-                    for r in recipient_source
-                    if isinstance(r, str) and r.strip()
-                ]
-            seen: set[str] = set()
-            recipient_list = [
-                r for r in recipient_list if not (r in seen or seen.add(r))
-            ]
+            recipient_list = self._normalise_recipients(
+                recipients if recipients is not None else draft.get("recipients")
+            )
+            if not recipient_list and draft.get("receiver"):
+                recipient_list = self._normalise_recipients([draft["receiver"]])
+
             if not recipient_list:
-                raise ValueError("At least one recipient is required")
+                raise ValueError("At least one recipient email is required to send the draft")
 
             sender_candidate = (
                 sender
                 if sender is not None
                 else draft.get("sender")
-                or draft.get("from")
-                or ""
+                or getattr(self.settings, "ses_default_sender", "")
             )
             sender_email = str(sender_candidate).strip()
             if not sender_email:
-                default_sender = getattr(
-                    self.settings, "DEFAULT_SENDER", None
-                ) or getattr(self.settings, "ses_default_sender", None)
-                if default_sender:
-                    sender_email = str(default_sender).strip()
-            if not sender_email:
-                raise ValueError(
-                    "Sender is required (configure settings.DEFAULT_SENDER or pass sender)"
-                )
+                raise ValueError("Sender email address is required")
 
-            body_text = (
-                (body_override or draft.get("body") or draft.get("html") or draft.get("text") or "")
-            ).strip()
-            subject = (
-                (subject_override or draft.get("subject") or "")
-            ).strip()
-            if not subject or not body_text:
-                raise ValueError("Both subject and body are required")
+            if subject_override is not None:
+                subject_candidate = subject_override
+            else:
+                subject_candidate = draft.get("subject")
+            subject_str = str(subject_candidate).strip() if subject_candidate else ""
+            subject = subject_str or f"{unique_id} – Request for Quotation"
+
+            body_source = body_override if body_override is not None else draft.get("body")
+            body_text = str(body_source).strip() if body_source else ""
 
             draft_metadata_source = (
                 draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
@@ -309,27 +171,14 @@ class EmailDispatchService:
             dispatch_run_id = uuid.uuid4().hex
             draft_metadata["dispatch_token"] = dispatch_run_id
             draft_metadata["run_id"] = dispatch_run_id
-            try:
-                body, backend_metadata = self._ensure_tracking_annotation(
-                    body_text,
-                    unique_id=unique_id,
-                    supplier_id=draft.get("supplier_id"),
-                    dispatch_token=dispatch_run_id,
-                    run_id=draft.get("run_id") or dispatch_run_id,
-                    workflow_id=draft.get("workflow_id"),
-                )
-            except ValueError as err:
-                self.logger.warning("Skipping tracking annotation: %s", err)
-                body = body_text
-                backend_metadata = {"unique_id": identifier}
-
-            backend_metadata.setdefault("unique_id", unique_id)
-            supplier_id_value = draft.get("supplier_id")
-            workflow_id_value = draft.get("workflow_id")
-            if supplier_id_value:
-                backend_metadata.setdefault("supplier_id", supplier_id_value)
-            if workflow_id_value:
-                backend_metadata.setdefault("workflow_id", workflow_id_value)
+            body, backend_metadata = self._ensure_tracking_annotation(
+                body_text,
+                unique_id=unique_id,
+                supplier_id=draft.get("supplier_id"),
+                dispatch_token=dispatch_run_id,
+                run_id=draft.get("run_id") or dispatch_run_id,
+                workflow_id=draft.get("workflow_id"),
+            )
             backend_metadata["run_id"] = dispatch_run_id
 
             dispatch_payload = dict(draft)
@@ -339,25 +188,19 @@ class EmailDispatchService:
                     "subject": subject,
                     "body": body,
                     "recipients": recipient_list,
-                    "receiver": (
-                        recipient_list[0] if recipient_list else draft.get("receiver")
-                    ),
+                    "receiver": recipient_list[0] if recipient_list else draft.get("receiver"),
                     "contact_level": 1 if recipient_list else 0,
                     "sender": sender_email,
                     "dispatch_metadata": backend_metadata,
                     "dispatch_run_id": dispatch_run_id,
                 }
             )
-            dispatch_payload.setdefault(
-                "workflow_id", backend_metadata.get("workflow_id")
-            )
+            dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
             dispatch_payload.setdefault("unique_id", unique_id)
             if backend_metadata.get("run_id"):
                 dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
             if backend_metadata.get("supplier_id"):
-                dispatch_payload.setdefault(
-                    "supplier_id", backend_metadata.get("supplier_id")
-                )
+                dispatch_payload.setdefault("supplier_id", backend_metadata.get("supplier_id"))
             dispatch_payload.setdefault("metadata", {})
             if isinstance(dispatch_payload["metadata"], dict):
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
@@ -367,25 +210,12 @@ class EmailDispatchService:
                 "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
                 "X-Procwise-Unique-Id": unique_id,
             }
-            mailbox_header = draft.get("mailbox") or getattr(
-                self.settings, "supplier_mailbox", None
-            )
+            mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
                 headers["X-Procwise-Mailbox"] = mailbox_header
             if backend_metadata.get("supplier_id"):
                 headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
-
-            payload_metadata = dict(backend_metadata)
-            payload: Dict[str, Any] = {
-                "to": list(recipient_list),
-                "from": sender_email,
-                "subject": subject,
-                "metadata": payload_metadata,
-            }
-            payload["html" if "<" in body and ">" in body else "text"] = body
-
-            dispatch_payload["payload"] = payload
 
             send_result = self.email_service.send_email(
                 subject,
@@ -501,9 +331,9 @@ class EmailDispatchService:
                         )
                     else:
                         try:
-                            BackendScheduler.ensure(
-                                self.agent_nick
-                            ).notify_email_dispatch(workflow_identifier)
+                            BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
+                                workflow_identifier
+                            )
                         except Exception:  # pragma: no cover - defensive logging
                             logger.exception(
                                 "Failed to trigger email watcher for workflow %s",
@@ -525,7 +355,6 @@ class EmailDispatchService:
                 or dispatch_payload.get("workflow_id"),
                 "run_id": backend_metadata.get("run_id")
                 or dispatch_payload.get("run_id"),
-                "payload": provider_payload,
                 "draft": dispatch_payload,
             }
 
@@ -537,7 +366,7 @@ class EmailDispatchService:
             cur.execute(
                 """
                 SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
                        workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
                 FROM proc.draft_rfq_emails
                 WHERE unique_id = %s
@@ -555,7 +384,7 @@ class EmailDispatchService:
             cur.execute(
                 """
                 SELECT id, rfq_id, supplier_id, supplier_name, subject, body, sent,
-                       review_status, recipient_email, contact_level, thread_index, payload, sender, sent_on,
+                       recipient_email, contact_level, thread_index, payload, sender, sent_on,
                        workflow_id, run_id, unique_id, mailbox, dispatch_run_id, dispatched_at
                 FROM proc.draft_rfq_emails
                 WHERE rfq_id = %s
@@ -566,34 +395,10 @@ class EmailDispatchService:
             )
             return cur.fetchone()
 
-    def _load_draft_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
-        resolved = self._normalise_identifier(identifier)
-        if not resolved:
-            return None
-
-        try:
-            with self.agent_nick.get_db_connection() as conn:
-                draft_row = self._fetch_latest_draft(conn, resolved)
-                if not draft_row:
-                    return None
-                return self._hydrate_draft(draft_row)
-        except Exception:  # pragma: no cover - defensive logging
-            self.logger.exception(
-                "Failed to load draft for identifier %s", resolved
-            )
-            return None
-
-    def _load_draft_for_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
-        workflow_token = self._normalise_identifier(workflow_id)
-        if not workflow_token:
-            return None
-
-        return None
-
     def _hydrate_draft(self, row: Tuple) -> Dict[str, Any]:
         values = list(row)
-        if len(values) < 20:
-            values.extend([None] * (20 - len(values)))
+        if len(values) < 19:
+            values.extend([None] * (19 - len(values)))
 
         (
             draft_id,
@@ -603,7 +408,6 @@ class EmailDispatchService:
             subject,
             body,
             sent,
-            review_status,
             recipient_email,
             contact_level,
             thread_index,
@@ -616,7 +420,7 @@ class EmailDispatchService:
             mailbox,
             dispatch_run_id,
             dispatched_at,
-        ) = values[:20]
+        ) = values[:19]
 
         hydrated: Dict[str, Any]
         if isinstance(payload, dict):
@@ -635,13 +439,11 @@ class EmailDispatchService:
             "subject": subject,
             "body": body,
             "sent_status": bool(sent),
-            "review_status": (review_status or "PENDING"),
             "receiver": recipient_email,
             "contact_level": contact_level,
             "thread_index": thread_index,
             "sender": sender,
-            "recipients": hydrated.get("recipients")
-            or ([recipient_email] if recipient_email else []),
+            "recipients": hydrated.get("recipients") or ([recipient_email] if recipient_email else []),
             "workflow_id": workflow_id,
             "run_id": run_id,
             "unique_id": unique_id,
@@ -652,11 +454,7 @@ class EmailDispatchService:
         for key, value in defaults.items():
             hydrated.setdefault(key, value)
         if sent_on and "sent_on" not in hydrated:
-            hydrated["sent_on"] = (
-                sent_on
-                if isinstance(sent_on, str)
-                else getattr(sent_on, "isoformat", lambda: sent_on)()
-            )
+            hydrated["sent_on"] = sent_on if isinstance(sent_on, str) else getattr(sent_on, "isoformat", lambda: sent_on)()
         recipients_value = hydrated.get("recipients")
         if isinstance(recipients_value, str):
             hydrated["recipients"] = self._normalise_recipients([recipients_value])
@@ -666,8 +464,6 @@ class EmailDispatchService:
             hydrated["recipients"] = []
         if not hydrated.get("sender"):
             hydrated["sender"] = getattr(self.settings, "ses_default_sender", "")
-        if not hydrated.get("review_status"):
-            hydrated["review_status"] = review_status or "PENDING"
         return hydrated
 
     @staticmethod
@@ -697,8 +493,8 @@ class EmailDispatchService:
         sent: bool,
     ) -> None:
         values = list(row)
-        if len(values) < 20:
-            values.extend([None] * (20 - len(values)))
+        if len(values) < 19:
+            values.extend([None] * (19 - len(values)))
 
         draft_id = values[0]
         recipient = recipients[0] if recipients else payload.get("receiver")
@@ -713,11 +509,11 @@ class EmailDispatchService:
         supplier_id = payload.get("supplier_id") or values[2]
         supplier_name = payload.get("supplier_name") or values[3]
         rfq_value = payload.get("rfq_id") or values[1]
-        workflow_id = payload.get("workflow_id") or values[14]
-        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or values[15]
-        unique_id = payload.get("unique_id") or values[16] or uuid.uuid4().hex
-        mailbox = payload.get("mailbox") or values[17]
-        dispatch_run_id = payload.get("dispatch_run_id") or values[18]
+        workflow_id = payload.get("workflow_id") or values[13]
+        run_id = payload.get("run_id") or payload.get("dispatch_run_id") or values[14]
+        unique_id = payload.get("unique_id") or values[15] or uuid.uuid4().hex
+        mailbox = payload.get("mailbox") or values[16]
+        dispatch_run_id = payload.get("dispatch_run_id") or values[17]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -737,7 +533,6 @@ class EmailDispatchService:
                     unique_id = %s,
                     mailbox = %s,
                     dispatch_run_id = %s,
-                    review_status = CASE WHEN %s THEN 'SENT' ELSE review_status END,
                     dispatched_at = CASE WHEN %s THEN NOW() ELSE dispatched_at END,
                     sent_on = CASE WHEN %s THEN NOW() ELSE sent_on END,
                     updated_on = NOW()
@@ -758,7 +553,6 @@ class EmailDispatchService:
                     unique_id,
                     mailbox,
                     dispatch_run_id,
-                    bool(sent),
                     bool(sent),
                     bool(sent),
                     draft_id,
@@ -833,9 +627,9 @@ class EmailDispatchService:
 
         self._ensure_thread_table(conn)
 
-        rfq_reference = self._normalise_identifier(
-            rfq_id
-        ) or self._normalise_identifier(unique_id)
+        rfq_reference = self._normalise_identifier(rfq_id) or self._normalise_identifier(
+            unique_id
+        )
         if not rfq_reference:
             return
 
@@ -870,19 +664,22 @@ class EmailDispatchService:
         if recipients is None:
             return []
         if isinstance(recipients, str):
-            recipients = [recipients]
+            items: Iterable[str] = [recipients]
+        else:
+            items = recipients
+
         values: List[str] = []
-        seen: set[str] = set()
-        for value in recipients:
+        seen_lower: set[str] = set()
+        for value in items:
             if not isinstance(value, str):
                 continue
             candidate = value.strip()
             if not candidate:
                 continue
-            lowered = candidate.lower()
-            if lowered in seen:
+            candidate_lower = candidate.lower()
+            if candidate_lower in seen_lower:
                 continue
-            seen.add(lowered)
+            seen_lower.add(candidate_lower)
             values.append(candidate)
         return values
 
@@ -921,17 +718,13 @@ class EmailDispatchService:
         resolved_token = dispatch_token or (
             existing_metadata.token if existing_metadata else None
         )
-        resolved_run = run_id or (
-            existing_metadata.run_id if existing_metadata else None
-        )
+        resolved_run = run_id or (existing_metadata.run_id if existing_metadata else None)
 
         resolved_unique = unique_id or (
             existing_metadata.unique_id if existing_metadata else None
         )
         if not resolved_unique:
-            raise ValueError(
-                "unique_id is required to annotate outbound supplier emails"
-            )
+            raise ValueError("unique_id is required to annotate outbound supplier emails")
 
         comment, tracking_meta = build_tracking_comment(
             workflow_id=resolved_workflow,
