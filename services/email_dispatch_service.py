@@ -361,19 +361,26 @@ class EmailDispatchService:
                 ):
                     workflow_identifier = dispatch_payload_context.get("workflow_id")
                     backend_metadata.setdefault("workflow_id", workflow_identifier)
+                context_unique_id = None
                 if dispatch_payload_context:
                     backend_metadata.setdefault(
                         "workflow_context", dispatch_payload_context
                     )
+                    context_unique_id = dispatch_payload_context.get("unique_id")
+                    if (
+                        context_unique_id
+                        and isinstance(context_unique_id, str)
+                        and context_unique_id.strip()
+                        and context_unique_id != unique_id
+                    ):
+                        backend_metadata.setdefault(
+                            "workflow_context_identifier", context_unique_id
+                        )
                 if should_record_workflow and workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
-                            unique_id=(
-                                dispatch_payload_context.get("unique_id")
-                                if dispatch_payload_context
-                                else unique_id
-                            ),
+                            unique_id=unique_id,
                             supplier_id=str(
                                 backend_metadata.get("supplier_id")
                                 or draft.get("supplier_id")
