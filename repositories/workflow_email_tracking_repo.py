@@ -112,6 +112,63 @@ def _dedupe_workflow_unique_pairs(cur) -> None:
     )
 
 
+def _ensure_primary_key(cur) -> None:
+    """Ensure the table primary key matches (workflow_id, unique_id)."""
+
+    cur.execute("SELECT to_regclass('proc.workflow_email_tracking')")
+    table_name = cur.fetchone()[0]
+    if not table_name:
+        return
+
+    cur.execute(
+        """
+        SELECT
+            tc.constraint_name,
+            kcu.column_name,
+            kcu.ordinal_position
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.table_schema = 'proc'
+          AND tc.table_name = 'workflow_email_tracking'
+          AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+        """
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ADD PRIMARY KEY (workflow_id, unique_id)
+            """
+        )
+        return
+
+    constraint_name = rows[0][0]
+    columns = [row[1] for row in rows]
+    expected = ["workflow_id", "unique_id"]
+
+    if columns == expected:
+        return
+
+    safe_name = constraint_name.replace('"', '""')
+    cur.execute(
+        f"""
+        ALTER TABLE proc.workflow_email_tracking
+            DROP CONSTRAINT "{safe_name}"
+        """
+    )
+    cur.execute(
+        """
+        ALTER TABLE proc.workflow_email_tracking
+            ADD PRIMARY KEY (workflow_id, unique_id)
+        """
+    )
+
+
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
@@ -123,6 +180,7 @@ def init_schema() -> None:
                 ADD COLUMN IF NOT EXISTS dispatch_key TEXT
             """
         )
+        _ensure_primary_key(cur)
         cur.execute(
             """
             ALTER TABLE proc.workflow_email_tracking

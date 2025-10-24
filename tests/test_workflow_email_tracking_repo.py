@@ -3,6 +3,7 @@ from typing import Optional
 
 from repositories.workflow_email_tracking_repo import (
     WorkflowDispatchRow,
+    _ensure_primary_key,
     init_schema,
     load_active_workflow_ids,
     load_workflow_rows,
@@ -10,6 +11,50 @@ from repositories.workflow_email_tracking_repo import (
     record_dispatches,
     reset_workflow,
 )
+
+
+def test_ensure_primary_key_rebuilds_legacy_constraint():
+    executed = []
+
+    class FakeCursor:
+        def __init__(self) -> None:
+            self._result_one = None
+            self._result_all = None
+
+        def execute(self, query, params=None):
+            executed.append(" ".join(query.split()))
+            if "to_regclass" in query:
+                self._result_one = ("proc.workflow_email_tracking",)
+                self._result_all = None
+            elif "constraint_name" in query and "PRIMARY KEY" in query:
+                self._result_one = None
+                self._result_all = [
+                    ("workflow_email_tracking_pkey", "workflow_id", 1),
+                    ("workflow_email_tracking_pkey", "unique_id", 2),
+                    ("workflow_email_tracking_pkey", "dispatch_key", 3),
+                ]
+            else:
+                self._result_one = None
+                self._result_all = None
+
+        def fetchone(self):
+            result = self._result_one
+            self._result_one = None
+            return result
+
+        def fetchall(self):
+            result = list(self._result_all or [])
+            self._result_all = None
+            return result
+
+    cursor = FakeCursor()
+    _ensure_primary_key(cursor)
+
+    drop_statements = [stmt for stmt in executed if "DROP CONSTRAINT" in stmt]
+    add_statements = [stmt for stmt in executed if "ADD PRIMARY KEY" in stmt]
+
+    assert drop_statements, executed
+    assert add_statements, executed
 
 
 def _make_dispatch(

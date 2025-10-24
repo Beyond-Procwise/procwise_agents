@@ -70,12 +70,8 @@ class _FakeCursor:
         ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
             self._store.ensure_tables()
             return
-        if "SELECT TO_REGCLASS" in upper_stmt:
-            # Return truthy result when workflow tracking table exists
-            target = params[0] if params else ""
-            exists = bool(getattr(self._store, "workflow_email_tracking", []))
-            self._results = [(target if exists else None,)]
-            self.description = [_ColumnDescriptor("to_regclass")]
+        if upper_stmt.startswith("WITH RANKED AS"):
+            # Deduplication CTE is a no-op in the in-memory store.
             return
         if "INFORMATION_SCHEMA.COLUMNS" in upper_stmt:
             if params:
@@ -89,6 +85,20 @@ class _FakeCursor:
                 columns = self._store.list_columns(schema, table)
                 self._results = [(name,) for name in columns]
                 self.description = [_ColumnDescriptor("column_name")]
+            return
+        if (
+            "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in upper_stmt
+            and "PRIMARY KEY" in upper_stmt
+        ):
+            self._results = [
+                ("workflow_email_tracking_pkey", "workflow_id", 1),
+                ("workflow_email_tracking_pkey", "unique_id", 2),
+            ]
+            self.description = [
+                _ColumnDescriptor("constraint_name"),
+                _ColumnDescriptor("column_name"),
+                _ColumnDescriptor("ordinal_position"),
+            ]
             return
         if upper_stmt.startswith("ALTER TABLE"):
             # schema migrations are no-ops for the in-memory store because
