@@ -663,15 +663,24 @@ class EmailDispatchService:
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:
             return []
+        if isinstance(recipients, str):
+            items: Iterable[str] = [recipients]
+        else:
+            items = recipients
+
         values: List[str] = []
-        for value in recipients:
+        seen_lower: set[str] = set()
+        for value in items:
             if not isinstance(value, str):
                 continue
             candidate = value.strip()
             if not candidate:
                 continue
-            if candidate.lower() not in {item.lower() for item in values}:
-                values.append(candidate)
+            candidate_lower = candidate.lower()
+            if candidate_lower in seen_lower:
+                continue
+            seen_lower.add(candidate_lower)
+            values.append(candidate)
         return values
 
     @staticmethod
