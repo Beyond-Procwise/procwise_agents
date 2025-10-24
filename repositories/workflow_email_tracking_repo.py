@@ -38,9 +38,6 @@ ON proc.workflow_email_tracking (workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_workflow_email_tracking_unique
 ON proc.workflow_email_tracking (unique_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_email_tracking_wf_unique
-ON proc.workflow_email_tracking (workflow_id, unique_id);
 """
 
 @dataclass
@@ -168,10 +165,13 @@ def load_active_workflow_ids() -> List[str]:
     with get_conn() as conn:
         cur = conn.cursor()
         query = (
-            "SELECT DISTINCT workflow_id "
+            "SELECT workflow_id "
             "FROM proc.workflow_email_tracking "
-            "WHERE dispatched_at IS NOT NULL "
-            "AND (responded_at IS NULL OR matched = FALSE)"
+            "GROUP BY workflow_id "
+            "HAVING "
+            "    BOOL_OR(responded_at IS NULL OR COALESCE(matched, FALSE) = FALSE) "
+            "    AND BOOL_AND(dispatched_at IS NOT NULL) "
+            "    AND BOOL_AND(COALESCE(NULLIF(message_id, ''), '') <> '')"
         )
         cur.execute(query)
         rows = [row[0] for row in cur.fetchall() if row and row[0]]

@@ -203,7 +203,10 @@ class _FakeCursor:
             )
             return
 
-        if upper_stmt.startswith("SELECT DISTINCT WORKFLOW_ID"):
+        if upper_stmt.startswith("SELECT DISTINCT WORKFLOW_ID") or (
+            upper_stmt.startswith("SELECT WORKFLOW_ID FROM PROC.WORKFLOW_EMAIL_TRACKING")
+            and "GROUP BY" in upper_stmt
+        ):
             rows = self._store.distinct_active_workflow_ids()
             self.description = [_ColumnDescriptor("workflow_id")]
             self._results = [(workflow_id,) for workflow_id in rows]
@@ -492,14 +495,35 @@ class _FakePostgresStore:
     def distinct_active_workflow_ids(self) -> List[str]:
         self.ensure_tables()
         table = self.workflow_email_tracking  # type: ignore[attr-defined]
-        workflow_ids = []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
         for row in table:
-            dispatched_at = row.get("dispatched_at")
-            responded_at = row.get("responded_at")
-            matched = row.get("matched")
-            if dispatched_at and (responded_at is None or not matched):
-                if row["workflow_id"] not in workflow_ids:
-                    workflow_ids.append(row["workflow_id"])
+            workflow_id = row.get("workflow_id")
+            if not workflow_id:
+                continue
+            grouped.setdefault(workflow_id, []).append(row)
+
+        workflow_ids: List[str] = []
+        for workflow_id, rows in grouped.items():
+            has_pending = any(
+                (r.get("responded_at") is None)
+                or (not bool(r.get("matched")))
+                for r in rows
+            )
+            if not has_pending:
+                continue
+
+            all_dispatched = all(r.get("dispatched_at") for r in rows)
+            if not all_dispatched:
+                continue
+
+            all_have_message = all(
+                bool(str(r.get("message_id") or "").strip()) for r in rows
+            )
+            if not all_have_message:
+                continue
+
+            workflow_ids.append(workflow_id)
+
         return workflow_ids
 
     def fetch_workflow_tracking(self, workflow_id: str) -> List[Dict[str, Any]]:
