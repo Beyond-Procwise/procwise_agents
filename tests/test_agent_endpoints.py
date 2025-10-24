@@ -268,7 +268,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
             return {
                 "unique_id": unique_id,
                 "sent": True,
-                "recipients": recipients or ["r1", "r2"],
+                "recipients": recipients or ["r1@example.com", "r2@example.com"],
                 "sender": sender or "sender@example.com",
                 "subject": subject_override or "s",
                 "body": body_override or "<p>generated</p>",
@@ -288,7 +288,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
         data={
             "rfq_id": "RFQ-123",
             "subject": "s",
-            "recipients": "r1,r2",
+            "recipients": "r1@example.com,r2@example.com",
             "action_id": "a1",
             "body": "<p>generated</p>",
         },
@@ -298,7 +298,7 @@ def test_email_workflow_returns_action_id(monkeypatch):
     assert data["action_id"] == "a1"
     assert data["status"] == "completed"
     assert data["result"]["sent"] is True
-    assert data["result"]["recipients"] == ["r1", "r2"]
+    assert data["result"]["recipients"] == ["r1@example.com", "r2@example.com"]
     assert data["result"]["draft"]["sent_status"] is True
     assert calls["args"][0] == "RFQ-123"
 
