@@ -56,6 +56,13 @@ class _FakeCursor:
     def _dispatch(self, statement: str, params: Tuple[Any, ...]) -> None:
         upper_stmt = statement.upper()
 
+        if upper_stmt.startswith("SELECT TO_REGCLASS"):
+            exists = hasattr(self._store, "workflow_email_tracking")
+            value = "proc.workflow_email_tracking" if exists else None
+            self._results = [(value,)]
+            self.description = [_ColumnDescriptor("to_regclass")]
+            return
+
         if upper_stmt.startswith("CREATE SCHEMA"):
             return
         if upper_stmt.startswith("CREATE TABLE") or upper_stmt.startswith(
@@ -71,10 +78,17 @@ class _FakeCursor:
             self.description = [_ColumnDescriptor("to_regclass")]
             return
         if "INFORMATION_SCHEMA.COLUMNS" in upper_stmt:
-            schema, table, column = params
-            exists = self._store.column_exists(schema, table, column)
-            self._results = [(1,)] if exists else []
-            self.description = [_ColumnDescriptor("exists")]
+            if params:
+                schema, table, column = params
+                exists = self._store.column_exists(schema, table, column)
+                self._results = [(1,)] if exists else []
+                self.description = [_ColumnDescriptor("exists")]
+            else:
+                schema = "proc"
+                table = "workflow_email_tracking"
+                columns = self._store.list_columns(schema, table)
+                self._results = [(name,) for name in columns]
+                self.description = [_ColumnDescriptor("column_name")]
             return
         if upper_stmt.startswith("ALTER TABLE"):
             # schema migrations are no-ops for the in-memory store because
@@ -181,6 +195,7 @@ class _FakeCursor:
             (
                 workflow_id,
                 unique_id,
+                dispatch_key,
                 supplier_id,
                 supplier_email,
                 message_id,
@@ -197,6 +212,7 @@ class _FakeCursor:
                 {
                     "workflow_id": workflow_id,
                     "unique_id": unique_id,
+                    "dispatch_key": dispatch_key,
                     "supplier_id": supplier_id,
                     "supplier_email": supplier_email,
                     "message_id": message_id,
@@ -227,6 +243,7 @@ class _FakeCursor:
             columns = [
                 "workflow_id",
                 "unique_id",
+                "dispatch_key",
                 "supplier_id",
                 "supplier_email",
                 "message_id",
@@ -375,10 +392,9 @@ class _FakePostgresStore:
             self.supplier_risk_scores = {}  # type: ignore[attr-defined]
 
     # -- information schema helpers --------------------------------------
-    def column_exists(self, schema: str, table: str, column: str) -> bool:
-        full_table = f"{schema}.{table}"
-        columns = {
-            "proc.supplier_response": {
+    def _schema_columns(self) -> Dict[str, List[str]]:
+        return {
+            "proc.supplier_response": [
                 "workflow_id",
                 "supplier_id",
                 "supplier_email",
@@ -396,10 +412,11 @@ class _FakePostgresStore:
                 "lead_time",
                 "received_time",
                 "processed",
-            },
-            "proc.workflow_email_tracking": {
+            ],
+            "proc.workflow_email_tracking": [
                 "workflow_id",
                 "unique_id",
+                "dispatch_key",
                 "supplier_id",
                 "supplier_email",
                 "message_id",
@@ -410,8 +427,8 @@ class _FakePostgresStore:
                 "matched",
                 "created_at",
                 "thread_headers",
-            },
-            "proc.supplier_risk_signals": {
+            ],
+            "proc.supplier_risk_signals": [
                 "id",
                 "supplier_id",
                 "signal_type",
@@ -419,16 +436,24 @@ class _FakePostgresStore:
                 "source",
                 "payload",
                 "occurred_at",
-            },
-            "proc.supplier_risk_scores": {
+            ],
+            "proc.supplier_risk_scores": [
                 "supplier_id",
                 "score",
                 "model_version",
                 "feature_summary",
                 "computed_at",
-            },
+            ],
         }
-        return column in columns.get(full_table, set())
+
+    def column_exists(self, schema: str, table: str, column: str) -> bool:
+        full_table = f"{schema}.{table}"
+        columns = self._schema_columns().get(full_table, [])
+        return column in columns
+
+    def list_columns(self, schema: str, table: str) -> List[str]:
+        full_table = f"{schema}.{table}"
+        return list(self._schema_columns().get(full_table, []))
 
     # -- supplier response operations ------------------------------------
     def upsert_supplier_response(

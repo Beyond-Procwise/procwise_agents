@@ -5,6 +5,7 @@ from repositories.workflow_email_tracking_repo import (
     WorkflowDispatchRow,
     init_schema,
     load_active_workflow_ids,
+    load_workflow_rows,
     mark_response,
     record_dispatches,
     reset_workflow,
@@ -19,15 +20,17 @@ def _make_dispatch(
     dispatched_at: datetime,
     responded_at: Optional[datetime] = None,
     matched: bool = False,
+    dispatch_key: Optional[str] = None,
 ) -> WorkflowDispatchRow:
     return WorkflowDispatchRow(
         workflow_id=workflow_id,
         unique_id=unique_id,
+        dispatched_at=dispatched_at,
         supplier_id="supplier-a",
         supplier_email="buyer@example.com",
         message_id=message_id,
         subject="Subject",
-        dispatched_at=dispatched_at,
+        dispatch_key=dispatch_key,
         responded_at=responded_at,
         response_message_id=None,
         matched=matched,
@@ -40,6 +43,34 @@ def test_active_workflows_wait_until_dispatch_metadata_complete():
     now = datetime.now(timezone.utc)
 
     init_schema()
+    reset_workflow(workflow_id=workflow_id)
+
+
+def test_dispatch_key_optional_and_persisted():
+    workflow_id = "wf-dispatch-key"
+    unique_id = "uid-dk-1"
+    now = datetime.now(timezone.utc)
+
+    init_schema()
+    reset_workflow(workflow_id=workflow_id)
+
+    record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[
+            _make_dispatch(
+                workflow_id=workflow_id,
+                unique_id=unique_id,
+                message_id="mid-dk",
+                dispatched_at=now,
+                dispatch_key="run-123",
+            )
+        ],
+    )
+
+    rows = load_workflow_rows(workflow_id=workflow_id)
+    assert rows
+    assert rows[0].dispatch_key == "run-123"
+
     reset_workflow(workflow_id=workflow_id)
 
     # Initial row without outbound metadata should not trigger the watcher.
