@@ -115,6 +115,27 @@ class Settings(BaseSettings):
     imap_search_criteria: str = Field(default="ALL", env="IMAP_SEARCH_CRITERIA")
 
     extraction_model: str = "gpt-oss:20b"
+    llm_backend: str = Field(default="ollama", env="LLM_BACKEND")
+    langchain_provider: str = Field(default="ollama", env="LANGCHAIN_PROVIDER")
+    langchain_model: Optional[str] = Field(
+        default="qwen3:30b", env="LANGCHAIN_MODEL"
+    )
+    langchain_api_base: Optional[str] = Field(
+        default=None, env="LANGCHAIN_API_BASE"
+    )
+    langchain_api_key: Optional[str] = Field(
+        default=None, env="LANGCHAIN_API_KEY"
+    )
+    langchain_request_timeout: Optional[int] = Field(
+        default=120, env="LANGCHAIN_REQUEST_TIMEOUT"
+    )
+    hitl_enabled: bool = Field(default=True, env="HITL_ENABLED")
+    memory_store_uri: Optional[str] = Field(
+        default=None, env="MEMORY_STORE_URI"
+    )
+    langgraph_tracing_enabled: bool = Field(
+        default=False, env="LANGGRAPH_TRACING_ENABLED"
+    )
     document_extraction_model: str = Field(
         default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
     )
