@@ -251,8 +251,7 @@ def load_active_workflow_ids() -> List[str]:
             "GROUP BY workflow_id "
             "HAVING "
             "    BOOL_OR(responded_at IS NULL OR COALESCE(matched, FALSE) = FALSE) "
-            "    AND BOOL_AND(dispatched_at IS NOT NULL) "
-            "    AND BOOL_AND(COALESCE(NULLIF(message_id, ''), '') <> '')"
+            "    AND BOOL_AND(dispatched_at IS NOT NULL)"
         )
         cur.execute(query)
         rows = [row[0] for row in cur.fetchall() if row and row[0]]

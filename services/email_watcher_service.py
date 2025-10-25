@@ -258,14 +258,39 @@ def run_email_watcher_for_workflow(
             "matched_unique_ids": [],
         }
 
-    incomplete_dispatches = [
-        row.unique_id
-        for row in dispatch_rows
-        if not row.message_id or row.dispatched_at is None
-    ]
-    if incomplete_dispatches:
+    missing_required_fields: Dict[str, List[str]] = {}
+    missing_message_ids: List[str] = []
+
+    for index, row in enumerate(dispatch_rows):
+        unique_id = (row.unique_id or "").strip()
+        identifier = unique_id or f"row-{index}"
+
+        missing_fields: List[str] = []
+        if getattr(row, "dispatched_at", None) is None:
+            missing_fields.append("dispatched_at")
+        if not unique_id:
+            missing_fields.append("unique_id")
+
+        if missing_fields:
+            missing_required_fields[identifier] = missing_fields
+            continue
+
+        message_id = (row.message_id or "").strip()
+        if not message_id:
+            missing_message_ids.append(identifier)
+
+    if missing_message_ids:
+        logger.warning(
+            "Workflow %s has dispatches missing message_id: %s",
+            workflow_key,
+            ", ".join(sorted(missing_message_ids)),
+        )
+
+    if missing_required_fields:
         logger.debug(
-            "Workflow %s has pending dispatch metadata; deferring watcher start", workflow_key
+            "Workflow %s has pending dispatch metadata; deferring watcher start (missing=%s)",
+            workflow_key,
+            missing_required_fields,
         )
         return {
             "status": "waiting_for_dispatch",
@@ -275,7 +300,8 @@ def run_email_watcher_for_workflow(
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
-            "pending_unique_ids": sorted(incomplete_dispatches),
+            "pending_unique_ids": sorted(missing_required_fields.keys()),
+            "missing_required_fields": missing_required_fields,
         }
 
     try:
