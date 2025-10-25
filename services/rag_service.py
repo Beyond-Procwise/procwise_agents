@@ -1,3 +1,5 @@
+import importlib
+import importlib.util
 import json
 import logging
 import uuid
@@ -290,6 +292,76 @@ class RAGService:
             scores = scores.tolist()
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         return [h for h, _ in ranked[:top_k]]
+
+    def create_langchain_retriever_tool(
+        self,
+        name: str = "procwise_rag_retriever",
+        description: Optional[str] = None,
+        top_k: int = 5,
+    ):
+        """Expose this service as a LangChain retriever tool."""
+
+        if importlib.util.find_spec("langchain_core") is None:
+            raise RuntimeError(
+                "LangChain integrations requested but 'langchain-core' is missing."
+            )
+        if importlib.util.find_spec("langchain.tools") is None:
+            raise RuntimeError(
+                "LangChain tool support requires the 'langchain' extra dependencies."
+            )
+
+        retriever_module = importlib.import_module("langchain_core.retrievers")
+        documents_module = importlib.import_module("langchain_core.documents")
+        tools_module = importlib.import_module("langchain.tools")
+
+        base_retriever_cls = getattr(retriever_module, "BaseRetriever")
+        document_cls = getattr(documents_module, "Document")
+        create_retriever_tool = getattr(tools_module, "create_retriever_tool")
+
+        rag_service = self
+
+        class _RAGServiceRetriever(base_retriever_cls):
+            def __init__(self, limit: int):
+                super().__init__()
+                self._limit = max(1, int(limit))
+
+            def _get_relevant_documents(self, query: str, *, run_manager=None, **kwargs):
+                hits = rag_service.search(query, top_k=self._limit)
+                documents: List[Any] = []
+                for hit in hits:
+                    payload: Dict[str, Any]
+                    if hasattr(hit, "payload") and isinstance(hit.payload, dict):
+                        payload = dict(hit.payload)
+                    elif isinstance(hit, dict):
+                        payload = dict(hit)
+                    else:
+                        payload = {"content": str(hit)}
+                    text = (
+                        payload.get("content")
+                        or payload.get("text_summary")
+                        or payload.get("summary")
+                        or ""
+                    )
+                    documents.append(
+                        document_cls(page_content=str(text), metadata=payload)
+                    )
+                return documents
+
+            async def _aget_relevant_documents(  # type: ignore[override]
+                self,
+                query: str,
+                *,
+                run_manager=None,
+                **kwargs,
+            ):
+                return self._get_relevant_documents(query, run_manager=run_manager, **kwargs)
+
+        tool_description = description or (
+            "Retrieve procurement knowledge base documents from Qdrant to "
+            "ground supplier negotiations and policy checks."
+        )
+        retriever = _RAGServiceRetriever(limit=top_k)
+        return create_retriever_tool(retriever, name=name, description=tool_description)
 
     # ------------------------------------------------------------------
     # Internal helpers

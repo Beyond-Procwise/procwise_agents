@@ -22,3 +22,7 @@ faiss-cpu
 rank-bm25
 redis
 email-validator
+langchain
+langchain-community
+langchain-openai
+langgraph

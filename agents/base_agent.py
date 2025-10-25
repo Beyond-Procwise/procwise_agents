@@ -5,6 +5,8 @@ from botocore.config import Config
 import json
 import logging
 import os
+import importlib
+import importlib.util
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -808,6 +810,22 @@ class BaseAgent:
         on GPU-enabled systems.  When ``messages`` is provided the ``prompt`` is
         ignored.
         """
+        backend = getattr(self.settings, "llm_backend", "ollama") or "ollama"
+        if backend.lower() == "langchain":
+            try:
+                return self._call_langchain_chat(
+                    prompt=prompt,
+                    model=model,
+                    format=format,
+                    messages=messages,
+                    **kwargs,
+                )
+            except Exception as exc:
+                logger.error(
+                    "LangChain backend failed; falling back to Ollama pipeline.",
+                    exc_info=exc,
+                )
+
         base_model = getattr(self.settings, "extraction_model", "gpt-oss")
         quantized = getattr(self.settings, "ollama_quantized_model", None)
 
@@ -968,6 +986,193 @@ class BaseAgent:
         # Defensive fallback if the loop completes without returning (should not happen)
         logger.error("Ollama call failed for unknown reasons")
         return {"response": "", "error": "Unknown Ollama invocation failure"}
+
+    def _call_langchain_chat(
+        self,
+        prompt: Optional[str],
+        model: Optional[str],
+        format: Optional[str],
+        messages: Optional[List[Dict[str, str]]],
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Invoke the configured LangChain chat model.
+
+        The interface mirrors :meth:`call_ollama` so that agents can switch
+        between the native Ollama client and LangChain-powered execution using
+        the ``LLM_BACKEND`` configuration flag.
+        """
+
+        chat_model = self._get_langchain_chat_model(model_override=model)
+
+        allowed_kwarg_keys = {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "response_format",
+        }
+        invocation_kwargs = {
+            key: value for key, value in kwargs.items() if key in allowed_kwarg_keys
+        }
+        if format and "response_format" not in invocation_kwargs:
+            if isinstance(format, str) and format.lower() == "json":
+                invocation_kwargs["response_format"] = {"type": "json_object"}
+            elif isinstance(format, (dict, list)):
+                invocation_kwargs["response_format"] = format
+
+        request_timeout = getattr(self.settings, "langchain_request_timeout", None)
+        if request_timeout is not None:
+            invocation_kwargs.setdefault("config", {})
+            invocation_kwargs["config"].setdefault("configurable", {})
+            invocation_kwargs["config"]["configurable"]["timeout"] = request_timeout
+
+        langchain_messages = self._build_langchain_messages(messages, prompt)
+        result = chat_model.invoke(langchain_messages, **invocation_kwargs)
+
+        content: str
+        additional: Dict[str, Any] = {}
+        if hasattr(result, "content"):
+            content = result.content  # type: ignore[assignment]
+            to_dict = getattr(result, "to_dict", None)
+            if callable(to_dict):
+                additional = to_dict()
+        elif isinstance(result, dict):
+            content = str(
+                result.get("content")
+                or result.get("response")
+                or result.get("message")
+                or ""
+            )
+            additional = result
+        else:
+            content = str(result)
+
+        response_payload: Dict[str, Any] = {"response": content}
+        if additional:
+            response_payload["langchain_raw"] = additional
+        return response_payload
+
+    def _get_langchain_chat_model(
+        self,
+        model_override: Optional[str] = None,
+    ):
+        cached_model = getattr(self.agent_nick, "_langchain_chat_model", None)
+        cached_model_name = getattr(
+            self.agent_nick, "_langchain_chat_model_name", None
+        )
+        target_model = model_override or getattr(self.settings, "langchain_model", None)
+        if cached_model is not None and cached_model_name == target_model:
+            return cached_model
+
+        chat_model = self._initialise_langchain_chat_model(target_model)
+        setattr(self.agent_nick, "_langchain_chat_model", chat_model)
+        setattr(self.agent_nick, "_langchain_chat_model_name", target_model)
+        return chat_model
+
+    def _initialise_langchain_chat_model(self, model_name: Optional[str]):
+        if importlib.util.find_spec("langchain") is None:
+            raise RuntimeError(
+                "LangChain backend requested but 'langchain' is not installed."
+            )
+
+        provider = (getattr(self.settings, "langchain_provider", "ollama") or "").lower()
+        model_identifier = model_name or getattr(self.settings, "langchain_model", None)
+        if not model_identifier:
+            raise RuntimeError(
+                "LANGCHAIN_MODEL must be configured when LLM_BACKEND=langchain"
+            )
+
+        base_url = getattr(self.settings, "langchain_api_base", None)
+        api_key = getattr(self.settings, "langchain_api_key", None)
+
+        if provider in {"ollama", "ollama-chat"}:
+            module = importlib.import_module("langchain_community.chat_models")
+            chat_cls = getattr(module, "ChatOllama")
+            init_kwargs: Dict[str, Any] = {"model": model_identifier}
+            if base_url:
+                init_kwargs["base_url"] = base_url
+            return chat_cls(**init_kwargs)
+
+        if provider in {"openai", "azure-openai", "gpt"}:
+            if importlib.util.find_spec("langchain_openai") is None:
+                raise RuntimeError(
+                    "LangChain OpenAI integration is not installed. Add 'langchain-openai'."
+                )
+            module = importlib.import_module("langchain_openai")
+            chat_cls = getattr(module, "ChatOpenAI")
+            init_kwargs = {"model": model_identifier}
+            if api_key:
+                init_kwargs["api_key"] = api_key
+            if base_url:
+                init_kwargs["base_url"] = base_url
+            return chat_cls(**init_kwargs)
+
+        module = importlib.import_module("langchain.chat_models")
+        init_chat_model = getattr(module, "init_chat_model")
+        config: Dict[str, Any] = {}
+        if api_key:
+            config["api_key"] = api_key
+        if base_url:
+            config["base_url"] = base_url
+        return init_chat_model(provider, model=model_identifier, config=config or None)
+
+    def _resolve_langchain_message_classes(self) -> Dict[str, Any]:
+        cached = getattr(self.agent_nick, "_langchain_message_classes", None)
+        if cached is not None:
+            return cached
+
+        module = importlib.import_module("langchain_core.messages")
+        classes = {
+            "system": getattr(module, "SystemMessage"),
+            "human": getattr(module, "HumanMessage"),
+            "ai": getattr(module, "AIMessage"),
+        }
+        tool_cls = getattr(module, "ToolMessage", None)
+        if tool_cls is not None:
+            classes["tool"] = tool_cls
+        setattr(self.agent_nick, "_langchain_message_classes", classes)
+        return classes
+
+    def _build_langchain_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]],
+        prompt: Optional[str],
+    ) -> List[Any]:
+        classes = self._resolve_langchain_message_classes()
+        lc_messages: List[Any] = []
+
+        if messages:
+            for entry in messages:
+                if not isinstance(entry, Mapping):
+                    lc_messages.append(classes["human"](content=str(entry)))
+                    continue
+                role = str(entry.get("role", "user")).lower()
+                content = entry.get("content", "")
+                if isinstance(content, str):
+                    text_content = content
+                else:
+                    try:
+                        text_content = json.dumps(content, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        text_content = str(content)
+                if role == "system":
+                    lc_messages.append(classes["system"](content=text_content))
+                elif role in {"assistant", "ai"}:
+                    lc_messages.append(classes["ai"](content=text_content))
+                elif role == "tool" and "tool" in classes:
+                    tool_message = classes["tool"](
+                        content=text_content,
+                        tool_call_id=entry.get("tool_call_id"),
+                    )
+                    lc_messages.append(tool_message)
+                else:
+                    lc_messages.append(classes["human"](content=text_content))
+        elif prompt:
+            lc_messages.append(classes["human"](content=prompt))
+        else:
+            lc_messages.append(classes["human"](content=""))
+
+        return lc_messages
 
     def _get_available_ollama_models(self, force_refresh: bool = False) -> List[str]:
         """Return the cached list of Ollama models available on the host."""
