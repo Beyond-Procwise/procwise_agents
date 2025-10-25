@@ -2743,9 +2743,24 @@ class EmailDraftingAgent(BaseAgent):
         html_parts: List[str] = []
         bullets: List[str] = []
 
+        def render_inline(markup: str) -> str:
+            if not markup:
+                return ""
+            result: List[str] = []
+            last_index = 0
+            for match in re.finditer(r"\*\*(.+?)\*\*", markup):
+                start, end = match.span()
+                if start > last_index:
+                    result.append(escape(markup[last_index:start]))
+                result.append(f"<strong>{escape(match.group(1))}</strong>")
+                last_index = end
+            if last_index < len(markup):
+                result.append(escape(markup[last_index:]))
+            return "".join(result)
+
         def flush() -> None:
             if bullets:
-                items = "".join(f"<li>{escape(item)}</li>" for item in bullets)
+                items = "".join(f"<li>{render_inline(item)}</li>" for item in bullets)
                 html_parts.append(f"<ul>{items}</ul>")
                 bullets.clear()
 
@@ -2758,7 +2773,7 @@ class EmailDraftingAgent(BaseAgent):
                 bullets.append(stripped[1:].strip())
                 continue
             flush()
-            html_parts.append(f"<p>{escape(stripped)}</p>")
+            html_parts.append(f"<p>{render_inline(stripped)}</p>")
         flush()
         if not html_parts:
             return ""
