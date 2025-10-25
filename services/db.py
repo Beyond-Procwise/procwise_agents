@@ -558,12 +558,6 @@ class _FakePostgresStore:
             if not all_dispatched:
                 continue
 
-            all_have_message = all(
-                bool(str(r.get("message_id") or "").strip()) for r in rows
-            )
-            if not all_have_message:
-                continue
-
             workflow_ids.append(workflow_id)
 
         return workflow_ids

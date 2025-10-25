@@ -1,5 +1,9 @@
+import os
+import sys
 from datetime import datetime, timezone
 from typing import Optional
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from repositories.workflow_email_tracking_repo import (
     WorkflowDispatchRow,
@@ -83,11 +87,29 @@ def _make_dispatch(
     )
 
 
-def test_active_workflows_wait_until_dispatch_metadata_complete():
+def test_active_workflows_include_dispatches_without_message_id():
     workflow_id = "wf-init"
     now = datetime.now(timezone.utc)
 
     init_schema()
+    reset_workflow(workflow_id=workflow_id)
+
+    record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[
+            _make_dispatch(
+                workflow_id=workflow_id,
+                unique_id="uid-init",
+                message_id=None,
+                dispatched_at=now,
+            )
+        ],
+    )
+
+    rows = load_workflow_rows(workflow_id=workflow_id)
+    assert rows and rows[0].message_id is None
+    assert workflow_id in load_active_workflow_ids()
+
     reset_workflow(workflow_id=workflow_id)
 
 
@@ -118,7 +140,6 @@ def test_dispatch_key_optional_and_persisted():
 
     reset_workflow(workflow_id=workflow_id)
 
-    # Initial row without outbound metadata should not trigger the watcher.
     record_dispatches(
         workflow_id=workflow_id,
         dispatches=[
@@ -130,9 +151,9 @@ def test_dispatch_key_optional_and_persisted():
             )
         ],
     )
-    assert workflow_id not in load_active_workflow_ids()
+    assert workflow_id in load_active_workflow_ids()
 
-    # Once dispatch metadata is populated the workflow becomes active.
+    # Updating the dispatch metadata keeps the workflow active.
     record_dispatches(
         workflow_id=workflow_id,
         dispatches=[
@@ -162,7 +183,7 @@ def test_active_workflows_require_all_dispatches_to_complete():
             _make_dispatch(
                 workflow_id=workflow_id,
                 unique_id="uid-1",
-                message_id="mid-1",
+                message_id=None,
                 dispatched_at=now,
             ),
             _make_dispatch(
@@ -173,20 +194,23 @@ def test_active_workflows_require_all_dispatches_to_complete():
             ),
         ],
     )
-    assert workflow_id not in load_active_workflow_ids()
+    assert workflow_id in load_active_workflow_ids()
 
-    record_dispatches(
+    mark_response(
         workflow_id=workflow_id,
-        dispatches=[
-            _make_dispatch(
-                workflow_id=workflow_id,
-                unique_id="uid-2",
-                message_id="mid-2",
-                dispatched_at=now,
-            )
-        ],
+        unique_id="uid-2",
+        responded_at=now,
+        response_message_id="resp-2",
     )
     assert workflow_id in load_active_workflow_ids()
+
+    mark_response(
+        workflow_id=workflow_id,
+        unique_id="uid-1",
+        responded_at=now,
+        response_message_id="resp-1",
+    )
+    assert workflow_id not in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
 
