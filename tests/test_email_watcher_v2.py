@@ -14,6 +14,7 @@ from agents.base_agent import AgentOutput, AgentStatus
 from decimal import Decimal
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from utils.email_tracking import (
     embed_unique_id_in_email_body,
@@ -172,6 +173,84 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert len(all_rows) == 1
     assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
 
+
+def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
+    workflow_id = "wf-legacy-thread"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    supplier_agent = StubSupplierAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-legacy")
+    legacy_message_id = "<legacy-msg-001@procwise>"
+
+    workflow_email_tracking_repo.record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[
+            WorkflowDispatchRow(
+                workflow_id=workflow_id,
+                unique_id=unique_id,
+                supplier_id="sup-legacy",
+                supplier_email="legacy@example.com",
+                message_id=legacy_message_id,
+                subject="Legacy Quote Request",
+                dispatched_at=now - timedelta(minutes=15),
+            )
+        ],
+    )
+
+    responses = [
+        EmailResponse(
+            unique_id=None,
+            supplier_id="sup-legacy",
+            supplier_email="legacy@example.com",
+            from_address="legacy@example.com",
+            message_id="reply-legacy-001",
+            subject="Re: Legacy Quote Request",
+            body="Legacy response body",
+            received_at=now,
+            in_reply_to=("legacy-msg-001@procwise",),
+        )
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+
+    rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(rows) == 1
+    persisted = rows[0]
+    assert persisted.get("original_message_id") == "<legacy-msg-001@procwise>"
+    assert persisted.get("response_message_id") == "reply-legacy-001"
 
 def test_parse_email_recovers_tracking_headers():
     message = EmailMessage()
