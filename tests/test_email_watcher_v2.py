@@ -168,6 +168,10 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     rows = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
     assert rows == []
 
+    all_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(all_rows) == 1
+    assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
+
 
 def test_parse_email_recovers_tracking_headers():
     message = EmailMessage()

@@ -1,5 +1,9 @@
+import os
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from repositories import supplier_response_repo
 from utils.supplier_response_helper import store_supplier_response
@@ -29,6 +33,7 @@ def test_store_supplier_response_persists_row(monkeypatch):
         original_message_id="orig-1",
         original_subject="RFQ",
         match_confidence=Decimal("0.95"),
+        rfq_id="RFQ-123",
         processed=True,
     )
 
@@ -38,6 +43,7 @@ def test_store_supplier_response_persists_row(monkeypatch):
     assert row.processed is True
     assert row.response_time == Decimal("12.5")
     assert row.supplier_email == "supplier@example.com"
+    assert row.rfq_id == "RFQ-123"
 
 
 def test_store_supplier_response_falls_back_to_available_body(monkeypatch):
@@ -64,6 +70,7 @@ def test_store_supplier_response_falls_back_to_available_body(monkeypatch):
         original_message_id=None,
         original_subject=None,
         match_confidence=None,
+        rfq_id=None,
         processed=False,
     )
 
@@ -71,3 +78,4 @@ def test_store_supplier_response_falls_back_to_available_body(monkeypatch):
     assert row.response_text == "<p>Hello world</p>"
     assert row.response_body == "<p>Hello world</p>"
     assert row.processed is False
+    assert row.rfq_id is None
