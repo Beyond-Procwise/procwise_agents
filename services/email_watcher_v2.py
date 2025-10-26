@@ -149,7 +149,8 @@ def _extract_plain_text(message: EmailMessage) -> str:
             if ctype == "text/plain" and "attachment" not in disp:
                 try:
                     return part.get_content().strip()
-                except Exception:
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.warning("Failed to extract text/plain content: %s", exc)
                     continue
         for part in message.walk():
             ctype = part.get_content_type()
@@ -157,7 +158,8 @@ def _extract_plain_text(message: EmailMessage) -> str:
             if ctype == "text/html" and "attachment" not in disp:
                 try:
                     return part.get_content()
-                except Exception:
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.warning("Failed to extract text/html content: %s", exc)
                     continue
         return ""
     return message.get_content() if message.get_content() else ""
@@ -638,10 +640,13 @@ class EmailWatcherV2:
                 matched_rows.append(response_row)
             else:
                 logger.warning(
-                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f)",
+                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f) supplier_id=%s rfq_id=%s unique_id=%s",
                     tracker.workflow_id,
                     email.message_id,
                     best_score,
+                    email.supplier_id,
+                    email.rfq_id,
+                    email.unique_id,
                 )
         return matched_rows
 
@@ -719,7 +724,11 @@ class EmailWatcherV2:
             subject = row.get("response_subject") or (matched.subject if matched else None)
             message_id = row.get("response_message_id") or (matched.message_id if matched else None)
             from_address = row.get("response_from") or (matched.from_address if matched else None)
-            body_text = row.get("response_body") or (matched.body if matched else "")
+            body_text = (
+                row.get("response_text")
+                or row.get("response_body")
+                or (matched.body if matched else "")
+            )
             workflow_id = matched.workflow_id if matched and matched.workflow_id else tracker.workflow_id
             rfq_id = matched.rfq_id if matched and matched.rfq_id else None
             supplier_email = row.get("supplier_email") or (matched.supplier_email if matched else None)
