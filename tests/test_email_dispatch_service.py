@@ -13,14 +13,23 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 _backend_scheduler_stub = types.ModuleType("services.backend_scheduler")
 
 
+_backend_notifications: list[str] = []
+
+
 class _BackendSchedulerProxy:
+    notifications = _backend_notifications
+
     @staticmethod
     def ensure(agent_nick):
-        return SimpleNamespace(notify_email_dispatch=lambda *_, **__: None)
+        return SimpleNamespace(
+            notify_email_dispatch=lambda workflow_id: _backend_notifications.append(
+                workflow_id
+            )
+        )
 
 
 _backend_scheduler_stub.BackendScheduler = _BackendSchedulerProxy
-sys.modules.setdefault("services.backend_scheduler", _backend_scheduler_stub)
+sys.modules["services.backend_scheduler"] = _backend_scheduler_stub
 
 from services.email_dispatch_service import EmailDispatchService
 from services.email_service import EmailSendResult
@@ -198,6 +207,8 @@ class DummyNick:
 
 
 def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
+    _BackendSchedulerProxy.notifications.clear()
+
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-UNIT-12345"
     draft_payload = {
@@ -354,8 +365,12 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         for row in stored_rows
     )
 
+    assert _BackendSchedulerProxy.notifications == [result["workflow_id"]]
+
 
 def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
+    _BackendSchedulerProxy.notifications.clear()
+
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-NOLOG-001"
     draft_payload = {
@@ -428,3 +443,82 @@ def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
         workflow_id="wf-no-track"
     )
     assert not any(row.unique_id == unique_id for row in stored_rows)
+    assert _BackendSchedulerProxy.notifications == []
+
+
+def test_email_dispatch_service_deferred_watcher_notification(monkeypatch):
+    _BackendSchedulerProxy.notifications.clear()
+
+    store = InMemoryDraftStore()
+    unique_id = "PROC-WF-DEFER-001"
+    draft_payload = {
+        "rfq_id": "RFQ-DEFER",
+        "subject": DEFAULT_RFQ_SUBJECT,
+        "body": "<p>Deferred</p>",
+        "receiver": "buyer@example.com",
+        "recipients": ["buyer@example.com"],
+        "sender": "sender@example.com",
+        "thread_index": 1,
+        "contact_level": 1,
+        "sent_status": False,
+        "action_id": "action-3",
+        "workflow_id": "wf-defer",
+        "unique_id": unique_id,
+    }
+    store.add(
+        {
+            "rfq_id": "RFQ-DEFER",
+            "supplier_id": "S3",
+            "supplier_name": "Deferred",
+            "subject": draft_payload["subject"],
+            "body": draft_payload["body"],
+            "sent": False,
+            "recipient_email": None,
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": "sender@example.com",
+            "payload": json.dumps(draft_payload),
+            "sent_on": None,
+            "workflow_id": "wf-defer",
+            "unique_id": unique_id,
+        }
+    )
+
+    action_store = InMemoryActionStore()
+    action_store.update(
+        "action-3",
+        json.dumps(
+            {
+                "drafts": [draft_payload],
+                "rfq_id": "RFQ-DEFER",
+                "unique_id": unique_id,
+                "sent_status": False,
+            }
+        ),
+    )
+
+    nick = DummyNick(store, action_store)
+    service = EmailDispatchService(nick)
+
+    monkeypatch.setattr(
+        service.email_service,
+        "send_email",
+        lambda *_, **__: EmailSendResult(True, "<message-id-defer>"),
+    )
+
+    dispatch_context = {"workflow_id": "wf-defer", "unique_id": unique_id}
+    result = service.send_draft(
+        "RFQ-DEFER",
+        is_workflow_email=True,
+        workflow_dispatch_context=dispatch_context,
+        notify_watcher=False,
+    )
+
+    assert result["sent"] is True
+
+    workflow_email_tracking_repo.init_schema()
+    stored_rows = workflow_email_tracking_repo.load_workflow_rows(
+        workflow_id="wf-defer"
+    )
+    assert any(row.unique_id == unique_id for row in stored_rows)
+    assert _BackendSchedulerProxy.notifications == []
