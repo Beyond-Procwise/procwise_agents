@@ -262,6 +262,15 @@ def _normalise_thread_header(value) -> Sequence[str]:
     return (str(value).strip("<> "),)
 
 
+def _normalise_message_id(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.strip("<> \t\r\n") or None
+
+
 def _normalise_identifier(value: Optional[str]) -> Optional[str]:
     if value in (None, ""):
         return None
@@ -348,14 +357,16 @@ def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailR
     ):
         score += 0.65
 
-    thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
-        dispatch.thread_headers.get("in_reply_to", ())
-    )
-    if dispatch.message_id:
-        thread_ids.add(dispatch.message_id)
+    thread_ids: set[str] = set()
+    headers = dispatch.thread_headers or {}
+    for key in ("references", "in_reply_to"):
+        thread_ids.update(_normalise_thread_header(headers.get(key)))
+    normalised_message_id = _normalise_message_id(dispatch.message_id)
+    if normalised_message_id:
+        thread_ids.add(normalised_message_id)
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
-    if dispatch.message_id and dispatch.message_id in reply_headers:
+    if normalised_message_id and normalised_message_id in reply_headers:
         score += 0.8
     elif thread_ids & reply_headers:
         score += 0.8
@@ -436,9 +447,14 @@ class EmailWatcherV2:
                     unique_id=row.unique_id,
                     supplier_id=row.supplier_id,
                     supplier_email=row.supplier_email,
-                    message_id=row.message_id,
+                    message_id=_normalise_message_id(row.message_id),
                     subject=row.subject,
-                    thread_headers=row.thread_headers or {},
+                    thread_headers={
+                        str(key): _normalise_thread_header(value)
+                        for key, value in (row.thread_headers or {}).items()
+                    }
+                    if row.thread_headers
+                    else {},
                     dispatched_at=row.dispatched_at,
                 )
                 for row in rows
@@ -478,7 +494,12 @@ class EmailWatcherV2:
             unique_id = str(payload.get("unique_id") or uuid.uuid4().hex)
             supplier_id = payload.get("supplier_id")
             supplier_email = payload.get("supplier_email")
-            message_id = payload.get("message_id")
+            raw_message_id = payload.get("message_id")
+            message_id = (
+                _normalise_message_id(str(raw_message_id))
+                if raw_message_id not in (None, "")
+                else None
+            )
             subject = payload.get("subject")
             dispatched_at = payload.get("dispatched_at")
             rfq_id = payload.get("rfq_id")
@@ -495,7 +516,7 @@ class EmailWatcherV2:
                 unique_id=unique_id,
                 supplier_id=str(supplier_id) if supplier_id else None,
                 supplier_email=str(supplier_email) if supplier_email else None,
-                message_id=str(message_id) if message_id else None,
+                message_id=message_id,
                 subject=str(subject) if subject else None,
                 rfq_id=str(rfq_id) if rfq_id else None,
                 thread_headers={
