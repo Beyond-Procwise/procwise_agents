@@ -165,6 +165,47 @@ def test_from_decision_strips_rfq_identifier(monkeypatch, fixed_unique_id):
     assert "rfq_id" not in result
 
 
+def test_render_html_from_text_formats_markdown_headings():
+    agent = EmailDraftingAgent()
+    html = agent._render_html_from_text(
+        "**Commercial Summary**\n"
+        "- Pricing aligned with expectations\n"
+        "- Include **key** lever\n"
+        "\n"
+        "Closing **remarks** go here."
+    )
+
+    assert "<p><strong>Commercial Summary</strong></p>" in html
+    assert "<li>Pricing aligned with expectations</li>" in html
+    assert "<li>Include <strong>key</strong> lever</li>" in html
+    assert "<p>Closing <strong>remarks</strong> go here.</p>" in html
+    assert "**" not in html
+
+
+def test_negotiation_fallback_renders_strong_headings(monkeypatch, fixed_unique_id):
+    monkeypatch.setattr(module, "_chat", lambda *_, **__: "")
+    monkeypatch.setattr(module, "_current_rfq_date", lambda: "20250930")
+
+    agent = EmailDraftingAgent()
+    decision = {
+        "rfq_id": "RFQ-NEG-123",
+        "supplier_id": "S-100",
+        "counter_price": 1000,
+        "current_offer": 1250,
+        "target_price": 1100,
+        "currency": "GBP",
+        "asks": ["Confirm revised pricing"],
+    }
+
+    result = agent.from_decision(decision)
+
+    html = result["html"]
+    assert "<strong>Commercial Position:</strong>" in html
+    assert "**Commercial Position:**" not in html
+    assert "<ul>" in html and "<li>" in html
+    assert result["unique_id"] == fixed_unique_id
+
+
 def test_prompt_mode_with_polish(monkeypatch, fixed_unique_id):
     responses = iter([
         "Subject: RFQ XYZ follow-up\nInitial draft",  # compose
