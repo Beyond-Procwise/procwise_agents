@@ -113,6 +113,7 @@ class EmailDispatchService:
         *,
         is_workflow_email: Optional[bool] = None,
         workflow_dispatch_context: Optional[Dict[str, Any]] = None,
+        notify_watcher: bool = True,
     ) -> Dict[str, Any]:
         """Send the latest draft for ``identifier`` (unique_id preferred)."""
 
@@ -407,15 +408,16 @@ class EmailDispatchService:
                             workflow_identifier,
                         )
                     else:
-                        try:
-                            BackendScheduler.ensure(
-                                self.agent_nick
-                            ).notify_email_dispatch(workflow_identifier)
-                        except Exception:  # pragma: no cover - defensive logging
-                            logger.exception(
-                                "Failed to trigger email watcher for workflow %s",
-                                workflow_identifier,
-                            )
+                        if notify_watcher:
+                            try:
+                                BackendScheduler.ensure(
+                                    self.agent_nick
+                                ).notify_email_dispatch(workflow_identifier)
+                            except Exception:  # pragma: no cover - defensive logging
+                                logger.exception(
+                                    "Failed to trigger email watcher for workflow %s",
+                                    workflow_identifier,
+                                )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
 

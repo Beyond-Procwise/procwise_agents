@@ -61,7 +61,6 @@ class BackendScheduler:
         self._email_watcher_lock = threading.Lock()
         self._register_default_jobs()
         self.start()
-        self._ensure_email_watcher_service()
 
     @classmethod
     def ensure(

@@ -97,8 +97,7 @@ def test_submit_once_executes_and_removes_job(monkeypatch):
 
     assert executed == ["ran"]
     assert "once" not in scheduler._jobs
-    assert isinstance(scheduler._email_watcher_service, DummyEmailWatcher)
-    assert scheduler._email_watcher_service.started is True
+    assert scheduler._email_watcher_service is None
 
     scheduler.stop()
     backend_scheduler.BackendScheduler._instance = None
@@ -158,8 +157,12 @@ def test_ensure_updates_training_endpoint_reference(monkeypatch):
 def test_notify_email_dispatch_wakes_watcher(monkeypatch):
     scheduler = _prepare_scheduler(monkeypatch, SimpleNamespace())
 
+    assert scheduler._email_watcher_service is None
+
     scheduler.notify_email_dispatch("wf-demo")
 
+    assert isinstance(scheduler._email_watcher_service, DummyEmailWatcher)
+    assert scheduler._email_watcher_service.started is True
     assert scheduler._email_watcher_service.notifications == ["wf-demo"]
 
     scheduler.stop()
