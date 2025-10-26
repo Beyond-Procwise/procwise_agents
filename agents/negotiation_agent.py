@@ -2729,6 +2729,8 @@ class NegotiationAgent(BaseAgent):
         }
         if draft_bundles:
             pass_fields["drafts"] = draft_bundles
+        elif drafts:
+            pass_fields["drafts"] = drafts
         if drafts:
             pass_fields["draft_records"] = drafts
         if round_summaries:
