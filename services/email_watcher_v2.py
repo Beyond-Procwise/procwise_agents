@@ -45,7 +45,8 @@ class EmailDispatchRecord:
     supplier_id: Optional[str]
     supplier_email: Optional[str]
     message_id: Optional[str]
-    subject: Optional[str]
+    subject: Optional[str] = None
+    normalised_message_id: Optional[str] = None
     rfq_id: Optional[str] = None
     thread_headers: Dict[str, str] = field(default_factory=dict)
     dispatched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -271,6 +272,13 @@ def _normalise_thread_header(value) -> Sequence[str]:
     return (str(value).strip("<> "),)
 
 
+def _preserve_message_id(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _normalise_message_id(value: Optional[str]) -> Optional[str]:
     if value in (None, ""):
         return None
@@ -370,7 +378,9 @@ def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailR
     headers = dispatch.thread_headers or {}
     for key in ("references", "in_reply_to"):
         thread_ids.update(_normalise_thread_header(headers.get(key)))
-    normalised_message_id = _normalise_message_id(dispatch.message_id)
+    normalised_message_id = dispatch.normalised_message_id or _normalise_message_id(
+        dispatch.message_id
+    )
     if normalised_message_id:
         thread_ids.add(normalised_message_id)
 
@@ -451,23 +461,28 @@ class EmailWatcherV2:
         tracker = WorkflowTracker(workflow_id=workflow_id)
         rows = tracking_repo.load_workflow_rows(workflow_id=workflow_id)
         if rows:
-            dispatches = [
-                EmailDispatchRecord(
-                    unique_id=row.unique_id,
-                    supplier_id=row.supplier_id,
-                    supplier_email=row.supplier_email,
-                    message_id=_normalise_message_id(row.message_id),
-                    subject=row.subject,
-                    thread_headers={
-                        str(key): _normalise_thread_header(value)
-                        for key, value in (row.thread_headers or {}).items()
-                    }
-                    if row.thread_headers
-                    else {},
-                    dispatched_at=row.dispatched_at,
+            dispatches: List[EmailDispatchRecord] = []
+            for row in rows:
+                preserved_message_id = _preserve_message_id(row.message_id)
+                dispatches.append(
+                    EmailDispatchRecord(
+                        unique_id=row.unique_id,
+                        supplier_id=row.supplier_id,
+                        supplier_email=row.supplier_email,
+                        message_id=preserved_message_id,
+                        subject=row.subject,
+                        normalised_message_id=_normalise_message_id(
+                            preserved_message_id or row.message_id
+                        ),
+                        thread_headers={
+                            str(key): _normalise_thread_header(value)
+                            for key, value in (row.thread_headers or {}).items()
+                        }
+                        if row.thread_headers
+                        else {},
+                        dispatched_at=row.dispatched_at,
+                    )
                 )
-                for row in rows
-            ]
             tracker.register_dispatches(dispatches)
             if dispatches:
                 tracker.finalize_dispatches()
@@ -508,10 +523,9 @@ class EmailWatcherV2:
             supplier_id = payload.get("supplier_id")
             supplier_email = payload.get("supplier_email")
             raw_message_id = payload.get("message_id")
-            message_id = (
-                _normalise_message_id(str(raw_message_id))
-                if raw_message_id not in (None, "")
-                else None
+            message_id = _preserve_message_id(raw_message_id)
+            normalised_message_id = _normalise_message_id(
+                message_id or raw_message_id
             )
             subject = payload.get("subject")
             dispatched_at = payload.get("dispatched_at")
@@ -531,6 +545,7 @@ class EmailWatcherV2:
                 supplier_email=str(supplier_email) if supplier_email else None,
                 message_id=message_id,
                 subject=str(subject) if subject else None,
+                normalised_message_id=normalised_message_id,
                 rfq_id=str(rfq_id) if rfq_id else None,
                 thread_headers={
                     str(k): _normalise_thread_header(v) for k, v in raw_thread_headers.items()

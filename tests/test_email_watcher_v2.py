@@ -249,7 +249,7 @@ def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
     assert len(rows) == 1
     persisted = rows[0]
-    assert persisted.get("original_message_id") == "legacy-msg-001@procwise"
+    assert persisted.get("original_message_id") == "<legacy-msg-001@procwise>"
     assert persisted.get("response_message_id") == "reply-legacy-001"
 
 def test_parse_email_recovers_tracking_headers():
