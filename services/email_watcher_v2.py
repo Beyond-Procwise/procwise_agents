@@ -645,6 +645,7 @@ class EmailWatcherV2:
                     except Exception:  # pragma: no cover - defensive conversion
                         response_time = None
                 match_confidence = _score_to_confidence(best_score)
+                rfq_id = email.rfq_id or best_dispatch.rfq_id
                 response_row = store_supplier_response(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
@@ -660,6 +661,7 @@ class EmailWatcherV2:
                     original_message_id=best_dispatch.message_id,
                     original_subject=best_dispatch.subject,
                     match_confidence=match_confidence,
+                    rfq_id=rfq_id,
                     processed=False,
                 )
                 matched_rows.append(response_row)
@@ -755,7 +757,7 @@ class EmailWatcherV2:
                 or (matched.body if matched else "")
             )
             workflow_id = matched.workflow_id if matched and matched.workflow_id else tracker.workflow_id
-            rfq_id = matched.rfq_id if matched and matched.rfq_id else None
+            rfq_id = row.get("rfq_id") or (matched.rfq_id if matched and matched.rfq_id else None)
             supplier_email = row.get("supplier_email") or (matched.supplier_email if matched else None)
 
             input_payload = {

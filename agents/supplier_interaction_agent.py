@@ -4596,6 +4596,7 @@ class SupplierInteractionAgent(BaseAgent):
                     unique_id=unique_key,
                     supplier_id=resolved_supplier,
                     supplier_email=supplier_email,
+                    rfq_id=rfq_id,
                     response_text=text,
                     received_time=received_time,
                     response_time=response_time_value,

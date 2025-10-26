@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS proc.supplier_response (
     unique_id TEXT NOT NULL,
     supplier_id TEXT,
     supplier_email TEXT,
+    rfq_id TEXT,
     response_message_id TEXT,
     response_subject TEXT,
     response_text TEXT,
@@ -59,6 +60,7 @@ class SupplierResponseRow:
     price: Optional[Decimal] = None
     lead_time: Optional[int] = None
     supplier_email: Optional[str] = None
+    rfq_id: Optional[str] = None
     response_body: Optional[str] = None
     response_message_id: Optional[str] = None
     response_subject: Optional[str] = None
@@ -111,6 +113,7 @@ def init_schema() -> None:
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_text", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_body", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "supplier_email", "TEXT")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "rfq_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_message_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_subject", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_from", "TEXT")
@@ -140,18 +143,20 @@ def insert_response(row: SupplierResponseRow) -> None:
     original_subject = row.original_subject or None
     processed = _coerce_bool(row.processed)
     response_date = received_time
+    rfq_id = row.rfq_id or None
 
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.supplier_response "
-            "(workflow_id, supplier_id, supplier_email, unique_id, response_text, response_body, "
+            "(workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
             "original_subject, match_confidence, price, lead_time, response_time, received_time, processed) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
             "supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_response.supplier_id), "
             "supplier_email=COALESCE(EXCLUDED.supplier_email, proc.supplier_response.supplier_email), "
+            "rfq_id=COALESCE(EXCLUDED.rfq_id, proc.supplier_response.rfq_id), "
             "response_text=EXCLUDED.response_text, "
             "response_body=EXCLUDED.response_body, "
             "response_message_id=COALESCE(EXCLUDED.response_message_id, proc.supplier_response.response_message_id), "
@@ -173,6 +178,7 @@ def insert_response(row: SupplierResponseRow) -> None:
                 row.workflow_id,
                 row.supplier_id,
                 supplier_email,
+                rfq_id,
                 row.unique_id,
                 response_text,
                 response_body,
@@ -293,7 +299,7 @@ def fetch_pending(
             filters.append("COALESCE(processed, FALSE)=FALSE")
 
         q = (
-            "SELECT workflow_id, supplier_id, supplier_email, unique_id, response_text, response_body, "
+            "SELECT workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
             "original_subject, match_confidence, price, lead_time, received_time, processed "
             "FROM proc.supplier_response "
@@ -310,7 +316,7 @@ def fetch_all(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, supplier_id, supplier_email, unique_id, response_text, response_body, "
+            "SELECT workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
             "original_subject, match_confidence, price, lead_time, received_time, processed "
             "FROM proc.supplier_response WHERE workflow_id=%s"
