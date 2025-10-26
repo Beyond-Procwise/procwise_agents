@@ -34,6 +34,7 @@ from utils.email_tracking import (
     extract_unique_id_from_headers,
 )
 from utils import email_tracking
+from utils.supplier_response_helper import store_supplier_response
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class EmailResponse:
     subject: Optional[str]
     body: str
     received_at: datetime
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
     in_reply_to: Sequence[str] = field(default_factory=tuple)
     references: Sequence[str] = field(default_factory=tuple)
     workflow_id: Optional[str] = None
@@ -141,28 +144,44 @@ def _extract_thread_ids(message: EmailMessage) -> Dict[str, Sequence[str]]:
     return {"references": refs, "in_reply_to": in_reply}
 
 
-def _extract_plain_text(message: EmailMessage) -> str:
+def _extract_body_content(message: EmailMessage) -> Dict[str, Optional[str]]:
+    text_value: Optional[str] = None
+    html_value: Optional[str] = None
+
     if message.is_multipart():
         for part in message.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
-            if ctype == "text/plain" and "attachment" not in disp:
+            if "attachment" in disp:
+                continue
+            if ctype == "text/plain" and text_value is None:
                 try:
-                    return part.get_content().strip()
+                    content = part.get_content()
                 except Exception as exc:  # pragma: no cover - defensive logging
                     logger.warning("Failed to extract text/plain content: %s", exc)
                     continue
-        for part in message.walk():
-            ctype = part.get_content_type()
-            disp = (part.get("Content-Disposition") or "").lower()
-            if ctype == "text/html" and "attachment" not in disp:
+                if content:
+                    text_value = str(content).strip()
+            elif ctype == "text/html" and html_value is None:
                 try:
-                    return part.get_content()
+                    content = part.get_content()
                 except Exception as exc:  # pragma: no cover - defensive logging
                     logger.warning("Failed to extract text/html content: %s", exc)
                     continue
-        return ""
-    return message.get_content() if message.get_content() else ""
+                if content:
+                    html_value = str(content)
+    else:
+        content = message.get_content()
+        if message.get_content_type() == "text/html":
+            html_value = content if content else None
+        else:
+            text_value = str(content).strip() if content else ""
+
+    if text_value is None and html_value:
+        stripped = html_value.strip()
+        text_value = stripped
+
+    return {"text": text_value or "", "html": html_value}
 
 
 def _parse_email(raw: bytes) -> EmailResponse:
@@ -170,7 +189,10 @@ def _parse_email(raw: bytes) -> EmailResponse:
     subject = message.get("Subject")
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
-    body = _extract_plain_text(message)
+    content = _extract_body_content(message)
+    body_text = content.get("text") if isinstance(content, dict) else ""
+    body_html = content.get("html") if isinstance(content, dict) else None
+    body = body_text or (body_html or "")
     header_map = {
         key: message.get_all(key, failobj=[])
         for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
@@ -217,11 +239,13 @@ def _parse_email(raw: bytes) -> EmailResponse:
     return EmailResponse(
         unique_id=unique_id,
         supplier_id=supplier_id,
-        supplier_email=None,
+        supplier_email=metadata.supplier_email if metadata else None,
         from_address=from_address,
         message_id=message_id,
         subject=subject,
         body=body or "",
+        body_text=body_text or None,
+        body_html=body_html,
         received_at=received_at,
         in_reply_to=thread_ids.get("in_reply_to", ()),
         references=thread_ids.get("references", ()),
@@ -620,23 +644,24 @@ class EmailWatcherV2:
                             response_time = Decimal(str(delta_seconds))
                     except Exception:  # pragma: no cover - defensive conversion
                         response_time = None
-                response_row = SupplierResponseRow(
+                match_confidence = _score_to_confidence(best_score)
+                response_row = store_supplier_response(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
-                    response_text=email.body,
-                    received_time=email.received_at,
+                    body_text=email.body_text or email.body,
+                    body_html=email.body_html,
+                    received_at=email.received_at,
                     response_time=response_time,
                     response_message_id=email.message_id,
                     response_subject=email.subject,
                     response_from=email.from_address,
                     original_message_id=best_dispatch.message_id,
                     original_subject=best_dispatch.subject,
-                    match_confidence=_score_to_confidence(best_score),
+                    match_confidence=match_confidence,
                     processed=False,
                 )
-                supplier_response_repo.insert_response(response_row)
                 matched_rows.append(response_row)
             else:
                 logger.warning(

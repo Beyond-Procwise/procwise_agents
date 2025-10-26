@@ -59,6 +59,7 @@ class SupplierResponseRow:
     price: Optional[Decimal] = None
     lead_time: Optional[int] = None
     supplier_email: Optional[str] = None
+    response_body: Optional[str] = None
     response_message_id: Optional[str] = None
     response_subject: Optional[str] = None
     response_from: Optional[str] = None
@@ -124,6 +125,9 @@ def init_schema() -> None:
 
 def insert_response(row: SupplierResponseRow) -> None:
     response_text = row.response_text or ""
+    response_body = row.response_body if row.response_body not in (None, "") else None
+    if response_body is None:
+        response_body = response_text
     received_time = _normalise_dt(row.received_time)
     price_value = _serialise_decimal(row.price)
     match_confidence = _serialise_decimal(row.match_confidence)
@@ -171,7 +175,7 @@ def insert_response(row: SupplierResponseRow) -> None:
                 supplier_email,
                 row.unique_id,
                 response_text,
-                response_text,
+                response_body,
                 response_message_id,
                 response_subject,
                 response_from,
@@ -355,4 +359,6 @@ def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault("response_time", payload.get("response_time"))
     payload.setdefault("received_time", payload.get("response_date") or payload.get("received_time"))
     payload.setdefault("processed", _coerce_bool(payload.get("processed")))
+    payload.setdefault("body_text", payload.get("response_text"))
+    payload.setdefault("body_html", payload.get("response_body"))
     return payload
