@@ -39,6 +39,7 @@ class SupplierInteractionAgent(BaseAgent):
 
     WORKFLOW_POLL_INTERVAL_SECONDS = 30
     RESPONSE_GATE_POLL_SECONDS = 30
+    WATCHER_MIN_WAIT_SECONDS = 90
 
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
@@ -49,6 +50,7 @@ class SupplierInteractionAgent(BaseAgent):
         self._response_coordinator = SupplierResponseWorkflow()
         self._dispatch_schema_ready = False
         self._response_schema_ready = False
+        self._watcher_activation: Dict[str, float] = {}
 
     # Suppliers occasionally include upper-case letters or non-hex characters
     # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
@@ -784,6 +786,12 @@ class SupplierInteractionAgent(BaseAgent):
             for value in metadata.get("unique_ids", [])
             if self._coerce_text(value)
         ]
+        last_dispatched_at = metadata.get("last_dispatched_at")
+        self._activate_email_watcher(
+            workflow_id,
+            last_dispatched_at=last_dispatched_at,
+            expected_unique_ids=metadata_unique_ids,
+        )
         expected_unique_ids: Set[str] = set(metadata_unique_ids)
 
         if unique_filter is not None:
@@ -870,6 +878,11 @@ class SupplierInteractionAgent(BaseAgent):
                 "Response poll returned no rows despite completion for workflow=%s",
                 workflow_id,
             )
+            self._activate_email_watcher(
+                workflow_id,
+                last_dispatched_at=last_dispatched_at,
+                expected_unique_ids=list(expected_unique_ids),
+            )
 
             if deadline is not None and time.monotonic() >= deadline:
                 break
@@ -889,6 +902,83 @@ class SupplierInteractionAgent(BaseAgent):
                 break
 
         return []
+
+    def _activate_email_watcher(
+        self,
+        workflow_id: Optional[str],
+        *,
+        last_dispatched_at: Optional[datetime],
+        expected_unique_ids: Optional[Sequence[Optional[str]]],
+    ) -> Optional[Dict[str, Any]]:
+        workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key:
+            return None
+
+        identifiers = [
+            self._coerce_text(uid)
+            for uid in (expected_unique_ids or [])
+            if self._coerce_text(uid)
+        ]
+        if not identifiers:
+            return None
+
+        throttle_seconds = max(5.0, float(self.RESPONSE_GATE_POLL_SECONDS))
+        now = time.monotonic()
+        last_activation = self._watcher_activation.get(workflow_key)
+        if last_activation is not None and (now - last_activation) < throttle_seconds:
+            return None
+
+        wait_seconds = self.WATCHER_MIN_WAIT_SECONDS
+        if last_dispatched_at is not None:
+            reference = last_dispatched_at if last_dispatched_at.tzinfo else last_dispatched_at.replace(
+                tzinfo=timezone.utc
+            )
+            elapsed = (datetime.now(timezone.utc) - reference).total_seconds()
+            if elapsed >= self.WATCHER_MIN_WAIT_SECONDS:
+                wait_seconds = 0
+            elif elapsed > 0:
+                wait_seconds = max(0, int(round(self.WATCHER_MIN_WAIT_SECONDS - elapsed)))
+
+        try:
+            from services.email_watcher_service import run_email_watcher_for_workflow
+        except Exception:
+            logger.exception(
+                "Failed to import email watcher service for workflow=%s",
+                workflow_key,
+            )
+            return None
+
+        registry = getattr(self.agent_nick, "agents", None)
+        registry_dict = registry if isinstance(registry, dict) else None
+        orchestrator = getattr(self.agent_nick, "orchestrator", None)
+
+        try:
+            result = run_email_watcher_for_workflow(
+                workflow_id=workflow_key,
+                run_id=None,
+                wait_seconds_after_last_dispatch=wait_seconds,
+                mailbox_name=None,
+                agent_registry=registry_dict,
+                orchestrator=orchestrator,
+                supplier_agent=None,
+                negotiation_agent=None,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to activate email watcher for workflow=%s",
+                workflow_key,
+            )
+            return None
+
+        self._watcher_activation[workflow_key] = now
+        logger.debug(
+            "Email watcher activation result for workflow=%s status=%s expected=%s found=%s",
+            workflow_key,
+            result.get("status"),
+            result.get("expected"),
+            result.get("found"),
+        )
+        return result
 
     def _expected_dispatch_context(
         self, workflow_id: str
