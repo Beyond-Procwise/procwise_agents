@@ -93,7 +93,16 @@ class WorkflowTracker:
             ):
                 self.last_dispatched_at = dispatch.dispatched_at
         self.dispatched_count = len(self.email_records)
+
+    def finalize_dispatches(self) -> None:
+        if self.all_dispatched:
+            return
         self.all_dispatched = True
+        logger.info(
+            "Finalized workflow %s with %d dispatches",
+            self.workflow_id,
+            self.dispatched_count,
+        )
 
     def record_response(self, unique_id: str, response: EmailResponse) -> None:
         if unique_id not in self.email_records:
@@ -460,6 +469,8 @@ class EmailWatcherV2:
                 for row in rows
             ]
             tracker.register_dispatches(dispatches)
+            if dispatches:
+                tracker.finalize_dispatches()
             matched = [row for row in rows if row.matched]
             for row in matched:
                 tracker.record_response(
@@ -482,6 +493,8 @@ class EmailWatcherV2:
         self,
         workflow_id: str,
         dispatches: Sequence[Dict[str, object]],
+        *,
+        finalize: bool = True,
     ) -> WorkflowTracker:
         if not workflow_id:
             raise ValueError("workflow_id is required to register dispatches")
@@ -548,7 +561,18 @@ class EmailWatcherV2:
 
         tracker.register_dispatches(records)
         tracking_repo.record_dispatches(workflow_id=workflow_id, dispatches=repo_rows)
+        if finalize:
+            tracker.finalize_dispatches()
         return tracker
+
+    def finalize_workflow_dispatches(self, workflow_id: str) -> None:
+        tracker = self._ensure_tracker(workflow_id)
+        tracker.finalize_dispatches()
+        logger.info(
+            "Workflow %s finalized: %d dispatches, ready to poll",
+            workflow_id,
+            tracker.dispatched_count,
+        )
 
     def _fetch_emails(self, since: datetime) -> List[EmailResponse]:
         if self._fetcher:
@@ -685,21 +709,40 @@ class EmailWatcherV2:
                     rfq_id=rfq_id,
                     processed=False,
                 )
+                logger.info(
+                    "\u2713 Wrote response to DB: workflow=%s unique_id=%s confidence=%.2f body_len=%d",
+                    tracker.workflow_id,
+                    matched_id,
+                    float(response_row.match_confidence),
+                    len(email.body or ""),
+                )
                 matched_rows.append(response_row)
             else:
                 logger.warning(
-                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f) supplier_id=%s rfq_id=%s unique_id=%s",
+                    "Unmatched response: workflow=%s score=%.2f threshold=%.2f\n"
+                    "  supplier_id=%s rfq_id=%s unique_id=%s\n"
+                    "  from=%s subject=%s\n"
+                    "  available_ids=%s matched_ids=%s",
                     tracker.workflow_id,
-                    email.message_id,
                     best_score,
+                    self.match_threshold,
                     email.supplier_id,
                     email.rfq_id,
                     email.unique_id,
+                    email.from_address,
+                    email.subject,
+                    list(tracker.email_records.keys()),
+                    list(tracker.matched_responses.keys()),
                 )
         return matched_rows
 
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
+        if not tracker.all_dispatched:
+            logger.warning(
+                "wait_and_collect_responses called before finalization. Auto-finalizing."
+            )
+            tracker.finalize_dispatches()
         if tracker.dispatched_count == 0:
             return {
                 "workflow_id": workflow_id,
@@ -772,11 +815,7 @@ class EmailWatcherV2:
             subject = row.get("response_subject") or (matched.subject if matched else None)
             message_id = row.get("response_message_id") or (matched.message_id if matched else None)
             from_address = row.get("response_from") or (matched.from_address if matched else None)
-            body_text = (
-                row.get("response_text")
-                or row.get("response_body")
-                or (matched.body if matched else "")
-            )
+            body_text = row.get("response_text") or (matched.body if matched else "")
             workflow_id = matched.workflow_id if matched and matched.workflow_id else tracker.workflow_id
             rfq_id = row.get("rfq_id") or (matched.rfq_id if matched and matched.rfq_id else None)
             supplier_email = row.get("supplier_email") or (matched.supplier_email if matched else None)
