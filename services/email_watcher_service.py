@@ -53,6 +53,7 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
         "unique_id": row.get("unique_id"),
         "supplier_id": row.get("supplier_id"),
         "body_text": row.get("response_text", ""),
+        "body_html": row.get("response_body"),
         "subject": row.get("subject"),
         "from_addr": row.get("from_addr"),
         "message_id": row.get("message_id"),

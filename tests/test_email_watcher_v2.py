@@ -188,6 +188,21 @@ def test_parse_email_recovers_tracking_headers():
     assert parsed.rfq_id == "RFQ-12345"
 
 
+def test_parse_email_extracts_plain_and_html_bodies():
+    message = EmailMessage()
+    message["Subject"] = "Re: Pricing"
+    message["From"] = "quotes@example.com"
+    message["To"] = "buyer@example.com"
+    message.set_content("Plain body text")
+    message.add_alternative("<p>Plain body text</p>", subtype="html")
+
+    parsed = _parse_email(message.as_bytes())
+
+    assert parsed.body == "Plain body text"
+    assert parsed.body_text == "Plain body text"
+    assert "<p>Plain body text</p>" in (parsed.body_html or "")
+
+
 def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path):
     workflow_id = "wf-header-fallback"
     supplier_response_repo.init_schema()
