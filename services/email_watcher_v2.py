@@ -12,11 +12,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
@@ -39,6 +40,86 @@ from utils import email_tracking
 from services.supplier_response_coordinator import get_supplier_response_coordinator
 
 logger = logging.getLogger(__name__)
+
+
+_PRICE_PATTERN = re.compile(
+    r"(?P<currency>USD|EUR|GBP|AUD|CAD|INR|JPY|CHF|RMB|CNY|\$|€|£)?\s*" r"(?P<amount>\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+_LEAD_TIME_PATTERN = re.compile(
+    r"(?P<value>\d{1,3})\s*(?P<unit>day|days|business day|business days|week|weeks)",
+    re.IGNORECASE,
+)
+_PAYMENT_TERMS_PATTERN = re.compile(
+    r"net\s*\d{1,3}|payment\s*terms?:\s*[^\n\.]+", re.IGNORECASE
+)
+_WARRANTY_PATTERN = re.compile(r"warranty[^\n\.]*", re.IGNORECASE)
+_VALIDITY_PATTERN = re.compile(r"valid(?:ity)?[^\n\.]*", re.IGNORECASE)
+_EXCEPTION_PATTERN = re.compile(r"except(?:ion|ions)?[^\n\.]*", re.IGNORECASE)
+
+
+def _extract_price_fields(text: str) -> Tuple[Optional[Decimal], Optional[str]]:
+    match = _PRICE_PATTERN.search(text)
+    if not match:
+        return None, None
+    amount = match.group("amount")
+    currency = match.group("currency")
+    if amount:
+        normalised = amount.replace(",", "").replace(" ", "")
+        try:
+            price = Decimal(normalised)
+        except (InvalidOperation, ValueError):  # pragma: no cover - defensive
+            price = None
+    else:
+        price = None
+    if currency:
+        symbol = currency.upper()
+        currency_map = {"$": "USD", "€": "EUR", "£": "GBP"}
+        currency = currency_map.get(currency) or currency_map.get(symbol) or symbol
+    return price, currency
+
+
+def _extract_lead_time(text: str) -> Optional[int]:
+    match = _LEAD_TIME_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        value = int(match.group("value"))
+    except (TypeError, ValueError):
+        return None
+    unit = match.group("unit").lower()
+    if "week" in unit:
+        return value * 7
+    return value
+
+
+def _find_pattern(text: str, pattern: re.Pattern[str]) -> Optional[str]:
+    match = pattern.search(text)
+    if not match:
+        return None
+    return match.group(0).strip()
+
+
+def extract_structured_fields(email: EmailResponse) -> Dict[str, Any]:
+    text_segments = [email.body_text or "", email.body_html or ""]
+    combined = "\n".join(segment for segment in text_segments if segment)
+    price, currency = _extract_price_fields(combined)
+    lead_time_days = _extract_lead_time(combined)
+    payment_terms = _find_pattern(combined, _PAYMENT_TERMS_PATTERN)
+    warranty = _find_pattern(combined, _WARRANTY_PATTERN)
+    validity = _find_pattern(combined, _VALIDITY_PATTERN)
+    exceptions = _find_pattern(combined, _EXCEPTION_PATTERN)
+    return {
+        "price": price,
+        "currency": currency,
+        "lead_time_days": lead_time_days,
+        "payment_terms": payment_terms,
+        "warranty": warranty,
+        "validity": validity,
+        "exceptions": exceptions,
+        "attachments": list(email.attachments),
+        "tables": list(email.tables),
+    }
 
 
 @dataclass
@@ -73,6 +154,8 @@ class EmailResponse:
     workflow_id: Optional[str] = None
     rfq_id: Optional[str] = None
     headers: Dict[str, Sequence[str]] = field(default_factory=dict)
+    attachments: Sequence[Dict[str, Any]] = field(default_factory=tuple)
+    tables: Sequence[Dict[str, Any]] = field(default_factory=tuple)
 
 
 @dataclass
@@ -93,6 +176,8 @@ class WorkflowTracker:
     last_response_at: Optional[datetime] = None
     round_index: Dict[str, Optional[int]] = field(default_factory=dict)
     completion_logged: bool = False
+    seen_message_ids: Set[str] = field(default_factory=set)
+    seen_fingerprints: Set[str] = field(default_factory=set)
 
     def register_dispatches(self, dispatches: Iterable[EmailDispatchRecord]) -> None:
         for dispatch in dispatches:
@@ -215,34 +300,42 @@ def _extract_thread_ids(message: EmailMessage) -> Dict[str, Sequence[str]]:
     return {"references": refs, "in_reply_to": in_reply}
 
 
-def _extract_plain_text(message: EmailMessage) -> Tuple[str, Optional[str]]:
+def _extract_plain_text(message: EmailMessage) -> Tuple[str, Optional[str], List[Dict[str, Any]]]:
     plain_text: Optional[str] = None
     html_text: Optional[str] = None
+    attachments: List[Dict[str, Any]] = []
     if message.is_multipart():
         for part in message.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
-            if ctype == "text/plain" and "attachment" not in disp:
-                try:
-                    content = part.get_content()
-                    if content is not None:
-                        plain_text = str(content).strip()
-                        break
-                except Exception:
-                    continue
-        for part in message.walk():
-            ctype = part.get_content_type()
-            disp = (part.get("Content-Disposition") or "").lower()
-            if ctype == "text/html" and "attachment" not in disp:
-                try:
-                    content = part.get_content()
-                    if content is not None:
-                        html_text = str(content)
-                        break
-                except Exception:
-                    continue
+            filename = part.get_filename()
+            is_attachment = "attachment" in disp or bool(filename)
+            if is_attachment:
+                payload = part.get_payload(decode=True) or b""
+                size = len(payload) if isinstance(payload, (bytes, bytearray)) else None
+                attachments.append(
+                    {
+                        "filename": filename or "",
+                        "content_type": ctype,
+                        "size": size,
+                    }
+                )
+                continue
+            try:
+                content = part.get_content()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if content is None:
+                continue
+            if ctype == "text/plain" and plain_text is None:
+                plain_text = str(content).strip()
+            elif ctype == "text/html" and html_text is None:
+                html_text = str(content)
     else:
-        content = message.get_content()
+        try:
+            content = message.get_content()
+        except Exception:  # pragma: no cover - defensive
+            content = None
         if content is not None:
             if (message.get_content_type() or "").lower() == "text/html":
                 html_text = str(content)
@@ -250,7 +343,68 @@ def _extract_plain_text(message: EmailMessage) -> Tuple[str, Optional[str]]:
                 plain_text = str(content)
     if plain_text is None and html_text is not None:
         plain_text = html_text
-    return (plain_text or "", html_text)
+    return (plain_text or "", html_text, attachments)
+
+
+class _TableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: List[Dict[str, Any]] = []
+        self._current: Optional[Dict[str, Any]] = None
+        self._current_row: Optional[List[str]] = None
+        self._current_cell: Optional[str] = None
+        self._header_phase: bool = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        tag_lower = tag.lower()
+        if tag_lower == "table":
+            self._current = {"headers": [], "rows": []}
+            self._current_row = None
+            self._current_cell = None
+            self._header_phase = True
+        elif tag_lower == "tr" and self._current is not None:
+            self._current_row = []
+        elif tag_lower in {"th", "td"} and self._current is not None:
+            self._current_cell = ""
+            self._header_phase = self._header_phase and tag_lower == "th"
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._current_cell is not None:
+            self._current_cell += data
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        tag_lower = tag.lower()
+        if tag_lower in {"th", "td"} and self._current is not None:
+            if self._current_cell is not None:
+                text = self._current_cell.strip()
+                if self._header_phase and tag_lower == "th":
+                    self._current.setdefault("headers", []).append(text)
+                elif self._current_row is not None:
+                    self._current_row.append(text)
+            self._current_cell = None
+        elif tag_lower == "tr" and self._current is not None:
+            if self._current_row:
+                self._current.setdefault("rows", []).append(self._current_row)
+            self._current_row = None
+            self._header_phase = False
+        elif tag_lower == "table" and self._current is not None:
+            if self._current.get("headers") or self._current.get("rows"):
+                self.tables.append(self._current)
+            self._current = None
+            self._current_row = None
+            self._current_cell = None
+            self._header_phase = False
+
+
+def _extract_tables_from_html(html_text: Optional[str]) -> List[Dict[str, Any]]:
+    if not html_text:
+        return []
+    parser = _TableHTMLParser()
+    try:
+        parser.feed(html_text)
+    except Exception:  # pragma: no cover - defensive parsing
+        return []
+    return parser.tables
 
 
 def _parse_email(raw: bytes) -> EmailResponse:
@@ -258,7 +412,8 @@ def _parse_email(raw: bytes) -> EmailResponse:
     subject = message.get("Subject")
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
-    plain_body, html_body = _extract_plain_text(message)
+    plain_body, html_body, attachments = _extract_plain_text(message)
+    tables = _extract_tables_from_html(html_body)
     body = plain_body or html_body or ""
     header_map = {
         key: message.get_all(key, failobj=[])
@@ -329,6 +484,8 @@ def _parse_email(raw: bytes) -> EmailResponse:
         workflow_id=workflow_id,
         rfq_id=rfq_id,
         headers=raw_headers,
+        attachments=tuple(attachments),
+        tables=tuple(tables),
     )
 
 
@@ -373,6 +530,19 @@ def _subject_hash(subject: Optional[str]) -> Optional[str]:
     if not normalised:
         return None
     return hashlib.sha1(normalised.encode("utf-8")).hexdigest()
+
+
+def _response_fingerprint(email: EmailResponse) -> Optional[str]:
+    subject_norm = _normalise_subject_line(email.subject) or ""
+    from_norm = _normalise_email_address(email.from_address) or ""
+    received_at = email.received_at or datetime.now(timezone.utc)
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    bucket = int(received_at.timestamp() // 120)
+    payload = "|".join([subject_norm, from_norm, str(bucket)])
+    if not payload.strip("|"):
+        return None
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _coerce_round_number(value: Optional[object]) -> Optional[int]:
@@ -452,22 +622,6 @@ def _calculate_match_score(
     if email_response.unique_id and email_response.unique_id == dispatch.unique_id:
         return 1.0, ["unique_id"]
 
-    if (
-        email_response.workflow_id
-        and dispatch.workflow_id
-        and str(email_response.workflow_id) == str(dispatch.workflow_id)
-    ):
-        score += 0.1
-        matched_on.append("workflow")
-
-    if (
-        email_response.supplier_id
-        and dispatch.supplier_id
-        and email_response.supplier_id == dispatch.supplier_id
-    ):
-        score += 0.65
-        matched_on.append("supplier_id")
-
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
         dispatch.thread_headers.get("in_reply_to", ())
     )
@@ -476,42 +630,51 @@ def _calculate_match_score(
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
     if dispatch.message_id and dispatch.message_id in reply_headers:
-        score += 0.8
+        score += 0.6
         matched_on.append("in-reply-to")
     elif thread_ids & reply_headers:
         score += 0.6
         matched_on.append("thread")
 
-    if dispatch.supplier_email and email_response.from_address:
-        dispatch_email = _normalise_email_address(dispatch.supplier_email) or ""
-        response_email = _normalise_email_address(email_response.from_address) or ""
-        if dispatch_email and response_email:
-            if dispatch_email == response_email:
-                score += 0.6
-                matched_on.append("from")
-            else:
-                dispatch_domain = dispatch_email.split("@")[-1]
-                response_domain = response_email.split("@")[-1]
-                if dispatch_domain and response_domain and dispatch_domain == response_domain:
-                    score += 0.35
-                    matched_on.append("domain")
+    header_match = False
+    header_map = {key.lower(): value for key, value in email_response.headers.items()}
+    if dispatch.workflow_id and any(
+        str(dispatch.workflow_id).strip().lower() == str(value).strip().lower()
+        for value in header_map.get("x-procwise-workflow-id", ())
+    ):
+        header_match = True
+    if dispatch.unique_id and any(
+        str(dispatch.unique_id).strip().lower() == str(value).strip().lower()
+        for value in header_map.get("x-procwise-unique-id", ())
+    ):
+        header_match = True
+    thread_index_values = header_map.get("thread-index") or ()
+    if thread_index_values and dispatch.thread_headers.get("thread-index"):
+        dispatch_index = set(
+            str(item).strip().lower()
+            for item in dispatch.thread_headers.get("thread-index", ())
+        )
+        if dispatch_index & {str(val).strip().lower() for val in thread_index_values}:
+            header_match = True
+    if header_match:
+        score += 0.2
+        matched_on.append("headers")
 
     if dispatch.subject and email_response.subject:
         normalised_subject = _normalise_subject_line(dispatch.subject)
         response_subject = _normalise_subject_line(email_response.subject)
-        if normalised_subject and response_subject and normalised_subject in response_subject:
-            score += 0.5
+        if normalised_subject and response_subject and normalised_subject == response_subject:
+            score += 0.1
             matched_on.append("subject")
 
-    if dispatch.rfq_id and email_response.rfq_id:
-        if _normalise_identifier(dispatch.rfq_id) == _normalise_identifier(email_response.rfq_id):
-            score += 0.4
-            matched_on.append("rfq")
-
-    if dispatch.unique_id and email_response.body:
-        if dispatch.unique_id in email_response.body:
-            score += 0.25
-            matched_on.append("body_token")
+    dispatch_email = _normalise_email_address(dispatch.supplier_email)
+    response_email = (
+        _normalise_email_address(email_response.from_address)
+        or _normalise_email_address(email_response.supplier_email)
+    )
+    if dispatch_email and response_email and dispatch_email == response_email:
+        score += 0.1
+        matched_on.append("sender")
 
     return score, matched_on
 
@@ -527,7 +690,7 @@ class EmailWatcherV2:
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.45,
+        match_threshold: float = 0.7,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,
@@ -780,7 +943,24 @@ class EmailWatcherV2:
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
+        threshold = max(self.match_threshold, 0.7)
         for email in responses:
+            message_id = email.message_id or ""
+            fingerprint = _response_fingerprint(email)
+            if message_id and message_id in tracker.seen_message_ids:
+                logger.debug(
+                    "EmailWatcher deduped message_id workflow=%s message_id=%s",
+                    tracker.workflow_id,
+                    message_id,
+                )
+                continue
+            if fingerprint and fingerprint in tracker.seen_fingerprints:
+                logger.debug(
+                    "EmailWatcher deduped fingerprint workflow=%s fingerprint=%s",
+                    tracker.workflow_id,
+                    fingerprint,
+                )
+                continue
             matched_id: Optional[str] = None
             best_score = 0.0
             best_dispatch: Optional[EmailDispatchRecord] = None
@@ -840,10 +1020,10 @@ class EmailWatcherV2:
                     tracker.workflow_id,
                     matched_id,
                 )
-                best_score = max(best_score, self.match_threshold)
+                best_score = max(best_score, threshold)
                 best_dispatch = tracker.latest_dispatch(matched_id)
 
-            if matched_id and best_score >= self.match_threshold:
+            if matched_id and best_score >= threshold:
                 logger.debug(
                     "Matched response for workflow=%s unique_id=%s score=%.2f",
                     tracker.workflow_id,
@@ -861,6 +1041,9 @@ class EmailWatcherV2:
                     continue
                 tracker.record_response(matched_id, email)
                 elapsed = tracker.elapsed_seconds(email.received_at)
+                tracker.seen_message_ids.add(message_id)
+                if fingerprint:
+                    tracker.seen_fingerprints.add(fingerprint)
                 logger.info(
                     "EmailWatcher captured supplier response workflow=%s%s responded=%d/%d elapsed=%.1fs matched_on=%s best_score=%.2f",
                     tracker.workflow_id,
@@ -891,6 +1074,8 @@ class EmailWatcherV2:
                             response_time = Decimal(str(delta_seconds))
                     except Exception:  # pragma: no cover - defensive conversion
                         response_time = None
+                structured = extract_structured_fields(email)
+                matched_decimal = _score_to_confidence(best_score)
                 response_row = SupplierResponseRow(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
@@ -905,20 +1090,37 @@ class EmailWatcherV2:
                     response_from=email.from_address,
                     original_message_id=best_dispatch.message_id,
                     original_subject=best_dispatch.subject,
-                    match_confidence=_score_to_confidence(best_score),
+                    match_confidence=matched_decimal,
+                    match_score=matched_decimal,
                     match_evidence=best_reasons,
+                    matched_on=best_reasons,
                     raw_headers=email.headers,
+                    body_html=email.body_html,
+                    price=structured.get("price"),
+                    currency=structured.get("currency"),
+                    lead_time=structured.get("lead_time_days"),
+                    payment_terms=structured.get("payment_terms"),
+                    warranty=structured.get("warranty"),
+                    validity=structured.get("validity"),
+                    exceptions=structured.get("exceptions"),
+                    attachments=structured.get("attachments"),
+                    tables=structured.get("tables"),
                     processed=False,
                 )
                 supplier_response_repo.insert_response(response_row)
                 matched_rows.append(response_row)
             else:
+                reasons = best_reasons or ["insufficient-evidence"]
+                if message_id:
+                    tracker.seen_message_ids.add(message_id)
+                if fingerprint:
+                    tracker.seen_fingerprints.add(fingerprint)
                 logger.warning(
                     "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f matched_on=%s)",
                     tracker.workflow_id,
                     email.message_id,
                     best_score,
-                    best_reasons,
+                    reasons,
                 )
         return matched_rows
 
