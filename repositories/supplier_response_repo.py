@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -30,13 +31,16 @@ CREATE TABLE IF NOT EXISTS proc.supplier_response (
     original_message_id TEXT,
     original_subject TEXT,
     match_confidence NUMERIC(4, 2),
+    match_evidence JSONB,
+    raw_headers JSONB,
     price NUMERIC(18, 4),
     lead_time INTEGER,
     response_time NUMERIC(18, 6),
     received_time TIMESTAMPTZ,
     processed BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id)
+    CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id),
+    CONSTRAINT supplier_response_message_unique UNIQUE (workflow_id, response_message_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_supplier_response_wf
@@ -68,6 +72,8 @@ class SupplierResponseRow:
     original_message_id: Optional[str] = None
     original_subject: Optional[str] = None
     match_confidence: Optional[Decimal] = None
+    match_evidence: Optional[Sequence[str]] = None
+    raw_headers: Optional[Dict[str, Any]] = None
     processed: bool = False
 
 
@@ -85,6 +91,34 @@ def _serialise_decimal(value: Optional[Decimal]) -> Optional[str]:
 
 def _coerce_bool(value: Optional[bool]) -> bool:
     return bool(value)
+
+
+def _serialise_match_evidence(value: Optional[Sequence[str]]) -> Optional[str]:
+    if not value:
+        return None
+    items = [str(entry).strip() for entry in value if str(entry).strip()]
+    if not items:
+        return None
+    return json.dumps(items)
+
+
+def _serialise_headers(value: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not value:
+        return None
+    serialised: Dict[str, List[str]] = {}
+    for key, raw in value.items():
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, (list, tuple, set)):
+            entries = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            text = str(raw).strip()
+            entries = [text] if text else []
+        if entries:
+            serialised[str(key)] = entries
+    if not serialised:
+        return None
+    return json.dumps(serialised)
 
 
 def _ensure_postgres_column(cur, schema: str, table: str, column: str, definition: str) -> None:
@@ -121,8 +155,17 @@ def init_schema() -> None:
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_message_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_subject", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "match_confidence", "NUMERIC(4, 2)")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "match_evidence", "JSONB")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "raw_headers", "JSONB")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_time", "NUMERIC(18, 6)")
         _ensure_postgres_column(cur, "proc", "supplier_response", "processed", "BOOLEAN DEFAULT FALSE")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_response_message_unique
+            ON proc.supplier_response (workflow_id, response_message_id)
+            WHERE response_message_id IS NOT NULL
+            """
+        )
         cur.close()
 
 
@@ -144,15 +187,81 @@ def insert_response(row: SupplierResponseRow) -> None:
     processed = _coerce_bool(row.processed)
     response_date = received_time
     rfq_id = row.rfq_id or None
+    match_evidence = _serialise_match_evidence(row.match_evidence)
+    raw_headers = _serialise_headers(row.raw_headers)
 
     with get_conn() as conn:
         cur = conn.cursor()
+        if response_message_id:
+            cur.execute(
+                "SELECT unique_id FROM proc.supplier_response WHERE workflow_id=%s AND response_message_id=%s",
+                (row.workflow_id, response_message_id),
+            )
+            existing = cur.fetchone()
+            if existing:
+                update_q = (
+                    "UPDATE proc.supplier_response SET "
+                    "supplier_id=COALESCE(%s, supplier_id), "
+                    "supplier_email=COALESCE(%s, supplier_email), "
+                    "rfq_id=COALESCE(%s, rfq_id), "
+                    "response_text=%s, "
+                    "response_body=%s, "
+                    "response_subject=COALESCE(%s, response_subject), "
+                    "response_from=COALESCE(%s, response_from), "
+                    "response_date=COALESCE(%s, response_date), "
+                    "original_message_id=COALESCE(%s, original_message_id), "
+                    "original_subject=COALESCE(%s, original_subject), "
+                    "match_confidence=COALESCE(%s, match_confidence), "
+                    "price=COALESCE(%s, price), "
+                    "lead_time=COALESCE(%s, lead_time), "
+                    "response_time=COALESCE(%s, response_time), "
+                    "received_time=COALESCE(%s, received_time), "
+                    "match_evidence=COALESCE(%s, match_evidence), "
+                    "raw_headers=COALESCE(%s, raw_headers), "
+                    "processed=COALESCE(processed, FALSE) OR %s "
+                    "WHERE workflow_id=%s AND response_message_id=%s"
+                )
+                cur.execute(
+                    update_q,
+                    (
+                        row.supplier_id,
+                        supplier_email,
+                        rfq_id,
+                        response_text,
+                        response_body,
+                        response_subject,
+                        response_from,
+                        response_date,
+                        original_message_id,
+                        original_subject,
+                        match_confidence,
+                        price_value,
+                        row.lead_time,
+                        response_time,
+                        received_time,
+                        match_evidence,
+                        raw_headers,
+                        processed,
+                        row.workflow_id,
+                        response_message_id,
+                    ),
+                )
+                cur.close()
+                try:
+                    notify_response_received(workflow_id=row.workflow_id, unique_id=row.unique_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        "Failed to notify response coordinator for workflow=%s unique_id=%s",
+                        row.workflow_id,
+                        row.unique_id,
+                    )
+                return
         q = (
             "INSERT INTO proc.supplier_response "
             "(workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
-            "original_subject, match_confidence, price, lead_time, response_time, received_time, processed) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "original_subject, match_confidence, price, lead_time, response_time, received_time, match_evidence, raw_headers, processed) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
             "supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_response.supplier_id), "
             "supplier_email=COALESCE(EXCLUDED.supplier_email, proc.supplier_response.supplier_email), "
@@ -170,7 +279,9 @@ def insert_response(row: SupplierResponseRow) -> None:
             "lead_time=COALESCE(EXCLUDED.lead_time, proc.supplier_response.lead_time), "
             "response_time=COALESCE(EXCLUDED.response_time, proc.supplier_response.response_time), "
             "received_time=COALESCE(EXCLUDED.received_time, proc.supplier_response.received_time), "
-            "processed=EXCLUDED.processed"
+            "match_evidence=COALESCE(EXCLUDED.match_evidence, proc.supplier_response.match_evidence), "
+            "raw_headers=COALESCE(EXCLUDED.raw_headers, proc.supplier_response.raw_headers), "
+            "processed=proc.supplier_response.processed OR EXCLUDED.processed"
         )
         cur.execute(
             q,
@@ -193,6 +304,8 @@ def insert_response(row: SupplierResponseRow) -> None:
                 row.lead_time,
                 response_time,
                 received_time,
+                match_evidence,
+                raw_headers,
                 processed,
             ),
         )
@@ -301,7 +414,7 @@ def fetch_pending(
         q = (
             "SELECT workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
-            "original_subject, match_confidence, price, lead_time, received_time, processed "
+            "original_subject, match_confidence, match_evidence, raw_headers, price, lead_time, response_time, received_time, processed "
             "FROM proc.supplier_response "
             f"WHERE {' AND '.join(filters)}"
         )
@@ -318,7 +431,7 @@ def fetch_all(*, workflow_id: str) -> List[Dict[str, Any]]:
         q = (
             "SELECT workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, "
             "response_message_id, response_subject, response_from, response_date, original_message_id, "
-            "original_subject, match_confidence, price, lead_time, received_time, processed "
+            "original_subject, match_confidence, match_evidence, raw_headers, price, lead_time, response_time, received_time, processed "
             "FROM proc.supplier_response WHERE workflow_id=%s"
         )
         cur.execute(q, (workflow_id,))
@@ -367,4 +480,16 @@ def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault("processed", _coerce_bool(payload.get("processed")))
     payload.setdefault("body_text", payload.get("response_text"))
     payload.setdefault("body_html", payload.get("response_body"))
+    evidence = payload.get("match_evidence")
+    if isinstance(evidence, str):
+        try:
+            payload["match_evidence"] = json.loads(evidence)
+        except Exception:
+            pass
+    headers = payload.get("raw_headers")
+    if isinstance(headers, str):
+        try:
+            payload["raw_headers"] = json.loads(headers)
+        except Exception:
+            pass
     return payload
