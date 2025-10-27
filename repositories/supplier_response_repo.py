@@ -139,6 +139,42 @@ def _ensure_postgres_column(cur, schema: str, table: str, column: str, definitio
     )
 
 
+def _remove_duplicate_response_message_ids(cur) -> None:
+    """Remove duplicate rows that share the same workflow/message identifier."""
+
+    cur.execute(
+        """
+        WITH duplicates AS (
+            SELECT id
+            FROM (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY workflow_id, response_message_id
+                        ORDER BY
+                            COALESCE(processed, FALSE) DESC,
+                            created_at DESC,
+                            id DESC
+                    ) AS rn
+                FROM proc.supplier_response
+                WHERE response_message_id IS NOT NULL
+            ) ranked
+            WHERE rn > 1
+        )
+        DELETE FROM proc.supplier_response sr
+        USING duplicates d
+        WHERE sr.id = d.id
+        RETURNING sr.workflow_id, sr.response_message_id
+        """
+    )
+
+    removed = cur.fetchall()
+    if removed:
+        logger.warning(
+            "Removed %d duplicate supplier responses prior to creating message id index", len(removed)
+        )
+
+
 def init_schema() -> None:
     with get_conn() as conn:
         cur = conn.cursor()
@@ -159,6 +195,7 @@ def init_schema() -> None:
         _ensure_postgres_column(cur, "proc", "supplier_response", "raw_headers", "JSONB")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_time", "NUMERIC(18, 6)")
         _ensure_postgres_column(cur, "proc", "supplier_response", "processed", "BOOLEAN DEFAULT FALSE")
+        _remove_duplicate_response_message_ids(cur)
         cur.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_response_message_unique
