@@ -16,6 +16,7 @@ from decimal import Decimal
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
+from services import supplier_response_coordinator
 from utils.email_tracking import (
     embed_unique_id_in_email_body,
     extract_unique_id_from_body,
@@ -159,10 +160,14 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
 
     assert result["complete"] is True
     assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert result["expected_responses"] == 1
+    assert result["timeout_reached"] is False
     assert supplier_agent.contexts, "Supplier agent should be invoked"
     assert fetcher.calls >= 1
 
     context = supplier_agent.contexts[0]
+    assert context.input_data.get("workflow_status") == "responses_complete"
     assert context.input_data.get("rfq_id") == "RFQ-2024-0001"
     assert context.input_data["email_headers"].get("rfq_id") == "RFQ-2024-0001"
 
@@ -245,6 +250,9 @@ def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
 
     assert result["complete"] is True
     assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert result["expected_responses"] == 1
+    assert result["timeout_reached"] is False
 
     rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
     assert len(rows) == 1
@@ -353,6 +361,9 @@ def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path
 
     assert result["complete"] is True
     assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert result["expected_responses"] == 1
+    assert result["timeout_reached"] is False
     assert supplier_agent.contexts, "Supplier agent should still be invoked via fallback"
 
 
@@ -425,7 +436,37 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
 
     assert result["complete"] is True
     assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert result["expected_responses"] == 1
+    assert result["timeout_reached"] is False
     assert supplier_agent.contexts, "Supplier agent should run on RFQ fallback"
     context = supplier_agent.contexts[0]
+    assert context.input_data.get("workflow_status") == "responses_complete"
     assert context.input_data.get("rfq_id") == rfq_identifier
     assert context.input_data.get("unique_id") == unique_id
+@pytest.fixture(autouse=True)
+def _stub_response_coordinator(monkeypatch):
+    class _Coordinator:
+        def __init__(self) -> None:
+            self.registered = []
+            self.recorded = []
+
+        def register_expected_responses(self, workflow_id, unique_ids, expected_count):
+            self.registered.append((workflow_id, list(unique_ids), expected_count))
+
+        def record_response(self, workflow_id, unique_id):
+            self.recorded.append((workflow_id, unique_id))
+
+        def await_completion(self, workflow_id, timeout):  # pragma: no cover - stub
+            return None
+
+        def clear(self, workflow_id):  # pragma: no cover - stub
+            return None
+
+    coordinator = _Coordinator()
+    monkeypatch.setattr(
+        supplier_response_coordinator,
+        "get_supplier_response_coordinator",
+        lambda: coordinator,
+    )
+    return coordinator
