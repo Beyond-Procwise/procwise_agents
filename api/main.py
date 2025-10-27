@@ -14,7 +14,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.model_training_endpoint import ModelTrainingEndpoint
-from services.email_watcher_service import EmailWatcherService
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
@@ -83,13 +82,7 @@ async def lifespan(app: FastAPI):
         )
         app.state.orchestrator = orchestrator
         app.state.rag_pipeline = RAGPipeline(agent_nick)
-        email_watcher_service = EmailWatcherService(
-            agent_registry=agent_nick.agents,
-            orchestrator=orchestrator,
-            supplier_agent=supplier_interaction_agent,
-            negotiation_agent=negotiation_agent,
-        )
-        email_watcher_service.start()
+        email_watcher_service = orchestrator.backend_scheduler.get_email_watcher_service()
         app.state.email_watcher_service = email_watcher_service
         logger.info("System initialized successfully.")
     except Exception as e:
