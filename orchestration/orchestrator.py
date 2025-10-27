@@ -1700,14 +1700,57 @@ class Orchestrator:
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
         coordinator = SupplierResponseWorkflow()
-        readiness = coordinator.ensure_ready(
-            workflow_id=workflow_hint,
-            unique_ids=unique_ids,
-            dispatch_timeout=dispatch_timeout,
-            dispatch_poll_interval=dispatch_poll,
-            response_timeout=response_timeout,
-            response_poll_interval=response_poll,
-        )
+        readiness: Dict[str, Dict[str, object]] = {}
+
+        expected_email_count = len(tracked_unique_ids) or drafted_email_count
+
+        try:
+            readiness = coordinator.ensure_ready(
+                workflow_id=workflow_hint,
+                unique_ids=unique_ids,
+                dispatch_timeout=dispatch_timeout,
+                dispatch_poll_interval=dispatch_poll,
+                response_timeout=response_timeout,
+                response_poll_interval=response_poll,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Supplier response readiness timed out for workflow=%s",
+                workflow_hint,
+            )
+            normalised_ids = list(tracked_unique_ids) or [
+                uid for uid in unique_ids if uid
+            ]
+            readiness = {
+                "activation": {
+                    "activated": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "unique_ids": normalised_ids,
+                },
+                "dispatch": {
+                    "complete": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "expected_dispatches": expected_email_count,
+                    "completed_dispatches": 0,
+                    "unique_ids": normalised_ids,
+                },
+                "responses": {
+                    "complete": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "expected_responses": expected_email_count,
+                    "completed_responses": 0,
+                    "unique_ids": normalised_ids,
+                },
+            }
+        except Exception:
+            logger.exception(
+                "Failed to coordinate supplier response readiness for workflow=%s",
+                workflow_hint,
+            )
+            readiness = {}
 
         supplier_input: Dict[str, Any] = {}
         if email_result and email_result.pass_fields:
@@ -1715,7 +1758,6 @@ class Orchestrator:
         if isinstance(supplier_payload, dict):
             supplier_input.update(supplier_payload)
         supplier_input["drafts"] = email_drafts
-        expected_email_count = len(tracked_unique_ids) or drafted_email_count
         supplier_input.setdefault("expected_dispatch_count", expected_email_count)
         # Retain legacy key for agents that still inspect the historical field.
         supplier_input.setdefault("expected_email_count", expected_email_count)
@@ -1754,6 +1796,20 @@ class Orchestrator:
             workflow_hint,
             getattr(supplier_result, "status", None),
         )
+
+        scheduler = getattr(self, "backend_scheduler", None)
+        if (
+            workflow_hint
+            and scheduler
+            and hasattr(scheduler, "notify_email_dispatch")
+        ):
+            try:
+                scheduler.notify_email_dispatch(workflow_hint)
+            except Exception:
+                logger.exception(
+                    "Failed to notify email watcher for workflow=%s from orchestrator",
+                    workflow_hint,
+                )
 
         negotiation_result = None
         if (
@@ -1803,8 +1859,8 @@ class Orchestrator:
 
         results: Dict[str, Any] = {
             "email_drafting": email_data,
-            "dispatch_monitor": readiness.get("dispatch"),
-            "response_monitor": readiness.get("responses"),
+            "dispatch_monitor": readiness.get("dispatch") if readiness else None,
+            "response_monitor": readiness.get("responses") if readiness else None,
             "activation_monitor": activation_summary,
             "supplier_interaction": supplier_result.data if supplier_result else {},
             "expected_email_count": expected_email_count,

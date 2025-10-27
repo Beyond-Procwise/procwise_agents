@@ -152,8 +152,14 @@ def patch_dependencies(monkeypatch):
 
 def test_supplier_workflow_coordinates_agents(monkeypatch):
     email_agent = StubEmailAgent()
-    supplier_agent = StubSupplierAgent()
     coordinator = StubCoordinator()
+
+    class CheckingSupplierAgent(StubSupplierAgent):
+        def execute(self, context):
+            assert coordinator.calls, "supplier readiness must be ensured before execution"
+            return super().execute(context)
+
+    supplier_agent = CheckingSupplierAgent()
 
     monkeypatch.setattr(
         patch_dependencies, "coordinator", coordinator, raising=False
@@ -186,6 +192,74 @@ def test_supplier_workflow_coordinates_agents(monkeypatch):
     assert result["dispatch_monitor"]["complete"] is True
     assert result["response_monitor"]["complete"] is False
     assert result["supplier_interaction"]["processed"] is True
+
+
+def test_supplier_workflow_handles_readiness_timeout(monkeypatch):
+    email_agent = StubEmailAgent()
+
+    class TimeoutCoordinator:
+        def __init__(self):
+            self.calls = []
+
+        def ensure_ready(
+            self,
+            *,
+            workflow_id,
+            unique_ids,
+            dispatch_timeout,
+            dispatch_poll_interval,
+            response_timeout,
+            response_poll_interval,
+        ):
+            self.calls.append(
+                {
+                    "workflow_id": workflow_id,
+                    "unique_ids": list(unique_ids),
+                    "dispatch_timeout": dispatch_timeout,
+                    "dispatch_poll_interval": dispatch_poll_interval,
+                    "response_timeout": response_timeout,
+                    "response_poll_interval": response_poll_interval,
+                }
+            )
+            raise TimeoutError("readiness timeout")
+
+    coordinator = TimeoutCoordinator()
+
+    class CheckingSupplierAgent(StubSupplierAgent):
+        def execute(self, context):
+            assert coordinator.calls, "supplier readiness must be ensured before execution"
+            return super().execute(context)
+
+    supplier_agent = CheckingSupplierAgent()
+    monkeypatch.setattr(patch_dependencies, "coordinator", coordinator, raising=False)
+
+    nick = StubNick(email_agent, supplier_agent)
+    orchestrator = Orchestrator(nick)
+
+    response = orchestrator.execute_workflow(
+        "supplier_interaction",
+        {
+            "draft_payload": {"subject": "RFQ"},
+            "dispatch_poll_interval": 2,
+            "dispatch_timeout_seconds": 15,
+            "response_timeout_seconds": 20,
+            "response_poll_interval": 3,
+        },
+    )
+
+    result = response.get("result", {})
+
+    assert email_agent.calls
+    assert supplier_agent.calls
+    activation_monitor = result.get("activation_monitor")
+    dispatch_monitor = result.get("dispatch_monitor")
+    response_monitor = result.get("response_monitor")
+
+    assert activation_monitor
+    assert activation_monitor.get("timed_out") is True
+    assert dispatch_monitor and dispatch_monitor.get("timed_out") is True
+    assert response_monitor and response_monitor.get("timed_out") is True
+    assert result.get("supplier_interaction", {}).get("processed") is True
 
 
 def test_supplier_workflow_realigns_draft_workflow_ids(monkeypatch):
