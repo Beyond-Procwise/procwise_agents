@@ -368,6 +368,80 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert _BackendSchedulerProxy.notifications == [result["workflow_id"]]
 
 
+def test_email_dispatch_service_defaults_to_workflow_tracking(monkeypatch):
+    _BackendSchedulerProxy.notifications.clear()
+
+    store = InMemoryDraftStore()
+    unique_id = "PROC-WF-AUTO-001"
+    draft_payload = {
+        "rfq_id": "RFQ-AUTO",
+        "subject": DEFAULT_RFQ_SUBJECT,
+        "body": "<p>Auto</p>",
+        "receiver": "buyer@example.com",
+        "recipients": ["buyer@example.com"],
+        "sender": "sender@example.com",
+        "thread_index": 1,
+        "contact_level": 1,
+        "sent_status": False,
+        "action_id": "action-auto",
+        "workflow_id": "wf-auto",
+        "unique_id": unique_id,
+    }
+    store.add(
+        {
+            "rfq_id": "RFQ-AUTO",
+            "supplier_id": "S-AUTO",
+            "supplier_name": "Auto Supplier",
+            "subject": draft_payload["subject"],
+            "body": draft_payload["body"],
+            "sent": False,
+            "recipient_email": None,
+            "contact_level": 0,
+            "thread_index": 1,
+            "sender": "sender@example.com",
+            "payload": json.dumps(draft_payload),
+            "sent_on": None,
+            "workflow_id": "wf-auto",
+            "unique_id": unique_id,
+        }
+    )
+
+    action_store = InMemoryActionStore()
+    action_store.update(
+        "action-auto",
+        json.dumps(
+            {
+                "drafts": [draft_payload],
+                "rfq_id": "RFQ-AUTO",
+                "unique_id": unique_id,
+                "sent_status": False,
+            }
+        ),
+    )
+
+    nick = DummyNick(store, action_store)
+    service = EmailDispatchService(nick)
+
+    monkeypatch.setattr(
+        service.email_service,
+        "send_email",
+        lambda *_, **__: EmailSendResult(True, "<message-id-auto>"),
+    )
+
+    result = service.send_draft(unique_id)
+
+    assert result["sent"] is True
+    assert result["workflow_id"] == "wf-auto"
+    assert result["workflow_email"] is True
+
+    workflow_email_tracking_repo.init_schema()
+    stored_rows = workflow_email_tracking_repo.load_workflow_rows(
+        workflow_id="wf-auto"
+    )
+    assert any(row.unique_id == unique_id for row in stored_rows)
+    assert _BackendSchedulerProxy.notifications == ["wf-auto"]
+
+
 def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
     _BackendSchedulerProxy.notifications.clear()
 

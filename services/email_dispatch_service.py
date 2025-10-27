@@ -224,7 +224,6 @@ class EmailDispatchService:
             ):
                 workflow_email_flag = True
 
-            should_record_workflow = bool(workflow_email_flag) if workflow_email_flag is not None else False
             if workflow_email_flag is not None:
                 draft_metadata["workflow_email"] = bool(workflow_email_flag)
 
@@ -377,6 +376,15 @@ class EmailDispatchService:
                         backend_metadata.setdefault(
                             "workflow_context_identifier", context_unique_id
                         )
+                if workflow_email_flag is None and workflow_identifier:
+                    workflow_email_flag = True
+                    draft_metadata["workflow_email"] = True
+                    dispatch_payload["workflow_email"] = True
+                    metadata_payload = dispatch_payload.get("metadata")
+                    if isinstance(metadata_payload, dict):
+                        metadata_payload["workflow_email"] = True
+
+                should_record_workflow = bool(workflow_email_flag)
                 if should_record_workflow and workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
