@@ -365,7 +365,8 @@ def run_email_watcher_for_workflow(
     pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_key)
     responses = [_serialise_response(row, mailbox) for row in pending_rows]
 
-    status = "processed" if result.get("complete") else "not_ready"
+    workflow_status = result.get("workflow_status")
+    status = workflow_status or ("processed" if result.get("complete") else "not_ready")
 
     response_payload = {
         "status": status,
@@ -375,9 +376,18 @@ def run_email_watcher_for_workflow(
         "rows": responses,
         "matched_unique_ids": matched_ids,
     }
+    if workflow_status:
+        response_payload["workflow_status"] = workflow_status
+    if "expected_responses" in result:
+        response_payload["expected_responses"] = result.get("expected_responses")
+    if "elapsed_seconds" in result:
+        response_payload["elapsed_seconds"] = result.get("elapsed_seconds")
+    if "timeout_reached" in result:
+        response_payload["timeout_reached"] = bool(result.get("timeout_reached"))
 
     expected_ids = {row.unique_id for row in dispatch_rows}
-    if status != "processed":
+    terminal_statuses = {"processed", "responses_complete"}
+    if status not in terminal_statuses:
         missing = sorted(expected_ids - set(matched_ids))
         response_payload["reason"] = (
             "Not all responses received"

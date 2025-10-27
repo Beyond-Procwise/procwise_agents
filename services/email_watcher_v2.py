@@ -15,7 +15,7 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
@@ -34,6 +34,7 @@ from utils.email_tracking import (
     extract_unique_id_from_headers,
 )
 from utils import email_tracking
+from services.supplier_response_coordinator import get_supplier_response_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class EmailDispatchRecord:
     rfq_id: Optional[str] = None
     thread_headers: Dict[str, str] = field(default_factory=dict)
     dispatched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    round_number: Optional[int] = None
 
 
 @dataclass
@@ -61,6 +63,8 @@ class EmailResponse:
     subject: Optional[str]
     body: str
     received_at: datetime
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
     in_reply_to: Sequence[str] = field(default_factory=tuple)
     references: Sequence[str] = field(default_factory=tuple)
     workflow_id: Optional[str] = None
@@ -72,6 +76,7 @@ class WorkflowTracker:
     workflow_id: str
     dispatched_count: int = 0
     responded_count: int = 0
+    expected_responses: int = 0
     email_records: Dict[str, List[EmailDispatchRecord]] = field(default_factory=dict)
     matched_responses: Dict[str, EmailResponse] = field(default_factory=dict)
     response_history: Dict[str, List[EmailResponse]] = field(default_factory=dict)
@@ -80,12 +85,18 @@ class WorkflowTracker:
     all_dispatched: bool = False
     all_responded: bool = False
     last_dispatched_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    last_response_at: Optional[datetime] = None
+    round_index: Dict[str, Optional[int]] = field(default_factory=dict)
+    completion_logged: bool = False
 
     def register_dispatches(self, dispatches: Iterable[EmailDispatchRecord]) -> None:
         for dispatch in dispatches:
             bucket = self.email_records.setdefault(dispatch.unique_id, [])
             bucket.append(dispatch)
             bucket.sort(key=lambda item: item.dispatched_at or datetime.min)
+            if dispatch.round_number is not None:
+                self.round_index[dispatch.unique_id] = dispatch.round_number
             if dispatch.rfq_id:
                 normalised = _normalise_identifier(dispatch.rfq_id)
                 if normalised:
@@ -94,9 +105,14 @@ class WorkflowTracker:
                 self.last_dispatched_at is None or dispatch.dispatched_at > self.last_dispatched_at
             ):
                 self.last_dispatched_at = dispatch.dispatched_at
+            if dispatch.dispatched_at and (
+                self.started_at is None or dispatch.dispatched_at < self.started_at
+            ):
+                self.started_at = dispatch.dispatched_at
         self.dispatched_count = len(self.email_records)
+        self.expected_responses = self.dispatched_count
         self.all_dispatched = True
-        self.all_responded = self.responded_count >= self.dispatched_count > 0
+        self.all_responded = self.responded_count >= self.expected_responses > 0
 
     def record_response(self, unique_id: str, response: EmailResponse) -> None:
         if unique_id not in self.email_records:
@@ -113,7 +129,8 @@ class WorkflowTracker:
             # keep counts consistent even if new dispatches arrive later
             self.responded_count = len(self.responded_unique_ids)
 
-        self.all_responded = self.responded_count >= self.dispatched_count > 0
+        self.last_response_at = response.received_at or self.last_response_at
+        self.all_responded = self.responded_count >= self.expected_responses > 0
 
     def latest_dispatch(self, unique_id: str) -> Optional[EmailDispatchRecord]:
         records = self.email_records.get(unique_id)
@@ -127,6 +144,32 @@ class WorkflowTracker:
         if history:
             return history[-1]
         return self.matched_responses.get(unique_id)
+
+    def elapsed_seconds(self, now: Optional[datetime] = None) -> float:
+        """Return elapsed seconds from the first dispatch to ``now``."""
+
+        reference = self.started_at or self.last_dispatched_at
+        if reference is None:
+            return 0.0
+        moment = now or datetime.now(timezone.utc)
+        try:
+            delta = (moment - reference).total_seconds()
+        except Exception:  # pragma: no cover - defensive arithmetic
+            return 0.0
+        return float(delta) if delta >= 0 else 0.0
+
+    def distinct_rounds(self) -> List[int]:
+        rounds = {
+            value
+            for value in self.round_index.values()
+            if isinstance(value, int) and value >= 0
+        }
+        return sorted(rounds)
+
+    def round_for_unique(self, unique_id: Optional[str]) -> Optional[int]:
+        if not unique_id:
+            return None
+        return self.round_index.get(unique_id)
 
 
 def _imap_client(
@@ -168,14 +211,19 @@ def _extract_thread_ids(message: EmailMessage) -> Dict[str, Sequence[str]]:
     return {"references": refs, "in_reply_to": in_reply}
 
 
-def _extract_plain_text(message: EmailMessage) -> str:
+def _extract_plain_text(message: EmailMessage) -> Tuple[str, Optional[str]]:
+    plain_text: Optional[str] = None
+    html_text: Optional[str] = None
     if message.is_multipart():
         for part in message.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/plain" and "attachment" not in disp:
                 try:
-                    return part.get_content().strip()
+                    content = part.get_content()
+                    if content is not None:
+                        plain_text = str(content).strip()
+                        break
                 except Exception:
                     continue
         for part in message.walk():
@@ -183,11 +231,22 @@ def _extract_plain_text(message: EmailMessage) -> str:
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/html" and "attachment" not in disp:
                 try:
-                    return part.get_content()
+                    content = part.get_content()
+                    if content is not None:
+                        html_text = str(content)
+                        break
                 except Exception:
                     continue
-        return ""
-    return message.get_content() if message.get_content() else ""
+    else:
+        content = message.get_content()
+        if content is not None:
+            if (message.get_content_type() or "").lower() == "text/html":
+                html_text = str(content)
+            else:
+                plain_text = str(content)
+    if plain_text is None and html_text is not None:
+        plain_text = html_text
+    return (plain_text or "", html_text)
 
 
 def _parse_email(raw: bytes) -> EmailResponse:
@@ -195,7 +254,8 @@ def _parse_email(raw: bytes) -> EmailResponse:
     subject = message.get("Subject")
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
-    body = _extract_plain_text(message)
+    plain_body, html_body = _extract_plain_text(message)
+    body = plain_body or html_body or ""
     header_map = {
         key: message.get_all(key, failobj=[])
         for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
@@ -246,7 +306,9 @@ def _parse_email(raw: bytes) -> EmailResponse:
         from_address=from_address,
         message_id=message_id,
         subject=subject,
-        body=body or "",
+        body=body,
+        body_text=plain_body or body,
+        body_html=html_body,
         received_at=received_at,
         in_reply_to=thread_ids.get("in_reply_to", ()),
         references=thread_ids.get("references", ()),
@@ -276,6 +338,16 @@ def _normalise_email_address(value: Optional[str]) -> Optional[str]:
     _, address = parseaddr(str(value))
     address = address.strip().lower()
     return address or None
+
+
+def _coerce_round_number(value: Optional[object]) -> Optional[int]:
+    if value in (None, "", False):
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _default_fetcher(
@@ -403,6 +475,7 @@ class EmailWatcherV2:
         imap_login: Optional[str] = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        max_total_wait_seconds: Optional[int] = None,
     ) -> None:
         self.supplier_agent = supplier_agent
         self.negotiation_agent = negotiation_agent
@@ -420,6 +493,14 @@ class EmailWatcherV2:
         self._imap_login = imap_login
         self._sleep = sleep
         self._now = now
+        baseline_timeout = self.poll_interval_seconds * self.max_poll_attempts * 3
+        derived_timeout = max(self.dispatch_wait_seconds, baseline_timeout)
+        if max_total_wait_seconds is not None:
+            try:
+                derived_timeout = max(0, int(max_total_wait_seconds))
+            except Exception:  # pragma: no cover - defensive conversion
+                derived_timeout = max(self.dispatch_wait_seconds, baseline_timeout)
+        self.max_total_wait_seconds = derived_timeout if derived_timeout > 0 else None
         self._trackers: Dict[str, WorkflowTracker] = {}
 
         tracking_repo.init_schema()
@@ -473,6 +554,7 @@ class EmailWatcherV2:
             raise ValueError("workflow_id is required to register dispatches")
 
         tracker = self._ensure_tracker(workflow_id)
+        previous_unique_ids = set(tracker.email_records.keys())
         records: List[EmailDispatchRecord] = []
         repo_rows: List[WorkflowDispatchRow] = []
 
@@ -484,6 +566,11 @@ class EmailWatcherV2:
             subject = payload.get("subject")
             dispatched_at = payload.get("dispatched_at")
             rfq_id = payload.get("rfq_id")
+            round_number = _coerce_round_number(
+                payload.get("round_number")
+                or payload.get("round")
+                or payload.get("round_num")
+            )
             dispatch_key = str(
                 payload.get("dispatch_key")
                 or payload.get("message_id")
@@ -509,6 +596,7 @@ class EmailWatcherV2:
                     str(k): _normalise_thread_header(v) for k, v in raw_thread_headers.items()
                 },
                 dispatched_at=dispatched_dt,
+                round_number=round_number,
             )
             records.append(record)
             repo_rows.append(
@@ -534,7 +622,76 @@ class EmailWatcherV2:
 
         tracker.register_dispatches(records)
         tracking_repo.record_dispatches(workflow_id=workflow_id, dispatches=repo_rows)
+        if records:
+            batch_size = len(records)
+            self._register_expected_with_coordinator(tracker)
+            self._log_dispatch_registration(
+                tracker,
+                newly_added=max(0, tracker.expected_responses - len(previous_unique_ids)),
+                batch_size=batch_size,
+            )
         return tracker
+
+    def _register_expected_with_coordinator(self, tracker: WorkflowTracker) -> None:
+        unique_ids = list(tracker.email_records.keys())
+        if not unique_ids:
+            return
+        try:
+            coordinator = get_supplier_response_coordinator()
+        except Exception:
+            logger.exception(
+                "Failed to initialise supplier response coordinator for workflow %s",
+                tracker.workflow_id,
+            )
+            return
+        if not coordinator:
+            return
+        try:
+            coordinator.register_expected_responses(
+                tracker.workflow_id,
+                unique_ids,
+                max(len(unique_ids), tracker.expected_responses),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to register expected responses with coordinator for workflow %s",
+                tracker.workflow_id,
+            )
+
+    def _round_fragment(
+        self, tracker: WorkflowTracker, unique_id: Optional[str] = None
+    ) -> str:
+        if unique_id:
+            round_number = tracker.round_for_unique(unique_id)
+            if round_number is not None:
+                return f" round={round_number}"
+            return ""
+        rounds = tracker.distinct_rounds()
+        if rounds:
+            joined = ",".join(str(value) for value in rounds)
+            return f" rounds={joined}"
+        return ""
+
+    def _log_dispatch_registration(
+        self,
+        tracker: WorkflowTracker,
+        *,
+        newly_added: int,
+        batch_size: int,
+    ) -> None:
+        elapsed = tracker.elapsed_seconds(self._now())
+        round_fragment = self._round_fragment(tracker)
+        logger.info(
+            "EmailWatcher registered dispatch batch workflow=%s%s batch_size=%d new_unique=%d "
+            "expected_total=%d responded=%d elapsed=%.1fs",
+            tracker.workflow_id,
+            round_fragment,
+            batch_size,
+            newly_added,
+            tracker.expected_responses,
+            tracker.responded_count,
+            elapsed,
+        )
 
     def _fetch_emails(self, since: datetime) -> List[EmailResponse]:
         if self._fetcher:
@@ -634,6 +791,15 @@ class EmailWatcherV2:
                     )
                     continue
                 tracker.record_response(matched_id, email)
+                elapsed = tracker.elapsed_seconds(email.received_at)
+                logger.info(
+                    "EmailWatcher captured supplier response workflow=%s%s responded=%d/%d elapsed=%.1fs",
+                    tracker.workflow_id,
+                    self._round_fragment(tracker, matched_id),
+                    tracker.responded_count,
+                    tracker.expected_responses,
+                    elapsed,
+                )
                 tracking_repo.mark_response(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
@@ -659,6 +825,7 @@ class EmailWatcherV2:
                     unique_id=matched_id,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
+                    rfq_id=email.rfq_id or best_dispatch.rfq_id,
                     response_text=email.body,
                     received_time=email.received_at,
                     response_time=response_time,
@@ -704,16 +871,62 @@ class EmailWatcherV2:
                 )
                 self._sleep(wait_time)
 
-        attempts = 0
-        since = tracker.last_dispatched_at or (self._now() - timedelta(hours=4))
-        while attempts < self.max_poll_attempts and not tracker.all_responded:
+        idle_attempts = 0
+        timeout_reached = False
+        poll_started_at = self._now()
+        since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
+        while not tracker.all_responded:
+            now = self._now()
+            elapsed = tracker.elapsed_seconds(now)
+            runtime_elapsed = max(0.0, (now - poll_started_at).total_seconds())
+            if self.max_total_wait_seconds is not None and runtime_elapsed >= self.max_total_wait_seconds:
+                timeout_reached = True
+                logger.warning(
+                    "EmailWatcher timed out waiting for responses workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs",
+                    workflow_id,
+                    self._round_fragment(tracker),
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    elapsed,
+                    runtime_elapsed,
+                )
+                break
+
             responses = self._fetch_emails(since)
             matched_rows = self._match_responses(tracker, responses)
             if matched_rows:
                 self._process_agents(tracker)
             if tracker.all_responded:
                 break
-            attempts += 1
+
+            if responses or matched_rows:
+                idle_attempts = 0
+            else:
+                idle_attempts += 1
+
+            logger.info(
+                "EmailWatcher poll summary workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs idle_attempts=%d",
+                workflow_id,
+                self._round_fragment(tracker),
+                tracker.expected_responses,
+                tracker.responded_count,
+                elapsed,
+                runtime_elapsed,
+                idle_attempts,
+            )
+
+            if idle_attempts >= self.max_poll_attempts:
+                logger.info(
+                    "EmailWatcher entering idle backoff for workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs",
+                    workflow_id,
+                    self._round_fragment(tracker),
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    elapsed,
+                    runtime_elapsed,
+                )
+                break
+
             self._sleep(self.poll_interval_seconds)
 
         complete = tracker.all_responded
@@ -724,6 +937,12 @@ class EmailWatcherV2:
             "responded_count": tracker.responded_count,
             "matched_responses": tracker.matched_responses,
             "response_history": tracker.response_history,
+            "expected_responses": tracker.expected_responses,
+            "elapsed_seconds": tracker.elapsed_seconds(self._now()),
+            "timeout_reached": timeout_reached,
+            "workflow_status": "responses_complete"
+            if complete
+            else "awaiting_responses",
         }
 
         self._process_agents(tracker)
@@ -737,6 +956,16 @@ class EmailWatcherV2:
                 tracker.workflow_id,
             )
             return
+        if not tracker.completion_logged:
+            logger.info(
+                "EmailWatcher responses complete workflow=%s%s expected=%d responded=%d elapsed=%.1fs",
+                tracker.workflow_id,
+                self._round_fragment(tracker),
+                tracker.expected_responses,
+                tracker.responded_count,
+                tracker.elapsed_seconds(self._now()),
+            )
+            tracker.completion_logged = True
         pending_rows = supplier_response_repo.fetch_pending(workflow_id=tracker.workflow_id)
         if not pending_rows:
             return
@@ -773,6 +1002,7 @@ class EmailWatcherV2:
                 "supplier_id": supplier_id,
                 "supplier_email": supplier_email,
                 "action": "await_workflow_batch",
+                "workflow_status": "responses_complete",
             }
             if rfq_id:
                 input_payload["rfq_id"] = rfq_id
@@ -878,6 +1108,7 @@ class EmailWatcherV2:
                     "ready": True,
                 },
             )
+            negotiation_payload.setdefault("workflow_status", "responses_complete")
 
             if self.negotiation_agent is not None:
                 try:
