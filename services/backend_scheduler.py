@@ -61,6 +61,12 @@ class BackendScheduler:
         self._email_watcher_lock = threading.Lock()
         self._register_default_jobs()
         self.start()
+        # Ensure the email watcher service is running as soon as the scheduler
+        # is initialised so replies can be processed even after restarts.
+        try:
+            self._ensure_email_watcher_service()
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to start email watcher service during initialisation")
 
     @classmethod
     def ensure(
@@ -95,7 +101,21 @@ class BackendScheduler:
         self._relationship_scheduler = self._init_relationship_scheduler()
         if training_endpoint is not None:
             self._training_endpoint = training_endpoint
+        # Reinitialise the email watcher service so it reflects the new agent
+        # registry/orchestrator context.
+        with self._email_watcher_lock:
+            watcher = self._email_watcher_service
+            self._email_watcher_service = None
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("Failed to stop previous email watcher service")
         self._sync_training_job()
+        try:
+            self._ensure_email_watcher_service()
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to restart email watcher service after agent update")
 
     def start(self) -> None:
         with self._lock:
@@ -195,6 +215,11 @@ class BackendScheduler:
             service = self._email_watcher_service
         service.start()
         return service
+
+    def get_email_watcher_service(self) -> EmailWatcherService:
+        """Expose the active email watcher service instance."""
+
+        return self._ensure_email_watcher_service()
 
     def notify_email_dispatch(self, workflow_id: str) -> None:
         workflow_key = (workflow_id or "").strip()
