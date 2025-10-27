@@ -24,6 +24,7 @@ class DummyNick:
             script_user="tester",
             ses_default_sender="noreply@example.com",
             enable_learning=enable_learning,
+            hitl_enabled=True,
         )
         self.action_logs: List[Dict[str, Any]] = []
 
@@ -985,3 +986,139 @@ def test_negotiation_agent_adopts_workflow_from_drafts_when_mismatched(monkeypat
     assert len(entries) == 3
     assert all(entry.get("workflow_id") == "draft-workflow" for entry in entries)
     assert kwargs["enable_negotiation"] is False
+
+
+def test_multi_round_waits_for_hitl_before_second_round(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    def fake_resolve(self, context, payload):
+        supplier = payload.get("supplier_id")
+        round_no = int(payload.get("round") or 1)
+        data = {
+            "supplier": supplier,
+            "decision": {
+                "strategy": "counter",
+                "counter_price": 900.0 - round_no,
+                "currency": "USD",
+            },
+            "drafts": [
+                {
+                    "supplier_id": supplier,
+                    "unique_id": f"{supplier}-r{round_no}",
+                    "metadata": {"round": round_no},
+                }
+            ],
+        }
+        return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
+    monkeypatch.setattr(
+        NegotiationAgent,
+        "_resolve_batch_entry_output",
+        fake_resolve,
+    )
+
+    context = AgentContext(
+        workflow_id="wf-hitl",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={},
+    )
+
+    batch_entries = [
+        {"supplier_id": "S1", "current_offer": 1000.0},
+        {"supplier_id": "S2", "current_offer": 1100.0},
+    ]
+
+    shared_context = {"workflow_id": "wf-hitl"}
+
+    output = agent._run_multi_round_negotiation(
+        context,
+        batch_entries,
+        shared_context,
+        max_rounds=2,
+    )
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["hitl_pending_rounds"] == [1]
+    assert output.data["hitl_reviews"][0]["status"] == "pending"
+    assert output.data["ready_for_quote_evaluation"] is False
+    assert "QuoteEvaluationAgent" not in (output.next_agents or [])
+
+
+def test_multi_round_routes_to_quote_evaluation_after_hitl(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    def fake_resolve(self, context, payload):
+        supplier = payload.get("supplier_id")
+        round_no = int(payload.get("round") or 1)
+        counter_price = 900.0 - (round_no * 10)
+        data = {
+            "supplier": supplier,
+            "decision": {
+                "strategy": "counter",
+                "counter_price": counter_price,
+                "currency": "USD",
+            },
+            "drafts": [
+                {
+                    "supplier_id": supplier,
+                    "unique_id": f"{supplier}-r{round_no}",
+                    "metadata": {"round": round_no},
+                }
+            ],
+        }
+        return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
+    def fake_wait(self, context, round_result, round_num, negotiation_state):
+        responses: Dict[str, List[Dict[str, Any]]] = {}
+        for record in round_result.get("results", []):
+            supplier = record.get("supplier_id")
+            decision = record.get("decision") or {}
+            responses[supplier] = [
+                {
+                    "supplier_id": supplier,
+                    "price": decision.get("counter_price", 880.0),
+                }
+            ]
+        return responses, True
+
+    monkeypatch.setattr(
+        NegotiationAgent,
+        "_resolve_batch_entry_output",
+        fake_resolve,
+    )
+    monkeypatch.setattr(NegotiationAgent, "_wait_for_round_responses", fake_wait)
+
+    context = AgentContext(
+        workflow_id="wf-approved",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={},
+    )
+
+    batch_entries = [
+        {"supplier_id": "S1", "current_offer": 1000.0},
+        {"supplier_id": "S2", "current_offer": 1100.0},
+    ]
+
+    shared_context = {
+        "workflow_id": "wf-approved",
+        "hitl_decisions": {"1": "approved", "2": "approved"},
+    }
+
+    output = agent._run_multi_round_negotiation(
+        context,
+        batch_entries,
+        shared_context,
+        max_rounds=2,
+    )
+
+    assert output.status == AgentStatus.SUCCESS
+    assert output.data["hitl_pending_rounds"] == []
+    assert output.data["ready_for_quote_evaluation"] is True
+    assert output.next_agents == ["QuoteEvaluationAgent"]
+    quotes = output.data["final_quotes"]
+    assert quotes
+    assert {quote["supplier_id"] for quote in quotes} == {"S1", "S2"}
