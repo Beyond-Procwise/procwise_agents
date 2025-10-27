@@ -245,3 +245,58 @@ def test_run_email_watcher_uses_agent_registry(monkeypatch):
     assert captured.get("supplier_agent") is supplier_agent
     assert captured.get("negotiation_agent") is negotiation_agent
     assert result["status"] == "not_ready"
+
+
+def test_watcher_accepts_login_without_username(monkeypatch):
+    from services import email_watcher_service
+
+    env_values = {
+        "IMAP_HOST": "imap.test",
+        "IMAP_LOGIN": "login@test",
+        "IMAP_PASSWORD": "secret",
+    }
+
+    monkeypatch.setattr(email_watcher_service, "app_settings", None)
+    monkeypatch.setattr(email_watcher_service, "_env", lambda key, default=None: env_values.get(key, default))
+    monkeypatch.setattr(email_watcher_service, "_setting", lambda *args: None)
+    monkeypatch.setattr(
+        email_watcher_service,
+        "_load_dispatch_rows",
+        lambda workflow_id: [_sample_row()],
+    )
+    monkeypatch.setattr(
+        email_watcher_service.supplier_response_repo,
+        "fetch_pending",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        email_watcher_service.supplier_response_repo,
+        "delete_responses",
+        lambda **kwargs: None,
+    )
+
+    captured = {}
+
+    class _FakeWatcher:
+        def __init__(self, *, imap_username=None, imap_login=None, **kwargs):
+            captured["imap_username"] = imap_username
+            captured["imap_login"] = imap_login
+
+        def wait_and_collect_responses(self, workflow_id):
+            return {
+                "complete": False,
+                "dispatched_count": 1,
+                "responded_count": 0,
+                "matched_responses": {},
+            }
+
+    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+
+    result = email_watcher_service.run_email_watcher_for_workflow(
+        workflow_id="wf-login",
+        run_id=None,
+    )
+
+    assert result["status"] == "not_ready"
+    assert captured.get("imap_login") == "login@test"
+    assert captured.get("imap_username") == "login@test"

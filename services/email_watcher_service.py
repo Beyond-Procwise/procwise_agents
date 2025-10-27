@@ -217,6 +217,8 @@ def run_email_watcher_for_workflow(
         return username
 
     imap_login = _pick_login()
+    if not imap_username and imap_login:
+        imap_username = imap_login.strip() or None
     try:
         imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
     except Exception:
@@ -244,7 +246,7 @@ def run_email_watcher_for_workflow(
         or "INBOX"
     )
 
-    if not all([imap_host, imap_username, imap_password]):
+    if not imap_host or not imap_password or not (imap_username or imap_login):
         logger.warning(
             "IMAP credentials are not configured; skipping EmailWatcherV2 (host=%s user=%s)",
             imap_host,
