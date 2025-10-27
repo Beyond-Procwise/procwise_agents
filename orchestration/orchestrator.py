@@ -92,7 +92,9 @@ class Orchestrator:
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
         self.model_training_endpoint = training_endpoint
         self.backend_scheduler = BackendScheduler.ensure(
-            agent_nick, training_endpoint=training_endpoint
+            agent_nick,
+            training_endpoint=training_endpoint,
+            orchestrator=self,
         )
         self.event_bus = get_event_bus()
         self.manifest_service = AgentManifestService(agent_nick)
