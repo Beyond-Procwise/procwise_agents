@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping, Set
 
 from utils.email_tracking import (
     build_tracking_comment,
@@ -17,6 +17,7 @@ from utils.email_tracking import (
 from utils.gpu import configure_gpu
 
 from services.backend_scheduler import BackendScheduler
+from repositories import draft_rfq_emails_repo, workflow_email_tracking_repo
 
 from .email_dispatch_chain_store import (
     record_dispatch as record_workflow_dispatch,
@@ -417,13 +418,25 @@ class EmailDispatchService:
                         )
                     else:
                         if notify_watcher:
-                            try:
-                                BackendScheduler.ensure(
-                                    self.agent_nick
-                                ).notify_email_dispatch(workflow_identifier)
-                            except Exception:  # pragma: no cover - defensive logging
-                                logger.exception(
-                                    "Failed to trigger email watcher for workflow %s",
+                            if self._should_notify_watcher(
+                                workflow_id=workflow_identifier,
+                                unique_id=unique_id,
+                                dispatch_context=dispatch_payload_context,
+                                dispatch_payload=dispatch_payload,
+                                backend_metadata=backend_metadata,
+                            ):
+                                try:
+                                    BackendScheduler.ensure(
+                                        self.agent_nick
+                                    ).notify_email_dispatch(workflow_identifier)
+                                except Exception:  # pragma: no cover - defensive logging
+                                    logger.exception(
+                                        "Failed to trigger email watcher for workflow %s",
+                                        workflow_identifier,
+                                    )
+                            else:
+                                self.logger.debug(
+                                    "Deferring email watcher notification for workflow %s until all dispatches complete",
                                     workflow_identifier,
                                 )
             elif message_id:
@@ -486,6 +499,224 @@ class EmailDispatchService:
                 if text:
                     cleaned[str(key)] = text
         return cleaned or None
+
+    @staticmethod
+    def _coerce_text(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return None
+
+    def _collect_expected_unique_ids(
+        self,
+        *,
+        unique_id: Optional[str],
+        metadata_sources: Sequence[Mapping[str, Any]],
+    ) -> Set[str]:
+        expected_ids: Set[str] = set()
+
+        def _extend(values: Any) -> None:
+            if values in (None, ""):
+                return
+            if isinstance(values, (list, tuple, set)):
+                for item in values:
+                    text = self._coerce_text(item)
+                    if text:
+                        expected_ids.add(text)
+            else:
+                if isinstance(values, str):
+                    text = values.strip()
+                    if not text:
+                        return
+                    parsed = None
+                    if text.startswith("[") and text.endswith("]"):
+                        try:
+                            parsed = json.loads(text)
+                        except Exception:
+                            try:
+                                parsed = json.loads(text.replace("'", '"'))
+                            except Exception:
+                                parsed = None
+                        if isinstance(parsed, (list, tuple, set)):
+                            _extend(parsed)
+                            return
+                    if "," in text:
+                        parts = [part.strip("'\" ") for part in text.split(",")]
+                        _extend([part for part in parts if part])
+                        return
+                    cleaned = text.strip("'\" ")
+                    if cleaned:
+                        expected_ids.add(cleaned)
+                else:
+                    text = self._coerce_text(values)
+                    if text:
+                        expected_ids.add(text)
+
+        if unique_id:
+            text = self._coerce_text(unique_id)
+            if text:
+                expected_ids.add(text)
+
+        for payload in metadata_sources:
+            for key in ("expected_unique_ids", "unique_ids"):
+                if key in payload:
+                    _extend(payload.get(key))
+            candidate = payload.get("unique_id")
+            if candidate:
+                _extend([candidate])
+
+        return expected_ids
+
+    def _resolve_expected_dispatches(
+        self,
+        *,
+        workflow_id: Optional[str],
+        unique_id: str,
+        dispatch_context: Optional[Mapping[str, Any]],
+        dispatch_payload: Mapping[str, Any],
+        backend_metadata: Mapping[str, Any],
+    ) -> Tuple[Set[str], Optional[int]]:
+        metadata_sources: List[Mapping[str, Any]] = []
+
+        for payload in (
+            dispatch_context,
+            dispatch_payload,
+            dispatch_payload.get("metadata") if isinstance(dispatch_payload, Mapping) else None,
+            dispatch_payload.get("workflow_context")
+            if isinstance(dispatch_payload.get("workflow_context"), Mapping)
+            else None,
+            backend_metadata,
+        ):
+            if isinstance(payload, Mapping):
+                metadata_sources.append(payload)
+
+        expected_count: Optional[int] = None
+        run_id_hint: Optional[str] = None
+
+        for payload in metadata_sources:
+            for key in (
+                "expected_dispatch_count",
+                "expected_dispatches",
+                "expected_email_count",
+            ):
+                if expected_count is None and key in payload:
+                    expected_count = self._coerce_int(payload.get(key))
+            if run_id_hint is None:
+                run_id_hint = self._coerce_text(
+                    payload.get("run_id") or payload.get("dispatch_run_id")
+                )
+
+        expected_ids = self._collect_expected_unique_ids(
+            unique_id=unique_id,
+            metadata_sources=metadata_sources,
+        )
+
+        repo_ids: Set[str] = set()
+        workflow_key = self._coerce_text(workflow_id)
+        if workflow_key:
+            try:
+                rows, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
+                    workflow_id=workflow_key,
+                    run_id=run_id_hint,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                self.logger.debug(
+                    "Failed to load expected dispatch identifiers for workflow %s",
+                    workflow_key,
+                    exc_info=True,
+                )
+            else:
+                for uid in rows:
+                    text = self._coerce_text(uid)
+                    if text:
+                        repo_ids.add(text)
+
+        if repo_ids:
+            expected_ids.update(repo_ids)
+            if expected_count is None:
+                expected_count = len(repo_ids)
+
+        if expected_count is not None and expected_count < 0:
+            expected_count = None
+
+        return expected_ids, expected_count
+
+    def _should_notify_watcher(
+        self,
+        *,
+        workflow_id: Optional[str],
+        unique_id: str,
+        dispatch_context: Optional[Mapping[str, Any]],
+        dispatch_payload: Mapping[str, Any],
+        backend_metadata: Mapping[str, Any],
+    ) -> bool:
+        workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key:
+            return True
+
+        expected_ids, expected_count = self._resolve_expected_dispatches(
+            workflow_id=workflow_key,
+            unique_id=unique_id,
+            dispatch_context=dispatch_context,
+            dispatch_payload=dispatch_payload,
+            backend_metadata=backend_metadata,
+        )
+
+        try:
+            workflow_email_tracking_repo.init_schema()
+            rows = workflow_email_tracking_repo.load_workflow_rows(
+                workflow_id=workflow_key
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to load dispatch rows while evaluating watcher notification for workflow %s",
+                workflow_key,
+            )
+            return True
+
+        dispatched_ids: Set[str] = {
+            self._coerce_text(row.unique_id)
+            for row in rows
+            if getattr(row, "message_id", None)
+            and self._coerce_text(row.unique_id)
+        }
+
+        filtered_expected = {uid for uid in expected_ids if uid}
+        if filtered_expected:
+            pending = sorted(filtered_expected - dispatched_ids)
+            if pending:
+                self.logger.debug(
+                    "Workflow %s dispatches pending for unique_ids: %s",
+                    workflow_key,
+                    ", ".join(pending),
+                )
+                return False
+            return True
+
+        if expected_count:
+            if len(dispatched_ids) >= expected_count:
+                return True
+            self.logger.debug(
+                "Workflow %s has %s/%s dispatches recorded; deferring watcher",
+                workflow_key,
+                len(dispatched_ids),
+                expected_count,
+            )
+            return False
+
+        return True
 
     def _fetch_latest_draft(self, conn, identifier: str) -> Optional[Tuple]:
         with conn.cursor() as cur:

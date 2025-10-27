@@ -596,3 +596,114 @@ def test_email_dispatch_service_deferred_watcher_notification(monkeypatch):
     )
     assert any(row.unique_id == unique_id for row in stored_rows)
     assert _BackendSchedulerProxy.notifications == []
+
+
+def test_email_dispatch_service_notifies_after_final_dispatch(monkeypatch):
+    _BackendSchedulerProxy.notifications.clear()
+
+    workflow_id = "wf-batch"
+    unique_ids = ["PROC-WF-B1", "PROC-WF-B2"]
+
+    store = InMemoryDraftStore()
+    action_store = InMemoryActionStore()
+
+    for index, uid in enumerate(unique_ids, start=1):
+        draft_payload = {
+            "rfq_id": f"RFQ-B{index}",
+            "subject": DEFAULT_RFQ_SUBJECT,
+            "body": f"<p>Batch {index}</p>",
+            "receiver": "buyer@example.com",
+            "recipients": ["buyer@example.com"],
+            "sender": "sender@example.com",
+            "thread_index": 1,
+            "contact_level": 1,
+            "sent_status": False,
+            "action_id": f"action-b{index}",
+            "workflow_id": workflow_id,
+            "unique_id": uid,
+        }
+        store.add(
+            {
+                "rfq_id": draft_payload["rfq_id"],
+                "supplier_id": f"S{index}",
+                "supplier_name": f"Batch {index}",
+                "subject": draft_payload["subject"],
+                "body": draft_payload["body"],
+                "sent": False,
+                "recipient_email": None,
+                "contact_level": 0,
+                "thread_index": 1,
+                "sender": "sender@example.com",
+                "payload": json.dumps(draft_payload),
+                "sent_on": None,
+                "workflow_id": workflow_id,
+                "unique_id": uid,
+            }
+        )
+        action_store.update(
+            f"action-b{index}",
+            json.dumps(
+                {
+                    "drafts": [draft_payload],
+                    "rfq_id": draft_payload["rfq_id"],
+                    "unique_id": uid,
+                    "sent_status": False,
+                }
+            ),
+        )
+
+    nick = DummyNick(store, action_store)
+    service = EmailDispatchService(nick)
+
+    def fake_send(subject, body, recipients, sender, attachments=None, **kwargs):
+        message_id = f"<message-{subject}>"
+        return EmailSendResult(True, message_id)
+
+    monkeypatch.setattr(service.email_service, "send_email", fake_send)
+
+    workflow_email_tracking_repo.init_schema()
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    dispatch_context = {
+        "workflow_id": workflow_id,
+        "expected_unique_ids": unique_ids,
+        "expected_dispatches": len(unique_ids),
+        "expected_dispatch_count": len(unique_ids),
+    }
+
+    first_result = service.send_draft(
+        unique_ids[0],
+        is_workflow_email=True,
+        workflow_dispatch_context=dispatch_context,
+    )
+
+    assert first_result["sent"] is True
+    assert _BackendSchedulerProxy.notifications == []
+
+    second_result = service.send_draft(
+        unique_ids[1],
+        is_workflow_email=True,
+        workflow_dispatch_context=dispatch_context,
+    )
+
+    assert second_result["sent"] is True
+    rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
+    recorded_ids = sorted(
+        [row.unique_id for row in rows if getattr(row, "message_id", None)]
+    )
+    assert recorded_ids == sorted(unique_ids)
+    expected_ids, expected_count = service._resolve_expected_dispatches(
+        workflow_id=workflow_id,
+        unique_id=unique_ids[1],
+        dispatch_context=dispatch_context,
+        dispatch_payload=second_result["draft"],
+        backend_metadata=second_result.get("workflow_context") or {},
+    )
+    dispatched_ids = {
+        service._coerce_text(row.unique_id)
+        for row in rows
+        if getattr(row, "message_id", None)
+    }
+    pending_ids = sorted(set(expected_ids) - dispatched_ids)
+    assert not pending_ids, pending_ids
+    assert _BackendSchedulerProxy.notifications == [workflow_id]
