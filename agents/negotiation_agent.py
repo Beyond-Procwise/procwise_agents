@@ -5,6 +5,7 @@ import os
 import re
 import binascii
 import threading
+import time
 from copy import deepcopy
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -2824,7 +2825,7 @@ class NegotiationAgent(BaseAgent):
             all_round_results.append(round_result)
 
             if round_num < max_rounds:
-                responses_received = self._wait_for_round_responses(
+                responses_received, all_received = self._wait_for_round_responses(
                     context=context,
                     round_result=round_result,
                     round_num=round_num,
@@ -2843,6 +2844,13 @@ class NegotiationAgent(BaseAgent):
                     negotiation_state,
                     round_num,
                 )
+
+                if not all_received:
+                    logger.warning(
+                        "Incomplete supplier responses for round %s; halting progression",
+                        round_num,
+                    )
+                    break
 
             remaining_active = [
                 supplier_id
@@ -3071,7 +3079,7 @@ class NegotiationAgent(BaseAgent):
         round_result: Dict[str, Any],
         round_num: int,
         negotiation_state: Dict[str, Any],
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], bool]:
         """Wait for supplier responses before commencing the next round."""
 
         drafts = round_result.get("drafts") or []
@@ -3079,16 +3087,35 @@ class NegotiationAgent(BaseAgent):
 
         if not drafts:
             logger.warning("No drafts to wait for in round %s", round_num)
-            return {}
+            return {}, False
+
+        expected_suppliers: Set[str] = set()
+        supplier_by_id: Dict[str, Dict[str, Any]] = {}
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            supplier_id = self._coerce_text(
+                draft.get("supplier_id") or draft.get("supplier")
+            )
+            if supplier_id:
+                expected_suppliers.add(supplier_id)
+                supplier_by_id[supplier_id] = draft
+
+        if not expected_suppliers:
+            logger.warning(
+                "Unable to determine suppliers for round %s drafts; aborting wait",
+                round_num,
+            )
+            return {}, False
 
         logger.info(
             "Waiting for %s supplier responses for round %s (workflow_id=%s)",
-            len(drafts),
+            len(expected_suppliers),
             round_num,
             workflow_id,
         )
 
-        watch_payload = self._build_round_watch_payload(
+        self._build_round_watch_payload(
             drafts=drafts,
             workflow_id=workflow_id,
             round_num=round_num,
@@ -3097,49 +3124,95 @@ class NegotiationAgent(BaseAgent):
 
         try:
             supplier_agent = self._get_supplier_agent()
-            timeout = self._calculate_round_timeout(len(drafts), round_num)
+            if supplier_agent is None:
+                logger.error(
+                    "SupplierInteractionAgent unavailable; cannot await round %s responses",
+                    round_num,
+                )
+                return {}, False
+            timeout = self._calculate_round_timeout(len(expected_suppliers), round_num)
             poll_interval = getattr(
                 self.agent_nick.settings, "email_response_poll_seconds", 60
             )
+
+            deadline = time.time() + timeout
+            pending_suppliers = set(expected_suppliers)
+            aggregated: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
             logger.info(
                 "Initiating response wait: timeout=%ss, poll_interval=%ss, expected_count=%s",
                 timeout,
                 poll_interval,
-                len(drafts),
+                len(expected_suppliers),
             )
 
-            responses = supplier_agent.wait_for_multiple_responses(
-                drafts,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                limit=len(drafts),
-                enable_negotiation=False,
-            )
+            while pending_suppliers and time.time() < deadline:
+                wait_drafts: List[Dict[str, Any]] = []
+                for supplier_id in pending_suppliers:
+                    draft = supplier_by_id.get(supplier_id)
+                    if isinstance(draft, dict):
+                        wait_drafts.append(draft)
 
-            if not responses:
-                logger.error(
-                    "No responses received for round %s within timeout %s", round_num, timeout
+                if not wait_drafts:
+                    break
+
+                remaining = max(1, int(deadline - time.time()))
+
+                responses = supplier_agent.wait_for_multiple_responses(
+                    wait_drafts,
+                    timeout=remaining,
+                    poll_interval=poll_interval,
+                    limit=len(wait_drafts),
+                    enable_negotiation=False,
                 )
-                return {}
 
-            supplier_responses = self._map_responses_to_suppliers(
-                responses,
-                drafts,
-                negotiation_state,
-            )
+                if not responses:
+                    logger.debug(
+                        "No supplier responses returned for round %s iteration; remaining suppliers=%s",
+                        round_num,
+                        sorted(pending_suppliers),
+                    )
+                    continue
 
+                mapped = self._map_responses_to_suppliers(
+                    [resp for resp in responses if isinstance(resp, dict)],
+                    wait_drafts,
+                    negotiation_state,
+                )
+
+                for supplier_id, supplier_responses in mapped.items():
+                    if not supplier_responses:
+                        continue
+                    aggregated[supplier_id].extend(supplier_responses)
+                    pending_suppliers.discard(supplier_id)
+
+                if pending_suppliers and time.time() < deadline:
+                    logger.info(
+                        "Still awaiting %s supplier responses in round %s: %s",
+                        len(pending_suppliers),
+                        round_num,
+                        sorted(pending_suppliers),
+                    )
+
+            if pending_suppliers:
+                logger.warning(
+                    "Timed out waiting for suppliers %s in round %s",
+                    sorted(pending_suppliers),
+                    round_num,
+                )
+
+            received_total = sum(len(responses) for responses in aggregated.values())
             logger.info(
                 "Received %s supplier responses for round %s",
-                len(supplier_responses),
+                received_total,
                 round_num,
             )
 
-            return supplier_responses
+            return dict(aggregated), not pending_suppliers
 
         except Exception:
             logger.exception("Failed to wait for round %s responses", round_num)
-            return {}
+            return {}, False
 
     def _calculate_round_timeout(self, supplier_count: int, round_num: int) -> int:
         """Compute the timeout for waiting on supplier responses for a round."""
@@ -10819,10 +10892,178 @@ class NegotiationAgent(BaseAgent):
                     "parent_agent": parent_context.agent_id,
                 },
             )
-            return email_agent.execute(email_context) if email_agent else None
+            email_output = email_agent.execute(email_context) if email_agent else None
+            if email_output is not None:
+                try:
+                    self._ensure_structured_html_output(email_output, payload)
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug(
+                        "Failed to post-process negotiation email HTML output",
+                        exc_info=True,
+                    )
+            return email_output
         except Exception:
             logger.exception("Failed to invoke EmailDraftingAgent for negotiation counter")
             return None
+
+    def _ensure_structured_html_output(
+        self, email_output: AgentOutput, payload: Dict[str, Any]
+    ) -> None:
+        """Ensure negotiation email outputs include structured HTML variants."""
+
+        if not isinstance(email_output, AgentOutput):
+            return
+        if email_output.status != AgentStatus.SUCCESS:
+            return
+
+        data = email_output.data
+        if not isinstance(data, dict):
+            return
+
+        email_agent = self._ensure_email_agent()
+
+        decision_payload: Dict[str, Any] = {}
+        for container in (data.get("decision"), payload.get("decision")):
+            if isinstance(container, dict):
+                decision_payload = dict(container)
+                break
+
+        round_candidate = None
+        for container in (data, payload, decision_payload):
+            if isinstance(container, dict):
+                for key in ("round", "round_number", "round_no"):
+                    if key in container:
+                        round_candidate = container.get(key)
+                        if round_candidate is not None:
+                            break
+                if round_candidate is not None:
+                    break
+        try:
+            round_number = int(float(round_candidate)) if round_candidate is not None else 1
+        except Exception:
+            round_number = 1
+
+        base_supplier_name = self._coerce_text(
+            payload.get("supplier_name") or payload.get("supplier")
+        )
+
+        base_contact_name = self._resolve_contact_name(payload)
+
+        currency_candidate = None
+        for container in (decision_payload, payload, data):
+            if isinstance(container, dict) and container.get("currency"):
+                currency_candidate = container.get("currency")
+                break
+
+        playbook_context = payload.get("playbook_context")
+        if not isinstance(playbook_context, dict):
+            playbook_context = (
+                data.get("playbook_context")
+                if isinstance(data.get("playbook_context"), dict)
+                else None
+            )
+
+        subject_fallback = (
+            self._coerce_text(data.get("subject"))
+            or self._coerce_text(payload.get("subject"))
+            or self._coerce_text(decision_payload.get("subject"))
+            or DEFAULT_NEGOTIATION_SUBJECT
+        )
+
+        body_fallback = (
+            self._coerce_text(data.get("body"))
+            or self._coerce_text(payload.get("negotiation_message"))
+            or self._coerce_text(payload.get("message"))
+            or ""
+        )
+
+        sender_name = getattr(getattr(self.agent_nick, "settings", None), "sender_name", None)
+
+        def _apply_html(container: Dict[str, Any], *, fallback_subject: str, fallback_body: str) -> None:
+            if not isinstance(container, dict):
+                return
+
+            existing_html = self._coerce_text(container.get("html") or container.get("body_html"))
+            if existing_html:
+                return
+
+            subject_text = self._coerce_text(container.get("subject")) or fallback_subject
+            body_text = (
+                self._coerce_text(container.get("body"))
+                or self._coerce_text(container.get("text"))
+                or fallback_body
+            )
+            if not body_text:
+                return
+
+            cleaned_body = EmailDraftingAgent._clean_body_text(body_text)
+            contact_name = self._resolve_contact_name(container, fallback=base_contact_name)
+
+            html_candidate = ""
+            try:
+                html_candidate = self._build_enhanced_html_email(
+                    round_number=round_number,
+                    contact_name=contact_name,
+                    supplier_name=base_supplier_name,
+                    decision=decision_payload,
+                    negotiation_message=cleaned_body,
+                    currency=currency_candidate,
+                    playbook_context=playbook_context,
+                    sender_name=sender_name,
+                )
+            except Exception:
+                logger.debug(
+                    "Enhanced negotiation HTML build failed; using fallback shell",
+                    exc_info=True,
+                )
+                html_candidate = ""
+
+            plain_text = cleaned_body
+            if not html_candidate:
+                try:
+                    html_candidate, derived_plain = self._build_negotiation_html_shell(
+                        subject=subject_text,
+                        cleaned_body=cleaned_body,
+                        email_agent=email_agent,
+                    )
+                    if derived_plain:
+                        plain_text = EmailDraftingAgent._clean_body_text(derived_plain)
+                except Exception:
+                    logger.debug(
+                        "Negotiation HTML shell build failed",
+                        exc_info=True,
+                    )
+                    html_candidate = ""
+            else:
+                if email_agent:
+                    try:
+                        derived_plain = email_agent._html_to_plain_text(html_candidate)
+                        if derived_plain:
+                            plain_text = EmailDraftingAgent._clean_body_text(derived_plain)
+                    except Exception:
+                        logger.debug(
+                            "Failed to extract plain text from enhanced negotiation HTML",
+                            exc_info=True,
+                        )
+
+            if not html_candidate:
+                return
+
+            container["html"] = html_candidate
+            container.setdefault("body_html", html_candidate)
+            if plain_text:
+                container.setdefault("text", plain_text)
+
+        _apply_html(data, fallback_subject=subject_fallback, fallback_body=body_fallback)
+
+        drafts_payload = data.get("drafts")
+        if isinstance(drafts_payload, list):
+            for draft in drafts_payload:
+                _apply_html(
+                    draft,
+                    fallback_subject=subject_fallback,
+                    fallback_body=body_fallback,
+                )
 
     def _build_email_finalization_task(
         self,
