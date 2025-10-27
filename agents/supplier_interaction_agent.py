@@ -45,12 +45,20 @@ class SupplierInteractionAgent(BaseAgent):
         super().__init__(agent_nick)
         self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
+        self._backend_scheduler = None
         self._email_watcher = None
+        self._email_watcher_failure_at: Optional[float] = None
         self._negotiation_agent = None
         self._response_coordinator = SupplierResponseWorkflow()
         self._dispatch_schema_ready = False
         self._response_schema_ready = False
         self._watcher_activation: Dict[str, float] = {}
+
+        # Ensure the continuous email watcher service is running so inbound
+        # supplier replies are processed even when the orchestrator is not
+        # managing this agent instance (e.g. standalone CLI utilities or
+        # notebook experiments).
+        self._ensure_email_watcher_service()
 
     # Suppliers occasionally include upper-case letters or non-hex characters
     # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
@@ -104,6 +112,56 @@ class SupplierInteractionAgent(BaseAgent):
                 )
 
         return context
+
+    def _ensure_email_watcher_service(self):
+        """Ensure the background email watcher service is running."""
+
+        if self._email_watcher_failure_at is not None:
+            cooldown = max(30.0, float(self.RESPONSE_GATE_POLL_SECONDS))
+            if (time.monotonic() - self._email_watcher_failure_at) < cooldown:
+                return None
+            self._email_watcher_failure_at = None
+
+        if self._email_watcher is not None:
+            try:
+                self._email_watcher.start()
+            except Exception:
+                logger.exception(
+                    "Failed to restart email watcher service; disabling integration"
+                )
+                self._email_watcher_failure_at = time.monotonic()
+                self._email_watcher = None
+                return None
+            return self._email_watcher
+
+        try:
+            if self._backend_scheduler is None:
+                try:
+                    workflow_email_tracking_repo.load_active_workflow_ids()
+                except Exception:
+                    logger.debug(
+                        "Skipping email watcher service activation; active workflow lookup failed",
+                        exc_info=True,
+                    )
+                    self._email_watcher_failure_at = time.monotonic()
+                    return None
+
+            from services.backend_scheduler import BackendScheduler
+
+            training_endpoint = getattr(self.agent_nick, "model_training_endpoint", None)
+            scheduler = BackendScheduler.ensure(
+                self.agent_nick, training_endpoint=training_endpoint
+            )
+            self._backend_scheduler = scheduler
+            service = scheduler.get_email_watcher_service()
+            self._email_watcher = service
+            return service
+        except Exception:
+            logger.exception(
+                "Failed to initialise email watcher service for SupplierInteractionAgent"
+            )
+            self._email_watcher_failure_at = time.monotonic()
+            return None
 
     def _validate_workflow_consistency(
         self,
@@ -868,7 +926,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
             if rows:
-                return self._process_responses_concurrently(
+                return self._invoke_response_processor(
                     rows,
                     workflow_id=workflow_id,
                     expected_unique_ids=expected_unique_ids if expected_unique_ids else None,
@@ -921,6 +979,16 @@ class SupplierInteractionAgent(BaseAgent):
         ]
         if not identifiers:
             return None
+
+        service = self._ensure_email_watcher_service()
+        if service is not None:
+            try:
+                service.notify_workflow(workflow_key)
+            except Exception:
+                logger.exception(
+                    "Failed to notify email watcher service for workflow=%s",
+                    workflow_key,
+                )
 
         throttle_seconds = max(5.0, float(self.RESPONSE_GATE_POLL_SECONDS))
         now = time.monotonic()
@@ -1202,7 +1270,7 @@ class SupplierInteractionAgent(BaseAgent):
                 ready = bool(pending_ids)
 
             if ready:
-                responses = self._process_responses_concurrently(
+                responses = self._invoke_response_processor(
                     pending_rows,
                     workflow_id=workflow_key,
                     expected_unique_ids=expected_set,
@@ -1222,7 +1290,7 @@ class SupplierInteractionAgent(BaseAgent):
                     workflow_key,
                     time.monotonic() - start,
                 )
-                gate_summary["responses"] = self._process_responses_concurrently(
+                gate_summary["responses"] = self._invoke_response_processor(
                     pending_rows,
                     workflow_id=workflow_key,
                     expected_unique_ids=expected_set,
@@ -1235,7 +1303,7 @@ class SupplierInteractionAgent(BaseAgent):
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    gate_summary["responses"] = self._process_responses_concurrently(
+                    gate_summary["responses"] = self._invoke_response_processor(
                         pending_rows,
                         workflow_id=workflow_key,
                         expected_unique_ids=expected_set,
@@ -1668,6 +1736,29 @@ class SupplierInteractionAgent(BaseAgent):
                 responses.append(response)
 
         return responses
+
+    def _invoke_response_processor(
+        self,
+        rows: Sequence[Dict[str, Any]],
+        *,
+        workflow_id: Optional[str] = None,
+        expected_unique_ids: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        processor = self._process_responses_concurrently
+        kwargs: Dict[str, Any] = {}
+        if workflow_id is not None:
+            kwargs["workflow_id"] = workflow_id
+        if expected_unique_ids is not None:
+            kwargs["expected_unique_ids"] = expected_unique_ids
+        if not kwargs:
+            return processor(rows)
+        try:
+            return processor(rows, **kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword" in message or "got an unexpected keyword" in message:
+                return processor(rows)
+            raise
 
     def _ensure_dispatch_tracking_schema(self) -> None:
         if self._dispatch_schema_ready:
@@ -2499,7 +2590,7 @@ class SupplierInteractionAgent(BaseAgent):
                 all_expected_present = completed >= required
 
             if all_expected_present and completed == required:
-                responses = self._process_responses_concurrently(
+                responses = self._invoke_response_processor(
                     list(ordered.values()),
                     workflow_id=workflow_id,
                     expected_unique_ids=expected_set,
@@ -2541,7 +2632,7 @@ class SupplierInteractionAgent(BaseAgent):
 
             time.sleep(interval)
 
-        responses = self._process_responses_concurrently(
+        responses = self._invoke_response_processor(
             list(ordered.values()),
             workflow_id=workflow_id,
             expected_unique_ids=expected_set,
