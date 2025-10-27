@@ -874,7 +874,16 @@ class EmailWatcherV2:
         idle_attempts = 0
         timeout_reached = False
         poll_started_at = self._now()
-        since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
+        baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
+        since_cursor = tracker.last_response_at or baseline_since
+        if since_cursor.tzinfo is None:
+            since_cursor = since_cursor.replace(tzinfo=timezone.utc)
+        if baseline_since.tzinfo is None:
+            baseline_since = baseline_since.replace(tzinfo=timezone.utc)
+        if since_cursor < baseline_since:
+            since_cursor = baseline_since
+        base_sleep = float(self.poll_interval_seconds)
+        adaptive_sleep = base_sleep
         while not tracker.all_responded:
             now = self._now()
             elapsed = tracker.elapsed_seconds(now)
@@ -892,42 +901,62 @@ class EmailWatcherV2:
                 )
                 break
 
-            responses = self._fetch_emails(since)
+            responses = self._fetch_emails(since_cursor)
             matched_rows = self._match_responses(tracker, responses)
             if matched_rows:
                 self._process_agents(tracker)
+            cursor_candidate = tracker.last_response_at
+            if cursor_candidate is None and matched_rows:
+                cursor_candidate = max(
+                    (
+                        row.received_time
+                        for row in matched_rows
+                        if row.received_time is not None
+                    ),
+                    default=None,
+                )
+            if cursor_candidate is not None and cursor_candidate.tzinfo is None:
+                cursor_candidate = cursor_candidate.replace(tzinfo=timezone.utc)
+            if cursor_candidate is not None and cursor_candidate > since_cursor:
+                since_cursor = cursor_candidate
             if tracker.all_responded:
                 break
 
+            outstanding = max(0, tracker.expected_responses - tracker.responded_count)
             if responses or matched_rows:
                 idle_attempts = 0
+                adaptive_sleep = base_sleep
+                idle_snapshot = 0
             else:
                 idle_attempts += 1
+                idle_snapshot = idle_attempts
+                if idle_attempts >= self.max_poll_attempts:
+                    adaptive_sleep = min(adaptive_sleep * 2, max(base_sleep, 300.0))
+                    logger.info(
+                        "EmailWatcher continuing to monitor workflow=%s%s outstanding=%d runtime=%.1fs next_poll=%.1fs",
+                        workflow_id,
+                        self._round_fragment(tracker),
+                        outstanding,
+                        runtime_elapsed,
+                        adaptive_sleep,
+                    )
+                    idle_attempts = 0
+                    idle_snapshot = 0
 
             logger.info(
-                "EmailWatcher poll summary workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs idle_attempts=%d",
+                "EmailWatcher poll summary workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs idle_attempts=%d next_sleep=%.1fs outstanding=%d",
                 workflow_id,
                 self._round_fragment(tracker),
                 tracker.expected_responses,
                 tracker.responded_count,
                 elapsed,
                 runtime_elapsed,
-                idle_attempts,
+                idle_snapshot,
+                adaptive_sleep,
+                outstanding,
             )
 
-            if idle_attempts >= self.max_poll_attempts:
-                logger.info(
-                    "EmailWatcher entering idle backoff for workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs",
-                    workflow_id,
-                    self._round_fragment(tracker),
-                    tracker.expected_responses,
-                    tracker.responded_count,
-                    elapsed,
-                    runtime_elapsed,
-                )
-                break
-
-            self._sleep(self.poll_interval_seconds)
+            self._sleep(adaptive_sleep)
 
         complete = tracker.all_responded
         result = {

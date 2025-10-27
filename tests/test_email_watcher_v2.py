@@ -179,6 +179,110 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
 
 
+def test_email_watcher_continues_polling_until_all_responses():
+    workflow_id = "wf-multi-response"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    base_time = datetime.now(timezone.utc)
+    supplier_ids = ["sup-a", "sup-b", "sup-c"]
+    unique_ids = [generate_unique_email_id(workflow_id, sid) for sid in supplier_ids]
+    original_subject = "Pricing request"
+
+    dispatch_payloads = []
+    responses = []
+    for index, (supplier_id, unique_id) in enumerate(zip(supplier_ids, unique_ids)):
+        message_id = f"<dispatch-{index}>"
+        dispatch_payloads.append(
+            {
+                "unique_id": unique_id,
+                "supplier_id": supplier_id,
+                "supplier_email": f"{supplier_id}@example.com",
+                "message_id": message_id,
+                "subject": f"{original_subject} #{index + 1}",
+                "dispatched_at": base_time,
+            }
+        )
+        responses.append(
+            EmailResponse(
+                unique_id=unique_id,
+                supplier_id=supplier_id,
+                supplier_email=f"{supplier_id}@example.com",
+                from_address=f"{supplier_id}@example.com",
+                message_id=f"<reply-{index}>",
+                subject=f"Re: {original_subject}",
+                body=embed_unique_id_in_email_body(
+                    f"Response {index + 1} for {supplier_id}", unique_id
+                ),
+                received_at=base_time + timedelta(minutes=index + 1),
+                in_reply_to=(message_id,),
+                rfq_id=f"RFQ-{index + 1:04d}",
+            )
+        )
+
+    class SequenceFetcher:
+        def __init__(self, batches: List[List[EmailResponse]]):
+            self._batches = batches
+            self.calls = 0
+
+        def __call__(self, *, since):
+            _ = since
+            if self.calls < len(self._batches):
+                payload = self._batches[self.calls]
+            else:
+                payload = []
+            self.calls += 1
+            return list(payload)
+
+    response_batches = [
+        [],
+        [responses[0]],
+        [],
+        [],
+        [responses[1]],
+        [],
+        [],
+        [],
+        [responses[2]],
+        [],
+    ]
+    fetcher = SequenceFetcher(response_batches)
+
+    current_time = base_time
+
+    def fake_now() -> datetime:
+        return current_time
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += timedelta(seconds=seconds)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=None,
+        negotiation_agent=None,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=fake_sleep,
+        now=fake_now,
+        max_total_wait_seconds=1800,
+    )
+
+    watcher.register_workflow_dispatch(workflow_id, dispatch_payloads)
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == len(unique_ids)
+    assert result["expected_responses"] == len(unique_ids)
+    assert result["timeout_reached"] is False
+    assert all(uid in result["matched_responses"] for uid in unique_ids)
+    assert fetcher.calls > len(unique_ids)
+
+
 def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     workflow_id = "wf-legacy-thread"
     supplier_response_repo.init_schema()
