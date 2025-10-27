@@ -876,6 +876,10 @@ class EmailWatcherV2:
         poll_started_at = self._now()
         baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
         since_cursor = tracker.last_response_at or baseline_since
+        if since_cursor.tzinfo is None:
+            since_cursor = since_cursor.replace(tzinfo=timezone.utc)
+        if baseline_since.tzinfo is None:
+            baseline_since = baseline_since.replace(tzinfo=timezone.utc)
         if since_cursor < baseline_since:
             since_cursor = baseline_since
         base_sleep = float(self.poll_interval_seconds)
@@ -898,20 +902,23 @@ class EmailWatcherV2:
                 break
 
             responses = self._fetch_emails(since_cursor)
-            latest_received = None
-            for response in responses:
-                received_at = response.received_at
-                if received_at is None:
-                    continue
-                if received_at.tzinfo is None:
-                    received_at = received_at.replace(tzinfo=timezone.utc)
-                if latest_received is None or received_at > latest_received:
-                    latest_received = received_at
             matched_rows = self._match_responses(tracker, responses)
             if matched_rows:
                 self._process_agents(tracker)
-            if latest_received is not None and latest_received > since_cursor:
-                since_cursor = latest_received
+            cursor_candidate = tracker.last_response_at
+            if cursor_candidate is None and matched_rows:
+                cursor_candidate = max(
+                    (
+                        row.received_time
+                        for row in matched_rows
+                        if row.received_time is not None
+                    ),
+                    default=None,
+                )
+            if cursor_candidate is not None and cursor_candidate.tzinfo is None:
+                cursor_candidate = cursor_candidate.replace(tzinfo=timezone.utc)
+            if cursor_candidate is not None and cursor_candidate > since_cursor:
+                since_cursor = cursor_candidate
             if tracker.all_responded:
                 break
 
