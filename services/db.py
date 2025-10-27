@@ -127,6 +127,8 @@ class _FakeCursor:
                 lead_time,
                 response_time,
                 received_time,
+                match_evidence,
+                raw_headers,
                 processed,
             ) = params
             self._store.upsert_supplier_response(
@@ -147,10 +149,61 @@ class _FakeCursor:
                     "original_message_id": original_message_id,
                     "original_subject": original_subject,
                     "match_confidence": match_confidence,
+                    "match_evidence": match_evidence,
+                    "raw_headers": raw_headers,
                     "price": price,
                     "lead_time": lead_time,
                     "response_time": response_time,
                     "received_time": received_time,
+                    "processed": processed,
+                },
+            )
+            return
+
+        if upper_stmt.startswith("UPDATE PROC.SUPPLIER_RESPONSE SET SUPPLIER_ID"):
+            (
+                supplier_id,
+                supplier_email,
+                rfq_id,
+                response_text,
+                response_body,
+                response_subject,
+                response_from,
+                response_date,
+                original_message_id,
+                original_subject,
+                match_confidence,
+                price,
+                lead_time,
+                response_time,
+                received_time,
+                match_evidence,
+                raw_headers,
+                processed,
+                workflow_id,
+                response_message_id,
+            ) = params
+            self._store.update_supplier_response_by_message_id(
+                workflow_id,
+                response_message_id,
+                {
+                    "supplier_id": supplier_id,
+                    "supplier_email": supplier_email,
+                    "rfq_id": rfq_id,
+                    "response_text": response_text,
+                    "response_body": response_body,
+                    "response_subject": response_subject,
+                    "response_from": response_from,
+                    "response_date": response_date,
+                    "original_message_id": original_message_id,
+                    "original_subject": original_subject,
+                    "match_confidence": match_confidence,
+                    "price": price,
+                    "lead_time": lead_time,
+                    "response_time": response_time,
+                    "received_time": received_time,
+                    "match_evidence": match_evidence,
+                    "raw_headers": raw_headers,
                     "processed": processed,
                 },
             )
@@ -189,8 +242,11 @@ class _FakeCursor:
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_evidence",
+                "raw_headers",
                 "price",
                 "lead_time",
+                "response_time",
                 "received_time",
                 "processed",
             ]
@@ -201,6 +257,16 @@ class _FakeCursor:
                 tuple(row.get(col) for col in columns)
                 for row in rows
             ]
+            return
+
+        if upper_stmt.startswith("SELECT UNIQUE_ID FROM PROC.SUPPLIER_RESPONSE"):
+            workflow_id, message_id = params
+            unique_id = self._store.lookup_unique_by_message_id(workflow_id, message_id)
+            self.description = [_ColumnDescriptor("unique_id")]
+            if unique_id is None:
+                self._results = []
+            else:
+                self._results = [(unique_id,)]
             return
 
         # Workflow email tracking commands
@@ -422,6 +488,8 @@ class _FakePostgresStore:
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_evidence",
+                "raw_headers",
                 "price",
                 "lead_time",
                 "received_time",
@@ -475,11 +543,48 @@ class _FakePostgresStore:
     ) -> None:
         self.ensure_tables()
         table = self.supplier_response  # type: ignore[attr-defined]
+        message_id = row.get("response_message_id")
         for existing in table:
-            if existing["workflow_id"] == workflow_id and existing["unique_id"] == unique_id:
+            if existing["workflow_id"] != workflow_id:
+                continue
+            if existing["unique_id"] == unique_id or (
+                message_id and existing.get("response_message_id") == message_id
+            ):
                 existing.update(row)
                 return
         table.append(dict(row))
+
+    def update_supplier_response_by_message_id(
+        self, workflow_id: str, message_id: Optional[str], updates: Dict[str, Any]
+    ) -> None:
+        if not message_id:
+            return
+        self.ensure_tables()
+        table = self.supplier_response  # type: ignore[attr-defined]
+        for existing in table:
+            if existing["workflow_id"] != workflow_id:
+                continue
+            if existing.get("response_message_id") == message_id:
+                existing.update(updates)
+                if updates.get("processed"):
+                    existing["processed"] = bool(
+                        existing.get("processed") or updates["processed"]
+                    )
+                return
+
+    def lookup_unique_by_message_id(
+        self, workflow_id: str, message_id: Optional[str]
+    ) -> Optional[str]:
+        if not message_id:
+            return None
+        self.ensure_tables()
+        table = self.supplier_response  # type: ignore[attr-defined]
+        for existing in table:
+            if existing["workflow_id"] != workflow_id:
+                continue
+            if existing.get("response_message_id") == message_id:
+                return existing.get("unique_id")
+        return None
 
     def mark_supplier_responses_processed(
         self, workflow_id: str, unique_ids: Optional[List[str]]
