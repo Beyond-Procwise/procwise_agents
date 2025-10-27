@@ -9,8 +9,10 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field, field_validator
+
+from services.document_embedding_service import DocumentEmbeddingService
 
 from services.document_extractor import DocumentExtractor
 
@@ -59,6 +61,39 @@ class S3DocumentExtractionRequest(BaseModel):
         if not path:
             raise ValueError("s3_path must not be empty")
         return path
+
+
+class DocumentEmbeddingResponse(BaseModel):
+    """Response payload for embedded document uploads."""
+
+    document_id: str
+    collection: str
+    chunk_count: int
+    metadata: Dict[str, Any]
+
+
+class DocumentQueryRequest(BaseModel):
+    """Request payload for querying uploaded document embeddings."""
+
+    query: str = Field(..., description="User question to answer from uploaded documents")
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Optional document identifier to scope retrieval",
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum number of chunks to retrieve before answering",
+    )
+
+
+class DocumentQueryResponse(BaseModel):
+    """Response payload for document-grounded Q&A."""
+
+    answer: str
+    contexts: List[Dict[str, Any]]
+    collection: str
 
 
 def _resolve_s3_path(s3_path: str, default_bucket: str) -> Tuple[str, str]:
@@ -243,4 +278,63 @@ def extract_document_from_s3(
 
 
 __all__ = ["router"]
+
+
+@router.post("/embed-document", response_model=DocumentEmbeddingResponse)
+async def embed_document(
+    file: UploadFile = File(...),
+    agent_nick=Depends(get_agent_nick),
+):
+    """Ingest an uploaded document and persist its embeddings."""
+
+    filename = file.filename or "uploaded-document"
+    try:
+        file_bytes = await file.read()
+    except Exception as exc:  # pragma: no cover - defensive I/O guard
+        logger.exception("Failed to read uploaded file %s", filename)
+        raise HTTPException(status_code=500, detail="Unable to read uploaded file") from exc
+
+    service = DocumentEmbeddingService(agent_nick)
+    metadata = {"mime_type": file.content_type or ""}
+    try:
+        embedded = service.embed_document(
+            filename=filename,
+            file_bytes=file_bytes,
+            metadata=metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Embedding pipeline failed for %s", filename)
+        raise HTTPException(status_code=500, detail="Failed to embed uploaded document") from exc
+
+    return DocumentEmbeddingResponse(
+        document_id=embedded.document_id,
+        collection=embedded.collection,
+        chunk_count=embedded.chunk_count,
+        metadata=embedded.metadata,
+    )
+
+
+@router.post("/query-uploaded", response_model=DocumentQueryResponse)
+def query_uploaded_documents(
+    request: DocumentQueryRequest,
+    agent_nick=Depends(get_agent_nick),
+):
+    """Answer questions using embeddings from previously uploaded documents."""
+
+    service = DocumentEmbeddingService(agent_nick)
+    try:
+        result = service.query(
+            request.query,
+            document_id=request.document_id,
+            top_k=request.top_k,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Uploaded document query failed")
+        raise HTTPException(status_code=500, detail="Failed to answer query") from exc
+
+    return DocumentQueryResponse(**result)
 
