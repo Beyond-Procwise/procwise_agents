@@ -3094,6 +3094,9 @@ class NegotiationAgent(BaseAgent):
                 )
 
                 if not responses_received:
+                    negotiation_state["final_round_responses"] = {}
+                    negotiation_state["final_round_all_received"] = False
+                    negotiation_state["final_round_response_round"] = round_num
                     logger.warning(
                         "No responses received for round %s, stopping negotiations",
                         round_num,
@@ -3105,6 +3108,12 @@ class NegotiationAgent(BaseAgent):
                     negotiation_state,
                     round_num,
                 )
+
+                negotiation_state["final_round_responses"] = (
+                    responses_received or {}
+                )
+                negotiation_state["final_round_all_received"] = all_received
+                negotiation_state["final_round_response_round"] = round_num
 
                 if not all_received:
                     logger.warning(
@@ -3137,22 +3146,31 @@ class NegotiationAgent(BaseAgent):
             if (
                 isinstance(last_round_no, int)
                 and last_round_no >= negotiation_state.get("current_round", 1)
-                and last_round_no >= max_rounds
             ):
-                responses_received, all_received = self._wait_for_round_responses(
-                    context=context,
-                    round_result=last_round_result,
-                    round_num=last_round_no,
-                    negotiation_state=negotiation_state,
+                recorded_round = negotiation_state.get(
+                    "final_round_response_round"
                 )
-                if responses_received:
-                    self._process_round_responses(
+                if recorded_round != last_round_no:
+                    (
                         responses_received,
-                        negotiation_state,
-                        last_round_no,
+                        all_received,
+                    ) = self._wait_for_round_responses(
+                        context=context,
+                        round_result=last_round_result,
+                        round_num=last_round_no,
+                        negotiation_state=negotiation_state,
                     )
-                negotiation_state["final_round_responses"] = responses_received
-                negotiation_state["final_round_all_received"] = all_received
+                    if responses_received:
+                        self._process_round_responses(
+                            responses_received,
+                            negotiation_state,
+                            last_round_no,
+                        )
+                    negotiation_state["final_round_responses"] = (
+                        responses_received or {}
+                    )
+                    negotiation_state["final_round_all_received"] = all_received
+                    negotiation_state["final_round_response_round"] = last_round_no
 
         final_output = self._consolidate_multi_round_results(
             context=context,
