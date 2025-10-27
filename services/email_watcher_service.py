@@ -275,13 +275,14 @@ def run_email_watcher_for_workflow(
         if not unique_id:
             missing_fields.append("unique_id")
 
+        message_id = (row.message_id or "").strip()
+        if not message_id:
+            missing_fields.append("message_id")
+            missing_message_ids.append(identifier)
+
         if missing_fields:
             missing_required_fields[identifier] = missing_fields
             continue
-
-        message_id = (row.message_id or "").strip()
-        if not message_id:
-            missing_message_ids.append(identifier)
 
     if missing_message_ids:
         logger.warning(
