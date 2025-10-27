@@ -72,30 +72,6 @@ class DocumentEmbeddingResponse(BaseModel):
     metadata: Dict[str, Any]
 
 
-class DocumentQueryRequest(BaseModel):
-    """Request payload for querying uploaded document embeddings."""
-
-    query: str = Field(..., description="User question to answer from uploaded documents")
-    document_id: Optional[str] = Field(
-        default=None,
-        description="Optional document identifier to scope retrieval",
-    )
-    top_k: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="Maximum number of chunks to retrieve before answering",
-    )
-
-
-class DocumentQueryResponse(BaseModel):
-    """Response payload for document-grounded Q&A."""
-
-    answer: str
-    contexts: List[Dict[str, Any]]
-    collection: str
-
-
 def _resolve_s3_path(s3_path: str, default_bucket: str) -> Tuple[str, str]:
     """Return bucket and prefix for the provided path."""
 
@@ -315,26 +291,4 @@ async def embed_document(
         metadata=embedded.metadata,
     )
 
-
-@router.post("/query-uploaded", response_model=DocumentQueryResponse)
-def query_uploaded_documents(
-    request: DocumentQueryRequest,
-    agent_nick=Depends(get_agent_nick),
-):
-    """Answer questions using embeddings from previously uploaded documents."""
-
-    service = DocumentEmbeddingService(agent_nick)
-    try:
-        result = service.query(
-            request.query,
-            document_id=request.document_id,
-            top_k=request.top_k,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("Uploaded document query failed")
-        raise HTTPException(status_code=500, detail="Failed to answer query") from exc
-
-    return DocumentQueryResponse(**result)
 

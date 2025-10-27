@@ -45,20 +45,23 @@ class DummyQdrantClient:
         self.upserts.append({"collection": collection_name, "points": points})
         self.collections.setdefault(collection_name, {"size": 3, "schema": {}})
 
-    def search(self, collection_name: str, query_vector, limit: int, with_payload: bool, with_vectors: bool, query_filter=None):
-        points = []
-        if self.upserts:
-            points = self.upserts[-1]["points"][:limit]
-        results = []
-        for point in points:
-            results.append(SimpleNamespace(payload=point.payload, score=0.42))
-        return results
+    def search(self, *args, **kwargs):
+        raise AssertionError("Search should not be invoked in embedding tests")
+
+
+class DummyRAGService:
+    def __init__(self):
+        self.upserts: list[tuple[list[dict], str]] = []
+
+    def upsert_payloads(self, payloads, text_representation_key="content"):
+        self.upserts.append((payloads, text_representation_key))
 
 
 @pytest.fixture()
 def service():
     client = DummyQdrantClient()
     embedder = DummyEmbedder()
+    rag_service = DummyRAGService()
     settings = SimpleNamespace(rag_chunk_chars=50, rag_chunk_overlap=10, rag_model="mock-model")
     agent = SimpleNamespace(
         qdrant_client=client,
@@ -66,14 +69,16 @@ def service():
         settings=settings,
         ollama_options=lambda: {"temperature": 0.1},
     )
-    def fake_chat(**kwargs):
-        return {"message": {"content": "Mock grounded answer"}}
-    svc = DocumentEmbeddingService(agent, chat_completion_fn=fake_chat)
-    return svc, client
+
+    svc = DocumentEmbeddingService(
+        agent,
+        rag_service_factory=lambda _: rag_service,
+    )
+    return svc, client, rag_service
 
 
 def test_embed_document_creates_collection_and_upserts(service):
-    svc, client = service
+    svc, client, rag_service = service
     result = svc.embed_document(filename="sample.txt", file_bytes=b"Hello world", metadata={"mime_type": "text/plain"})
     assert result.collection == "uploaded_documents"
     assert result.chunk_count > 0
@@ -87,12 +92,20 @@ def test_embed_document_creates_collection_and_upserts(service):
         "file_extension",
         "uploaded_at",
     }
+    assert rag_service.upserts, "Expected propagation to RAG"
+    forwarded_payloads, key = rag_service.upserts[0]
+    assert key == "content"
+    assert forwarded_payloads[0]["source_collection"] == "uploaded_documents"
+    assert forwarded_payloads[0]["document_id"] == result.document_id
 
 
-def test_query_returns_grounded_answer(service):
-    svc, _ = service
-    svc.embed_document(filename="note.txt", file_bytes=b"Procurement policy requires two quotes.")
-    response = svc.query("What does the policy require?", top_k=2)
-    assert response["answer"] == "Mock grounded answer"
-    assert response["contexts"]
-    assert response["contexts"][0]["document_id"]
+def test_embed_document_handles_rag_failure(service):
+    svc, _, rag_service = service
+
+    def failing_upsert(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    rag_service.upsert_payloads = failing_upsert
+
+    result = svc.embed_document(filename="policy.txt", file_bytes=b"Always collect two bids")
+    assert result.chunk_count > 0
