@@ -139,34 +139,74 @@ def _ensure_postgres_column(cur, schema: str, table: str, column: str, definitio
     )
 
 
+def _table_has_column(cur, schema: str, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s AND column_name=%s
+        LIMIT 1
+        """,
+        (schema, table, column),
+    )
+    return cur.fetchone() is not None
+
+
 def _remove_duplicate_response_message_ids(cur) -> None:
     """Remove duplicate rows that share the same workflow/message identifier."""
 
-    cur.execute(
-        """
-        WITH duplicates AS (
-            SELECT id
-            FROM (
-                SELECT
-                    id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY workflow_id, response_message_id
-                        ORDER BY
-                            COALESCE(processed, FALSE) DESC,
-                            created_at DESC,
-                            id DESC
-                    ) AS rn
-                FROM proc.supplier_response
-                WHERE response_message_id IS NOT NULL
-            ) ranked
-            WHERE rn > 1
+    if _table_has_column(cur, "proc", "supplier_response", "id"):
+        cur.execute(
+            """
+            WITH duplicates AS (
+                SELECT id
+                FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY workflow_id, response_message_id
+                            ORDER BY
+                                COALESCE(processed, FALSE) DESC,
+                                created_at DESC,
+                                id DESC
+                        ) AS rn
+                    FROM proc.supplier_response
+                    WHERE response_message_id IS NOT NULL
+                ) ranked
+                WHERE rn > 1
+            )
+            DELETE FROM proc.supplier_response sr
+            USING duplicates d
+            WHERE sr.id = d.id
+            RETURNING sr.workflow_id, sr.response_message_id
+            """
         )
-        DELETE FROM proc.supplier_response sr
-        USING duplicates d
-        WHERE sr.id = d.id
-        RETURNING sr.workflow_id, sr.response_message_id
-        """
-    )
+    else:
+        cur.execute(
+            """
+            WITH duplicates AS (
+                SELECT ctid
+                FROM (
+                    SELECT
+                        ctid,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY workflow_id, response_message_id
+                            ORDER BY
+                                COALESCE(processed, FALSE) DESC,
+                                created_at DESC,
+                                unique_id DESC
+                        ) AS rn
+                    FROM proc.supplier_response
+                    WHERE response_message_id IS NOT NULL
+                ) ranked
+                WHERE rn > 1
+            )
+            DELETE FROM proc.supplier_response sr
+            USING duplicates d
+            WHERE sr.ctid = d.ctid
+            RETURNING sr.workflow_id, sr.response_message_id
+            """
+        )
 
     removed = cur.fetchall()
     if removed:
