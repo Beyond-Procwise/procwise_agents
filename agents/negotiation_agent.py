@@ -2331,6 +2331,8 @@ class NegotiationAgent(BaseAgent):
         round_number: Optional[int],
         drafts: List[Dict[str, Any]],
         draft_bundles: List[Dict[str, Any]],
+        negotiation_state: Optional[Dict[str, Any]] = None,
+        require_hitl: bool = False,
     ) -> None:
         """Finalize deferred emails for a negotiation round after all suppliers complete."""
 
@@ -2339,6 +2341,13 @@ class NegotiationAgent(BaseAgent):
 
         pending_entries = self._drain_pending_email_tasks(context, round_number)
         if not pending_entries:
+            return
+
+        if require_hitl:
+            if isinstance(negotiation_state, dict):
+                storage = negotiation_state.setdefault("hitl_email_tasks", {})
+                if isinstance(storage, dict):
+                    storage[int(round_number)] = deepcopy(pending_entries)
             return
 
         primary_identifier = None
@@ -2746,6 +2755,228 @@ class NegotiationAgent(BaseAgent):
             ),
         )
 
+    def _hitl_enforced(self) -> bool:
+        """Return whether HITL checkpoints are enforced."""
+
+        try:
+            return bool(getattr(self.agent_nick.settings, "hitl_enabled", True))
+        except Exception:
+            return True
+
+    def _extract_hitl_decisions(
+        self,
+        context: AgentContext,
+        shared_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Collect explicit HITL decisions provided in the inbound payload."""
+
+        decisions: Dict[str, Any] = {}
+
+        def _merge(source: Optional[Dict[str, Any]]) -> None:
+            if not isinstance(source, dict):
+                return
+            for key in ("hitl_decisions", "hitl_approvals", "hitl_review", "hitl"):
+                value = source.get(key)
+                if isinstance(value, dict):
+                    for round_key, decision_value in value.items():
+                        decisions[str(round_key)] = decision_value
+
+        if isinstance(context.input_data, dict):
+            _merge(context.input_data)
+            nested_shared = context.input_data.get("shared_context")
+            if isinstance(nested_shared, dict):
+                _merge(nested_shared)
+        _merge(shared_context)
+        return decisions
+
+    @staticmethod
+    def _normalise_hitl_value(value: Any) -> Tuple[str, Optional[str]]:
+        """Normalise arbitrary decision tokens into approved/pending/rejected."""
+
+        reason: Optional[str] = None
+        candidate = value
+        if isinstance(candidate, dict):
+            reason = cast(Optional[str], candidate.get("reason") or candidate.get("notes"))
+            candidate = candidate.get("status") or candidate.get("decision")
+
+        if isinstance(candidate, bool):
+            return ("approved" if candidate else "rejected", reason)
+
+        token = str(candidate).strip().lower() if candidate is not None else ""
+        if token in {"approved", "approve", "ok", "okay", "yes", "true", "allow", "proceed"}:
+            return "approved", reason
+        if token in {"rejected", "reject", "no", "false", "deny", "denied", "blocked"}:
+            return "rejected", reason
+        if token in {"pending", "awaiting", "hold", "review"}:
+            return "pending", reason
+        return "pending", reason
+
+    def _resolve_hitl_decision(
+        self,
+        context: AgentContext,
+        shared_context: Dict[str, Any],
+        negotiation_state: Dict[str, Any],
+        round_num: int,
+    ) -> Dict[str, Any]:
+        """Determine the HITL decision for the given round."""
+
+        if not self._hitl_enforced():
+            return {"status": "approved", "source": "hitl_disabled"}
+
+        decisions = negotiation_state.setdefault(
+            "hitl_decisions", self._extract_hitl_decisions(context, shared_context)
+        )
+
+        raw_value: Any = None
+        for key in (str(round_num), round_num):
+            if key in decisions:
+                raw_value = decisions[key]
+                break
+
+        auto_flag: Optional[bool] = None
+        if raw_value is None:
+            if isinstance(shared_context, dict):
+                auto_flag = shared_context.get("hitl_auto_approve")
+            if isinstance(context.input_data, dict):
+                inherited = context.input_data.get("hitl_auto_approve")
+                if inherited is not None:
+                    auto_flag = bool(inherited)
+
+        if raw_value is None:
+            if isinstance(auto_flag, bool) and auto_flag:
+                return {"status": "approved", "source": "auto_approved"}
+            return {"status": "pending", "source": "awaiting_review"}
+
+        status, reason = self._normalise_hitl_value(raw_value)
+        decision_info: Dict[str, Any] = {
+            "status": status,
+            "source": "provided",
+            "raw": raw_value,
+        }
+        if reason:
+            decision_info["reason"] = reason
+        return decision_info
+
+    def _log_hitl_checkpoint(
+        self,
+        context: AgentContext,
+        review_payload: Dict[str, Any],
+    ) -> None:
+        """Persist a HITL checkpoint for auditing purposes."""
+
+        routing = getattr(self.agent_nick, "process_routing_service", None)
+        if routing is None or not hasattr(routing, "log_action"):
+            return
+
+        try:
+            serialisable = json.loads(json.dumps(review_payload, default=str))
+        except Exception:
+            serialisable = {key: str(value) for key, value in review_payload.items()}
+
+        status_token = review_payload.get("status")
+        if status_token == "approved":
+            status_value = "completed"
+        elif status_token == "rejected":
+            status_value = "failed"
+        else:
+            status_value = "pending"
+
+        description = (
+            f"HITL review for negotiation round {review_payload.get('round')}"
+        )
+
+        try:
+            routing.log_action(
+                process_id=getattr(context, "process_id", None),
+                agent_type=self.__class__.__name__,
+                action_desc=description,
+                process_output=serialisable,
+                status=status_value,
+                run_id=None,
+            )
+        except Exception:  # pragma: no cover - defensive log guard
+            logger.exception("Failed to log HITL checkpoint")
+
+    def _record_hitl_review(
+        self,
+        context: AgentContext,
+        negotiation_state: Dict[str, Any],
+        round_result: Dict[str, Any],
+        decision_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Attach HITL review metadata to the round result."""
+
+        round_no = int(round_result.get("round", 0) or 0)
+        review_payload: Dict[str, Any] = {
+            "round": round_no,
+            "status": decision_info.get("status", "pending"),
+            "decision_source": decision_info.get("source"),
+            "reason": decision_info.get("reason"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "suppliers": [],
+        }
+
+        for record in round_result.get("results", []):
+            if not isinstance(record, dict):
+                continue
+            decision = record.get("decision") if isinstance(record.get("decision"), dict) else {}
+            review_payload["suppliers"].append(
+                {
+                    "supplier_id": record.get("supplier_id"),
+                    "status": record.get("status"),
+                    "strategy": decision.get("strategy"),
+                    "counter_price": decision.get("counter_price"),
+                    "draft_count": len(record.get("drafts") or []),
+                }
+            )
+
+        negotiation_state.setdefault("hitl_reviews", []).append(review_payload)
+        if review_payload["status"] != "approved":
+            pending_rounds = negotiation_state.setdefault("hitl_pending_rounds", set())
+            pending_rounds.add(round_no)
+
+        round_result["hitl_review"] = review_payload
+        self._log_hitl_checkpoint(context, review_payload)
+        return review_payload
+
+    def _compile_final_quotes(self, negotiation_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Compile supplier offers and counters for downstream evaluation."""
+
+        quotes: List[Dict[str, Any]] = []
+        active_suppliers = negotiation_state.get("active_suppliers", {})
+        if not isinstance(active_suppliers, dict):
+            return quotes
+
+        for supplier_id, supplier_state in active_suppliers.items():
+            if not isinstance(supplier_state, dict):
+                continue
+            entry_payload = supplier_state.get("entry") or {}
+            decisions = supplier_state.get("decisions") or []
+            latest_decision = decisions[-1] if decisions else {}
+            responses = supplier_state.get("responses") or []
+            latest_response = responses[-1] if responses else {}
+
+            currency = (
+                latest_decision.get("currency")
+                or entry_payload.get("currency")
+                or entry_payload.get("currency_code")
+            )
+
+            quotes.append(
+                {
+                    "supplier_id": supplier_id,
+                    "supplier_offer": entry_payload.get("current_offer")
+                    or entry_payload.get("price"),
+                    "counter_offer": latest_decision.get("counter_price"),
+                    "strategy": latest_decision.get("strategy"),
+                    "currency": currency,
+                    "rounds_completed": max(0, int(supplier_state.get("current_round", 1)) - 1),
+                    "latest_response": latest_response,
+                }
+            )
+
+        return quotes
+
     def _run_multi_round_negotiation(
         self,
         context: AgentContext,
@@ -2768,6 +2999,8 @@ class NegotiationAgent(BaseAgent):
             "round_history": [],
             "current_round": 1,
             "max_rounds": max_rounds,
+            "hitl_reviews": [],
+            "hitl_pending_rounds": set(),
         }
 
         for entry in batch_entries:
@@ -2802,6 +3035,14 @@ class NegotiationAgent(BaseAgent):
                 workflow_id,
             )
 
+            decision_info = self._resolve_hitl_decision(
+                context,
+                shared_context,
+                negotiation_state,
+                round_num,
+            )
+            require_hitl_hold = decision_info.get("status") != "approved"
+
             round_entries = self._prepare_round_entries(
                 negotiation_state["active_suppliers"],
                 round_num,
@@ -2820,9 +3061,29 @@ class NegotiationAgent(BaseAgent):
                 round_num=round_num,
                 workflow_id=workflow_id,
                 negotiation_state=negotiation_state,
+                require_hitl=require_hitl_hold,
             )
 
             all_round_results.append(round_result)
+
+            review_info = self._record_hitl_review(
+                context,
+                negotiation_state,
+                round_result,
+                decision_info,
+            )
+
+            if require_hitl_hold:
+                logger.info(
+                    "Round %s awaiting HITL approval; pausing multi-round flow",
+                    round_num,
+                )
+                negotiation_state["override_status"] = (
+                    "HITL_REJECTED"
+                    if review_info.get("status") == "rejected"
+                    else "AWAITING_HITL"
+                )
+                break
 
             if round_num < max_rounds:
                 responses_received, all_received = self._wait_for_round_responses(
@@ -2863,11 +3124,81 @@ class NegotiationAgent(BaseAgent):
                 logger.info("All supplier negotiations completed")
                 break
 
-        return self._consolidate_multi_round_results(
+        else:
+            if negotiation_state.get("override_status") == "AWAITING_HITL":
+                negotiation_state.pop("override_status", None)
+
+        if (
+            all_round_results
+            and not negotiation_state.get("hitl_pending_rounds")
+        ):
+            last_round_result = all_round_results[-1]
+            last_round_no = last_round_result.get("round")
+            if (
+                isinstance(last_round_no, int)
+                and last_round_no >= negotiation_state.get("current_round", 1)
+                and last_round_no >= max_rounds
+            ):
+                responses_received, all_received = self._wait_for_round_responses(
+                    context=context,
+                    round_result=last_round_result,
+                    round_num=last_round_no,
+                    negotiation_state=negotiation_state,
+                )
+                if responses_received:
+                    self._process_round_responses(
+                        responses_received,
+                        negotiation_state,
+                        last_round_no,
+                    )
+                negotiation_state["final_round_responses"] = responses_received
+                negotiation_state["final_round_all_received"] = all_received
+
+        final_output = self._consolidate_multi_round_results(
             context=context,
             negotiation_state=negotiation_state,
             all_round_results=all_round_results,
         )
+
+        final_output.data.setdefault("hitl_reviews", negotiation_state.get("hitl_reviews", []))
+        pending_rounds = negotiation_state.get("hitl_pending_rounds", set())
+        if isinstance(pending_rounds, set):
+            final_output.data["hitl_pending_rounds"] = sorted(pending_rounds)
+        else:
+            final_output.data["hitl_pending_rounds"] = []
+
+        override_status = negotiation_state.get("override_status")
+        if override_status:
+            final_output.data["final_status"] = override_status
+
+        final_output.data["final_round_all_responses_received"] = negotiation_state.get(
+            "final_round_all_received"
+        )
+        final_output.data["final_round_responses"] = negotiation_state.get(
+            "final_round_responses", {}
+        )
+        final_output.data["final_quotes"] = self._compile_final_quotes(negotiation_state)
+        final_output.data["ready_for_quote_evaluation"] = (
+            not final_output.data.get("hitl_pending_rounds")
+            and bool(all_round_results)
+            and negotiation_state.get("final_round_all_received") is True
+        )
+        if negotiation_state.get("hitl_email_tasks"):
+            try:
+                final_output.data["hitl_email_tasks"] = json.loads(
+                    json.dumps(negotiation_state.get("hitl_email_tasks"), default=str)
+                )
+            except Exception:
+                final_output.data["hitl_email_tasks"] = negotiation_state.get(
+                    "hitl_email_tasks"
+                )
+
+        if final_output.data.get("ready_for_quote_evaluation"):
+            final_output.next_agents = sorted(
+                set(final_output.next_agents or []) | {"QuoteEvaluationAgent"}
+            )
+
+        return final_output
 
     def _prepare_round_entries(
         self,
@@ -2928,6 +3259,8 @@ class NegotiationAgent(BaseAgent):
         round_num: int,
         workflow_id: str,
         negotiation_state: Dict[str, Any],
+        *,
+        require_hitl: bool = False,
     ) -> Dict[str, Any]:
         """Execute a negotiation round across all active suppliers."""
 
@@ -3051,6 +3384,8 @@ class NegotiationAgent(BaseAgent):
             round_number=round_num,
             drafts=drafts,
             draft_bundles=draft_bundles,
+            negotiation_state=negotiation_state,
+            require_hitl=require_hitl,
         )
 
         round_result = {
