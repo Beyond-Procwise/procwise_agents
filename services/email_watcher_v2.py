@@ -1589,7 +1589,10 @@ class ContinuousEmailWatcher:
         return index, tracking_rows
 
     def run_once(
-        self, workflow_id: str, dispatch_index: Dict[str, EmailDispatchRecord]
+        self,
+        workflow_id: str,
+        dispatch_index: Dict[str, EmailDispatchRecord],
+        tracking_rows: Optional[Sequence[WorkflowDispatchRow]] = None,
     ) -> List[Dict[str, object]]:
         responses = self._fetch(workflow_id=workflow_id)
         if not responses:
@@ -1598,8 +1601,22 @@ class ContinuousEmailWatcher:
         supplier_interaction_repo.init_schema()
         stored: List[Dict[str, object]] = []
         self._last_unmatched = []
+        pending_unique_ids: Set[str] = {
+            unique_id for unique_id in dispatch_index.keys() if unique_id
+        }
+        if tracking_rows:
+            for row in tracking_rows:
+                unique_id = getattr(row, "unique_id", None)
+                if not unique_id:
+                    continue
+                if getattr(row, "matched", False) or getattr(row, "responded_at", None):
+                    pending_unique_ids.discard(unique_id)
+                elif getattr(row, "response_message_id", None):
+                    pending_unique_ids.discard(unique_id)
         for response in responses:
-            stored_record = self._handle_response(response, dispatch_index)
+            stored_record = self._handle_response(
+                response, dispatch_index, pending_unique_ids
+            )
             if stored_record:
                 stored.append(stored_record)
         return stored
@@ -1608,12 +1625,15 @@ class ContinuousEmailWatcher:
         self,
         response: EmailResponse,
         dispatch_index: Dict[str, EmailDispatchRecord],
+        pending_unique_ids: Set[str],
     ) -> Optional[Dict[str, object]]:
         matched_unique: Optional[str] = None
         best_score = 0.0
         best_reasons: List[str] = []
         best_dispatch: Optional[EmailDispatchRecord] = None
         for unique_id, dispatch in dispatch_index.items():
+            if pending_unique_ids and unique_id not in pending_unique_ids:
+                continue
             score, reasons = _calculate_match_score(dispatch, response)
             if score > best_score:
                 best_score = score
@@ -1623,7 +1643,27 @@ class ContinuousEmailWatcher:
 
         fingerprint = self._response_fingerprint(response)
 
-        if not matched_unique or best_score < self.match_threshold or best_dispatch is None:
+        unmatched = (
+            not matched_unique
+            or best_score < self.match_threshold
+            or best_dispatch is None
+        )
+
+        if unmatched and pending_unique_ids:
+            remaining_pending = [uid for uid in pending_unique_ids]
+            if matched_unique and matched_unique in remaining_pending:
+                remaining_pending = [matched_unique]
+            if len(remaining_pending) == 1:
+                fallback_unique = remaining_pending[0]
+                fallback_dispatch = dispatch_index.get(fallback_unique)
+                if fallback_dispatch is not None:
+                    matched_unique = fallback_unique
+                    best_dispatch = fallback_dispatch
+                    best_score = max(best_score, self.match_threshold)
+                    best_reasons = list({*best_reasons, "sole_pending_dispatch"})
+                    unmatched = False
+
+        if unmatched:
             subject_norm = _normalise_subject_line(response.subject)
             logger.warning(
                 "services.email_watcher_v2 unable to match response agent=%s workflow=%s message_id=%s best_score=%.2f matched_on=%s",
@@ -1673,6 +1713,9 @@ class ContinuousEmailWatcher:
                 }
             )
             return None
+
+        if matched_unique:
+            pending_unique_ids.discard(matched_unique)
 
         supplier_interaction_repo.record_inbound_response(
             outbound=outbound,
@@ -1922,7 +1965,9 @@ class ContinuousEmailWatcher:
                 )
             state["pending_suppliers"] = pending_suppliers
 
-            stored_batch = self.run_once(workflow_id, dispatch_index)
+            stored_batch = self.run_once(
+                workflow_id, dispatch_index, tracking_rows
+            )
             for record in stored_batch:
                 msg_id = record.get("message_id")
                 subj_hash = record.get("subject_hash")

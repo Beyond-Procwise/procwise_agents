@@ -54,9 +54,11 @@ def teardown_module(_module):
     supplier_response_repo.reset_workflow(workflow_id="wf-watch")
     supplier_response_repo.reset_workflow(workflow_id="wf-header")
     supplier_response_repo.reset_workflow(workflow_id="wf-continuous")
+    supplier_response_repo.reset_workflow(workflow_id="wf-fallback")
     reset_tracking(workflow_id="wf-watch")
     reset_tracking(workflow_id="wf-header")
     reset_tracking(workflow_id="wf-continuous")
+    reset_tracking(workflow_id="wf-fallback")
 
 
 def test_register_and_process_supplier_response():
@@ -162,7 +164,7 @@ def test_continuous_watcher_records_unique_id_response():
     )
 
     dispatch_index, _ = watcher._build_dispatch_index(workflow_id, None)
-    watcher._handle_response(response, dispatch_index)
+    watcher._handle_response(response, dispatch_index, {unique_id})
 
     responses = get_supplier_responses("negotiation-agent", workflow_id)
     assert len(responses) == 1
@@ -242,8 +244,8 @@ def test_continuous_watcher_matches_via_headers_and_persists():
         now_fn=lambda: dispatched_at + timedelta(minutes=5, seconds=1),
     )
 
-    dispatch_index, _ = watcher._build_dispatch_index(workflow_id, None)
-    stored = watcher.run_once(workflow_id, dispatch_index)
+    dispatch_index, tracking_rows = watcher._build_dispatch_index(workflow_id, None)
+    stored = watcher.run_once(workflow_id, dispatch_index, tracking_rows)
 
     assert stored
     entry = stored[0]
@@ -259,6 +261,89 @@ def test_continuous_watcher_matches_via_headers_and_persists():
     if isinstance(evidence, str):
         evidence = json.loads(evidence)
     assert "in-reply-to" in evidence
+
+
+def test_run_once_defaults_to_remaining_dispatch_when_low_confidence():
+    supplier_interaction_repo.reset()
+    workflow_id = "wf-fallback"
+    reset_tracking(workflow_id=workflow_id)
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+
+    unique_id = generate_unique_email_id(workflow_id, "sup-fallback", round_number=1)
+    dispatched_at = datetime(2024, 5, 1, 12, 0, tzinfo=timezone.utc)
+
+    register_sent_email(
+        "negotiation-agent",
+        workflow_id,
+        "sup-fallback",
+        "contact@supplier.test",
+        unique_id,
+        round_number=1,
+        interaction_type="initial",
+        subject="RFQ Request",
+    )
+
+    record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[
+            WorkflowDispatchRow(
+                workflow_id=workflow_id,
+                unique_id=unique_id,
+                dispatch_key="dispatch-fallback",
+                supplier_id="sup-fallback",
+                supplier_email="contact@supplier.test",
+                message_id="<dispatch-fallback>",
+                subject="RFQ Request",
+                dispatched_at=dispatched_at,
+                responded_at=None,
+                response_message_id=None,
+                matched=False,
+                thread_headers={},
+            )
+        ],
+    )
+
+    response = EmailResponse(
+        unique_id=None,
+        supplier_id=None,
+        supplier_email=None,
+        from_address="updates@other.test",
+        message_id="<fallback-reply>",
+        subject="Availability Update",
+        body="Hello team, attaching our availability soon.",
+        received_at=dispatched_at + timedelta(minutes=15),
+        in_reply_to=(),
+        references=(),
+        workflow_id=workflow_id,
+        rfq_id=None,
+        headers={},
+    )
+
+    watcher = ContinuousEmailWatcher(
+        "watcher-agent",
+        poll_interval_seconds=1,
+        poll_jitter_seconds=0,
+        email_fetcher=lambda **_: [response],
+        sleep_fn=lambda *_: None,
+        now_fn=lambda: dispatched_at + timedelta(minutes=15, seconds=1),
+    )
+
+    dispatch_index, tracking_rows = watcher._build_dispatch_index(workflow_id, None)
+    stored = watcher.run_once(workflow_id, dispatch_index, tracking_rows)
+
+    assert stored, "fallback response should be stored"
+    entry = stored[0]
+    assert entry["unique_id"] == unique_id
+    assert entry["match_score"] >= watcher.match_threshold
+    assert "sole_pending_dispatch" in entry["matched_on"]
+
+    pending = supplier_response_repo.fetch_pending(workflow_id=workflow_id)
+    assert len(pending) == 1
+    assert pending[0]["response_message_id"] == "<fallback-reply>"
+    evidence = pending[0].get("match_evidence") or []
+    if isinstance(evidence, str):
+        evidence = json.loads(evidence)
+    assert "sole_pending_dispatch" in evidence
 
 
 def test_run_continuously_waits_for_all_responses(monkeypatch):
