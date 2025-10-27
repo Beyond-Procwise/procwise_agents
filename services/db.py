@@ -73,6 +73,10 @@ class _FakeCursor:
         if upper_stmt.startswith("WITH RANKED AS"):
             # Deduplication CTE is a no-op in the in-memory store.
             return
+        if upper_stmt.startswith("WITH DUPLICATES AS") and "DELETE FROM PROC.SUPPLIER_RESPONSE" in upper_stmt:
+            # The in-memory store never creates duplicate response rows so the
+            # clean-up CTE can be safely ignored during tests.
+            return
         if "INFORMATION_SCHEMA.COLUMNS" in upper_stmt:
             if params:
                 schema, table, column = params
@@ -108,104 +112,93 @@ class _FakeCursor:
 
         # Data manipulation commands for supplier responses
         if upper_stmt.startswith("INSERT INTO PROC.SUPPLIER_RESPONSE"):
-            (
-                workflow_id,
-                supplier_id,
-                supplier_email,
-                rfq_id,
-                unique_id,
-                response_text,
-                response_body,
-                response_message_id,
-                response_subject,
-                response_from,
-                response_date,
-                original_message_id,
-                original_subject,
-                match_confidence,
-                price,
-                lead_time,
-                response_time,
-                received_time,
-                match_evidence,
-                raw_headers,
-                processed,
-            ) = params
+            column_order = [
+                "workflow_id",
+                "supplier_id",
+                "supplier_email",
+                "rfq_id",
+                "unique_id",
+                "response_text",
+                "response_body",
+                "body_html",
+                "response_message_id",
+                "response_subject",
+                "response_from",
+                "response_date",
+                "original_message_id",
+                "original_subject",
+                "match_confidence",
+                "match_score",
+                "price",
+                "currency",
+                "payment_terms",
+                "warranty",
+                "validity",
+                "exceptions",
+                "lead_time",
+                "response_time",
+                "received_time",
+                "match_evidence",
+                "matched_on",
+                "raw_headers",
+                "tables",
+                "attachments",
+                "processed",
+            ]
+            values = {key: params[idx] if idx < len(params) else None for idx, key in enumerate(column_order)}
+            workflow_id = values.get("workflow_id")
+            unique_id = values.get("unique_id")
+            if workflow_id is None or unique_id is None:
+                return
             self._store.upsert_supplier_response(
                 workflow_id,
                 unique_id,
-                {
-                    "workflow_id": workflow_id,
-                    "supplier_id": supplier_id,
-                    "supplier_email": supplier_email,
-                    "rfq_id": rfq_id,
-                    "unique_id": unique_id,
-                    "response_text": response_text,
-                    "response_body": response_body,
-                    "response_message_id": response_message_id,
-                    "response_subject": response_subject,
-                    "response_from": response_from,
-                    "response_date": response_date,
-                    "original_message_id": original_message_id,
-                    "original_subject": original_subject,
-                    "match_confidence": match_confidence,
-                    "match_evidence": match_evidence,
-                    "raw_headers": raw_headers,
-                    "price": price,
-                    "lead_time": lead_time,
-                    "response_time": response_time,
-                    "received_time": received_time,
-                    "processed": processed,
-                },
+                values,
             )
             return
 
         if upper_stmt.startswith("UPDATE PROC.SUPPLIER_RESPONSE SET SUPPLIER_ID"):
-            (
-                supplier_id,
-                supplier_email,
-                rfq_id,
-                response_text,
-                response_body,
-                response_subject,
-                response_from,
-                response_date,
-                original_message_id,
-                original_subject,
-                match_confidence,
-                price,
-                lead_time,
-                response_time,
-                received_time,
-                match_evidence,
-                raw_headers,
-                processed,
-                workflow_id,
-                response_message_id,
-            ) = params
+            update_keys = [
+                "supplier_id",
+                "supplier_email",
+                "rfq_id",
+                "response_text",
+                "response_body",
+                "body_html",
+                "response_subject",
+                "response_from",
+                "response_date",
+                "original_message_id",
+                "original_subject",
+                "match_confidence",
+                "match_score",
+                "price",
+                "currency",
+                "payment_terms",
+                "warranty",
+                "validity",
+                "exceptions",
+                "lead_time",
+                "response_time",
+                "received_time",
+                "match_evidence",
+                "matched_on",
+                "raw_headers",
+                "tables",
+                "attachments",
+                "processed",
+                "workflow_id",
+                "response_message_id",
+            ]
+            values = {key: params[idx] if idx < len(params) else None for idx, key in enumerate(update_keys)}
+            workflow_id = values.pop("workflow_id")
+            response_message_id = values.pop("response_message_id")
+            if workflow_id is None or response_message_id is None:
+                return
             self._store.update_supplier_response_by_message_id(
                 workflow_id,
                 response_message_id,
-                {
-                    "supplier_id": supplier_id,
-                    "supplier_email": supplier_email,
-                    "rfq_id": rfq_id,
-                    "response_text": response_text,
-                    "response_body": response_body,
-                    "response_subject": response_subject,
-                    "response_from": response_from,
-                    "response_date": response_date,
-                    "original_message_id": original_message_id,
-                    "original_subject": original_subject,
-                    "match_confidence": match_confidence,
-                    "price": price,
-                    "lead_time": lead_time,
-                    "response_time": response_time,
-                    "received_time": received_time,
-                    "match_evidence": match_evidence,
-                    "raw_headers": raw_headers,
-                    "processed": processed,
-                },
+                values,
             )
             return
 
@@ -235,6 +228,7 @@ class _FakeCursor:
                 "unique_id",
                 "response_text",
                 "response_body",
+                "body_html",
                 "response_message_id",
                 "response_subject",
                 "response_from",
@@ -242,12 +236,21 @@ class _FakeCursor:
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_score",
                 "match_evidence",
+                "matched_on",
                 "raw_headers",
                 "price",
+                "currency",
+                "payment_terms",
+                "warranty",
+                "validity",
+                "exceptions",
                 "lead_time",
                 "response_time",
                 "received_time",
+                "tables",
+                "attachments",
                 "processed",
             ]
             self.description = [
@@ -481,6 +484,7 @@ class _FakePostgresStore:
                 "unique_id",
                 "response_text",
                 "response_body",
+                "body_html",
                 "response_message_id",
                 "response_subject",
                 "response_from",
@@ -488,11 +492,21 @@ class _FakePostgresStore:
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_score",
                 "match_evidence",
+                "matched_on",
                 "raw_headers",
                 "price",
+                "currency",
+                "payment_terms",
+                "warranty",
+                "validity",
+                "exceptions",
                 "lead_time",
+                "response_time",
                 "received_time",
+                "tables",
+                "attachments",
                 "processed",
             ],
             "proc.workflow_email_tracking": [
@@ -552,7 +566,12 @@ class _FakePostgresStore:
             ):
                 existing.update(row)
                 return
-        table.append(dict(row))
+        record = dict(row)
+        record["workflow_id"] = workflow_id
+        record["unique_id"] = unique_id
+        if "processed" in record:
+            record["processed"] = bool(record.get("processed"))
+        table.append(record)
 
     def update_supplier_response_by_message_id(
         self, workflow_id: str, message_id: Optional[str], updates: Dict[str, Any]
