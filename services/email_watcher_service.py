@@ -510,6 +510,25 @@ class EmailWatcherService:
                 self._wake_event.clear()
                 break
 
+    def update_dependencies(
+        self,
+        *,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+    ) -> None:
+        """Refresh shared dependency references used by the watcher."""
+
+        if agent_registry is not None:
+            self._agent_registry = agent_registry
+        if orchestrator is not None:
+            self._orchestrator = orchestrator
+        if supplier_agent is not None:
+            self._supplier_agent = supplier_agent
+        if negotiation_agent is not None:
+            self._negotiation_agent = negotiation_agent
+
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             waiting_for_dispatch = False
