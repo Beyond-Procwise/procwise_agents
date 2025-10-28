@@ -22,6 +22,7 @@ from email.utils import parsedate_to_datetime
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
+from repositories import supplier_response_repo
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -1565,6 +1566,41 @@ class NegotiationAgent(BaseAgent):
 
         self._email_thread_manager = EmailThreadManager()
         self._html_builder = NegotiationEmailHTMLBuilder()
+
+    def _log_round_event(
+        self,
+        *,
+        workflow_id: Optional[str],
+        round_number: Optional[int],
+        supplier_id: Optional[str],
+        status: str,
+        **extra: Any,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "round": round_number,
+            "supplier_id": supplier_id,
+            "status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        for key, value in extra.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                payload[key] = value
+            elif isinstance(value, (list, tuple)):
+                payload[key] = [
+                    item
+                    if isinstance(item, (str, int, float, bool)) or item is None
+                    else str(item)
+                    for item in value
+                ]
+            else:
+                payload[key] = str(value)
+        try:
+            message = json.dumps(payload)
+        except TypeError:
+            sanitised = {key: str(value) for key, value in payload.items()}
+            message = json.dumps(sanitised)
+        logger.info("NEGOTIATION_ROUND_EVENT %s", message)
 
     @contextmanager
     def _session_lock(self, workflow_id: str, supplier_id: str, round_no: int):
@@ -3276,6 +3312,62 @@ class NegotiationAgent(BaseAgent):
 
         return round_entries
 
+    def _execute_round_entry_with_lock(
+        self, context: AgentContext, entry: Dict[str, Any]
+    ) -> Tuple[Optional[str], AgentOutput, float]:
+        workflow_id = (
+            self._coerce_text(entry.get("workflow_id"))
+            or self._coerce_text(context.workflow_id)
+        )
+        supplier_id = self._coerce_text(
+            entry.get("supplier_id") or entry.get("supplier")
+        )
+        if not supplier_id:
+            supplier_id = f"SUP-{uuid.uuid4().hex[:10].upper()}"
+            entry.setdefault("supplier_id", supplier_id)
+            entry.setdefault("supplier", supplier_id)
+        else:
+            entry.setdefault("supplier_id", supplier_id)
+            entry.setdefault("supplier", supplier_id)
+
+        round_raw = entry.get("round") or entry.get("round_number")
+        try:
+            round_number = int(round_raw) if round_raw is not None else 1
+        except Exception:
+            round_number = 1
+
+        start_time = time.time()
+
+        with self._session_lock(workflow_id or "", supplier_id, round_number) as acquired:
+            if not acquired:
+                self._log_round_event(
+                    workflow_id=workflow_id,
+                    round_number=round_number,
+                    supplier_id=supplier_id,
+                    status="LockBusy",
+                )
+                failure_output = AgentOutput(
+                    status=AgentStatus.FAILED,
+                    data={
+                        "workflow_id": workflow_id,
+                        "supplier_id": supplier_id,
+                        "supplier": supplier_id,
+                        "round": round_number,
+                        "message": "Another negotiation instance is already processing this supplier round.",
+                    },
+                    error="negotiation_session_locked",
+                )
+                return supplier_id, self._with_plan(context, failure_output), start_time
+
+            self._log_round_event(
+                workflow_id=workflow_id,
+                round_number=round_number,
+                supplier_id=supplier_id,
+                status="Drafting",
+            )
+            result = self._resolve_batch_entry_output(context, entry)
+            return supplier_id, result, start_time
+
     def _execute_negotiation_round(
         self,
         context: AgentContext,
@@ -3302,11 +3394,22 @@ class NegotiationAgent(BaseAgent):
 
         max_workers = self._compute_batch_workers(round_entries)
 
+        start_times: Dict[str, float] = {}
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                (entry, executor.submit(self._resolve_batch_entry_output, context, entry))
-                for entry in round_entries
-            ]
+            futures: List[Tuple[Dict[str, Any], Any]] = []
+            for entry in round_entries:
+                supplier_id = (
+                    entry.get("supplier_id")
+                    or entry.get("supplier")
+                    or entry.get("supplier_name")
+                )
+                supplier_key = self._coerce_text(supplier_id)
+                if supplier_key and supplier_key not in start_times:
+                    start_times[supplier_key] = time.time()
+                futures.append(
+                    (entry, executor.submit(self._execute_round_entry_with_lock, context, entry))
+                )
 
             for entry, future in futures:
                 supplier_id = (
@@ -3317,11 +3420,27 @@ class NegotiationAgent(BaseAgent):
                 supplier_key = self._coerce_text(supplier_id)
 
                 try:
-                    result = future.result()
+                    future_supplier, result, lock_start = future.result()
+                    if future_supplier:
+                        supplier_key = self._coerce_text(future_supplier) or supplier_key
+                        if supplier_key and supplier_key not in start_times:
+                            start_times[supplier_key] = lock_start
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.exception(
                         "Failed to execute negotiation for supplier %s", supplier_key
                     )
+                    if supplier_key:
+                        duration_ms = int(
+                            (time.time() - start_times.get(supplier_key, time.time())) * 1000
+                        )
+                        self._log_round_event(
+                            workflow_id=workflow_id,
+                            round_number=round_num,
+                            supplier_id=supplier_key,
+                            status="DraftFailed",
+                            error=str(exc),
+                            duration_ms=duration_ms,
+                        )
                     failed_records.append(
                         {
                             "supplier_id": supplier_key,
@@ -3341,8 +3460,16 @@ class NegotiationAgent(BaseAgent):
                         supplier_state["status"] = "FAILED"
                     continue
 
+                result = cast(AgentOutput, result)
+
+                if not supplier_key:
+                    supplier_key = self._coerce_text(future_supplier)
                 if not supplier_key:
                     supplier_key = f"SUP-{uuid.uuid4().hex[:8].upper()}"
+
+                duration_ms = int(
+                    (time.time() - start_times.get(supplier_key, lock_start)) * 1000
+                )
 
                 if isinstance(result, AgentOutput) and result.status == AgentStatus.SUCCESS:
                     result_data = result.data or {}
@@ -3356,6 +3483,19 @@ class NegotiationAgent(BaseAgent):
                             "decision": result_data.get("decision"),
                             "drafts": result_data.get("drafts", []),
                         }
+                    )
+
+                    decision = result_data.get("decision") or {}
+                    strategy = None
+                    if isinstance(decision, dict):
+                        strategy = decision.get("strategy")
+                    self._log_round_event(
+                        workflow_id=workflow_id,
+                        round_number=round_num,
+                        supplier_id=supplier_key,
+                        status="Drafted",
+                        duration_ms=duration_ms,
+                        strategy=strategy,
                     )
 
                     drafts_payload = result_data.get("drafts")
@@ -3373,11 +3513,10 @@ class NegotiationAgent(BaseAgent):
                         )
                         supplier_state["current_round"] = round_num
 
-                        decision = result_data.get("decision") or {}
-                        strategy = (decision.get("strategy") or "").lower()
-                        if strategy in {"accept", "decline"}:
+                        strategy_lower = (strategy or "").lower()
+                        if strategy_lower in {"accept", "decline"}:
                             supplier_state["status"] = (
-                                "ACCEPTED" if strategy == "accept" else "DECLINED"
+                                "ACCEPTED" if strategy_lower == "accept" else "DECLINED"
                             )
                             negotiation_state["completed_suppliers"].add(supplier_key)
 
@@ -3385,6 +3524,14 @@ class NegotiationAgent(BaseAgent):
                     error_text = None
                     if isinstance(result, AgentOutput):
                         error_text = result.error
+                    self._log_round_event(
+                        workflow_id=workflow_id,
+                        round_number=round_num,
+                        supplier_id=supplier_key,
+                        status="DraftFailed",
+                        duration_ms=duration_ms,
+                        error=error_text,
+                    )
                     failed_records.append(
                         {
                             "supplier_id": supplier_key,
@@ -3431,6 +3578,47 @@ class NegotiationAgent(BaseAgent):
         negotiation_state["current_round"] = round_num
 
         return round_result
+
+    def _load_round_supplier_responses(
+        self,
+        *,
+        workflow_id: Optional[str],
+        unique_ids: Sequence[str],
+        supplier_ids: Sequence[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        if not workflow_id:
+            return {}
+
+        unique_tokens = [
+            self._coerce_text(token) for token in unique_ids if self._coerce_text(token)
+        ]
+        supplier_tokens = [
+            self._coerce_text(supplier) for supplier in supplier_ids if self._coerce_text(supplier)
+        ]
+
+        if not unique_tokens and not supplier_tokens:
+            return {}
+
+        try:
+            rows = supplier_response_repo.fetch_for_unique_ids(
+                workflow_id=workflow_id,
+                unique_ids=unique_tokens,
+                supplier_ids=supplier_tokens,
+                include_processed=False,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to load supplier responses from repository",
+                extra={"workflow_id": workflow_id},
+            )
+            return {}
+
+        mapped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            supplier_id = self._coerce_text(row.get("supplier_id"))
+            if supplier_id:
+                mapped[supplier_id].append(row)
+        return mapped
 
     def _wait_for_round_responses(
         self,
@@ -3481,6 +3669,63 @@ class NegotiationAgent(BaseAgent):
             negotiation_state=negotiation_state,
         )
 
+        aggregated: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        start_times: Dict[str, float] = {
+            supplier_id: time.time() for supplier_id in expected_suppliers
+        }
+        pending_suppliers: Set[str] = set(expected_suppliers)
+
+        unique_ids: Set[str] = set()
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            token = self._coerce_text(
+                draft.get("unique_id") or draft.get("session_reference")
+            )
+            if token:
+                unique_ids.add(token)
+
+        for supplier_id in pending_suppliers:
+            self._log_round_event(
+                workflow_id=workflow_id,
+                round_number=round_num,
+                supplier_id=supplier_id,
+                status="Waiting",
+            )
+
+        preloaded = self._load_round_supplier_responses(
+            workflow_id=workflow_id,
+            unique_ids=list(unique_ids),
+            supplier_ids=list(pending_suppliers),
+        )
+        for supplier_id, responses in preloaded.items():
+            if not responses:
+                continue
+            aggregated[supplier_id].extend(responses)
+            if supplier_id in pending_suppliers:
+                pending_suppliers.discard(supplier_id)
+                elapsed_ms = int(
+                    (time.time() - start_times.get(supplier_id, time.time())) * 1000
+                )
+                self._log_round_event(
+                    workflow_id=workflow_id,
+                    round_number=round_num,
+                    supplier_id=supplier_id,
+                    status="ResponseReceived",
+                    duration_ms=elapsed_ms,
+                    response_count=len(responses),
+                    source="database",
+                )
+
+        if not pending_suppliers:
+            received_total = sum(len(values) for values in aggregated.values())
+            logger.info(
+                "Received %s supplier responses for round %s",
+                received_total,
+                round_num,
+            )
+            return dict(aggregated), True
+
         try:
             supplier_agent = self._get_supplier_agent()
             if supplier_agent is None:
@@ -3495,8 +3740,6 @@ class NegotiationAgent(BaseAgent):
             )
 
             deadline = time.time() + timeout
-            pending_suppliers = set(expected_suppliers)
-            aggregated: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
             logger.info(
                 "Initiating response wait: timeout=%ss, poll_interval=%ss, expected_count=%s",
@@ -3517,6 +3760,7 @@ class NegotiationAgent(BaseAgent):
 
                 remaining = max(1, int(deadline - time.time()))
 
+                wait_started = time.time()
                 responses = supplier_agent.wait_for_multiple_responses(
                     wait_drafts,
                     timeout=remaining,
@@ -3543,7 +3787,20 @@ class NegotiationAgent(BaseAgent):
                     if not supplier_responses:
                         continue
                     aggregated[supplier_id].extend(supplier_responses)
-                    pending_suppliers.discard(supplier_id)
+                    if supplier_id in pending_suppliers:
+                        pending_suppliers.discard(supplier_id)
+                        elapsed_ms = int(
+                            (time.time() - start_times.get(supplier_id, wait_started)) * 1000
+                        )
+                        self._log_round_event(
+                            workflow_id=workflow_id,
+                            round_number=round_num,
+                            supplier_id=supplier_id,
+                            status="ResponseReceived",
+                            duration_ms=elapsed_ms,
+                            response_count=len(supplier_responses),
+                            source="watcher",
+                        )
 
                 if pending_suppliers and time.time() < deadline:
                     logger.info(
@@ -3554,11 +3811,47 @@ class NegotiationAgent(BaseAgent):
                     )
 
             if pending_suppliers:
+                follow_up = self._load_round_supplier_responses(
+                    workflow_id=workflow_id,
+                    unique_ids=list(unique_ids),
+                    supplier_ids=list(pending_suppliers),
+                )
+                for supplier_id, responses in follow_up.items():
+                    if not responses:
+                        continue
+                    aggregated[supplier_id].extend(responses)
+                    if supplier_id in pending_suppliers:
+                        pending_suppliers.discard(supplier_id)
+                        elapsed_ms = int(
+                            (time.time() - start_times.get(supplier_id, time.time())) * 1000
+                        )
+                        self._log_round_event(
+                            workflow_id=workflow_id,
+                            round_number=round_num,
+                            supplier_id=supplier_id,
+                            status="ResponseReceived",
+                            duration_ms=elapsed_ms,
+                            response_count=len(responses),
+                            source="database",
+                        )
+
+            if pending_suppliers:
                 logger.warning(
                     "Timed out waiting for suppliers %s in round %s",
                     sorted(pending_suppliers),
                     round_num,
                 )
+                for supplier_id in sorted(pending_suppliers):
+                    elapsed_ms = int(
+                        (time.time() - start_times.get(supplier_id, time.time())) * 1000
+                    )
+                    self._log_round_event(
+                        workflow_id=workflow_id,
+                        round_number=round_num,
+                        supplier_id=supplier_id,
+                        status="ResponseTimeout",
+                        duration_ms=elapsed_ms,
+                    )
 
             received_total = sum(len(responses) for responses in aggregated.values())
             logger.info(
