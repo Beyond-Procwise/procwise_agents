@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import email
 import hashlib
 import imaplib
@@ -555,6 +556,65 @@ def _coerce_round_number(value: Optional[object]) -> Optional[int]:
     return number if number >= 0 else None
 
 
+def _coerce_last_uid(value: Optional[object]) -> Optional[int]:
+    if value in (None, "", False):
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _coerce_responses(candidate: Optional[object]) -> List[EmailResponse]:
+    if candidate is None:
+        return []
+    if isinstance(candidate, EmailResponse):
+        return [candidate]
+    if isinstance(candidate, list):
+        return [item for item in candidate if isinstance(item, EmailResponse)]
+    if isinstance(candidate, tuple):
+        return [item for item in candidate if isinstance(item, EmailResponse)]
+    if isinstance(candidate, set):
+        return [item for item in candidate if isinstance(item, EmailResponse)]
+    if isinstance(candidate, Iterable):
+        return [item for item in candidate if isinstance(item, EmailResponse)]
+    return []
+
+
+def _normalise_fetch_result(payload: Optional[object]) -> Tuple[List[EmailResponse], Optional[int]]:
+    if payload is None:
+        return [], None
+
+    if isinstance(payload, tuple) and len(payload) == 2:
+        responses = _coerce_responses(payload[0])
+        last_uid = _coerce_last_uid(payload[1])
+        if responses or last_uid is not None:
+            return responses, last_uid
+
+    if isinstance(payload, dict):
+        responses = _coerce_responses(
+            payload.get("responses")
+            or payload.get("emails")
+            or payload.get("messages")
+        )
+        last_uid = _coerce_last_uid(
+            payload.get("last_uid")
+            or payload.get("uid")
+            or payload.get("last_seen_uid")
+            or payload.get("max_uid")
+        )
+        return responses, last_uid
+
+    if isinstance(payload, EmailResponse):
+        return [payload], None
+
+    if isinstance(payload, Iterable):
+        return [item for item in payload if isinstance(item, EmailResponse)], None
+
+    return [], None
+
+
 def _default_fetcher(
     *,
     host: str,
@@ -565,23 +625,93 @@ def _default_fetcher(
     port: int = 993,
     use_ssl: bool = True,
     login: Optional[str] = None,
-) -> List[EmailResponse]:
+    last_seen_uid: Optional[int] = None,
+    backtrack_seconds: int = 180,
+    max_uid_samples: int = 200,
+    **_: object,
+) -> Tuple[List[EmailResponse], Optional[int]]:
     client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
-        since_str = since.strftime("%d-%b-%Y")
-        typ, data = client.search(None, f'(SINCE {since_str})')
-        if typ != "OK":
-            return []
-        ids = (data[0] or b"").decode().split()
+        candidate_uids: List[int] = []
+
+        if last_seen_uid is not None:
+            uid_query = f"{last_seen_uid + 1}:*"
+            typ, data = client.uid("SEARCH", None, "UID", uid_query)
+            if typ == "OK":
+                candidate_uids = [
+                    int(part)
+                    for part in (data[0] or b"").split()
+                    if part and part.isdigit()
+                ]
+        else:
+            since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
+            since_str = since_floor.strftime("%d-%b-%Y")
+            typ, data = client.uid("SEARCH", None, "SINCE", since_str)
+            if typ == "OK":
+                candidate_uids = [
+                    int(part)
+                    for part in (data[0] or b"").split()
+                    if part and part.isdigit()
+                ]
+            if not candidate_uids:
+                typ, data = client.uid("SEARCH", None, "ALL")
+                if typ == "OK":
+                    all_uids = [
+                        int(part)
+                        for part in (data[0] or b"").split()
+                        if part and part.isdigit()
+                    ]
+                    candidate_uids = all_uids[-max_uid_samples:]
+
+        if not candidate_uids:
+            return [], last_seen_uid
+
         responses: List[EmailResponse] = []
-        for message_id in ids:
-            typ, payload = client.fetch(message_id, "(RFC822)")
-            if typ != "OK" or not payload or not isinstance(payload[0], tuple):
+        max_uid_value = last_seen_uid or 0
+        lower_bound = since - timedelta(seconds=max(backtrack_seconds, 86400))
+
+        for uid_value in candidate_uids:
+            typ, payload = client.uid("FETCH", str(uid_value), "(RFC822 INTERNALDATE)")
+            if typ != "OK" or not payload:
                 continue
-            raw = payload[0][1]
-            responses.append(_parse_email(raw))
-        return responses
+
+            raw_bytes: Optional[bytes] = None
+            internal_dt: Optional[datetime] = None
+
+            for part in payload:
+                if not isinstance(part, tuple) or len(part) < 2:
+                    continue
+                meta, content = part[0], part[1]
+                if isinstance(meta, (bytes, bytearray)):
+                    try:
+                        internal_tuple = imaplib.Internaldate2tuple(meta)
+                    except Exception:
+                        internal_tuple = None
+                    if internal_tuple:
+                        timestamp = calendar.timegm(internal_tuple)
+                        internal_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                if isinstance(content, (bytes, bytearray)):
+                    raw_bytes = bytes(content)
+
+            if raw_bytes is None:
+                continue
+
+            email_response = _parse_email(raw_bytes)
+
+            if internal_dt:
+                email_response.received_at = internal_dt
+            elif email_response.received_at is None:
+                email_response.received_at = datetime.now(timezone.utc)
+
+            if last_seen_uid is None and email_response.received_at and email_response.received_at < lower_bound:
+                continue
+
+            responses.append(email_response)
+            if uid_value > max_uid_value:
+                max_uid_value = uid_value
+
+        return responses, (max_uid_value if max_uid_value else last_seen_uid)
     finally:
         try:
             client.close()
@@ -728,6 +858,8 @@ class EmailWatcherV2:
                 derived_timeout = max(self.dispatch_wait_seconds, baseline_timeout)
         self.max_total_wait_seconds = derived_timeout if derived_timeout > 0 else None
         self._trackers: Dict[str, WorkflowTracker] = {}
+        self._imap_last_seen_uid: Optional[int] = None
+        self._backtrack_window_seconds = 180
 
         tracking_repo.init_schema()
         supplier_response_repo.init_schema()
@@ -922,22 +1054,39 @@ class EmailWatcherV2:
         )
 
     def _fetch_emails(self, since: datetime) -> List[EmailResponse]:
+        payload: Optional[object]
+
         if self._fetcher:
-            return self._fetcher(since=since)
+            try:
+                payload = self._fetcher(
+                    since=since,
+                    last_seen_uid=self._imap_last_seen_uid,
+                    backtrack_seconds=self._backtrack_window_seconds,
+                )
+            except TypeError:
+                payload = self._fetcher(since=since)
+        else:
+            if not all([self._imap_host, self._imap_username, self._imap_password]):
+                raise RuntimeError("IMAP credentials must be supplied when no custom fetcher is provided")
 
-        if not all([self._imap_host, self._imap_username, self._imap_password]):
-            raise RuntimeError("IMAP credentials must be supplied when no custom fetcher is provided")
+            payload = _default_fetcher(
+                host=self._imap_host,
+                username=self._imap_username,
+                password=self._imap_password,
+                mailbox=self._mailbox,
+                since=since,
+                port=self._imap_port or 993,
+                use_ssl=True if self._imap_use_ssl is None else self._imap_use_ssl,
+                login=self._imap_login,
+                last_seen_uid=self._imap_last_seen_uid,
+                backtrack_seconds=self._backtrack_window_seconds,
+            )
 
-        return _default_fetcher(
-            host=self._imap_host,
-            username=self._imap_username,
-            password=self._imap_password,
-            mailbox=self._mailbox,
-            since=since,
-            port=self._imap_port or 993,
-            use_ssl=True if self._imap_use_ssl is None else self._imap_use_ssl,
-            login=self._imap_login,
-        )
+        responses, last_uid = _normalise_fetch_result(payload)
+        if last_uid is not None:
+            if self._imap_last_seen_uid is None or last_uid > self._imap_last_seen_uid:
+                self._imap_last_seen_uid = last_uid
+        return responses
 
     def _match_responses(
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
@@ -1599,8 +1748,11 @@ class ContinuousEmailWatcher:
 
     def _fetch(self, **kwargs) -> List[EmailResponse]:
         if self._email_fetcher is not None:
-            return self._email_fetcher(**kwargs)
-        return _default_fetcher(**kwargs)
+            payload = self._email_fetcher(**kwargs)
+        else:
+            payload = _default_fetcher(**kwargs)
+        responses, _ = _normalise_fetch_result(payload)
+        return responses
 
     def _sleep(self) -> None:
         try:

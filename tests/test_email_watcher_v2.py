@@ -548,6 +548,65 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     assert context.input_data.get("workflow_status") == "responses_complete"
     assert context.input_data.get("rfq_id") == rfq_identifier
     assert context.input_data.get("unique_id") == unique_id
+
+
+def test_email_fetcher_tracks_last_seen_uid(monkeypatch):
+    workflow_id = "wf-last-uid"
+    now = datetime.now(timezone.utc)
+
+    response = EmailResponse(
+        unique_id=generate_unique_email_id(workflow_id, "sup-late"),
+        supplier_id="sup-late",
+        supplier_email="late@example.com",
+        from_address="late@example.com",
+        message_id="<reply-last-uid>",
+        subject="Re: Update",
+        body="Responding with updated pricing",
+        received_at=now,
+    )
+
+    calls = []
+
+    def fetcher(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("last_seen_uid") is None:
+            return {"responses": [response], "last_uid": 5123}
+        return []
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": response.unique_id,
+                "supplier_id": "sup-late",
+                "supplier_email": "late@example.com",
+                "message_id": "<dispatch-last-uid>",
+                "subject": "Request",
+                "dispatched_at": now - timedelta(minutes=5),
+            }
+        ],
+    )
+
+    first_batch = watcher._fetch_emails(now)
+    assert first_batch == [response]
+    assert watcher._imap_last_seen_uid == 5123
+
+    second_batch = watcher._fetch_emails(now)
+    assert second_batch == []
+    assert len(calls) >= 2
+    assert calls[0].get("last_seen_uid") is None
+    assert calls[1].get("last_seen_uid") == 5123
+
+
 @pytest.fixture(autouse=True)
 def _stub_response_coordinator(monkeypatch):
     class _Coordinator:
