@@ -299,6 +299,7 @@ class EmailDispatchAgent(BaseAgent):
                     workflow_id,
                     unique_ids,
                     expected_count,
+                    round_number=round_number,
                 )
             except Exception:  # pragma: no cover - defensive logging
                 logger.debug(

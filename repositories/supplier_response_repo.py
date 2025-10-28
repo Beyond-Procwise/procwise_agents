@@ -448,7 +448,11 @@ def insert_response(row: SupplierResponseRow) -> None:
                 )
                 cur.close()
                 try:
-                    notify_response_received(workflow_id=row.workflow_id, unique_id=row.unique_id)
+                    notify_response_received(
+                        workflow_id=row.workflow_id,
+                        unique_id=row.unique_id,
+                        round_number=row.round_number,
+                    )
                 except Exception:  # pragma: no cover - defensive
                     logger.exception(
                         "Failed to notify response coordinator for workflow=%s unique_id=%s",
@@ -540,7 +544,11 @@ def insert_response(row: SupplierResponseRow) -> None:
         cur.close()
 
     try:
-        notify_response_received(workflow_id=row.workflow_id, unique_id=row.unique_id)
+        notify_response_received(
+            workflow_id=row.workflow_id,
+            unique_id=row.unique_id,
+            round_number=row.round_number,
+        )
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "Failed to broadcast response event for workflow=%s unique_id=%s",

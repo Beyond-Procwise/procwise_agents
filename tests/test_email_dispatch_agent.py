@@ -1,7 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -68,12 +68,19 @@ def test_email_dispatch_agent_sends_all_drafts(monkeypatch):
 
     coordinator_calls: List[Dict[str, Any]] = []
 
-    def fake_register(workflow_id: str, unique_ids: List[str], expected_count: int):
+    def fake_register(
+        workflow_id: str,
+        unique_ids: List[str],
+        expected_count: int,
+        *,
+        round_number: Optional[int] = None,
+    ):
         coordinator_calls.append(
             {
                 "workflow_id": workflow_id,
                 "unique_ids": list(unique_ids),
                 "expected_count": expected_count,
+                "round_number": round_number,
             }
         )
 
@@ -130,6 +137,7 @@ def test_email_dispatch_agent_sends_all_drafts(monkeypatch):
             "workflow_id": "wf-123",
             "unique_ids": ["PROC-WF-UID-1", "PROC-WF-UID-2", "PROC-WF-UID-3"],
             "expected_count": 3,
+            "round_number": 2,
         }
     ]
 
