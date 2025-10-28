@@ -836,8 +836,17 @@ def _calculate_match_score(
         )
         if value is not None
     }
+    # Weighting favours ProcWise headers when present but still allows
+    # conventional reply heuristics (thread headers + matching subject) to
+    # exceed the default 0.8 threshold when custom headers are stripped.
+    WORKFLOW_HEADER_WEIGHT = 0.5
+    UNIQUE_HEADER_WEIGHT = 0.3
+    ROUND_WEIGHT = 0.1
+    THREAD_WEIGHT = 0.5
+    SUBJECT_WEIGHT = 0.3
+
     if dispatch_workflow and dispatch_workflow in workflow_candidates:
-        score += 0.6
+        score += WORKFLOW_HEADER_WEIGHT
         matched_on.append("workflow_header")
 
     dispatch_unique = _normalise(dispatch.unique_id)
@@ -856,7 +865,7 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_unique and dispatch_unique in unique_candidates:
-        score += 0.2
+        score += UNIQUE_HEADER_WEIGHT
         matched_on.append("unique_id")
 
     dispatch_round = dispatch.round_number
@@ -875,7 +884,7 @@ def _calculate_match_score(
         and response_round is not None
         and dispatch_round == response_round
     ):
-        score += 0.1
+        score += ROUND_WEIGHT
         matched_on.append("round")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
@@ -898,12 +907,12 @@ def _calculate_match_score(
         if normalised_subject and response_subject and normalised_subject == response_subject:
             subject_match = True
 
-    if reference_match or subject_match:
-        score += 0.1
-        if reference_match:
-            matched_on.append("references")
-        if subject_match:
-            matched_on.append("subject")
+    if reference_match:
+        score += THREAD_WEIGHT
+        matched_on.append("references")
+    if subject_match:
+        score += SUBJECT_WEIGHT
+        matched_on.append("subject")
 
     return min(score, 1.0), matched_on
 
