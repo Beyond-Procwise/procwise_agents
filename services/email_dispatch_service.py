@@ -334,9 +334,12 @@ class EmailDispatchService:
                     thread_headers,
                     message_id,
                 )
-                if updated_thread_headers:
-                    backend_metadata["thread_headers"] = updated_thread_headers
-                    dispatch_payload["thread_headers"] = updated_thread_headers
+                resolved_thread_headers = (
+                    updated_thread_headers if updated_thread_headers else thread_headers
+                )
+                if resolved_thread_headers:
+                    backend_metadata["thread_headers"] = resolved_thread_headers
+                    dispatch_payload["thread_headers"] = resolved_thread_headers
                 logger.info(
                     "Dispatched supplier email workflow=%s unique_id=%s supplier=%s message_id=%s",
                     backend_metadata.get("workflow_id"),
@@ -391,13 +394,13 @@ class EmailDispatchService:
                     )
 
                 workflow_identifier = backend_metadata.get("workflow_id")
-                if (
-                    not workflow_identifier
-                    and dispatch_payload_context
-                    and dispatch_payload_context.get("workflow_id")
-                ):
+                if not workflow_identifier and dispatch_payload_context:
                     workflow_identifier = dispatch_payload_context.get("workflow_id")
-                    backend_metadata.setdefault("workflow_id", workflow_identifier)
+                if not workflow_identifier:
+                    raise ValueError(
+                        "workflow_id is required for email dispatch tracking"
+                    )
+                backend_metadata.setdefault("workflow_id", workflow_identifier)
                 context_unique_id = None
                 if dispatch_payload_context:
                     backend_metadata.setdefault(
@@ -449,7 +452,7 @@ class EmailDispatchService:
                                 if dispatch_payload_context
                                 else None
                             ),
-                            thread_headers=updated_thread_headers,
+                            thread_headers=resolved_thread_headers,
                         )
                         round_for_record = backend_metadata.get("round")
                         if not isinstance(round_for_record, int):
