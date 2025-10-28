@@ -384,6 +384,14 @@ def run_email_watcher_for_workflow(
         response_payload["elapsed_seconds"] = result.get("elapsed_seconds")
     if "timeout_reached" in result:
         response_payload["timeout_reached"] = bool(result.get("timeout_reached"))
+    if "pending_suppliers" in result:
+        response_payload["pending_suppliers"] = result.get("pending_suppliers")
+    if "pending_unique_ids" in result:
+        response_payload["pending_unique_ids"] = result.get("pending_unique_ids")
+    if "last_capture_ts" in result:
+        response_payload["last_capture_ts"] = result.get("last_capture_ts")
+    if "timeout_deadline" in result:
+        response_payload["timeout_deadline"] = result.get("timeout_deadline")
 
     expected_ids = {row.unique_id for row in dispatch_rows}
     terminal_statuses = {"processed", "responses_complete"}

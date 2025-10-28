@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS proc.supplier_response (
     response_body TEXT,
     body_html TEXT,
     response_from TEXT,
+    round_number INTEGER,
+    in_reply_to JSONB,
+    reference_ids JSONB,
     response_date TIMESTAMPTZ,
     original_message_id TEXT,
     original_subject TEXT,
@@ -80,6 +83,9 @@ class SupplierResponseRow:
     response_message_id: Optional[str] = None
     response_subject: Optional[str] = None
     response_from: Optional[str] = None
+    round_number: Optional[int] = None
+    in_reply_to: Optional[Sequence[str]] = None
+    references: Optional[Sequence[str]] = None
     original_message_id: Optional[str] = None
     original_subject: Optional[str] = None
     match_confidence: Optional[Decimal] = None
@@ -154,6 +160,31 @@ def _serialise_optional_json(value: Optional[object]) -> Optional[str]:
         return json.dumps(value, default=_json_default)
     except TypeError:
         return json.dumps(str(value))
+
+
+def _normalise_message_identifier(value: Optional[object]) -> Optional[str]:
+    if value in (None, "", False):
+        return None
+    if isinstance(value, (list, tuple, set)):
+        for candidate in value:
+            formatted = _normalise_message_identifier(candidate)
+            if formatted:
+                return formatted
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (list, tuple)) and parsed:
+            return _normalise_message_identifier(parsed[0])
+    text = text.strip("<>").strip()
+    if not text:
+        return None
+    return f"<{text}>"
 
 
 def _ensure_postgres_column(cur, schema: str, table: str, column: str, definition: str) -> None:
@@ -263,6 +294,9 @@ def init_schema() -> None:
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_message_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_subject", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_from", "TEXT")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "round_number", "INTEGER")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "in_reply_to", "JSONB")
+        _ensure_postgres_column(cur, "proc", "supplier_response", "reference_ids", "JSONB")
         _ensure_postgres_column(cur, "proc", "supplier_response", "response_date", "TIMESTAMPTZ")
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_message_id", "TEXT")
         _ensure_postgres_column(cur, "proc", "supplier_response", "original_subject", "TEXT")
@@ -292,7 +326,8 @@ def init_schema() -> None:
 
 
 def insert_response(row: SupplierResponseRow) -> None:
-    response_text = row.response_text or ""
+    base_text = row.response_text or row.response_body or ""
+    response_text = base_text or ""
     response_body = row.response_body if row.response_body not in (None, "") else None
     if response_body is None:
         response_body = response_text
@@ -309,7 +344,11 @@ def insert_response(row: SupplierResponseRow) -> None:
     response_message_id = row.response_message_id or None
     response_subject = row.response_subject or None
     response_from = row.response_from or None
-    original_message_id = row.original_message_id or None
+    try:
+        round_number_value = int(row.round_number) if row.round_number is not None else None
+    except Exception:
+        round_number_value = None
+    original_message_id = _normalise_message_identifier(row.original_message_id)
     original_subject = row.original_subject or None
     processed = _coerce_bool(row.processed)
     match_evidence = _serialise_match_evidence(row.match_evidence)
@@ -317,6 +356,8 @@ def insert_response(row: SupplierResponseRow) -> None:
     raw_headers = _serialise_headers(row.raw_headers)
     tables_json = _serialise_optional_json(row.tables)
     attachments_json = _serialise_optional_json(row.attachments)
+    in_reply_to_json = _serialise_optional_json(row.in_reply_to)
+    references_json = _serialise_optional_json(row.references)
     currency = row.currency or None
     payment_terms = row.payment_terms or None
     warranty = row.warranty or None
@@ -342,6 +383,9 @@ def insert_response(row: SupplierResponseRow) -> None:
                     "body_html=COALESCE(%s, body_html), "
                     "response_subject=COALESCE(%s, response_subject), "
                     "response_from=COALESCE(%s, response_from), "
+                    "round_number=COALESCE(%s, round_number), "
+                    "in_reply_to=COALESCE(%s, in_reply_to), "
+                    "reference_ids=COALESCE(%s, reference_ids), "
                     "response_date=COALESCE(%s, response_date), "
                     "original_message_id=COALESCE(%s, original_message_id), "
                     "original_subject=COALESCE(%s, original_subject), "
@@ -375,6 +419,9 @@ def insert_response(row: SupplierResponseRow) -> None:
                         body_html,
                         response_subject,
                         response_from,
+                        round_number_value,
+                        in_reply_to_json,
+                        references_json,
                         response_date,
                         original_message_id,
                         original_subject,
@@ -413,10 +460,10 @@ def insert_response(row: SupplierResponseRow) -> None:
         insert_query = (
             "INSERT INTO proc.supplier_response "
             "(workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, body_html, "
-            "response_message_id, response_subject, response_from, response_date, original_message_id, original_subject, "
+            "response_message_id, response_subject, response_from, round_number, in_reply_to, reference_ids, response_date, original_message_id, original_subject, "
             "match_confidence, match_score, price, currency, payment_terms, warranty, validity, exceptions, lead_time, "
             "response_time, received_time, match_evidence, matched_on, raw_headers, tables, attachments, processed) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT(workflow_id, unique_id) DO UPDATE SET "
             "supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_response.supplier_id), "
             "supplier_email=COALESCE(EXCLUDED.supplier_email, proc.supplier_response.supplier_email), "
@@ -427,6 +474,9 @@ def insert_response(row: SupplierResponseRow) -> None:
             "response_message_id=COALESCE(EXCLUDED.response_message_id, proc.supplier_response.response_message_id), "
             "response_subject=COALESCE(EXCLUDED.response_subject, proc.supplier_response.response_subject), "
             "response_from=COALESCE(EXCLUDED.response_from, proc.supplier_response.response_from), "
+            "round_number=COALESCE(EXCLUDED.round_number, proc.supplier_response.round_number), "
+            "in_reply_to=COALESCE(EXCLUDED.in_reply_to, proc.supplier_response.in_reply_to), "
+            "reference_ids=COALESCE(EXCLUDED.reference_ids, proc.supplier_response.reference_ids), "
             "response_date=COALESCE(EXCLUDED.response_date, proc.supplier_response.response_date), "
             "original_message_id=COALESCE(EXCLUDED.original_message_id, proc.supplier_response.original_message_id), "
             "original_subject=COALESCE(EXCLUDED.original_subject, proc.supplier_response.original_subject), "
@@ -462,6 +512,9 @@ def insert_response(row: SupplierResponseRow) -> None:
                 response_message_id,
                 response_subject,
                 response_from,
+                round_number_value,
+                in_reply_to_json,
+                references_json,
                 response_date,
                 original_message_id,
                 original_subject,
@@ -729,4 +782,7 @@ def _normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 payload[key] = json.loads(value)
             except Exception:
                 pass
+    payload["original_message_id"] = _normalise_message_identifier(
+        payload.get("original_message_id")
+    )
     return payload
