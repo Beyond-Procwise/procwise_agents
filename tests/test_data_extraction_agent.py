@@ -1,8 +1,10 @@
 import os
 import sys
 import json
+import concurrent.futures
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from pytest import approx
@@ -13,6 +15,7 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.data_extraction_agent import (
     DataExtractionAgent,
     DocumentTextBundle,
+    PageExtractionResult,
     StructuredExtractionResult,
 )
 
@@ -237,6 +240,133 @@ def test_raw_payload_merges_into_persistence(monkeypatch):
     assert res["data"]["header_data"]["invoice_id"] == "INV-1"
 
 
+def test_traceability_includes_validation_review_flag(monkeypatch):
+    from io import BytesIO
+    import numpy as np
+
+    trace_calls: Dict[str, Any] = {}
+
+    nick = SimpleNamespace(
+        s3_client=SimpleNamespace(
+            get_object=lambda Bucket, Key: {"Body": BytesIO(b"fake")}
+        ),
+        embedding_model=SimpleNamespace(
+            encode=lambda chunks, **kwargs: [np.zeros(3) for _ in chunks]
+        ),
+        qdrant_client=SimpleNamespace(upsert=lambda **kwargs: None),
+        _initialize_qdrant_collection=lambda: None,
+        settings=SimpleNamespace(
+            s3_bucket_name="bucket",
+            s3_prefixes=[],
+            qdrant_collection_name="collection",
+            extraction_model="model",
+            document_extraction_model="parser-v1",
+        ),
+    )
+
+    agent = DataExtractionAgent(nick)
+
+    bundle = DocumentTextBundle(
+        full_text="invoice body",
+        page_results=[
+            PageExtractionResult(
+                page_number=1,
+                route="digital",
+                digital_text="invoice body",
+                ocr_text="",
+                char_count=20,
+            )
+        ],
+        raw_text="invoice body",
+        ocr_text="",
+        routing_log=[{"page": 1, "route": "digital"}],
+    )
+    monkeypatch.setattr(agent, "_extract_text", lambda *args, **kwargs: bundle)
+    monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Invoice")
+    monkeypatch.setattr(agent, "_classify_product_type", lambda t: "hardware")
+    monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "INV-2")
+    monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_vectorize_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_vectorize_structured_data", lambda *args, **kwargs: None)
+
+    structured = StructuredExtractionResult(
+        header={
+            "invoice_id": "INV-2",
+            "_validation": {"ok": False, "confidence": 0.5, "notes": ["missing buyer"]},
+        },
+        line_items=[{"item_description": "Service", "quantity": "1"}],
+        header_df=pd.DataFrame([{"invoice_id": "INV-2"}]),
+        line_df=pd.DataFrame([{"item_description": "Service"}]),
+        report={
+            "validation": {
+                "is_valid": False,
+                "confidence_score": 0.5,
+                "errors": ["Missing buyer"],
+                "warnings": ["No buyer field"],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_extract_structured_data",
+        lambda text, fb, dt, source_hint=None: structured,
+    )
+
+    stub_payload = {
+        "header": {"invoice_id": "INV-2"},
+        "line_items": [{"item_description": "Service", "quantity": "1"}],
+        "tables": [],
+        "raw_text": "invoice text",
+        "metadata": {
+            "ingestion_mode": "digital",
+            "parser_version": "parser-v2",
+            "page_count": 1,
+        },
+        "schema_reference": {},
+    }
+
+    monkeypatch.setattr(
+        agent,
+        "_trigger_document_extraction",
+        lambda *args, **kwargs: (None, stub_payload),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_record_etl_errors",
+        lambda **kwargs: trace_calls.setdefault("payload", kwargs),
+    )
+
+    events: List[Dict[str, Any]] = []
+
+    def capture_event(**kwargs):
+        events.append(kwargs)
+
+    monkeypatch.setattr(agent, "_log_workflow_event", capture_event)
+
+    ctx = SimpleNamespace(workflow_id="wf-logs", agent_id="data_extraction")
+
+    result = agent._process_single_document("docs/invoice.pdf", context=ctx)
+
+    validation = result["data"]["validation"]
+    traceability = result["data"]["traceability"]
+    accuracy = result["data"].get("accuracy_report")
+
+    assert validation["requires_review"] is True
+    assert result["needs_review"] is True
+    assert traceability["s3_key"] == "docs/invoice.pdf"
+    assert traceability["parser_version"] == "parser-v2"
+    assert traceability["confidence_score"] == approx(0.5)
+    assert trace_calls["payload"]["validation"]["requires_review"] is True
+    assert trace_calls["payload"]["trace_metadata"]["s3_key"] == "docs/invoice.pdf"
+    assert isinstance(accuracy, list)
+    event_names = [entry.get("event") for entry in events]
+    assert "document_start" in event_names
+    assert "document_complete" in event_names
+    complete = next(entry for entry in events if entry.get("event") == "document_complete")
+    assert complete.get("workflow_id") == "wf-logs"
+    assert complete.get("record_id") == "INV-2"
+
+
 def test_run_document_extraction_handles_extractor_initialisation_failure(monkeypatch):
     nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
     agent = DataExtractionAgent(nick)
@@ -254,6 +384,94 @@ def test_run_document_extraction_handles_extractor_initialisation_failure(monkey
     )
 
     assert result is None
+
+
+def test_process_documents_paginates_and_passes_context(monkeypatch):
+    """S3 listing should walk pagination and filter supported keys."""
+
+    class FakeClient:
+        def __init__(self):
+            self.calls: List[Dict[str, Any]] = []
+
+        def list_objects_v2(self, Bucket, Prefix, **kwargs):
+            self.calls.append({"Bucket": Bucket, "Prefix": Prefix, "token": kwargs.get("ContinuationToken")})
+            if kwargs.get("ContinuationToken"):
+                return {
+                    "IsTruncated": False,
+                    "Contents": [
+                        {"Key": "docs/b.pdf"},
+                        {"Key": "docs/skip.txt"},
+                    ],
+                }
+            return {
+                "IsTruncated": True,
+                "NextContinuationToken": "token-1",
+                "Contents": [{"Key": "docs/a.pdf"}],
+            }
+
+    fake_client = FakeClient()
+
+    @contextmanager
+    def fake_borrow():
+        yield fake_client
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(
+            s3_bucket_name="bucket",
+            s3_prefixes=["docs/"],
+            data_extraction_max_workers=2,
+            qdrant_collection_name="collection",
+            extraction_model="model",
+            document_extraction_model="parser",
+            force_ocr_vendors=[],
+        ),
+        s3_pool_size=2,
+    )
+
+    agent = DataExtractionAgent(nick)
+
+    monkeypatch.setattr(agent, "_borrow_s3_client", fake_borrow)
+
+    processed: List[str] = []
+    contexts: List[Any] = []
+
+    def fake_single(key, *, context=None):
+        processed.append(key)
+        contexts.append(context)
+        return {"object_key": key, "status": "success"}
+
+    monkeypatch.setattr(agent, "_process_single_document", fake_single)
+
+    class ImmediateExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class ImmediateFuture:
+                def result(self_inner):
+                    return fn(*args, **kwargs)
+
+            return ImmediateFuture()
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", ImmediateExecutor)
+    monkeypatch.setattr(concurrent.futures, "as_completed", lambda futures: futures)
+
+    ctx = SimpleNamespace(workflow_id="wf-1", agent_id="data_extraction")
+
+    result = agent._process_documents(context=ctx)
+
+    assert processed == ["docs/a.pdf", "docs/b.pdf"]
+    assert all(item is ctx for item in contexts)
+    assert fake_client.calls[0]["token"] is None
+    assert fake_client.calls[1]["token"] == "token-1"
+    assert result["status"] == "completed"
+    assert len(result["details"]) == 2
 
 
 def test_vectorize_structured_data_creates_points(monkeypatch):
@@ -333,20 +551,30 @@ def test_invoice_row_numeric_repair():
 
 
 def test_po_line_items_unit_mapping(monkeypatch):
-    executed = []
-
     class DummyCursor:
+        def __init__(self):
+            self.calls: List[Tuple[str, Any]] = []
+            self.last_sql = ""
+            self.params: Any = None
+
         def execute(self, sql, params=None):
-            executed.append((sql, params))
+            text = str(sql)
+            self.calls.append((text, params))
+            self.last_sql = text
+            self.params = params
 
         def fetchall(self):
-            return [
-                ("po_line_id",),
-                ("po_id",),
-                ("line_number",),
-                ("unit_of_measue",),
-                ("quantity",),
-            ]
+            if "information_schema.columns" in self.last_sql:
+                return [
+                    ("po_line_id", "text"),
+                    ("po_id", "text"),
+                    ("line_number", "integer"),
+                    ("unit_of_measue", "text"),
+                    ("quantity", "integer"),
+                ]
+            if "table_constraints" in self.last_sql:
+                return []
+            return []
 
         def __enter__(self):
             return self
@@ -355,8 +583,13 @@ def test_po_line_items_unit_mapping(monkeypatch):
             pass
 
     class DummyConn:
+        def __init__(self):
+            self.cursors: List[DummyCursor] = []
+
         def cursor(self):
-            return DummyCursor()
+            cur = DummyCursor()
+            self.cursors.append(cur)
+            return cur
 
         def commit(self):
             pass
@@ -397,8 +630,9 @@ def test_po_line_items_unit_mapping(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             pass
 
+    conn = DummyConn()
     nick = SimpleNamespace(
-        get_db_connection=lambda: DummyConn(),
+        get_db_connection=lambda: conn,
         settings=SimpleNamespace(extraction_model="m"),
     )
     agent = DataExtractionAgent(nick)
@@ -408,10 +642,28 @@ def test_po_line_items_unit_mapping(monkeypatch):
         "PO1", [item], "Purchase_Order", {}, None
     )
 
-    insert_sql, params = executed[-1]
-    assert "proc.po_line_items_agent" in insert_sql
-    assert "unit_of_measue" in insert_sql
-    assert "pcs" in params
+    all_calls = [call for cursor in conn.cursors for call in cursor.calls]
+
+    stage_insert = next(
+        (
+            params
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc_stage"."po_line_items_agent_staging"')
+        ),
+        None,
+    )
+    final_insert = next(
+        (
+            sql
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc"."po_line_items_agent"')
+        ),
+        "",
+    )
+
+    assert stage_insert is not None
+    assert any(str(value) == "pcs" for value in stage_insert)
+    assert "unit_of_measue" in final_insert
 
 
 def test_extract_header_with_ner(monkeypatch):
@@ -461,7 +713,9 @@ def test_run_summarises_discrepancies(monkeypatch):
     agent = DataExtractionAgent(nick)
 
     monkeypatch.setattr(
-        agent, "_process_documents", lambda p, k: {"status": "completed", "details": docs}
+        agent,
+        "_process_documents",
+        lambda p, k, **kwargs: {"status": "completed", "details": docs},
     )
 
     def fake_run_disc(self, docs, ctx):
@@ -495,7 +749,9 @@ def test_run_propagates_discrepancy_fail(monkeypatch):
     agent = DataExtractionAgent(nick)
 
     monkeypatch.setattr(
-        agent, "_process_documents", lambda p, k: {"status": "completed", "details": docs}
+        agent,
+        "_process_documents",
+        lambda p, k, **kwargs: {"status": "completed", "details": docs},
     )
 
     def fake_run_disc(self, docs, ctx):
@@ -922,35 +1178,32 @@ def test_structured_extraction_injects_recovered_fields(monkeypatch):
 def test_persist_to_postgres_sanitizes_values(monkeypatch):
     """Insertion into target tables should strip stray symbols from values."""
 
-    executed = {"header": None, "line": None}
-
     class DummyCursor:
         def __init__(self):
-            self.sql = ""
-            self.params = None
+            self.calls: List[Tuple[str, Any]] = []
+            self.last_sql = ""
+            self.params: Any = None
 
         def execute(self, sql, params=None):
-            self.sql = sql.lower().strip()
+            text = str(sql)
+            self.calls.append((text, params))
+            self.last_sql = text
             self.params = params
-            if self.sql.startswith("insert into proc.invoice_agent"):
-                executed["header"] = params
-            elif self.sql.startswith("insert into proc.invoice_line_items_agent"):
-                executed["line"] = params
 
         def fetchall(self):
-            if "information_schema.columns" in self.sql:
+            if "information_schema.columns" in self.last_sql:
                 table = self.params[1] if self.params and len(self.params) > 1 else ""
                 if table == "invoice_agent":
                     return [("invoice_id", "text"), ("supplier_id", "text")]
                 if table == "invoice_line_items_agent":
                     return [
-                        ("invoice_line_id",),
-                        ("invoice_id",),
-                        ("line_no",),
-                        ("item_description",),
-                        ("quantity",),
+                        ("invoice_line_id", "text"),
+                        ("invoice_id", "text"),
+                        ("line_no", "integer"),
+                        ("item_description", "text"),
+                        ("quantity", "integer"),
                     ]
-            if "table_constraints" in self.sql:
+            if "table_constraints" in self.last_sql:
                 return []
             return []
 
@@ -961,8 +1214,13 @@ def test_persist_to_postgres_sanitizes_values(monkeypatch):
             pass
 
     class InvoiceConn:
+        def __init__(self):
+            self.cursors: List[DummyCursor] = []
+
         def cursor(self):
-            return DummyCursor()
+            cur = DummyCursor()
+            self.cursors.append(cur)
+            return cur
 
         def commit(self):
             pass
@@ -979,8 +1237,9 @@ def test_persist_to_postgres_sanitizes_values(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             pass
 
+    conn = InvoiceConn()
     nick = SimpleNamespace(
-        get_db_connection=lambda: InvoiceConn(),
+        get_db_connection=lambda: conn,
         settings=SimpleNamespace(extraction_model="m"),
     )
 
@@ -991,6 +1250,146 @@ def test_persist_to_postgres_sanitizes_values(monkeypatch):
 
     agent._persist_to_postgres(header, line_items, "Invoice", "INV{123}")
 
-    assert executed["header"] == ["INV123", "ACMECo"]
-    assert executed["line"] == ["INV123", 1, "INV123-1", "Widget", 2]
+    all_calls = [call for cursor in conn.cursors for call in cursor.calls]
 
+    header_stage = next(
+        (
+            params
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc_stage"."invoice_agent_staging"')
+        ),
+        None,
+    )
+    line_stage = next(
+        (
+            params
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc_stage"."invoice_line_items_agent_staging"')
+        ),
+        None,
+    )
+    header_insert = next(
+        (
+            (sql, params)
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc"."invoice_agent"')
+        ),
+        None,
+    )
+    line_insert = next(
+        (
+            (sql, params)
+            for sql, params in all_calls
+            if sql.startswith('INSERT INTO "proc"."invoice_line_items_agent"')
+        ),
+        None,
+    )
+
+    assert header_stage is not None
+    assert any(str(value) == "INV123" for value in header_stage)
+    assert any(str(value) == "ACMECo" for value in header_stage)
+    assert line_stage is not None
+    assert any(str(value) == "INV123-1" for value in line_stage)
+    assert any(str(value) == "INV123" for value in line_stage)
+    assert any(str(value).startswith("Widget") for value in line_stage)
+    assert any(str(value) in {"2", "2.0"} for value in line_stage)
+    assert header_insert is not None
+    assert "SELECT \"invoice_id\"" in header_insert[0]
+    assert len(header_insert[1]) == 1  # ingestion id placeholder
+    assert line_insert is not None
+    assert "SELECT \"invoice_id\", \"line_no\"" in line_insert[0]
+    assert len(line_insert[1]) == 1
+
+
+def test_record_etl_errors_inserts_rows(monkeypatch):
+    executed: List[Any] = []
+
+    class DummyCursor:
+        def __init__(self):
+            self.last_sql = ""
+
+        def execute(self, sql, params=None):
+            self.last_sql = sql
+            executed.append((sql, params))
+
+        def fetchall(self):
+            if "information_schema.columns" in self.last_sql:
+                return [
+                    ("record_id",),
+                    ("document_type",),
+                    ("source_object_key",),
+                    ("error_category",),
+                    ("error_detail",),
+                    ("confidence_score",),
+                    ("source_table",),
+                ]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyConn:
+        def cursor(self):
+            return DummyCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(extraction_model="m"),
+        get_db_connection=lambda: DummyConn(),
+    )
+    agent = DataExtractionAgent(nick)
+
+    agent._record_etl_errors(
+        doc_type="Invoice",
+        record_id="INV-9",
+        object_key="docs/inv.pdf",
+        validation={
+            "is_valid": False,
+            "confidence_score": 0.6,
+            "errors": ["missing"],
+            "warnings": [],
+        },
+        table_name="proc.invoice_agent",
+        trace_metadata={"s3_key": "docs/inv.pdf"},
+    )
+
+    insert_sql, params = executed[-1]
+    assert "INSERT INTO proc.etl_errors" in insert_sql
+    assert "ON CONFLICT" in insert_sql
+    assert params[0] == "INV-9"
+    detail_payload = json.loads(params[4])
+    assert detail_payload["errors"] == ["missing"]
+    assert params[3] == "validation_error"
+
+
+def test_record_etl_errors_skips_when_confident():
+    def boom():
+        raise AssertionError("should not connect")
+
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(extraction_model="m"),
+        get_db_connection=boom,
+    )
+    agent = DataExtractionAgent(nick)
+
+    agent._record_etl_errors(
+        doc_type="Invoice",
+        record_id="INV-10",
+        object_key="docs/inv.pdf",
+        validation={
+            "is_valid": True,
+            "confidence_score": 0.95,
+            "errors": [],
+            "warnings": [],
+        },
+        table_name="proc.invoice_agent",
+        trace_metadata={},
+    )
