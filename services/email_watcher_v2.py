@@ -27,6 +27,7 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from repositories import (
+    email_dispatch_repo,
     email_watcher_state_repo,
     supplier_interaction_repo,
     supplier_response_repo,
@@ -176,6 +177,8 @@ class WorkflowTracker:
     response_history: Dict[str, List[EmailResponse]] = field(default_factory=dict)
     responded_unique_ids: Set[str] = field(default_factory=set)
     rfq_index: Dict[str, List[str]] = field(default_factory=dict)
+    supplier_unique_map: Dict[str, Set[str]] = field(default_factory=dict)
+    expected_supplier_ids: Set[str] = field(default_factory=set)
     all_dispatched: bool = False
     all_responded: bool = False
     last_dispatched_at: Optional[datetime] = None
@@ -187,12 +190,19 @@ class WorkflowTracker:
     completion_logged: bool = False
     seen_message_ids: Set[str] = field(default_factory=set)
     seen_fingerprints: Set[str] = field(default_factory=set)
+    status: str = "initializing"
 
     def register_dispatches(self, dispatches: Iterable[EmailDispatchRecord]) -> None:
         for dispatch in dispatches:
             bucket = self.email_records.setdefault(dispatch.unique_id, [])
             bucket.append(dispatch)
             bucket.sort(key=lambda item: item.dispatched_at or datetime.min)
+            supplier_key = dispatch.supplier_id or ""
+            if supplier_key:
+                self.expected_supplier_ids.add(supplier_key)
+                self.supplier_unique_map.setdefault(supplier_key, set()).add(
+                    dispatch.unique_id
+                )
             if dispatch.round_number is not None:
                 self.round_index[dispatch.unique_id] = dispatch.round_number
             if dispatch.rfq_id:
@@ -208,7 +218,9 @@ class WorkflowTracker:
             ):
                 self.started_at = dispatch.dispatched_at
         self.dispatched_count = len(self.email_records)
-        self.expected_responses = self.dispatched_count
+        supplier_total = len(self.expected_supplier_ids)
+        if supplier_total > self.expected_responses:
+            self.expected_responses = supplier_total
         self.all_dispatched = True
         self.all_responded = self.responded_count >= self.expected_responses > 0
 
@@ -235,6 +247,18 @@ class WorkflowTracker:
         if not records:
             return None
         return records[-1]
+
+    def set_expected_responses(self, expected: Optional[int]) -> None:
+        if expected is None:
+            return
+        try:
+            value = int(expected)
+        except Exception:  # pragma: no cover - defensive conversion
+            return
+        if value < 0:
+            value = 0
+        self.expected_responses = max(value, self.responded_count)
+        self.all_responded = self.responded_count >= self.expected_responses > 0
 
     def latest_response(self, unique_id: str) -> Optional[EmailResponse]:
         """Return the most recent response recorded for a dispatch."""
@@ -885,18 +909,9 @@ def _calculate_match_score(
         )
         if value is not None
     }
-    # Weighting favours ProcWise headers when present but still allows
-    # conventional reply heuristics (thread headers + matching subject) to
-    # exceed the default 0.8 threshold when custom headers are stripped.
-    WORKFLOW_HEADER_WEIGHT = 0.5
-    UNIQUE_HEADER_WEIGHT = 0.3
-    ROUND_WEIGHT = 0.1
-    THREAD_WEIGHT = 0.5
-    SUBJECT_WEIGHT = 0.3
-
     if dispatch_workflow and dispatch_workflow in workflow_candidates:
-        score += WORKFLOW_HEADER_WEIGHT
-        matched_on.append("workflow_header")
+        score += 0.6
+        matched_on.append("workflow_id")
 
     dispatch_unique = _normalise(dispatch.unique_id)
     unique_candidates = {
@@ -914,27 +929,26 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_unique and dispatch_unique in unique_candidates:
-        score += UNIQUE_HEADER_WEIGHT
+        score += 0.2
         matched_on.append("unique_id")
 
-    dispatch_round = dispatch.round_number
-    response_round = email_response.round_number
-    if response_round is None:
-        for candidate in _collect_header_values("x-procwise-round"):
-            try:
-                parsed = int(candidate)
-            except (TypeError, ValueError):
-                continue
-            if parsed >= 0:
-                response_round = parsed
-                break
-    if (
-        dispatch_round is not None
-        and response_round is not None
-        and dispatch_round == response_round
-    ):
-        score += ROUND_WEIGHT
-        matched_on.append("round")
+    supplier_candidates = {
+        value
+        for value in (
+            _normalise(email_response.supplier_id),
+            *(_normalise(candidate) for candidate in _collect_header_values("x-procwise-supplier-id")),
+        )
+        if value is not None
+    }
+    dispatch_supplier = _normalise(dispatch.supplier_id)
+    if dispatch_supplier and dispatch_supplier in supplier_candidates:
+        score += 0.1
+        matched_on.append("supplier_id")
+
+    subject_similarity = _subject_similarity(dispatch.subject, email_response.subject)
+    if subject_similarity >= 0.7:
+        score += 0.1
+        matched_on.append("subject_similarity")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
         dispatch.thread_headers.get("in_reply_to", ())
@@ -943,25 +957,10 @@ def _calculate_match_score(
         thread_ids.add(dispatch.message_id)
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
-    reference_match = False
     if dispatch.message_id and dispatch.message_id in reply_headers:
-        reference_match = True
+        matched_on.append("in_reply_to")
     elif thread_ids & reply_headers:
-        reference_match = True
-
-    subject_match = False
-    if dispatch.subject and email_response.subject:
-        normalised_subject = _normalise_subject_line(dispatch.subject)
-        response_subject = _normalise_subject_line(email_response.subject)
-        if normalised_subject and response_subject and normalised_subject == response_subject:
-            subject_match = True
-
-    if reference_match:
-        score += THREAD_WEIGHT
-        matched_on.append("references")
-    if subject_match:
-        score += SUBJECT_WEIGHT
-        matched_on.append("subject")
+        matched_on.append("thread_reference")
 
     return min(score, 1.0), matched_on
 
@@ -977,7 +976,7 @@ class EmailWatcherV2:
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.75,
+        match_threshold: float = 0.8,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,
@@ -1223,6 +1222,32 @@ class EmailWatcherV2:
                 tracker.workflow_id,
             )
 
+    def _sync_expected_response_count(self, tracker: WorkflowTracker) -> bool:
+        """Refresh the expected response count from the dispatch repository."""
+
+        confirmed = False
+        try:
+            expected_total = email_dispatch_repo.count_completed_supplier_dispatches(
+                tracker.workflow_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to load completed dispatch count for workflow=%s",
+                tracker.workflow_id,
+            )
+            expected_total = None
+
+        if expected_total and expected_total > 0:
+            tracker.set_expected_responses(expected_total)
+            confirmed = True
+        else:
+            fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
+            if fallback:
+                tracker.set_expected_responses(fallback)
+            if expected_total is None and fallback:
+                confirmed = True
+        return confirmed
+
     def _resolve_round(
         self, tracker: WorkflowTracker, *, unique_id: Optional[str] = None
     ) -> Optional[int]:
@@ -1287,6 +1312,20 @@ class EmailWatcherV2:
                 continue
             seen.add(supplier_id)
             pending_suppliers.append(supplier_id)
+        remaining = max(0, tracker.expected_responses - tracker.responded_count)
+        if remaining and len(pending_suppliers) < remaining:
+            for supplier_id in sorted(tracker.expected_supplier_ids):
+                if supplier_id in seen:
+                    continue
+                unique_set = tracker.supplier_unique_map.get(supplier_id) or set()
+                if unique_set and all(
+                    uid in tracker.responded_unique_ids for uid in unique_set
+                ):
+                    continue
+                seen.add(supplier_id)
+                pending_suppliers.append(supplier_id)
+                if len(pending_suppliers) >= remaining:
+                    break
         return pending_suppliers
 
     def _update_idle_deadline(self, tracker: WorkflowTracker, capture_time: datetime) -> None:
@@ -1638,6 +1677,7 @@ class EmailWatcherV2:
                     tracker.seen_fingerprints.add(fingerprint)
                 capture_time = self._now()
                 self._update_idle_deadline(tracker, capture_time)
+                pending_suppliers_after = self._pending_suppliers(tracker)
                 logger.info(
                     "EmailWatcher captured supplier response workflow=%s%s responded=%d/%d elapsed=%.1fs matched_on=%s best_score=%.2f",
                     tracker.workflow_id,
@@ -1658,8 +1698,11 @@ class EmailWatcherV2:
                     message_id=email.message_id,
                     score=round(best_score, 4),
                     matched_on=list(best_reasons),
-                    responses_received=tracker.responded_count,
-                    expected_count=tracker.expected_responses,
+                    responded=tracker.responded_count,
+                    expected=tracker.expected_responses,
+                    pending_suppliers=pending_suppliers_after,
+                    status=tracker.status,
+                    elapsed_s=round(tracker.elapsed_seconds(self._now()), 2),
                 )
                 tracking_repo.mark_response(
                     workflow_id=tracker.workflow_id,
@@ -1782,7 +1825,7 @@ class EmailWatcherV2:
         lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
         supplier_status = (lifecycle.get("supplier_agent_status") or "").strip().lower()
         allowed_statuses = {"awaiting_responses", "running", "started", "active"}
-        if supplier_status not in allowed_statuses:
+        if supplier_status and supplier_status not in allowed_statuses:
             logger.info(
                 "EmailWatcher deferring start until SupplierInteractionAgent is active workflow=%s status=%s",
                 workflow_id,
@@ -1842,13 +1885,19 @@ class EmailWatcherV2:
         try:
             watcher_start_at = self._now()
             self._update_idle_deadline(tracker, watcher_start_at)
+            expected_confirmed = self._sync_expected_response_count(tracker)
+            pending_unique_ids = self._pending_unique_ids(tracker)
+            pending_suppliers = self._pending_suppliers(tracker, pending_unique_ids)
+            tracker.status = "initializing"
             self._update_watcher_state(
                 tracker,
-                "active",
+                "initializing",
                 start_ts=watcher_start_at,
                 last_capture_ts=watcher_start_at,
                 timeout_deadline=tracker.timeout_deadline,
                 uid_cursor=self._imap_last_seen_uid,
+                pending_unique_ids=pending_unique_ids,
+                pending_suppliers=pending_suppliers,
             )
             workflow_lifecycle_repo.record_watcher_event(
                 workflow_id,
@@ -1858,31 +1907,52 @@ class EmailWatcherV2:
                 metadata={"supplier_status": supplier_status} if supplier_status else None,
             )
             watcher_started = True
-            workflow_lifecycle_repo.record_watcher_event(
-                workflow_id,
-                "watcher_active",
-                expected_responses=tracker.expected_responses,
-                received_responses=tracker.responded_count,
-            )
 
             self._log_event(
                 "watcher_started",
                 tracker,
                 start_ts=watcher_start_at,
-                expected_count=tracker.expected_responses,
-                responses_received=tracker.responded_count,
+                expected=tracker.expected_responses,
+                responded=tracker.responded_count,
+                pending_suppliers=pending_suppliers,
+                status=tracker.status,
+                elapsed_s=0.0,
                 uid_cursor=self._imap_last_seen_uid,
             )
 
-            last_pending_unique = self._pending_unique_ids(tracker)
-            last_pending_suppliers = self._pending_suppliers(
-                tracker, last_pending_unique
-            )
+            if not expected_confirmed:
+                stop_reason = "awaiting_dispatch_confirmation"
+                final_status = "initializing"
+                last_pending_unique = list(pending_unique_ids)
+                last_pending_suppliers = list(pending_suppliers)
+                return {
+                    "workflow_id": workflow_id,
+                    "complete": False,
+                    "dispatched_count": tracker.dispatched_count,
+                    "responded_count": tracker.responded_count,
+                    "matched_responses": tracker.matched_responses,
+                    "expected_responses": tracker.expected_responses,
+                    "workflow_status": "awaiting_dispatch_confirmation",
+                    "timeout_reached": False,
+                    "pending_unique_ids": list(pending_unique_ids),
+                    "pending_suppliers": list(pending_suppliers),
+                }
+
+            tracker.status = "active"
+            last_pending_unique = list(pending_unique_ids)
+            last_pending_suppliers = list(pending_suppliers)
             self._update_watcher_state(
                 tracker,
                 "active",
                 pending_unique_ids=last_pending_unique,
                 pending_suppliers=last_pending_suppliers,
+                heartbeat_ts=watcher_start_at,
+            )
+            workflow_lifecycle_repo.record_watcher_event(
+                workflow_id,
+                "watcher_active",
+                expected_responses=tracker.expected_responses,
+                received_responses=tracker.responded_count,
             )
 
             if tracker.last_dispatched_at:
@@ -1949,9 +2019,24 @@ class EmailWatcherV2:
                     )
                     break
 
-                responses = self._fetch_emails(
-                    since_cursor,
-                )
+                try:
+                    responses = self._fetch_emails(
+                        since_cursor,
+                    )
+                except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
+                    logger.warning(
+                        "EmailWatcher IMAP abort encountered workflow=%s error=%s",
+                        workflow_id,
+                        exc,
+                    )
+                    self._log_event(
+                        "watcher_imap_abort",
+                        tracker,
+                        status=tracker.status,
+                        error=str(exc),
+                    )
+                    self._sleep(base_sleep)
+                    continue
                 matched_rows = self._match_responses(tracker, responses)
                 now_after_poll = self._now()
                 reference_capture = tracker.last_capture_at or watcher_start_at
@@ -1975,6 +2060,8 @@ class EmailWatcherV2:
                     pending_suppliers=pending_suppliers,
                     since_last_capture_s=round(since_last_capture, 2),
                     timeout_deadline=timeout_deadline,
+                    status=tracker.status,
+                    elapsed_s=round(tracker.elapsed_seconds(self._now()), 2),
                 )
                 self._update_watcher_state(
                     tracker,
@@ -1989,6 +2076,7 @@ class EmailWatcherV2:
                 ):
                     timeout_reached = True
                     stop_reason = "partial_timeout"
+                    tracker.status = "partial_timeout"
                     self._emit_timeout_event(
                         tracker,
                         round_number=self._resolve_round(tracker),
@@ -2074,6 +2162,13 @@ class EmailWatcherV2:
             else:
                 workflow_state = "awaiting_responses"
                 final_status = final_status or "active"
+
+            if negotiation_completed or tracker.all_responded:
+                tracker.status = "completed"
+            elif stop_reason in {"partial_timeout", "timeout"}:
+                tracker.status = "partial_timeout"
+            else:
+                tracker.status = "active"
             result = {
                 "workflow_id": workflow_id,
                 "complete": complete,
@@ -2108,7 +2203,9 @@ class EmailWatcherV2:
 
             self._update_watcher_state(
                 tracker,
-                final_status or ("partial_timeout" if timeout_reached else "completed"),
+                tracker.status
+                or final_status
+                or ("partial_timeout" if timeout_reached else "completed"),
                 reason=stop_reason,
                 pending_unique_ids=last_pending_unique,
                 pending_suppliers=last_pending_suppliers,
@@ -2146,17 +2243,20 @@ class EmailWatcherV2:
                     stop_metadata["pending_suppliers"] = list(last_pending_suppliers)
                 if final_status:
                     stop_metadata["status"] = final_status
-                self._log_event(
-                    "watcher_stopped",
-                    tracker,
-                    status=
-                    final_status
+                resolved_status = (
+                    tracker.status
+                    or final_status
                     or (
                         "partial_timeout"
                         if stop_reason in {"partial_timeout", "timeout"}
                         else "complete"
-                    ),
-                    responses_received=tracker.responded_count,
+                    )
+                )
+                self._log_event(
+                    "watcher_stopped",
+                    tracker,
+                    status=resolved_status,
+                    responded=tracker.responded_count,
                     expected=tracker.expected_responses,
                     pending_suppliers=last_pending_suppliers,
                     elapsed_s=runtime,

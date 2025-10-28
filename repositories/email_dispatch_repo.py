@@ -53,7 +53,7 @@ def record_dispatch(
     message_id: str,
     dispatched_at: Optional[datetime],
     subject: Optional[str],
-    status: str = "sent",
+    status: str = "completed",
 ) -> None:
     """Upsert an outbound dispatch record."""
 
@@ -102,3 +102,29 @@ def record_dispatch(
             ),
         )
         cur.close()
+
+
+def count_completed_supplier_dispatches(workflow_id: str) -> int:
+    """Return the number of suppliers with completed dispatches for a workflow."""
+
+    if not workflow_id:
+        return 0
+
+    init_schema()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT supplier_id)
+            FROM proc.email_dispatch
+            WHERE workflow_id = %s
+              AND status = 'completed'
+              AND supplier_id IS NOT NULL
+            """,
+            (workflow_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+
+    return int(row[0] or 0) if row else 0
