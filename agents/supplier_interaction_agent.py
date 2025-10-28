@@ -18,6 +18,7 @@ from repositories import (
     draft_rfq_emails_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
@@ -2205,7 +2206,27 @@ class SupplierInteractionAgent(BaseAgent):
         expected_dispatch_raw = context.input_data.get("expected_dispatch_count")
         if expected_dispatch_raw is None:
             expected_dispatch_raw = context.input_data.get("expected_email_count")
-        gating_actions_blocklist = {"poll", "monitor", "business_monitor", "await_workflow_batch"}
+        # These actions operate in legacy/stateless modes and should not flip the
+        # workflow lifecycle into an active supplier state.  The
+        # ``await_workflow_batch`` action, which represents the standard
+        # supplier-response collection flow, must still register lifecycle
+        # activity so downstream watchers can activate correctly.
+        gating_actions_blocklist = {"poll", "monitor", "business_monitor"}
+
+        workflow_hint = self._coerce_text(
+            context.input_data.get("workflow_id") or getattr(context, "workflow_id", None)
+        )
+        if workflow_hint and action not in {"poll", "monitor", "business_monitor"}:
+            try:
+                workflow_lifecycle_repo.record_supplier_agent_status(
+                    workflow_hint, "invoked"
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to record supplier agent lifecycle status for workflow=%s",
+                    workflow_hint,
+                    exc_info=True,
+                )
 
         if expected_dispatch_raw is not None and action not in gating_actions_blocklist:
             workflow_key = self._coerce_text(
@@ -2244,6 +2265,14 @@ class SupplierInteractionAgent(BaseAgent):
                 )
                 expected_email_count = 0
 
+            try:
+                workflow_lifecycle_repo.record_supplier_agent_status(
+                    workflow_key, "awaiting_responses"
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to record awaiting_responses status for workflow=%s", workflow_key
+                )
             return self._run_stateful_gate(
                 context,
                 workflow_id=workflow_key,
@@ -2343,6 +2372,15 @@ class SupplierInteractionAgent(BaseAgent):
                 timeout=timeout,
                 poll_interval=poll_interval,
             )
+
+            try:
+                workflow_lifecycle_repo.record_supplier_agent_status(
+                    workflow_key, "awaiting_responses"
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to update awaiting_responses status for workflow=%s", workflow_key
+                )
 
             expected_total = summary.get("expected_count", 0)
             collected_total = summary.get("collected_count", 0)

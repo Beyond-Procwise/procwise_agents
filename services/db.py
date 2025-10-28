@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 from datetime import datetime
@@ -210,6 +211,55 @@ class _FakeCursor:
         if upper_stmt.startswith("DELETE FROM PROC.SUPPLIER_RESPONSE"):
             (workflow_id,) = params
             self._store.delete_supplier_responses(workflow_id, None)
+            return
+
+        if upper_stmt.startswith("INSERT INTO PROC.WORKFLOW_LIFECYCLE"):
+            column_segment = statement.split("(", 1)[1].split(")", 1)[0]
+            columns = [col.strip().strip('"') for col in column_segment.split(",")]
+            values = {col: params[idx] if idx < len(params) else None for idx, col in enumerate(columns)}
+            workflow_id = values.get("workflow_id")
+            payload = {key: value for key, value in values.items() if key != "workflow_id"}
+            if workflow_id is not None:
+                self._store.upsert_workflow_lifecycle(str(workflow_id), payload)
+            return
+
+        if upper_stmt.startswith("UPDATE PROC.WORKFLOW_LIFECYCLE SET"):
+            set_clause = statement.split("SET", 1)[1]
+            set_part, _, _ = set_clause.partition("WHERE")
+            assignments = [item.strip() for item in set_part.split(",") if item.strip()]
+            columns = [assign.split("=")[0].strip().strip('"') for assign in assignments]
+            updates = {columns[idx]: params[idx] for idx in range(len(columns))}
+            workflow_id = params[len(columns)] if len(params) > len(columns) else None
+            if workflow_id is not None:
+                self._store.upsert_workflow_lifecycle(str(workflow_id), updates)
+            return
+
+        if upper_stmt.startswith("DELETE FROM PROC.WORKFLOW_LIFECYCLE"):
+            if params:
+                workflow_id = params[0]
+                if workflow_id is not None:
+                    self._store.delete_workflow_lifecycle(str(workflow_id))
+            return
+
+        if upper_stmt.startswith("SELECT") and "FROM PROC.WORKFLOW_LIFECYCLE" in upper_stmt:
+            select_part = statement.split("SELECT", 1)[1].split("FROM", 1)[0]
+            columns = [col.strip().strip('"') for col in select_part.split(",")]
+            workflow_id = params[0] if params else None
+            row = None
+            if workflow_id is not None:
+                row = self._store.fetch_workflow_lifecycle(str(workflow_id))
+            if row is None:
+                self._results = []
+            else:
+                payload: List[Any] = []
+                for column in columns:
+                    value = row.get(column)
+                    if column == "metadata" and isinstance(value, dict):
+                        payload.append(json.dumps(value))
+                    else:
+                        payload.append(value)
+                self._results = [tuple(payload)]
+            self.description = [_ColumnDescriptor(col) for col in columns]
             return
 
         if upper_stmt.startswith("SELECT WORKFLOW_ID, SUPPLIER_ID") and (
@@ -468,6 +518,8 @@ class _FakePostgresStore:
             self.supplier_response = []  # type: ignore[attr-defined]
         if not hasattr(self, "workflow_email_tracking"):
             self.workflow_email_tracking = []  # type: ignore[attr-defined]
+        if not hasattr(self, "workflow_lifecycle"):
+            self.workflow_lifecycle = []  # type: ignore[attr-defined]
         if not hasattr(self, "supplier_risk_signals"):
             self.supplier_risk_signals = []  # type: ignore[attr-defined]
         if not hasattr(self, "supplier_risk_scores"):
@@ -523,6 +575,22 @@ class _FakePostgresStore:
                 "matched",
                 "created_at",
                 "thread_headers",
+            ],
+            "proc.workflow_lifecycle": [
+                "workflow_id",
+                "supplier_agent_status",
+                "supplier_agent_updated_at",
+                "negotiation_status",
+                "negotiation_updated_at",
+                "watcher_status",
+                "watcher_started_at",
+                "watcher_stopped_at",
+                "watcher_runtime_seconds",
+                "expected_responses",
+                "received_responses",
+                "last_event",
+                "last_event_at",
+                "metadata",
             ],
             "proc.supplier_risk_signals": [
                 "id",
@@ -716,6 +784,43 @@ class _FakePostgresStore:
         table = self.workflow_email_tracking  # type: ignore[attr-defined]
         self.workflow_email_tracking = [
             row for row in table if row["workflow_id"] != workflow_id
+        ]
+
+    # -- workflow lifecycle operations ---------------------------------
+
+    def upsert_workflow_lifecycle(
+        self, workflow_id: str, row: Dict[str, Any]
+    ) -> None:
+        self.ensure_tables()
+        table = self.workflow_lifecycle  # type: ignore[attr-defined]
+        serialised = dict(row)
+        if "metadata" in serialised and isinstance(serialised["metadata"], str):
+            try:
+                serialised["metadata"] = json.loads(serialised["metadata"])
+            except Exception:
+                pass
+        for existing in table:
+            if existing.get("workflow_id") == workflow_id:
+                for key, value in serialised.items():
+                    existing[key] = value
+                return
+        record = {"workflow_id": workflow_id}
+        record.update(serialised)
+        table.append(record)
+
+    def fetch_workflow_lifecycle(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        self.ensure_tables()
+        table = self.workflow_lifecycle  # type: ignore[attr-defined]
+        for row in table:
+            if row.get("workflow_id") == workflow_id:
+                return dict(row)
+        return None
+
+    def delete_workflow_lifecycle(self, workflow_id: str) -> None:
+        self.ensure_tables()
+        table = self.workflow_lifecycle  # type: ignore[attr-defined]
+        self.workflow_lifecycle = [
+            row for row in table if row.get("workflow_id") != workflow_id
         ]
 
     # -- risk intelligence operations -----------------------------------

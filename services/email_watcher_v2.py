@@ -28,6 +28,7 @@ from repositories import (
     supplier_interaction_repo,
     supplier_response_repo,
     workflow_email_tracking_repo as tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.supplier_interaction_repo import SupplierInteractionRow
 from repositories.supplier_response_repo import SupplierResponseRow
@@ -863,6 +864,10 @@ class EmailWatcherV2:
 
         tracking_repo.init_schema()
         supplier_response_repo.init_schema()
+        try:
+            workflow_lifecycle_repo.init_schema()
+        except Exception:  # pragma: no cover - defensive initialisation
+            logger.debug("Failed to initialise workflow lifecycle schema", exc_info=True)
 
     def _ensure_tracker(self, workflow_id: str) -> WorkflowTracker:
         tracker = self._trackers.get(workflow_id)
@@ -1284,124 +1289,247 @@ class EmailWatcherV2:
                 "matched_responses": {},
             }
 
-        if tracker.last_dispatched_at:
-            target = tracker.last_dispatched_at + timedelta(seconds=self.dispatch_wait_seconds)
-            now = self._now()
-            if target > now:
-                wait_time = (target - now).total_seconds()
-                logger.info(
-                    "Waiting %.1f seconds before polling IMAP for workflow %s",
-                    wait_time,
-                    workflow_id,
-                )
-                self._sleep(wait_time)
+        lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
+        supplier_status = (lifecycle.get("supplier_agent_status") or "").strip().lower()
+        allowed_statuses = {"started", "invoked", "awaiting_responses", "running"}
+        if supplier_status not in allowed_statuses:
+            logger.info(
+                "EmailWatcher deferring start until SupplierInteractionAgent is active workflow=%s status=%s",
+                workflow_id,
+                supplier_status or None,
+            )
+            return {
+                "workflow_id": workflow_id,
+                "complete": False,
+                "dispatched_count": tracker.dispatched_count,
+                "responded_count": tracker.responded_count,
+                "matched_responses": {},
+                "expected_responses": tracker.expected_responses,
+                "workflow_status": "awaiting_supplier_activation",
+                "timeout_reached": False,
+                "reason": "supplier_agent_inactive",
+            }
 
-        idle_attempts = 0
+        negotiation_status = (lifecycle.get("negotiation_status") or "").strip().lower()
+        if negotiation_status in {"completed", "finalized"}:
+            logger.info(
+                "EmailWatcher skipping run because negotiation already completed workflow=%s status=%s",
+                workflow_id,
+                negotiation_status,
+            )
+            return {
+                "workflow_id": workflow_id,
+                "complete": True,
+                "dispatched_count": tracker.dispatched_count,
+                "responded_count": tracker.responded_count,
+                "matched_responses": tracker.matched_responses,
+                "expected_responses": tracker.expected_responses,
+                "response_history": tracker.response_history,
+                "workflow_status": "negotiation_completed",
+                "timeout_reached": False,
+                "reason": "negotiation_completed",
+            }
+
+        watcher_started = False
+        watcher_start_at: Optional[datetime] = None
         timeout_reached = False
-        poll_started_at = self._now()
-        baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
-        since_cursor = tracker.last_response_at or baseline_since
-        if since_cursor.tzinfo is None:
-            since_cursor = since_cursor.replace(tzinfo=timezone.utc)
-        if baseline_since.tzinfo is None:
-            baseline_since = baseline_since.replace(tzinfo=timezone.utc)
-        if since_cursor < baseline_since:
-            since_cursor = baseline_since
-        base_sleep = float(self.poll_interval_seconds)
-        adaptive_sleep = base_sleep
-        while not tracker.all_responded:
-            now = self._now()
-            elapsed = tracker.elapsed_seconds(now)
-            runtime_elapsed = max(0.0, (now - poll_started_at).total_seconds())
-            if self.max_total_wait_seconds is not None and runtime_elapsed >= self.max_total_wait_seconds:
-                timeout_reached = True
-                logger.warning(
-                    "EmailWatcher timed out waiting for responses workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs",
+        negotiation_stop = False
+        stop_reason: Optional[str] = None
+
+        try:
+            watcher_start_at = self._now()
+            workflow_lifecycle_repo.record_watcher_event(
+                workflow_id,
+                "watcher_started",
+                expected_responses=tracker.expected_responses,
+                received_responses=tracker.responded_count,
+                metadata={"supplier_status": supplier_status} if supplier_status else None,
+            )
+            watcher_started = True
+            workflow_lifecycle_repo.record_watcher_event(
+                workflow_id,
+                "watcher_active",
+                expected_responses=tracker.expected_responses,
+                received_responses=tracker.responded_count,
+            )
+
+            if tracker.last_dispatched_at:
+                target = tracker.last_dispatched_at + timedelta(seconds=self.dispatch_wait_seconds)
+                now = self._now()
+                if target > now:
+                    wait_time = (target - now).total_seconds()
+                    logger.info(
+                        "Waiting %.1f seconds before polling IMAP for workflow %s",
+                        wait_time,
+                        workflow_id,
+                    )
+                    self._sleep(wait_time)
+
+            idle_attempts = 0
+            poll_started_at = self._now()
+            baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
+            since_cursor = tracker.last_response_at or baseline_since
+            if since_cursor.tzinfo is None:
+                since_cursor = since_cursor.replace(tzinfo=timezone.utc)
+            if baseline_since.tzinfo is None:
+                baseline_since = baseline_since.replace(tzinfo=timezone.utc)
+            if since_cursor < baseline_since:
+                since_cursor = baseline_since
+            base_sleep = float(self.poll_interval_seconds)
+            adaptive_sleep = base_sleep
+
+            while not tracker.all_responded:
+                now = self._now()
+                elapsed = tracker.elapsed_seconds(now)
+                runtime_elapsed = max(0.0, (now - poll_started_at).total_seconds())
+                try:
+                    lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
+                    negotiation_status = (
+                        lifecycle.get("negotiation_status") or ""
+                    ).strip().lower()
+                except Exception:  # pragma: no cover - defensive lifecycle lookup
+                    negotiation_status = ""
+                if negotiation_status in {"completed", "finalized"}:
+                    logger.info(
+                        "EmailWatcher detected negotiation completion; stopping workflow=%s status=%s",
+                        workflow_id,
+                        negotiation_status,
+                    )
+                    negotiation_stop = True
+                    stop_reason = "negotiation_completed"
+                    break
+                if (
+                    self.max_total_wait_seconds is not None
+                    and runtime_elapsed >= self.max_total_wait_seconds
+                ):
+                    timeout_reached = True
+                    stop_reason = "timeout"
+                    logger.warning(
+                        "EmailWatcher timed out waiting for responses workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs",
+                        workflow_id,
+                        self._round_fragment(tracker),
+                        tracker.expected_responses,
+                        tracker.responded_count,
+                        elapsed,
+                        runtime_elapsed,
+                    )
+                    break
+
+                responses = self._fetch_emails(since_cursor)
+                matched_rows = self._match_responses(tracker, responses)
+                if matched_rows:
+                    workflow_lifecycle_repo.record_watcher_event(
+                        workflow_id,
+                        "watcher_active",
+                        expected_responses=tracker.expected_responses,
+                        received_responses=tracker.responded_count,
+                    )
+                    self._process_agents(tracker)
+                cursor_candidate = tracker.last_response_at
+                if cursor_candidate is None and matched_rows:
+                    cursor_candidate = max(
+                        (
+                            row.received_time
+                            for row in matched_rows
+                            if row.received_time is not None
+                        ),
+                        default=None,
+                    )
+                if cursor_candidate is not None and cursor_candidate.tzinfo is None:
+                    cursor_candidate = cursor_candidate.replace(tzinfo=timezone.utc)
+                if cursor_candidate is not None and cursor_candidate > since_cursor:
+                    since_cursor = cursor_candidate
+                if tracker.all_responded:
+                    break
+
+                outstanding = max(0, tracker.expected_responses - tracker.responded_count)
+                if responses or matched_rows:
+                    idle_attempts = 0
+                    adaptive_sleep = base_sleep
+                    idle_snapshot = 0
+                else:
+                    idle_attempts += 1
+                    idle_snapshot = idle_attempts
+                    if idle_attempts >= self.max_poll_attempts:
+                        adaptive_sleep = min(adaptive_sleep * 2, max(base_sleep, 300.0))
+                        logger.info(
+                            "EmailWatcher continuing to monitor workflow=%s%s outstanding=%d runtime=%.1fs next_poll=%.1fs",
+                            workflow_id,
+                            self._round_fragment(tracker),
+                            outstanding,
+                            runtime_elapsed,
+                            adaptive_sleep,
+                        )
+                        idle_attempts = 0
+                        idle_snapshot = 0
+
+                logger.info(
+                    "EmailWatcher poll summary workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs idle_attempts=%d next_sleep=%.1fs outstanding=%d",
                     workflow_id,
                     self._round_fragment(tracker),
                     tracker.expected_responses,
                     tracker.responded_count,
                     elapsed,
                     runtime_elapsed,
+                    idle_snapshot,
+                    adaptive_sleep,
+                    outstanding,
                 )
-                break
 
-            responses = self._fetch_emails(since_cursor)
-            matched_rows = self._match_responses(tracker, responses)
-            if matched_rows:
+                self._sleep(adaptive_sleep)
+
+            if stop_reason is None and tracker.all_responded:
+                stop_reason = "responses_complete"
+
+            negotiation_completed = negotiation_stop
+
+            complete = tracker.all_responded or negotiation_completed
+            result = {
+                "workflow_id": workflow_id,
+                "complete": complete,
+                "dispatched_count": tracker.dispatched_count,
+                "responded_count": tracker.responded_count,
+                "matched_responses": tracker.matched_responses,
+                "response_history": tracker.response_history,
+                "expected_responses": tracker.expected_responses,
+                "elapsed_seconds": tracker.elapsed_seconds(self._now()),
+                "timeout_reached": timeout_reached,
+                "workflow_status": "negotiation_completed"
+                if negotiation_completed
+                else (
+                    "responses_complete" if tracker.all_responded else "awaiting_responses"
+                ),
+            }
+
+            if not negotiation_completed:
                 self._process_agents(tracker)
-            cursor_candidate = tracker.last_response_at
-            if cursor_candidate is None and matched_rows:
-                cursor_candidate = max(
-                    (
-                        row.received_time
-                        for row in matched_rows
-                        if row.received_time is not None
-                    ),
-                    default=None,
+
+            return result
+        finally:
+            if watcher_started:
+                runtime = 0.0
+                if watcher_start_at is not None:
+                    try:
+                        runtime = max(
+                            0.0, (self._now() - watcher_start_at).total_seconds()
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        runtime = 0.0
+                stop_metadata: Dict[str, Any] = {}
+                if stop_reason:
+                    stop_metadata["stop_reason"] = stop_reason
+                if timeout_reached:
+                    stop_metadata["timeout_reached"] = True
+                if negotiation_stop:
+                    stop_metadata["negotiation_completed"] = True
+                workflow_lifecycle_repo.record_watcher_event(
+                    workflow_id,
+                    "watcher_stopped",
+                    expected_responses=tracker.expected_responses,
+                    received_responses=tracker.responded_count,
+                    runtime_seconds=runtime,
+                    metadata=stop_metadata or None,
                 )
-            if cursor_candidate is not None and cursor_candidate.tzinfo is None:
-                cursor_candidate = cursor_candidate.replace(tzinfo=timezone.utc)
-            if cursor_candidate is not None and cursor_candidate > since_cursor:
-                since_cursor = cursor_candidate
-            if tracker.all_responded:
-                break
-
-            outstanding = max(0, tracker.expected_responses - tracker.responded_count)
-            if responses or matched_rows:
-                idle_attempts = 0
-                adaptive_sleep = base_sleep
-                idle_snapshot = 0
-            else:
-                idle_attempts += 1
-                idle_snapshot = idle_attempts
-                if idle_attempts >= self.max_poll_attempts:
-                    adaptive_sleep = min(adaptive_sleep * 2, max(base_sleep, 300.0))
-                    logger.info(
-                        "EmailWatcher continuing to monitor workflow=%s%s outstanding=%d runtime=%.1fs next_poll=%.1fs",
-                        workflow_id,
-                        self._round_fragment(tracker),
-                        outstanding,
-                        runtime_elapsed,
-                        adaptive_sleep,
-                    )
-                    idle_attempts = 0
-                    idle_snapshot = 0
-
-            logger.info(
-                "EmailWatcher poll summary workflow=%s%s expected=%d responded=%d elapsed=%.1fs runtime=%.1fs idle_attempts=%d next_sleep=%.1fs outstanding=%d",
-                workflow_id,
-                self._round_fragment(tracker),
-                tracker.expected_responses,
-                tracker.responded_count,
-                elapsed,
-                runtime_elapsed,
-                idle_snapshot,
-                adaptive_sleep,
-                outstanding,
-            )
-
-            self._sleep(adaptive_sleep)
-
-        complete = tracker.all_responded
-        result = {
-            "workflow_id": workflow_id,
-            "complete": complete,
-            "dispatched_count": tracker.dispatched_count,
-            "responded_count": tracker.responded_count,
-            "matched_responses": tracker.matched_responses,
-            "response_history": tracker.response_history,
-            "expected_responses": tracker.expected_responses,
-            "elapsed_seconds": tracker.elapsed_seconds(self._now()),
-            "timeout_reached": timeout_reached,
-            "workflow_status": "responses_complete"
-            if complete
-            else "awaiting_responses",
-        }
-
-        self._process_agents(tracker)
-
-        return result
 
     def _process_agents(self, tracker: WorkflowTracker) -> None:
         if not tracker.all_dispatched or not tracker.all_responded:
@@ -1432,6 +1560,8 @@ class EmailWatcherV2:
             return
 
         processed_ids: List[str] = []
+        ids_from_agent: List[str] = []
+        negotiation_payload: Dict[str, Any] = {}
         for row in pending_rows:
             unique_id = row.get("unique_id")
             latest = tracker.latest_response(unique_id) if unique_id else None
@@ -1564,22 +1694,37 @@ class EmailWatcherV2:
             )
             negotiation_payload.setdefault("workflow_status", "responses_complete")
 
-            if self.negotiation_agent is not None:
-                try:
-                    neg_context = AgentContext(
-                        workflow_id=tracker.workflow_id,
-                        agent_id="NegotiationAgent",
-                        user_id="system",
-                        input_data=negotiation_payload,
-                    )
-                    self.negotiation_agent.execute(neg_context)
-                except Exception:
-                    logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
-
-            if ids_from_agent:
-                supplier_response_repo.delete_responses(
-                    workflow_id=tracker.workflow_id, unique_ids=ids_from_agent
+        if self.negotiation_agent is not None:
+            try:
+                workflow_lifecycle_repo.record_negotiation_status(
+                    tracker.workflow_id, "started"
                 )
+                neg_context = AgentContext(
+                    workflow_id=tracker.workflow_id,
+                    agent_id="NegotiationAgent",
+                    user_id="system",
+                    input_data=negotiation_payload,
+                )
+                result = self.negotiation_agent.execute(neg_context)
+                status = getattr(result, "status", None)
+                if status == AgentStatus.SUCCESS or status is None:
+                    workflow_lifecycle_repo.record_negotiation_status(
+                        tracker.workflow_id, "completed"
+                    )
+                else:
+                    workflow_lifecycle_repo.record_negotiation_status(
+                        tracker.workflow_id, "failed"
+                    )
+            except Exception:
+                logger.exception("NegotiationAgent failed for workflow %s", tracker.workflow_id)
+                workflow_lifecycle_repo.record_negotiation_status(
+                    tracker.workflow_id, "failed"
+                )
+
+        if ids_from_agent:
+            supplier_response_repo.delete_responses(
+                workflow_id=tracker.workflow_id, unique_ids=ids_from_agent
+            )
 
         if processed_ids:
             supplier_response_repo.delete_responses(
