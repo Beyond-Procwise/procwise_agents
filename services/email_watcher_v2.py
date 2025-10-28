@@ -919,7 +919,7 @@ class EmailWatcherV2:
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.8,
+        match_threshold: float = 0.75,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,
@@ -1303,7 +1303,7 @@ class EmailWatcherV2:
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
-        threshold = max(self.match_threshold, 0.8)
+        threshold = max(self.match_threshold, 0.75)
         for email in responses:
             message_id = email.message_id or ""
             fingerprint = _response_fingerprint(email)
@@ -1557,23 +1557,13 @@ class EmailWatcherV2:
         lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
         supplier_status = (lifecycle.get("supplier_agent_status") or "").strip().lower()
         allowed_statuses = {"awaiting_responses", "running"}
-        if supplier_status not in allowed_statuses:
-            logger.info(
-                "EmailWatcher deferring start until SupplierInteractionAgent is active workflow=%s status=%s",
+        supplier_active = supplier_status in allowed_statuses
+        if not supplier_active:
+            logger.warning(
+                "EmailWatcher starting without confirmed supplier activity workflow=%s status=%s",
                 workflow_id,
-                supplier_status or None,
+                supplier_status or "unknown",
             )
-            return {
-                "workflow_id": workflow_id,
-                "complete": False,
-                "dispatched_count": tracker.dispatched_count,
-                "responded_count": tracker.responded_count,
-                "matched_responses": {},
-                "expected_responses": tracker.expected_responses,
-                "workflow_status": "awaiting_supplier_activation",
-                "timeout_reached": False,
-                "reason": "supplier_agent_inactive",
-            }
 
         negotiation_status = (lifecycle.get("negotiation_status") or "").strip().lower()
         if negotiation_status in {"completed", "finalized"}:
@@ -1647,7 +1637,11 @@ class EmailWatcherV2:
                     )
                     self._sleep(wait_time)
 
+            base_sleep = float(self.poll_interval_seconds)
+            adaptive_sleep = base_sleep
             idle_attempts = 0
+            error_backoff = base_sleep
+            error_backoff_cap = max(base_sleep, 300.0)
             poll_started_at = self._now()
             baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
             since_cursor = tracker.last_response_at or baseline_since
@@ -1657,8 +1651,6 @@ class EmailWatcherV2:
                 baseline_since = baseline_since.replace(tzinfo=timezone.utc)
             if since_cursor < baseline_since:
                 since_cursor = baseline_since
-            base_sleep = float(self.poll_interval_seconds)
-            adaptive_sleep = base_sleep
 
             while not tracker.all_responded:
                 now = self._now()
@@ -1697,8 +1689,42 @@ class EmailWatcherV2:
                     )
                     break
 
-                responses = self._fetch_emails(since_cursor)
-                matched_rows = self._match_responses(tracker, responses)
+                try:
+                    responses = self._fetch_emails(since_cursor)
+                    error_backoff = base_sleep
+                except imaplib.IMAP4.abort:
+                    logger.exception(
+                        "EmailWatcher encountered IMAP abort while fetching responses workflow=%s",
+                        workflow_id,
+                    )
+                    error_backoff = min(error_backoff * 2, error_backoff_cap)
+                    self._sleep(error_backoff)
+                    continue
+                except imaplib.IMAP4.error:
+                    logger.exception(
+                        "EmailWatcher encountered IMAP error while fetching responses workflow=%s",
+                        workflow_id,
+                    )
+                    error_backoff = min(error_backoff * 2, error_backoff_cap)
+                    self._sleep(error_backoff)
+                    continue
+                except Exception:
+                    logger.exception(
+                        "EmailWatcher failed to fetch responses for workflow=%s",
+                        workflow_id,
+                    )
+                    error_backoff = min(error_backoff * 2, error_backoff_cap)
+                    self._sleep(error_backoff)
+                    continue
+
+                try:
+                    matched_rows = self._match_responses(tracker, responses)
+                except Exception:
+                    logger.exception(
+                        "EmailWatcher failed to match responses for workflow=%s",
+                        workflow_id,
+                    )
+                    matched_rows = []
                 now_after_poll = self._now()
                 reference_capture = tracker.last_capture_at or watcher_start_at
                 if reference_capture is None:
