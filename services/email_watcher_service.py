@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 from repositories import supplier_response_repo, workflow_email_tracking_repo
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailWatcherV2
+from services.event_bus import get_event_bus
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -19,6 +20,26 @@ except Exception:  # pragma: no cover - fallback when settings module unavailabl
     app_settings = None
 
 logger = logging.getLogger(__name__)
+
+
+MAX_IMAP_AUTH_RETRIES = 3
+
+
+def send_alert(alert_code: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Publish an alert event for operational visibility."""
+
+    message = {"alert_code": alert_code}
+    if payload:
+        message.update(payload)
+    try:
+        bus = get_event_bus()
+    except Exception:
+        logger.exception("Failed to initialise event bus for alert %s", alert_code)
+        return
+    try:
+        bus.publish("alerts", message)
+    except Exception:
+        logger.exception("Failed to publish alert %s", alert_code)
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -280,6 +301,14 @@ def run_email_watcher_for_workflow(
             missing_fields.append("message_id")
             missing_message_ids.append(identifier)
 
+        supplier_email = (row.supplier_email or "").strip()
+        if not supplier_email:
+            missing_fields.append("supplier_email")
+
+        subject_value = (row.subject or "").strip()
+        if not subject_value:
+            missing_fields.append("subject")
+
         if missing_fields:
             missing_required_fields[identifier] = missing_fields
             continue
@@ -339,24 +368,34 @@ def run_email_watcher_for_workflow(
         imap_use_ssl=imap_use_ssl,
         imap_login=imap_login,
     )
-    try:
-        result = watcher.wait_and_collect_responses(workflow_key)
-    except imaplib.IMAP4.error as exc:
-        logger.error(
-            "IMAP authentication failed for host=%s user=%s: %s",
-            imap_host,
-            imap_login or imap_username,
-            exc,
-        )
-        return {
-            "status": "failed",
-            "reason": "IMAP authentication failed",
-            "workflow_id": workflow_key,
-            "expected": len(dispatch_rows),
-            "found": 0,
-            "rows": [],
-            "matched_unique_ids": [],
-        }
+    retry_count = 0
+    while True:
+        try:
+            result = watcher.wait_and_collect_responses(workflow_key)
+            break
+        except imaplib.IMAP4.error as exc:
+            logger.error(
+                "IMAP authentication failed for host=%s user=%s: %s",
+                imap_host,
+                imap_login or imap_username,
+                exc,
+                exc_info=True,
+            )
+            send_alert(
+                "IMAP_AUTH_FAILURE",
+                {
+                    "workflow_id": workflow_key,
+                    "host": imap_host,
+                    "username": imap_login or imap_username,
+                    "error": str(exc),
+                    "attempt": retry_count + 1,
+                },
+            )
+            if retry_count >= MAX_IMAP_AUTH_RETRIES:
+                raise
+            sleep_seconds = max(1, 2 ** retry_count)
+            time.sleep(sleep_seconds)
+            retry_count += 1
     expected = result.get("dispatched_count", 0)
     responded = result.get("responded_count", 0)
     matched = result.get("matched_responses", {}) or {}

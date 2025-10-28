@@ -21,6 +21,7 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from difflib import SequenceMatcher
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
@@ -564,6 +565,21 @@ def _normalise_subject_line(subject: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _subject_similarity(left: Optional[str], right: Optional[str]) -> float:
+    """Compute a similarity ratio between two subject lines."""
+
+    left_norm = _normalise_subject_line(left)
+    right_norm = _normalise_subject_line(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    try:
+        return SequenceMatcher(None, left_norm, right_norm).ratio()
+    except Exception:  # pragma: no cover - defensive guard
+        return 0.0
+
+
 def _subject_hash(subject: Optional[str]) -> Optional[str]:
     normalised = _normalise_subject_line(subject)
     if not normalised:
@@ -687,12 +703,23 @@ def _default_fetcher(
     last_seen_uid: Optional[int] = None,
     backtrack_seconds: int = 180,
     max_uid_samples: int = 200,
+    workflow_ids: Optional[Sequence[str]] = None,
+    mailbox_filter: Optional[str] = None,
     **_: object,
 ) -> Tuple[List[EmailResponse], Optional[int]]:
     client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
         candidate_uids: List[int] = []
+        workflow_tokens: List[str] = []
+        if workflow_ids:
+            for token in workflow_ids:
+                if token in (None, ""):
+                    continue
+                text = str(token).strip()
+                if text:
+                    workflow_tokens.append(text)
+        mailbox_header = str(mailbox_filter).strip() if mailbox_filter else ""
 
         if last_seen_uid is not None:
             uid_query = f"{last_seen_uid + 1}:*"
@@ -706,15 +733,36 @@ def _default_fetcher(
         else:
             since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
             since_str = since_floor.strftime("%d-%b-%Y")
-            typ, data = client.uid("SEARCH", None, "SINCE", since_str)
-            if typ == "OK":
-                candidate_uids = [
-                    int(part)
-                    for part in (data[0] or b"").split()
-                    if part and part.isdigit()
-                ]
+            if workflow_tokens:
+                uid_candidates: Set[int] = set()
+                for token in workflow_tokens:
+                    search_terms: List[str] = ["SINCE", since_str, "HEADER", "X-ProcWise-Workflow-ID", token]
+                    if mailbox_header:
+                        search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
+                    typ, data = client.uid("SEARCH", None, *search_terms)
+                    if typ == "OK":
+                        uid_candidates.update(
+                            int(part)
+                            for part in (data[0] or b"").split()
+                            if part and part.isdigit()
+                        )
+                candidate_uids = sorted(uid_candidates)
+            else:
+                search_terms = ["SINCE", since_str]
+                if mailbox_header:
+                    search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
+                typ, data = client.uid("SEARCH", None, *search_terms)
+                if typ == "OK":
+                    candidate_uids = [
+                        int(part)
+                        for part in (data[0] or b"").split()
+                        if part and part.isdigit()
+                    ]
             if not candidate_uids:
-                typ, data = client.uid("SEARCH", None, "ALL")
+                search_terms = ["ALL"]
+                if mailbox_header:
+                    search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
+                typ, data = client.uid("SEARCH", None, *search_terms)
                 if typ == "OK":
                     all_uids = [
                         int(part)
@@ -1264,18 +1312,51 @@ class EmailWatcherV2:
             elapsed,
         )
 
-    def _fetch_emails(self, since: datetime) -> List[EmailResponse]:
+    def _fetch_emails(
+        self,
+        since: datetime,
+        *,
+        workflow_ids: Optional[Sequence[str]] = None,
+        mailbox_filter: Optional[str] = None,
+    ) -> List[EmailResponse]:
         payload: Optional[object]
 
+        workflow_filters: List[str] = []
+        if workflow_ids:
+            for value in workflow_ids:
+                if value in (None, ""):
+                    continue
+                text = str(value).strip()
+                if text:
+                    workflow_filters.append(text)
+        mailbox_filter_value = str(mailbox_filter).strip() if mailbox_filter else ""
+
         if self._fetcher:
+            fetch_kwargs = {
+                "since": since,
+                "last_seen_uid": self._imap_last_seen_uid,
+                "backtrack_seconds": self._backtrack_window_seconds,
+            }
+            if workflow_filters:
+                fetch_kwargs["workflow_ids"] = list(dict.fromkeys(workflow_filters))
+            if mailbox_filter_value:
+                fetch_kwargs["mailbox_filter"] = mailbox_filter_value
             try:
-                payload = self._fetcher(
-                    since=since,
-                    last_seen_uid=self._imap_last_seen_uid,
-                    backtrack_seconds=self._backtrack_window_seconds,
-                )
+                payload = self._fetcher(**fetch_kwargs)
             except TypeError:
-                payload = self._fetcher(since=since)
+                fetch_kwargs.pop("last_seen_uid", None)
+                fetch_kwargs.pop("backtrack_seconds", None)
+                try:
+                    payload = self._fetcher(**fetch_kwargs)
+                except TypeError:
+                    fallback_kwargs = {"since": since}
+                    if workflow_filters:
+                        fallback_kwargs["workflow_ids"] = list(
+                            dict.fromkeys(workflow_filters)
+                        )
+                    if mailbox_filter_value:
+                        fallback_kwargs["mailbox_filter"] = mailbox_filter_value
+                    payload = self._fetcher(**fallback_kwargs)
         else:
             if not all([self._imap_host, self._imap_username, self._imap_password]):
                 raise RuntimeError("IMAP credentials must be supplied when no custom fetcher is provided")
@@ -1291,6 +1372,8 @@ class EmailWatcherV2:
                 login=self._imap_login,
                 last_seen_uid=self._imap_last_seen_uid,
                 backtrack_seconds=self._backtrack_window_seconds,
+                workflow_ids=list(dict.fromkeys(workflow_filters)) or None,
+                mailbox_filter=mailbox_filter_value or None,
             )
 
         responses, last_uid = _normalise_fetch_result(payload)
@@ -1343,10 +1426,19 @@ class EmailWatcherV2:
                 email.round_number is not None
                 or _has_header_value(header_presence_map.get("x-procwise-round"))
             )
+            def _merge_reasons(existing: List[str], *reasons: str) -> List[str]:
+                ordered = list(existing)
+                for reason in reasons:
+                    if not reason:
+                        continue
+                    if reason not in ordered:
+                        ordered.append(reason)
+                return ordered
             matched_id: Optional[str] = None
             best_score = 0.0
             best_dispatch: Optional[EmailDispatchRecord] = None
             best_reasons: List[str] = []
+            match_details: Dict[str, Any] = {}
             for unique_id, dispatch_list in tracker.email_records.items():
                 dispatch = dispatch_list[-1]
                 if unique_id in tracker.matched_responses:
@@ -1356,7 +1448,8 @@ class EmailWatcherV2:
                     matched_id = unique_id
                     best_score = score
                     best_dispatch = dispatch
-                    best_reasons = reasons
+                    best_reasons = _merge_reasons([], *reasons)
+                    match_details = {"matcher": "header_score"}
             if (not matched_id or best_score < self.match_threshold) and email.supplier_id:
                 supplier_matches = [
                     uid
@@ -1370,7 +1463,8 @@ class EmailWatcherV2:
                     matched_id = supplier_matches[0]
                     best_score = max(best_score, self.match_threshold)
                     best_dispatch = tracker.latest_dispatch(matched_id)
-                    best_reasons = list({*best_reasons, "supplier_id"})
+                    best_reasons = _merge_reasons(best_reasons, "supplier_id")
+                    match_details.setdefault("supplier_match_candidates", len(supplier_matches))
             if (not matched_id or best_score < self.match_threshold) and email.rfq_id:
                 normalised_rfq = _normalise_identifier(email.rfq_id)
                 if normalised_rfq:
@@ -1387,7 +1481,64 @@ class EmailWatcherV2:
                         matched_id = rfq_candidates[0]
                         best_score = max(best_score, self.match_threshold)
                         best_dispatch = tracker.latest_dispatch(matched_id)
-                        best_reasons = list({*best_reasons, "rfq"})
+                        best_reasons = _merge_reasons(best_reasons, "rfq")
+                        match_details.setdefault("rfq_match_candidates", len(rfq_candidates))
+
+            if (
+                (not matched_id or best_score < self.match_threshold)
+                and email.received_at
+            ):
+                candidates: List[Tuple[str, EmailDispatchRecord]] = []
+                for uid, dispatch_list in tracker.email_records.items():
+                    if uid in tracker.matched_responses:
+                        continue
+                    if not dispatch_list:
+                        continue
+                    dispatch_candidate = dispatch_list[-1]
+                    dispatched_at = dispatch_candidate.dispatched_at
+                    if not dispatched_at:
+                        continue
+                    candidates.append((uid, dispatch_candidate))
+                if candidates:
+                    def _time_distance(item: Tuple[str, EmailDispatchRecord]) -> float:
+                        dispatch_time = item[1].dispatched_at
+                        received_at = email.received_at
+                        if dispatch_time is None or received_at is None:
+                            return float("inf")
+                        if dispatch_time.tzinfo is None:
+                            dispatch_dt = dispatch_time.replace(tzinfo=timezone.utc)
+                        else:
+                            dispatch_dt = dispatch_time
+                        if received_at.tzinfo is None:
+                            received_dt = received_at.replace(tzinfo=timezone.utc)
+                        else:
+                            received_dt = received_at
+                        return abs((received_dt - dispatch_dt).total_seconds())
+
+                    candidates.sort(key=_time_distance)
+                    candidate_uid, candidate_dispatch = candidates[0]
+                    time_delta_seconds = _time_distance((candidate_uid, candidate_dispatch))
+                    subject_similarity = _subject_similarity(
+                        candidate_dispatch.subject,
+                        email.subject,
+                    )
+                    match_details.setdefault("temporal_candidate_count", len(candidates))
+                    match_details.update(
+                        {
+                            "temporal_delta_seconds": time_delta_seconds,
+                            "subject_similarity": round(subject_similarity, 3),
+                        }
+                    )
+                    if subject_similarity >= 0.7:
+                        matched_id = candidate_uid
+                        best_dispatch = candidate_dispatch
+                        best_score = max(best_score, 0.5)
+                        best_reasons = _merge_reasons(
+                            best_reasons,
+                            "temporal_proximity",
+                            "subject_similarity",
+                        )
+                        match_details["matcher"] = "temporal_subject"
 
             remaining_unresponded = [
                 uid
@@ -1406,11 +1557,18 @@ class EmailWatcherV2:
                 best_dispatch = tracker.latest_dispatch(matched_id)
 
             if matched_id and best_score >= threshold:
-                logger.debug(
-                    "Matched response for workflow=%s unique_id=%s score=%.2f",
+                criteria_str = ", ".join(best_reasons) if best_reasons else "n/a"
+                try:
+                    detail_payload = json.dumps(match_details, sort_keys=True)
+                except TypeError:
+                    detail_payload = str(match_details)
+                logger.info(
+                    "MATCH SUCCESS: workflow=%s unique_id=%s score=%.2f criteria=[%s] details=%s",
                     tracker.workflow_id,
                     matched_id,
                     best_score,
+                    criteria_str,
+                    detail_payload,
                 )
                 if best_dispatch is None:
                     best_dispatch = tracker.latest_dispatch(matched_id)
@@ -1533,11 +1691,18 @@ class EmailWatcherV2:
                     "supplier": supplier_header_present,
                     "round": round_header_present,
                 }
+                attempted_unique = email.unique_id or "n/a"
+                attempted_supplier = email.supplier_id or "n/a"
+                attempted_threads = len(email.references) + len(email.in_reply_to)
                 logger.warning(
-                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f matched_on=%s headers=%s)",
+                    "MATCH FAILED: workflow=%s email_from=%s best_score=%.2f threshold=%.2f attempted=[unique_id=%s, supplier=%s, thread_ids=%d] matched_on=%s headers=%s",
                     tracker.workflow_id,
-                    email.message_id,
+                    email.from_address or email.supplier_email or "unknown",
                     best_score,
+                    self.match_threshold,
+                    attempted_unique,
+                    attempted_supplier,
+                    attempted_threads,
                     reasons,
                     header_summary,
                 )
@@ -1697,7 +1862,11 @@ class EmailWatcherV2:
                     )
                     break
 
-                responses = self._fetch_emails(since_cursor)
+                responses = self._fetch_emails(
+                    since_cursor,
+                    workflow_ids=[workflow_id],
+                    mailbox_filter=self._mailbox,
+                )
                 matched_rows = self._match_responses(tracker, responses)
                 now_after_poll = self._now()
                 reference_capture = tracker.last_capture_at or watcher_start_at
