@@ -130,6 +130,9 @@ class Settings(BaseSettings):
         default=120, env="LANGCHAIN_REQUEST_TIMEOUT"
     )
     hitl_enabled: bool = Field(default=True, env="HITL_ENABLED")
+    data_extraction_staging_schema: str = Field(
+        default="proc_stage", env="DATA_EXTRACTION_STAGING_SCHEMA"
+    )
     memory_store_uri: Optional[str] = Field(
         default=None, env="MEMORY_STORE_URI"
     )
