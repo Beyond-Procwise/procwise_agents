@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import imaplib
 import sys
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -19,6 +20,7 @@ from repositories import (
     workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
+from services import email_watcher_v2
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from services import supplier_response_coordinator
 from utils.email_tracking import (
@@ -100,7 +102,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     supplier_agent = StubSupplierAgent()
     negotiation_agent = StubNegotiationAgent()
@@ -186,7 +188,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
 
 
-def test_email_watcher_defers_until_supplier_agent_active():
+def test_email_watcher_starts_even_when_supplier_agent_inactive():
     workflow_id = "wf-wait-for-supplier"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
@@ -198,13 +200,21 @@ def test_email_watcher_defers_until_supplier_agent_active():
     now = datetime.now(timezone.utc)
     unique_id = generate_unique_email_id(workflow_id, "sup-inactive")
 
+    current_time = now - timedelta(seconds=1)
+
+    def now_fn() -> datetime:
+        nonlocal current_time
+        current_time = current_time + timedelta(seconds=1)
+        return current_time
+
     watcher = EmailWatcherV2(
         dispatch_wait_seconds=0,
         poll_interval_seconds=1,
         max_poll_attempts=1,
         email_fetcher=lambda **_: [],
         sleep=lambda _: None,
-        now=lambda: now,
+        now=now_fn,
+        response_idle_timeout_seconds=2,
     )
 
     watcher.register_workflow_dispatch(
@@ -224,10 +234,14 @@ def test_email_watcher_defers_until_supplier_agent_active():
     result = watcher.wait_and_collect_responses(workflow_id)
 
     assert result["complete"] is False
-    assert result["workflow_status"] == "awaiting_supplier_activation"
-    assert result["reason"] == "supplier_agent_inactive"
+    assert result["workflow_status"] == "partial_timeout"
+    assert result["timeout_reached"] is True
     lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id)
-    assert lifecycle is None or lifecycle.get("watcher_status") is None
+    assert lifecycle is not None
+    assert lifecycle.get("watcher_status") == "stopped"
+    metadata = lifecycle.get("metadata") or {}
+    assert metadata.get("stop_reason") == "partial_timeout"
+    assert metadata.get("timeout_reached") is True
 
 
 def test_email_watcher_continues_polling_until_all_responses():
@@ -238,7 +252,7 @@ def test_email_watcher_continues_polling_until_all_responses():
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     base_time = datetime.now(timezone.utc)
     supplier_ids = ["sup-a", "sup-b", "sup-c"]
@@ -337,6 +351,153 @@ def test_email_watcher_continues_polling_until_all_responses():
     assert fetcher.calls > len(unique_ids)
 
 
+def test_email_watcher_recovers_from_imap_errors():
+    workflow_id = "wf-imap-error"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    base_time = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "supplier-error")
+    dispatch_message_id = "<dispatch-error>"
+
+    current_time = base_time - timedelta(seconds=2)
+
+    def now_fn() -> datetime:
+        nonlocal current_time
+        current_time = current_time + timedelta(seconds=2)
+        return current_time
+
+    response_email = EmailResponse(
+        unique_id=unique_id,
+        supplier_id="supplier-error",
+        supplier_email="supplier-error@example.com",
+        from_address="supplier-error@example.com",
+        message_id="<reply-error>",
+        subject="Re: Pricing request",
+        body="Here is our quote",
+        received_at=base_time + timedelta(seconds=10),
+        in_reply_to=(dispatch_message_id,),
+        rfq_id="RFQ-ERROR-01",
+        body_text="Here is our quote",
+    )
+
+    fetch_calls = {"count": 0}
+
+    def fetcher(**_: Any):
+        fetch_calls["count"] += 1
+        if fetch_calls["count"] == 1:
+            raise imaplib.IMAP4.abort("session reset")
+        return [response_email]
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=now_fn,
+        response_idle_timeout_seconds=30,
+        max_total_wait_seconds=120,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "supplier-error",
+                "supplier_email": "supplier-error@example.com",
+                "message_id": dispatch_message_id,
+                "subject": "Pricing request",
+                "dispatched_at": base_time,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert fetch_calls["count"] >= 2
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(rows) == 1
+    assert rows[0]["response_message_id"].strip("<>") == "reply-error"
+
+
+def test_email_watcher_stops_after_inactivity_timeout(monkeypatch):
+    workflow_id = "wf-timeout"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(
+        workflow_id, "awaiting_responses"
+    )
+
+    unique_id = generate_unique_email_id(workflow_id, "sup-timeout")
+
+    class _FakeBus:
+        def __init__(self) -> None:
+            self.events: List[Tuple[str, Dict[str, Any]]] = []
+
+        def publish(self, event: str, payload: Dict[str, Any]) -> None:
+            self.events.append((event, dict(payload)))
+
+    fake_bus = _FakeBus()
+    monkeypatch.setattr(email_watcher_v2, "get_event_bus", lambda: fake_bus)
+
+    current_time = datetime.now(timezone.utc)
+
+    def fake_now() -> datetime:
+        return current_time
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += timedelta(seconds=seconds)
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=10,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=fake_sleep,
+        now=fake_now,
+        response_idle_timeout_seconds=120,
+        max_total_wait_seconds=3600,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-timeout",
+                "supplier_email": "timeout@example.com",
+                "message_id": "<timeout-dispatch>",
+                "subject": "Timeout scenario",
+                "dispatched_at": current_time,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["workflow_status"] == "partial_timeout"
+    assert result["timeout_reached"] is True
+    assert result["complete"] is False
+    assert result["pending_unique_ids"] == [unique_id]
+    assert result["pending_suppliers"] == ["sup-timeout"]
+    assert any(event == "responses_timeout" for event, _ in fake_bus.events)
+
+
 def test_email_watcher_stops_when_negotiation_completed():
     workflow_id = "wf-negotiation-complete"
     supplier_response_repo.init_schema()
@@ -345,7 +506,7 @@ def test_email_watcher_stops_when_negotiation_completed():
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     now = datetime.now(timezone.utc)
     unique_id = generate_unique_email_id(workflow_id, "sup-negotiated")
@@ -398,7 +559,7 @@ def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     supplier_agent = StubSupplierAgent()
     negotiation_agent = StubNegotiationAgent()
@@ -516,7 +677,7 @@ def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     supplier_agent = StubSupplierAgent()
 
@@ -592,7 +753,7 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
     workflow_lifecycle_repo.reset_workflow(workflow_id)
-    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
 
     supplier_agent = StubSupplierAgent()
 
