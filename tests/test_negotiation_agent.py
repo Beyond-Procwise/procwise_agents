@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -12,7 +13,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.negotiation_agent import NegotiationAgent
+import agents.negotiation_agent as negotiation_agent_module
+from agents.negotiation_agent import NegotiationAgent, EmailHistoryEntry
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
@@ -1122,3 +1124,71 @@ def test_multi_round_routes_to_quote_evaluation_after_hitl(monkeypatch):
     quotes = output.data["final_quotes"]
     assert quotes
     assert {quote["supplier_id"] for quote in quotes} == {"S1", "S2"}
+
+
+def test_negotiation_agent_embeds_full_thread_history(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    monkeypatch.setattr(negotiation_agent_module, "THREAD_HISTORY_TRANSCRIPT_LIMIT", None)
+    monkeypatch.setattr(agent, "_ensure_email_agent", lambda: None)
+
+    workflow_id = "wf-history"
+    supplier_id = "SUP-1"
+    base_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    entries = []
+    for idx in range(12):
+        entries.append(
+            EmailHistoryEntry(
+                email_id=f"email-{idx}",
+                round_number=idx + 1,
+                supplier_id=supplier_id,
+                supplier_name="Supplier Co",
+                subject=f"Subject {idx}",
+                body_text=f"Message body {idx}",
+                body_html=f"<p>Message body {idx}</p>",
+                sender=f"contact{idx}@supplier.test",
+                recipients=[f"buyer{idx}@procwise.test"],
+                sent_at=base_time + timedelta(hours=idx),
+                message_id=f"<msg-{idx}@test>",
+                thread_headers={},
+                metadata={},
+                decision={},
+                negotiation_context={},
+            )
+        )
+
+    agent._email_thread_manager.set_thread(workflow_id, supplier_id, entries)
+
+    context = AgentContext(
+        workflow_id=workflow_id,
+        agent_id="negotiation",
+        user_id="tester",
+        input_data={},
+    )
+
+    stub = agent._build_email_draft_stub(
+        context=context,
+        draft_payload={"subject": "Re: Negotiation Update"},
+        metadata={},
+        negotiation_message="Counter offer details",
+        supplier_id=supplier_id,
+        supplier_name="Supplier Co",
+        contact_name="Sam Supplier",
+        session_reference="session-123",
+        rfq_id="RFQ-100",
+        recipients=["quotes@supplier.test"],
+        thread_headers=None,
+        round_number=3,
+        decision={},
+        currency="USD",
+        playbook_context={},
+    )
+
+    for idx in range(12):
+        snippet = f"Message body {idx}"
+        assert snippet in stub["text"]
+        assert snippet in stub["html"]
+
+    assert stub["text"].count("Message body") == 12
