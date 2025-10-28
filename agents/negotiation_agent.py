@@ -41,9 +41,33 @@ LLM_ENABLED = os.getenv("NEG_ENABLE_LLM", "1").strip() not in {"0", "false", "Fa
 LLM_MODEL = os.getenv("NEG_LLM_MODEL", "llama3.2:latest")
 COST_OF_CAPITAL_APR = float(os.getenv("NEG_COST_OF_CAPITAL_APR", "0.12"))
 LEAD_TIME_VALUE_PCT_PER_WEEK = float(os.getenv("NEG_LT_VALUE_PCT_PER_WEEK", "0.01"))
-THREAD_HISTORY_TRANSCRIPT_LIMIT = int(
-    os.getenv("NEG_THREAD_TRANSCRIPT_LIMIT", "10")
-)
+def _resolve_thread_transcript_limit() -> Optional[int]:
+    """Return the configured transcript limit or ``None`` for full history."""
+
+    raw_limit = os.getenv("NEG_THREAD_TRANSCRIPT_LIMIT")
+    if raw_limit is None:
+        return None
+
+    raw_limit = raw_limit.strip()
+    if not raw_limit:
+        return None
+
+    try:
+        parsed = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            "Invalid NEG_THREAD_TRANSCRIPT_LIMIT=%s; defaulting to full history",
+            raw_limit,
+        )
+        return None
+
+    if parsed <= 0:
+        return None
+
+    return parsed
+
+
+THREAD_HISTORY_TRANSCRIPT_LIMIT = _resolve_thread_transcript_limit()
 AGGRESSIVE_FIRST_COUNTER_PCT = float(os.getenv("NEG_FIRST_COUNTER_AGGR_PCT", "0.12"))
 FINAL_OFFER_PATTERNS = (
     "best and final",
@@ -11054,13 +11078,25 @@ class NegotiationAgent(BaseAgent):
         thread = self._email_thread_manager.get_thread(workflow_key, supplier_key)
         return [entry.to_dict() for entry in thread]
 
+    def _select_thread_history_entries(
+        self, entries: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not entries:
+            return []
+
+        limit = THREAD_HISTORY_TRANSCRIPT_LIMIT
+        if isinstance(limit, int) and limit > 0:
+            return list(entries)[-limit:]
+
+        return list(entries)
+
     def _format_thread_history_plain(
         self, entries: Sequence[Dict[str, Any]]
     ) -> str:
         if not entries:
             return ""
 
-        recent_entries = list(entries)[-THREAD_HISTORY_TRANSCRIPT_LIMIT:]
+        recent_entries = self._select_thread_history_entries(entries)
         lines: List[str] = ["--- Prior Thread History ---"]
 
         for entry in recent_entries:
@@ -11089,8 +11125,6 @@ class NegotiationAgent(BaseAgent):
             subject = self._coerce_text(entry.get("subject")) or "(no subject)"
             raw_body = entry.get("body_text") or entry.get("body") or ""
             cleaned_body = EmailDraftingAgent._clean_body_text(str(raw_body))
-            if len(cleaned_body) > 500:
-                cleaned_body = f"{cleaned_body[:499].rstrip()}…"
 
             lines.extend(
                 [
@@ -11111,7 +11145,7 @@ class NegotiationAgent(BaseAgent):
         if not entries:
             return ""
 
-        recent_entries = list(entries)[-THREAD_HISTORY_TRANSCRIPT_LIMIT:]
+        recent_entries = self._select_thread_history_entries(entries)
         sections: List[str] = []
 
         for entry in recent_entries:
@@ -11140,8 +11174,6 @@ class NegotiationAgent(BaseAgent):
             subject = self._coerce_text(entry.get("subject")) or "(no subject)"
             raw_body = entry.get("body_text") or entry.get("body") or ""
             cleaned_body = EmailDraftingAgent._clean_body_text(str(raw_body))
-            if len(cleaned_body) > 500:
-                cleaned_body = f"{cleaned_body[:499].rstrip()}…"
 
             escaped_body = (
                 escape(cleaned_body).replace("\n", "<br/>") if cleaned_body else ""
