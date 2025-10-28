@@ -1532,7 +1532,7 @@ class EmailWatcherV2:
                     if subject_similarity >= 0.7:
                         matched_id = candidate_uid
                         best_dispatch = candidate_dispatch
-                        best_score = max(best_score, 0.5)
+                        best_score = max(best_score, threshold)
                         best_reasons = _merge_reasons(
                             best_reasons,
                             "temporal_proximity",
@@ -1856,8 +1856,6 @@ class EmailWatcherV2:
 
                 responses = self._fetch_emails(
                     since_cursor,
-                    workflow_ids=[workflow_id],
-                    mailbox_filter=self._mailbox,
                 )
                 matched_rows = self._match_responses(tracker, responses)
                 now_after_poll = self._now()
