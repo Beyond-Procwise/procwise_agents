@@ -58,6 +58,7 @@ def get_workflow_redis_client() -> Optional["redis.Redis"]:
     if not workflow_url:
         return get_redis_client()
 
+    fallback_to_shared = False
     with _REDIS_LOCK:
         if _WORKFLOW_REDIS_CLIENT is not None:
             return _WORKFLOW_REDIS_CLIENT
@@ -71,10 +72,15 @@ def get_workflow_redis_client() -> Optional["redis.Redis"]:
                 workflow_url,
             )
             _WORKFLOW_REDIS_CLIENT = None
-            return None
+            fallback_to_shared = True
+        else:
+            _WORKFLOW_REDIS_CLIENT = client
+            return _WORKFLOW_REDIS_CLIENT
 
-        _WORKFLOW_REDIS_CLIENT = client
-        return _WORKFLOW_REDIS_CLIENT
+    if fallback_to_shared:
+        return get_redis_client()
+
+    return None
 
 
 def reset_redis_client() -> None:
