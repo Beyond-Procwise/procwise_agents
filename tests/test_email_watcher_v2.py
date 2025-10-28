@@ -13,7 +13,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from agents.base_agent import AgentOutput, AgentStatus
 from decimal import Decimal
 
-from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories import (
+    supplier_response_repo,
+    workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
+)
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
 from services import supplier_response_coordinator
@@ -92,8 +96,11 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     workflow_id = "wf-integration-test"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
 
     supplier_agent = StubSupplierAgent()
     negotiation_agent = StubNegotiationAgent()
@@ -179,12 +186,59 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
 
 
+def test_email_watcher_defers_until_supplier_agent_active():
+    workflow_id = "wf-wait-for-supplier"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-inactive")
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-inactive",
+                "supplier_email": "inactive@example.com",
+                "message_id": "<dispatch-inactive>",
+                "subject": "Pending request",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is False
+    assert result["workflow_status"] == "awaiting_supplier_activation"
+    assert result["reason"] == "supplier_agent_inactive"
+    lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id)
+    assert lifecycle is None or lifecycle.get("watcher_status") is None
+
+
 def test_email_watcher_continues_polling_until_all_responses():
     workflow_id = "wf-multi-response"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
 
     base_time = datetime.now(timezone.utc)
     supplier_ids = ["sup-a", "sup-b", "sup-c"]
@@ -283,12 +337,68 @@ def test_email_watcher_continues_polling_until_all_responses():
     assert fetcher.calls > len(unique_ids)
 
 
+def test_email_watcher_stops_when_negotiation_completed():
+    workflow_id = "wf-negotiation-complete"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-negotiated")
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=lambda _: workflow_lifecycle_repo.record_negotiation_status(
+            workflow_id, "completed"
+        ),
+        now=lambda: now,
+        max_total_wait_seconds=30,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-negotiated",
+                "supplier_email": "negotiated@example.com",
+                "message_id": "<dispatch-negotiated>",
+                "subject": "Request for negotiation",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["workflow_status"] == "negotiation_completed"
+    assert result["timeout_reached"] is False
+    lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id)
+    assert lifecycle is not None
+    assert lifecycle.get("watcher_status") == "stopped"
+    assert lifecycle.get("negotiation_status") == "completed"
+    metadata = lifecycle.get("metadata") or {}
+    assert metadata.get("stop_reason") == "negotiation_completed"
+    assert metadata.get("negotiation_completed") is True
+
+
 def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     workflow_id = "wf-legacy-thread"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
 
     supplier_agent = StubSupplierAgent()
     negotiation_agent = StubNegotiationAgent()
@@ -402,8 +512,11 @@ def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path
     workflow_id = "wf-header-fallback"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
 
     supplier_agent = StubSupplierAgent()
 
@@ -475,8 +588,11 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     workflow_id = "wf-rfq-fallback"
     supplier_response_repo.init_schema()
     workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
     supplier_response_repo.reset_workflow(workflow_id=workflow_id)
     workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "invoked")
 
     supplier_agent = StubSupplierAgent()
 
