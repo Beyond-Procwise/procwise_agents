@@ -14,6 +14,8 @@ from repositories.workflow_email_tracking_repo import (
     record_dispatches as workflow_record_dispatches,
 )
 
+from services.db import get_conn
+
 try:  # pragma: no cover - psycopg2 may be optional
     from psycopg2.extras import Json
 except Exception:  # pragma: no cover - fallback when psycopg2 missing
@@ -70,6 +72,7 @@ def record_dispatch(
     subject: str,
     dispatched_at: datetime,
     dispatch_key: Optional[str] = None,
+    thread_headers: Optional[Dict[str, Sequence[str]]] = None,
     **kwargs,
 ) -> None:
     """Record dispatch metadata in workflow tracking."""
@@ -106,16 +109,17 @@ def record_dispatch(
                     unique_id=unique_id,
                     dispatch_key=dispatch_key,
                     supplier_id=supplier_id,
-                    supplier_email=supplier_email,
-                    message_id=message_id,
-                    subject=subject,
-                    dispatched_at=dispatched_at,
-                    responded_at=None,
-                    response_message_id=None,
-                    matched=False,
-                )
-            ],
-        )
+                supplier_email=supplier_email,
+                message_id=message_id,
+                subject=subject,
+                dispatched_at=dispatched_at,
+                responded_at=None,
+                response_message_id=None,
+                matched=False,
+                thread_headers=thread_headers,
+            )
+        ],
+    )
     except Exception:
         logger.exception(
             "Failed to record dispatch for workflow=%s unique=%s",
@@ -233,6 +237,126 @@ def register_dispatch(
                 metadata_json,
             ),
         )
+
+
+def _normalise_dispatch_metadata(
+    metadata: Optional[dict],
+    *,
+    workflow_id: Optional[str],
+    supplier_id: Optional[str],
+    unique_id: Optional[str],
+) -> Optional[dict]:
+    if metadata is None:
+        metadata = {}
+    elif not isinstance(metadata, dict):
+        try:
+            metadata = dict(metadata)  # type: ignore[arg-type]
+        except Exception:
+            metadata = {"raw": str(metadata)}
+
+    metadata.setdefault("workflow_id", workflow_id)
+    metadata.setdefault("supplier_id", supplier_id)
+    metadata.setdefault("unique_id", unique_id)
+    return metadata or None
+
+
+def mark_sent(
+    workflow_id: Optional[str],
+    supplier_id: Optional[str],
+    unique_id: Optional[str],
+    message_id: Optional[str],
+    *,
+    subject: Optional[str] = None,
+    body: Optional[str] = None,
+    recipients: Optional[Sequence[str]] = None,
+    metadata: Optional[dict] = None,
+    thread_index: Optional[int] = None,
+    connection=None,
+) -> None:
+    """Persist a sent dispatch in ``proc.email_dispatch_chains``."""
+
+    if not unique_id or not message_id:
+        return
+
+    metadata_payload = _normalise_dispatch_metadata(
+        metadata,
+        workflow_id=workflow_id,
+        supplier_id=supplier_id,
+        unique_id=unique_id,
+    )
+
+    if recipients:
+        cleaned = [value for value in recipients if value]
+    else:
+        cleaned = []
+
+    recipients_payload = (
+        Json(cleaned) if cleaned and Json is not None else json.dumps(cleaned)
+        if cleaned
+        else None
+    )
+
+    metadata_json = (
+        Json(metadata_payload) if metadata_payload and Json is not None else json.dumps(metadata_payload)
+        if metadata_payload
+        else None
+    )
+
+    owns_connection = connection is None
+    if owns_connection:
+        connection = get_conn()
+
+    ensure_chain_table(connection)
+
+    params = (
+        unique_id,
+        message_id,
+        thread_index,
+        supplier_id,
+        workflow_id,
+        recipients_payload,
+        subject,
+        body,
+        metadata_json,
+    )
+
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {CHAIN_TABLE} (
+                rfq_id,
+                message_id,
+                thread_index,
+                supplier_id,
+                workflow_ref,
+                recipients,
+                subject,
+                body,
+                dispatch_metadata,
+                awaiting_response,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, %s, COALESCE(%s, 1), %s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW())
+            ON CONFLICT (message_id) DO UPDATE SET
+                thread_index = COALESCE(EXCLUDED.thread_index, {CHAIN_TABLE}.thread_index),
+                supplier_id = COALESCE(EXCLUDED.supplier_id, {CHAIN_TABLE}.supplier_id),
+                workflow_ref = COALESCE(EXCLUDED.workflow_ref, {CHAIN_TABLE}.workflow_ref),
+                recipients = COALESCE(EXCLUDED.recipients, {CHAIN_TABLE}.recipients),
+                subject = COALESCE(EXCLUDED.subject, {CHAIN_TABLE}.subject),
+                body = COALESCE(EXCLUDED.body, {CHAIN_TABLE}.body),
+                dispatch_metadata = COALESCE(EXCLUDED.dispatch_metadata, {CHAIN_TABLE}.dispatch_metadata),
+                awaiting_response = TRUE,
+                updated_at = NOW()
+            """,
+            params,
+        )
+
+    if owns_connection:
+        try:
+            connection.commit()
+        finally:
+            connection.close()
 
 
 def mark_response(

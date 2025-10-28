@@ -1701,10 +1701,48 @@ class Orchestrator:
         email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
+        dispatch_input: Dict[str, Any] = {}
+        if email_result and email_result.pass_fields:
+            dispatch_input.update(dict(email_result.pass_fields))
+        dispatch_input.setdefault("drafts", email_drafts)
+        dispatch_input.setdefault("workflow_id", workflow_hint)
+        round_hint = (
+            payload.get("round_number")
+            or payload.get("round")
+            or (supplier_payload.get("round") if isinstance(supplier_payload, dict) else None)
+        )
+        if round_hint is not None:
+            dispatch_input.setdefault("round", round_hint)
+
+        dispatch_ctx = self._create_child_context(context, "email_dispatch", dispatch_input)
+        dispatch_result = self._execute_agent("email_dispatch", dispatch_ctx)
+        dispatch_data = dispatch_result.data if dispatch_result else {}
+
+        if isinstance(dispatch_data.get("drafts"), list):
+            email_drafts = [draft for draft in dispatch_data["drafts"] if isinstance(draft, dict)]
+            unique_ids = [draft.get("unique_id") for draft in email_drafts]
+
+        dispatch_records = (
+            dispatch_data.get("dispatch_records")
+            if isinstance(dispatch_data.get("dispatch_records"), list)
+            else []
+        )
+        if dispatch_records:
+            tracked_unique_ids = [
+                str(record.get("unique_id")).strip()
+                for record in dispatch_records
+                if record.get("unique_id")
+            ]
+            tracked_unique_ids = [uid for uid in tracked_unique_ids if uid]
+            unique_ids = [record.get("unique_id") for record in dispatch_records]
+
         coordinator = SupplierResponseWorkflow()
         readiness: Dict[str, Dict[str, object]] = {}
 
-        expected_email_count = len(tracked_unique_ids) or drafted_email_count
+        if isinstance(dispatch_data.get("expected_dispatches"), int):
+            expected_email_count = int(dispatch_data["expected_dispatches"])
+        else:
+            expected_email_count = len(tracked_unique_ids) or drafted_email_count
 
         try:
             readiness = coordinator.ensure_ready(
@@ -1763,6 +1801,12 @@ class Orchestrator:
         supplier_input.setdefault("expected_dispatch_count", expected_email_count)
         # Retain legacy key for agents that still inspect the historical field.
         supplier_input.setdefault("expected_email_count", expected_email_count)
+        if dispatch_records:
+            supplier_input.setdefault("dispatch_records", dispatch_records)
+        if dispatch_data.get("failures"):
+            supplier_input.setdefault("dispatch_failures", dispatch_data.get("failures"))
+        if dispatch_data:
+            supplier_input.setdefault("dispatch_metadata", dispatch_data)
         if tracked_unique_ids:
             supplier_input.setdefault("expected_unique_ids", tracked_unique_ids)
         supplier_input.setdefault("await_response", True)
