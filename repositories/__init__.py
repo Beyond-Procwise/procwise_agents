@@ -5,4 +5,5 @@ __all__ = [
     "supplier_response_repo",
     "draft_rfq_emails_repo",
     "workflow_lifecycle_repo",
+    "email_dispatch_repo",
 ]

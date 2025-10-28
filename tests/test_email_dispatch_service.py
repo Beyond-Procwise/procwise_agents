@@ -211,6 +211,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
 
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-UNIT-12345"
+    workflow_identifier = "7e5ab1d4-1234-4f2a-9d5b-1234567890ab"
     draft_payload = {
         "rfq_id": "RFQ-UNIT",
         "subject": DEFAULT_RFQ_SUBJECT,
@@ -222,7 +223,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         "contact_level": 1,
         "sent_status": False,
         "action_id": "action-1",
-        "workflow_id": "wf-test-1",
+        "workflow_id": workflow_identifier,
         "unique_id": unique_id,
     }
     draft_id = store.add(
@@ -239,7 +240,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
                 "sender": "sender@example.com",
                 "payload": json.dumps(draft_payload),
                 "sent_on": None,
-                "workflow_id": "wf-test-1",
+                "workflow_id": workflow_identifier,
                 "unique_id": unique_id,
             }
         )
@@ -289,8 +290,9 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     monkeypatch.setattr(service.email_service, "send_email", fake_send)
     monkeypatch.setattr(service, "_record_thread_mapping", fake_record_thread)
 
+    workflow_identifier = "7e5ab1d4-1234-4f2a-9d5b-1234567890ab"
     dispatch_context = {
-        "workflow_id": "wf-test-1",
+        "workflow_id": workflow_identifier,
         "unique_id": unique_id,
         "dispatch_key": "neg-round-1",
     }
@@ -306,13 +308,14 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
-    assert "X-Procwise-RFQ-ID" not in sent_args["headers"]
+    assert "X-ProcWise-RFQ-ID" not in sent_args["headers"]
     unique_id = extract_unique_id_from_body(result["body"])
     assert unique_id
-    assert sent_args["headers"]["X-Procwise-Unique-Id"] == unique_id
-    if sent_args["headers"].get("X-Procwise-Workflow-Id"):
+    assert sent_args["headers"]["X-ProcWise-Unique-ID"] == unique_id
+    assert sent_args["headers"]["X-ProcWise-Round"].isdigit()
+    if sent_args["headers"].get("X-ProcWise-Workflow-ID"):
         assert (
-            sent_args["headers"]["X-Procwise-Workflow-Id"]
+            sent_args["headers"]["X-ProcWise-Workflow-ID"]
             == result["draft"]["dispatch_metadata"].get("workflow_id")
         )
     assert result["draft"]["dispatch_metadata"]["unique_id"] == unique_id

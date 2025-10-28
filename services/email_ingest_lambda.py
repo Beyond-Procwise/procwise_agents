@@ -353,7 +353,9 @@ def _build_reply_metadata(message, bucket: str, key: str) -> Dict[str, object]:
     from_address = _decode_header(message.get("From"))
     to_addresses = [_decode_header(value) for value in message.get_all("To", [])]
     cc_addresses = [_decode_header(value) for value in message.get_all("Cc", [])]
-    mailbox = _decode_header(message.get("X-Procwise-Mailbox"))
+    mailbox = _decode_header(
+        message.get("X-ProcWise-Mailbox") or message.get("X-Procwise-Mailbox")
+    )
     if not mailbox and to_addresses:
         mailbox = to_addresses[0]
 
@@ -583,13 +585,16 @@ def process_record(record: Dict[str, object]) -> Dict[str, object]:
     subject = metadata.get("subject") or ""
 
     header_candidates = {
+        "X-ProcWise-Unique-ID": message.get_all("X-ProcWise-Unique-ID", []),
         "X-Procwise-Unique-Id": message.get_all("X-Procwise-Unique-Id", []),
         "X-Procwise-Unique-ID": message.get_all("X-Procwise-Unique-ID", []),
         "X-Procwise-Uid": message.get_all("X-Procwise-Uid", []),
     }
     unique_id = extract_unique_id_from_headers(header_candidates)
     if not unique_id:
-        header_fallback = message.get("X-Procwise-Unique-Id")
+        header_fallback = message.get("X-ProcWise-Unique-ID") or message.get(
+            "X-Procwise-Unique-Id"
+        )
         if header_fallback:
             unique_id = _normalise_unique_id(header_fallback)
     if not unique_id:

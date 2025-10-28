@@ -127,6 +127,7 @@ class EmailDispatchAgent(BaseAgent):
             context["unique_id"] = unique_id
         if round_number is not None:
             context["round"] = round_number
+            context["round_number"] = round_number
         dispatch_key = draft.get("dispatch_key") or draft.get("action_id")
         if dispatch_key:
             context["dispatch_key"] = dispatch_key
@@ -170,7 +171,8 @@ class EmailDispatchAgent(BaseAgent):
             workflow_dispatch_context=dispatch_context,
         )
 
-        dispatched_at = datetime.now(timezone.utc).isoformat()
+        dispatched_at_dt = datetime.now(timezone.utc)
+        dispatched_at = dispatched_at_dt.isoformat()
         sent = bool(result.get("sent"))
         message_id = self._coerce_text(result.get("message_id"))
         updated_draft = result.get("draft") if isinstance(result.get("draft"), dict) else {}
@@ -191,6 +193,9 @@ class EmailDispatchAgent(BaseAgent):
                 "dispatched_at": draft.get("dispatched_at", dispatched_at),
                 "thread_headers": draft.get("thread_headers"),
                 "status": "sent",
+                "round": dispatch_context.get("round")
+                if isinstance(dispatch_context, dict)
+                else round_number,
             }
 
             log_payload = {
@@ -202,6 +207,7 @@ class EmailDispatchAgent(BaseAgent):
                 "to": recipients,
                 "from": sender,
                 "subject": subject,
+                "round": record.get("round"),
             }
             logger.info(json.dumps(log_payload))
             return record

@@ -160,6 +160,7 @@ class EmailResponse:
     headers: Dict[str, Sequence[str]] = field(default_factory=dict)
     attachments: Sequence[Dict[str, Any]] = field(default_factory=tuple)
     tables: Sequence[Dict[str, Any]] = field(default_factory=tuple)
+    round_number: Optional[int] = None
 
 
 @dataclass
@@ -421,15 +422,21 @@ def _parse_email(raw: bytes) -> EmailResponse:
     plain_body, html_body, attachments = _extract_plain_text(message)
     tables = _extract_tables_from_html(html_body)
     body = plain_body or html_body or ""
-    header_map = {
-        key: message.get_all(key, failobj=[])
-        for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
-    }
+    header_aliases = (
+        "X-ProcWise-Unique-ID",
+        "X-Procwise-Unique-Id",
+        "X-Procwise-Unique-ID",
+        "X-Procwise-Uid",
+    )
+    header_map = {key: message.get_all(key, failobj=[]) for key in header_aliases}
     unique_id = extract_unique_id_from_headers(header_map)
     if not unique_id:
-        fallback_header = message.get("X-Procwise-Unique-Id")
-        if fallback_header:
-            unique_id = str(fallback_header).strip()
+        for alias in header_aliases:
+            fallback_header = message.get(alias)
+            if fallback_header:
+                unique_id = str(fallback_header).strip()
+                if unique_id:
+                    break
     body_unique = extract_unique_id_from_body(body)
     if body_unique and not unique_id:
         unique_id = body_unique
@@ -438,20 +445,45 @@ def _parse_email(raw: bytes) -> EmailResponse:
     if metadata and not unique_id:
         unique_id = metadata.unique_id
 
-    header_unique_id = (message.get("X-Procwise-Unique-Id") or "").strip()
+    header_unique_id = (
+        message.get("X-ProcWise-Unique-ID")
+        or message.get("X-Procwise-Unique-Id")
+        or ""
+    ).strip()
     if header_unique_id and not unique_id:
         unique_id = header_unique_id
 
-    header_supplier_id = (message.get("X-Procwise-Supplier-Id") or "").strip()
+    header_supplier_id = (
+        message.get("X-ProcWise-Supplier-ID")
+        or message.get("X-Procwise-Supplier-Id")
+        or ""
+    ).strip()
     if header_supplier_id and not supplier_id:
         supplier_id = header_supplier_id
 
     workflow_id = metadata.workflow_id if metadata else None
-    header_workflow_id = (message.get("X-Procwise-Workflow-Id") or "").strip()
+    header_workflow_id = (
+        message.get("X-ProcWise-Workflow-ID")
+        or message.get("X-Procwise-Workflow-Id")
+        or ""
+    ).strip()
     if header_workflow_id and not workflow_id:
         workflow_id = header_workflow_id
 
     rfq_id = (message.get("X-Procwise-RFQ-ID") or "").strip() or None
+    round_header = (
+        message.get("X-ProcWise-Round")
+        or message.get("X-Procwise-Round")
+        or ""
+    ).strip()
+    round_number: Optional[int] = None
+    if round_header:
+        try:
+            parsed_round = int(round_header)
+        except ValueError:
+            parsed_round = None
+        if parsed_round is not None and parsed_round >= 0:
+            round_number = parsed_round
 
     date_header = message.get("Date")
     try:
@@ -492,6 +524,7 @@ def _parse_email(raw: bytes) -> EmailResponse:
         headers=raw_headers,
         attachments=tuple(attachments),
         tables=tuple(tables),
+        round_number=round_number,
     )
 
 
@@ -772,11 +805,78 @@ def _score_to_confidence(score: float) -> Decimal:
 def _calculate_match_score(
     dispatch: EmailDispatchRecord, email_response: EmailResponse
 ) -> Tuple[float, List[str]]:
-    score = 0.0
-    matched_on: List[str] = []
-
     if email_response.unique_id and email_response.unique_id == dispatch.unique_id:
         return 1.0, ["unique_id"]
+
+    matched_on: List[str] = []
+    score = 0.0
+
+    def _normalise(value: Optional[object]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        return str(value).strip().lower() or None
+
+    header_map = {key.lower(): tuple(value) for key, value in email_response.headers.items()}
+
+    def _collect_header_values(*keys: str) -> List[str]:
+        collected: List[str] = []
+        for key in keys:
+            for entry in header_map.get(key.lower(), ()):  # type: ignore[assignment]
+                text = str(entry).strip()
+                if text:
+                    collected.append(text)
+        return collected
+
+    dispatch_workflow = _normalise(dispatch.workflow_id)
+    workflow_candidates = {
+        value
+        for value in (
+            *(_normalise(email_response.workflow_id),),
+            *(_normalise(candidate) for candidate in _collect_header_values("x-procwise-workflow-id")),
+        )
+        if value is not None
+    }
+    if dispatch_workflow and dispatch_workflow in workflow_candidates:
+        score += 0.6
+        matched_on.append("workflow_header")
+
+    dispatch_unique = _normalise(dispatch.unique_id)
+    unique_candidates = {
+        value
+        for value in (
+            *(_normalise(email_response.unique_id),),
+            *(
+                _normalise(candidate)
+                for candidate in _collect_header_values(
+                    "x-procwise-unique-id",
+                    "x-procwise-uid",
+                )
+            ),
+        )
+        if value is not None
+    }
+    if dispatch_unique and dispatch_unique in unique_candidates:
+        score += 0.2
+        matched_on.append("unique_id")
+
+    dispatch_round = dispatch.round_number
+    response_round = email_response.round_number
+    if response_round is None:
+        for candidate in _collect_header_values("x-procwise-round"):
+            try:
+                parsed = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                response_round = parsed
+                break
+    if (
+        dispatch_round is not None
+        and response_round is not None
+        and dispatch_round == response_round
+    ):
+        score += 0.1
+        matched_on.append("round")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
         dispatch.thread_headers.get("in_reply_to", ())
@@ -785,54 +885,27 @@ def _calculate_match_score(
         thread_ids.add(dispatch.message_id)
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
+    reference_match = False
     if dispatch.message_id and dispatch.message_id in reply_headers:
-        score += 0.6
-        matched_on.append("in-reply-to")
+        reference_match = True
     elif thread_ids & reply_headers:
-        score += 0.6
-        matched_on.append("thread")
+        reference_match = True
 
-    header_match = False
-    header_map = {key.lower(): value for key, value in email_response.headers.items()}
-    if dispatch.workflow_id and any(
-        str(dispatch.workflow_id).strip().lower() == str(value).strip().lower()
-        for value in header_map.get("x-procwise-workflow-id", ())
-    ):
-        header_match = True
-    if dispatch.unique_id and any(
-        str(dispatch.unique_id).strip().lower() == str(value).strip().lower()
-        for value in header_map.get("x-procwise-unique-id", ())
-    ):
-        header_match = True
-    thread_index_values = header_map.get("thread-index") or ()
-    if thread_index_values and dispatch.thread_headers.get("thread-index"):
-        dispatch_index = set(
-            str(item).strip().lower()
-            for item in dispatch.thread_headers.get("thread-index", ())
-        )
-        if dispatch_index & {str(val).strip().lower() for val in thread_index_values}:
-            header_match = True
-    if header_match:
-        score += 0.2
-        matched_on.append("headers")
-
+    subject_match = False
     if dispatch.subject and email_response.subject:
         normalised_subject = _normalise_subject_line(dispatch.subject)
         response_subject = _normalise_subject_line(email_response.subject)
         if normalised_subject and response_subject and normalised_subject == response_subject:
-            score += 0.1
+            subject_match = True
+
+    if reference_match or subject_match:
+        score += 0.1
+        if reference_match:
+            matched_on.append("references")
+        if subject_match:
             matched_on.append("subject")
 
-    dispatch_email = _normalise_email_address(dispatch.supplier_email)
-    response_email = (
-        _normalise_email_address(email_response.from_address)
-        or _normalise_email_address(email_response.supplier_email)
-    )
-    if dispatch_email and response_email and dispatch_email == response_email:
-        score += 0.1
-        matched_on.append("sender")
-
-    return score, matched_on
+    return min(score, 1.0), matched_on
 
 
 class EmailWatcherV2:
@@ -846,7 +919,7 @@ class EmailWatcherV2:
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.75,
+        match_threshold: float = 0.8,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,
@@ -1230,7 +1303,7 @@ class EmailWatcherV2:
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
-        threshold = max(self.match_threshold, 0.75)
+        threshold = max(self.match_threshold, 0.8)
         for email in responses:
             message_id = email.message_id or ""
             fingerprint = _response_fingerprint(email)
@@ -1248,6 +1321,28 @@ class EmailWatcherV2:
                     fingerprint,
                 )
                 continue
+            header_presence_map = {key.lower(): value for key, value in email.headers.items()}
+
+            def _has_header_value(entries: Optional[object]) -> bool:
+                if entries in (None, ""):
+                    return False
+                if isinstance(entries, (list, tuple, set)):
+                    return any(str(item).strip() for item in entries if item is not None)
+                return bool(str(entries).strip())
+
+            workflow_header_present = bool(email.workflow_id) or _has_header_value(
+                header_presence_map.get("x-procwise-workflow-id")
+            )
+            unique_header_present = bool(email.unique_id) or _has_header_value(
+                header_presence_map.get("x-procwise-unique-id")
+            )
+            supplier_header_present = bool(email.supplier_id) or _has_header_value(
+                header_presence_map.get("x-procwise-supplier-id")
+            )
+            round_header_present = (
+                email.round_number is not None
+                or _has_header_value(header_presence_map.get("x-procwise-round"))
+            )
             matched_id: Optional[str] = None
             best_score = 0.0
             best_dispatch: Optional[EmailDispatchRecord] = None
@@ -1432,12 +1527,19 @@ class EmailWatcherV2:
                     tracker.seen_message_ids.add(message_id)
                 if fingerprint:
                     tracker.seen_fingerprints.add(fingerprint)
+                header_summary = {
+                    "workflow": workflow_header_present,
+                    "unique": unique_header_present,
+                    "supplier": supplier_header_present,
+                    "round": round_header_present,
+                }
                 logger.warning(
-                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f matched_on=%s)",
+                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f matched_on=%s headers=%s)",
                     tracker.workflow_id,
                     email.message_id,
                     best_score,
                     reasons,
+                    header_summary,
                 )
         return matched_rows
 
@@ -2119,7 +2221,7 @@ class ContinuousEmailWatcher:
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         poll_jitter_seconds: float = 3.0,
-        match_threshold: float = 0.45,
+        match_threshold: float = 0.8,
         soft_timeout_minutes: Optional[int] = 360,
         grace_period_minutes: int = 45,
     ) -> None:

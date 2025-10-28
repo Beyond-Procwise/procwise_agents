@@ -80,7 +80,10 @@ def test_from_decision_formats_payload(monkeypatch, fixed_unique_id):
     assert result["sender"]
     assert result["sent_status"] is False
     assert calls[0]["payload"]["unique_id"] == fixed_unique_id
-    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
+    assert result["headers"]["X-ProcWise-Unique-ID"] == fixed_unique_id
+    round_header = result["headers"]["X-ProcWise-Round"]
+    assert round_header.isdigit() and int(round_header) >= 0
+    assert result["headers"]["X-ProcWise-Supplier-ID"] == "S-1"
     assert result["metadata"]["unique_id"] == fixed_unique_id
     assert result["unique_id"] == fixed_unique_id
 
@@ -147,9 +150,9 @@ def test_from_decision_generates_unique_identifier(monkeypatch, fixed_unique_id)
     result = agent.from_decision(decision)
 
     assert "rfq_id" not in result
-    assert "X-Procwise-RFQ-ID" not in result["headers"]
-    assert result["headers"]["X-Procwise-Unique-Id"] == fixed_unique_id
-    assert "X-Procwise-Workflow-Id" not in result["headers"]
+    assert "X-ProcWise-RFQ-ID" not in result["headers"]
+    assert result["headers"]["X-ProcWise-Unique-ID"] == fixed_unique_id
+    assert "X-ProcWise-Workflow-ID" not in result["headers"]
     assert result["metadata"]["unique_id"] == fixed_unique_id
     assert result["unique_id"] == fixed_unique_id
     assert result["subject"] == module.DEFAULT_NEGOTIATION_SUBJECT
@@ -317,11 +320,13 @@ def test_supplier_context_is_not_injected_into_email_body():
 
 
 def _make_context(payload: dict) -> AgentContext:
+    enriched = dict(payload)
+    enriched.setdefault("supplier_id", "TEST-SUPPLIER")
     return AgentContext(
         workflow_id="wf-1",
         agent_id="email_drafting",
         user_id="tester",
-        input_data=payload,
+        input_data=enriched,
     )
 
 

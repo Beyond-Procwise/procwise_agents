@@ -17,7 +17,11 @@ from utils.email_tracking import (
 from utils.gpu import configure_gpu
 
 from services.backend_scheduler import BackendScheduler
-from repositories import draft_rfq_emails_repo, workflow_email_tracking_repo
+from repositories import (
+    draft_rfq_emails_repo,
+    email_dispatch_repo,
+    workflow_email_tracking_repo,
+)
 
 from .email_dispatch_chain_store import (
     record_dispatch as record_workflow_dispatch,
@@ -262,18 +266,36 @@ class EmailDispatchService:
             thread_headers = self._normalise_thread_headers(raw_thread_headers)
 
             headers = {
-                "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
-                "X-Procwise-Unique-Id": unique_id,
+                "X-ProcWise-Workflow-ID": backend_metadata.get("workflow_id"),
+                "X-ProcWise-Unique-ID": unique_id,
             }
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
-                headers["X-Procwise-Mailbox"] = mailbox_header
+                headers["X-ProcWise-Mailbox"] = mailbox_header
             if backend_metadata.get("supplier_id"):
-                headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
+                headers["X-ProcWise-Supplier-ID"] = backend_metadata.get("supplier_id")
+
+            round_value = self._coerce_round_number(
+                dispatch_payload_context.get("round") if dispatch_payload_context else None,
+                draft.get("round") or draft.get("round_number"),
+                backend_metadata.get("round") if isinstance(backend_metadata, dict) else None,
+            )
+            if round_value is not None:
+                backend_metadata["round"] = round_value
+                headers["X-ProcWise-Round"] = str(round_value)
+                dispatch_payload.setdefault("round", round_value)
+                dispatch_payload.setdefault("round_number", round_value)
+            else:
+                headers["X-ProcWise-Round"] = "0"
+                backend_metadata.setdefault("round", 0)
+                dispatch_payload.setdefault("round", 0)
+                dispatch_payload.setdefault("round_number", 0)
 
             thread_header_values = self._extract_thread_header_values(thread_headers)
             headers.update(thread_header_values)
+
+            self._validate_metadata_headers(headers)
 
             send_result = self.email_service.send_email(
                 subject,
@@ -429,6 +451,31 @@ class EmailDispatchService:
                             ),
                             thread_headers=updated_thread_headers,
                         )
+                        round_for_record = backend_metadata.get("round")
+                        if not isinstance(round_for_record, int):
+                            round_for_record = dispatch_payload.get("round")
+                        if not isinstance(round_for_record, int):
+                            round_for_record = 0
+                        try:
+                            email_dispatch_repo.record_dispatch(
+                                workflow_id=workflow_identifier,
+                                supplier_id=str(
+                                    backend_metadata.get("supplier_id")
+                                    or draft.get("supplier_id")
+                                    or ""
+                                )
+                                or None,
+                                unique_id=unique_id,
+                                round_number=round_for_record,
+                                message_id=message_id,
+                                dispatched_at=datetime.now(timezone.utc),
+                                subject=subject,
+                                status="sent",
+                            )
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception(
+                                "Failed to persist email_dispatch row for workflow %s", workflow_identifier
+                            )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
                             "Failed to record workflow email dispatch for workflow %s",
@@ -547,6 +594,47 @@ class EmailDispatchService:
             if lowered in {"false", "0", "no", "n", "off"}:
                 return False
         return None
+
+    @staticmethod
+    def _coerce_round_number(*candidates: Optional[object]) -> Optional[int]:
+        for candidate in candidates:
+            if candidate in (None, ""):
+                continue
+            try:
+                round_int = int(candidate)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if round_int < 0:
+                continue
+            return round_int
+        return None
+
+    def _validate_metadata_headers(self, headers: Mapping[str, object]) -> None:
+        workflow_id = str(headers.get("X-ProcWise-Workflow-ID") or "").strip()
+        unique_id = str(headers.get("X-ProcWise-Unique-ID") or "").strip()
+        supplier_id = str(headers.get("X-ProcWise-Supplier-ID") or "").strip()
+        round_value = headers.get("X-ProcWise-Round")
+
+        if not workflow_id:
+            raise ValueError("workflow_id header missing for dispatch")
+        try:
+            uuid.UUID(workflow_id)
+        except Exception:
+            logger.warning(
+                "EmailDispatchService encountered non-UUID workflow identifier %s", workflow_id
+            )
+
+        if not unique_id:
+            raise ValueError("unique_id header missing for dispatch")
+        if not supplier_id:
+            raise ValueError("supplier_id header missing for dispatch")
+
+        try:
+            round_int = int(round_value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("round header must be a non-negative integer") from exc
+        if round_int < 0:
+            raise ValueError("round header must be a non-negative integer")
 
     @staticmethod
     def _normalise_workflow_context(
