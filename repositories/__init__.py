@@ -6,4 +6,5 @@ __all__ = [
     "draft_rfq_emails_repo",
     "workflow_lifecycle_repo",
     "email_dispatch_repo",
+    "email_watcher_state_repo",
 ]

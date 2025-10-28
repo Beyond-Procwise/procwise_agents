@@ -26,6 +26,7 @@ from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from repositories import (
+    email_watcher_state_repo,
     supplier_interaction_repo,
     supplier_response_repo,
     workflow_email_tracking_repo as tracking_repo,
@@ -1009,6 +1010,47 @@ class EmailWatcherV2:
         self._trackers[workflow_id] = tracker
         return tracker
 
+    def _state_round_value(self, tracker: WorkflowTracker) -> int:
+        round_number = self._resolve_round(tracker)
+        return round_number if isinstance(round_number, int) else 0
+
+    def _archive_other_rounds(self, tracker: WorkflowTracker) -> None:
+        try:
+            email_watcher_state_repo.archive_other_rounds(
+                tracker.workflow_id, self._state_round_value(tracker)
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Failed to archive watcher state for workflow=%s", tracker.workflow_id
+            )
+
+    def _update_watcher_state(
+        self,
+        tracker: WorkflowTracker,
+        status: str,
+        **extra: Any,
+    ) -> None:
+        payload = {
+            "expected_count": tracker.expected_responses,
+            "responses_received": tracker.responded_count,
+            "pending_suppliers": self._pending_suppliers(tracker),
+            "pending_unique_ids": self._pending_unique_ids(tracker),
+            "last_capture_ts": tracker.last_capture_at,
+            "timeout_deadline": tracker.timeout_deadline,
+        }
+        payload.update(extra)
+        try:
+            email_watcher_state_repo.transition_state(
+                tracker.workflow_id,
+                self._state_round_value(tracker),
+                status=status,
+                **payload,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to persist watcher state for workflow=%s", tracker.workflow_id
+            )
+
     def register_workflow_dispatch(
         self,
         workflow_id: str,
@@ -1116,6 +1158,7 @@ class EmailWatcherV2:
                 tracker.workflow_id,
                 unique_ids,
                 max(len(unique_ids), tracker.expected_responses),
+                round_number=self._resolve_round(tracker),
             )
         except Exception:
             logger.exception(
@@ -1545,7 +1588,15 @@ class EmailWatcherV2:
 
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
+        self._archive_other_rounds(tracker)
         if tracker.dispatched_count == 0:
+            self._update_watcher_state(
+                tracker,
+                "completed",
+                reason="no_dispatches",
+                responses_received=0,
+                expected_count=0,
+            )
             return {
                 "workflow_id": workflow_id,
                 "complete": True,
@@ -1556,12 +1607,17 @@ class EmailWatcherV2:
 
         lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
         supplier_status = (lifecycle.get("supplier_agent_status") or "").strip().lower()
-        allowed_statuses = {"awaiting_responses", "running"}
+        allowed_statuses = {"awaiting_responses", "running", "started", "active"}
         if supplier_status not in allowed_statuses:
             logger.info(
                 "EmailWatcher deferring start until SupplierInteractionAgent is active workflow=%s status=%s",
                 workflow_id,
                 supplier_status or None,
+            )
+            self._update_watcher_state(
+                tracker,
+                "none",
+                reason="supplier_agent_inactive",
             )
             return {
                 "workflow_id": workflow_id,
@@ -1581,6 +1637,11 @@ class EmailWatcherV2:
                 "EmailWatcher skipping run because negotiation already completed workflow=%s status=%s",
                 workflow_id,
                 negotiation_status,
+            )
+            self._update_watcher_state(
+                tracker,
+                "completed",
+                reason="negotiation_completed",
             )
             return {
                 "workflow_id": workflow_id,
@@ -1602,9 +1663,19 @@ class EmailWatcherV2:
         stop_reason: Optional[str] = None
         last_pending_unique: List[str] = []
         last_pending_suppliers: List[str] = []
+        final_status: Optional[str] = None
 
         try:
             watcher_start_at = self._now()
+            self._update_idle_deadline(tracker, watcher_start_at)
+            self._update_watcher_state(
+                tracker,
+                "active",
+                start_ts=watcher_start_at,
+                last_capture_ts=watcher_start_at,
+                timeout_deadline=tracker.timeout_deadline,
+                uid_cursor=self._imap_last_seen_uid,
+            )
             workflow_lifecycle_repo.record_watcher_event(
                 workflow_id,
                 "watcher_started",
@@ -1620,7 +1691,6 @@ class EmailWatcherV2:
                 received_responses=tracker.responded_count,
             )
 
-            self._update_idle_deadline(tracker, watcher_start_at)
             self._log_event(
                 "watcher_started",
                 tracker,
@@ -1633,6 +1703,12 @@ class EmailWatcherV2:
             last_pending_unique = self._pending_unique_ids(tracker)
             last_pending_suppliers = self._pending_suppliers(
                 tracker, last_pending_unique
+            )
+            self._update_watcher_state(
+                tracker,
+                "active",
+                pending_unique_ids=last_pending_unique,
+                pending_suppliers=last_pending_suppliers,
             )
 
             if tracker.last_dispatched_at:
@@ -1722,6 +1798,13 @@ class EmailWatcherV2:
                     since_last_capture_s=round(since_last_capture, 2),
                     timeout_deadline=timeout_deadline,
                 )
+                self._update_watcher_state(
+                    tracker,
+                    "active",
+                    pending_unique_ids=pending_unique_ids,
+                    pending_suppliers=pending_suppliers,
+                    heartbeat_ts=now_after_poll,
+                )
                 if (
                     tracker.expected_responses > tracker.responded_count
                     and since_last_capture >= self.response_idle_timeout_seconds
@@ -1801,14 +1884,18 @@ class EmailWatcherV2:
             negotiation_completed = negotiation_stop
 
             complete = tracker.all_responded or negotiation_completed
-            if stop_reason == "partial_timeout":
+            if stop_reason in {"partial_timeout", "timeout"}:
                 workflow_state = "partial_timeout"
+                final_status = "partial_timeout"
             elif negotiation_completed:
                 workflow_state = "negotiation_completed"
+                final_status = "completed"
             elif tracker.all_responded:
                 workflow_state = "responses_complete"
+                final_status = "completed"
             else:
                 workflow_state = "awaiting_responses"
+                final_status = final_status or "active"
             result = {
                 "workflow_id": workflow_id,
                 "complete": complete,
@@ -1841,7 +1928,25 @@ class EmailWatcherV2:
             if not negotiation_completed:
                 self._process_agents(tracker)
 
+            self._update_watcher_state(
+                tracker,
+                final_status or ("partial_timeout" if timeout_reached else "completed"),
+                reason=stop_reason,
+                pending_unique_ids=last_pending_unique,
+                pending_suppliers=last_pending_suppliers,
+            )
+
             return result
+        except Exception as exc:
+            final_status = "failed"
+            self._update_watcher_state(
+                tracker,
+                "failed",
+                last_error=str(exc),
+                pending_unique_ids=last_pending_unique,
+                pending_suppliers=last_pending_suppliers,
+            )
+            raise
         finally:
             if watcher_started:
                 runtime = 0.0
@@ -1861,10 +1966,18 @@ class EmailWatcherV2:
                     stop_metadata["negotiation_completed"] = True
                 if last_pending_suppliers:
                     stop_metadata["pending_suppliers"] = list(last_pending_suppliers)
+                if final_status:
+                    stop_metadata["status"] = final_status
                 self._log_event(
                     "watcher_stopped",
                     tracker,
-                    status="partial_timeout" if stop_reason == "partial_timeout" else "complete",
+                    status=
+                    final_status
+                    or (
+                        "partial_timeout"
+                        if stop_reason in {"partial_timeout", "timeout"}
+                        else "complete"
+                    ),
                     responses_received=tracker.responded_count,
                     expected=tracker.expected_responses,
                     pending_suppliers=last_pending_suppliers,
@@ -2616,6 +2729,7 @@ class ContinuousEmailWatcher:
                 response_subject=response.subject,
                 response_from=response.from_address,
                 received_time=response.received_at,
+                round_number=best_dispatch.round_number,
                 response_time=response_time,
                 original_message_id=best_dispatch.message_id,
                 original_subject=best_dispatch.subject,
@@ -2627,7 +2741,11 @@ class ContinuousEmailWatcher:
         )
 
         try:
-            self._response_coordinator.record_response(workflow_id, matched_unique)
+            self._response_coordinator.record_response(
+                workflow_id,
+                matched_unique,
+                round_number=best_dispatch.round_number,
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "Failed to register supplier response completion workflow=%s unique_id=%s",
@@ -2783,7 +2901,10 @@ class ContinuousEmailWatcher:
             if expected_total and expected_total != registered_expected:
                 try:
                     self._response_coordinator.register_expected_responses(
-                        workflow_id, expected_unique_ids, expected_total
+                        workflow_id,
+                        expected_unique_ids,
+                        expected_total,
+                        round_number=round_number,
                     )
                 except Exception:  # pragma: no cover - defensive
                     logger.exception(

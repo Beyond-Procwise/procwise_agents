@@ -801,16 +801,27 @@ def _stub_response_coordinator(monkeypatch):
             self.registered = []
             self.recorded = []
 
-        def register_expected_responses(self, workflow_id, unique_ids, expected_count):
-            self.registered.append((workflow_id, list(unique_ids), expected_count))
+        def register_expected_responses(
+            self,
+            workflow_id,
+            unique_ids,
+            expected_count,
+            *,
+            round_number=None,
+        ):
+            self.registered.append(
+                (workflow_id, list(unique_ids), expected_count, round_number)
+            )
 
-        def record_response(self, workflow_id, unique_id):
-            self.recorded.append((workflow_id, unique_id))
+        def record_response(self, workflow_id, unique_id, *, round_number=None):
+            self.recorded.append((workflow_id, unique_id, round_number))
 
-        def await_completion(self, workflow_id, timeout):  # pragma: no cover - stub
+        def await_completion(  # pragma: no cover - stub
+            self, workflow_id, timeout, *, round_number=None
+        ):
             return None
 
-        def clear(self, workflow_id):  # pragma: no cover - stub
+        def clear(self, workflow_id, *, round_number=None):  # pragma: no cover - stub
             return None
 
     coordinator = _Coordinator()
