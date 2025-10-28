@@ -775,7 +775,9 @@ class EmailDraftingAgent(BaseAgent):
         if not unique_id:
             headers = cleaned_draft.get("headers")
             if isinstance(headers, dict):
-                unique_id = headers.get("X-Procwise-Unique-Id")
+                unique_id = headers.get("X-ProcWise-Unique-ID") or headers.get(
+                    "X-Procwise-Unique-Id"
+                )
         if unique_id and "unique_id" not in cleaned_draft:
             cleaned_draft["unique_id"] = unique_id
 
@@ -1024,9 +1026,12 @@ class EmailDraftingAgent(BaseAgent):
         if isinstance(thread_headers, dict):
             resolved_thread_headers = dict(thread_headers)
         headers: Dict[str, Any] = {
-            "X-Procwise-Unique-Id": unique_id,
-            "X-Procwise-Workflow-Id": workflow_hint,
+            "X-ProcWise-Unique-ID": unique_id,
+            "X-ProcWise-Workflow-ID": workflow_hint,
+            "X-ProcWise-Round": "0",
         }
+        if supplier_id:
+            headers["X-ProcWise-Supplier-ID"] = supplier_id
         message_id = None
         if resolved_thread_headers:
             message_id = resolved_thread_headers.get("Message-ID") or resolved_thread_headers.get("message_id")
@@ -1125,6 +1130,16 @@ class EmailDraftingAgent(BaseAgent):
         sender = context.get("sender") or self.agent_nick.settings.ses_default_sender
 
         supplier_id = context.get("supplier_id")
+        if not supplier_id and isinstance(context.get("supplier"), Mapping):
+            supplier_payload = context.get("supplier")
+            supplier_id = (
+                supplier_payload.get("supplier_id")
+                if isinstance(supplier_payload, Mapping)
+                else None
+            )
+            if not supplier_id and isinstance(supplier_payload, Mapping):
+                supplier_id = supplier_payload.get("id")
+        supplier_id = self._coerce_text(supplier_id)
         workflow_hint = context.get("workflow_id") if isinstance(context, dict) else None
         existing_unique = self._normalise_tracking_value(context.get("unique_id"))
         unique_id = existing_unique or self._generate_unique_identifier(
@@ -1214,6 +1229,12 @@ class EmailDraftingAgent(BaseAgent):
                         counter_price = proposal.get("price")
                         break
 
+        round_hint = context.get("round")
+        try:
+            round_number = int(round_hint) if round_hint is not None else 0
+        except (TypeError, ValueError):
+            round_number = 0
+
         metadata = {
             "intent": context.get("intent") or "PROMPT_COMPOSE",
             "unique_id": unique_id,
@@ -1224,10 +1245,17 @@ class EmailDraftingAgent(BaseAgent):
             metadata["dispatch_token"] = marker_token
         if workflow_hint:
             metadata["workflow_id"] = workflow_hint
+        if supplier_id:
+            metadata["supplier_id"] = supplier_id
+        metadata["round"] = round_number
+        metadata["round_number"] = round_number
 
-        headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
+        headers: Dict[str, Any] = {"X-ProcWise-Unique-ID": unique_id}
         if workflow_hint:
-            headers["X-Procwise-Workflow-Id"] = workflow_hint
+            headers["X-ProcWise-Workflow-ID"] = workflow_hint
+        if supplier_id:
+            headers["X-ProcWise-Supplier-ID"] = supplier_id
+        headers["X-ProcWise-Round"] = str(round_number)
 
         draft = {
             "subject": subject,
@@ -1246,6 +1274,10 @@ class EmailDraftingAgent(BaseAgent):
             "unique_id": unique_id,
             "workflow_id": workflow_hint,
         }
+        if supplier_id:
+            draft["supplier_id"] = supplier_id
+        draft["round"] = round_number
+        draft["round_number"] = round_number
 
         return draft
 
@@ -1752,9 +1784,12 @@ class EmailDraftingAgent(BaseAgent):
         if isinstance(thread_headers_payload, dict):
             resolved_thread_headers = dict(thread_headers_payload)
 
-        headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
+        headers: Dict[str, Any] = {"X-ProcWise-Unique-ID": unique_id}
         if workflow_hint:
-            headers["X-Procwise-Workflow-Id"] = workflow_hint
+            headers["X-ProcWise-Workflow-ID"] = workflow_hint
+        if supplier_id:
+            headers["X-ProcWise-Supplier-ID"] = supplier_id
+        headers["X-ProcWise-Round"] = str(round_int if isinstance(round_int, int) else 0)
         headers["Subject"] = subject
 
         message_id = None
@@ -1787,7 +1822,7 @@ class EmailDraftingAgent(BaseAgent):
         if message_id:
             resolved_thread_headers.setdefault("Message-ID", message_id)
         if workflow_hint:
-            resolved_thread_headers.setdefault("X-Procwise-Workflow-Id", workflow_hint)
+            resolved_thread_headers.setdefault("X-ProcWise-Workflow-ID", workflow_hint)
 
         draft: Dict[str, Any] = {
             "supplier_id": supplier_id,
@@ -3990,12 +4025,44 @@ class EmailDraftingAgent(BaseAgent):
                     draft["mailbox"] = mailbox_hint
                     metadata.setdefault("mailbox", mailbox_hint)
 
+                raw_round = metadata.get("round") if isinstance(metadata, dict) else None
+                if raw_round is None and isinstance(metadata, dict):
+                    raw_round = metadata.get("round_number")
+
+                round_number: Optional[int]
+                try:
+                    round_number = int(raw_round) if raw_round is not None else None
+                except (TypeError, ValueError):
+                    round_number = None
+                if round_number is None:
+                    round_number = 0
+
+                metadata["round"] = round_number
+                metadata["round_number"] = round_number
+                draft["round"] = round_number
+                draft["round_number"] = round_number
+
                 headers = draft.get("headers") if isinstance(draft.get("headers"), dict) else {}
-                headers["X-Procwise-Unique-Id"] = unique_id
-                headers.setdefault("X-Procwise-Workflow-Id", workflow_id)
+                headers["X-ProcWise-Unique-ID"] = unique_id
+                headers.setdefault("X-ProcWise-Workflow-ID", workflow_id)
+                headers["X-ProcWise-Supplier-ID"] = supplier_id
+                headers["X-ProcWise-Round"] = str(round_number)
                 if mailbox_hint:
-                    headers.setdefault("X-Procwise-Mailbox", mailbox_hint)
+                    headers.setdefault("X-ProcWise-Mailbox", mailbox_hint)
                 draft["headers"] = {k: v for k, v in headers.items() if v is not None}
+
+                if not workflow_id or not unique_id or not supplier_id:
+                    raise ValueError(
+                        "EmailDraftingAgent requires workflow_id, unique_id, and supplier_id for header embedding"
+                    )
+
+                logger.info(
+                    "EmailDraftingAgent: embedded headers workflow=%s, supplier=%s, unique_id=%s, round=%s",
+                    workflow_id,
+                    supplier_id,
+                    unique_id,
+                    round_number,
+                )
 
                 thread_index = draft.get("thread_index")
                 if not isinstance(thread_index, int) or thread_index < 1:
