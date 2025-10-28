@@ -2206,7 +2206,27 @@ class SupplierInteractionAgent(BaseAgent):
         expected_dispatch_raw = context.input_data.get("expected_dispatch_count")
         if expected_dispatch_raw is None:
             expected_dispatch_raw = context.input_data.get("expected_email_count")
-        gating_actions_blocklist = {"poll", "monitor", "business_monitor", "await_workflow_batch"}
+        # These actions operate in legacy/stateless modes and should not flip the
+        # workflow lifecycle into an active supplier state.  The
+        # ``await_workflow_batch`` action, which represents the standard
+        # supplier-response collection flow, must still register lifecycle
+        # activity so downstream watchers can activate correctly.
+        gating_actions_blocklist = {"poll", "monitor", "business_monitor"}
+
+        workflow_hint = self._coerce_text(
+            context.input_data.get("workflow_id") or getattr(context, "workflow_id", None)
+        )
+        if workflow_hint and action not in {"poll", "monitor", "business_monitor"}:
+            try:
+                workflow_lifecycle_repo.record_supplier_agent_status(
+                    workflow_hint, "invoked"
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to record supplier agent lifecycle status for workflow=%s",
+                    workflow_hint,
+                    exc_info=True,
+                )
 
         workflow_hint = self._coerce_text(
             context.input_data.get("workflow_id") or getattr(context, "workflow_id", None)
