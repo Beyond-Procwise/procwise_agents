@@ -6,6 +6,7 @@ import calendar
 import email
 import hashlib
 import imaplib
+import json
 import logging
 import random
 import re
@@ -39,6 +40,7 @@ from utils.email_tracking import (
     extract_unique_id_from_headers,
 )
 from utils import email_tracking
+from services.event_bus import get_event_bus
 from services.supplier_response_coordinator import get_supplier_response_coordinator
 
 logger = logging.getLogger(__name__)
@@ -176,6 +178,8 @@ class WorkflowTracker:
     last_dispatched_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     last_response_at: Optional[datetime] = None
+    last_capture_at: Optional[datetime] = None
+    timeout_deadline: Optional[datetime] = None
     round_index: Dict[str, Optional[int]] = field(default_factory=dict)
     completion_logged: bool = False
     seen_message_ids: Set[str] = field(default_factory=set)
@@ -534,6 +538,27 @@ def _subject_hash(subject: Optional[str]) -> Optional[str]:
     return hashlib.sha1(normalised.encode("utf-8")).hexdigest()
 
 
+def _format_message_identifier(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (list, tuple)) and parsed:
+            first = parsed[0]
+            if isinstance(first, str):
+                text = first.strip()
+    text = text.strip("<>").strip()
+    if not text:
+        return None
+    return f"<{text}>"
+
+
 def _response_fingerprint(email: EmailResponse) -> Optional[str]:
     subject_norm = _normalise_subject_line(email.subject) or ""
     from_norm = _normalise_email_address(email.from_address) or ""
@@ -821,7 +846,7 @@ class EmailWatcherV2:
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.7,
+        match_threshold: float = 0.75,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,
@@ -833,6 +858,7 @@ class EmailWatcherV2:
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         max_total_wait_seconds: Optional[int] = None,
+        response_idle_timeout_seconds: int = 900,
     ) -> None:
         self.supplier_agent = supplier_agent
         self.negotiation_agent = negotiation_agent
@@ -850,6 +876,7 @@ class EmailWatcherV2:
         self._imap_login = imap_login
         self._sleep = sleep
         self._now = now
+        self.response_idle_timeout_seconds = max(1, int(response_idle_timeout_seconds))
         baseline_timeout = self.poll_interval_seconds * self.max_poll_attempts * 3
         derived_timeout = max(self.dispatch_wait_seconds, baseline_timeout)
         if max_total_wait_seconds is not None:
@@ -1023,6 +1050,112 @@ class EmailWatcherV2:
                 tracker.workflow_id,
             )
 
+    def _resolve_round(
+        self, tracker: WorkflowTracker, *, unique_id: Optional[str] = None
+    ) -> Optional[int]:
+        if unique_id:
+            return tracker.round_for_unique(unique_id)
+        rounds = tracker.distinct_rounds()
+        if len(rounds) == 1:
+            return rounds[0]
+        return None
+
+    def _log_event(
+        self,
+        event: str,
+        tracker: WorkflowTracker,
+        *,
+        round_override: Optional[int] = None,
+        **fields: Any,
+    ) -> None:
+        payload: Dict[str, Any] = {"event": event, "workflow_id": tracker.workflow_id}
+        round_value = round_override
+        if round_value is None:
+            round_value = self._resolve_round(tracker)
+        if round_value is not None:
+            payload["round"] = round_value
+
+        def _serialise(value: Any) -> Any:
+            if isinstance(value, datetime):
+                moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+                return moment.astimezone(timezone.utc).isoformat()
+            if isinstance(value, set):
+                return sorted(value)
+            return value
+
+        for key, value in fields.items():
+            if value is None:
+                continue
+            payload[key] = _serialise(value)
+
+        try:
+            logger.info(json.dumps(payload))
+        except TypeError:
+            safe_payload = {key: str(val) for key, val in payload.items()}
+            logger.info(json.dumps(safe_payload))
+
+    def _pending_unique_ids(self, tracker: WorkflowTracker) -> List[str]:
+        return sorted(
+            uid for uid in tracker.email_records if uid not in tracker.responded_unique_ids
+        )
+
+    def _pending_suppliers(
+        self, tracker: WorkflowTracker, pending_unique: Optional[Iterable[str]] = None
+    ) -> List[str]:
+        unique_ids = list(pending_unique) if pending_unique is not None else self._pending_unique_ids(tracker)
+        seen: Set[str] = set()
+        pending_suppliers: List[str] = []
+        for uid in unique_ids:
+            dispatch = tracker.latest_dispatch(uid)
+            supplier_id = dispatch.supplier_id if dispatch else None
+            if not supplier_id:
+                continue
+            if supplier_id in seen:
+                continue
+            seen.add(supplier_id)
+            pending_suppliers.append(supplier_id)
+        return pending_suppliers
+
+    def _update_idle_deadline(self, tracker: WorkflowTracker, capture_time: datetime) -> None:
+        moment = capture_time if capture_time.tzinfo else capture_time.replace(tzinfo=timezone.utc)
+        tracker.last_capture_at = moment
+        tracker.timeout_deadline = moment + timedelta(seconds=self.response_idle_timeout_seconds)
+
+    def _emit_timeout_event(
+        self,
+        tracker: WorkflowTracker,
+        *,
+        round_number: Optional[int],
+        pending_suppliers: Sequence[str],
+    ) -> None:
+        try:
+            bus = get_event_bus()
+        except Exception:
+            bus = None
+        payload = {
+            "workflow_id": tracker.workflow_id,
+            "round": round_number,
+            "pending_suppliers": list(pending_suppliers),
+            "expected_count": tracker.expected_responses,
+            "responses_received": tracker.responded_count,
+        }
+        if bus is not None:
+            try:
+                bus.publish("responses_timeout", payload)
+                scoped = f"responses_timeout:{tracker.workflow_id}:{round_number}" if round_number is not None else None
+                if scoped:
+                    bus.publish(scoped, payload)
+            except Exception:
+                logger.exception(
+                    "Failed to publish responses_timeout event workflow=%s", tracker.workflow_id
+                )
+        else:
+            logger.debug(
+                "Event bus unavailable when emitting responses_timeout workflow=%s",
+                tracker.workflow_id,
+            )
+
+
     def _round_fragment(
         self, tracker: WorkflowTracker, unique_id: Optional[str] = None
     ) -> str:
@@ -1097,7 +1230,7 @@ class EmailWatcherV2:
         self, tracker: WorkflowTracker, responses: Iterable[EmailResponse]
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
-        threshold = max(self.match_threshold, 0.7)
+        threshold = max(self.match_threshold, 0.75)
         for email in responses:
             message_id = email.message_id or ""
             fingerprint = _response_fingerprint(email)
@@ -1198,6 +1331,8 @@ class EmailWatcherV2:
                 tracker.seen_message_ids.add(message_id)
                 if fingerprint:
                     tracker.seen_fingerprints.add(fingerprint)
+                capture_time = self._now()
+                self._update_idle_deadline(tracker, capture_time)
                 logger.info(
                     "EmailWatcher captured supplier response workflow=%s%s responded=%d/%d elapsed=%.1fs matched_on=%s best_score=%.2f",
                     tracker.workflow_id,
@@ -1207,6 +1342,19 @@ class EmailWatcherV2:
                     elapsed,
                     best_reasons,
                     best_score,
+                )
+                supplier_id_value = email.supplier_id or best_dispatch.supplier_id
+                self._log_event(
+                    "response_captured",
+                    tracker,
+                    round_override=tracker.round_for_unique(matched_id),
+                    supplier_id=supplier_id_value,
+                    dispatch_id=matched_id,
+                    message_id=email.message_id,
+                    score=round(best_score, 4),
+                    matched_on=list(best_reasons),
+                    responses_received=tracker.responded_count,
+                    expected_count=tracker.expected_responses,
                 )
                 tracking_repo.mark_response(
                     workflow_id=tracker.workflow_id,
@@ -1219,7 +1367,17 @@ class EmailWatcherV2:
                     or _normalise_email_address(email.from_address)
                     or best_dispatch.supplier_email
                 )
-                supplier_id = email.supplier_id or best_dispatch.supplier_id
+                supplier_id = supplier_id_value
+                original_message_id_value = _format_message_identifier(
+                    best_dispatch.message_id
+                )
+                if not original_message_id_value:
+                    thread_candidates = list(email.in_reply_to) + list(email.references)
+                    for thread_id in thread_candidates:
+                        formatted = _format_message_identifier(thread_id)
+                        if formatted:
+                            original_message_id_value = formatted
+                            break
                 response_time: Optional[Decimal] = None
                 if best_dispatch.dispatched_at and email.received_at:
                     try:
@@ -1230,19 +1388,22 @@ class EmailWatcherV2:
                         response_time = None
                 structured = extract_structured_fields(email)
                 matched_decimal = _score_to_confidence(best_score)
+                plain_text = email.body_text or email.body
                 response_row = SupplierResponseRow(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
                     rfq_id=email.rfq_id or best_dispatch.rfq_id,
-                    response_text=email.body,
+                    response_text=plain_text or "",
+                    response_body=plain_text or "",
                     received_time=email.received_at,
                     response_time=response_time,
                     response_message_id=email.message_id,
                     response_subject=email.subject,
                     response_from=email.from_address,
-                    original_message_id=best_dispatch.message_id,
+                    round_number=tracker.round_for_unique(matched_id),
+                    original_message_id=original_message_id_value,
                     original_subject=best_dispatch.subject,
                     match_confidence=matched_decimal,
                     match_score=matched_decimal,
@@ -1250,6 +1411,8 @@ class EmailWatcherV2:
                     matched_on=best_reasons,
                     raw_headers=email.headers,
                     body_html=email.body_html,
+                    in_reply_to=list(email.in_reply_to),
+                    references=list(email.references),
                     price=structured.get("price"),
                     currency=structured.get("currency"),
                     lead_time=structured.get("lead_time_days"),
@@ -1291,7 +1454,7 @@ class EmailWatcherV2:
 
         lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id) or {}
         supplier_status = (lifecycle.get("supplier_agent_status") or "").strip().lower()
-        allowed_statuses = {"started", "invoked", "awaiting_responses", "running"}
+        allowed_statuses = {"awaiting_responses", "running"}
         if supplier_status not in allowed_statuses:
             logger.info(
                 "EmailWatcher deferring start until SupplierInteractionAgent is active workflow=%s status=%s",
@@ -1335,6 +1498,8 @@ class EmailWatcherV2:
         timeout_reached = False
         negotiation_stop = False
         stop_reason: Optional[str] = None
+        last_pending_unique: List[str] = []
+        last_pending_suppliers: List[str] = []
 
         try:
             watcher_start_at = self._now()
@@ -1351,6 +1516,21 @@ class EmailWatcherV2:
                 "watcher_active",
                 expected_responses=tracker.expected_responses,
                 received_responses=tracker.responded_count,
+            )
+
+            self._update_idle_deadline(tracker, watcher_start_at)
+            self._log_event(
+                "watcher_started",
+                tracker,
+                start_ts=watcher_start_at,
+                expected_count=tracker.expected_responses,
+                responses_received=tracker.responded_count,
+                uid_cursor=self._imap_last_seen_uid,
+            )
+
+            last_pending_unique = self._pending_unique_ids(tracker)
+            last_pending_suppliers = self._pending_suppliers(
+                tracker, last_pending_unique
             )
 
             if tracker.last_dispatched_at:
@@ -1417,6 +1597,41 @@ class EmailWatcherV2:
 
                 responses = self._fetch_emails(since_cursor)
                 matched_rows = self._match_responses(tracker, responses)
+                now_after_poll = self._now()
+                reference_capture = tracker.last_capture_at or watcher_start_at
+                if reference_capture is None:
+                    reference_capture = now_after_poll
+                if reference_capture.tzinfo is None:
+                    reference_capture = reference_capture.replace(tzinfo=timezone.utc)
+                since_last_capture = max(
+                    0.0, (now_after_poll - reference_capture).total_seconds()
+                )
+                pending_unique_ids = self._pending_unique_ids(tracker)
+                pending_suppliers = self._pending_suppliers(tracker, pending_unique_ids)
+                last_pending_unique = pending_unique_ids
+                last_pending_suppliers = pending_suppliers
+                timeout_deadline = tracker.timeout_deadline
+                self._log_event(
+                    "watcher_heartbeat",
+                    tracker,
+                    responded=tracker.responded_count,
+                    expected=tracker.expected_responses,
+                    pending_suppliers=pending_suppliers,
+                    since_last_capture_s=round(since_last_capture, 2),
+                    timeout_deadline=timeout_deadline,
+                )
+                if (
+                    tracker.expected_responses > tracker.responded_count
+                    and since_last_capture >= self.response_idle_timeout_seconds
+                ):
+                    timeout_reached = True
+                    stop_reason = "partial_timeout"
+                    self._emit_timeout_event(
+                        tracker,
+                        round_number=self._resolve_round(tracker),
+                        pending_suppliers=pending_suppliers,
+                    )
+                    break
                 if matched_rows:
                     workflow_lifecycle_repo.record_watcher_event(
                         workflow_id,
@@ -1484,6 +1699,14 @@ class EmailWatcherV2:
             negotiation_completed = negotiation_stop
 
             complete = tracker.all_responded or negotiation_completed
+            if stop_reason == "partial_timeout":
+                workflow_state = "partial_timeout"
+            elif negotiation_completed:
+                workflow_state = "negotiation_completed"
+            elif tracker.all_responded:
+                workflow_state = "responses_complete"
+            else:
+                workflow_state = "awaiting_responses"
             result = {
                 "workflow_id": workflow_id,
                 "complete": complete,
@@ -1494,12 +1717,24 @@ class EmailWatcherV2:
                 "expected_responses": tracker.expected_responses,
                 "elapsed_seconds": tracker.elapsed_seconds(self._now()),
                 "timeout_reached": timeout_reached,
-                "workflow_status": "negotiation_completed"
-                if negotiation_completed
-                else (
-                    "responses_complete" if tracker.all_responded else "awaiting_responses"
-                ),
+                "workflow_status": workflow_state,
+                "pending_unique_ids": list(last_pending_unique),
+                "pending_suppliers": list(last_pending_suppliers),
             }
+            if tracker.last_capture_at is not None:
+                capture_ts = (
+                    tracker.last_capture_at
+                    if tracker.last_capture_at.tzinfo
+                    else tracker.last_capture_at.replace(tzinfo=timezone.utc)
+                )
+                result["last_capture_ts"] = capture_ts.isoformat()
+            if tracker.timeout_deadline is not None:
+                deadline_ts = (
+                    tracker.timeout_deadline
+                    if tracker.timeout_deadline.tzinfo
+                    else tracker.timeout_deadline.replace(tzinfo=timezone.utc)
+                )
+                result["timeout_deadline"] = deadline_ts.isoformat()
 
             if not negotiation_completed:
                 self._process_agents(tracker)
@@ -1522,6 +1757,17 @@ class EmailWatcherV2:
                     stop_metadata["timeout_reached"] = True
                 if negotiation_stop:
                     stop_metadata["negotiation_completed"] = True
+                if last_pending_suppliers:
+                    stop_metadata["pending_suppliers"] = list(last_pending_suppliers)
+                self._log_event(
+                    "watcher_stopped",
+                    tracker,
+                    status="partial_timeout" if stop_reason == "partial_timeout" else "complete",
+                    responses_received=tracker.responded_count,
+                    expected=tracker.expected_responses,
+                    pending_suppliers=last_pending_suppliers,
+                    elapsed_s=runtime,
+                )
                 workflow_lifecycle_repo.record_watcher_event(
                     workflow_id,
                     "watcher_stopped",
@@ -1530,6 +1776,7 @@ class EmailWatcherV2:
                     runtime_seconds=runtime,
                     metadata=stop_metadata or None,
                 )
+            self._trackers.pop(workflow_id, None)
 
     def _process_agents(self, tracker: WorkflowTracker) -> None:
         if not tracker.all_dispatched or not tracker.all_responded:
