@@ -1,7 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import pytest
 
@@ -13,6 +13,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents.negotiation_agent import NegotiationAgent
+from repositories import supplier_response_repo
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 
 
@@ -1122,3 +1123,128 @@ def test_multi_round_routes_to_quote_evaluation_after_hitl(monkeypatch):
     quotes = output.data["final_quotes"]
     assert quotes
     assert {quote["supplier_id"] for quote in quotes} == {"S1", "S2"}
+
+
+def test_wait_for_round_responses_uses_repository(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    class StubSupplierAgent:
+        def wait_for_multiple_responses(self, *_, **__):
+            return []
+
+    monkeypatch.setattr(agent, "_get_supplier_agent", lambda: StubSupplierAgent())
+
+    captured: Dict[str, Any] = {}
+
+    def fake_fetch_for_unique_ids(
+        *, workflow_id: str, unique_ids: Sequence[str], supplier_ids: Sequence[str], include_processed: bool
+    ) -> List[Dict[str, Any]]:
+        captured["workflow_id"] = workflow_id
+        captured["unique_ids"] = tuple(unique_ids)
+        captured["supplier_ids"] = tuple(supplier_ids)
+        return [
+            {"supplier_id": "S1", "unique_id": "S1-thread", "message_id": "m1"},
+            {"supplier_id": "S2", "unique_id": "S2-thread", "message_id": "m2"},
+        ]
+
+    monkeypatch.setattr(
+        supplier_response_repo,
+        "fetch_for_unique_ids",
+        fake_fetch_for_unique_ids,
+    )
+
+    context = AgentContext(
+        workflow_id="wf-repo",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={},
+    )
+
+    round_result = {
+        "workflow_id": "wf-repo",
+        "drafts": [
+            {"supplier_id": "S1", "unique_id": "S1-thread"},
+            {"supplier_id": "S2", "unique_id": "S2-thread"},
+        ],
+    }
+
+    responses, all_received = agent._wait_for_round_responses(
+        context=context,
+        round_result=round_result,
+        round_num=1,
+        negotiation_state={"workflow_id": "wf-repo"},
+    )
+
+    assert all_received is True
+    assert set(responses) == {"S1", "S2"}
+    assert captured["workflow_id"] == "wf-repo"
+    assert set(captured["unique_ids"]) == {"S1-thread", "S2-thread"}
+
+
+def test_multi_round_reuses_unique_id_and_max_round(monkeypatch):
+    nick = DummyNick()
+    agent = NegotiationAgent(nick)
+
+    def fake_resolve(self, context, payload):
+        supplier = payload.get("supplier_id")
+        round_no = int(payload.get("round") or 1)
+        unique_id = f"{supplier}-thread"
+        data = {
+            "supplier": supplier,
+            "decision": {"strategy": "counter", "counter_price": 1000 - round_no},
+            "drafts": [
+                {
+                    "supplier_id": supplier,
+                    "unique_id": unique_id,
+                    "metadata": {"round": round_no},
+                }
+            ],
+            "draft_payload": {"unique_id": unique_id, "subject": "Re: Updated terms"},
+        }
+        return AgentOutput(status=AgentStatus.SUCCESS, data=data)
+
+    def fake_wait(self, context, round_result, round_num, negotiation_state):
+        responses: Dict[str, List[Dict[str, Any]]] = {}
+        for draft in round_result.get("drafts", []):
+            supplier_id = draft.get("supplier_id")
+            unique_id = draft.get("unique_id")
+            responses.setdefault(supplier_id, []).append(
+                {
+                    "supplier_id": supplier_id,
+                    "unique_id": unique_id,
+                    "message_id": f"{unique_id}-reply-{round_num}",
+                }
+            )
+        return responses, True
+
+    monkeypatch.setattr(NegotiationAgent, "_resolve_batch_entry_output", fake_resolve)
+    monkeypatch.setattr(NegotiationAgent, "_wait_for_round_responses", fake_wait)
+
+    context = AgentContext(
+        workflow_id="wf-unique",
+        agent_id="NegotiationAgent",
+        user_id="tester",
+        input_data={},
+    )
+
+    batch_entries = [{"supplier_id": "S1"}, {"supplier_id": "S2"}]
+    shared_context = {
+        "workflow_id": "wf-unique",
+        "hitl_decisions": {"1": "approved", "2": "approved"},
+    }
+
+    output = agent._run_multi_round_negotiation(
+        context,
+        batch_entries,
+        shared_context,
+        max_rounds=2,
+    )
+
+    assert output.data["total_rounds_executed"] == 2
+    drafts = output.data.get("all_drafts") or []
+    supplier_one_drafts = [draft for draft in drafts if draft.get("supplier_id") == "S1"]
+    assert len(supplier_one_drafts) == 2
+    assert {draft.get("unique_id") for draft in supplier_one_drafts} == {"S1-thread"}
+    assert output.data.get("ready_for_quote_evaluation") is True
+    assert "QuoteEvaluationAgent" in (output.next_agents or [])

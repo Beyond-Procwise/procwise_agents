@@ -601,6 +601,53 @@ def fetch_pending(
         return [_normalise_row(row) for row in rows]
 
 
+def fetch_for_unique_ids(
+    *,
+    workflow_id: str,
+    unique_ids: Sequence[str],
+    supplier_ids: Optional[Sequence[str]] = None,
+    include_processed: bool = False,
+) -> List[Dict[str, Any]]:
+    """Fetch supplier responses filtered by unique and supplier identifiers."""
+
+    identifiers = [uid for uid in unique_ids if uid]
+    supplier_filter = [sid for sid in (supplier_ids or []) if sid]
+
+    if not identifiers and not supplier_filter:
+        return []
+
+    filters = ["workflow_id=%s"]
+    params: List[Any] = [workflow_id]
+
+    if not include_processed:
+        filters.append("COALESCE(processed, FALSE)=FALSE")
+
+    if identifiers:
+        filters.append("unique_id = ANY(%s)")
+        params.append(identifiers)
+
+    if supplier_filter:
+        filters.append("supplier_id = ANY(%s)")
+        params.append(supplier_filter)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        q = (
+            "SELECT workflow_id, supplier_id, supplier_email, rfq_id, unique_id, response_text, response_body, body_html, "
+            "response_message_id, response_subject, response_from, response_date, original_message_id, "
+            "original_subject, match_confidence, match_score, match_evidence, matched_on, raw_headers, price, currency, "
+            "payment_terms, warranty, validity, exceptions, lead_time, response_time, received_time, tables, attachments, processed "
+            "FROM proc.supplier_response "
+            f"WHERE {' AND '.join(filters)}"
+        )
+        cur.execute(q, tuple(params))
+        cols = [c.name for c in cur.description]
+        rows = [dict(zip(cols, rec)) for rec in cur.fetchall()]
+        cur.close()
+
+    return [_normalise_row(row) for row in rows]
+
+
 def fetch_all(*, workflow_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
