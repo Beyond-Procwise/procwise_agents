@@ -10528,10 +10528,10 @@ class NegotiationAgent(BaseAgent):
             sender = getattr(self.agent_nick.settings, "ses_default_sender", None)
 
         headers: Dict[str, Any] = {
-            "X-Procwise-Unique-Id": unique_id,
+            "X-ProcWise-Unique-ID": unique_id,
         }
         if workflow_id:
-            headers["X-Procwise-Workflow-Id"] = workflow_id
+            headers["X-ProcWise-Workflow-ID"] = workflow_id
 
         metadata_payload = dict(metadata or {})
         metadata_payload.setdefault("unique_id", unique_id)
@@ -12517,7 +12517,9 @@ class NegotiationAgent(BaseAgent):
 
         unique_id = primary.get("unique_id") or metadata.get("unique_id")
         if not unique_id and isinstance(thread_headers, dict):
-            unique_id = thread_headers.get("X-Procwise-Unique-Id")
+            unique_id = thread_headers.get("X-ProcWise-Unique-ID") or thread_headers.get(
+                "X-Procwise-Unique-Id"
+            )
 
         message_id = primary.get("message_id") or headers.get("Message-ID")
 

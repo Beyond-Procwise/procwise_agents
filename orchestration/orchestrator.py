@@ -2509,8 +2509,8 @@ class WorkflowOrchestrator(_BaseWorkflowOrchestrator):
                 draft.action_id,
                 round_number=0,
                 headers={
-                    "X-Procwise-Unique-Id": draft.unique_id,
-                    "X-Procwise-Workflow-Id": self.workflow_id,
+                    "X-ProcWise-Unique-ID": draft.unique_id,
+                    "X-ProcWise-Workflow-ID": self.workflow_id,
                 },
             )
 

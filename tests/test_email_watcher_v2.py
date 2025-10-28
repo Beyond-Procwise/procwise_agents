@@ -548,10 +548,11 @@ def test_parse_email_recovers_tracking_headers():
     message["Subject"] = "Re: RFQ details"
     message["From"] = "Acme Quotes <quotes@acme.example>"
     message["To"] = "buyer@procwise.test"
-    message["X-Procwise-Unique-Id"] = "UID-HEADER12345"
-    message["X-Procwise-Workflow-Id"] = "wf-123"
-    message["X-Procwise-Supplier-Id"] = "sup-123"
-    message["X-Procwise-RFQ-ID"] = "RFQ-12345"
+    message["X-ProcWise-Unique-ID"] = "UID-HEADER12345"
+    message["X-ProcWise-Workflow-ID"] = "wf-123"
+    message["X-ProcWise-Supplier-ID"] = "sup-123"
+    message["X-ProcWise-RFQ-ID"] = "RFQ-12345"
+    message["X-ProcWise-Round"] = "0"
     message.set_content("Thank you for the opportunity")
 
     parsed = _parse_email(message.as_bytes())
@@ -560,6 +561,7 @@ def test_parse_email_recovers_tracking_headers():
     assert parsed.workflow_id == "wf-123"
     assert parsed.supplier_id == "sup-123"
     assert parsed.rfq_id == "RFQ-12345"
+    assert parsed.round_number == 0
 
 
 def test_parse_email_extracts_plain_and_html_bodies():

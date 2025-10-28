@@ -261,6 +261,7 @@ def extract_unique_id_from_headers(headers: Optional[Mapping[str, Any]]) -> Opti
         return None
 
     candidate_keys = (
+        "X-ProcWise-Unique-ID",
         "X-Procwise-Unique-Id",
         "X-Procwise-Unique-ID",
         "X-Procwise-Uid",
