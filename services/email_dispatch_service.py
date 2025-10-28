@@ -22,6 +22,7 @@ from repositories import draft_rfq_emails_repo, workflow_email_tracking_repo
 from .email_dispatch_chain_store import (
     record_dispatch as record_workflow_dispatch,
     register_dispatch as register_dispatch_chain,
+    mark_sent as mark_dispatch_chain_sent,
 )
 from .email_service import EmailService
 from .email_thread_store import (
@@ -257,6 +258,9 @@ class EmailDispatchService:
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
+            raw_thread_headers = dispatch_payload.get("thread_headers")
+            thread_headers = self._normalise_thread_headers(raw_thread_headers)
+
             headers = {
                 "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
                 "X-Procwise-Unique-Id": unique_id,
@@ -267,6 +271,9 @@ class EmailDispatchService:
                 headers["X-Procwise-Mailbox"] = mailbox_header
             if backend_metadata.get("supplier_id"):
                 headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
+
+            thread_header_values = self._extract_thread_header_values(thread_headers)
+            headers.update(thread_header_values)
 
             send_result = self.email_service.send_email(
                 subject,
@@ -301,6 +308,13 @@ class EmailDispatchService:
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
                 dispatch_payload["message_id"] = message_id
+                updated_thread_headers = self._augment_thread_headers(
+                    thread_headers,
+                    message_id,
+                )
+                if updated_thread_headers:
+                    backend_metadata["thread_headers"] = updated_thread_headers
+                    dispatch_payload["thread_headers"] = updated_thread_headers
                 logger.info(
                     "Dispatched supplier email workflow=%s unique_id=%s supplier=%s message_id=%s",
                     backend_metadata.get("workflow_id"),
@@ -386,6 +400,9 @@ class EmailDispatchService:
                         metadata_payload["workflow_email"] = True
 
                 should_record_workflow = bool(workflow_email_flag)
+                notified = False
+                notification_evaluated = False
+                should_notify_watcher = False
                 if should_record_workflow and workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
@@ -410,35 +427,85 @@ class EmailDispatchService:
                                 if dispatch_payload_context
                                 else None
                             ),
+                            thread_headers=updated_thread_headers,
                         )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
                             "Failed to record workflow email dispatch for workflow %s",
                             workflow_identifier,
                         )
+                        if notify_watcher:
+                            notification_evaluated = True
+                            should_notify_watcher = True
                     else:
                         if notify_watcher:
-                            if self._should_notify_watcher(
+                            notification_evaluated = True
+                            should_notify_watcher = self._should_notify_watcher(
                                 workflow_id=workflow_identifier,
                                 unique_id=unique_id,
                                 dispatch_context=dispatch_payload_context,
                                 dispatch_payload=dispatch_payload,
                                 backend_metadata=backend_metadata,
-                            ):
-                                try:
-                                    BackendScheduler.ensure(
-                                        self.agent_nick
-                                    ).notify_email_dispatch(workflow_identifier)
-                                except Exception:  # pragma: no cover - defensive logging
-                                    logger.exception(
-                                        "Failed to trigger email watcher for workflow %s",
-                                        workflow_identifier,
-                                    )
-                            else:
-                                self.logger.debug(
-                                    "Deferring email watcher notification for workflow %s until all dispatches complete",
+                            )
+
+                    if notify_watcher and notification_evaluated:
+                        if should_notify_watcher:
+                            try:
+                                BackendScheduler.ensure(
+                                    self.agent_nick
+                                ).notify_email_dispatch(workflow_identifier)
+                                notified = True
+                            except Exception:  # pragma: no cover - defensive logging
+                                logger.exception(
+                                    "Failed to trigger email watcher for workflow %s",
                                     workflow_identifier,
                                 )
+                        else:
+                            self.logger.debug(
+                                "Dispatch watcher notification deferred for workflow %s",
+                                workflow_identifier,
+                            )
+                try:
+                    mark_dispatch_chain_sent(
+                        workflow_identifier,
+                        str(
+                            backend_metadata.get("supplier_id")
+                            or draft.get("supplier_id")
+                            or ""
+                        )
+                        or None,
+                        unique_id,
+                        message_id,
+                        subject=subject,
+                        body=body,
+                        recipients=recipient_list,
+                        metadata=backend_metadata,
+                        thread_index=draft.get("thread_index"),
+                        connection=conn,
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception(
+                        "Failed to mark dispatch chain sent for workflow %s unique_id=%s",
+                        workflow_identifier,
+                        unique_id,
+                    )
+                if (
+                    notify_watcher
+                    and should_record_workflow
+                    and workflow_identifier
+                    and not notified
+                    and not notification_evaluated
+                ):
+                    try:
+                        BackendScheduler.ensure(self.agent_nick).notify_email_dispatch(
+                            workflow_identifier
+                        )
+                        notified = True
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to trigger email watcher after dispatch for workflow %s",
+                            workflow_identifier,
+                        )
             elif message_id:
                 dispatch_payload["message_id"] = message_id
 
@@ -1016,6 +1083,88 @@ class EmailDispatchService:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    @staticmethod
+    def _normalise_thread_headers(
+        payload: Optional[Mapping[str, Any]]
+    ) -> Optional[Dict[str, List[str]]]:
+        if not isinstance(payload, Mapping):
+            return None
+        normalised: Dict[str, List[str]] = {}
+        for key, value in payload.items():
+            if value in (None, "", [], {}, ()):  # ignore empty structures
+                continue
+            key_text = str(key).strip()
+            if not key_text:
+                continue
+            lower = key_text.lower()
+            if lower in {"message-id", "message_id"}:
+                canonical = "Message-ID"
+            elif lower in {"in-reply-to", "in_reply_to"}:
+                canonical = "In-Reply-To"
+            elif lower == "references":
+                canonical = "References"
+            else:
+                canonical = key_text
+
+            if isinstance(value, (list, tuple, set)):
+                items = [str(item).strip() for item in value if str(item).strip()]
+            else:
+                text = str(value).strip()
+                items = [text] if text else []
+
+            if not items:
+                continue
+            normalised[canonical] = items
+
+        return normalised or None
+
+    @staticmethod
+    def _extract_thread_header_values(
+        thread_headers: Optional[Dict[str, List[str]]]
+    ) -> Dict[str, str]:
+        if not thread_headers:
+            return {}
+        values: Dict[str, str] = {}
+        in_reply = thread_headers.get("In-Reply-To")
+        if in_reply:
+            candidate = in_reply[0] if isinstance(in_reply, list) else str(in_reply)
+            if candidate:
+                values["In-Reply-To"] = candidate
+        references = thread_headers.get("References")
+        if references:
+            if isinstance(references, list):
+                compact = [ref for ref in references if ref]
+                if compact:
+                    values["References"] = " ".join(compact)
+            else:
+                text = str(references).strip()
+                if text:
+                    values["References"] = text
+        return values
+
+    @staticmethod
+    def _augment_thread_headers(
+        thread_headers: Optional[Dict[str, List[str]]],
+        message_id: Optional[str],
+    ) -> Optional[Dict[str, List[str]]]:
+        headers: Dict[str, List[str]] = {}
+        if thread_headers:
+            for key, values in thread_headers.items():
+                if isinstance(values, list):
+                    cleaned = [str(item).strip() for item in values if str(item).strip()]
+                elif isinstance(values, (tuple, set)):
+                    cleaned = [str(item).strip() for item in values if str(item).strip()]
+                else:
+                    text = str(values).strip()
+                    cleaned = [text] if text else []
+                if cleaned:
+                    headers[key] = cleaned
+        if message_id:
+            trimmed = str(message_id).strip()
+            if trimmed:
+                headers["Message-ID"] = [trimmed]
+        return headers or None
 
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:
