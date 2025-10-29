@@ -551,6 +551,10 @@ class EmailWatcherService:
         if not workflow_key:
             return
 
+        self._preempt_existing_workflows(workflow_key)
+        if self._thread and self._thread.is_alive():
+            self.stop()
+            self.start()
         with self._forced_lock:
             self._forced_workflows.add(workflow_key)
         self._wake_event.set()
@@ -560,6 +564,52 @@ class EmailWatcherService:
             items = list(self._forced_workflows)
             self._forced_workflows.clear()
         return items
+
+    def _preempt_existing_workflows(self, new_workflow_id: str) -> None:
+        try:
+            active_workflows = workflow_email_tracking_repo.load_active_workflow_ids()
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to enumerate active workflows before preemption"
+            )
+            return
+
+        seen: Set[str] = set()
+        for workflow_id in active_workflows:
+            workflow_key = (workflow_id or "").strip()
+            if not workflow_key or workflow_key == new_workflow_id:
+                continue
+            if workflow_key in seen:
+                continue
+            seen.add(workflow_key)
+            try:
+                workflow_email_tracking_repo.reset_workflow(workflow_key)
+                workflow_lifecycle_repo.record_watcher_event(
+                    workflow_key,
+                    "watcher_stopped",
+                    expected_responses=0,
+                    received_responses=0,
+                    metadata={
+                        "stop_reason": "preempted_by_new_workflow",
+                        "preempted_by": new_workflow_id,
+                    },
+                )
+                logger.info(
+                    "EmailWatcherService preempted workflow=%s in favour of workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+            except Exception:
+                logger.exception(
+                    "EmailWatcherService failed to preempt workflow=%s before starting workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+        if seen:
+            with self._forced_lock:
+                self._forced_workflows = {
+                    wf for wf in self._forced_workflows if wf == new_workflow_id
+                }
 
     def _should_skip_workflow(self, workflow_id: str) -> bool:
         """Return ``True`` when ``workflow_id`` should not be processed."""

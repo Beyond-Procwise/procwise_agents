@@ -2403,7 +2403,7 @@ class EmailWatcherV2:
             idle_attempts = 0
             error_backoff = base_sleep
             error_backoff_cap = max(base_sleep, 300.0)
-            poll_started_at = self._now()
+            poll_started_at = watcher_start_at or self._now()
             baseline_since = tracker.last_dispatched_at or (poll_started_at - timedelta(hours=4))
             since_cursor = tracker.last_response_at or baseline_since
             if since_cursor.tzinfo is None:
