@@ -65,6 +65,17 @@ _WARRANTY_PATTERN = re.compile(r"warranty[^\n\.]*", re.IGNORECASE)
 _VALIDITY_PATTERN = re.compile(r"valid(?:ity)?[^\n\.]*", re.IGNORECASE)
 _EXCEPTION_PATTERN = re.compile(r"except(?:ion|ions)?[^\n\.]*", re.IGNORECASE)
 
+_PRIORITY_RECENT = 0
+_PRIORITY_WORKFLOW = 1
+_PRIORITY_GENERAL = 2
+_PRIORITY_FALLBACK = 3
+
+# Legacy constant names retained for backwards compatibility with running watcher threads.
+PRIORITY_RECENT = _PRIORITY_RECENT
+PRIORITY_WORKFLOW = _PRIORITY_WORKFLOW
+PRIORITY_GENERAL = _PRIORITY_GENERAL
+PRIORITY_FALLBACK = _PRIORITY_FALLBACK
+
 
 def _extract_price_fields(text: str) -> Tuple[Optional[Decimal], Optional[str]]:
     match = _PRICE_PATTERN.search(text)
@@ -135,10 +146,11 @@ class EmailDispatchRecord:
     workflow_id: Optional[str]
     unique_id: str
     dispatch_key: str
-    supplier_id: Optional[str]
-    supplier_email: Optional[str]
-    message_id: Optional[str]
-    subject: Optional[str]
+    supplier_id: Optional[str] = None
+    supplier_email: Optional[str] = None
+    recipient_emails: Sequence[str] = field(default_factory=tuple)
+    message_id: Optional[str] = None
+    subject: Optional[str] = None
     rfq_id: Optional[str] = None
     thread_headers: Dict[str, Sequence[str]] = field(default_factory=dict)
     dispatched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -798,8 +810,7 @@ def _default_fetcher(
     client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
-        candidate_uids: Set[int] = set()
-        unseen_uids: Set[int] = set()
+        candidate_priorities: Dict[int, int] = {}
         workflow_tokens: List[str] = []
         if workflow_ids:
             for token in workflow_ids:
@@ -810,7 +821,17 @@ def _default_fetcher(
                     workflow_tokens.append(text)
         mailbox_header = str(mailbox_filter).strip() if mailbox_filter else ""
 
-        def _search_uids(*terms: str, mark_unseen: bool = False) -> None:
+        def _register_candidate(uid_value: Optional[int], priority: int) -> None:
+            if uid_value in (None, 0):
+                return
+            uid = int(uid_value)
+            if uid <= 0:
+                return
+            existing = candidate_priorities.get(uid)
+            if existing is None or priority < existing:
+                candidate_priorities[uid] = priority
+
+        def _search_uids(priority: int, *terms: str) -> None:
             search_terms = list(terms)
             if mailbox_header:
                 search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
@@ -830,10 +851,7 @@ def _default_fetcher(
                 else:
                     token = str(part)
                 if token.isdigit():
-                    value = int(token)
-                    candidate_uids.add(value)
-                    if mark_unseen:
-                        unseen_uids.add(value)
+                    _register_candidate(int(token), priority)
 
         since_aware = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
         since_floor = since_aware - timedelta(seconds=max(0, backtrack_seconds))
@@ -842,23 +860,24 @@ def _default_fetcher(
         if workflow_tokens:
             for token in workflow_tokens:
                 _search_uids(
+                    _PRIORITY_RECENT,
                     "UNSEEN",
                     "SINCE",
                     since_str,
                     "HEADER",
                     "X-ProcWise-Workflow-ID",
                     token,
-                    mark_unseen=True,
                 )
         else:
-            _search_uids("UNSEEN", "SINCE", since_str, mark_unseen=True)
+            _search_uids(_PRIORITY_RECENT, "UNSEEN", "SINCE", since_str)
+
         if last_seen_uid is not None:
-            _search_uids(PRIORITY_RECENT, "UID", f"{last_seen_uid + 1}:*")
+            _search_uids(_PRIORITY_RECENT, "UID", f"{last_seen_uid + 1}:*")
 
         if workflow_tokens:
             for token in workflow_tokens:
                 _search_uids(
-                    PRIORITY_WORKFLOW,
+                    _PRIORITY_WORKFLOW,
                     "SINCE",
                     since_str,
                     "HEADER",
@@ -866,10 +885,10 @@ def _default_fetcher(
                     token,
                 )
 
-        _search_uids(PRIORITY_GENERAL, "SINCE", since_str)
+        _search_uids(_PRIORITY_GENERAL, "SINCE", since_str)
 
         if not candidate_priorities:
-            _search_uids(PRIORITY_FALLBACK, "ALL")
+            _search_uids(_PRIORITY_FALLBACK, "ALL")
 
         if not candidate_priorities:
             return [], last_seen_uid
@@ -877,13 +896,13 @@ def _default_fetcher(
         candidate_items = sorted(candidate_priorities.items())
         if max_uid_samples > 0 and len(candidate_items) > max_uid_samples:
             pinned = [
-                uid for uid, priority in candidate_items if priority <= PRIORITY_WORKFLOW
+                uid for uid, priority in candidate_items if priority <= _PRIORITY_WORKFLOW
             ]
             remaining_capacity = max_uid_samples - len(pinned)
             if remaining_capacity <= 0:
                 candidate_list = sorted(set(pinned))
             else:
-                others = [uid for uid, priority in candidate_items if priority > PRIORITY_WORKFLOW]
+                others = [uid for uid, priority in candidate_items if priority > _PRIORITY_WORKFLOW]
                 selected_tail = others[-remaining_capacity:] if remaining_capacity > 0 else []
                 candidate_list = sorted(set(pinned + selected_tail))
         else:
@@ -932,8 +951,8 @@ def _default_fetcher(
                 email_response.received_at = received_at
 
             if (
-                received_at
-                and uid_value not in unseen_uids
+                last_seen_uid is None
+                and received_at
                 and received_at < lower_bound
             ):
                 continue
@@ -990,6 +1009,7 @@ def _calculate_match_score(
     SUPPLIER_WEIGHT = 0.1
     ROUND_WEIGHT = 0.1
     THREAD_WEIGHT = 0.5
+    EMAIL_WEIGHT = 0.6
     SUBJECT_WEIGHT = 0.3
     SUBJECT_SIMILARITY_THRESHOLD = 0.6
 
@@ -1053,6 +1073,26 @@ def _calculate_match_score(
     if dispatch_supplier and dispatch_supplier in supplier_candidates:
         score += SUPPLIER_WEIGHT
         matched_on.append("supplier_id")
+
+    response_email = (
+        _normalise_email_address(email_response.from_address)
+        or _normalise_email_address(email_response.supplier_email)
+    )
+    if response_email:
+        dispatch_email_candidates: Set[str] = set()
+        dispatch_email = _normalise_email_address(dispatch.supplier_email)
+        if dispatch_email:
+            dispatch_email_candidates.add(dispatch_email)
+        for contact in getattr(dispatch, "recipient_emails", ()) or ():
+            normalised = _normalise_email_address(contact)
+            if normalised:
+                dispatch_email_candidates.add(normalised)
+        if dispatch_email_candidates and response_email in dispatch_email_candidates:
+            score += EMAIL_WEIGHT
+            if dispatch_email and response_email == dispatch_email:
+                matched_on.append("supplier_email")
+            else:
+                matched_on.append("recipient_email")
 
     dispatch_round = _coerce_round_number(dispatch.round_number)
     response_round = _coerce_round_number(email_response.round_number)
@@ -1289,6 +1329,20 @@ class EmailWatcherV2:
             raw_thread_headers = (
                 payload.get("thread_headers") if isinstance(payload.get("thread_headers"), dict) else {}
             )
+            recipient_emails: List[str] = []
+            raw_recipients = payload.get("recipients")
+            if isinstance(raw_recipients, (list, tuple, set)):
+                for entry in raw_recipients:
+                    if entry in (None, ""):
+                        continue
+                    text = str(entry).strip()
+                    if text:
+                        recipient_emails.append(text)
+            elif isinstance(raw_recipients, str):
+                text = raw_recipients.strip()
+                if text:
+                    recipient_emails.append(text)
+            recipient_emails_tuple: Tuple[str, ...] = tuple(dict.fromkeys(recipient_emails))
             if isinstance(dispatched_at, datetime):
                 dispatched_dt = dispatched_at if dispatched_at.tzinfo else dispatched_at.replace(tzinfo=timezone.utc)
             else:
@@ -1300,6 +1354,7 @@ class EmailWatcherV2:
                 dispatch_key=dispatch_key,
                 supplier_id=str(supplier_id) if supplier_id else None,
                 supplier_email=str(supplier_email) if supplier_email else None,
+                recipient_emails=recipient_emails_tuple,
                 message_id=str(message_id) if message_id else None,
                 subject=str(subject) if subject else None,
                 rfq_id=str(rfq_id) if rfq_id else None,
@@ -1317,6 +1372,7 @@ class EmailWatcherV2:
                     dispatch_key=dispatch_key,
                     supplier_id=record.supplier_id,
                     supplier_email=record.supplier_email,
+                    recipient_emails=list(recipient_emails_tuple) if recipient_emails_tuple else None,
                     message_id=record.message_id,
                     subject=record.subject,
                     dispatched_at=dispatched_dt,
@@ -1429,6 +1485,8 @@ class EmailWatcherV2:
         elif expected_total > 0:
             tracker.set_expected_responses(expected_total)
             if tracker.dispatched_count >= expected_total:
+                confirm_total = True
+            elif expected_from_drafts and tracker.dispatched_count == 0:
                 confirm_total = True
         else:
             # ``count_completed_supplier_dispatches`` filters out ``NULL`` supplier ids,
@@ -1639,13 +1697,10 @@ class EmailWatcherV2:
                     payload = self._fetcher(**fetch_kwargs)
                 except TypeError:
                     fallback_kwargs = {"since": since}
-                    if workflow_filters:
-                        fallback_kwargs["workflow_ids"] = list(
-                            dict.fromkeys(workflow_filters)
-                        )
-                    if mailbox_filter_value:
-                        fallback_kwargs["mailbox_filter"] = mailbox_filter_value
-                    payload = self._fetcher(**fallback_kwargs)
+                    try:
+                        payload = self._fetcher(**fallback_kwargs)
+                    except TypeError:
+                        payload = self._fetcher(since)
         else:
             if not all([self._imap_host, self._imap_username, self._imap_password]):
                 raise RuntimeError("IMAP credentials must be supplied when no custom fetcher is provided")
@@ -1676,6 +1731,7 @@ class EmailWatcherV2:
     ) -> List[SupplierResponseRow]:
         matched_rows: List[SupplierResponseRow] = []
         threshold = max(self.match_threshold, 0.75)
+        supplier_interaction_repo.init_schema()
         for email in responses:
             message_id_raw = email.message_id or ""
             message_id = message_id_raw.strip()
@@ -1734,6 +1790,8 @@ class EmailWatcherV2:
             best_reasons: List[str] = []
             match_details: Dict[str, Any] = {}
             for unique_id, dispatch_list in tracker.email_records.items():
+                if not dispatch_list:
+                    continue
                 dispatch = dispatch_list[-1]
                 if unique_id in tracker.matched_responses:
                     continue
@@ -1776,7 +1834,72 @@ class EmailWatcherV2:
                         best_score = max(best_score, self.match_threshold)
                         best_dispatch = tracker.latest_dispatch(matched_id)
                         best_reasons = _merge_reasons(best_reasons, "rfq")
-                        match_details.setdefault("rfq_match_candidates", len(rfq_candidates))
+                    match_details.setdefault("rfq_match_candidates", len(rfq_candidates))
+
+            if (
+                (not matched_id or best_score < self.match_threshold)
+                and email.workflow_id
+                and email.unique_id
+            ):
+                normalised_workflow = _normalise_identifier(email.workflow_id)
+                tracker_workflow = _normalise_identifier(tracker.workflow_id)
+                if normalised_workflow and tracker_workflow and normalised_workflow == tracker_workflow:
+                    placeholder_dispatch = tracker.latest_dispatch(email.unique_id)
+                    if placeholder_dispatch is None:
+                        dispatched_at = email.received_at or self._now()
+                        if dispatched_at.tzinfo is None:
+                            dispatched_at = dispatched_at.replace(tzinfo=timezone.utc)
+                        placeholder_dispatch = EmailDispatchRecord(
+                            workflow_id=tracker.workflow_id,
+                            unique_id=email.unique_id,
+                            dispatch_key=email.message_id or email.unique_id or uuid.uuid4().hex,
+                            supplier_id=email.supplier_id,
+                            supplier_email=email.supplier_email
+                            or _normalise_email_address(email.from_address),
+                            message_id=None,
+                            subject=email.subject,
+                            rfq_id=email.rfq_id,
+                            thread_headers={
+                                "in_reply_to": tuple(email.in_reply_to or ()),
+                                "references": tuple(email.references or ()),
+                            },
+                            dispatched_at=dispatched_at,
+                            round_number=email.round_number,
+                        )
+                        tracker.register_dispatches([placeholder_dispatch])
+                        try:
+                            tracking_repo.record_dispatches(
+                                workflow_id=tracker.workflow_id,
+                                dispatches=[
+                                    WorkflowDispatchRow(
+                                        workflow_id=tracker.workflow_id,
+                                        unique_id=email.unique_id,
+                                        dispatch_key=placeholder_dispatch.dispatch_key,
+                                        supplier_id=placeholder_dispatch.supplier_id,
+                                        supplier_email=placeholder_dispatch.supplier_email,
+                                        message_id=None,
+                                        subject=placeholder_dispatch.subject,
+                                        dispatched_at=dispatched_at,
+                                        thread_headers=placeholder_dispatch.thread_headers,
+                                    )
+                                ],
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to persist placeholder dispatch for workflow=%s unique_id=%s",
+                                tracker.workflow_id,
+                                email.unique_id,
+                            )
+                    if placeholder_dispatch:
+                        score, reasons = _calculate_match_score(
+                            placeholder_dispatch, email
+                        )
+                        if score >= self.match_threshold:
+                            matched_id = placeholder_dispatch.unique_id
+                            best_dispatch = placeholder_dispatch
+                            best_score = score
+                            best_reasons = _merge_reasons(best_reasons, *reasons)
+                            match_details["matcher"] = "placeholder"
 
             if (
                 (not matched_id or best_score < self.match_threshold)
@@ -2598,6 +2721,19 @@ class EmailWatcherV2:
                     runtime_seconds=runtime,
                     metadata=stop_metadata or None,
                 )
+                if stop_reason in {"partial_timeout", "timeout"}:
+                    try:
+                        workflow_email_tracking_repo.reset_workflow(workflow_id)
+                        logger.info(
+                            "EmailWatcher cleared pending dispatch records after %s for workflow=%s",
+                            stop_reason,
+                            workflow_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to clear workflow email tracking rows after timeout for workflow=%s",
+                            workflow_id,
+                        )
             self._trackers.pop(workflow_id, None)
 
     def _process_agents(self, tracker: WorkflowTracker) -> None:
@@ -3074,6 +3210,7 @@ class ContinuousEmailWatcher:
         dispatched_at = None
         rfq_id = None
         round_number = None
+        collected_recipients: List[str] = []
 
         if outbound_row:
             supplier_id = outbound_row.get("supplier_id") or supplier_id
@@ -3083,6 +3220,17 @@ class ContinuousEmailWatcher:
             dispatched_at = outbound_row.get("dispatched_at") or dispatched_at
             rfq_id = outbound_row.get("rfq_id") or rfq_id
             round_number = outbound_row.get("round_number")
+            raw_recipients = (
+                outbound_row.get("recipient_emails")
+                or outbound_row.get("recipients")
+                or outbound_row.get("recipient_email")
+            )
+            if isinstance(raw_recipients, (list, tuple, set)):
+                collected_recipients.extend(str(item).strip() for item in raw_recipients if str(item).strip())
+            elif isinstance(raw_recipients, str):
+                text = raw_recipients.strip()
+                if text:
+                    collected_recipients.append(text)
 
         if tracking_row is not None:
             supplier_id = tracking_row.supplier_id or supplier_id
@@ -3090,6 +3238,8 @@ class ContinuousEmailWatcher:
             message_id = tracking_row.message_id or message_id
             subject = tracking_row.subject or subject
             dispatched_at = tracking_row.dispatched_at or dispatched_at
+            if tracking_row.recipient_emails:
+                collected_recipients.extend(str(item).strip() for item in tracking_row.recipient_emails if str(item).strip())
 
         if dispatched_at is None:
             dispatched_at = self._now_fn()
@@ -3126,12 +3276,15 @@ class ContinuousEmailWatcher:
         if not unique_id:
             unique_id = str(dispatch_key)
 
+        recipient_set = tuple(dict.fromkeys(email for email in collected_recipients if email))
+
         return EmailDispatchRecord(
             workflow_id=workflow_id,
             unique_id=unique_id,
             dispatch_key=str(dispatch_key),
             supplier_id=str(supplier_id) if supplier_id else None,
             supplier_email=str(supplier_email) if supplier_email else None,
+            recipient_emails=recipient_set,
             message_id=str(message_id) if message_id else None,
             subject=str(subject) if subject else None,
             rfq_id=str(rfq_id) if rfq_id else None,

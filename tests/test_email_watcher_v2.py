@@ -421,11 +421,13 @@ def test_email_watcher_waits_for_all_drafted_suppliers_before_activation(monkeyp
     result = watcher.wait_and_collect_responses(workflow_id)
 
     assert result["complete"] is False
-    assert result["workflow_status"] == "awaiting_dispatch_confirmation"
+    assert result["workflow_status"] == "partial_timeout"
+    assert result["timeout_reached"] is True
     assert result["expected_responses"] == len(unique_ids)
     assert sorted(result["pending_unique_ids"]) == sorted(unique_ids)
     assert set(result["pending_suppliers"]) == set(supplier_map.values())
     assert dispatch_calls["count"] >= 1
+    assert workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id) == []
 
 
 def test_email_watcher_starts_even_when_supplier_agent_inactive():
@@ -1218,6 +1220,145 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     assert context.input_data.get("workflow_status") == "responses_complete"
     assert context.input_data.get("rfq_id") == rfq_identifier
     assert context.input_data.get("unique_id") == unique_id
+
+
+def test_email_watcher_matches_using_supplier_email_when_headers_missing():
+    workflow_id = "wf-email-fallback"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    supplier_agent = StubSupplierAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-email")
+    supplier_address = "direct@supplier.example"
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [
+            EmailResponse(
+                unique_id=None,
+                supplier_id=None,
+                supplier_email=None,
+                from_address=supplier_address,
+                message_id="<reply-email>",
+                subject="Re: Contract terms",
+                body="Please find our updated quote attached.",
+                received_at=now + timedelta(minutes=3),
+            )
+        ],
+        sleep=lambda _: None,
+        now=lambda: now,
+        match_threshold=0.8,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-email",
+                "supplier_email": supplier_address,
+                "recipients": [supplier_address],
+                "message_id": "<dispatch-email>",
+                "subject": "Contract terms",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(rows) == 1
+    assert rows[0]["unique_id"] == unique_id
+    assert rows[0]["response_message_id"] == "<reply-email>"
+
+
+def test_email_watcher_creates_placeholder_dispatch_when_metadata_present(monkeypatch):
+    workflow_id = "wf-placeholder"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    unique_id = generate_unique_email_id(workflow_id, "sup-meta")
+    supplier_id = "sup-meta"
+    now = datetime.now(timezone.utc)
+
+    def fake_draft_lookup(*, workflow_id: str, run_id=None):  # type: ignore[override]
+        assert workflow_id == "wf-placeholder"
+        return {unique_id}, {unique_id: supplier_id}, None
+
+    monkeypatch.setattr(
+        draft_rfq_emails_repo,
+        "expected_unique_ids_and_last_dispatch",
+        fake_draft_lookup,
+    )
+    monkeypatch.setattr(
+        email_dispatch_repo,
+        "count_completed_supplier_dispatches",
+        lambda workflow_id: 0,
+    )
+
+    response = EmailResponse(
+        unique_id=unique_id,
+        supplier_id=supplier_id,
+        supplier_email="sup-meta@example.com",
+        from_address="sup-meta@example.com",
+        message_id="<reply-placeholder>",
+        subject="Re: Negotiation Update",
+        body="Thank you for the update",
+        received_at=now + timedelta(minutes=5),
+        body_text="Thank you for the update",
+        workflow_id=workflow_id,
+        rfq_id=None,
+        headers={
+            "X-ProcWise-Unique-ID": (unique_id,),
+            "X-ProcWise-Workflow-ID": (workflow_id,),
+        },
+    )
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [response],
+        sleep=lambda _: None,
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert sorted(result["matched_responses"].keys()) == [unique_id]
+
+    rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(rows) == 1
+    assert rows[0]["unique_id"] == unique_id
+    assert rows[0]["response_message_id"] == "<reply-placeholder>"
+
+    tracking_rows = workflow_email_tracking_repo.load_workflow_rows(
+        workflow_id=workflow_id
+    )
+    assert tracking_rows, "Placeholder dispatch should be registered"
+    assert tracking_rows[0].unique_id == unique_id
+    assert tracking_rows[0].message_id is None
 
 
 def test_email_watcher_does_not_dedup_distinct_message_ids_with_same_fingerprint(tmp_path):
