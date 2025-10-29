@@ -1335,31 +1335,24 @@ class EmailWatcherV2:
             )
             dispatch_total = None
 
-        if expected_from_drafts:
-            tracker.set_expected_responses(expected_from_drafts)
-            if tracker.dispatched_count >= expected_from_drafts:
-                confirmed = True
-            elif dispatch_total is not None:
-                supplier_target = len(
-                    {sid for sid in tracker.expected_supplier_ids if sid}
-                )
-                if supplier_target <= 0:
-                    supplier_target = expected_from_drafts
-                confirmed = dispatch_total >= supplier_target
-        elif dispatch_total and dispatch_total > 0:
-            tracker.set_expected_responses(dispatch_total)
-            confirmed = True
+        fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
 
-        if not confirmed:
-            fallback = max(
-                len(tracker.expected_supplier_ids),
-                tracker.dispatched_count,
-                expected_from_drafts,
-            )
+        if expected_total is None:
             if fallback:
                 tracker.set_expected_responses(fallback)
-                if dispatch_total is None and expected_from_drafts == 0:
-                    confirmed = True
+                confirmed = True
+        elif expected_total > 0:
+            tracker.set_expected_responses(expected_total)
+            confirmed = True
+        else:
+            # ``count_completed_supplier_dispatches`` filters out ``NULL`` supplier ids,
+            # so workflows that dispatch emails without a supplier identifier (e.g. when
+            # the supplier agent is inactive) report ``0`` even though dispatches exist.
+            # Fall back to the tracker counts in that scenario so the watcher can move
+            # past the dispatch confirmation gate.
+            if fallback:
+                tracker.set_expected_responses(fallback)
+                confirmed = True
         return confirmed
 
     def _resolve_round(
