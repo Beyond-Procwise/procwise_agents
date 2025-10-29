@@ -15,12 +15,13 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html import escape
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from jinja2 import Template
 
@@ -33,6 +34,26 @@ from utils.instructions import parse_instruction_sources
 logger = logging.getLogger(__name__)
 
 configure_gpu()
+
+
+@dataclass
+class ThreadMessage:
+    """Represents a single email message inside a threaded conversation."""
+
+    author: str
+    body: str
+    timestamp: str
+    subject: Optional[str] = None
+
+
+@dataclass
+class SupplierDraftResult:
+    """Container used when generating supplier-specific drafts concurrently."""
+
+    index: int
+    supplier_id: Optional[str]
+    draft: Dict[str, Any]
+    supplier_thread_state: Dict[str, Any]
 
 
 SYSTEM_COMPOSE = (
@@ -706,6 +727,404 @@ class EmailDraftingAgent(BaseAgent):
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
 
         return cleaned.strip()
+
+    @staticmethod
+    def _detect_invocation_mode(context: AgentContext, data: Mapping[str, Any]) -> str:
+        """Determine whether the agent was called by the negotiation flow or directly."""
+
+        parent = getattr(context, "parent_agent", None)
+        if isinstance(parent, str) and "negotiationagent" in parent.lower():
+            return "negotiation"
+
+        trigger = data.get("invoked_by") if isinstance(data, Mapping) else None
+        if isinstance(trigger, str) and "negotiation" in trigger.lower():
+            return "negotiation"
+
+        return "independent"
+
+    @staticmethod
+    def _normalise_thread_state(raw_state: Any) -> Dict[str, Any]:
+        """Coerce ``raw_state`` into a predictable structure for thread tracking."""
+
+        if isinstance(raw_state, dict):
+            state = {key: value for key, value in raw_state.items() if value is not None}
+        else:
+            state = {}
+
+        suppliers = state.get("suppliers")
+        if not isinstance(suppliers, dict):
+            suppliers_map: Dict[str, Dict[str, Any]] = {}
+        else:
+            suppliers_map = {}
+            for key, value in suppliers.items():
+                supplier_key = str(key)
+                supplier_state: Dict[str, Any]
+                if isinstance(value, dict):
+                    supplier_state = {
+                        k: v for k, v in value.items() if v is not None
+                    }
+                    messages = supplier_state.get("messages")
+                    if isinstance(messages, list):
+                        supplier_state["messages"] = [
+                            message
+                            for message in messages
+                            if isinstance(message, dict) and message.get("body")
+                        ]
+                    else:
+                        supplier_state["messages"] = []
+                else:
+                    supplier_state = {"messages": []}
+                suppliers_map[supplier_key] = supplier_state
+
+        state["suppliers"] = suppliers_map
+        return state
+
+    @staticmethod
+    def _thread_supplier_key(supplier_id: Optional[Any]) -> str:
+        if supplier_id is None:
+            return "default"
+        try:
+            text = str(supplier_id).strip()
+        except Exception:
+            text = "default"
+        return text or "default"
+
+    def _apply_thread_state(
+        self,
+        *,
+        supplier_id: Optional[str],
+        subject: str,
+        base_body: str,
+        thread_state: Dict[str, Any],
+        author: str,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Update ``thread_state`` and return enriched body and subject."""
+
+        state = self._normalise_thread_state(thread_state)
+        supplier_key = self._thread_supplier_key(supplier_id)
+        supplier_state = dict(state.get("suppliers", {}).get(supplier_key, {}))
+        messages: List[Dict[str, Any]] = []
+
+        existing_messages = supplier_state.get("messages")
+        if isinstance(existing_messages, list):
+            messages = [
+                dict(entry)
+                for entry in existing_messages
+                if isinstance(entry, dict) and entry.get("body")
+            ]
+
+        timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        new_message = {
+            "author": author or "ProcWise",  # default identity
+            "body": base_body.strip(),
+            "timestamp": timestamp,
+            "subject": subject,
+        }
+
+        if messages and messages[-1].get("body") == new_message["body"]:
+            messages[-1].update(new_message)
+        else:
+            messages.append(new_message)
+
+        supplier_state["messages"] = messages
+        supplier_state["last_subject"] = subject
+        supplier_state["last_updated"] = timestamp
+
+        history_blocks: List[str] = []
+        if len(messages) > 1:
+            previous_messages = messages[:-1]
+            previous_messages.sort(
+                key=lambda entry: entry.get("timestamp") or "",
+            )
+            for entry in previous_messages:
+                entry_body = entry.get("body") or ""
+                entry_author = entry.get("author") or "Supplier"
+                entry_timestamp = entry.get("timestamp") or ""
+                history_header = (
+                    f"On {entry_timestamp}, {entry_author} wrote:".strip()
+                )
+                history_segment = "\n".join(
+                    part for part in [history_header, entry_body.strip()] if part
+                )
+                if history_segment:
+                    history_blocks.append(history_segment)
+
+        final_body = base_body.strip()
+        final_subject = subject
+        if history_blocks:
+            history_text = "\n\n---\n".join(history_blocks)
+            final_body = (
+                f"{final_body}\n\n--- Previous Conversation ---\n{history_text}"
+            )
+            if subject and not subject.lower().startswith("re:"):
+                final_subject = f"RE: {subject}"
+
+        suppliers_map = dict(state.get("suppliers", {}))
+        suppliers_map[supplier_key] = supplier_state
+        state["suppliers"] = suppliers_map
+        state["updated_at"] = timestamp
+
+        return final_body, final_subject, state
+
+    def _render_supplier_draft(
+        self,
+        *,
+        supplier: Dict[str, Any],
+        index: int,
+        workflow_id: str,
+        data: Dict[str, Any],
+        supplier_profiles: Dict[str, Any],
+        base_body_template: Any,
+        subject_template_source: Optional[str],
+        include_rfq_table: bool,
+        additional_section_html: str,
+        compliance_section_html: str,
+        instruction_suffix: str,
+        negotiation_section_html: str,
+        negotiation_message: Optional[str],
+        instruction_settings: Dict[str, Any],
+        default_action_id: Optional[str],
+        negotiation_message_plain: Optional[str],
+        base_thread_state: Dict[str, Any],
+        resolve_action_id: Callable[[Optional[Dict[str, Any]]], Optional[str]],
+        sender_email: str,
+    ) -> SupplierDraftResult:
+        """Render a single supplier draft returning the draft and updated thread state."""
+
+        supplier_id = supplier.get("supplier_id")
+        supplier_name = supplier.get("supplier_name", supplier_id)
+        unique_id = self._generate_unique_identifier(workflow_id, supplier_id)
+
+        profile = (
+            supplier_profiles.get(str(supplier_id))
+            if supplier_id is not None
+            else {}
+        )
+        if profile is None:
+            profile = {}
+
+        sender_name, sender_title = self._derive_sender_identity(
+            sender_email, data.get("sender_title")
+        )
+
+        fmt_args = {
+            "supplier_contact_name": supplier.get("contact_name")
+            or supplier_name
+            or "Supplier",
+            "supplier_company": supplier_name or supplier_id or "",
+            "supplier_contact_email": supplier.get("contact_email", ""),
+            "deadline": data.get("deadline")
+            or data.get("submission_deadline", ""),
+            "category_manager_name": data.get("category_manager_name", ""),
+            "category_manager_title": data.get("category_manager_title", ""),
+            "category_manager_email": data.get("category_manager_email", ""),
+            "your_name": sender_name,
+            "your_title": sender_title,
+            "your_company": data.get("your_company", "ProcWise"),
+        }
+        for key, value in list(fmt_args.items()):
+            fmt_args[f"{key}_html"] = self._format_plain_text(value)
+
+        body_template = base_body_template or self.TEXT_TEMPLATE
+        contextual_args = self._build_template_args(
+            supplier,
+            profile,
+            fmt_args,
+            data,
+            include_rfq_table=include_rfq_table,
+        )
+        template_args = {**data, **fmt_args, **contextual_args}
+        template_args.update(
+            {
+                "unique_id": unique_id,
+                "additional_paragraph_html": additional_section_html,
+                "compliance_notice_html": compliance_section_html,
+                "negotiation_message_html": negotiation_section_html,
+            }
+        )
+        if negotiation_message:
+            template_args["negotiation_message"] = negotiation_message
+
+        interaction_type = self._determine_interaction_type(
+            data, instruction_settings
+        )
+        template_args["interaction_type"] = interaction_type
+
+        dynamic_meta = {
+            "interaction_type": interaction_type,
+            "instructions": instruction_settings,
+            "tone": instruction_settings.get("tone") or data.get("tone"),
+            "call_to_action": instruction_settings.get("call_to_action"),
+            "context_note": instruction_settings.get("context_note"),
+        }
+        if negotiation_message:
+            dynamic_meta["negotiation_message"] = negotiation_message
+
+        if self._should_auto_compose(body_template, instruction_settings, data):
+            rendered = self._render_dynamic_body(
+                supplier,
+                profile,
+                template_args,
+                data,
+                dynamic_meta,
+                include_rfq_table=include_rfq_table,
+            )
+        else:
+            rendered = self._render_template_string(body_template, template_args)
+
+        comment, message = self._split_existing_comment(rendered)
+        message_content = message if comment else rendered
+        appended_sections: List[str] = []
+        if additional_section_html and additional_section_html not in message_content:
+            appended_sections.append(additional_section_html)
+        if compliance_section_html and compliance_section_html not in message_content:
+            appended_sections.append(compliance_section_html)
+        if appended_sections:
+            message_content = f"{message_content}{''.join(appended_sections)}"
+        elif instruction_suffix and instruction_suffix not in message_content:
+            message_content = f"{message_content}{instruction_suffix}"
+
+        content = self._sanitise_generated_body(message_content)
+        if negotiation_section_html and negotiation_section_html not in content:
+            content = f"{content}{negotiation_section_html}"
+        body = self._clean_body_text(content)
+
+        body, marker_token = attach_hidden_marker(
+            body,
+            supplier_id=supplier_id,
+            unique_id=unique_id,
+        )
+
+        if subject_template_source:
+            subject_args = dict(template_args)
+            subject_args.setdefault("unique_id", unique_id)
+            rendered_subject = self._render_template_string(
+                subject_template_source, subject_args
+            )
+            subject = self._clean_subject_text(
+                self._normalise_subject_line(rendered_subject, unique_id),
+                DEFAULT_RFQ_SUBJECT,
+            )
+        else:
+            subject = self._clean_subject_text(None, DEFAULT_RFQ_SUBJECT)
+
+        draft_action_id = resolve_action_id(supplier) or default_action_id
+
+        receiver = self._resolve_receiver(supplier, profile)
+        recipients: List[str] = []
+        if receiver:
+            recipients = self._normalise_recipients([receiver])
+        if recipients:
+            receiver = recipients[0]
+        contact_level = 1 if recipients else 0
+
+        internal_context = {}
+        if isinstance(dynamic_meta.get("internal_context"), dict):
+            internal_context = {
+                key: value
+                for key, value in dynamic_meta["internal_context"].items()
+                if value
+            }
+        if not internal_context:
+            fallback_context = self._build_supplier_personalisation(
+                supplier,
+                profile,
+                template_args,
+                data,
+                instruction_settings,
+                interaction_type,
+            )
+            if fallback_context:
+                internal_context = {
+                    "supplier_context_html": fallback_context,
+                    "supplier_context_text": self._html_to_plain_text(
+                        fallback_context
+                    ),
+                }
+
+        base_thread_state_supplier = {}
+        supplier_key = self._thread_supplier_key(supplier_id)
+        if isinstance(base_thread_state.get("suppliers"), dict):
+            existing_state = base_thread_state["suppliers"].get(supplier_key)
+            if isinstance(existing_state, dict):
+                base_thread_state_supplier = dict(existing_state)
+
+        enriched_body, enriched_subject, updated_state = self._apply_thread_state(
+            supplier_id=supplier_id,
+            subject=subject,
+            base_body=body,
+            thread_state={"suppliers": {supplier_key: base_thread_state_supplier}},
+            author=data.get("author") or sender_name,
+        )
+
+        body = enriched_body
+        subject = enriched_subject
+
+        draft = {
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "subject": subject,
+            "body": body,
+            "sent_status": False,
+            "sender": sender_email,
+            "action_id": draft_action_id,
+            "supplier_profile": profile,
+            "receiver": receiver,
+            "contact_level": contact_level,
+            "recipients": recipients,
+            "unique_id": unique_id,
+            "workflow_id": workflow_id,
+            "draft_id": unique_id,
+        }
+        if draft_action_id:
+            draft["action_id"] = draft_action_id
+        draft.setdefault("thread_index", 1)
+
+        metadata: Dict[str, Any] = {
+            "unique_id": unique_id,
+            "interaction_type": interaction_type,
+            "workflow_id": workflow_id,
+        }
+        if supplier_id is not None:
+            metadata["supplier_id"] = supplier_id
+        if supplier_name:
+            metadata["supplier_name"] = supplier_name
+        if internal_context:
+            metadata["internal_context"] = internal_context
+        if marker_token:
+            metadata["dispatch_token"] = marker_token
+        if negotiation_message_plain:
+            metadata.setdefault("negotiation_message", negotiation_message_plain)
+
+        draft["metadata"] = metadata
+
+        supplier_state = updated_state.get("suppliers", {}).get(supplier_key, {})
+        supplier_state = dict(supplier_state) if isinstance(supplier_state, dict) else {}
+
+        return SupplierDraftResult(
+            index=index,
+            supplier_id=self._coerce_text(supplier_id),
+            draft=draft,
+            supplier_thread_state=supplier_state,
+        )
+
+    def _determine_parallel_workers(self, supplier_count: int) -> int:
+        if supplier_count <= 1:
+            return 1
+
+        configured = 0
+        try:
+            raw_value = os.getenv("EMAIL_DRAFTING_WORKERS")
+            if raw_value:
+                configured = int(raw_value)
+        except Exception:
+            configured = 0
+
+        if configured > 0:
+            return max(1, min(configured, supplier_count))
+
+        cpu_default = os.cpu_count() or 4
+        return max(1, min(cpu_default, supplier_count))
 
     def __init__(self, agent_nick=None):
         agent_nick = self._prepare_agent_nick(agent_nick)
@@ -3055,6 +3474,27 @@ class EmailDraftingAgent(BaseAgent):
         if isinstance(prev, dict):
             data = {**prev, **data}
 
+        invocation_mode = self._detect_invocation_mode(context, data)
+        if invocation_mode == "negotiation":
+            negotiation_payload: Optional[Dict[str, Any]] = None
+            for key in ("negotiation_context", "negotiation"):
+                candidate = data.get(key)
+                if isinstance(candidate, dict):
+                    negotiation_payload = candidate
+                    break
+            if negotiation_payload is None and isinstance(context.input_data, dict):
+                candidate = context.input_data.get("negotiation_context")
+                if isinstance(candidate, dict):
+                    negotiation_payload = candidate
+            if negotiation_payload:
+                data.setdefault("negotiation", negotiation_payload)
+        else:
+            data.pop("negotiation", None)
+            data.pop("negotiation_context", None)
+
+        thread_state_input = data.get("email_thread_state")
+        thread_state_root = self._normalise_thread_state(thread_state_input)
+
         decision_payload = data.get("decision")
         thread_headers_payload = data.get("thread_headers")
         if isinstance(thread_headers_payload, dict):
@@ -3128,7 +3568,22 @@ class EmailDraftingAgent(BaseAgent):
         if isinstance(intent_value, str) and intent_value.upper() == "NEGOTIATION_COUNTER":
             return self._handle_negotiation_counter(context, data)
 
-        ranking = data.get("ranking", [])
+        ranking_input = data.get("ranking")
+        if isinstance(ranking_input, list):
+            ranking = [entry for entry in ranking_input if isinstance(entry, dict)]
+        elif isinstance(ranking_input, (tuple, set)):
+            ranking = [
+                entry for entry in ranking_input if isinstance(entry, dict)
+            ]
+        else:
+            ranking = []
+
+        if not ranking:
+            supplier_info = data.get("supplier_information")
+            if isinstance(supplier_info, list):
+                ranking = [
+                    entry for entry in supplier_info if isinstance(entry, dict)
+                ]
         findings = data.get("findings", [])
         supplier_profiles = (
             data.get("supplier_profiles") if isinstance(data.get("supplier_profiles"), dict) else {}
@@ -3251,189 +3706,67 @@ class EmailDraftingAgent(BaseAgent):
         if not workflow_id:
             workflow_id = f"WF-{uuid.uuid4().hex[:16]}"
 
-        for supplier in ranking:
-            supplier_id = supplier.get("supplier_id")
-            supplier_name = supplier.get("supplier_name", supplier_id)
-            unique_id = self._generate_unique_identifier(workflow_id, supplier_id)
+        ranking_enumerated = list(enumerate(ranking))
+        supplier_results: List[SupplierDraftResult] = []
+        draft_supplier_map: Dict[str, Optional[str]] = {}
+        if ranking_enumerated:
+            max_workers = self._determine_parallel_workers(len(ranking_enumerated))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._render_supplier_draft,
+                        supplier=supplier,
+                        index=index,
+                        workflow_id=workflow_id,
+                        data=data,
+                        supplier_profiles=supplier_profiles,
+                        base_body_template=base_body_template,
+                        subject_template_source=subject_template_source,
+                        include_rfq_table=include_rfq_table,
+                        additional_section_html=additional_section_html,
+                        compliance_section_html=compliance_section_html,
+                        instruction_suffix=instruction_suffix,
+                        negotiation_section_html=negotiation_section_html,
+                        negotiation_message=negotiation_message,
+                        instruction_settings=instruction_settings,
+                        default_action_id=default_action_id,
+                        negotiation_message_plain=negotiation_message,
+                        base_thread_state=thread_state_root,
+                        resolve_action_id=_resolve_action_id,
+                        sender_email=self.agent_nick.settings.ses_default_sender,
+                    )
+                    for index, supplier in ranking_enumerated
+                ]
 
-            profile = supplier_profiles.get(str(supplier_id)) if supplier_id is not None else {}
-            if profile is None:
-                profile = {}
+                for future in as_completed(futures):
+                    try:
+                        supplier_results.append(future.result())
+                    except Exception:
+                        logger.exception("EmailDraftingAgent failed to build supplier draft")
 
-            sender_email = self.agent_nick.settings.ses_default_sender
-            sender_name, sender_title = self._derive_sender_identity(
-                sender_email, data.get("sender_title")
-            )
+            supplier_results.sort(key=lambda result: result.index)
 
-            fmt_args = {
-                "supplier_contact_name": supplier.get("contact_name")
-                or supplier_name
-                or "Supplier",
-                "supplier_company": supplier_name or supplier_id or "",
-                "supplier_contact_email": supplier.get("contact_email", ""),
-                "deadline": data.get("deadline")
-                or data.get("submission_deadline", ""),
-                "category_manager_name": data.get("category_manager_name", ""),
-                "category_manager_title": data.get("category_manager_title", ""),
-                "category_manager_email": data.get("category_manager_email", ""),
-                "your_name": sender_name,
-                "your_title": sender_title,
-                "your_company": data.get("your_company", "ProcWise"),
-            }
-            for key, value in list(fmt_args.items()):
-                fmt_args[f"{key}_html"] = self._format_plain_text(value)
-            body_template = base_body_template or self.TEXT_TEMPLATE
-            contextual_args = self._build_template_args(
-                supplier,
-                profile,
-                fmt_args,
-                data,
-                include_rfq_table=include_rfq_table,
-            )
-            template_args = {**data, **fmt_args, **contextual_args}
-            template_args.update(
-                {
-                    "unique_id": unique_id,
-                    "additional_paragraph_html": additional_section_html,
-                    "compliance_notice_html": compliance_section_html,
-                    "negotiation_message_html": negotiation_section_html,
-                }
-            )
-            if negotiation_message:
-                template_args["negotiation_message"] = negotiation_message
-            interaction_type = self._determine_interaction_type(data, instruction_settings)
-            template_args["interaction_type"] = interaction_type
-            dynamic_meta = {
-                "interaction_type": interaction_type,
-                "instructions": instruction_settings,
-                "tone": instruction_settings.get("tone") or data.get("tone"),
-                "call_to_action": instruction_settings.get("call_to_action"),
-                "context_note": instruction_settings.get("context_note"),
-            }
-            if negotiation_message:
-                dynamic_meta["negotiation_message"] = negotiation_message
+            aggregated_suppliers_state = dict(thread_state_root.get("suppliers", {}))
 
-            rendered = None
-            if self._should_auto_compose(
-                body_template, instruction_settings, data
-            ):
-                rendered = self._render_dynamic_body(
-                    supplier,
-                    profile,
-                    template_args,
-                    data,
-                    dynamic_meta,
-                    include_rfq_table=include_rfq_table,
+            for result in supplier_results:
+                draft = self._apply_workflow_context(
+                    result.draft, context, source_payload=data
                 )
-            else:
-                rendered = self._render_template_string(body_template, template_args)
-
-            comment, message = self._split_existing_comment(rendered)
-            message_content = message if comment else rendered
-            appended_sections: List[str] = []
-            if additional_section_html and additional_section_html not in message_content:
-                appended_sections.append(additional_section_html)
-            if compliance_section_html and compliance_section_html not in message_content:
-                appended_sections.append(compliance_section_html)
-            if appended_sections:
-                message_content = f"{message_content}{''.join(appended_sections)}"
-            elif instruction_suffix and instruction_suffix not in message_content:
-                message_content = f"{message_content}{instruction_suffix}"
-
-            content = self._sanitise_generated_body(message_content)
-            if negotiation_section_html and negotiation_section_html not in content:
-                content = f"{content}{negotiation_section_html}"
-            body = self._clean_body_text(content)
-            body, marker_token = attach_hidden_marker(
-                body,
-                supplier_id=supplier_id,
-                unique_id=unique_id,
-            )
-            if subject_template_source:
-                subject_args = dict(template_args)
-                subject_args.setdefault("unique_id", unique_id)
-                rendered_subject = self._render_template_string(
-                    subject_template_source, subject_args
+                drafts.append(draft)
+                draft_supplier_map[draft.get("draft_id") or draft.get("unique_id") or ""] = (
+                    result.supplier_id
                 )
-                subject = self._clean_subject_text(
-                    self._normalise_subject_line(rendered_subject, unique_id),
-                    DEFAULT_RFQ_SUBJECT,
+                supplier_key = self._thread_supplier_key(result.supplier_id)
+                aggregated_suppliers_state[supplier_key] = result.supplier_thread_state
+                self._store_draft(draft)
+                logger.debug(
+                    "EmailDraftingAgent created draft %s for supplier %s",
+                    draft.get("unique_id"),
+                    result.supplier_id,
                 )
-            else:
-                subject = self._clean_subject_text(None, DEFAULT_RFQ_SUBJECT)
 
-            draft_action_id = _resolve_action_id(supplier) or default_action_id
-
-            receiver = self._resolve_receiver(supplier, profile)
-            recipients: List[str] = []
-            if receiver:
-                recipients = self._normalise_recipients([receiver])
-            if recipients:
-                receiver = recipients[0]
-            contact_level = 1 if recipients else 0
-
-            internal_context = {}
-            if isinstance(dynamic_meta.get("internal_context"), dict):
-                internal_context = {
-                    key: value
-                    for key, value in dynamic_meta["internal_context"].items()
-                    if value
-                }
-            if not internal_context:
-                fallback_context = self._build_supplier_personalisation(
-                    supplier,
-                    profile,
-                    template_args,
-                    data,
-                    instruction_settings,
-                    interaction_type,
-                )
-                if fallback_context:
-                    internal_context = {
-                        "supplier_context_html": fallback_context,
-                        "supplier_context_text": self._html_to_plain_text(
-                            fallback_context
-                        ),
-                    }
-
-            draft = {
-                "supplier_id": supplier_id,
-                "supplier_name": supplier_name,
-                "subject": subject,
-                "body": body,
-                "sent_status": False,
-                "sender": self.agent_nick.settings.ses_default_sender,
-                "action_id": draft_action_id,
-                "supplier_profile": profile,
-                "receiver": receiver,
-                "contact_level": contact_level,
-                "recipients": recipients,
-                "unique_id": unique_id,
-                "workflow_id": workflow_id,
-            }
-            if draft_action_id:
-                draft["action_id"] = draft_action_id
-            draft.setdefault("thread_index", 1)
-            metadata: Dict[str, Any] = {
-                "unique_id": unique_id,
-                "interaction_type": interaction_type,
-                "workflow_id": workflow_id,
-            }
-            if supplier_id is not None:
-                metadata["supplier_id"] = supplier_id
-            if supplier_name:
-                metadata["supplier_name"] = supplier_name
-            if internal_context:
-                metadata["internal_context"] = internal_context
-            if marker_token:
-                metadata["dispatch_token"] = marker_token
-            draft["metadata"] = metadata
-            draft = self._apply_workflow_context(draft, context, source_payload=data)
-            drafts.append(draft)
-            self._store_draft(draft)
-            logger.debug(
-                "EmailDraftingAgent created draft %s for supplier %s", unique_id, supplier_id
-            )
+            thread_state_root["suppliers"] = aggregated_suppliers_state
+            thread_state_root["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         if manual_recipients and manual_has_body:
             manual_comment, manual_message = self._split_existing_comment(manual_body_input)
@@ -3488,9 +3821,17 @@ class EmailDraftingAgent(BaseAgent):
             )
             drafts.append(manual_draft)
             self._store_draft(manual_draft)
+            if manual_unique_id:
+                draft_supplier_map.setdefault(manual_unique_id, None)
 
         logger.info("EmailDraftingAgent generated %d drafts", len(drafts))
         output_data: Dict[str, Any] = {"drafts": drafts, "prompt": self.prompt_template}
+        if thread_state_root:
+            output_data["email_thread_state"] = thread_state_root
+        if draft_supplier_map:
+            output_data["draft_supplier_map"] = {
+                key: value for key, value in draft_supplier_map.items() if key
+            }
         if manual_subject_rendered is not None:
             output_data["subject"] = manual_subject_rendered
         if manual_body_rendered is not None:
@@ -3519,6 +3860,12 @@ class EmailDraftingAgent(BaseAgent):
             pass_fields["body"] = manual_body_rendered
         if manual_recipients:
             pass_fields["recipients"] = manual_recipients
+        if draft_supplier_map:
+            pass_fields["draft_supplier_map"] = {
+                key: value for key, value in draft_supplier_map.items() if key
+            }
+        if thread_state_root:
+            pass_fields["email_thread_state"] = thread_state_root
 
         self._record_learning_events(context, drafts, data)
 

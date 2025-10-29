@@ -316,6 +316,33 @@ class EmailWatcherAgent(BaseAgent):
         threshold = float(payload.get("match_threshold") or 0.65)
         skip_barrier = bool(payload.get("skip_dispatch_barrier"))
 
+        agents_registry = getattr(self.agent_nick, "agents", {})
+        supplier_agent_active = bool(
+            payload.get("supplier_interaction_active")
+            or (
+                isinstance(agents_registry, dict)
+                and "SupplierInteractionAgent" in agents_registry
+            )
+        )
+        if not supplier_agent_active:
+            logger.info(
+                "EmailWatcherAgent skipped for workflow=%s because SupplierInteractionAgent is inactive",
+                workflow_id,
+            )
+            return self._with_plan(
+                context,
+                AgentOutput(
+                    status=AgentStatus.SUCCESS,
+                    data={
+                        "workflow_id": workflow_id,
+                        "round": round_number,
+                        "status": "supplier_agent_inactive",
+                        "responses_received": 0,
+                        "expected_responses": expected or 0,
+                    },
+                ),
+            )
+
         db = DatabaseBackend()
         db.ensure_schema()
         dispatch_records, last_dispatch = db.fetch_dispatch_context(
@@ -324,6 +351,20 @@ class EmailWatcherAgent(BaseAgent):
             run_id=dispatch_run_id,
         )
         dispatch_context = DispatchContext.build(dispatch_records)
+
+        sent_email_metadata = [
+            {
+                "message_id": record.message_id,
+                "recipient": record.recipient,
+                "subject": record.subject,
+                "sent_timestamp": record.dispatched_at.isoformat()
+                if isinstance(record.dispatched_at, datetime)
+                else None,
+                "workflow_id": record.workflow_id,
+                "round_number": record.round_number,
+            }
+            for record in dispatch_context.records
+        ]
 
         expected_total = expected or len(dispatch_context.records)
         if expected_total <= 0:
@@ -383,6 +424,7 @@ class EmailWatcherAgent(BaseAgent):
             round_number=round_number,
             dispatch_run_id=dispatch_run_id,
             dispatch_context=dispatch_context,
+            db_backend=db,
             expected=expected_total,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
@@ -391,6 +433,7 @@ class EmailWatcherAgent(BaseAgent):
             email_fetcher=email_fetcher,
             last_dispatch_time=last_dispatch,
         )
+        summary["sent_email_metadata"] = sent_email_metadata
 
         if fetcher_instance is not None:
             fetcher_instance.close()
@@ -415,6 +458,7 @@ class EmailWatcherAgent(BaseAgent):
         round_number: Optional[int],
         dispatch_run_id: Optional[str],
         dispatch_context: DispatchContext,
+        db_backend: DatabaseBackend,
         expected: int,
         timeout_seconds: int,
         poll_seconds: int,
@@ -460,7 +504,7 @@ class EmailWatcherAgent(BaseAgent):
                         email=email,
                         accepted=accepted,
                     )
-                    DatabaseBackend().upsert_response(record)
+                    db_backend.upsert_response(record)
                     if accepted:
                         dispatch_key = (
                             match.dispatch.message_id
@@ -505,6 +549,14 @@ class EmailWatcherAgent(BaseAgent):
         if responses_received >= expected:
             self._signal_completion(workflow_id, round_number, expected, responses_received)
 
+        status = "complete" if responses_received >= expected else "waiting"
+        logger.info(
+            "Collected %d responses out of %d - Status: %s",
+            responses_received,
+            expected,
+            status,
+        )
+
         return {
             "workflow_id": workflow_id,
             "round": round_number,
@@ -514,6 +566,7 @@ class EmailWatcherAgent(BaseAgent):
             "timeout": timeout,
             "supplier_responses": stored_rows,
             "unmatched_messages": [msg for msg in unmatched_messages if msg],
+            "status": status,
         }
 
     # ------------------------------------------------------------------
@@ -525,6 +578,31 @@ class EmailWatcherAgent(BaseAgent):
         reasons: List[str] = []
         best_score = 0.0
         best_dispatch: Optional[DispatchRecord] = None
+
+        header_identifiers: List[str] = []
+        for raw_header in list(email.in_reply_to) + list(email.references):
+            normalised = _normalise_identifier(raw_header)
+            if not normalised:
+                continue
+            header_identifiers.append(normalised)
+
+        direct_dispatch = dispatch_context.match_message(header_identifiers)
+        if direct_dispatch is not None:
+            logger.debug(
+                "EmailWatcherAgent direct match via thread identifiers message_id=%s",
+                email.message_id,
+            )
+            supplier_id = direct_dispatch.supplier_id
+            rfq_id = direct_dispatch.rfq_id
+            workflow_id = direct_dispatch.workflow_id
+            return MatchResult(
+                dispatch=direct_dispatch,
+                score=0.98,
+                reasons=["thread"],
+                supplier_id=supplier_id,
+                rfq_id=rfq_id,
+                workflow_id=workflow_id,
+            )
 
         comment, _ = split_hidden_marker(email.body or "")
         marker_token = extract_marker_token(comment)
@@ -562,7 +640,13 @@ class EmailWatcherAgent(BaseAgent):
             if normalised:
                 thread_ids.add(normalised)
 
-        subject_norm = _normalise_subject(email.subject)
+        def _strip_thread_prefix(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            cleaned = re.sub(r"^(?i)(re|fw|fwd):\s*", "", value).strip()
+            return _normalise_subject(cleaned)
+
+        subject_norm = _strip_thread_prefix(email.subject)
 
         TOKEN_WEIGHT = 0.55
         THREAD_WEIGHT = 0.35
@@ -598,7 +682,9 @@ class EmailWatcherAgent(BaseAgent):
                     score += RFQ_WEIGHT
                     matched_reasons.append("rfq")
             if subject_norm and record.rfq_id:
-                record_subject = _normalise_subject(record.rfq_id)
+                record_subject = _strip_thread_prefix(record.subject) if record.subject else None
+                if not record_subject:
+                    record_subject = _normalise_subject(record.rfq_id)
                 if record_subject and record_subject in subject_norm:
                     score += SUBJECT_WEIGHT
                     matched_reasons.append("subject")
@@ -643,6 +729,15 @@ class EmailWatcherAgent(BaseAgent):
         if email.message_id and "Message-ID" not in headers:
             headers["Message-ID"] = email.message_id
 
+        attachments = [dict(item) for item in (email.attachments or []) if isinstance(item, dict)]
+        matched_sent_id = dispatch.message_id if dispatch else None
+        round_number = (
+            dispatch.round_number
+            if dispatch and dispatch.round_number is not None
+            else email.round_number
+        )
+        matched_subject = dispatch.subject if dispatch else None
+
         return SupplierResponseRecord(
             workflow_id=workflow_id,
             action_id=str(dispatch.action_id) if dispatch and dispatch.action_id else None,
@@ -660,6 +755,10 @@ class EmailWatcherAgent(BaseAgent):
             match_method="accepted" if accepted else "needs_review",
             matched_on=match.reasons,
             match_confidence=match.score if accepted else 0.0,
+            attachments=attachments,
+            matched_sent_email_id=matched_sent_id,
+            round_number=round_number,
+            matched_dispatch_subject=matched_subject,
         )
 
     # ------------------------------------------------------------------
