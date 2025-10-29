@@ -17,6 +17,7 @@ from decimal import Decimal
 from repositories import (
     draft_rfq_emails_repo,
     email_dispatch_repo,
+    supplier_interaction_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
     workflow_lifecycle_repo,
@@ -94,6 +95,100 @@ def test_embed_unique_id_is_recoverable():
     body = embed_unique_id_in_email_body("Hello Supplier", uid)
     assert uid in body
     assert extract_unique_id_from_body(body) == uid
+
+
+def test_default_fetcher_reads_all_unseen_emails(monkeypatch):
+    class _FakeIMAP:
+        def __init__(self) -> None:
+            self.search_calls: List[Tuple[Any, ...]] = []
+            self.fetch_calls: List[int] = []
+
+        def select(self, mailbox, readonly=True):
+            assert mailbox == "INBOX"
+            assert readonly is True
+
+        def uid(self, command, *args):
+            if command == "SEARCH":
+                self.search_calls.append(tuple(args))
+                if "UNSEEN" in args:
+                    return "OK", [b"1 2 3"]
+                if "ALL" in args:
+                    return "OK", [b""]
+                return "OK", [b""]
+            if command == "FETCH":
+                uid_value = int(args[0])
+                self.fetch_calls.append(uid_value)
+                internal = f'{uid_value} (INTERNALDATE "01-Feb-2024 12:0{uid_value}:00 +0000")'.encode()
+                message = EmailMessage()
+                message["Message-ID"] = f"<msg-{uid_value}>"
+                message["Subject"] = f"Test {uid_value}"
+                message["Date"] = f"Thu, 1 Feb 2024 12:0{uid_value}:00 +0000"
+                message.set_content(f"Body {uid_value}")
+                return "OK", [(internal, message.as_bytes())]
+            return "NO", []
+
+        def close(self):
+            return None
+
+        def logout(self):
+            return None
+
+    fake_client = _FakeIMAP()
+    monkeypatch.setattr(
+        email_watcher_v2,
+        "_imap_client",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    since = datetime(2024, 2, 1, 12, 0, tzinfo=timezone.utc)
+    responses, last_uid = email_watcher_v2._default_fetcher(
+        host="imap.test",
+        username="user",
+        password="secret",
+        mailbox="INBOX",
+        since=since,
+    )
+
+    assert {resp.message_id for resp in responses} == {
+        "msg-1",
+        "msg-2",
+        "msg-3",
+    }
+    assert last_uid == 3
+    assert any("UNSEEN" in call for call in fake_client.search_calls)
+    assert [resp.received_at for resp in responses] == sorted(
+        resp.received_at for resp in responses
+    )
+
+
+def test_register_sent_email_includes_dispatch_timestamp(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    def _capture_outbound(row):
+        captured["row"] = row
+
+    monkeypatch.setattr(supplier_interaction_repo, "init_schema", lambda: None)
+    monkeypatch.setattr(
+        supplier_interaction_repo,
+        "register_outbound",
+        _capture_outbound,
+    )
+
+    dispatched_at = datetime(2024, 5, 1, 9, 30, tzinfo=timezone.utc)
+
+    email_watcher_v2.register_sent_email(
+        agent_nick="watcher",
+        workflow_id="wf-meta",
+        supplier_id="sup-1",
+        supplier_email="supplier@example.com",
+        unique_id="uid-123",
+        dispatched_at=dispatched_at,
+    )
+
+    row = captured["row"]
+    assert row.processed_at == dispatched_at
+    assert row.metadata.get("agent") == "watcher"
+    assert row.metadata.get("dispatched_at") == dispatched_at.isoformat()
 
 
 def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
@@ -744,6 +839,109 @@ def test_email_watcher_flags_completed_negotiation_with_pending_responses():
     assert result["pending_unique_ids"] == [unique_id]
     assert result["pending_suppliers"] == ["sup-outstanding"]
 
+
+def test_email_watcher_metadata_includes_received_timestamp(monkeypatch):
+    workflow_id = "wf-metadata-capture"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(
+        workflow_id, "awaiting_responses"
+    )
+
+    supplier_interaction_repo.init_schema()
+    supplier_interaction_repo.reset()
+
+    captured: Dict[str, Any] = {}
+
+    original_record_inbound = supplier_interaction_repo.record_inbound_response
+
+    def _capture_inbound(**kwargs):
+        captured["metadata"] = kwargs.get("metadata") or {}
+        return original_record_inbound(**kwargs)
+
+    monkeypatch.setattr(
+        supplier_interaction_repo,
+        "record_inbound_response",
+        _capture_inbound,
+    )
+
+    dispatch_time = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+    received_time = dispatch_time + timedelta(minutes=3)
+    unique_id = generate_unique_email_id(workflow_id, "sup-metadata")
+    message_id = "<msg-metadata>"
+
+    responses_queue = [
+        [
+            EmailResponse(
+                unique_id=unique_id,
+                supplier_id="sup-metadata",
+                supplier_email="reply@example.com",
+                from_address="reply@example.com",
+                message_id="<reply-001>",
+                subject="Re: Quote",
+                body="Quote body",
+                received_at=received_time,
+                in_reply_to=(message_id,),
+                references=(message_id,),
+                workflow_id=workflow_id,
+            )
+        ],
+        [],
+    ]
+
+    def _fetcher(**kwargs):
+        return responses_queue.pop(0) if responses_queue else []
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=_fetcher,
+        sleep=lambda _: None,
+        now=lambda: dispatch_time,
+        max_total_wait_seconds=30,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-metadata",
+                "supplier_email": "supplier@example.com",
+                "message_id": message_id,
+                "subject": "Request",
+                "dispatched_at": dispatch_time,
+            }
+        ],
+    )
+
+    email_watcher_v2.register_sent_email(
+        agent_nick="watcher",
+        workflow_id=workflow_id,
+        supplier_id="sup-metadata",
+        supplier_email="supplier@example.com",
+        unique_id=unique_id,
+        subject="Request",
+        message_id=message_id,
+        dispatched_at=dispatch_time,
+    )
+
+    outbound_row = supplier_interaction_repo.lookup_outbound(unique_id)
+    assert outbound_row is not None
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+    assert result.get("responded_count") == 1
+
+    metadata = captured.get("metadata")
+    assert metadata is not None
+    assert metadata.get("received_at") == received_time.isoformat()
+    assert metadata.get("dispatched_at") == dispatch_time.isoformat()
+
 def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     workflow_id = "wf-legacy-thread"
     supplier_response_repo.init_schema()
@@ -1020,6 +1218,193 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     assert context.input_data.get("workflow_status") == "responses_complete"
     assert context.input_data.get("rfq_id") == rfq_identifier
     assert context.input_data.get("unique_id") == unique_id
+
+
+def test_email_watcher_does_not_dedup_distinct_message_ids_with_same_fingerprint(tmp_path):
+    workflow_id = "wf-fingerprint"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    supplier_agent = StubSupplierAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_a = generate_unique_email_id(workflow_id, "sup-a")
+    unique_b = generate_unique_email_id(workflow_id, "sup-b")
+
+    subject = "Re: Pricing update"
+    from_address = "aggregator@example.com"
+
+    responses = [
+        EmailResponse(
+            unique_id=unique_a,
+            supplier_id="sup-a",
+            supplier_email=from_address,
+            from_address=from_address,
+            message_id="<reply-a>",
+            subject=subject,
+            body="Quote details A",
+            received_at=now + timedelta(seconds=30),
+        ),
+        EmailResponse(
+            unique_id=unique_b,
+            supplier_id="sup-b",
+            supplier_email=from_address,
+            from_address=from_address,
+            message_id="<reply-b>",
+            subject=subject,
+            body="Quote details B",
+            received_at=now + timedelta(seconds=70),
+        ),
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+        match_threshold=0.8,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_a,
+                "supplier_id": "sup-a",
+                "supplier_email": from_address,
+                "message_id": "<dispatch-a>",
+                "subject": subject,
+                "dispatched_at": now,
+            },
+            {
+                "unique_id": unique_b,
+                "supplier_id": "sup-b",
+                "supplier_email": from_address,
+                "message_id": "<dispatch-b>",
+                "subject": subject,
+                "dispatched_at": now,
+            },
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 2
+    assert result["expected_responses"] == 2
+    assert result["workflow_status"] == "responses_complete"
+    assert sorted(result["matched_responses"].keys()) == sorted([unique_a, unique_b])
+    assert supplier_agent.contexts, "Supplier agent should receive completion context"
+
+
+def test_match_responses_allows_same_fingerprint_across_polls_with_message_ids(tmp_path):
+    workflow_id = "wf-fingerprint-polls"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    supplier_agent = StubSupplierAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_a = generate_unique_email_id(workflow_id, "sup-a")
+    unique_b = generate_unique_email_id(workflow_id, "sup-b")
+
+    subject = "Re: Pricing update"
+    from_address = "aggregator@example.com"
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=lambda _: None,
+        now=lambda: now,
+        match_threshold=0.8,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_a,
+                "supplier_id": "sup-a",
+                "supplier_email": from_address,
+                "message_id": "<dispatch-a>",
+                "subject": subject,
+                "dispatched_at": now,
+            },
+            {
+                "unique_id": unique_b,
+                "supplier_id": "sup-b",
+                "supplier_email": from_address,
+                "message_id": "<dispatch-b>",
+                "subject": subject,
+                "dispatched_at": now,
+            },
+        ],
+    )
+
+    tracker = watcher._ensure_tracker(workflow_id)
+
+    response_a = EmailResponse(
+        unique_id=unique_a,
+        supplier_id="sup-a",
+        supplier_email=from_address,
+        from_address=from_address,
+        message_id="<reply-a>",
+        subject=subject,
+        body="Quote details A",
+        received_at=now + timedelta(seconds=30),
+    )
+
+    response_b = EmailResponse(
+        unique_id=unique_b,
+        supplier_id="sup-b",
+        supplier_email=from_address,
+        from_address=from_address,
+        message_id="<reply-b>",
+        subject=subject,
+        body="Quote details B",
+        received_at=now + timedelta(seconds=70),
+    )
+
+    first_batch = watcher._match_responses(tracker, [response_a])
+    assert [row.unique_id for row in first_batch] == [unique_a]
+    assert tracker.responded_count == 1
+
+    second_batch = watcher._match_responses(tracker, [response_b])
+    assert [row.unique_id for row in second_batch] == [unique_b]
+    assert tracker.responded_count == 2
+
+    stored_rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    stored_unique_ids = sorted(row.get("unique_id") for row in stored_rows)
+    assert stored_unique_ids == sorted([unique_a, unique_b])
 
 
 def test_email_fetcher_tracks_last_seen_uid(monkeypatch):

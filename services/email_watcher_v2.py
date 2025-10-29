@@ -799,6 +799,7 @@ def _default_fetcher(
     try:
         client.select(mailbox, readonly=True)
         candidate_uids: Set[int] = set()
+        unseen_uids: Set[int] = set()
         workflow_tokens: List[str] = []
         if workflow_ids:
             for token in workflow_ids:
@@ -809,7 +810,7 @@ def _default_fetcher(
                     workflow_tokens.append(text)
         mailbox_header = str(mailbox_filter).strip() if mailbox_filter else ""
 
-        def _search_uids(*terms: str) -> None:
+        def _search_uids(*terms: str, mark_unseen: bool = False) -> None:
             search_terms = list(terms)
             if mailbox_header:
                 search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
@@ -829,11 +830,28 @@ def _default_fetcher(
                 else:
                     token = str(part)
                 if token.isdigit():
-                    candidate_uids.add(int(token))
+                    value = int(token)
+                    candidate_uids.add(value)
+                    if mark_unseen:
+                        unseen_uids.add(value)
 
-        since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
+        since_aware = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        since_floor = since_aware - timedelta(seconds=max(0, backtrack_seconds))
         since_str = since_floor.strftime("%d-%b-%Y")
 
+        if workflow_tokens:
+            for token in workflow_tokens:
+                _search_uids(
+                    "UNSEEN",
+                    "SINCE",
+                    since_str,
+                    "HEADER",
+                    "X-ProcWise-Workflow-ID",
+                    token,
+                    mark_unseen=True,
+                )
+        else:
+            _search_uids("UNSEEN", "SINCE", since_str, mark_unseen=True)
         if last_seen_uid is not None:
             _search_uids("UID", f"{last_seen_uid + 1}:*")
 
@@ -855,7 +873,7 @@ def _default_fetcher(
 
         responses: List[EmailResponse] = []
         max_uid_value = last_seen_uid or 0
-        lower_bound = since - timedelta(seconds=max(backtrack_seconds, 86400))
+        lower_bound = since_aware - timedelta(seconds=max(backtrack_seconds, 86400))
 
         for uid_value in candidate_list:
             typ, payload = client.uid("FETCH", str(uid_value), "(RFC822 INTERNALDATE)")
@@ -890,12 +908,23 @@ def _default_fetcher(
             elif email_response.received_at is None:
                 email_response.received_at = datetime.now(timezone.utc)
 
-            if last_seen_uid is None and email_response.received_at and email_response.received_at < lower_bound:
+            received_at = email_response.received_at
+            if received_at and received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+                email_response.received_at = received_at
+
+            if (
+                received_at
+                and uid_value not in unseen_uids
+                and received_at < lower_bound
+            ):
                 continue
 
             responses.append(email_response)
             if uid_value > max_uid_value:
                 max_uid_value = uid_value
+
+        responses.sort(key=lambda response: response.received_at or since_aware)
 
         return responses, (max_uid_value if max_uid_value else last_seen_uid)
     finally:
@@ -1117,6 +1146,8 @@ class EmailWatcherV2:
         self._trackers: Dict[str, WorkflowTracker] = {}
         self._imap_last_seen_uid: Optional[int] = None
         self._backtrack_window_seconds = 180
+        self.agent_nick = "EmailWatcherV2"
+        self._last_unmatched: List[Dict[str, Any]] = []
 
         tracking_repo.init_schema()
         supplier_response_repo.init_schema()
@@ -1628,7 +1659,8 @@ class EmailWatcherV2:
         matched_rows: List[SupplierResponseRow] = []
         threshold = max(self.match_threshold, 0.75)
         for email in responses:
-            message_id = email.message_id or ""
+            message_id_raw = email.message_id or ""
+            message_id = message_id_raw.strip()
             fingerprint = _response_fingerprint(email)
             if message_id and message_id in tracker.seen_message_ids:
                 logger.debug(
@@ -1637,7 +1669,11 @@ class EmailWatcherV2:
                     message_id,
                 )
                 continue
-            if fingerprint and fingerprint in tracker.seen_fingerprints:
+            if (
+                fingerprint
+                and not message_id
+                and fingerprint in tracker.seen_fingerprints
+            ):
                 logger.debug(
                     "EmailWatcher deduped fingerprint workflow=%s fingerprint=%s",
                     tracker.workflow_id,
@@ -1819,10 +1855,43 @@ class EmailWatcherV2:
                         matched_id,
                     )
                     continue
+                outbound_data = supplier_interaction_repo.lookup_outbound(matched_id)
+                if outbound_data is None and email.unique_id and email.unique_id != matched_id:
+                    outbound_data = supplier_interaction_repo.lookup_outbound(email.unique_id)
+                outbound: Optional[SupplierInteractionRow] = None
+                if outbound_data is not None:
+                    outbound = SupplierInteractionRow(
+                        workflow_id=outbound_data.get("workflow_id"),
+                        unique_id=outbound_data.get("unique_id"),
+                        supplier_id=outbound_data.get("supplier_id"),
+                        supplier_email=outbound_data.get("supplier_email"),
+                        round_number=int(outbound_data.get("round_number") or 1),
+                        direction=str(outbound_data.get("direction") or "outbound"),
+                        interaction_type=str(
+                            outbound_data.get("interaction_type") or "initial"
+                        ),
+                        status=str(outbound_data.get("status") or "pending"),
+                        subject=outbound_data.get("subject"),
+                        body=outbound_data.get("body"),
+                        message_id=outbound_data.get("message_id"),
+                        in_reply_to=outbound_data.get("in_reply_to"),
+                        references=outbound_data.get("references"),
+                        rfq_id=outbound_data.get("rfq_id"),
+                        received_at=outbound_data.get("received_at"),
+                        processed_at=outbound_data.get("processed_at"),
+                        metadata=outbound_data.get("metadata"),
+                    )
+                if outbound is None:
+                    logger.warning(
+                        "services.email_watcher_v2 missing outbound row agent=%s workflow=%s unique_id=%s",
+                        self.agent_nick,
+                        tracker.workflow_id,
+                        matched_id,
+                    )
                 tracker.record_response(matched_id, email)
                 elapsed = tracker.elapsed_seconds(email.received_at)
                 tracker.seen_message_ids.add(message_id)
-                if fingerprint:
+                if not message_id and fingerprint:
                     tracker.seen_fingerprints.add(fingerprint)
                 capture_time = self._now()
                 self._update_idle_deadline(tracker, capture_time)
@@ -1862,9 +1931,41 @@ class EmailWatcherV2:
                 supplier_email = (
                     email.supplier_email
                     or _normalise_email_address(email.from_address)
+                    or (outbound.supplier_email if outbound else None)
                     or best_dispatch.supplier_email
                 )
-                supplier_id = supplier_id_value
+                supplier_id = supplier_id_value or (outbound.supplier_id if outbound else None)
+                metadata_payload: Dict[str, Any] = {
+                    "agent": self.agent_nick,
+                    "matched_on": best_reasons,
+                }
+                if email.received_at:
+                    received_ts = (
+                        email.received_at
+                        if email.received_at.tzinfo
+                        else email.received_at.replace(tzinfo=timezone.utc)
+                    )
+                    metadata_payload["received_at"] = received_ts.isoformat()
+                if best_dispatch.dispatched_at:
+                    dispatch_ts = (
+                        best_dispatch.dispatched_at
+                        if best_dispatch.dispatched_at.tzinfo
+                        else best_dispatch.dispatched_at.replace(tzinfo=timezone.utc)
+                    )
+                    metadata_payload.setdefault("dispatched_at", dispatch_ts.isoformat())
+                if outbound is not None:
+                    supplier_interaction_repo.record_inbound_response(
+                        outbound=outbound,
+                        message_id=email.message_id or uuid.uuid4().hex,
+                        subject=email.subject,
+                        body=email.body,
+                        from_address=email.from_address,
+                        received_at=email.received_at,
+                        in_reply_to=email.in_reply_to,
+                        references=email.references,
+                        rfq_id=email.rfq_id,
+                        metadata=metadata_payload,
+                    )
                 original_message_id_value = _format_message_identifier(
                     best_dispatch.message_id
                 )
@@ -1927,7 +2028,7 @@ class EmailWatcherV2:
                 reasons = best_reasons or ["insufficient-evidence"]
                 if message_id:
                     tracker.seen_message_ids.add(message_id)
-                if fingerprint:
+                if not message_id and fingerprint:
                     tracker.seen_fingerprints.add(fingerprint)
                 header_summary = {
                     "workflow": workflow_header_present,
@@ -2714,12 +2815,17 @@ def register_sent_email(
     message_id: Optional[str] = None,
     rfq_id: Optional[str] = None,
     thread_headers: Optional[Dict[str, Iterable[str]]] = None,
+    dispatched_at: Optional[datetime] = None,
 ) -> None:
     """Persist a dispatched email so inbound replies can be reconciled."""
 
     supplier_interaction_repo.init_schema()
 
     headers = thread_headers or {}
+    if isinstance(dispatched_at, datetime):
+        dispatched_dt = dispatched_at if dispatched_at.tzinfo else dispatched_at.replace(tzinfo=timezone.utc)
+    else:
+        dispatched_dt = datetime.now(timezone.utc)
     record = SupplierInteractionRow(
         workflow_id=workflow_id,
         unique_id=unique_id,
@@ -2735,7 +2841,11 @@ def register_sent_email(
         in_reply_to=list(headers.get("in_reply_to", [])) if headers else None,
         references=list(headers.get("references", [])) if headers else None,
         rfq_id=rfq_id,
-        metadata={"agent": agent_nick},
+        processed_at=dispatched_dt,
+        metadata={
+            "agent": agent_nick,
+            "dispatched_at": dispatched_dt.isoformat(),
+        },
     )
     supplier_interaction_repo.register_outbound(record)
 
@@ -3166,6 +3276,22 @@ class ContinuousEmailWatcher:
         if matched_unique:
             pending_unique_ids.discard(matched_unique)
 
+        metadata_payload: Dict[str, Any] = {"agent": self.agent_nick, "matched_on": best_reasons}
+        if response.received_at:
+            received_ts = (
+                response.received_at
+                if response.received_at.tzinfo
+                else response.received_at.replace(tzinfo=timezone.utc)
+            )
+            metadata_payload["received_at"] = received_ts.isoformat()
+        if best_dispatch and best_dispatch.dispatched_at:
+            dispatch_ts = (
+                best_dispatch.dispatched_at
+                if best_dispatch.dispatched_at.tzinfo
+                else best_dispatch.dispatched_at.replace(tzinfo=timezone.utc)
+            )
+            metadata_payload.setdefault("dispatched_at", dispatch_ts.isoformat())
+
         supplier_interaction_repo.record_inbound_response(
             outbound=outbound,
             message_id=response.message_id or uuid.uuid4().hex,
@@ -3176,7 +3302,7 @@ class ContinuousEmailWatcher:
             in_reply_to=response.in_reply_to,
             references=response.references,
             rfq_id=response.rfq_id,
-            metadata={"agent": self.agent_nick, "matched_on": best_reasons},
+            metadata=metadata_payload,
         )
 
         workflow_id = outbound.workflow_id
@@ -3438,7 +3564,11 @@ class ContinuousEmailWatcher:
                         subject_norm,
                     )
                     continue
-                if fingerprint and fingerprint in seen_fingerprints:
+                if (
+                    fingerprint
+                    and not msg_id
+                    and fingerprint in seen_fingerprints
+                ):
                     logger.info(
                         "services.email_watcher_v2 deduped inbound workflow=%s unique_id=%s action=deduped reason=fingerprint subject_norm=%s",
                         workflow_id,
@@ -3460,7 +3590,7 @@ class ContinuousEmailWatcher:
                     seen_message_ids.add(msg_id)
                 if subj_hash:
                     seen_subject_hashes.add(subj_hash)
-                if fingerprint:
+                if not msg_id and fingerprint:
                     seen_fingerprints.add(fingerprint)
 
             for unmatched_record in getattr(self, "_last_unmatched", []):
