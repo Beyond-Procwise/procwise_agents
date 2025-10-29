@@ -1337,13 +1337,29 @@ class EmailWatcherV2:
 
         fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
 
+        expected_total: Optional[int] = None
+        confirm_total = False
+
+        if dispatch_total is not None:
+            if expected_from_drafts and dispatch_total < expected_from_drafts:
+                expected_total = expected_from_drafts
+            else:
+                expected_total = max(dispatch_total, expected_from_drafts)
+                confirm_total = expected_total > 0
+        elif expected_from_drafts:
+            expected_total = expected_from_drafts
+        else:
+            expected_total = None
+
         if expected_total is None:
             if fallback:
                 tracker.set_expected_responses(fallback)
-                confirmed = True
+                if not expected_from_drafts:
+                    confirm_total = True
         elif expected_total > 0:
             tracker.set_expected_responses(expected_total)
-            confirmed = True
+            if tracker.dispatched_count >= expected_total:
+                confirm_total = True
         else:
             # ``count_completed_supplier_dispatches`` filters out ``NULL`` supplier ids,
             # so workflows that dispatch emails without a supplier identifier (e.g. when
@@ -1352,7 +1368,9 @@ class EmailWatcherV2:
             # past the dispatch confirmation gate.
             if fallback:
                 tracker.set_expected_responses(fallback)
-                confirmed = True
+                confirm_total = True
+        if confirm_total:
+            confirmed = True
         return confirmed
 
     def _resolve_round(
