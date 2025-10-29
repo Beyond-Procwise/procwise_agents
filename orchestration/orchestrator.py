@@ -22,7 +22,7 @@ try:  # Optional dependency for JSONPath mapping
 except Exception:  # pragma: no cover - library may be absent in tests
     jsonpath_parse = None
 
-from agents.base_agent import AgentContext, AgentStatus
+from agents.base_agent import AgentContext, AgentStatus, AgentOutput
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from services.process_routing_service import ProcessRoutingService
