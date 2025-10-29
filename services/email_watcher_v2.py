@@ -685,6 +685,17 @@ def _format_message_identifier(value: Optional[str]) -> Optional[str]:
     return f"<{text}>"
 
 
+def _normalise_message_token(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1]
+    return text.strip() or None
+
+
 def _response_fingerprint(email: EmailResponse) -> Optional[str]:
     subject_norm = _normalise_subject_line(email.subject) or ""
     from_norm = _normalise_email_address(email.from_address) or ""
@@ -787,7 +798,7 @@ def _default_fetcher(
     client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
-        candidate_uids: List[int] = []
+        candidate_uids: Set[int] = set()
         workflow_tokens: List[str] = []
         if workflow_ids:
             for token in workflow_ids:
@@ -798,64 +809,55 @@ def _default_fetcher(
                     workflow_tokens.append(text)
         mailbox_header = str(mailbox_filter).strip() if mailbox_filter else ""
 
+        def _search_uids(*terms: str) -> None:
+            search_terms = list(terms)
+            if mailbox_header:
+                search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
+            typ, data = client.uid("SEARCH", None, *search_terms)
+            if typ != "OK":
+                return
+            payload = data[0] or b""
+            if isinstance(payload, bytes):
+                parts = payload.split()
+            else:  # pragma: no cover - defensive
+                parts = []
+            for part in parts:
+                if not part:
+                    continue
+                if isinstance(part, bytes):
+                    token = part.decode(errors="ignore")
+                else:
+                    token = str(part)
+                if token.isdigit():
+                    candidate_uids.add(int(token))
+
+        since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
+        since_str = since_floor.strftime("%d-%b-%Y")
+
         if last_seen_uid is not None:
-            uid_query = f"{last_seen_uid + 1}:*"
-            typ, data = client.uid("SEARCH", None, "UID", uid_query)
-            if typ == "OK":
-                candidate_uids = [
-                    int(part)
-                    for part in (data[0] or b"").split()
-                    if part and part.isdigit()
-                ]
+            _search_uids("UID", f"{last_seen_uid + 1}:*")
+
+        if workflow_tokens:
+            for token in workflow_tokens:
+                _search_uids("SINCE", since_str, "HEADER", "X-ProcWise-Workflow-ID", token)
         else:
-            since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
-            since_str = since_floor.strftime("%d-%b-%Y")
-            if workflow_tokens:
-                uid_candidates: Set[int] = set()
-                for token in workflow_tokens:
-                    search_terms: List[str] = ["SINCE", since_str, "HEADER", "X-ProcWise-Workflow-ID", token]
-                    if mailbox_header:
-                        search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
-                    typ, data = client.uid("SEARCH", None, *search_terms)
-                    if typ == "OK":
-                        uid_candidates.update(
-                            int(part)
-                            for part in (data[0] or b"").split()
-                            if part and part.isdigit()
-                        )
-                candidate_uids = sorted(uid_candidates)
-            else:
-                search_terms = ["SINCE", since_str]
-                if mailbox_header:
-                    search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
-                typ, data = client.uid("SEARCH", None, *search_terms)
-                if typ == "OK":
-                    candidate_uids = [
-                        int(part)
-                        for part in (data[0] or b"").split()
-                        if part and part.isdigit()
-                    ]
-            if not candidate_uids:
-                search_terms = ["ALL"]
-                if mailbox_header:
-                    search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
-                typ, data = client.uid("SEARCH", None, *search_terms)
-                if typ == "OK":
-                    all_uids = [
-                        int(part)
-                        for part in (data[0] or b"").split()
-                        if part and part.isdigit()
-                    ]
-                    candidate_uids = all_uids[-max_uid_samples:]
+            _search_uids("SINCE", since_str)
+
+        if not candidate_uids:
+            _search_uids("ALL")
 
         if not candidate_uids:
             return [], last_seen_uid
+
+        candidate_list = sorted(candidate_uids)
+        if max_uid_samples > 0 and len(candidate_list) > max_uid_samples:
+            candidate_list = candidate_list[-max_uid_samples:]
 
         responses: List[EmailResponse] = []
         max_uid_value = last_seen_uid or 0
         lower_bound = since - timedelta(seconds=max(backtrack_seconds, 86400))
 
-        for uid_value in candidate_uids:
+        for uid_value in candidate_list:
             typ, payload = client.uid("FETCH", str(uid_value), "(RFC822 INTERNALDATE)")
             if typ != "OK" or not payload:
                 continue
@@ -1026,19 +1028,38 @@ def _calculate_match_score(
         score += SUBJECT_WEIGHT * subject_similarity
         matched_on.append("subject_similarity")
 
-    thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
-        dispatch.thread_headers.get("in_reply_to", ())
-    )
-    if dispatch.message_id:
-        thread_ids.add(dispatch.message_id)
+    thread_ids: Set[str] = set()
+    for candidate in (
+        *(dispatch.thread_headers.get("references", ())),
+        *(dispatch.thread_headers.get("in_reply_to", ())),
+    ):
+        normalised = _normalise_message_token(candidate)
+        if normalised:
+            thread_ids.add(normalised)
+    dispatch_message_token = _normalise_message_token(dispatch.message_id)
+    if dispatch_message_token:
+        thread_ids.add(dispatch_message_token)
 
-    reply_headers = set(email_response.in_reply_to) | set(email_response.references)
-    if dispatch.message_id and dispatch.message_id in reply_headers:
-        score += THREAD_WEIGHT
-        matched_on.append("in_reply_to")
+    reply_headers: Set[str] = set()
+    for candidate in (
+        *(email_response.in_reply_to or ()),
+        *(email_response.references or ()),
+    ):
+        normalised = _normalise_message_token(candidate)
+        if normalised:
+            reply_headers.add(normalised)
+    for candidate in _collect_header_values("in-reply-to", "references"):
+        normalised = _normalise_message_token(candidate)
+        if normalised:
+            reply_headers.add(normalised)
+    if dispatch_message_token and dispatch_message_token in reply_headers:
+        score = max(score, 1.0)
+        if "in_reply_to" not in matched_on:
+            matched_on.append("in_reply_to")
     elif thread_ids & reply_headers:
         score += THREAD_WEIGHT
-        matched_on.append("thread_reference")
+        if "thread_reference" not in matched_on:
+            matched_on.append("thread_reference")
 
     return min(score, 1.0), matched_on
 
@@ -1979,6 +2000,43 @@ class EmailWatcherV2:
 
         negotiation_status = (lifecycle.get("negotiation_status") or "").strip().lower()
         if negotiation_status in {"completed", "finalized"}:
+            pending_unique_ids = self._pending_unique_ids(tracker)
+            pending_suppliers = self._pending_suppliers(tracker, pending_unique_ids)
+            outstanding_responses = bool(pending_unique_ids) or (
+                tracker.expected_responses > 0
+                and tracker.responded_count < tracker.expected_responses
+            )
+            if outstanding_responses:
+                logger.warning(
+                    "EmailWatcher negotiation already completed with outstanding responses workflow=%s status=%s expected=%d responded=%d pending_suppliers=%s",
+                    workflow_id,
+                    negotiation_status,
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    ",".join(pending_suppliers) or "-",
+                )
+                self._update_watcher_state(
+                    tracker,
+                    "awaiting_responses",
+                    reason="negotiation_completed_pending_responses",
+                    pending_unique_ids=pending_unique_ids,
+                    pending_suppliers=pending_suppliers,
+                )
+                return {
+                    "workflow_id": workflow_id,
+                    "complete": False,
+                    "dispatched_count": tracker.dispatched_count,
+                    "responded_count": tracker.responded_count,
+                    "matched_responses": tracker.matched_responses,
+                    "response_history": tracker.response_history,
+                    "expected_responses": tracker.expected_responses,
+                    "workflow_status": "negotiation_completed_pending_responses",
+                    "timeout_reached": False,
+                    "pending_unique_ids": pending_unique_ids,
+                    "pending_suppliers": pending_suppliers,
+                    "reason": "negotiation_completed_pending_responses",
+                }
+
             logger.info(
                 "EmailWatcher skipping run because negotiation already completed workflow=%s status=%s",
                 workflow_id,
@@ -2153,6 +2211,7 @@ class EmailWatcherV2:
                 try:
                     responses = self._fetch_emails(
                         since_cursor,
+                        workflow_ids=[workflow_id],
                     )
                 except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
                     logger.warning(
@@ -2279,14 +2338,32 @@ class EmailWatcherV2:
                 stop_reason = "responses_complete"
 
             negotiation_completed = negotiation_stop
+            outstanding_responses = bool(last_pending_unique) or (
+                tracker.expected_responses > 0
+                and tracker.responded_count < tracker.expected_responses
+            )
+            if negotiation_completed and outstanding_responses:
+                logger.warning(
+                    "EmailWatcher negotiation completed before responses were collected workflow=%s%s expected=%d responded=%d pending_suppliers=%s",
+                    workflow_id,
+                    self._round_fragment(tracker),
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    ",".join(last_pending_suppliers) or "-",
+                )
 
-            complete = tracker.all_responded or negotiation_completed
+            complete = tracker.all_responded or (
+                negotiation_completed and not outstanding_responses
+            )
             if stop_reason in {"partial_timeout", "timeout"}:
                 workflow_state = "partial_timeout"
                 final_status = "partial_timeout"
-            elif negotiation_completed:
+            elif negotiation_completed and not outstanding_responses:
                 workflow_state = "negotiation_completed"
                 final_status = "completed"
+            elif negotiation_completed and outstanding_responses:
+                workflow_state = "negotiation_completed_pending_responses"
+                final_status = "incomplete"
             elif tracker.all_responded:
                 workflow_state = "responses_complete"
                 final_status = "completed"
@@ -2294,7 +2371,9 @@ class EmailWatcherV2:
                 workflow_state = "awaiting_responses"
                 final_status = final_status or "active"
 
-            if negotiation_completed or tracker.all_responded:
+            if negotiation_completed and outstanding_responses:
+                tracker.status = "incomplete"
+            elif negotiation_completed or tracker.all_responded:
                 tracker.status = "completed"
             elif stop_reason in {"partial_timeout", "timeout"}:
                 tracker.status = "partial_timeout"

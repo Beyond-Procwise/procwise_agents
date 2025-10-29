@@ -134,7 +134,7 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
             self.payload = payload
             self.calls = 0
 
-        def __call__(self, *, since):
+        def __call__(self, *, since, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return list(self.payload)
@@ -189,6 +189,92 @@ def test_email_watcher_v2_matches_unique_id_and_triggers_agent(tmp_path):
     assert len(all_rows) == 1
     assert all_rows[0].get("rfq_id") == "RFQ-2024-0001"
 
+
+def test_email_watcher_matches_thread_headers_without_unique_id(tmp_path):
+    workflow_id = "wf-thread-only"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(workflow_id, "awaiting_responses")
+
+    supplier_agent = StubSupplierAgent()
+    negotiation_agent = StubNegotiationAgent()
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-1")
+    original_subject = "Quote request"
+    original_message_id = "<msg-002>"
+
+    responses = [
+        EmailResponse(
+            unique_id=None,
+            supplier_id=None,
+            supplier_email="supplier@example.com",
+            from_address="supplier@example.com",
+            message_id="<reply-002>",
+            subject=f"Re: {original_subject}",
+            body="Thank you for the opportunity",
+            received_at=now + timedelta(minutes=7),
+            in_reply_to=("msg-002",),
+            references=("msg-002",),
+            rfq_id=None,
+        )
+    ]
+
+    class _Fetcher:
+        def __init__(self, payload: List[EmailResponse]):
+            self.payload = payload
+            self.calls = 0
+
+        def __call__(self, *, since, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return list(self.payload)
+            return []
+
+    fetcher = _Fetcher(responses)
+
+    watcher = EmailWatcherV2(
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=2,
+        email_fetcher=fetcher,
+        sleep=lambda _: None,
+        now=lambda: now,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-1",
+                "supplier_email": "supplier@example.com",
+                "message_id": original_message_id,
+                "subject": original_subject,
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is True
+    assert result["responded_count"] == 1
+    assert result["workflow_status"] == "responses_complete"
+    assert result["expected_responses"] == 1
+    assert result["timeout_reached"] is False
+    assert supplier_agent.contexts, "Supplier agent should be invoked"
+
+    rows = supplier_response_repo.fetch_all(workflow_id=workflow_id)
+    assert len(rows) == 1
+    assert rows[0].get("response_message_id") == "<reply-002>"
+    assert rows[0].get("unique_id") == unique_id
 
 def test_email_watcher_waits_for_all_drafted_suppliers_before_activation(monkeypatch):
     workflow_id = "wf-drafted-gap"
@@ -354,7 +440,7 @@ def test_email_watcher_continues_polling_until_all_responses():
             self._batches = batches
             self.calls = 0
 
-        def __call__(self, *, since):
+        def __call__(self, *, since, **_kwargs):
             _ = since
             if self.calls < len(self._batches):
                 payload = self._batches[self.calls]
@@ -598,8 +684,8 @@ def test_email_watcher_stops_when_negotiation_completed():
 
     result = watcher.wait_and_collect_responses(workflow_id)
 
-    assert result["complete"] is True
-    assert result["workflow_status"] == "negotiation_completed"
+    assert result["complete"] is False
+    assert result["workflow_status"] == "negotiation_completed_pending_responses"
     assert result["timeout_reached"] is False
     lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id)
     assert lifecycle is not None
@@ -608,7 +694,55 @@ def test_email_watcher_stops_when_negotiation_completed():
     metadata = lifecycle.get("metadata") or {}
     assert metadata.get("stop_reason") == "negotiation_completed"
     assert metadata.get("negotiation_completed") is True
+    assert metadata.get("status") == "incomplete"
 
+
+def test_email_watcher_flags_completed_negotiation_with_pending_responses():
+    workflow_id = "wf-negotiation-pending-responses"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(
+        workflow_id, "awaiting_responses"
+    )
+    workflow_lifecycle_repo.record_negotiation_status(workflow_id, "completed")
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-outstanding")
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=lambda _: None,
+        now=lambda: now,
+        max_total_wait_seconds=30,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-outstanding",
+                "supplier_email": "pending@example.com",
+                "message_id": "<dispatch-pending>",
+                "subject": "Request for negotiation",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is False
+    assert result["workflow_status"] == "negotiation_completed_pending_responses"
+    assert result["pending_unique_ids"] == [unique_id]
+    assert result["pending_suppliers"] == ["sup-outstanding"]
 
 def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     workflow_id = "wf-legacy-thread"
@@ -661,7 +795,7 @@ def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
             self.payload = payload
             self.calls = 0
 
-        def __call__(self, *, since):
+        def __call__(self, *, since, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return list(self.payload)
@@ -763,7 +897,7 @@ def test_email_watcher_matches_using_supplier_id_when_threshold_not_met(tmp_path
             self.payload = payload
             self.calls = 0
 
-        def __call__(self, *, since):
+        def __call__(self, *, since, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return list(self.payload)
@@ -841,7 +975,7 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
             self.payload = payload
             self.calls = 0
 
-        def __call__(self, *, since):
+        def __call__(self, *, since, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return list(self.payload)
@@ -934,15 +1068,87 @@ def test_email_fetcher_tracks_last_seen_uid(monkeypatch):
         ],
     )
 
-    first_batch = watcher._fetch_emails(now)
+    first_batch = watcher._fetch_emails(now, workflow_ids=[workflow_id])
     assert first_batch == [response]
     assert watcher._imap_last_seen_uid == 5123
 
-    second_batch = watcher._fetch_emails(now)
+    second_batch = watcher._fetch_emails(now, workflow_ids=[workflow_id])
     assert second_batch == []
     assert len(calls) >= 2
     assert calls[0].get("last_seen_uid") is None
     assert calls[1].get("last_seen_uid") == 5123
+    assert calls[0].get("workflow_ids") == [workflow_id]
+    assert calls[1].get("workflow_ids") == [workflow_id]
+
+
+def test_default_fetcher_returns_responses_before_last_seen(monkeypatch):
+    now = datetime(2025, 10, 29, 9, 45, tzinfo=timezone.utc)
+
+    message = EmailMessage()
+    message["Subject"] = "Re: ProcWise RFQ"
+    message["From"] = "supplier@example.com"
+    message["To"] = "buyer@example.com"
+    message["Message-ID"] = "<reply-before-last@procwise>"
+    message.set_content("Pricing attached")
+    raw_bytes = message.as_bytes()
+
+    class _FakeIMAP:
+        def __init__(self) -> None:
+            self.selected = False
+            self.closed = False
+
+        def select(self, mailbox, readonly=True):  # pragma: no cover - trivial
+            self.selected = True
+            return "OK", [b"1"]
+
+        def uid(self, command, charset, *criteria):
+            if command == "SEARCH":
+                tokens = [
+                    c.decode() if isinstance(c, bytes) else str(c)
+                    for c in criteria
+                ]
+                if "UID" in tokens:
+                    return "OK", [b""]
+                return "OK", [b"150"]
+            if command == "FETCH":
+                uid_token = charset
+                if isinstance(uid_token, bytes):
+                    uid = int(uid_token.decode())
+                else:
+                    uid = int(str(uid_token))
+                if uid != 150:
+                    return "OK", []
+                internal = b'1 (INTERNALDATE "29-Oct-2025 09:40:00 +0000" RFC822 {0})'
+                return "OK", [(internal, raw_bytes)]
+            raise AssertionError(f"Unsupported command: {command}")
+
+        def close(self):  # pragma: no cover - defensive
+            self.closed = True
+
+        def logout(self):  # pragma: no cover - defensive
+            self.closed = True
+
+    monkeypatch.setattr(
+        email_watcher_v2,
+        "_imap_client",
+        lambda *args, **kwargs: _FakeIMAP(),
+    )
+
+    responses, last_uid = email_watcher_v2._default_fetcher(
+        host="imap.test",
+        username="user@test",
+        password="secret",
+        mailbox="INBOX",
+        since=now,
+        last_seen_uid=400,
+        workflow_ids=["wf-backfill"],
+    )
+
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.message_id == "reply-before-last@procwise"
+    assert response.received_at is not None
+    assert last_uid == 400
 
 
 @pytest.fixture(autouse=True)
