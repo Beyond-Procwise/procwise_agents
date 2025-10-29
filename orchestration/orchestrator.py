@@ -2253,9 +2253,7 @@ class Orchestrator:
         if agent_name not in self.agents:
             logger.debug("State machine skipped missing agent %s", agent_name)
             return None
-        child_context = context.create_child_context(
-            agent_name, dict(context.input_data)
-        )
+        child_context = self._create_child_context(context, agent_name, {})
         result = self._execute_agent(agent_name, child_context)
         if result and getattr(result, "pass_fields", None):
             context.input_data.update(result.pass_fields)
