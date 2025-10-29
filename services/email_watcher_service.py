@@ -9,7 +9,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
-from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories import (
+    supplier_response_repo,
+    workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
+)
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailWatcherV2
 from services.event_bus import get_event_bus
@@ -557,6 +561,49 @@ class EmailWatcherService:
             self._forced_workflows.clear()
         return items
 
+    def _should_skip_workflow(self, workflow_id: str) -> bool:
+        """Return ``True`` when ``workflow_id`` should not be processed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return False
+
+        try:
+            lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_key)
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to load lifecycle for workflow=%s",
+                workflow_key,
+            )
+            return False
+
+        if not lifecycle:
+            return False
+
+        negotiation_status = str(
+            lifecycle.get("negotiation_status") or ""
+        ).strip().lower()
+        if negotiation_status not in {"completed", "finalized"}:
+            return False
+
+        watcher_status = str(lifecycle.get("watcher_status") or "").strip().lower()
+        if watcher_status != "stopped":
+            return False
+
+        metadata = lifecycle.get("metadata") or {}
+        stop_reason = str(metadata.get("stop_reason") or "").strip().lower()
+        if stop_reason in {
+            "negotiation_completed",
+            "negotiation_completed_pending_responses",
+        }:
+            logger.debug(
+                "EmailWatcherService suppressing workflow=%s due to completed negotiation",
+                workflow_key,
+            )
+            return True
+
+        return False
+
     def _wait_for_next_cycle(self, seconds: float) -> None:
         if seconds <= 0:
             seconds = 0
@@ -612,6 +659,10 @@ class EmailWatcherService:
                     break
 
                 if not workflow_id:
+                    continue
+
+                if self._should_skip_workflow(workflow_id):
+                    processed_workflow = True
                     continue
 
                 try:
