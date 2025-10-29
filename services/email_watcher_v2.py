@@ -1979,6 +1979,43 @@ class EmailWatcherV2:
 
         negotiation_status = (lifecycle.get("negotiation_status") or "").strip().lower()
         if negotiation_status in {"completed", "finalized"}:
+            pending_unique_ids = self._pending_unique_ids(tracker)
+            pending_suppliers = self._pending_suppliers(tracker, pending_unique_ids)
+            outstanding_responses = bool(pending_unique_ids) or (
+                tracker.expected_responses > 0
+                and tracker.responded_count < tracker.expected_responses
+            )
+            if outstanding_responses:
+                logger.warning(
+                    "EmailWatcher negotiation already completed with outstanding responses workflow=%s status=%s expected=%d responded=%d pending_suppliers=%s",
+                    workflow_id,
+                    negotiation_status,
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    ",".join(pending_suppliers) or "-",
+                )
+                self._update_watcher_state(
+                    tracker,
+                    "awaiting_responses",
+                    reason="negotiation_completed_pending_responses",
+                    pending_unique_ids=pending_unique_ids,
+                    pending_suppliers=pending_suppliers,
+                )
+                return {
+                    "workflow_id": workflow_id,
+                    "complete": False,
+                    "dispatched_count": tracker.dispatched_count,
+                    "responded_count": tracker.responded_count,
+                    "matched_responses": tracker.matched_responses,
+                    "response_history": tracker.response_history,
+                    "expected_responses": tracker.expected_responses,
+                    "workflow_status": "negotiation_completed_pending_responses",
+                    "timeout_reached": False,
+                    "pending_unique_ids": pending_unique_ids,
+                    "pending_suppliers": pending_suppliers,
+                    "reason": "negotiation_completed_pending_responses",
+                }
+
             logger.info(
                 "EmailWatcher skipping run because negotiation already completed workflow=%s status=%s",
                 workflow_id,
@@ -2279,14 +2316,32 @@ class EmailWatcherV2:
                 stop_reason = "responses_complete"
 
             negotiation_completed = negotiation_stop
+            outstanding_responses = bool(last_pending_unique) or (
+                tracker.expected_responses > 0
+                and tracker.responded_count < tracker.expected_responses
+            )
+            if negotiation_completed and outstanding_responses:
+                logger.warning(
+                    "EmailWatcher negotiation completed before responses were collected workflow=%s%s expected=%d responded=%d pending_suppliers=%s",
+                    workflow_id,
+                    self._round_fragment(tracker),
+                    tracker.expected_responses,
+                    tracker.responded_count,
+                    ",".join(last_pending_suppliers) or "-",
+                )
 
-            complete = tracker.all_responded or negotiation_completed
+            complete = tracker.all_responded or (
+                negotiation_completed and not outstanding_responses
+            )
             if stop_reason in {"partial_timeout", "timeout"}:
                 workflow_state = "partial_timeout"
                 final_status = "partial_timeout"
-            elif negotiation_completed:
+            elif negotiation_completed and not outstanding_responses:
                 workflow_state = "negotiation_completed"
                 final_status = "completed"
+            elif negotiation_completed and outstanding_responses:
+                workflow_state = "negotiation_completed_pending_responses"
+                final_status = "incomplete"
             elif tracker.all_responded:
                 workflow_state = "responses_complete"
                 final_status = "completed"
@@ -2294,7 +2349,9 @@ class EmailWatcherV2:
                 workflow_state = "awaiting_responses"
                 final_status = final_status or "active"
 
-            if negotiation_completed or tracker.all_responded:
+            if negotiation_completed and outstanding_responses:
+                tracker.status = "incomplete"
+            elif negotiation_completed or tracker.all_responded:
                 tracker.status = "completed"
             elif stop_reason in {"partial_timeout", "timeout"}:
                 tracker.status = "partial_timeout"
