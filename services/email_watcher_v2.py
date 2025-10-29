@@ -1237,14 +1237,23 @@ class EmailWatcherV2:
             )
             expected_total = None
 
-        if expected_total and expected_total > 0:
+        fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
+
+        if expected_total is None:
+            if fallback:
+                tracker.set_expected_responses(fallback)
+                confirmed = True
+        elif expected_total > 0:
             tracker.set_expected_responses(expected_total)
             confirmed = True
         else:
-            fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
+            # ``count_completed_supplier_dispatches`` filters out ``NULL`` supplier ids,
+            # so workflows that dispatch emails without a supplier identifier (e.g. when
+            # the supplier agent is inactive) report ``0`` even though dispatches exist.
+            # Fall back to the tracker counts in that scenario so the watcher can move
+            # past the dispatch confirmation gate.
             if fallback:
                 tracker.set_expected_responses(fallback)
-            if expected_total is None and fallback:
                 confirmed = True
         return confirmed
 
