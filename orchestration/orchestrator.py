@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Mapping
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,6 +31,7 @@ from services.event_bus import get_event_bus, workflow_scope
 from services.agent_manifest import AgentManifestService
 from services.supplier_response_workflow import SupplierResponseWorkflow
 from utils.gpu import configure_gpu
+from services.redis_client import get_workflow_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class Orchestrator:
         self.manifest_service = AgentManifestService(agent_nick)
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
+        self._workflow_redis = get_workflow_redis_client()
 
     def execute_ranking_flow(self, query: str) -> Dict:
         """Public wrapper for the supplier ranking workflow.
@@ -192,8 +194,10 @@ class Orchestrator:
                     "workflow_id": workflow_id,
                 }
 
-            # Execute workflow based on type
-            if workflow_name == "document_extraction":
+            workflow_config = enriched_input.get("workflow_configuration")
+            if workflow_config:
+                result = self._run_state_machine(context, workflow_config)
+            elif workflow_name == "document_extraction":
                 result = self._execute_extraction_workflow(context)
             elif workflow_name == "supplier_ranking":
                 result = self._execute_ranking_workflow(context)
@@ -2162,6 +2166,149 @@ class Orchestrator:
             depth += 1
 
         return results
+
+    def _checkpoint_workflow_state(
+        self, workflow_id: str, state: str, payload: Mapping[str, Any]
+    ) -> None:
+        if not self._workflow_redis:
+            return
+        try:
+            checkpoint = {
+                "state": state,
+                "timestamp": datetime.utcnow().isoformat(),
+                "payload": dict(payload),
+            }
+            self._workflow_redis.set(
+                f"workflow_state:{workflow_id}", json.dumps(checkpoint)
+            )
+        except Exception:
+            logger.debug(
+                "Failed to checkpoint workflow state for %s", workflow_id, exc_info=True
+            )
+
+    def _clear_workflow_checkpoint(self, workflow_id: str) -> None:
+        if not self._workflow_redis:
+            return
+        try:
+            self._workflow_redis.delete(f"workflow_state:{workflow_id}")
+        except Exception:
+            logger.debug(
+                "Failed to clear workflow checkpoint for %s", workflow_id, exc_info=True
+            )
+
+    def _run_state_machine(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        state = "INIT"
+        results: Dict[str, Any] = {}
+        state_history: List[str] = []
+        while True:
+            state_history.append(state)
+            self._checkpoint_workflow_state(
+                context.workflow_id, state, context.input_data
+            )
+
+            if state == "INIT":
+                state = "DRAFT_EMAILS"
+                continue
+
+            if state == "DRAFT_EMAILS":
+                if self._should_trigger_drafting(context, workflow_config):
+                    result = self._invoke_state_agent("EmailDraftingAgent", context)
+                    results["EmailDraftingAgent"] = getattr(result, "data", None)
+                state = "SEND_EMAILS"
+                continue
+
+            if state == "SEND_EMAILS":
+                if self._should_trigger_dispatch(context, workflow_config):
+                    result = self._invoke_state_agent("EmailDispatchAgent", context)
+                    results["EmailDispatchAgent"] = getattr(result, "data", None)
+                state = "WATCH_RESPONSES"
+                continue
+
+            if state == "WATCH_RESPONSES":
+                if self._should_trigger_watcher(context, workflow_config):
+                    result = self._invoke_state_agent("EmailWatcherAgent", context)
+                    results["EmailWatcherAgent"] = getattr(result, "data", None)
+                state = "NEGOTIATE"
+                continue
+
+            if state == "NEGOTIATE":
+                if self._should_trigger_negotiation(context, workflow_config, results):
+                    result = self._invoke_state_agent("NegotiationAgent", context)
+                    results["NegotiationAgent"] = getattr(result, "data", None)
+                state = "FINALIZE"
+                continue
+
+            if state == "FINALIZE":
+                results["state_history"] = state_history
+                self._clear_workflow_checkpoint(context.workflow_id)
+                break
+
+        return results
+
+    def _invoke_state_agent(
+        self, agent_name: str, context: AgentContext
+    ) -> Optional[AgentOutput]:
+        if agent_name not in self.agents:
+            logger.debug("State machine skipped missing agent %s", agent_name)
+            return None
+        child_context = context.create_child_context(
+            agent_name, dict(context.input_data)
+        )
+        result = self._execute_agent(agent_name, child_context)
+        if result and getattr(result, "pass_fields", None):
+            context.input_data.update(result.pass_fields)
+        return result
+
+    def _should_trigger_drafting(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        if data.get("negotiation_context") or data.get("negotiation"):
+            return True
+        if data.get("supplier_information") or data.get("ranking"):
+            return True
+        trigger = workflow_config.get("states", {}).get("DRAFT_EMAILS", {})
+        return bool(trigger.get("enabled", True))
+
+    def _should_trigger_dispatch(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        has_drafts = bool(data.get("drafts"))
+        trigger = workflow_config.get("states", {}).get("SEND_EMAILS", {})
+        return has_drafts and trigger.get("enabled", True)
+
+    def _should_trigger_watcher(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        supplier_agent_active = "SupplierInteractionAgent" in self.agents
+        if not supplier_agent_active:
+            return False
+        dispatched = bool(
+            data.get("dispatch_summary")
+            or data.get("sent_messages")
+            or data.get("email_dispatch")
+        )
+        trigger = workflow_config.get("states", {}).get("WATCH_RESPONSES", {})
+        return dispatched and trigger.get("enabled", True)
+
+    def _should_trigger_negotiation(
+        self,
+        context: AgentContext,
+        workflow_config: Dict[str, Any],
+        results: Dict[str, Any],
+    ) -> bool:
+        data = context.input_data or {}
+        watcher_result = results.get("EmailWatcherAgent") or {}
+        responses_received = 0
+        if isinstance(watcher_result, dict):
+            responses_received = watcher_result.get("responses_received") or 0
+        pending_negotiation = data.get("negotiation_context") or data.get("supplier_responses")
+        trigger = workflow_config.get("states", {}).get("NEGOTIATE", {})
+        return trigger.get("enabled", True) and (responses_received > 0 or bool(pending_negotiation))
 
     def _execute_agent(self, agent_name: str, context: AgentContext) -> Any:
         """Execute single agent"""
