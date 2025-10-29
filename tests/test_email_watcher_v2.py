@@ -1536,6 +1536,137 @@ def test_default_fetcher_returns_responses_before_last_seen(monkeypatch):
     assert last_uid == 400
 
 
+def test_default_fetcher_fetches_general_results_with_workflow_filters(monkeypatch):
+    now = datetime(2025, 10, 29, 9, 45, tzinfo=timezone.utc)
+
+    general_message = EmailMessage()
+    general_message["Subject"] = "Re: Workflow Update"
+    general_message["From"] = "supplier@example.com"
+    general_message["To"] = "buyer@example.com"
+    general_message["Message-ID"] = "<reply-no-header@procwise>"
+    general_message.set_content("Thanks for the update")
+    general_bytes = general_message.as_bytes()
+
+    class _FakeIMAP:
+        def __init__(self) -> None:
+            self.selected = False
+
+        def select(self, mailbox, readonly=True):  # pragma: no cover - trivial
+            self.selected = True
+            return "OK", [b"1"]
+
+        def uid(self, command, charset, *criteria):
+            if command == "SEARCH":
+                tokens = [
+                    c.decode() if isinstance(c, bytes) else str(c)
+                    for c in criteria
+                ]
+                if "HEADER" in tokens and "X-ProcWise-Workflow-ID" in tokens:
+                    return "OK", [b"101"]
+                if tokens and tokens[0] == "SINCE":
+                    return "OK", [b"150"]
+                if tokens and tokens[0] == "ALL":
+                    return "OK", [b""]
+                return "OK", [b""]
+            if command == "FETCH":
+                uid_token = charset
+                uid_value = int(uid_token.decode() if isinstance(uid_token, bytes) else str(uid_token))
+                if uid_value == 150:
+                    internal = f'1 (INTERNALDATE "29-Oct-2025 09:40:00 +0000" RFC822 {{{len(general_bytes)}}})'.encode()
+                    return "OK", [(internal, general_bytes)]
+                return "OK", []
+            raise AssertionError(f"Unsupported command: {command}")
+
+        def close(self):  # pragma: no cover - defensive
+            return
+
+        def logout(self):  # pragma: no cover - defensive
+            return
+
+    monkeypatch.setattr(
+        email_watcher_v2,
+        "_imap_client",
+        lambda *args, **kwargs: _FakeIMAP(),
+    )
+
+    responses, last_uid = email_watcher_v2._default_fetcher(
+        host="imap.test",
+        username="user@test",
+        password="secret",
+        mailbox="INBOX",
+        since=now,
+        workflow_ids=["wf-no-header"],
+    )
+
+    assert any(resp.message_id == "reply-no-header@procwise" for resp in responses)
+    assert last_uid == 150
+
+
+def test_default_fetcher_preserves_targeted_uids_when_trimming(monkeypatch):
+    now = datetime(2025, 10, 29, 9, 45, tzinfo=timezone.utc)
+    targeted_uid = 25
+    general_uids = list(range(1, 251))
+
+    targeted_message = EmailMessage()
+    targeted_message["Subject"] = "Re: RFQ details"
+    targeted_message["From"] = "supplier@example.com"
+    targeted_message["To"] = "buyer@example.com"
+    targeted_message["Message-ID"] = "<reply-priority@procwise>"
+    targeted_message.set_content("Attaching the latest pricing sheet.")
+    targeted_bytes = targeted_message.as_bytes()
+
+    general_payload = " ".join(str(uid) for uid in general_uids).encode()
+
+    class _FloodedIMAP:
+        def select(self, mailbox, readonly=True):  # pragma: no cover - trivial
+            return "OK", [b"1"]
+
+        def uid(self, command, charset, *criteria):
+            if command == "SEARCH":
+                tokens = [
+                    c.decode() if isinstance(c, bytes) else str(c)
+                    for c in criteria
+                ]
+                if "HEADER" in tokens and "X-ProcWise-Workflow-ID" in tokens:
+                    return "OK", [str(targeted_uid).encode()]
+                if tokens and tokens[0] == "SINCE" and "HEADER" not in tokens:
+                    return "OK", [general_payload]
+                if tokens and tokens[0] == "ALL":
+                    return "OK", [b""]
+                return "OK", [b""]
+            if command == "FETCH":
+                uid_token = charset
+                uid_value = int(uid_token.decode() if isinstance(uid_token, bytes) else str(uid_token))
+                if uid_value == targeted_uid:
+                    internal = f'1 (INTERNALDATE "29-Oct-2025 09:35:00 +0000" RFC822 {{{len(targeted_bytes)}}})'.encode()
+                    return "OK", [(internal, targeted_bytes)]
+                return "OK", []
+            raise AssertionError(f"Unsupported command: {command}")
+
+        def close(self):  # pragma: no cover - defensive
+            return
+
+        def logout(self):  # pragma: no cover - defensive
+            return
+
+    monkeypatch.setattr(
+        email_watcher_v2,
+        "_imap_client",
+        lambda *args, **kwargs: _FloodedIMAP(),
+    )
+
+    responses, _ = email_watcher_v2._default_fetcher(
+        host="imap.test",
+        username="user@test",
+        password="secret",
+        mailbox="INBOX",
+        since=now,
+        workflow_ids=["wf-priority"],
+    )
+
+    assert any(resp.message_id == "reply-priority@procwise" for resp in responses)
+
+
 @pytest.fixture(autouse=True)
 def _stub_response_coordinator(monkeypatch):
     class _Coordinator:

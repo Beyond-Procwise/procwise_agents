@@ -55,9 +55,16 @@ def _normalise_timestamp(value: Optional[datetime]) -> datetime:
     return value
 
 
-def _serialise_metadata(value: Optional[Dict[str, Any]]) -> Optional[str]:
-    if value in (None, {}, []):
+def _serialise_metadata(value: Any) -> Optional[str]:
+    if value in (None, "", {}, []):
         return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode()
+        except Exception:  # pragma: no cover - defensive
+            return None
     try:
         return json.dumps(value)
     except TypeError:
@@ -296,7 +303,10 @@ def _persist(workflow_id: str, payload: Dict[str, Any]) -> None:
                 cur.close()
                 return
             assignments = ", ".join(f"{col}=%s" for col in set_columns)
-            params = [payload.get(col) for col in set_columns] + [workflow_id]
+            params = [
+                _serialise_metadata(payload.get(col)) if col == "metadata" else payload.get(col)
+                for col in set_columns
+            ] + [workflow_id]
             cur.execute(
                 f"UPDATE proc.workflow_lifecycle SET {assignments} WHERE workflow_id=%s",
                 tuple(params),
@@ -304,7 +314,12 @@ def _persist(workflow_id: str, payload: Dict[str, Any]) -> None:
         else:
             insert_cols = ["workflow_id"] + [col for col in columns if col in payload]
             placeholders = ", ".join(["%s"] * len(insert_cols))
-            values = [workflow_id] + [payload.get(col) for col in insert_cols[1:]]
+            values = [workflow_id]
+            for col in insert_cols[1:]:
+                value = payload.get(col)
+                if col == "metadata":
+                    value = _serialise_metadata(value)
+                values.append(value)
             cur.execute(
                 f"INSERT INTO proc.workflow_lifecycle ({', '.join(insert_cols)}) VALUES ({placeholders})",
                 tuple(values),
