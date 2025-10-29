@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from config.settings import settings
 from services.event_bus import get_event_bus
-from services.redis_client import get_redis_client
+from services.redis_client import get_workflow_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +501,7 @@ def get_supplier_response_coordinator() -> BaseResponseCoordinator:
         if _COORDINATOR is not None:
             return _COORDINATOR
 
-        redis_client = get_redis_client()
+        redis_client = get_workflow_redis_client()
         if redis_client is not None:
             try:
                 _COORDINATOR = RedisResponseCoordinator(

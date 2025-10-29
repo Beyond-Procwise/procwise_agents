@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     )
 
     redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
+    workflow_redis_url: Optional[str] = Field(
+        default=None, env="WORKFLOW_REDIS_URL"
+    )
+    langcache_api_key: Optional[str] = Field(
+        default=None, env="LANGCACHE_API_KEY"
+    )
     redis_response_ttl_seconds: int = Field(
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
