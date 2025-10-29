@@ -798,7 +798,7 @@ def _default_fetcher(
     client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
     try:
         client.select(mailbox, readonly=True)
-        candidate_uids: Set[int] = set()
+        candidate_priorities: Dict[int, int] = {}
         workflow_tokens: List[str] = []
         if workflow_ids:
             for token in workflow_ids:
@@ -809,7 +809,22 @@ def _default_fetcher(
                     workflow_tokens.append(text)
         mailbox_header = str(mailbox_filter).strip() if mailbox_filter else ""
 
-        def _search_uids(*terms: str) -> None:
+        PRIORITY_RECENT = 0
+        PRIORITY_WORKFLOW = 1
+        PRIORITY_GENERAL = 2
+        PRIORITY_FALLBACK = 3
+
+        def _register_candidate(uid_value: Optional[int], priority: int) -> None:
+            if uid_value in (None, 0):
+                return
+            uid = int(uid_value)
+            if uid <= 0:
+                return
+            existing = candidate_priorities.get(uid)
+            if existing is None or priority < existing:
+                candidate_priorities[uid] = priority
+
+        def _search_uids(priority: int, *terms: str) -> None:
             search_terms = list(terms)
             if mailbox_header:
                 search_terms.extend(["HEADER", "X-ProcWise-Mailbox", mailbox_header])
@@ -829,29 +844,47 @@ def _default_fetcher(
                 else:
                     token = str(part)
                 if token.isdigit():
-                    candidate_uids.add(int(token))
+                    _register_candidate(int(token), priority)
 
         since_floor = since - timedelta(seconds=max(0, backtrack_seconds))
         since_str = since_floor.strftime("%d-%b-%Y")
 
         if last_seen_uid is not None:
-            _search_uids("UID", f"{last_seen_uid + 1}:*")
+            _search_uids(PRIORITY_RECENT, "UID", f"{last_seen_uid + 1}:*")
 
         if workflow_tokens:
             for token in workflow_tokens:
-                _search_uids("SINCE", since_str, "HEADER", "X-ProcWise-Workflow-ID", token)
-        else:
-            _search_uids("SINCE", since_str)
+                _search_uids(
+                    PRIORITY_WORKFLOW,
+                    "SINCE",
+                    since_str,
+                    "HEADER",
+                    "X-ProcWise-Workflow-ID",
+                    token,
+                )
 
-        if not candidate_uids:
-            _search_uids("ALL")
+        _search_uids(PRIORITY_GENERAL, "SINCE", since_str)
 
-        if not candidate_uids:
+        if not candidate_priorities:
+            _search_uids(PRIORITY_FALLBACK, "ALL")
+
+        if not candidate_priorities:
             return [], last_seen_uid
 
-        candidate_list = sorted(candidate_uids)
-        if max_uid_samples > 0 and len(candidate_list) > max_uid_samples:
-            candidate_list = candidate_list[-max_uid_samples:]
+        candidate_items = sorted(candidate_priorities.items())
+        if max_uid_samples > 0 and len(candidate_items) > max_uid_samples:
+            pinned = [
+                uid for uid, priority in candidate_items if priority <= PRIORITY_WORKFLOW
+            ]
+            remaining_capacity = max_uid_samples - len(pinned)
+            if remaining_capacity <= 0:
+                candidate_list = sorted(set(pinned))
+            else:
+                others = [uid for uid, priority in candidate_items if priority > PRIORITY_WORKFLOW]
+                selected_tail = others[-remaining_capacity:] if remaining_capacity > 0 else []
+                candidate_list = sorted(set(pinned + selected_tail))
+        else:
+            candidate_list = [uid for uid, _ in candidate_items]
 
         responses: List[EmailResponse] = []
         max_uid_value = last_seen_uid or 0
@@ -1898,7 +1931,7 @@ class EmailWatcherV2:
                     supplier_email=supplier_email,
                     rfq_id=email.rfq_id or best_dispatch.rfq_id,
                     response_text=plain_text or "",
-                    response_body=plain_text or "",
+                    response_body=email.body_html or plain_text or "",
                     received_time=email.received_at,
                     response_time=response_time,
                     response_message_id=email.message_id,
