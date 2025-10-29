@@ -1,5 +1,6 @@
 import json
 import logging
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -28,6 +29,24 @@ class RAGAgent(BaseAgent):
         "supplier_relationship_overview",
         "procurement_flow",
         "agent_relationship_summary",
+    )
+
+    _STRUCTURED_DOCUMENT_TYPES: Tuple[str, ...] = (
+        "spend_summary",
+        "contract_metadata",
+        "contract_register",
+        "supplier_kpi",
+        "supplier_scorecard",
+        "savings_pipeline",
+        "category_savings",
+        "invoice_register",
+        "payment_terms",
+    )
+
+    _MEMORY_DOCUMENT_TYPES: Tuple[str, ...] = (
+        "learning",
+        "conversation_memory",
+        "qa_memory",
     )
 
     def __init__(self, agent_nick):
@@ -119,8 +138,39 @@ class RAGAgent(BaseAgent):
                     search_hits.append(hit)
                     seen_ids.add(hit.id)
 
-        documents, knowledge_hits = self._categorize_hits(search_hits)
-        reranked_docs = self._rerank(query, documents, top_k) if documents else []
+        (
+            structured_docs,
+            narrative_docs,
+            knowledge_hits,
+            memory_docs,
+        ) = self._categorize_hits(search_hits)
+
+        structured_ranked = (
+            self._rerank(query, structured_docs, top_k) if structured_docs else []
+        )
+        narrative_ranked = (
+            self._rerank(query, narrative_docs, top_k) if narrative_docs else []
+        )
+        memory_ranked = (
+            self._rerank(query, memory_docs, min(top_k, 3)) if memory_docs else []
+        )
+
+        reranked_docs = self._merge_ranked_layers(
+            structured_ranked, narrative_ranked, top_k
+        )
+        supplementary_narrative = [
+            hit
+            for hit in narrative_ranked
+            if hit not in reranked_docs
+        ][: max(0, top_k - len(reranked_docs))]
+        full_document_set = reranked_docs + supplementary_narrative
+        structured_ids = {getattr(hit, "id", id(hit)) for hit in structured_ranked}
+        narrative_focus = [
+            hit
+            for hit in full_document_set
+            if getattr(hit, "id", id(hit)) not in structured_ids
+        ]
+
         knowledge_hits_sorted = (
             sorted(knowledge_hits, key=lambda h: getattr(h, "score", 0.0), reverse=True)[
                 :top_k
@@ -129,21 +179,41 @@ class RAGAgent(BaseAgent):
             else []
         )
 
-        if not reranked_docs and not knowledge_hits_sorted:
-            answer = "I could not find any relevant documents to answer your question."
-            history.append({"query": query, "answer": answer})
+        if not full_document_set and not knowledge_hits_sorted and not memory_ranked:
+            fallback_answer = (
+                "I could not find any relevant documents to answer your question."
+            )
+            default_followups = [
+                "Can you share additional details or data sources to search?",
+                "Should I widen the analysis to other spend categories?",
+                "Do you want me to escalate this to procurement operations?",
+            ]
+            formatted_answer = self._compose_final_answer(
+                query, fallback_answer, default_followups
+            )
+            primary_topic = "general"
+            history.append(
+                {
+                    "query": query,
+                    "answer": formatted_answer,
+                    "topic": primary_topic,
+                    "follow_up_questions": default_followups,
+                }
+            )
             self._save_chat_history(user_id, history, session_id)
             return {
-                "answer": answer,
-                "follow_up_questions": [],
+                "answer": formatted_answer,
+                "follow_up_questions": default_followups,
                 "retrieved_documents": [],
             }
 
-        document_context = self._build_document_context(reranked_docs)
+        structured_context = self._build_document_context(structured_ranked)
+        narrative_context = self._build_document_context(narrative_focus)
+        memory_context = self._build_document_context(memory_ranked)
         knowledge_summary, knowledge_payloads = self._build_knowledge_summary(
             knowledge_hits_sorted
         )
-        outline = self._build_context_outline(reranked_docs, knowledge_summary)
+        outline = self._build_context_outline(full_document_set, knowledge_summary)
         plan = self._generate_agentic_plan(query, outline, knowledge_summary)
 
         plan_text = plan.strip() if plan else (
@@ -160,18 +230,30 @@ class RAGAgent(BaseAgent):
             retrieved_sections.append(
                 f"KNOWLEDGE GRAPH INSIGHTS:\n{knowledge_summary.strip()}"
             )
-        if document_context:
-            retrieved_sections.append(f"DOCUMENT EXCERPTS:\n{document_context.strip()}")
+        if structured_context:
+            retrieved_sections.append(
+                f"STRUCTURED DATA:\n{structured_context.strip()}"
+            )
+        if narrative_context and narrative_context != structured_context:
+            retrieved_sections.append(
+                f"NARRATIVE INSIGHTS:\n{narrative_context.strip()}"
+            )
+        if memory_context:
+            retrieved_sections.append(
+                f"MEMORY NOTES:\n{memory_context.strip()}"
+            )
 
         context_block = "\n\n".join(retrieved_sections).strip()
         if not context_block:
             payload_snapshot = [
                 getattr(hit, "payload", {})
-                for hit in reranked_docs + knowledge_hits_sorted
+                for hit in full_document_set + knowledge_hits_sorted + memory_ranked
             ]
             context_block = self._truncate_text(
                 json.dumps(payload_snapshot, ensure_ascii=False)
             )
+
+        context_block = self._limit_context(context_block)
 
         conversation_context = self._format_recent_history(history, limit=3)
         if conversation_context:
@@ -180,19 +262,14 @@ class RAGAgent(BaseAgent):
             conversation_section = ""
 
         rag_prompt = (
-            "You are a helpful procurement assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
-            "the USER QUESTION. If you must rely on prior knowledge, limit it strictly to procurement topics and never infer "
-            "or manipulate customer-specific data beyond what is explicitly provided.\n\n"
+            "You are the ProcWise Procurement Intelligence Assistant. Use ONLY the provided RETRIEVED CONTENT to answer "
+            "the USER QUESTION. If information is missing, acknowledge the gap explicitly.\n\n"
             "Instructions:\n"
-            "1) Return a single plain string as the final answer. Do NOT return JSON, YAML, Markdown, lists, or any extra metadata — only the answer text.\n"
-            "2) If the context contains relevant information, provide a concise, human-readable answer that integrates any structured content into natural language.\n"
-            "3) If the context does not contain the answer, return exactly the following string (no extra text):\n"
-            "   I could not find any relevant information in the provided documents.\n"
-            "4) For any factual claims or new information derived from the retrieved content, append an inline citation immediately after the claim in this format: [Document ID: <id>] or for multiple documents [Document IDs: id1,id2].\n"
-            "5) If quoting text verbatim from the context, enclose the quote in double quotes and include the document ID citation after the quote.\n"
-            "6) Do NOT hallucinate, invent facts, or cite documents that were not present in the RETRIEVED CONTENT. If uncertain, state that the information is unclear and cite the relevant document(s).\n"
-            "7) Preserve numeric values, dates, currencies and units exactly as presented in the context.\n"
-            "8) Keep the answer concise (aim for one short paragraph in simple terms).\n\n"
+            "1) Respond with a concise procurement analysis (2-3 sentences) that delivers a complete, decision-ready insight.\n"
+            "2) Maintain a professional, data-aware tone.\n"
+            "3) Preserve numeric values, dates, currencies, and units exactly as presented.\n"
+            "4) If the context does not answer the question, reply exactly with: Unable to answer from the provided materials.\n"
+            "5) Do not fabricate suppliers, contracts, figures, or policies beyond the context.\n\n"
             f"AGENTIC PLAN:\n{plan_text}\n\n"
             f"CONTEXT OUTLINE:\n{outline_text}\n\n"
             f"{conversation_section}RETRIEVED CONTENT:\n{context_block}\n\nUSER QUESTION: {query}\n\nReturn only the final answer string below:\n"
@@ -206,7 +283,15 @@ class RAGAgent(BaseAgent):
             self.call_ollama, rag_prompt, model=answer_model
         )
         combined_context = "\n\n".join(
-            part for part in (outline, knowledge_summary, document_context) if part
+            part
+            for part in (
+                outline,
+                knowledge_summary,
+                structured_context,
+                narrative_context,
+                memory_context,
+            )
+            if part
         )
         follow_future = self._executor.submit(
             self._generate_followups, query, combined_context
@@ -215,14 +300,41 @@ class RAGAgent(BaseAgent):
         answer_resp = answer_future.result()
         followups = follow_future.result()
         answer = answer_resp.get("response", "I am sorry, I could not generate an answer.")
+        normalised_followups = self._normalise_followups(
+            query,
+            followups,
+            structured_ranked,
+            knowledge_hits_sorted,
+            memory_ranked,
+        )
+        final_answer = self._compose_final_answer(query, answer, normalised_followups)
+        primary_topic = self._determine_primary_topic(
+            full_document_set, knowledge_hits_sorted, memory_ranked
+        )
 
-        history.append({"query": query, "answer": answer})
+        history.append(
+            {
+                "query": query,
+                "answer": final_answer,
+                "topic": primary_topic,
+                "follow_up_questions": normalised_followups,
+            }
+        )
         self._save_chat_history(user_id, history, session_id)
 
         retrieved_payloads: List[Dict[str, Any]] = []
-        for hit in reranked_docs:
+        for hit in full_document_set:
             payload = getattr(hit, "payload", {}) or {}
-            retrieved_payloads.append(dict(payload))
+            payload_copy = dict(payload)
+            payload_copy.setdefault("topic", self._infer_topic(payload_copy))
+            retrieved_payloads.append(payload_copy)
+        for hit in memory_ranked:
+            payload = getattr(hit, "payload", {}) or {}
+            payload_copy = dict(payload)
+            payload_copy.setdefault("topic", self._infer_topic(payload_copy))
+            retrieved_payloads.append(payload_copy)
+        for payload in knowledge_payloads:
+            payload.setdefault("topic", self._infer_topic(payload))
         retrieved_payloads.extend(knowledge_payloads)
         if outline:
             retrieved_payloads.append(
@@ -233,13 +345,14 @@ class RAGAgent(BaseAgent):
                 {
                     "document_type": "knowledge_summary",
                     "summary": knowledge_summary,
+                    "topic": self._infer_topic({"document_type": "knowledge_summary"}),
                 }
             )
         result = AgentOutput(
             status=AgentStatus.SUCCESS,
             data={
-                "answer": answer,
-                "follow_up_questions": followups,
+                "answer": final_answer,
+                "follow_up_questions": normalised_followups,
                 "retrieved_documents": retrieved_payloads,
             },
             agentic_plan=plan_text,
@@ -274,6 +387,226 @@ class RAGAgent(BaseAgent):
         if filtered:
             return filtered
         return [hit for hit, _ in ranked[:top_k]]
+
+    def _merge_ranked_layers(
+        self, structured_hits: Sequence[Any], narrative_hits: Sequence[Any], limit: int
+    ) -> List[Any]:
+        """Merge structured and narrative hits giving priority to structured results."""
+
+        seen: set[Any] = set()
+        merged: List[Any] = []
+        for layer in (structured_hits, narrative_hits):
+            for hit in layer:
+                hit_id = getattr(hit, "id", None)
+                if hit_id is None:
+                    hit_id = id(hit)
+                if hit_id in seen:
+                    continue
+                merged.append(hit)
+                seen.add(hit_id)
+                if len(merged) >= limit:
+                    return merged[:limit]
+        return merged[:limit]
+
+    def _is_structured_payload(self, payload: Dict[str, Any]) -> bool:
+        """Heuristically determine if the payload represents structured data."""
+
+        doc_type = str(payload.get("document_type") or "").lower()
+        if doc_type in self._STRUCTURED_DOCUMENT_TYPES:
+            return True
+        structured_keys = {
+            "total_spend",
+            "total_value",
+            "total_value_gbp",
+            "savings",
+            "savings_value",
+            "contract_value",
+            "contract_end_date",
+            "kpi_score",
+            "rows",
+            "table",
+            "metrics",
+        }
+        if any(key in payload for key in structured_keys):
+            return True
+        if isinstance(payload.get("rows"), list):
+            return True
+        table_value = payload.get("table")
+        if isinstance(table_value, (list, dict)):
+            return True
+        return False
+
+    def _limit_context(self, text: str, max_chars: int | None = None) -> str:
+        """Enforce a maximum character length for the retrieval context."""
+
+        if not text:
+            return ""
+        limit = max_chars or getattr(self.settings, "rag_context_chars", 6000)
+        limit = max(1000, int(limit))
+        if len(text) <= limit:
+            return text
+        truncated = text[:limit]
+        if "\n" in truncated:
+            truncated = truncated.rsplit("\n", 1)[0]
+        return truncated.strip()
+
+    def _compose_final_answer(
+        self, query: str, answer: str, followups: Sequence[str]
+    ) -> str:
+        """Format the final response using the ProcWise Q&A template."""
+
+        clean_answer = (answer or "Unable to answer from the provided materials.").strip()
+        if not clean_answer:
+            clean_answer = "Unable to answer from the provided materials."
+        lines = [f"Q: {query.strip()}", "", f"A: {clean_answer}", "", "Suggested Follow-Up Prompts:"]
+        for item in followups:
+            lines.append(f"- {item.strip()}")
+        return "\n".join(lines).strip()
+
+    def _normalise_followups(
+        self,
+        query: str,
+        followups: Sequence[str],
+        structured_hits: Sequence[Any],
+        knowledge_hits: Sequence[Any],
+        memory_hits: Sequence[Any],
+    ) -> List[str]:
+        """Ensure exactly three high-quality follow-up questions."""
+
+        cleaned: List[str] = []
+        for item in followups or []:
+            if not isinstance(item, str):
+                continue
+            candidate = item.strip().lstrip("-• ").strip()
+            if not candidate:
+                continue
+            if candidate not in cleaned:
+                cleaned.append(candidate)
+            if len(cleaned) == 3:
+                break
+
+        topic = self._determine_primary_topic(structured_hits, knowledge_hits, memory_hits)
+        template_candidates = self._topic_followups(topic)
+        for candidate in template_candidates:
+            if len(cleaned) >= 3:
+                break
+            if candidate not in cleaned:
+                cleaned.append(candidate)
+
+        while len(cleaned) < 3:
+            fallback = "What additional detail would help you act on this insight?"
+            if fallback in cleaned:
+                fallback = f"Which next step should we take for {topic or 'this area'}?"
+            cleaned.append(fallback)
+
+        return cleaned[:3]
+
+    def _topic_followups(self, topic: str | None) -> List[str]:
+        """Return template follow-ups aligned to the inferred topic."""
+
+        templates: Dict[str, List[str]] = {
+            "savings": [
+                "How does this compare with last year's savings delivery?",
+                "Which categories contributed most to the savings so far?",
+                "What savings remain in the pipeline and when will they land?",
+            ],
+            "supplier": [
+                "Are there performance concerns or KPIs trending negatively?",
+                "Do we have alternative suppliers to diversify this category?",
+                "Should we schedule a supplier review or QBR?",
+            ],
+            "contracts": [
+                "Which contracts are up for renewal in the next quarter?",
+                "Do any terms require CFO exception or escalation?",
+                "Are we aligned on compliance with agreed payment terms?",
+            ],
+            "spend": [
+                "What is the trend versus last year for this spend area?",
+                "Which suppliers drive the majority of this spend?",
+                "Do we have opportunities to consolidate vendors?",
+            ],
+            "compliance": [
+                "Are there open actions to remediate the compliance gaps?",
+                "Who owns the follow-up for policy adherence?",
+                "Do we need to escalate this risk to governance?",
+            ],
+            "risk": [
+                "What mitigation steps are in place for the highlighted risk?",
+                "Is there exposure to supplier failure or service disruption?",
+                "Should we update the risk register for this item?",
+            ],
+        }
+        if topic and topic in templates:
+            return templates[topic]
+        # Default procurement follow-ups
+        return [
+            "Do you want to drill into the category drivers behind this insight?",
+            "Should we review supplier performance before the next cycle?",
+            "Would trend analysis over the past year be helpful?",
+        ]
+
+    def _determine_primary_topic(
+        self,
+        docs: Sequence[Any],
+        knowledge_hits: Sequence[Any],
+        memory_hits: Sequence[Any],
+    ) -> str:
+        """Infer the dominant topic from retrieved payloads."""
+
+        topics: List[str] = []
+        for collection in (docs, knowledge_hits, memory_hits):
+            for hit in collection:
+                payload = getattr(hit, "payload", {}) or {}
+                topic = self._infer_topic(payload)
+                if topic:
+                    topics.append(topic)
+        if not topics:
+            return "general"
+        counter = Counter(topics)
+        return counter.most_common(1)[0][0]
+
+    def _infer_topic(self, payload: Dict[str, Any]) -> str:
+        """Map document metadata to a procurement topic label."""
+
+        doc_type = str(payload.get("document_type") or "").lower()
+        topic_map = {
+            "savings_pipeline": "savings",
+            "category_savings": "savings",
+            "savings_summary": "savings",
+            "spend_summary": "spend",
+            "spend_analysis": "spend",
+            "supplier_kpi": "supplier",
+            "supplier_scorecard": "supplier",
+            "supplier_relationship": "supplier",
+            "supplier_flow": "supplier",
+            "contract_metadata": "contracts",
+            "contract_register": "contracts",
+            "payment_terms": "contracts",
+            "policy": "compliance",
+            "compliance": "compliance",
+            "risk_register": "risk",
+            "risk": "risk",
+            "knowledge_summary": "knowledge",
+        }
+        if doc_type in topic_map:
+            return topic_map[doc_type]
+        if "savings" in doc_type:
+            return "savings"
+        if any(keyword in doc_type for keyword in ("supplier", "kpi")):
+            return "supplier"
+        if "contract" in doc_type:
+            return "contracts"
+        if "policy" in doc_type or "compliance" in doc_type:
+            return "compliance"
+        if "spend" in doc_type:
+            return "spend"
+        if "risk" in doc_type:
+            return "risk"
+        if "invoice" in doc_type:
+            return "spend"
+        if "learning" in doc_type or payload.get("source") == "memory":
+            return "memory"
+        return "general"
 
     def _expand_query(self, query: str) -> list:
         """Generate alternative phrasings to boost retrieval recall."""
@@ -403,11 +736,15 @@ class RAGAgent(BaseAgent):
                 f"ERROR: Could not save chat history to S3 bucket '{bucket_name}'. {e}"
             )
 
-    def _categorize_hits(self, hits: Sequence[Any]) -> Tuple[List[Any], List[Any]]:
-        """Separate regular document hits from knowledge-graph centric hits."""
+    def _categorize_hits(
+        self, hits: Sequence[Any]
+    ) -> Tuple[List[Any], List[Any], List[Any], List[Any]]:
+        """Separate hits into structured, narrative, knowledge, and memory layers."""
 
-        documents: List[Any] = []
+        structured: List[Any] = []
+        narrative: List[Any] = []
         knowledge: List[Any] = []
+        memory: List[Any] = []
         for hit in hits:
             payload = getattr(hit, "payload", {}) or {}
             doc_type = str(payload.get("document_type") or "").lower()
@@ -429,9 +766,15 @@ class RAGAgent(BaseAgent):
                 )
             ):
                 knowledge.append(hit)
+                continue
+            if doc_type in self._MEMORY_DOCUMENT_TYPES or payload.get("source") == "memory":
+                memory.append(hit)
+                continue
+            if self._is_structured_payload(payload):
+                structured.append(hit)
             else:
-                documents.append(hit)
-        return documents, knowledge
+                narrative.append(hit)
+        return structured, narrative, knowledge, memory
 
     def _search_learning_context(
         self, queries: Sequence[str], top_k: int

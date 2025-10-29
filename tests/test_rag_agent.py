@@ -37,7 +37,7 @@ def test_rag_agent_applies_filters(monkeypatch):
     agent._expand_query = lambda q: []
     agent._load_chat_history = lambda u, s=None: []
     agent._save_chat_history = lambda u, h, s=None: None
-    agent.call_ollama = lambda prompt, model: {"response": "ans"}
+    agent.call_ollama = lambda *args, **kwargs: {"response": "ans"}
     agent._generate_followups = lambda q, c: []
 
     agent.run("q", "u", doc_type="Invoice")
@@ -105,14 +105,23 @@ def test_rag_agent_generates_agentic_plan(monkeypatch):
     agent._expand_query = lambda q: []
     agent._load_chat_history = lambda u, s=None: []
     agent._save_chat_history = lambda u, h, s=None: None
-    agent.call_ollama = lambda prompt, model, format=None: {"response": "Final answer"}
+    agent.call_ollama = (
+        lambda *args, **kwargs: {"response": "Final answer"}
+    )
     agent._generate_followups = lambda q, c: ["Next step"]
 
     result = agent.run("How is Supplier One performing?", "user-1")
 
     assert isinstance(result, rag_module.AgentOutput)
-    assert result.data["answer"] == "Final answer"
-    assert result.data["follow_up_questions"] == ["Next step"]
+    answer = result.data["answer"]
+    assert answer.startswith("Q: How is Supplier One performing?")
+    assert "A: Final answer" in answer
+    assert "Suggested Follow-Up Prompts:" in answer
+    assert answer.count("- ") >= 3
+
+    followups = result.data["follow_up_questions"]
+    assert len(followups) == 3
+    assert followups[0] == "Next step"
 
     retrieved = result.data["retrieved_documents"]
     knowledge_entry = next(
@@ -122,6 +131,7 @@ def test_rag_agent_generates_agentic_plan(monkeypatch):
     )
     assert "Supplier One" in knowledge_entry["summary"]
     assert "coverage" in knowledge_entry["summary"].lower()
+    assert knowledge_entry.get("topic") == "knowledge"
     assert captured_plan["knowledge_summary"]
     assert "Supplier One" in captured_plan["knowledge_summary"]
     assert "Invoice" in captured_plan["outline"]
