@@ -473,7 +473,7 @@ class EmailDispatchService:
                                 message_id=message_id,
                                 dispatched_at=datetime.now(timezone.utc),
                                 subject=subject,
-                                status="sent",
+                                status="completed",
                             )
                         except Exception:  # pragma: no cover - defensive logging
                             logger.exception(
