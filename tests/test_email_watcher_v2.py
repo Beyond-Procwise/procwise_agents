@@ -598,8 +598,8 @@ def test_email_watcher_stops_when_negotiation_completed():
 
     result = watcher.wait_and_collect_responses(workflow_id)
 
-    assert result["complete"] is True
-    assert result["workflow_status"] == "negotiation_completed"
+    assert result["complete"] is False
+    assert result["workflow_status"] == "negotiation_completed_pending_responses"
     assert result["timeout_reached"] is False
     lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_id)
     assert lifecycle is not None
@@ -608,7 +608,55 @@ def test_email_watcher_stops_when_negotiation_completed():
     metadata = lifecycle.get("metadata") or {}
     assert metadata.get("stop_reason") == "negotiation_completed"
     assert metadata.get("negotiation_completed") is True
+    assert metadata.get("status") == "incomplete"
 
+
+def test_email_watcher_flags_completed_negotiation_with_pending_responses():
+    workflow_id = "wf-negotiation-pending-responses"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    workflow_lifecycle_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_lifecycle_repo.reset_workflow(workflow_id)
+    workflow_lifecycle_repo.record_supplier_agent_status(
+        workflow_id, "awaiting_responses"
+    )
+    workflow_lifecycle_repo.record_negotiation_status(workflow_id, "completed")
+
+    now = datetime.now(timezone.utc)
+    unique_id = generate_unique_email_id(workflow_id, "sup-outstanding")
+
+    watcher = EmailWatcherV2(
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=1,
+        email_fetcher=lambda **_: [],
+        sleep=lambda _: None,
+        now=lambda: now,
+        max_total_wait_seconds=30,
+    )
+
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-outstanding",
+                "supplier_email": "pending@example.com",
+                "message_id": "<dispatch-pending>",
+                "subject": "Request for negotiation",
+                "dispatched_at": now,
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is False
+    assert result["workflow_status"] == "negotiation_completed_pending_responses"
+    assert result["pending_unique_ids"] == [unique_id]
+    assert result["pending_suppliers"] == ["sup-outstanding"]
 
 def test_email_watcher_v2_matches_legacy_bracketed_message_id(tmp_path):
     workflow_id = "wf-legacy-thread"
