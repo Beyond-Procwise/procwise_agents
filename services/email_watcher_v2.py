@@ -20,13 +20,14 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from difflib import SequenceMatcher
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
 from repositories import (
+    draft_rfq_emails_repo,
     email_dispatch_repo,
     email_watcher_state_repo,
     supplier_interaction_repo,
@@ -179,6 +180,8 @@ class WorkflowTracker:
     rfq_index: Dict[str, List[str]] = field(default_factory=dict)
     supplier_unique_map: Dict[str, Set[str]] = field(default_factory=dict)
     expected_supplier_ids: Set[str] = field(default_factory=set)
+    expected_unique_ids: Set[str] = field(default_factory=set)
+    placeholder_unique_ids: Set[str] = field(default_factory=set)
     all_dispatched: bool = False
     all_responded: bool = False
     last_dispatched_at: Optional[datetime] = None
@@ -192,9 +195,21 @@ class WorkflowTracker:
     seen_fingerprints: Set[str] = field(default_factory=set)
     status: str = "initializing"
 
+    def _refresh_dispatch_state(self) -> None:
+        actual_unique_ids = {
+            unique_id for unique_id, records in self.email_records.items() if records
+        }
+        self.dispatched_count = len(actual_unique_ids)
+        if self.expected_unique_ids:
+            self.all_dispatched = self.expected_unique_ids.issubset(actual_unique_ids)
+        else:
+            self.all_dispatched = bool(actual_unique_ids)
+
     def register_dispatches(self, dispatches: Iterable[EmailDispatchRecord]) -> None:
         for dispatch in dispatches:
             bucket = self.email_records.setdefault(dispatch.unique_id, [])
+            if dispatch.unique_id in self.placeholder_unique_ids:
+                self.placeholder_unique_ids.discard(dispatch.unique_id)
             bucket.append(dispatch)
             bucket.sort(key=lambda item: item.dispatched_at or datetime.min)
             supplier_key = dispatch.supplier_id or ""
@@ -203,6 +218,7 @@ class WorkflowTracker:
                 self.supplier_unique_map.setdefault(supplier_key, set()).add(
                     dispatch.unique_id
                 )
+            self.expected_unique_ids.add(dispatch.unique_id)
             if dispatch.round_number is not None:
                 self.round_index[dispatch.unique_id] = dispatch.round_number
             if dispatch.rfq_id:
@@ -217,11 +233,43 @@ class WorkflowTracker:
                 self.started_at is None or dispatch.dispatched_at < self.started_at
             ):
                 self.started_at = dispatch.dispatched_at
-        self.dispatched_count = len(self.email_records)
+        self._refresh_dispatch_state()
         supplier_total = len(self.expected_supplier_ids)
         if supplier_total > self.expected_responses:
             self.expected_responses = supplier_total
-        self.all_dispatched = True
+        self.all_responded = self.responded_count >= self.expected_responses > 0
+
+    def register_expected_unique_ids(
+        self,
+        unique_ids: Iterable[str],
+        supplier_index: Optional[Mapping[str, Optional[str]]] = None,
+    ) -> None:
+        supplier_index = supplier_index or {}
+        updated = False
+        for unique_id in unique_ids:
+            uid = str(unique_id).strip()
+            if not uid:
+                continue
+            if uid not in self.expected_unique_ids:
+                self.expected_unique_ids.add(uid)
+                updated = True
+            supplier_hint = supplier_index.get(uid)
+            if supplier_hint:
+                supplier_key = str(supplier_hint).strip()
+                if supplier_key:
+                    self.expected_supplier_ids.add(supplier_key)
+                    self.supplier_unique_map.setdefault(supplier_key, set()).add(uid)
+            if uid not in self.email_records:
+                self.email_records[uid] = []
+                self.placeholder_unique_ids.add(uid)
+        if updated:
+            self.expected_responses = max(
+                self.expected_responses,
+                len(self.expected_unique_ids),
+                len(self.expected_supplier_ids),
+                self.responded_count,
+            )
+        self._refresh_dispatch_state()
         self.all_responded = self.responded_count >= self.expected_responses > 0
 
     def record_response(self, unique_id: str, response: EmailResponse) -> None:
@@ -257,7 +305,11 @@ class WorkflowTracker:
             return
         if value < 0:
             value = 0
-        self.expected_responses = max(value, self.responded_count)
+        minimum = max(
+            len(self.expected_unique_ids),
+            len(self.expected_supplier_ids),
+        )
+        self.expected_responses = max(value, self.responded_count, minimum)
         self.all_responded = self.responded_count >= self.expected_responses > 0
 
     def latest_response(self, unique_id: str) -> Optional[EmailResponse]:
@@ -884,6 +936,14 @@ def _calculate_match_score(
     matched_on: List[str] = []
     score = 0.0
 
+    WORKFLOW_WEIGHT = 0.6
+    UNIQUE_WEIGHT = 0.2
+    SUPPLIER_WEIGHT = 0.1
+    ROUND_WEIGHT = 0.1
+    THREAD_WEIGHT = 0.5
+    SUBJECT_WEIGHT = 0.3
+    SUBJECT_SIMILARITY_THRESHOLD = 0.6
+
     def _normalise(value: Optional[object]) -> Optional[str]:
         if value in (None, ""):
             return None
@@ -910,7 +970,7 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_workflow and dispatch_workflow in workflow_candidates:
-        score += 0.6
+        score += WORKFLOW_WEIGHT
         matched_on.append("workflow_id")
 
     dispatch_unique = _normalise(dispatch.unique_id)
@@ -929,7 +989,7 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_unique and dispatch_unique in unique_candidates:
-        score += 0.2
+        score += UNIQUE_WEIGHT
         matched_on.append("unique_id")
 
     supplier_candidates = {
@@ -942,12 +1002,28 @@ def _calculate_match_score(
     }
     dispatch_supplier = _normalise(dispatch.supplier_id)
     if dispatch_supplier and dispatch_supplier in supplier_candidates:
-        score += 0.1
+        score += SUPPLIER_WEIGHT
         matched_on.append("supplier_id")
 
+    dispatch_round = _coerce_round_number(dispatch.round_number)
+    response_round = _coerce_round_number(email_response.round_number)
+    if response_round is None:
+        for candidate in _collect_header_values("x-procwise-round"):
+            candidate_round = _coerce_round_number(candidate)
+            if candidate_round is not None:
+                response_round = candidate_round
+                break
+    if (
+        dispatch_round is not None
+        and response_round is not None
+        and dispatch_round == response_round
+    ):
+        score += ROUND_WEIGHT
+        matched_on.append("round")
+
     subject_similarity = _subject_similarity(dispatch.subject, email_response.subject)
-    if subject_similarity >= 0.7:
-        score += 0.1
+    if subject_similarity >= SUBJECT_SIMILARITY_THRESHOLD:
+        score += SUBJECT_WEIGHT * subject_similarity
         matched_on.append("subject_similarity")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
@@ -958,8 +1034,10 @@ def _calculate_match_score(
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
     if dispatch.message_id and dispatch.message_id in reply_headers:
+        score += THREAD_WEIGHT
         matched_on.append("in_reply_to")
     elif thread_ids & reply_headers:
+        score += THREAD_WEIGHT
         matched_on.append("thread_reference")
 
     return min(score, 1.0), matched_on
@@ -1196,7 +1274,9 @@ class EmailWatcherV2:
         return tracker
 
     def _register_expected_with_coordinator(self, tracker: WorkflowTracker) -> None:
-        unique_ids = list(tracker.email_records.keys())
+        unique_ids = sorted(
+            set(tracker.email_records.keys()) | tracker.expected_unique_ids
+        )
         if not unique_ids:
             return
         try:
@@ -1226,8 +1306,26 @@ class EmailWatcherV2:
         """Refresh the expected response count from the dispatch repository."""
 
         confirmed = False
+        draft_unique_ids: Set[str] = set()
+        supplier_index: Dict[str, Optional[str]] = {}
         try:
-            expected_total = email_dispatch_repo.count_completed_supplier_dispatches(
+            draft_unique_ids, supplier_index, _ = (
+                draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
+                    workflow_id=tracker.workflow_id
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to load drafted email expectations for workflow=%s",
+                tracker.workflow_id,
+            )
+        if draft_unique_ids:
+            tracker.register_expected_unique_ids(draft_unique_ids, supplier_index)
+
+        expected_from_drafts = len(tracker.expected_unique_ids)
+
+        try:
+            dispatch_total = email_dispatch_repo.count_completed_supplier_dispatches(
                 tracker.workflow_id
             )
         except Exception:
@@ -1235,7 +1333,7 @@ class EmailWatcherV2:
                 "Failed to load completed dispatch count for workflow=%s",
                 tracker.workflow_id,
             )
-            expected_total = None
+            dispatch_total = None
 
         fallback = max(len(tracker.expected_supplier_ids), tracker.dispatched_count)
 
@@ -1302,8 +1400,11 @@ class EmailWatcherV2:
             logger.info(json.dumps(safe_payload))
 
     def _pending_unique_ids(self, tracker: WorkflowTracker) -> List[str]:
+        known_unique_ids = set(tracker.email_records.keys()) | set(
+            tracker.expected_unique_ids
+        )
         return sorted(
-            uid for uid in tracker.email_records if uid not in tracker.responded_unique_ids
+            uid for uid in known_unique_ids if uid not in tracker.responded_unique_ids
         )
 
     def _pending_suppliers(
@@ -1815,7 +1916,8 @@ class EmailWatcherV2:
     def wait_and_collect_responses(self, workflow_id: str) -> Dict[str, object]:
         tracker = self._ensure_tracker(workflow_id)
         self._archive_other_rounds(tracker)
-        if tracker.dispatched_count == 0:
+        initial_confirmed = self._sync_expected_response_count(tracker)
+        if tracker.dispatched_count == 0 and not tracker.expected_unique_ids:
             self._update_watcher_state(
                 tracker,
                 "completed",
@@ -1894,7 +1996,9 @@ class EmailWatcherV2:
         try:
             watcher_start_at = self._now()
             self._update_idle_deadline(tracker, watcher_start_at)
-            expected_confirmed = self._sync_expected_response_count(tracker)
+            expected_confirmed = initial_confirmed
+            if not expected_confirmed:
+                expected_confirmed = self._sync_expected_response_count(tracker)
             pending_unique_ids = self._pending_unique_ids(tracker)
             pending_suppliers = self._pending_suppliers(tracker, pending_unique_ids)
             tracker.status = "initializing"
