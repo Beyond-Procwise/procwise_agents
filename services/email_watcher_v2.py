@@ -936,6 +936,14 @@ def _calculate_match_score(
     matched_on: List[str] = []
     score = 0.0
 
+    WORKFLOW_WEIGHT = 0.6
+    UNIQUE_WEIGHT = 0.2
+    SUPPLIER_WEIGHT = 0.1
+    ROUND_WEIGHT = 0.1
+    THREAD_WEIGHT = 0.5
+    SUBJECT_WEIGHT = 0.3
+    SUBJECT_SIMILARITY_THRESHOLD = 0.6
+
     def _normalise(value: Optional[object]) -> Optional[str]:
         if value in (None, ""):
             return None
@@ -962,7 +970,7 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_workflow and dispatch_workflow in workflow_candidates:
-        score += 0.6
+        score += WORKFLOW_WEIGHT
         matched_on.append("workflow_id")
 
     dispatch_unique = _normalise(dispatch.unique_id)
@@ -981,7 +989,7 @@ def _calculate_match_score(
         if value is not None
     }
     if dispatch_unique and dispatch_unique in unique_candidates:
-        score += 0.2
+        score += UNIQUE_WEIGHT
         matched_on.append("unique_id")
 
     supplier_candidates = {
@@ -994,12 +1002,28 @@ def _calculate_match_score(
     }
     dispatch_supplier = _normalise(dispatch.supplier_id)
     if dispatch_supplier and dispatch_supplier in supplier_candidates:
-        score += 0.1
+        score += SUPPLIER_WEIGHT
         matched_on.append("supplier_id")
 
+    dispatch_round = _coerce_round_number(dispatch.round_number)
+    response_round = _coerce_round_number(email_response.round_number)
+    if response_round is None:
+        for candidate in _collect_header_values("x-procwise-round"):
+            candidate_round = _coerce_round_number(candidate)
+            if candidate_round is not None:
+                response_round = candidate_round
+                break
+    if (
+        dispatch_round is not None
+        and response_round is not None
+        and dispatch_round == response_round
+    ):
+        score += ROUND_WEIGHT
+        matched_on.append("round")
+
     subject_similarity = _subject_similarity(dispatch.subject, email_response.subject)
-    if subject_similarity >= 0.7:
-        score += 0.1
+    if subject_similarity >= SUBJECT_SIMILARITY_THRESHOLD:
+        score += SUBJECT_WEIGHT * subject_similarity
         matched_on.append("subject_similarity")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
@@ -1010,8 +1034,10 @@ def _calculate_match_score(
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
     if dispatch.message_id and dispatch.message_id in reply_headers:
+        score += THREAD_WEIGHT
         matched_on.append("in_reply_to")
     elif thread_ids & reply_headers:
+        score += THREAD_WEIGHT
         matched_on.append("thread_reference")
 
     return min(score, 1.0), matched_on
