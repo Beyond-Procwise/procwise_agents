@@ -1628,7 +1628,8 @@ class EmailWatcherV2:
         matched_rows: List[SupplierResponseRow] = []
         threshold = max(self.match_threshold, 0.75)
         for email in responses:
-            message_id = email.message_id or ""
+            message_id_raw = email.message_id or ""
+            message_id = message_id_raw.strip()
             fingerprint = _response_fingerprint(email)
             if message_id and message_id in tracker.seen_message_ids:
                 logger.debug(
@@ -1637,7 +1638,11 @@ class EmailWatcherV2:
                     message_id,
                 )
                 continue
-            if fingerprint and fingerprint in tracker.seen_fingerprints:
+            if (
+                fingerprint
+                and not message_id
+                and fingerprint in tracker.seen_fingerprints
+            ):
                 logger.debug(
                     "EmailWatcher deduped fingerprint workflow=%s fingerprint=%s",
                     tracker.workflow_id,
