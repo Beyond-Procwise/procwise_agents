@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script for data extraction improvements.
-Run: python test_extraction.py
+Run: python tools_manual_extraction_runner.py
 """
 
 import json
