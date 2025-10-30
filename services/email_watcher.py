@@ -1027,6 +1027,21 @@ class EmailWatcher:
                     processed=False,
                 )
                 supplier_response_repo.insert_response(response_row)
+                if tracker.workflow_id:
+                    responded_at = email_response.received_at or datetime.now(timezone.utc)
+                    try:
+                        tracking_repo.mark_response(
+                            workflow_id=tracker.workflow_id,
+                            unique_id=matched_id,
+                            responded_at=responded_at,
+                            response_message_id=email_response.message_id,
+                        )
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to mark workflow email tracking responded workflow=%s unique_id=%s",
+                            tracker.workflow_id,
+                            matched_id,
+                        )
                 matched_rows.append(response_row)
             else:
                 logger.warning(
