@@ -98,10 +98,10 @@ def test_watcher_waits_until_dispatch_complete(monkeypatch):
         def __init__(self, *args, **kwargs):
             instantiated["count"] += 1
 
-        def wait_and_collect_responses(self, workflow_id):  # pragma: no cover - should not be called
+        def wait_for_responses(self, workflow_id):  # pragma: no cover - should not be called
             return {}
 
-    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+    monkeypatch.setattr(email_watcher_service, "EmailWatcher", _FakeWatcher)
 
     os.environ["IMAP_HOST"] = "imap.test"
     os.environ["IMAP_USERNAME"] = "user@test"
@@ -143,10 +143,10 @@ def test_watcher_waits_when_message_id_missing(monkeypatch):
         def __init__(self, *args, **kwargs):  # pragma: no cover - should not run
             instantiated["count"] += 1
 
-        def wait_and_collect_responses(self, workflow_id):  # pragma: no cover - should not run
+        def wait_for_responses(self, workflow_id):  # pragma: no cover - should not run
             return {}
 
-    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+    monkeypatch.setattr(email_watcher_service, "EmailWatcher", _FakeWatcher)
 
     result = email_watcher_service.run_email_watcher_for_workflow(workflow_id="wf-test", run_id=None)
 
@@ -185,10 +185,10 @@ def test_watcher_waits_without_expected_dispatches(monkeypatch):
         def __init__(self, *args, **kwargs):  # pragma: no cover - should not instantiate
             instantiated["count"] += 1
 
-        def wait_and_collect_responses(self, workflow_id):  # pragma: no cover - should not run
+        def wait_for_responses(self, workflow_id):  # pragma: no cover - should not run
             return {}
 
-    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+    monkeypatch.setattr(email_watcher_service, "EmailWatcher", _FakeWatcher)
 
     result = email_watcher_service.run_email_watcher_for_workflow(workflow_id="wf-test", run_id=None)
 
@@ -237,7 +237,7 @@ def test_run_email_watcher_uses_agent_registry(monkeypatch):
             captured["supplier_agent"] = supplier_agent
             captured["negotiation_agent"] = negotiation_agent
 
-        def wait_and_collect_responses(self, workflow_id):
+        def wait_for_responses(self, workflow_id):
             return {
                 "complete": False,
                 "dispatched_count": 1,
@@ -245,7 +245,7 @@ def test_run_email_watcher_uses_agent_registry(monkeypatch):
                 "matched_responses": {},
             }
 
-    monkeypatch.setattr(email_watcher_service, "EmailWatcherV2", _FakeWatcher)
+    monkeypatch.setattr(email_watcher_service, "EmailWatcher", _FakeWatcher)
 
     supplier_agent = object()
     negotiation_agent = object()

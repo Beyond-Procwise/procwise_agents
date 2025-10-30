@@ -70,6 +70,8 @@ class _FakeCursor:
         ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
             self._store.ensure_tables()
             return
+        if upper_stmt.startswith("CREATE SEQUENCE IF NOT EXISTS PROC.SUPPLIER_RESPONSE_ID_SEQ"):
+            return
         if upper_stmt.startswith("WITH RANKED AS"):
             # Deduplication CTE is a no-op in the in-memory store.
             return
