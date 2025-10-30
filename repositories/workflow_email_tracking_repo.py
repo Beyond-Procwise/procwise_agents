@@ -252,18 +252,31 @@ def load_active_workflow_ids() -> List[str]:
 
     with get_conn() as conn:
         cur = conn.cursor()
-        query = (
-            "SELECT workflow_id "
-            "FROM proc.workflow_email_tracking "
-            "GROUP BY workflow_id "
-            "HAVING "
-            "    BOOL_OR(responded_at IS NULL OR COALESCE(matched, FALSE) = FALSE) "
-            "    AND BOOL_AND(dispatched_at IS NOT NULL)"
+        cur.execute(
+            "SELECT DISTINCT workflow_id FROM proc.workflow_email_tracking"
         )
-        cur.execute(query)
-        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        workflow_rows = [row[0] for row in cur.fetchall() if row and row[0]]
         cur.close()
-        return rows
+
+    active: List[str] = []
+    for workflow_id in workflow_rows:
+        rows = load_workflow_rows(workflow_id=str(workflow_id))
+        if not rows:
+            continue
+        has_pending = any(
+            (row.responded_at is None) or (not bool(row.matched)) for row in rows
+        )
+        if not has_pending:
+            continue
+        all_dispatched = all(row.dispatched_at is not None for row in rows)
+        if not all_dispatched:
+            continue
+        all_message_ids = all((row.message_id or "").strip() for row in rows)
+        if not all_message_ids:
+            continue
+        active.append(str(workflow_id))
+
+    return active
 
 
 def _serialise_thread_headers(headers: Optional[Dict[str, Sequence[str]]]) -> Optional[str]:

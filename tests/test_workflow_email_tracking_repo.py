@@ -87,7 +87,7 @@ def _make_dispatch(
     )
 
 
-def test_active_workflows_include_dispatches_without_message_id():
+def test_active_workflows_skip_dispatches_without_message_id():
     workflow_id = "wf-init"
     now = datetime.now(timezone.utc)
 
@@ -108,7 +108,7 @@ def test_active_workflows_include_dispatches_without_message_id():
 
     rows = load_workflow_rows(workflow_id=workflow_id)
     assert rows and rows[0].message_id is None
-    assert workflow_id in load_active_workflow_ids()
+    assert workflow_id not in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
 
@@ -151,7 +151,7 @@ def test_dispatch_key_optional_and_persisted():
             )
         ],
     )
-    assert workflow_id in load_active_workflow_ids()
+    assert workflow_id not in load_active_workflow_ids()
 
     # Updating the dispatch metadata keeps the workflow active.
     record_dispatches(
@@ -183,13 +183,13 @@ def test_active_workflows_require_all_dispatches_to_complete():
             _make_dispatch(
                 workflow_id=workflow_id,
                 unique_id="uid-1",
-                message_id=None,
+                message_id="mid-1",
                 dispatched_at=now,
             ),
             _make_dispatch(
                 workflow_id=workflow_id,
                 unique_id="uid-2",
-                message_id=None,
+                message_id="mid-2",
                 dispatched_at=now,
             ),
         ],
