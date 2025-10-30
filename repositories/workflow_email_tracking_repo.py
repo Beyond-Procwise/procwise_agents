@@ -50,6 +50,7 @@ class WorkflowDispatchRow:
     supplier_email: Optional[str] = None
     message_id: Optional[str] = None
     subject: Optional[str] = None
+    round_number: Optional[int] = None
     dispatch_key: Optional[str] = None
     responded_at: Optional[datetime] = None
     response_message_id: Optional[str] = None
@@ -189,6 +190,12 @@ def init_schema() -> None:
                 ADD COLUMN IF NOT EXISTS dispatch_key TEXT
             """
         )
+        cur.execute(
+            """
+            ALTER TABLE proc.workflow_email_tracking
+                ADD COLUMN IF NOT EXISTS round_number INTEGER
+            """
+        )
         _ensure_primary_key(cur)
         cur.execute(
             """
@@ -291,15 +298,16 @@ def record_dispatches(
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.workflow_email_tracking "
-            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
+            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (workflow_id, unique_id) DO UPDATE SET "
             "dispatch_key=EXCLUDED.dispatch_key, "
             "supplier_id=EXCLUDED.supplier_id, "
             "supplier_email=EXCLUDED.supplier_email, "
             "message_id=EXCLUDED.message_id, "
             "subject=EXCLUDED.subject, "
+            "round_number=EXCLUDED.round_number, "
             "dispatched_at=EXCLUDED.dispatched_at, "
             "thread_headers=EXCLUDED.thread_headers"
         )
@@ -312,6 +320,7 @@ def record_dispatches(
                 row.supplier_email,
                 row.message_id,
                 row.subject,
+                row.round_number,
                 _normalise_dt(row.dispatched_at),
                 _normalise_dt(row.responded_at),
                 row.response_message_id,
@@ -328,7 +337,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking WHERE workflow_id=%s"
         )
@@ -348,6 +357,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
                     supplier_email=data.get("supplier_email"),
                     message_id=data.get("message_id"),
                     subject=data.get("subject"),
+                    round_number=data.get("round_number"),
                     dispatched_at=_normalise_dt(data.get("dispatched_at")),
                     responded_at=_normalise_dt(data.get("responded_at")) if data.get("responded_at") else None,
                     response_message_id=data.get("response_message_id"),
@@ -365,7 +375,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking "
             "WHERE workflow_id=%s AND unique_id=%s "
@@ -387,6 +397,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
         "supplier_email",
         "message_id",
         "subject",
+        "round_number",
         "dispatched_at",
         "responded_at",
         "response_message_id",
@@ -402,6 +413,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
         supplier_email=data.get("supplier_email"),
         message_id=data.get("message_id"),
         subject=data.get("subject"),
+        round_number=data.get("round_number"),
         dispatched_at=_normalise_dt(data.get("dispatched_at")),
         responded_at=_normalise_dt(data.get("responded_at")) if data.get("responded_at") else None,
         response_message_id=data.get("response_message_id"),

@@ -9,7 +9,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
-from repositories import supplier_response_repo, workflow_email_tracking_repo
+from repositories import (
+    draft_rfq_emails_repo,
+    supplier_response_repo,
+    workflow_email_tracking_repo,
+)
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher_v2 import EmailWatcherV2
 
@@ -178,6 +182,11 @@ def run_email_watcher_for_workflow(
             "matched_unique_ids": [],
         }
 
+    expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
+        workflow_id=workflow_key
+    )
+    expected_dispatch_total = len(expected_unique_ids) or len(dispatch_rows)
+
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
     imap_user = _env("IMAP_USER")
     imap_username = (
@@ -296,11 +305,37 @@ def run_email_watcher_for_workflow(
             "status": "waiting_for_dispatch",
             "reason": "Waiting for all dispatches to complete",
             "workflow_id": workflow_key,
-            "expected": len(dispatch_rows),
+            "expected": expected_dispatch_total,
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
             "pending_unique_ids": sorted(missing_required_fields.keys()),
+            "missing_required_fields": missing_required_fields,
+        }
+
+    completed_unique_ids = {
+        row.unique_id
+        for row in dispatch_rows
+        if row.unique_id
+        and row.message_id
+        and getattr(row, "dispatched_at", None) is not None
+    }
+    if expected_unique_ids and expected_unique_ids - completed_unique_ids:
+        pending = sorted(expected_unique_ids - completed_unique_ids)
+        logger.debug(
+            "Workflow %s dispatches incomplete; waiting for %s to finish",
+            workflow_key,
+            pending,
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "Waiting for all dispatches to complete",
+            "workflow_id": workflow_key,
+            "expected": expected_dispatch_total,
+            "found": len(completed_unique_ids),
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": pending,
             "missing_required_fields": missing_required_fields,
         }
 
@@ -334,6 +369,11 @@ def run_email_watcher_for_workflow(
         imap_use_ssl=imap_use_ssl,
         imap_login=imap_login,
     )
+    logger.info(
+        "watcher_started workflow=%s expected=%s status=active",
+        workflow_key,
+        expected_dispatch_total,
+    )
     try:
         result = watcher.wait_and_collect_responses(workflow_key)
     except imaplib.IMAP4.error as exc:
@@ -352,7 +392,7 @@ def run_email_watcher_for_workflow(
             "rows": [],
             "matched_unique_ids": [],
         }
-    expected = result.get("dispatched_count", 0)
+    expected = result.get("dispatched_count", expected_dispatch_total)
     responded = result.get("responded_count", 0)
     matched = result.get("matched_responses", {}) or {}
     matched_ids = sorted(matched.keys())
@@ -360,10 +400,14 @@ def run_email_watcher_for_workflow(
     pending_rows = supplier_response_repo.fetch_pending(workflow_id=workflow_key)
     responses = [_serialise_response(row, mailbox) for row in pending_rows]
 
-    status = "processed" if result.get("complete") else "not_ready"
+    watcher_status = result.get("status") or (
+        "completed" if result.get("complete") else "pending"
+    )
+    status = "processed" if watcher_status == "completed" else watcher_status
 
     response_payload = {
         "status": status,
+        "watcher_status": watcher_status,
         "workflow_id": workflow_key,
         "expected": expected,
         "found": responded,
@@ -372,7 +416,7 @@ def run_email_watcher_for_workflow(
     }
 
     expected_ids = {row.unique_id for row in dispatch_rows}
-    if status != "processed":
+    if status not in {"processed", "completed"}:
         missing = sorted(expected_ids - set(matched_ids))
         response_payload["reason"] = (
             "Not all responses received"

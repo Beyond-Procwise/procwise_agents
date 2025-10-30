@@ -3841,11 +3841,49 @@ class EmailDraftingAgent(BaseAgent):
                     draft["mailbox"] = mailbox_hint
                     metadata.setdefault("mailbox", mailbox_hint)
 
-                headers = draft.get("headers") if isinstance(draft.get("headers"), dict) else {}
-                headers["X-Procwise-Unique-Id"] = unique_id
-                headers.setdefault("X-Procwise-Workflow-Id", workflow_id)
+                headers = (
+                    draft.get("headers")
+                    if isinstance(draft.get("headers"), dict)
+                    else {}
+                )
+                round_number_raw = (
+                    draft.get("round")
+                    or metadata.get("round")
+                    or draft.get("thread_index")
+                )
+                try:
+                    round_number = int(round_number_raw) if round_number_raw is not None else 1
+                except Exception:
+                    round_number = 1
+                if round_number < 1:
+                    round_number = 1
+                metadata["round"] = round_number
+                draft["round"] = round_number
+
+                required_headers = {
+                    "X-ProcWise-Workflow-ID": workflow_id,
+                    "X-ProcWise-Unique-ID": unique_id,
+                    "X-ProcWise-Supplier-ID": supplier_id,
+                    "X-ProcWise-Round": str(round_number),
+                }
+                for key, value in required_headers.items():
+                    if value in (None, ""):
+                        raise ValueError(
+                            f"EmailDraftingAgent requires non-empty header {key}"
+                        )
+                    headers[key] = str(value)
+
                 if mailbox_hint:
-                    headers.setdefault("X-Procwise-Mailbox", mailbox_hint)
+                    headers.setdefault("X-ProcWise-Mailbox", mailbox_hint)
+
+                logger.info(
+                    "EmailDraftingAgent: embedded headers workflow=%s, supplier=%s, unique_id=%s, round=%s",
+                    workflow_id,
+                    supplier_id,
+                    unique_id,
+                    round_number,
+                )
+
                 draft["headers"] = {k: v for k, v in headers.items() if v is not None}
 
                 thread_index = draft.get("thread_index")
