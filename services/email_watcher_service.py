@@ -185,6 +185,12 @@ def run_email_watcher_for_workflow(
     expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
         workflow_id=workflow_key
     )
+    if not expected_unique_ids:
+        expected_unique_ids = {
+            (row.unique_id or "").strip()
+            for row in dispatch_rows
+            if (row.unique_id or "").strip()
+        }
     expected_dispatch_total = len(expected_unique_ids) or len(dispatch_rows)
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
@@ -280,13 +286,14 @@ def run_email_watcher_for_workflow(
         if not unique_id:
             missing_fields.append("unique_id")
 
-        if missing_fields:
-            missing_required_fields[identifier] = missing_fields
-            continue
-
         message_id = (row.message_id or "").strip()
         if not message_id:
             missing_message_ids.append(identifier)
+            missing_fields.append("message_id")
+
+        if missing_fields:
+            missing_required_fields[identifier] = missing_fields
+            continue
 
     if missing_message_ids:
         logger.warning(
