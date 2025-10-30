@@ -16,6 +16,7 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from agents.base_agent import AgentContext, AgentOutput, AgentStatus
@@ -179,18 +180,41 @@ def _extract_bodies(message: EmailMessage) -> tuple[str, Optional[str]]:
                     if text_content:
                         break
         if text_content is None and html_content:
-            text_content = email_tracking.strip_html_tags(html_content)
+            text_content = _strip_html_tags(html_content)
     else:
         payload = message.get_content()
         if isinstance(payload, str):
             ctype = message.get_content_type()
             if ctype == "text/html":
                 html_content = payload
-                text_content = email_tracking.strip_html_tags(payload)
+                text_content = _strip_html_tags(payload)
             else:
                 text_content = payload.strip()
 
     return text_content or "", html_content
+
+
+class _BodyHTMLStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: List[str] = []
+
+    def handle_data(self, data: str) -> None:  # pragma: no cover - HTMLParser handles
+        if data:
+            self._parts.append(data)
+
+    def get_data(self) -> str:
+        return "".join(self._parts)
+
+
+def _strip_html_tags(html: str) -> str:
+    stripper = _BodyHTMLStripper()
+    try:
+        stripper.feed(html)
+        stripper.close()
+    except Exception:  # pragma: no cover - defensive
+        return html
+    return stripper.get_data().strip()
 
 
 def _parse_email(raw: bytes) -> EmailResponse:
@@ -694,7 +718,7 @@ class EmailWatcherV2:
                 score, matched_on = _calculate_match_score(
                     dispatch, email, workflow_id=tracker.workflow_id
                 )
-                if score > best_score:
+                if score > best_score or (best_dispatch is None and score == best_score):
                     matched_id = unique_id
                     best_score = score
                     best_dispatch = dispatch
