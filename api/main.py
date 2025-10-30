@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.model_training_endpoint import ModelTrainingEndpoint
-from services.email_watcher_service import EmailWatcherService
+from services.email_watcher_service import run_email_watcher_for_workflow
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
@@ -27,7 +27,7 @@ from agents.email_drafting_agent import EmailDraftingAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
-from api.routers import documents, run, stream, system, training, workflows
+from api.routers import documents, email, run, stream, system, training, workflows
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -83,29 +83,26 @@ async def lifespan(app: FastAPI):
         )
         app.state.orchestrator = orchestrator
         app.state.rag_pipeline = RAGPipeline(agent_nick)
-        email_watcher_service = EmailWatcherService(
-            agent_registry=agent_nick.agents,
-            orchestrator=orchestrator,
-            supplier_agent=supplier_interaction_agent,
-            negotiation_agent=negotiation_agent,
-        )
-        email_watcher_service.start()
-        app.state.email_watcher_service = email_watcher_service
+        app.state.agent_registry = agent_nick.agents
+        app.state.supplier_interaction_agent = supplier_interaction_agent
+        app.state.negotiation_agent = negotiation_agent
+        app.state.email_watcher_runner = run_email_watcher_for_workflow
         logger.info("System initialized successfully.")
     except Exception as e:
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
         app.state.orchestrator = None; app.state.rag_pipeline = None
-        app.state.email_watcher_service = None
+        app.state.email_watcher_runner = None
     yield
     if hasattr(app.state, "agent_nick"):
         app.state.agent_nick = None
-    if hasattr(app.state, "email_watcher_service") and getattr(app.state, "email_watcher_service", None):
-        try:
-            app.state.email_watcher_service.stop()
-        except Exception:
-            logger.exception("Failed to stop EmailWatcherService cleanly")
-        finally:
-            app.state.email_watcher_service = None
+    if hasattr(app.state, "email_watcher_runner"):
+        app.state.email_watcher_runner = None
+    if hasattr(app.state, "supplier_interaction_agent"):
+        app.state.supplier_interaction_agent = None
+    if hasattr(app.state, "negotiation_agent"):
+        app.state.negotiation_agent = None
+    if hasattr(app.state, "agent_registry"):
+        app.state.agent_registry = None
     if hasattr(app.state, "model_training_endpoint"):
         app.state.model_training_endpoint = None
     logger.info("API shutting down.")
@@ -114,6 +111,7 @@ app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=life
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 app.include_router(documents.router)
+app.include_router(email.router)
 app.include_router(workflows.router)
 app.include_router(system.router)
 app.include_router(run.router)
