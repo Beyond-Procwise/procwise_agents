@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 DDL_PG = """
 CREATE SCHEMA IF NOT EXISTS proc;
 
+CREATE SEQUENCE IF NOT EXISTS proc.supplier_response_id_seq;
+
 CREATE TABLE IF NOT EXISTS proc.supplier_response (
-    id SERIAL PRIMARY KEY,
+    id BIGINT PRIMARY KEY DEFAULT nextval('proc.supplier_response_id_seq'),
     workflow_id TEXT NOT NULL,
     unique_id TEXT NOT NULL,
     supplier_id TEXT,
@@ -54,6 +56,9 @@ ON proc.supplier_response (unique_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_supplier_response_workflow_msg
 ON proc.supplier_response (workflow_id, response_message_id);
+
+ALTER TABLE proc.supplier_response
+    ALTER COLUMN id SET DEFAULT nextval('proc.supplier_response_id_seq');
 """
 
 @dataclass
