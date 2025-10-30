@@ -15,7 +15,7 @@ from repositories import (
     workflow_email_tracking_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from services.email_watcher_v2 import EmailWatcherV2
+from services.email_watcher import EmailWatcher, EmailWatcherConfig
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -39,6 +39,48 @@ def _setting(*attr_names: str) -> Optional[str]:
         value = getattr(app_settings, name, None)
         if value not in (None, ""):
             return value
+    return None
+
+
+def _resolve_float(env_key: str, setting_keys: Sequence[str], default: float) -> float:
+    raw_env = _env(env_key)
+    if raw_env not in (None, ""):
+        try:
+            return float(raw_env)
+        except Exception:
+            logger.warning("Invalid %s value %s; falling back to %s", env_key, raw_env, default)
+    for key in setting_keys:
+        raw_setting = _setting(key)
+        if raw_setting in (None, ""):
+            continue
+        try:
+            return float(raw_setting)
+        except Exception:
+            logger.warning("Invalid setting %s=%s; falling back to %s", key, raw_setting, default)
+    return default
+
+
+def _resolve_optional_int(env_key: str, setting_keys: Sequence[str]) -> Optional[int]:
+    raw_env = _env(env_key)
+    if raw_env not in (None, ""):
+        try:
+            candidate = int(float(raw_env))
+        except Exception:
+            logger.warning("Invalid %s value %s; ignoring", env_key, raw_env)
+        else:
+            if candidate > 0:
+                return candidate
+    for key in setting_keys:
+        raw_setting = _setting(key)
+        if raw_setting in (None, ""):
+            continue
+        try:
+            candidate = int(float(raw_setting))
+        except Exception:
+            logger.warning("Invalid setting %s=%s; ignoring", key, raw_setting)
+            continue
+        if candidate > 0:
+            return candidate
     return None
 
 
@@ -154,7 +196,7 @@ def run_email_watcher_for_workflow(
     negotiation_agent: Optional[Any] = None,
     max_workers: int = 8,
 ) -> Dict[str, Any]:
-    """Collect supplier responses for ``workflow_id`` using ``EmailWatcherV2``."""
+    """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
 
     _ = run_id  # maintained for backwards compatibility
     _ = agent_registry
@@ -303,7 +345,7 @@ def run_email_watcher_for_workflow(
 
     if not all([imap_host, imap_username, imap_password]):
         logger.warning(
-            "IMAP credentials are not configured; skipping EmailWatcherV2 (host=%s user=%s)",
+            "IMAP credentials are not configured; skipping EmailWatcher (host=%s user=%s)",
             imap_host,
             imap_username,
         )
@@ -396,6 +438,31 @@ def run_email_watcher_for_workflow(
     except Exception:
         max_attempts = 10
 
+    poll_backoff_factor = _resolve_float(
+        "IMAP_POLL_BACKOFF_FACTOR",
+        ("imap_poll_backoff_factor", "poll_backoff_factor"),
+        1.8,
+    )
+    poll_jitter_seconds = max(
+        0.0,
+        _resolve_float(
+            "IMAP_POLL_JITTER_SECONDS",
+            ("imap_poll_jitter_seconds", "poll_jitter_seconds"),
+            2.0,
+        ),
+    )
+    poll_max_interval_default = float(max(poll_interval * 6, poll_interval))
+    poll_max_interval = _resolve_float(
+        "IMAP_POLL_MAX_INTERVAL",
+        ("imap_poll_max_interval", "poll_max_interval_seconds"),
+        poll_max_interval_default,
+    )
+    poll_max_interval_seconds = max(int(poll_max_interval), poll_interval)
+    poll_timeout_seconds = _resolve_optional_int(
+        "IMAP_POLL_TIMEOUT_SECONDS",
+        ("imap_poll_timeout_seconds", "poll_timeout_seconds"),
+    )
+
     supplier_agent = supplier_agent or _resolve_agent_dependency(
         agent_registry, orchestrator, ("supplier_interaction", "SupplierInteractionAgent")
     )
@@ -403,19 +470,27 @@ def run_email_watcher_for_workflow(
         agent_registry, orchestrator, ("negotiation", "NegotiationAgent")
     )
 
-    watcher = EmailWatcherV2(
-        dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
-        poll_interval_seconds=max(1, poll_interval),
-        max_poll_attempts=max(1, max_attempts),
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        mailbox=mailbox,
+    config = EmailWatcherConfig(
         imap_host=imap_host,
         imap_username=imap_username,
         imap_password=imap_password,
-        imap_port=imap_port,
-        imap_use_ssl=imap_use_ssl,
+        imap_port=imap_port or 993,
+        imap_use_ssl=True if imap_use_ssl is None else imap_use_ssl,
         imap_login=imap_login,
+        imap_mailbox=mailbox or "INBOX",
+        dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
+        poll_interval_seconds=max(1, poll_interval),
+        max_poll_attempts=max(1, max_attempts),
+        poll_backoff_factor=max(1.0, poll_backoff_factor),
+        poll_jitter_seconds=poll_jitter_seconds,
+        poll_max_interval_seconds=poll_max_interval_seconds,
+        poll_timeout_seconds=poll_timeout_seconds,
+    )
+    watcher = EmailWatcher(
+        config=config,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        sleep=time.sleep,
     )
     logger.info(
         "watcher_started workflow=%s expected=%s status=active",
@@ -423,7 +498,7 @@ def run_email_watcher_for_workflow(
         expected_dispatch_total,
     )
     try:
-        result = watcher.wait_and_collect_responses(workflow_key)
+        result = watcher.wait_for_responses(workflow_key)
     except imaplib.IMAP4.error as exc:
         logger.error(
             "IMAP authentication failed for host=%s user=%s: %s",
@@ -492,7 +567,7 @@ def run_email_watcher_for_workflow(
 
 
 class EmailWatcherService:
-    """Run ``EmailWatcherV2`` as a background polling service."""
+    """Run the unified :class:`EmailWatcher` as a background polling service."""
 
     def __init__(
         self,

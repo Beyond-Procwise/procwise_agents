@@ -331,3 +331,83 @@ def test_email_watcher_matches_using_rfq_id_when_unique_id_missing(tmp_path):
     context = supplier_agent.contexts[0]
     assert context.input_data.get("rfq_id") == rfq_identifier
     assert context.input_data.get("unique_id") == unique_id
+
+
+def test_wait_for_responses_applies_adaptive_backoff(monkeypatch):
+    from services import email_watcher as email_watcher_module
+
+    workflow_id = "wf-backoff"
+    supplier_response_repo.init_schema()
+    workflow_email_tracking_repo.init_schema()
+    supplier_response_repo.reset_workflow(workflow_id=workflow_id)
+    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.current = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def now(self) -> datetime:
+            return self.current
+
+        def advance(self, seconds: float) -> None:
+            self.current += timedelta(seconds=seconds)
+
+    clock = FakeClock()
+
+    async def immediate(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(email_watcher_module.asyncio, "to_thread", immediate)
+
+    durations: List[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        durations.append(seconds)
+        clock.advance(seconds)
+
+    class EmptyFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, *, since: datetime) -> List[EmailResponse]:
+            self.calls += 1
+            return []
+
+    fetcher = EmptyFetcher()
+
+    watcher = EmailWatcherV2(
+        supplier_agent=None,
+        dispatch_wait_seconds=0,
+        poll_interval_seconds=1,
+        max_poll_attempts=3,
+        email_fetcher=fetcher,
+        sleep=fake_sleep,
+        now=clock.now,
+        poll_backoff_factor=2.0,
+        poll_jitter_seconds=0.0,
+        poll_max_interval_seconds=4,
+    )
+
+    unique_id = generate_unique_email_id(workflow_id, "sup-backoff")
+    watcher.register_workflow_dispatch(
+        workflow_id,
+        [
+            {
+                "unique_id": unique_id,
+                "supplier_id": "sup-backoff",
+                "supplier_email": "contact@vendor.example",
+                "message_id": "<dispatch-backoff>",
+                "subject": "RFQ",
+                "dispatched_at": clock.now(),
+            }
+        ],
+    )
+
+    result = watcher.wait_and_collect_responses(workflow_id)
+
+    assert result["complete"] is False
+    assert result["status"] == "max_attempts_exceeded"
+    assert result.get("timeout_reason") == "max_attempts"
+    assert result.get("poll_attempts") == 3
+    assert fetcher.calls == 3
+    assert durations == [1.0, 2.0]
