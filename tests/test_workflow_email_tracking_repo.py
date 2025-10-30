@@ -1,9 +1,11 @@
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, Optional, Set
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import repositories.workflow_email_tracking_repo as tracking_repo
 
 from repositories.workflow_email_tracking_repo import (
     WorkflowDispatchRow,
@@ -15,6 +17,21 @@ from repositories.workflow_email_tracking_repo import (
     record_dispatches,
     reset_workflow,
 )
+
+
+def _install_expected_map(monkeypatch) -> Dict[str, Set[str]]:
+    expected_map: Dict[str, Set[str]] = {}
+
+    def _fake_expected_unique_ids_and_last_dispatch(*, workflow_id: str, run_id=None):
+        ids = expected_map.get(workflow_id, set())
+        return (set(ids), {}, None)
+
+    monkeypatch.setattr(
+        tracking_repo.draft_rfq_emails_repo,
+        "expected_unique_ids_and_last_dispatch",
+        _fake_expected_unique_ids_and_last_dispatch,
+    )
+    return expected_map
 
 
 def test_ensure_primary_key_rebuilds_legacy_constraint():
@@ -87,12 +104,15 @@ def _make_dispatch(
     )
 
 
-def test_active_workflows_skip_dispatches_without_message_id():
+def test_active_workflows_skip_dispatches_without_message_id(monkeypatch):
     workflow_id = "wf-init"
     now = datetime.now(timezone.utc)
 
     init_schema()
     reset_workflow(workflow_id=workflow_id)
+
+    expected_map = _install_expected_map(monkeypatch)
+    expected_map[workflow_id] = {"uid-init"}
 
     record_dispatches(
         workflow_id=workflow_id,
@@ -111,15 +131,19 @@ def test_active_workflows_skip_dispatches_without_message_id():
     assert workflow_id not in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
 
 
-def test_dispatch_key_optional_and_persisted():
+def test_dispatch_key_optional_and_persisted(monkeypatch):
     workflow_id = "wf-dispatch-key"
     unique_id = "uid-dk-1"
     now = datetime.now(timezone.utc)
 
     init_schema()
     reset_workflow(workflow_id=workflow_id)
+
+    expected_map = _install_expected_map(monkeypatch)
+    expected_map[workflow_id] = {unique_id}
 
     record_dispatches(
         workflow_id=workflow_id,
@@ -139,6 +163,7 @@ def test_dispatch_key_optional_and_persisted():
     assert rows[0].dispatch_key == "run-123"
 
     reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
 
     record_dispatches(
         workflow_id=workflow_id,
@@ -151,6 +176,7 @@ def test_dispatch_key_optional_and_persisted():
             )
         ],
     )
+    expected_map[workflow_id] = {"uid-1"}
     assert workflow_id not in load_active_workflow_ids()
 
     # Updating the dispatch metadata keeps the workflow active.
@@ -168,14 +194,18 @@ def test_dispatch_key_optional_and_persisted():
     assert workflow_id in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
 
 
-def test_active_workflows_require_all_dispatches_to_complete():
+def test_active_workflows_require_all_dispatches_to_complete(monkeypatch):
     workflow_id = "wf-partial"
     now = datetime.now(timezone.utc)
 
     init_schema()
     reset_workflow(workflow_id=workflow_id)
+
+    expected_map = _install_expected_map(monkeypatch)
+    expected_map[workflow_id] = {"uid-1", "uid-2"}
 
     record_dispatches(
         workflow_id=workflow_id,
@@ -213,14 +243,18 @@ def test_active_workflows_require_all_dispatches_to_complete():
     assert workflow_id not in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
 
 
-def test_active_workflows_skip_when_all_responses_matched():
+def test_active_workflows_skip_when_all_responses_matched(monkeypatch):
     workflow_id = "wf-complete"
     now = datetime.now(timezone.utc)
 
     init_schema()
     reset_workflow(workflow_id=workflow_id)
+
+    expected_map = _install_expected_map(monkeypatch)
+    expected_map[workflow_id] = {"uid-1"}
 
     record_dispatches(
         workflow_id=workflow_id,
@@ -244,3 +278,35 @@ def test_active_workflows_skip_when_all_responses_matched():
     assert workflow_id not in load_active_workflow_ids()
 
     reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
+
+
+def test_active_workflows_skip_without_expected_unique_ids(monkeypatch):
+    workflow_id = "wf-missing-expected"
+    unique_id = "uid-missing"
+    now = datetime.now(timezone.utc)
+
+    init_schema()
+    reset_workflow(workflow_id=workflow_id)
+
+    expected_map = _install_expected_map(monkeypatch)
+
+    record_dispatches(
+        workflow_id=workflow_id,
+        dispatches=[
+            _make_dispatch(
+                workflow_id=workflow_id,
+                unique_id=unique_id,
+                message_id="mid-1",
+                dispatched_at=now,
+            )
+        ],
+    )
+
+    assert workflow_id not in load_active_workflow_ids()
+
+    expected_map[workflow_id] = {unique_id}
+    assert workflow_id in load_active_workflow_ids()
+
+    reset_workflow(workflow_id=workflow_id)
+    expected_map.pop(workflow_id, None)
