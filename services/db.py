@@ -65,6 +65,10 @@ class _FakeCursor:
 
         if upper_stmt.startswith("CREATE SCHEMA"):
             return
+        if upper_stmt.startswith("CREATE SEQUENCE"):
+            # Sequences aren't materialised in the in-memory store but the
+            # statement should succeed to mirror Postgres behaviour.
+            return
         if upper_stmt.startswith("CREATE TABLE") or upper_stmt.startswith(
             "CREATE INDEX"
         ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
@@ -108,49 +112,49 @@ class _FakeCursor:
 
         # Data manipulation commands for supplier responses
         if upper_stmt.startswith("INSERT INTO PROC.SUPPLIER_RESPONSE"):
-            (
-                workflow_id,
-                supplier_id,
-                supplier_email,
-                unique_id,
-                response_text,
-                response_body,
-                response_message_id,
-                response_subject,
-                response_from,
-                response_date,
-                original_message_id,
-                original_subject,
-                match_confidence,
-                price,
-                lead_time,
-                response_time,
-                received_time,
-                processed,
-            ) = params
+            columns = [
+                "workflow_id",
+                "unique_id",
+                "supplier_id",
+                "supplier_email",
+                "response_message_id",
+                "response_subject",
+                "response_text",
+                "response_body",
+                "response_from",
+                "response_date",
+                "original_message_id",
+                "original_subject",
+                "match_confidence",
+                "match_score",
+                "price",
+                "lead_time",
+                "response_time",
+                "received_time",
+                "processed",
+                "dispatch_id",
+                "matched_on",
+                "raw_headers",
+            ]
+            values = list(params)
+            if len(values) < 2:
+                raise ValueError(
+                    "INSERT INTO proc.supplier_response requires workflow_id and unique_id"
+                )
+            mapped = {
+                column: (values[idx] if idx < len(values) else None)
+                for idx, column in enumerate(columns)
+            }
+            workflow_id = mapped["workflow_id"]
+            unique_id = mapped["unique_id"]
+            if not workflow_id or not unique_id:
+                raise ValueError(
+                    "Fake supplier_response insert missing workflow_id or unique_id"
+                )
             self._store.upsert_supplier_response(
                 workflow_id,
                 unique_id,
-                {
-                    "workflow_id": workflow_id,
-                    "supplier_id": supplier_id,
-                    "supplier_email": supplier_email,
-                    "unique_id": unique_id,
-                    "response_text": response_text,
-                    "response_body": response_body,
-                    "response_message_id": response_message_id,
-                    "response_subject": response_subject,
-                    "response_from": response_from,
-                    "response_date": response_date,
-                    "original_message_id": original_message_id,
-                    "original_subject": original_subject,
-                    "match_confidence": match_confidence,
-                    "price": price,
-                    "lead_time": lead_time,
-                    "response_time": response_time,
-                    "received_time": received_time,
-                    "processed": processed,
-                },
+                mapped,
             )
             return
 
@@ -186,10 +190,15 @@ class _FakeCursor:
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_score",
                 "price",
                 "lead_time",
+                "response_time",
                 "received_time",
                 "processed",
+                "dispatch_id",
+                "matched_on",
+                "raw_headers",
             ]
             self.description = [
                 _ColumnDescriptor(col) for col in columns
@@ -202,37 +211,40 @@ class _FakeCursor:
 
         # Workflow email tracking commands
         if upper_stmt.startswith("INSERT INTO PROC.WORKFLOW_EMAIL_TRACKING"):
-            (
-                workflow_id,
-                unique_id,
-                dispatch_key,
-                supplier_id,
-                supplier_email,
-                message_id,
-                subject,
-                dispatched_at,
-                responded_at,
-                response_message_id,
-                matched,
-                thread_headers,
-            ) = params
+            columns = [
+                "workflow_id",
+                "unique_id",
+                "dispatch_key",
+                "supplier_id",
+                "supplier_email",
+                "message_id",
+                "subject",
+                "round_number",
+                "dispatched_at",
+                "responded_at",
+                "response_message_id",
+                "matched",
+                "thread_headers",
+            ]
+            values = list(params)
+            if len(values) < 2:
+                raise ValueError(
+                    "INSERT INTO proc.workflow_email_tracking requires workflow_id and unique_id"
+                )
+            mapped = {
+                column: (values[idx] if idx < len(values) else None)
+                for idx, column in enumerate(columns)
+            }
+            workflow_id = mapped["workflow_id"]
+            unique_id = mapped["unique_id"]
+            if not workflow_id or not unique_id:
+                raise ValueError(
+                    "Fake workflow_email_tracking insert missing workflow_id or unique_id"
+                )
             self._store.upsert_workflow_tracking(
                 workflow_id,
                 unique_id,
-                {
-                    "workflow_id": workflow_id,
-                    "unique_id": unique_id,
-                    "dispatch_key": dispatch_key,
-                    "supplier_id": supplier_id,
-                    "supplier_email": supplier_email,
-                    "message_id": message_id,
-                    "subject": subject,
-                    "dispatched_at": dispatched_at,
-                    "responded_at": responded_at,
-                    "response_message_id": response_message_id,
-                    "matched": matched,
-                    "thread_headers": thread_headers,
-                },
+                mapped,
             )
             return
 
@@ -258,6 +270,7 @@ class _FakeCursor:
                 "supplier_email",
                 "message_id",
                 "subject",
+                "round_number",
                 "dispatched_at",
                 "responded_at",
                 "response_message_id",
@@ -409,18 +422,23 @@ class _FakePostgresStore:
                 "supplier_id",
                 "supplier_email",
                 "unique_id",
-                "response_text",
-                "response_body",
                 "response_message_id",
                 "response_subject",
+                "response_text",
+                "response_body",
                 "response_from",
                 "response_date",
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
+                "match_score",
                 "price",
                 "lead_time",
+                "response_time",
                 "received_time",
+                "dispatch_id",
+                "matched_on",
+                "raw_headers",
                 "processed",
             ],
             "proc.workflow_email_tracking": [
@@ -431,6 +449,7 @@ class _FakePostgresStore:
                 "supplier_email",
                 "message_id",
                 "subject",
+                "round_number",
                 "dispatched_at",
                 "responded_at",
                 "response_message_id",

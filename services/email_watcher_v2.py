@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email
+import json
 import imaplib
 import logging
 import re
@@ -46,7 +47,10 @@ class EmailDispatchRecord:
     message_id: Optional[str]
     subject: Optional[str]
     rfq_id: Optional[str] = None
-    thread_headers: Dict[str, str] = field(default_factory=dict)
+    dispatch_id: Optional[str] = None
+    round_number: Optional[int] = None
+    workflow_id: Optional[str] = None
+    thread_headers: Dict[str, Sequence[str]] = field(default_factory=dict)
     dispatched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -60,10 +64,13 @@ class EmailResponse:
     subject: Optional[str]
     body: str
     received_at: datetime
+    body_html: Optional[str] = None
     in_reply_to: Sequence[str] = field(default_factory=tuple)
     references: Sequence[str] = field(default_factory=tuple)
     workflow_id: Optional[str] = None
     rfq_id: Optional[str] = None
+    round_number: Optional[int] = None
+    raw_headers: Dict[str, Sequence[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -141,28 +148,49 @@ def _extract_thread_ids(message: EmailMessage) -> Dict[str, Sequence[str]]:
     return {"references": refs, "in_reply_to": in_reply}
 
 
-def _extract_plain_text(message: EmailMessage) -> str:
+def _extract_bodies(message: EmailMessage) -> tuple[str, Optional[str]]:
+    text_content: Optional[str] = None
+    html_content: Optional[str] = None
+
     if message.is_multipart():
         for part in message.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/plain" and "attachment" not in disp:
                 try:
-                    return part.get_content().strip()
+                    candidate = part.get_content()
                 except Exception as exc:  # pragma: no cover - defensive logging
                     logger.warning("Failed to extract text/plain content: %s", exc)
                     continue
+                if isinstance(candidate, str) and candidate.strip():
+                    text_content = candidate.strip()
+                    break
         for part in message.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/html" and "attachment" not in disp:
                 try:
-                    return part.get_content()
+                    candidate_html = part.get_content()
                 except Exception as exc:  # pragma: no cover - defensive logging
                     logger.warning("Failed to extract text/html content: %s", exc)
                     continue
-        return ""
-    return message.get_content() if message.get_content() else ""
+                if isinstance(candidate_html, str) and candidate_html.strip():
+                    html_content = candidate_html
+                    if text_content:
+                        break
+        if text_content is None and html_content:
+            text_content = email_tracking.strip_html_tags(html_content)
+    else:
+        payload = message.get_content()
+        if isinstance(payload, str):
+            ctype = message.get_content_type()
+            if ctype == "text/html":
+                html_content = payload
+                text_content = email_tracking.strip_html_tags(payload)
+            else:
+                text_content = payload.strip()
+
+    return text_content or "", html_content
 
 
 def _parse_email(raw: bytes) -> EmailResponse:
@@ -170,38 +198,73 @@ def _parse_email(raw: bytes) -> EmailResponse:
     subject = message.get("Subject")
     message_id = (message.get("Message-ID") or "").strip("<> ") or None
     from_address = message.get("From")
-    body = _extract_plain_text(message)
+    body_text, body_html = _extract_bodies(message)
+
+    raw_headers: Dict[str, Sequence[str]] = {}
+    for key in message.keys():
+        values = message.get_all(key, failobj=[])
+        if not values:
+            continue
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if cleaned:
+            raw_headers[key] = tuple(cleaned)
+
+    def _header_lookup(name: str) -> Optional[str]:
+        lowered = name.lower()
+        for header_name, values in raw_headers.items():
+            if header_name.lower() == lowered and values:
+                return values[-1]
+        return None
+
     header_map = {
-        key: message.get_all(key, failobj=[])
-        for key in ("X-Procwise-Unique-Id", "X-Procwise-Unique-ID", "X-Procwise-Uid")
+        key: raw_headers.get(key, tuple())
+        for key in (
+            "X-ProcWise-Unique-ID",
+            "X-ProcWise-Unique-Id",
+            "X-ProcWise-Uid",
+            "X-Procwise-Unique-Id",
+        )
     }
     unique_id = extract_unique_id_from_headers(header_map)
     if not unique_id:
-        fallback_header = message.get("X-Procwise-Unique-Id")
+        fallback_header = _header_lookup("X-ProcWise-Unique-ID")
         if fallback_header:
-            unique_id = str(fallback_header).strip()
-    body_unique = extract_unique_id_from_body(body)
+            unique_id = fallback_header.strip()
+    body_unique = extract_unique_id_from_body(body_text)
     if body_unique and not unique_id:
         unique_id = body_unique
-    metadata = extract_tracking_metadata(body)
+
+    metadata = extract_tracking_metadata(body_text)
     supplier_id = metadata.supplier_id if metadata else None
     if metadata and not unique_id:
         unique_id = metadata.unique_id
 
-    header_unique_id = (message.get("X-Procwise-Unique-Id") or "").strip()
-    if header_unique_id and not unique_id:
-        unique_id = header_unique_id
-
-    header_supplier_id = (message.get("X-Procwise-Supplier-Id") or "").strip()
+    header_supplier_id = _header_lookup("X-ProcWise-Supplier-ID")
     if header_supplier_id and not supplier_id:
-        supplier_id = header_supplier_id
+        supplier_id = header_supplier_id.strip()
 
     workflow_id = metadata.workflow_id if metadata else None
-    header_workflow_id = (message.get("X-Procwise-Workflow-Id") or "").strip()
-    if header_workflow_id and not workflow_id:
-        workflow_id = header_workflow_id
+    header_workflow_id = _header_lookup("X-ProcWise-Workflow-ID")
+    if header_workflow_id:
+        workflow_id = header_workflow_id.strip()
 
-    rfq_id = (message.get("X-Procwise-RFQ-ID") or "").strip() or None
+    round_number: Optional[int] = None
+    header_round = _header_lookup("X-ProcWise-Round")
+    if header_round:
+        try:
+            round_number = int(header_round)
+        except Exception:
+            round_number = None
+    if round_number is None and metadata and getattr(metadata, "round_number", None):
+        try:
+            round_number = int(metadata.round_number)
+        except Exception:
+            round_number = None
+
+    rfq_id = metadata.rfq_id if metadata else None
+    header_rfq = _header_lookup("X-ProcWise-RFQ-ID")
+    if header_rfq:
+        rfq_id = header_rfq.strip()
 
     date_header = message.get("Date")
     try:
@@ -212,21 +275,28 @@ def _parse_email(raw: bytes) -> EmailResponse:
     if received_at.tzinfo is None:
         received_at = received_at.replace(tzinfo=timezone.utc)
 
+    supplier_email = metadata.supplier_email if metadata else None
+    if not supplier_email and from_address:
+        supplier_email = parseaddr(from_address)[1]
+
     thread_ids = _extract_thread_ids(message)
 
     return EmailResponse(
         unique_id=unique_id,
         supplier_id=supplier_id,
-        supplier_email=None,
+        supplier_email=supplier_email,
         from_address=from_address,
         message_id=message_id,
         subject=subject,
-        body=body or "",
+        body=body_text or "",
+        body_html=body_html,
         received_at=received_at,
         in_reply_to=thread_ids.get("in_reply_to", ()),
         references=thread_ids.get("references", ()),
         workflow_id=workflow_id,
         rfq_id=rfq_id,
+        round_number=round_number,
+        raw_headers=raw_headers,
     )
 
 
@@ -311,18 +381,52 @@ def _score_to_confidence(score: float) -> Decimal:
     return decimal_score.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailResponse) -> float:
+def _normalise_subject_line(subject: Optional[str]) -> str:
+    if not subject:
+        return ""
+    text = subject.strip().lower()
+    for prefix in ("re:", "fwd:", "fw:"):
+        while text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    return text
+
+
+def _calculate_match_score(
+    dispatch: EmailDispatchRecord,
+    email_response: EmailResponse,
+    *,
+    workflow_id: Optional[str],
+) -> tuple[float, List[str]]:
     score = 0.0
+    matched_on: List[str] = []
+
+    if (
+        workflow_id
+        and email_response.workflow_id
+        and email_response.workflow_id == workflow_id
+    ):
+        score += 0.6
+        matched_on.append("workflow_id")
 
     if email_response.unique_id and email_response.unique_id == dispatch.unique_id:
-        return 1.0
+        score += 0.2
+        matched_on.append("unique_id")
 
     if (
         email_response.supplier_id
         and dispatch.supplier_id
         and email_response.supplier_id == dispatch.supplier_id
     ):
-        score += 0.65
+        score += 0.1
+        matched_on.append("supplier_id")
+
+    if (
+        email_response.round_number is not None
+        and dispatch.round_number is not None
+        and email_response.round_number == dispatch.round_number
+    ):
+        score += 0.05
+        matched_on.append("round")
 
     thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
         dispatch.thread_headers.get("in_reply_to", ())
@@ -331,29 +435,62 @@ def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailR
         thread_ids.add(dispatch.message_id)
 
     reply_headers = set(email_response.in_reply_to) | set(email_response.references)
-    if dispatch.message_id and dispatch.message_id in reply_headers:
-        score += 0.8
-    elif thread_ids & reply_headers:
-        score += 0.8
+    subject_match = False
+    if dispatch.subject and email_response.subject:
+        subject_match = (
+            _normalise_subject_line(dispatch.subject)
+            == _normalise_subject_line(email_response.subject)
+        )
 
-    if dispatch.supplier_email and email_response.from_address:
-        dispatch_email = email.utils.parseaddr(str(dispatch.supplier_email))[1].lower()
-        response_email = email.utils.parseaddr(str(email_response.from_address))[1].lower()
-        if dispatch_email and response_email:
-            if dispatch_email == response_email:
-                score += 0.6
-            else:
-                dispatch_domain = dispatch_email.split("@")[-1]
-                response_domain = response_email.split("@")[-1]
-                if dispatch_domain and response_domain and dispatch_domain == response_domain:
-                    score += 0.35
+    if dispatch.message_id and dispatch.message_id in reply_headers:
+        score += 0.05
+        matched_on.append("headers")
+    elif thread_ids & reply_headers:
+        score += 0.05
+        matched_on.append("headers")
+    elif subject_match:
+        score += 0.05
+        matched_on.append("subject")
+
+    return score, matched_on
+
+
+def _fallback_match_score(
+    dispatch: EmailDispatchRecord, email_response: EmailResponse
+) -> tuple[float, List[str]]:
+    score = 0.0
+    matched_on: List[str] = []
+
+    dispatch_email = _normalise_email_address(dispatch.supplier_email)
+    response_email = _normalise_email_address(
+        email_response.from_address or email_response.supplier_email
+    )
+    if dispatch_email and response_email:
+        dispatch_domain = dispatch_email.split("@")[-1]
+        response_domain = response_email.split("@")[-1]
+        if dispatch_domain and response_domain and dispatch_domain == response_domain:
+            score += 0.25
+            matched_on.append("sender_domain")
 
     if dispatch.subject and email_response.subject:
-        normalised_subject = dispatch.subject.lower()
-        if normalised_subject in email_response.subject.lower():
-            score += 0.5
+        if _normalise_subject_line(dispatch.subject) == _normalise_subject_line(
+            email_response.subject
+        ):
+            score += 0.45
+            matched_on.append("subject")
 
-    return score
+    if dispatch.dispatched_at and email_response.received_at:
+        delta = abs(
+            (email_response.received_at - dispatch.dispatched_at).total_seconds()
+        )
+        if delta <= 3600:
+            score += 0.2
+            matched_on.append("temporal")
+        elif delta <= 4 * 3600:
+            score += 0.1
+            matched_on.append("temporal")
+
+    return score, matched_on
 
 
 class EmailWatcherV2:
@@ -414,6 +551,9 @@ class EmailWatcherV2:
                     supplier_email=row.supplier_email,
                     message_id=row.message_id,
                     subject=row.subject,
+                    dispatch_id=row.dispatch_key,
+                    round_number=row.round_number,
+                    workflow_id=workflow_id,
                     thread_headers=row.thread_headers or {},
                     dispatched_at=row.dispatched_at,
                 )
@@ -462,6 +602,17 @@ class EmailWatcherV2:
             raw_thread_headers = (
                 payload.get("thread_headers") if isinstance(payload.get("thread_headers"), dict) else {}
             )
+            round_value = (
+                payload.get("round_number")
+                or payload.get("round")
+                or payload.get("thread_index")
+            )
+            try:
+                round_number = int(round_value) if round_value is not None else None
+            except Exception:
+                round_number = None
+            if round_number is not None and round_number < 1:
+                round_number = None
             if isinstance(dispatched_at, datetime):
                 dispatched_dt = dispatched_at if dispatched_at.tzinfo else dispatched_at.replace(tzinfo=timezone.utc)
             else:
@@ -474,6 +625,9 @@ class EmailWatcherV2:
                 message_id=str(message_id) if message_id else None,
                 subject=str(subject) if subject else None,
                 rfq_id=str(rfq_id) if rfq_id else None,
+                dispatch_id=str(dispatch_key).strip() if dispatch_key else None,
+                round_number=round_number,
+                workflow_id=workflow_id,
                 thread_headers={
                     str(k): _normalise_thread_header(v) for k, v in raw_thread_headers.items()
                 },
@@ -489,6 +643,7 @@ class EmailWatcherV2:
                     supplier_email=record.supplier_email,
                     message_id=record.message_id,
                     subject=record.subject,
+                    round_number=round_number,
                     dispatched_at=dispatched_dt,
                     responded_at=None,
                     response_message_id=None,
@@ -531,14 +686,30 @@ class EmailWatcherV2:
             matched_id: Optional[str] = None
             best_score = 0.0
             best_dispatch: Optional[EmailDispatchRecord] = None
+            best_matched_on: List[str] = []
+
             for unique_id, dispatch in tracker.email_records.items():
                 if unique_id in tracker.matched_responses:
                     continue
-                score = _calculate_match_score(dispatch, email)
+                score, matched_on = _calculate_match_score(
+                    dispatch, email, workflow_id=tracker.workflow_id
+                )
                 if score > best_score:
                     matched_id = unique_id
                     best_score = score
                     best_dispatch = dispatch
+                    best_matched_on = list(matched_on)
+
+            if matched_id and best_dispatch and best_score < self.match_threshold:
+                fallback_score, fallback_flags = _fallback_match_score(
+                    best_dispatch, email
+                )
+                if fallback_score > best_score:
+                    best_score = fallback_score
+                    for flag in fallback_flags:
+                        if flag not in best_matched_on:
+                            best_matched_on.append(flag)
+
             if (not matched_id or best_score < self.match_threshold) and email.supplier_id:
                 supplier_matches = [
                     uid
@@ -551,6 +722,8 @@ class EmailWatcherV2:
                     matched_id = supplier_matches[0]
                     best_score = max(best_score, self.match_threshold)
                     best_dispatch = tracker.email_records.get(matched_id)
+                    best_matched_on = ["supplier_id"]
+
             if (not matched_id or best_score < self.match_threshold) and email.rfq_id:
                 normalised_rfq = _normalise_identifier(email.rfq_id)
                 if normalised_rfq:
@@ -565,6 +738,7 @@ class EmailWatcherV2:
                         matched_id = rfq_candidates[0]
                         best_score = max(best_score, self.match_threshold)
                         best_dispatch = tracker.email_records.get(matched_id)
+                        best_matched_on = ["rfq_id"]
 
             if not matched_id and len([
                 uid for uid in tracker.email_records.keys() if uid not in tracker.matched_responses
@@ -582,14 +756,9 @@ class EmailWatcherV2:
                 )
                 best_score = max(best_score, self.match_threshold)
                 best_dispatch = tracker.email_records.get(matched_id)
+                best_matched_on = ["last_remaining"]
 
             if matched_id and best_score >= self.match_threshold:
-                logger.debug(
-                    "Matched response for workflow=%s unique_id=%s score=%.2f",
-                    tracker.workflow_id,
-                    matched_id,
-                    best_score,
-                )
                 if best_dispatch is None:
                     best_dispatch = tracker.email_records.get(matched_id)
                 if best_dispatch is None:
@@ -599,6 +768,16 @@ class EmailWatcherV2:
                         matched_id,
                     )
                     continue
+
+                logger.info(
+                    "MATCH SUCCESS: workflow=%s unique_id=%s supplier=%s score=%.2f matched_on=%s",
+                    tracker.workflow_id,
+                    matched_id,
+                    email.supplier_id or best_dispatch.supplier_id,
+                    best_score,
+                    best_matched_on,
+                )
+
                 tracker.record_response(matched_id, email)
                 tracking_repo.mark_response(
                     workflow_id=tracker.workflow_id,
@@ -606,6 +785,7 @@ class EmailWatcherV2:
                     responded_at=email.received_at,
                     response_message_id=email.message_id,
                 )
+
                 supplier_email = (
                     email.supplier_email
                     or _normalise_email_address(email.from_address)
@@ -620,12 +800,14 @@ class EmailWatcherV2:
                             response_time = Decimal(str(delta_seconds))
                     except Exception:  # pragma: no cover - defensive conversion
                         response_time = None
+
                 response_row = SupplierResponseRow(
                     workflow_id=tracker.workflow_id,
                     unique_id=matched_id,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
                     response_text=email.body,
+                    response_body=email.body_html,
                     received_time=email.received_at,
                     response_time=response_time,
                     response_message_id=email.message_id,
@@ -634,19 +816,22 @@ class EmailWatcherV2:
                     original_message_id=best_dispatch.message_id,
                     original_subject=best_dispatch.subject,
                     match_confidence=_score_to_confidence(best_score),
+                    match_score=best_score,
+                    matched_on=best_matched_on,
+                    dispatch_id=best_dispatch.dispatch_id or best_dispatch.unique_id,
+                    raw_headers=email.raw_headers,
                     processed=False,
                 )
                 supplier_response_repo.insert_response(response_row)
                 matched_rows.append(response_row)
             else:
+                reason = "no-header-match" if best_score == 0 else "below-threshold"
                 logger.warning(
-                    "Unable to confidently match supplier email for workflow=%s message_id=%s (best_score=%.2f) supplier_id=%s rfq_id=%s unique_id=%s",
+                    "MATCH FAILED: workflow=%s email_from=%s score=%.2f reason=%s",
                     tracker.workflow_id,
-                    email.message_id,
+                    email.from_address,
                     best_score,
-                    email.supplier_id,
-                    email.rfq_id,
-                    email.unique_id,
+                    reason,
                 )
         return matched_rows
 
@@ -661,6 +846,7 @@ class EmailWatcherV2:
                 "matched_responses": {},
             }
 
+        start_time = self._now()
         if tracker.last_dispatched_at:
             target = tracker.last_dispatched_at + timedelta(seconds=self.dispatch_wait_seconds)
             now = self._now()
@@ -673,28 +859,78 @@ class EmailWatcherV2:
                 )
                 self._sleep(wait_time)
 
-        attempts = 0
         since = tracker.last_dispatched_at or (self._now() - timedelta(hours=4))
-        while attempts < self.max_poll_attempts and not tracker.all_responded:
+        last_capture = tracker.last_dispatched_at or start_time
+        timeout_deadline = last_capture + timedelta(seconds=900)
+        status = "pending"
+        attempts = 0
+
+        while not tracker.all_responded:
+            now = self._now()
+            if now >= timeout_deadline:
+                logger.warning(
+                    "WARNING - No new responses for workflow=%s (elapsed=900s). Terminating watcher.",
+                    workflow_id,
+                )
+                status = "partial_timeout"
+                break
+
             responses = self._fetch_emails(since)
             matched_rows = self._match_responses(tracker, responses)
             if matched_rows:
+                last_capture = now
+                timeout_deadline = last_capture + timedelta(seconds=900)
+                since = min(since, last_capture)
                 self._process_agents(tracker)
+
+            pending_suppliers = [
+                dispatch.supplier_id
+                for uid, dispatch in tracker.email_records.items()
+                if uid not in tracker.matched_responses and dispatch.supplier_id
+            ]
+            heartbeat = {
+                "event": "watcher_heartbeat",
+                "workflow_id": workflow_id,
+                "expected_count": tracker.dispatched_count,
+                "responses_received": tracker.responded_count,
+                "pending_suppliers": pending_suppliers,
+                "since_last_capture_s": int(max(0.0, (now - last_capture).total_seconds())),
+                "timeout_deadline": timeout_deadline.isoformat(),
+            }
+            logger.info(json.dumps(heartbeat))
+
             if tracker.all_responded:
+                status = "completed"
                 break
+
             attempts += 1
+            if self.max_poll_attempts and attempts >= self.max_poll_attempts:
+                attempts = 0
             self._sleep(self.poll_interval_seconds)
 
         complete = tracker.all_responded
+        if complete:
+            status = "completed"
         result = {
             "workflow_id": workflow_id,
             "complete": complete,
             "dispatched_count": tracker.dispatched_count,
             "responded_count": tracker.responded_count,
             "matched_responses": tracker.matched_responses,
+            "status": status,
         }
 
         self._process_agents(tracker)
+
+        stop_payload = {
+            "event": "watcher_stopped",
+            "workflow_id": workflow_id,
+            "status": "completed" if complete else status,
+            "responses_received": tracker.responded_count,
+            "expected_count": tracker.dispatched_count,
+            "elapsed_s": int(max(0.0, (self._now() - start_time).total_seconds())),
+        }
+        logger.info(json.dumps(stop_payload))
 
         return result
 

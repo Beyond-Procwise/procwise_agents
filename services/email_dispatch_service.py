@@ -256,16 +256,52 @@ class EmailDispatchService:
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
+            round_header_value = (
+                dispatch_payload.get("round")
+                or dispatch_payload.get("thread_index")
+                or backend_metadata.get("round")
+            )
+            try:
+                round_header_int = (
+                    int(round_header_value)
+                    if round_header_value is not None
+                    else draft.get("round")
+                )
+            except Exception:
+                round_header_int = draft.get("round")
+            if round_header_int in (None, ""):
+                round_header_int = 1
+            elif isinstance(round_header_int, int):
+                round_header_int = max(1, round_header_int)
+            else:
+                try:
+                    round_header_int = max(1, int(round_header_int))
+                except Exception:
+                    round_header_int = 1
+
             headers = {
-                "X-Procwise-Workflow-Id": backend_metadata.get("workflow_id"),
-                "X-Procwise-Unique-Id": unique_id,
+                "X-ProcWise-Workflow-ID": backend_metadata.get("workflow_id"),
+                "X-ProcWise-Unique-ID": unique_id,
+                "X-ProcWise-Supplier-ID": backend_metadata.get("supplier_id")
+                or draft.get("supplier_id"),
+                "X-ProcWise-Round": str(round_header_int),
             }
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
-                headers["X-Procwise-Mailbox"] = mailbox_header
-            if backend_metadata.get("supplier_id"):
-                headers["X-Procwise-Supplier-Id"] = backend_metadata.get("supplier_id")
+                headers["X-ProcWise-Mailbox"] = mailbox_header
+
+            workflow_for_error = (
+                backend_metadata.get("workflow_id")
+                or draft.get("workflow_id")
+                or "unknown"
+            )
+            for key, value in list(headers.items()):
+                if value in (None, ""):
+                    raise ValueError(
+                        f"Missing required header {key} for workflow {workflow_for_error}"
+                    )
+                headers[key] = str(value)
 
             send_result = self.email_service.send_email(
                 subject,
