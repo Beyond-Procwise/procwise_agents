@@ -6,9 +6,10 @@ import json
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from services.db import get_conn
+from repositories import draft_rfq_emails_repo
 
 
 DDL_PG = """
@@ -245,6 +246,10 @@ def _parse_thread_headers(value: Optional[object]) -> Optional[Dict[str, Sequenc
     return result or None
 
 
+def _normalise_expected_ids(ids: Iterable[str]) -> Set[str]:
+    return {uid.strip() for uid in ids if uid and uid.strip()}
+
+
 def load_active_workflow_ids() -> List[str]:
     """Return workflow identifiers with dispatched emails awaiting responses."""
 
@@ -252,18 +257,60 @@ def load_active_workflow_ids() -> List[str]:
 
     with get_conn() as conn:
         cur = conn.cursor()
-        query = (
-            "SELECT workflow_id "
-            "FROM proc.workflow_email_tracking "
-            "GROUP BY workflow_id "
-            "HAVING "
-            "    BOOL_OR(responded_at IS NULL OR COALESCE(matched, FALSE) = FALSE) "
-            "    AND BOOL_AND(dispatched_at IS NOT NULL)"
+        cur.execute(
+            "SELECT DISTINCT workflow_id FROM proc.workflow_email_tracking"
         )
-        cur.execute(query)
-        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+        workflow_rows = [row[0] for row in cur.fetchall() if row and row[0]]
         cur.close()
-        return rows
+
+    active: List[str] = []
+    for workflow_id in workflow_rows:
+        workflow_key = str(workflow_id)
+        expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
+            workflow_id=workflow_key
+        )
+        normalised_expected = _normalise_expected_ids(expected_unique_ids)
+        if not normalised_expected:
+            continue
+
+        rows = load_workflow_rows(workflow_id=workflow_key)
+        if not rows:
+            continue
+
+        rows_by_uid: Dict[str, WorkflowDispatchRow] = {
+            (row.unique_id or "").strip(): row
+            for row in rows
+            if (row.unique_id or "").strip()
+        }
+
+        if not rows_by_uid:
+            continue
+
+        if any(uid not in rows_by_uid for uid in normalised_expected):
+            continue
+
+        has_pending = any(
+            (rows_by_uid[uid].responded_at is None) or (not bool(rows_by_uid[uid].matched))
+            for uid in normalised_expected
+        )
+        if not has_pending:
+            continue
+
+        all_dispatched = all(
+            rows_by_uid[uid].dispatched_at is not None for uid in normalised_expected
+        )
+        if not all_dispatched:
+            continue
+
+        all_message_ids = all(
+            (rows_by_uid[uid].message_id or "").strip() for uid in normalised_expected
+        )
+        if not all_message_ids:
+            continue
+
+        active.append(workflow_key)
+
+    return active
 
 
 def _serialise_thread_headers(headers: Optional[Dict[str, Sequence[str]]]) -> Optional[str]:

@@ -185,7 +185,57 @@ def run_email_watcher_for_workflow(
     expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
         workflow_id=workflow_key
     )
-    expected_dispatch_total = len(expected_unique_ids) or len(dispatch_rows)
+    expected_unique_ids = {
+        (unique_id or "").strip()
+        for unique_id in expected_unique_ids
+        if unique_id and unique_id.strip()
+    }
+
+    rows_by_uid = {
+        (row.unique_id or "").strip(): row
+        for row in dispatch_rows
+        if (row.unique_id or "").strip()
+    }
+
+    if not expected_unique_ids:
+        logger.debug(
+            "Workflow %s has no expected dispatch records from drafting; deferring watcher",
+            workflow_key,
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "No expected dispatches recorded",
+            "workflow_id": workflow_key,
+            "expected": len(dispatch_rows),
+            "found": 0,
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": [],
+            "missing_required_fields": {},
+        }
+
+    missing_expected_rows = sorted(
+        uid for uid in expected_unique_ids if uid not in rows_by_uid
+    )
+    if missing_expected_rows:
+        logger.debug(
+            "Workflow %s awaiting dispatch rows for %s; deferring watcher",
+            workflow_key,
+            missing_expected_rows,
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "Waiting for all dispatches to complete",
+            "workflow_id": workflow_key,
+            "expected": len(expected_unique_ids),
+            "found": len(expected_unique_ids) - len(missing_expected_rows),
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": missing_expected_rows,
+            "missing_required_fields": {uid: ["dispatch_record"] for uid in missing_expected_rows},
+        }
+
+    expected_dispatch_total = len(expected_unique_ids)
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
     imap_user = _env("IMAP_USER")
@@ -270,23 +320,21 @@ def run_email_watcher_for_workflow(
     missing_required_fields: Dict[str, List[str]] = {}
     missing_message_ids: List[str] = []
 
-    for index, row in enumerate(dispatch_rows):
-        unique_id = (row.unique_id or "").strip()
-        identifier = unique_id or f"row-{index}"
-
+    for unique_id in sorted(expected_unique_ids):
+        row = rows_by_uid.get(unique_id)
         missing_fields: List[str] = []
-        if getattr(row, "dispatched_at", None) is None:
-            missing_fields.append("dispatched_at")
-        if not unique_id:
-            missing_fields.append("unique_id")
+        if not row:
+            missing_fields.append("dispatch_record")
+        else:
+            if getattr(row, "dispatched_at", None) is None:
+                missing_fields.append("dispatched_at")
+            message_id = (row.message_id or "").strip()
+            if not message_id:
+                missing_message_ids.append(unique_id)
+                missing_fields.append("message_id")
 
         if missing_fields:
-            missing_required_fields[identifier] = missing_fields
-            continue
-
-        message_id = (row.message_id or "").strip()
-        if not message_id:
-            missing_message_ids.append(identifier)
+            missing_required_fields[unique_id] = missing_fields
 
     if missing_message_ids:
         logger.warning(
@@ -314,11 +362,11 @@ def run_email_watcher_for_workflow(
         }
 
     completed_unique_ids = {
-        row.unique_id
-        for row in dispatch_rows
-        if row.unique_id
-        and row.message_id
-        and getattr(row, "dispatched_at", None) is not None
+        unique_id
+        for unique_id in expected_unique_ids
+        if unique_id in rows_by_uid
+        and (rows_by_uid[unique_id].message_id or "").strip()
+        and getattr(rows_by_uid[unique_id], "dispatched_at", None) is not None
     }
     if expected_unique_ids and expected_unique_ids - completed_unique_ids:
         pending = sorted(expected_unique_ids - completed_unique_ids)
@@ -415,7 +463,9 @@ def run_email_watcher_for_workflow(
         "matched_unique_ids": matched_ids,
     }
 
-    expected_ids = {row.unique_id for row in dispatch_rows}
+    expected_ids = expected_unique_ids or {
+        row.unique_id for row in dispatch_rows if row.unique_id
+    }
     if status not in {"processed", "completed"}:
         missing = sorted(expected_ids - set(matched_ids))
         response_payload["reason"] = (
