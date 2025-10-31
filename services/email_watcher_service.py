@@ -264,21 +264,29 @@ def run_email_watcher_for_workflow(
     }
 
     if not expected_unique_ids:
-        logger.debug(
-            "Workflow %s has no expected dispatch records from drafting; deferring watcher",
-            workflow_key,
-        )
-        return {
-            "status": "waiting_for_dispatch",
-            "reason": "No expected dispatches recorded",
-            "workflow_id": workflow_key,
-            "expected": len(dispatch_rows),
-            "found": 0,
-            "rows": [],
-            "matched_unique_ids": [],
-            "pending_unique_ids": [],
-            "missing_required_fields": {},
-        }
+        fallback_unique_ids = set(rows_by_uid)
+        if fallback_unique_ids:
+            logger.debug(
+                "Workflow %s has no drafting dispatch records; falling back to dispatch history",
+                workflow_key,
+            )
+            expected_unique_ids = fallback_unique_ids
+        else:
+            logger.debug(
+                "Workflow %s has no expected dispatch records from drafting or dispatch history; deferring watcher",
+                workflow_key,
+            )
+            return {
+                "status": "waiting_for_dispatch",
+                "reason": "No expected dispatches recorded",
+                "workflow_id": workflow_key,
+                "expected": len(dispatch_rows),
+                "found": 0,
+                "rows": [],
+                "matched_unique_ids": [],
+                "pending_unique_ids": [],
+                "missing_required_fields": {},
+            }
 
     missing_expected_rows = sorted(
         uid for uid in expected_unique_ids if uid not in rows_by_uid
