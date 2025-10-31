@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.model_training_endpoint import ModelTrainingEndpoint
-from services.email_watcher_service import run_email_watcher_for_workflow
+from services.email_watcher_service import EmailWatcherService, run_email_watcher_for_workflow
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent
@@ -87,32 +87,40 @@ async def lifespan(app: FastAPI):
         )
         app.state.orchestrator = orchestrator
         app.state.rag_pipeline = RAGPipeline(agent_nick)
-<<<<<<< HEAD
         app.state.agent_registry = agent_nick.agents
         app.state.supplier_interaction_agent = supplier_interaction_agent
         app.state.negotiation_agent = negotiation_agent
         app.state.email_watcher_runner = run_email_watcher_for_workflow
-=======
         email_watcher_service = EmailWatcherService(
             agent_registry=agent_nick.agents,
             orchestrator=orchestrator,
             supplier_agent=supplier_interaction_agent,
             negotiation_agent=negotiation_agent,
-            workflow_memory=agent_nick.workflow_memory,
+            process_routing_service=getattr(
+                supplier_interaction_agent, "process_routing_service", None
+            ),
         )
         email_watcher_service.start()
         app.state.email_watcher_service = email_watcher_service
->>>>>>> f6b29da (updated changes)
         logger.info("System initialized successfully.")
     except Exception as e:
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
         app.state.orchestrator = None; app.state.rag_pipeline = None
         app.state.email_watcher_runner = None
+        app.state.email_watcher_service = None
     yield
     if hasattr(app.state, "agent_nick"):
         app.state.agent_nick = None
     if hasattr(app.state, "email_watcher_runner"):
         app.state.email_watcher_runner = None
+    if hasattr(app.state, "email_watcher_service"):
+        service = app.state.email_watcher_service
+        if service:
+            try:
+                service.stop()
+            except Exception:  # pragma: no cover - defensive shutdown
+                logger.exception("Failed to stop EmailWatcherService during shutdown")
+        app.state.email_watcher_service = None
     if hasattr(app.state, "supplier_interaction_agent"):
         app.state.supplier_interaction_agent = None
     if hasattr(app.state, "negotiation_agent"):

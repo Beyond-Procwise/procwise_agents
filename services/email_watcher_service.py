@@ -18,6 +18,7 @@ from repositories import (
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher import EmailWatcher, EmailWatcherConfig
+from services.event_bus import get_event_bus
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -416,7 +417,7 @@ def run_email_watcher_for_workflow(
             missing_fields.append("subject")
 
         if missing_fields:
-            missing_required_fields[identifier] = missing_fields
+            missing_required_fields[unique_id] = missing_fields
             continue
 
     if missing_message_ids:
