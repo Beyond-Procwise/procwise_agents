@@ -3,6 +3,8 @@ import sys
 import uuid
 from types import SimpleNamespace
 
+from agents.base_agent import AgentOutput, AgentStatus
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.rag_service import RAGService
@@ -81,6 +83,19 @@ def test_pipeline_answer_returns_documents(monkeypatch):
 
     monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
 
+    class DummyStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, query, user_id, session_id=None, **kwargs):
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={"answer": "", "related_prompts": []},
+                confidence=0.1,
+            )
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
+
     nick = SimpleNamespace(
         device="cpu",
         s3_client=SimpleNamespace(get_object=lambda **_: {"Body": SimpleNamespace(read=lambda: b"[]")},
@@ -95,3 +110,71 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("q", "user")
     assert result["retrieved_documents"][0]["record_id"] == "R1"
+
+
+def test_pipeline_prefers_static_dataset(monkeypatch):
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, query, top_k=5, filters=None):
+            raise AssertionError("Dynamic search should not be called when static QA matches")
+
+        def upsert_texts(self, texts, metadata=None):
+            raise AssertionError("Dynamic upsert not expected for static QA responses")
+
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    class DummyStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, query, user_id, session_id=None, **kwargs):
+            return AgentOutput(
+                status=AgentStatus.SUCCESS,
+                data={
+                    "answer": "Year-to-date realised savings are around £2.8 million, mainly from IT and facilities contract renewals.",
+                    "related_prompts": [
+                        "How does this compare with the same period last year?",
+                        "Show me the savings trend over the past 6 months.",
+                    ],
+                    "topic": "Current Total Savings Year-to-Date",
+                    "question": "What is our current total savings year to date?",
+                },
+                confidence=0.92,
+            )
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
+
+    history_store = {"payloads": []}
+
+    def _get_object(**kwargs):
+        return {"Body": SimpleNamespace(read=lambda: b"[]")}
+
+    def _put_object(**kwargs):
+        history_store["payloads"].append(kwargs)
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(get_object=_get_object, put_object=_put_object),
+        settings=SimpleNamespace(
+            qdrant_collection_name="c",
+            s3_bucket_name="b",
+            reranker_model="x",
+            static_qa_confidence_threshold=0.5,
+        ),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
+    result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
+
+    assert "Year-to-date realised savings" in result["answer"]
+    assert result["retrieved_documents"][0]["source"] == "static_procurement_qa"
+    assert result["follow_ups"] == [
+        "How does this compare with the same period last year?",
+        "Show me the savings trend over the past 6 months.",
+    ]
+    assert history_store["payloads"], "Static answers should be recorded in history"
