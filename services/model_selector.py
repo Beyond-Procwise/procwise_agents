@@ -159,7 +159,9 @@ class RAGPipeline:
         system = (
             "You are a procurement-focused assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
             "where 'follow_ups' is a list of 3 to 5 short questions. Use only the supplied context, "
-            "external procurement knowledge, and never manipulate or infer customer data beyond the prompt." 
+            "external procurement knowledge, and never manipulate or infer customer data beyond the prompt. "
+            "Craft the answer as an expert consultant: be descriptive, confident, and avoid starting with phrases "
+            "such as 'Based on the'."
         )
         messages = [
             {"role": "system", "content": system},
@@ -224,16 +226,22 @@ class RAGPipeline:
         # --- Retrieve from Vector DB ---
         top_k = 6
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
-        retrieved_context = "\n---\n".join(
-            [
-                (
-                    f"{hit.payload.get('document_type', 'document').title()} "
-                    f"{hit.payload.get('record_id', hit.id)}\n"
-                    f"Summary: {hit.payload.get('summary', hit.payload.get('content', ''))}"
-                )
-                for hit in reranked
-            ]
-        ) if reranked else ""
+        context_segments: List[str] = []
+        for hit in reranked:
+            payload = getattr(hit, "payload", {}) or {}
+            chunk_suffix = (
+                f" | Chunk {payload.get('chunk_id')}"
+                if payload.get("chunk_id") is not None
+                else ""
+            )
+            segment = (
+                f"Source: {payload.get('collection_name', self.settings.qdrant_collection_name)} | "
+                f"Document: {payload.get('document_name') or payload.get('record_id', hit.id)}"
+                f"{chunk_suffix}\n"
+                f"Details: {payload.get('summary', payload.get('content', ''))}"
+            )
+            context_segments.append(segment)
+        retrieved_context = "\n---\n".join(context_segments) if context_segments else ""
 
         history = []
         if not reranked:
@@ -246,7 +254,7 @@ class RAGPipeline:
                     "retrieved_documents": [],
                 }
             prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
-Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided.
+Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided. Respond as an expert procurement consultant with confident, descriptive language, and avoid opening with phrases like 'Based on the'.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
@@ -270,7 +278,7 @@ Only leverage procurement-focused external knowledge when the retrieved context 
 
         # When documents are found, prioritise them over chat history
         prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
-Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided.
+Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided. Respond as an expert procurement consultant with confident, descriptive language, and avoid opening with phrases like 'Based on the'.
 
 ### Ad-hoc Context from Uploaded Files:
 {ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
