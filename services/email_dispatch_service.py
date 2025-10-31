@@ -196,6 +196,18 @@ class EmailDispatchService:
             else:
                 dispatch_payload_context = None
 
+            workflow_identifier = (
+                backend_metadata.get("workflow_id")
+                or draft.get("workflow_id")
+                or (
+                    dispatch_payload_context.get("workflow_id")
+                    if dispatch_payload_context
+                    else None
+                )
+            )
+            if workflow_identifier:
+                backend_metadata.setdefault("workflow_id", workflow_identifier)
+
             workflow_email_flag = self._coerce_bool_flag(is_workflow_email)
             if workflow_email_flag is None:
                 workflow_email_flag = self._coerce_bool_flag(draft.get("workflow_email"))
@@ -214,6 +226,9 @@ class EmailDispatchService:
             if workflow_email_flag is None:
                 workflow_email_flag = self._coerce_bool_flag(draft_metadata.get("workflow_email"))
 
+            if workflow_email_flag is None and workflow_identifier:
+                workflow_email_flag = True
+
             parent_agent_hint = draft_metadata.get("parent_agent") or draft.get("parent_agent")
             if (
                 workflow_email_flag is None
@@ -223,7 +238,6 @@ class EmailDispatchService:
             ):
                 workflow_email_flag = True
 
-            should_record_workflow = bool(workflow_email_flag) if workflow_email_flag is not None else False
             if workflow_email_flag is not None:
                 draft_metadata["workflow_email"] = bool(workflow_email_flag)
 
@@ -245,7 +259,9 @@ class EmailDispatchService:
                     "dispatch_run_id": dispatch_run_id,
                 }
             )
-            dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
+            dispatch_payload.setdefault(
+                "workflow_id", backend_metadata.get("workflow_id") or workflow_identifier
+            )
             dispatch_payload.setdefault("unique_id", unique_id)
             if backend_metadata.get("run_id"):
                 dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
@@ -412,7 +428,7 @@ class EmailDispatchService:
                         backend_metadata.setdefault(
                             "workflow_context_identifier", context_unique_id
                         )
-                if should_record_workflow and workflow_identifier and unique_id:
+                if workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
