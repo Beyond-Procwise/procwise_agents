@@ -614,9 +614,6 @@ def test_email_watcher_recovers_from_imap_errors():
         current_time = current_time + timedelta(seconds=2)
         return current_time
 
-    supplier_agent = StubSupplierAgent()
-    rfq_identifier = "RFQ-ERROR-01"
-
     response_email = EmailResponse(
         unique_id=unique_id,
         supplier_id="supplier-error",
@@ -627,7 +624,7 @@ def test_email_watcher_recovers_from_imap_errors():
         body="Here is our quote",
         received_at=base_time + timedelta(seconds=10),
         in_reply_to=(dispatch_message_id,),
-        rfq_id=rfq_identifier,
+        rfq_id="RFQ-ERROR-01",
         body_text="Here is our quote",
     )
 
@@ -640,7 +637,6 @@ def test_email_watcher_recovers_from_imap_errors():
         return [response_email]
 
     watcher = EmailWatcherV2(
-        supplier_agent=supplier_agent,
         dispatch_wait_seconds=0,
         poll_interval_seconds=1,
         max_poll_attempts=1,
