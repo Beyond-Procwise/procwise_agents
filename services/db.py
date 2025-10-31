@@ -120,6 +120,7 @@ class _FakeCursor:
                 "unique_id",
                 "supplier_id",
                 "supplier_email",
+                "rfq_id",
                 "response_message_id",
                 "response_subject",
                 "response_text",

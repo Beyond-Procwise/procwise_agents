@@ -98,8 +98,44 @@ class WorkflowTracker:
     all_responded: bool = False
     last_dispatched_at: Optional[datetime] = None
 
+    @staticmethod
+    def _normalise_round(value: Optional[object]) -> Optional[int]:
+        if value in (None, "", False):
+            return None
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except Exception:
+            return None
+        if number < 0:
+            return None
+        return number
+
+    def _recompute_counts(self) -> None:
+        self.dispatched_count = len(self.email_records)
+        matched = 0
+        for uid, record in self.email_records.items():
+            expected_round = self._normalise_round(record.round_number)
+            response = self.matched_responses.get(uid)
+            if not response:
+                continue
+            response_round = self._normalise_round(response.round_number)
+            if expected_round is not None and response_round is not None:
+                if expected_round != response_round:
+                    continue
+            matched += 1
+        self.responded_count = matched
+        self.all_dispatched = self.dispatched_count > 0
+        self.all_responded = matched >= self.dispatched_count > 0
+
     def register_dispatches(self, dispatches: Iterable[EmailDispatchRecord]) -> None:
         for dispatch in dispatches:
+            dispatch.round_number = self._normalise_round(dispatch.round_number)
+            existing = self.matched_responses.get(dispatch.unique_id)
+            if existing:
+                expected_round = dispatch.round_number
+                existing_round = self._normalise_round(existing.round_number)
+                if expected_round is not None and existing_round is not None and existing_round != expected_round:
+                    self.matched_responses.pop(dispatch.unique_id, None)
             self.email_records[dispatch.unique_id] = dispatch
             if dispatch.rfq_id:
                 normalised = _normalise_identifier(dispatch.rfq_id)
@@ -109,17 +145,25 @@ class WorkflowTracker:
                 self.last_dispatched_at is None or dispatch.dispatched_at > self.last_dispatched_at
             ):
                 self.last_dispatched_at = dispatch.dispatched_at
-        self.dispatched_count = len(self.email_records)
-        self.all_dispatched = True
+        self._recompute_counts()
 
     def record_response(self, unique_id: str, response: EmailResponse) -> None:
         if unique_id not in self.email_records:
             return
+        dispatch = self.email_records.get(unique_id)
         if unique_id in self.matched_responses:
-            return
+            dispatch_round = self._normalise_round(getattr(dispatch, "round_number", None)) if dispatch else None
+            response_round = self._normalise_round(self.matched_responses[unique_id].round_number)
+            if dispatch_round is not None and response_round == dispatch_round:
+                return
+        dispatch_round = self._normalise_round(getattr(dispatch, "round_number", None)) if dispatch else None
+        if dispatch_round is not None:
+            try:
+                response.round_number = dispatch_round
+            except Exception:
+                pass
         self.matched_responses[unique_id] = response
-        self.responded_count = len(self.matched_responses)
-        self.all_responded = self.responded_count >= self.dispatched_count > 0
+        self._recompute_counts()
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +915,7 @@ class EmailWatcher:
                         subject=None,
                         body="",
                         received_at=row.responded_at or row.dispatched_at or self._now(),
+                        round_number=row.round_number,
                     ),
                 )
         self._trackers[workflow_id] = tracker
@@ -1041,6 +1086,12 @@ class EmailWatcher:
                         best_reason = reason
 
             if matched_id and best_dispatch and best_score >= self.config.match_threshold:
+                dispatch_round = best_dispatch.round_number
+                if dispatch_round is not None:
+                    try:
+                        email_response.round_number = dispatch_round
+                    except Exception:
+                        pass
                 tracker.record_response(matched_id, email_response)
                 supplier_email = (
                     email_response.supplier_email
@@ -1058,6 +1109,7 @@ class EmailWatcher:
                     unique_id=matched_id,
                     supplier_id=supplier_id,
                     supplier_email=supplier_email,
+                    rfq_id=email_response.rfq_id or best_dispatch.rfq_id,
                     response_text=email_response.body,
                     response_body=email_response.body_html,
                     received_time=email_response.received_at,
@@ -1072,6 +1124,7 @@ class EmailWatcher:
                     matched_on=best_reason,
                     dispatch_id=best_dispatch.dispatch_id or best_dispatch.unique_id,
                     raw_headers=email_response.raw_headers,
+                    round_number=dispatch_round,
                     processed=False,
                 )
                 supplier_response_repo.insert_response(response_row)
@@ -1083,6 +1136,7 @@ class EmailWatcher:
                             unique_id=matched_id,
                             responded_at=responded_at,
                             response_message_id=email_response.message_id,
+                            round_number=dispatch_round,
                         )
                     except Exception:  # pragma: no cover - defensive logging
                         logger.exception(
@@ -1136,6 +1190,7 @@ class EmailWatcher:
                         unique_id=matched_id,
                         supplier_id=supplier_id,
                         supplier_email=supplier_email,
+                        rfq_id=email_response.rfq_id or best_dispatch.rfq_id,
                         response_text=email_response.body,
                         response_body=email_response.body_html,
                         received_time=email_response.received_at,
@@ -1382,15 +1437,18 @@ class EmailWatcher:
         while not tracker.all_responded:
             exceeded, reason = poll_controller.check_limits()
             if exceeded:
-                status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
                 timeout_reason = reason
-                logger.warning(
-                    "Watcher exiting for workflow=%s due to %s after %.1fs",
-                    workflow_id,
-                    reason,
-                    (self._now() - start_time).total_seconds(),
-                )
-                break
+                if grace_deadline and self._now() < grace_deadline:
+                    poll_controller.activate_grace(grace_deadline, reason=reason)
+                else:
+                    status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
+                    logger.warning(
+                        "Watcher exiting for workflow=%s due to %s after %.1fs",
+                        workflow_id,
+                        reason,
+                        (self._now() - start_time).total_seconds(),
+                    )
+                    break
 
             responses = await self._fetch_emails(since)
             matched_rows = self._match_responses(tracker, responses)
@@ -1398,6 +1456,8 @@ class EmailWatcher:
                 last_capture = self._now()
                 since = min(since, last_capture)
                 poll_controller.record_activity()
+                if self.config.response_grace_seconds > 0:
+                    grace_deadline = last_capture + timedelta(seconds=self.config.response_grace_seconds)
                 self._process_agents(tracker)
             else:
                 poll_controller.record_empty()
@@ -1430,8 +1490,23 @@ class EmailWatcher:
 
             exceeded, reason = poll_controller.check_limits()
             if exceeded:
-                status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
                 timeout_reason = reason
+                if grace_deadline and self._now() < grace_deadline:
+                    if poll_controller.activate_grace(grace_deadline, reason=reason):
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "watcher_grace_period",
+                                    "workflow_id": workflow_id,
+                                    "grace_until": grace_deadline.isoformat(),
+                                    "pending_suppliers": pending_suppliers,
+                                    "responses_received": tracker.responded_count,
+                                }
+                            )
+                        )
+                        timeout_reason = reason
+                        continue
+                status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
                 logger.warning(
                     "Watcher exiting for workflow=%s due to %s after %.1fs",
                     workflow_id,
@@ -1441,21 +1516,7 @@ class EmailWatcher:
                 break
 
             if not tracker.all_responded and grace_deadline and self._now() < grace_deadline:
-                if poll_controller.activate_grace(grace_deadline, reason=timeout_reason):
-                    logger.info(
-                        json.dumps(
-                            {
-                                "event": "watcher_grace_period",
-                                "workflow_id": workflow_id,
-                                "grace_until": grace_deadline.isoformat(),
-                                "pending_suppliers": pending_suppliers,
-                                "responses_received": tracker.responded_count,
-                            }
-                        )
-                    )
-                    timeout_reason = None
-                else:
-                    timeout_reason = None
+                poll_controller.activate_grace(grace_deadline, reason=timeout_reason)
 
             delay = poll_controller.next_delay()
             if delay > 0:
@@ -1480,6 +1541,8 @@ class EmailWatcher:
             "poll_attempts": poll_controller.total_polls,
             "last_delay_s": poll_controller.last_delay,
         }
+        if grace_deadline:
+            result["timeout_deadline"] = grace_deadline.isoformat()
         pending_unique_ids = [
             uid
             for uid in tracker.email_records
@@ -1576,12 +1639,17 @@ def register_sent_email(
     message_id: Optional[str] = None,
     rfq_id: Optional[str] = None,
     thread_headers: Optional[Dict[str, Iterable[str]]] = None,
+    dispatched_at: Optional[datetime] = None,
 ) -> None:
     """Persist a dispatched email for downstream response reconciliation."""
 
     supplier_interaction_repo.init_schema()
 
     headers = thread_headers or {}
+    metadata: Dict[str, Any] = {"agent": agent_nick}
+    if dispatched_at is not None:
+        metadata["dispatched_at"] = dispatched_at.isoformat()
+
     record = SupplierInteractionRow(
         workflow_id=workflow_id,
         unique_id=unique_id,
@@ -1597,7 +1665,8 @@ def register_sent_email(
         in_reply_to=list(headers.get("in_reply_to", [])) or None,
         references=list(headers.get("references", [])) or None,
         rfq_id=rfq_id,
-        metadata={"agent": agent_nick},
+        processed_at=dispatched_at,
+        metadata=metadata,
     )
     supplier_interaction_repo.register_outbound(record)
 
