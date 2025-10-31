@@ -17,7 +17,12 @@ from repositories import (
     workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
+<<<<<<< HEAD
 from services.email_watcher import EmailWatcher, EmailWatcherConfig
+=======
+from services.email_watcher_v2 import EmailWatcherV2
+from services.watcher_utils import run_email_watcher_for_workflow
+>>>>>>> f6b29da (updated changes)
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -220,6 +225,7 @@ def run_email_watcher_for_workflow(
     negotiation_agent: Optional[Any] = None,
     process_routing_service: Optional[Any] = None,
     max_workers: int = 8,
+    workflow_memory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
 
@@ -540,6 +546,7 @@ def run_email_watcher_for_workflow(
         imap_port=imap_port or 993,
         imap_use_ssl=True if imap_use_ssl is None else imap_use_ssl,
         imap_login=imap_login,
+<<<<<<< HEAD
         imap_mailbox=mailbox or "INBOX",
         dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
         poll_interval_seconds=max(1, poll_interval),
@@ -563,6 +570,9 @@ def run_email_watcher_for_workflow(
         "watcher_started workflow=%s expected=%s status=active",
         workflow_key,
         expected_dispatch_total,
+=======
+        workflow_memory=workflow_memory,
+>>>>>>> f6b29da (updated changes)
     )
     try:
         result = watcher.wait_for_responses(workflow_key)
@@ -670,7 +680,11 @@ class EmailWatcherService:
         orchestrator: Optional[Any] = None,
         supplier_agent: Optional[Any] = None,
         negotiation_agent: Optional[Any] = None,
+<<<<<<< HEAD
         process_routing_service: Optional[Any] = None,
+=======
+        workflow_memory: Optional[Any] = None,
+>>>>>>> f6b29da (updated changes)
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -697,7 +711,11 @@ class EmailWatcherService:
         self._orchestrator = orchestrator
         self._supplier_agent = supplier_agent
         self._negotiation_agent = negotiation_agent
+<<<<<<< HEAD
         self._process_router = process_routing_service
+=======
+        self._workflow_memory = workflow_memory
+>>>>>>> f6b29da (updated changes)
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -751,7 +769,7 @@ class EmailWatcherService:
             self.stop()
             self.start()
         with self._forced_lock:
-            self._forced_workflows.add(workflow_key)
+            self._forced_workflows = {workflow_key}
         self._wake_event.set()
 
     def _consume_forced_workflows(self) -> List[str]:
@@ -885,19 +903,11 @@ class EmailWatcherService:
         while not self._stop_event.is_set():
             waiting_for_dispatch = False
             processed_workflow = False
-            try:
-                workflow_ids = workflow_email_tracking_repo.load_active_workflow_ids()
-            except Exception:
-                logger.exception("Failed to load workflows for email watcher service")
-                workflow_ids = []
-
             forced = self._consume_forced_workflows()
             if forced:
-                seen = set(workflow_ids)
-                for workflow_id in forced:
-                    if workflow_id not in seen:
-                        workflow_ids.append(workflow_id)
-                        seen.add(workflow_id)
+                workflow_ids = list(dict.fromkeys(forced))
+            else:
+                workflow_ids = []
 
             for workflow_id in workflow_ids:
                 if self._stop_event.is_set():
@@ -919,7 +929,11 @@ class EmailWatcherService:
                         orchestrator=self._orchestrator,
                         supplier_agent=self._supplier_agent,
                         negotiation_agent=self._negotiation_agent,
+<<<<<<< HEAD
                         process_routing_service=self._process_router,
+=======
+                        workflow_memory=self._workflow_memory,
+>>>>>>> f6b29da (updated changes)
                     )
                     status = str(result.get("status") or "").lower()
                     processed_workflow = True

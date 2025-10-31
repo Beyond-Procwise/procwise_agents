@@ -9926,13 +9926,49 @@ class NegotiationAgent(BaseAgent):
         supplier_reply_registered: bool = False,
         rfq_id: Optional[str] = None,
     ) -> None:
-        _ = self._coerce_text(rfq_id) or self._coerce_text(session_id)
-        logger.debug(
-            "Negotiation learning capture skipped (session_id=%s, supplier=%s)",
-            session_id,
-            supplier,
-        )
-        return
+        workflow_id = getattr(context, "workflow_id", None)
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        event_payload = {
+            "category": "negotiation_snapshot",
+            "rfq_id": rfq_id,
+            "session_id": session_id,
+            "supplier_id": supplier,
+            "decision": dict(decision or {}),
+            "state": dict(state or {}),
+            "awaiting_response": awaiting_response,
+            "supplier_reply_registered": supplier_reply_registered,
+        }
+        if memory and getattr(memory, "enabled", False) and workflow_id:
+            try:
+                memory.enqueue_learning_event(workflow_id, event_payload)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to enqueue negotiation learning for workflow=%s",
+                    workflow_id,
+                    exc_info=True,
+                )
+            return
+
+        repository = getattr(self.agent_nick, "learning_repository", None)
+        if not repository:
+            return
+        try:
+            repository.record_negotiation_learning(
+                workflow_id=workflow_id,
+                rfq_id=rfq_id,
+                supplier_id=supplier,
+                decision=decision or {},
+                state=state or {},
+                awaiting_response=awaiting_response,
+                supplier_reply_registered=supplier_reply_registered,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Failed to record negotiation learning for workflow=%s supplier=%s",
+                workflow_id,
+                supplier,
+                exc_info=True,
+            )
 
     def _collect_recipient_candidates(self, context: AgentContext) -> List[str]:
         seen: Set[str] = set()
@@ -13130,6 +13166,7 @@ class NegotiationAgent(BaseAgent):
                 )
             except Exception:
                 logger.exception("Failed to log negotiation email draft action")
+<<<<<<< HEAD
 
     def _log_final_negotiation_outcome(
         self, context: AgentContext, summary: Dict[str, Any]
@@ -13244,3 +13281,5 @@ class NegotiationSession:
     def update_round(self, round_number: int) -> None:
         self.current_round = max(1, round_number)
 
+=======
+>>>>>>> f6b29da (updated changes)
