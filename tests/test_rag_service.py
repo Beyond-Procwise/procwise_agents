@@ -51,8 +51,9 @@ def test_upsert_and_search():
         uuid.UUID(str(pid))
     hits = rag.search("hello")
     assert hits[0].payload["record_id"] == "test"
-    # ensure local indexes were used without calling qdrant search
-    assert not nick.qdrant_client.search_calls
+    # ensure qdrant was queried across configured collections even with local hits
+    collections = {call["collection_name"] for call in nick.qdrant_client.search_calls}
+    assert {"c", "uploaded_documents", "learning"}.issubset(collections)
 
 
 def test_upsert_gpu_fallback(monkeypatch, caplog):
@@ -69,6 +70,8 @@ def test_upsert_gpu_fallback(monkeypatch, caplog):
     assert "falling back to CPU index" in caplog.text
     hits = rag.search("gpu")
     assert hits[0].payload["record_id"] == "gpu"
+    collections = {call["collection_name"] for call in nick.qdrant_client.search_calls}
+    assert {"c", "uploaded_documents", "learning"}.issubset(collections)
 
 
 def test_upsert_payloads_respects_source_collection():
@@ -104,6 +107,10 @@ def test_pipeline_answer_returns_documents(monkeypatch):
 
         def upsert_texts(self, texts, metadata=None):
             pass
+
+        primary_collection = "c"
+        uploaded_collection = "uploaded_documents"
+        learning_collection = "learning"
 
     monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
 

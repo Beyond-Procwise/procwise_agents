@@ -37,6 +37,11 @@ class RAGService:
             "uploaded_documents_collection_name",
             "uploaded_documents",
         )
+        self.learning_collection = getattr(
+            self.settings,
+            "learning_collection_name",
+            "learning",
+        )
         # Local FAISS and BM25 indexes to complement Qdrant
         self._faiss_index = None
         self._doc_vectors: List[np.ndarray] = []
@@ -144,11 +149,10 @@ class RAGService:
         if not payloads:
             return
 
-        target_collection = collection_name or self.primary_collection
+        resolved_collection = collection_name or self.primary_collection
         points: List[models.PointStruct] = []
         texts_for_embedding: List[str] = []
         payloads_for_storage: List[Dict[str, Any]] = []
-        target_collection: Optional[str] = None
 
         for payload in payloads:
             if not isinstance(payload, dict):
@@ -168,8 +172,9 @@ class RAGService:
             )
             base_payload["record_id"] = record_id
 
-            if target_collection is None:
-                target_collection = self._extract_source_collection(base_payload)
+            override_collection = self._extract_source_collection(base_payload)
+            if override_collection:
+                resolved_collection = override_collection
 
             if text_representation_key in base_payload:
                 base_payload.pop(text_representation_key, None)
@@ -212,7 +217,7 @@ class RAGService:
                         chunk_payload.get("text_summary"),
                     )
                 chunk_payload["text_summary"] = chunk
-                chunk_payload.setdefault("collection_name", target_collection)
+                chunk_payload.setdefault("collection_name", resolved_collection)
                 texts_for_embedding.append(chunk)
                 payloads_for_storage.append(chunk_payload)
 
@@ -255,13 +260,13 @@ class RAGService:
                 self._bm25 = BM25Okapi(self._bm25_corpus)
 
         collection_name = (
-            target_collection
+            resolved_collection
             or getattr(self.settings, "qdrant_collection_name", None)
         )
 
         if points and collection_name:
             self.client.upsert(
-                collection_name=target_collection,
+                collection_name=collection_name,
                 points=points,
                 wait=True,
             )
@@ -370,12 +375,16 @@ class RAGService:
                         id=doc["id"], payload=doc, score=float(score)
                     )
 
-        # --- Fallback to Qdrant if local indexes empty ---
-        if not candidates and self.client is not None:
+        # --- Hybrid retrieval across Qdrant collections ---
+        if self.client is not None:
             _, vector = _ensure_query_vectors()
             search_params = models.SearchParams(hnsw_ef=256, exact=False)
 
-            def _search_collection(name: str) -> List[SimpleNamespace]:
+            def _search_collection(
+                name: str,
+                *,
+                query_filter: Optional[models.Filter],
+            ) -> List[SimpleNamespace]:
                 if not name:
                     return []
 
@@ -383,7 +392,7 @@ class RAGService:
                     raw_hits = self.client.search(
                         collection_name=name,
                         query_vector=vector,
-                        query_filter=filters,
+                        query_filter=query_filter,
                         limit=top_k * 5,
                         with_payload=True,
                         with_vectors=False,
@@ -407,11 +416,13 @@ class RAGService:
                         raw_hits = self.client.search(
                             collection_name=name,
                             query_vector=vector,
-                            query_filter=filters,
+                            query_filter=query_filter,
                             limit=top_k * 5,
                             with_payload=True,
                             with_vectors=False,
-                            search_params=models.SearchParams(hnsw_ef=256, exact=True),
+                            search_params=models.SearchParams(
+                                hnsw_ef=256, exact=True
+                            ),
                         )
                     except UnexpectedResponse as exc:
                         if getattr(exc, "status_code", None) == 404:
@@ -439,12 +450,14 @@ class RAGService:
                     )
                 return wrapped
 
-            for collection in {
-                self.primary_collection,
-                self.uploaded_collection,
-            }:
-                for hit in _search_collection(collection):
-                    key = f"{hit.payload.get('collection_name', collection)}:{hit.id}"
+            collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = (
+                (self.primary_collection, filters),
+                (self.uploaded_collection, filters),
+                (self.learning_collection, None),
+            )
+            for name, collection_filter in collections_to_query:
+                for hit in _search_collection(name, query_filter=collection_filter):
+                    key = f"{hit.payload.get('collection_name', name)}:{hit.id}"
                     existing = candidates.get(key)
                     if existing is None or hit.score > existing.score:
                         candidates[key] = hit
@@ -471,7 +484,23 @@ class RAGService:
         scores = self._reranker.predict(pairs)
         if hasattr(scores, "tolist"):
             scores = scores.tolist()
-        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+
+        def _priority_bonus(hit: SimpleNamespace) -> float:
+            payload = getattr(hit, "payload", {}) or {}
+            collection = payload.get("collection_name", self.primary_collection)
+            if collection == self.primary_collection:
+                return 0.12
+            if collection == self.uploaded_collection:
+                return 0.08
+            if collection == self.learning_collection:
+                return 0.04
+            return 0.0
+
+        ranked = sorted(
+            zip(hits, scores),
+            key=lambda x: (float(x[1]) + _priority_bonus(x[0])),
+            reverse=True,
+        )
         return [h for h, _ in ranked[:top_k]]
 
     def create_langchain_retriever_tool(

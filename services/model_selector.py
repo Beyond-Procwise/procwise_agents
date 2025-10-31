@@ -160,18 +160,32 @@ class RAGPipeline:
             "You are a procurement-focused assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
             "where 'follow_ups' is a list of 3 to 5 short questions. Use only the supplied context, "
             "external procurement knowledge, and never manipulate or infer customer data beyond the prompt. "
-            "Craft the answer as an expert consultant: be descriptive, confident, and avoid starting with phrases "
-            "such as 'Based on the'."
+            "Craft the answer as an expert consultant: be descriptive, confident, and keep the tone conversational "
+            "yet professional. Avoid opening with phrases such as 'Based on the'."
         )
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
         try:
+            base_options = dict(self.agent_nick.ollama_options() or {})
+        except Exception:
+            base_options = {}
+        temperature = base_options.get("temperature", 0.0)
+        try:
+            temperature = float(temperature)
+        except (TypeError, ValueError):
+            temperature = 0.0
+        if temperature <= 0.0:
+            base_options["temperature"] = 0.35
+        else:
+            base_options["temperature"] = min(0.7, temperature + 0.1)
+        base_options.setdefault("top_p", 0.9)
+        try:
             response = ollama.chat(
                 model=model,
                 messages=messages,
-                options=self.agent_nick.ollama_options(),
+                options=base_options,
                 format="json",
             )
             content = response.get("message", {}).get("content", "")
@@ -227,20 +241,64 @@ class RAGPipeline:
         top_k = 6
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
         context_segments: List[str] = []
+        retrieved_documents_payloads: List[Dict[str, Any]] = []
         for hit in reranked:
             payload = getattr(hit, "payload", {}) or {}
+            retrieved_documents_payloads.append(payload)
             chunk_suffix = (
                 f" | Chunk {payload.get('chunk_id')}"
                 if payload.get("chunk_id") is not None
                 else ""
             )
+            collection_name = payload.get(
+                "collection_name", self.settings.qdrant_collection_name
+            )
+            source_label = {
+                self.rag.primary_collection: "ProcWise knowledge base",
+                self.rag.uploaded_collection: "Uploaded reference",
+                getattr(self.rag, "learning_collection", "learning"): "Procurement playbook",
+            }.get(collection_name, collection_name)
+            details = (
+                payload.get("summary")
+                or payload.get("text_summary")
+                or payload.get("content", "")
+            )
+            if collection_name == getattr(self.rag, "learning_collection", "learning"):
+                intro = "Process guidance"
+            elif collection_name == self.rag.uploaded_collection:
+                intro = "Uploaded details"
+            else:
+                intro = "Document insight"
             segment = (
-                f"Source: {payload.get('collection_name', self.settings.qdrant_collection_name)} | "
-                f"Document: {payload.get('document_name') or payload.get('record_id', hit.id)}"
+                f"Source: {source_label} | Document: {payload.get('document_name') or payload.get('record_id', hit.id)}"
                 f"{chunk_suffix}\n"
-                f"Details: {payload.get('summary', payload.get('content', ''))}"
+                f"{intro}: {details}"
             )
             context_segments.append(segment)
+
+        try:
+            static_output = self._static_agent.run(query=query, user_id=user_id, session_id=user_id)
+        except Exception:
+            logger.exception("Static procurement QA lookup failed during context build")
+        else:
+            if static_output.status is AgentStatus.SUCCESS:
+                payload = static_output.data or {}
+                answer_text = payload.get("answer")
+                if isinstance(answer_text, str) and answer_text.strip():
+                    static_context_payload = {
+                        "source": "static_procurement_qa",
+                        "topic": payload.get("topic"),
+                        "question": payload.get("question"),
+                        "answer": answer_text,
+                        "confidence": float(static_output.confidence or 0.0),
+                    }
+                    retrieved_documents_payloads.append(static_context_payload)
+                    context_segments.append(
+                        "Source: Static procurement guide"
+                        f" | Topic: {payload.get('topic', 'Common procurement guidance')}\n"
+                        f"Contextual answer: {answer_text}"
+                    )
+
         retrieved_context = "\n---\n".join(context_segments) if context_segments else ""
 
         history = []
@@ -301,5 +359,5 @@ Only leverage procurement-focused external knowledge when the retrieved context 
         return {
             "answer": answer,
             "follow_ups": follow_ups,
-            "retrieved_documents": [hit.payload for hit in reranked],
+            "retrieved_documents": retrieved_documents_payloads,
         }
