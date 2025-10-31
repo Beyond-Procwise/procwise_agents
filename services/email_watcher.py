@@ -1501,6 +1501,7 @@ class EmailWatcher:
                 timeout_reason = reason
                 if grace_deadline and self._now() < grace_deadline:
                     poll_controller.activate_grace(grace_deadline, reason=reason)
+                    timeout_reason = None
                 else:
                     status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
                     logger.warning(
@@ -1565,7 +1566,7 @@ class EmailWatcher:
                                 }
                             )
                         )
-                        timeout_reason = reason
+                        timeout_reason = None
                         continue
                 status = "timeout" if reason == "timeout" else "max_attempts_exceeded"
                 logger.warning(
@@ -1578,6 +1579,7 @@ class EmailWatcher:
 
             if not tracker.all_responded and grace_deadline and self._now() < grace_deadline:
                 poll_controller.activate_grace(grace_deadline, reason=timeout_reason)
+                timeout_reason = None
 
             delay = poll_controller.next_delay()
             if delay > 0:
