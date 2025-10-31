@@ -330,7 +330,12 @@ def insert_response(row: SupplierResponseRow) -> None:
     body_html = row.body_html if row.body_html not in (None, "") else None
     received_time = _normalise_dt(row.received_time)
     response_date = received_time
-    price_value = _serialise_decimal(row.price)
+    price_value = _serialise_decimal(getattr(row, "price", None))
+    currency = getattr(row, "currency", None) or None
+    payment_terms = getattr(row, "payment_terms", None) or None
+    warranty = getattr(row, "warranty", None) or None
+    validity = getattr(row, "validity", None) or None
+    exceptions = getattr(row, "exceptions", None) or None
     lead_time = row.lead_time
     match_confidence = _serialise_decimal(row.match_confidence)
     match_score = _serialise_decimal(row.match_score)
@@ -357,11 +362,16 @@ def insert_response(row: SupplierResponseRow) -> None:
         except Exception:
             match_score_value = str(row.match_score)
     matched_on_json = None
+    matched_on_json = None
     if row.matched_on:
         try:
             matched_on_json = json.dumps(list(row.matched_on))
         except Exception:
             matched_on_json = json.dumps([str(item) for item in row.matched_on])
+    in_reply_to_json = _serialise_optional_json(row.in_reply_to)
+    references_json = _serialise_optional_json(row.references)
+    tables_json = _serialise_optional_json(getattr(row, "tables", None))
+    attachments_json = _serialise_optional_json(getattr(row, "attachments", None))
     raw_headers_json = None
     if row.raw_headers:
         try:
@@ -370,6 +380,10 @@ def insert_response(row: SupplierResponseRow) -> None:
             serialisable = None
         if serialisable is not None:
             raw_headers_json = json.dumps(serialisable)
+
+    match_evidence = _serialise_match_evidence(getattr(row, "match_evidence", None))
+    matched_on = matched_on_json
+    raw_headers = raw_headers_json
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -470,13 +484,14 @@ def insert_response(row: SupplierResponseRow) -> None:
 
         insert_query = (
             "INSERT INTO proc.supplier_response "
-            "(workflow_id, unique_id, supplier_id, supplier_email, response_message_id, response_subject, "
+            "(workflow_id, unique_id, supplier_id, supplier_email, rfq_id, response_message_id, response_subject, "
             "response_text, response_body, response_from, response_date, original_message_id, original_subject, "
             "match_confidence, match_score, price, lead_time, response_time, received_time, processed, dispatch_id, matched_on, raw_headers) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT(workflow_id, response_message_id) DO UPDATE SET "
             "supplier_id=COALESCE(EXCLUDED.supplier_id, proc.supplier_response.supplier_id), "
             "supplier_email=COALESCE(EXCLUDED.supplier_email, proc.supplier_response.supplier_email), "
+            "rfq_id=COALESCE(EXCLUDED.rfq_id, proc.supplier_response.rfq_id), "
             "unique_id=EXCLUDED.unique_id, "
             "response_text=EXCLUDED.response_text, "
             "response_body=EXCLUDED.response_body, "
@@ -511,6 +526,7 @@ def insert_response(row: SupplierResponseRow) -> None:
                 row.unique_id,
                 row.supplier_id,
                 supplier_email,
+                rfq_id,
                 response_message_id,
                 response_subject,
                 response_text,
