@@ -1,4 +1,3 @@
-import json
 """Simple context holder used by the illustrative workflow orchestrator."""
 
 from __future__ import annotations

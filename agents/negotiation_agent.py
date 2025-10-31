@@ -13166,7 +13166,6 @@ class NegotiationAgent(BaseAgent):
                 )
             except Exception:
                 logger.exception("Failed to log negotiation email draft action")
-<<<<<<< HEAD
 
     def _log_final_negotiation_outcome(
         self, context: AgentContext, summary: Dict[str, Any]
@@ -13280,6 +13279,3 @@ class NegotiationSession:
 
     def update_round(self, round_number: int) -> None:
         self.current_round = max(1, round_number)
-
-=======
->>>>>>> f6b29da (updated changes)

@@ -821,20 +821,13 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
             if rows:
-<<<<<<< HEAD
+                self._watcher_last_run.pop(workflow_id, None)
                 return self._process_responses_concurrently(rows)
 
             if routing_service and routing_service.workflow_has_failed(workflow_id):
                 logger.error(
                     "Workflow %s flagged failed during response wait; aborting",
                     workflow_id,
-=======
-                self._watcher_last_run.pop(workflow_id, None)
-                return self._process_responses_concurrently(
-                    rows,
-                    workflow_id=workflow_id,
-                    expected_unique_ids=expected_unique_ids if expected_unique_ids else None,
->>>>>>> f6b29da (updated changes)
                 )
                 break
 

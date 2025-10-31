@@ -1831,9 +1831,6 @@ class EmailDraftingAgent(BaseAgent):
         metadata["round"] = round_number
         metadata["round_number"] = round_number
 
-<<<<<<< HEAD
-        headers: Dict[str, Any] = {"X-ProcWise-Unique-ID": unique_id}
-=======
         self._record_thread_message(
             workflow_id=workflow_hint,
             unique_id=unique_id,
@@ -1844,8 +1841,10 @@ class EmailDraftingAgent(BaseAgent):
             metadata={"intent": metadata.get("intent")},
         )
 
-        headers: Dict[str, Any] = {"X-Procwise-Unique-Id": unique_id}
->>>>>>> f6b29da (updated changes)
+        headers: Dict[str, Any] = {
+            "X-ProcWise-Unique-ID": unique_id,
+            "X-Procwise-Unique-Id": unique_id,
+        }
         if workflow_hint:
             headers["X-ProcWise-Workflow-ID"] = workflow_hint
         if supplier_id:
@@ -3951,47 +3950,10 @@ class EmailDraftingAgent(BaseAgent):
                 draft = self._apply_workflow_context(
                     result.draft, context, source_payload=data
                 )
-<<<<<<< HEAD
+
                 drafts.append(draft)
                 draft_supplier_map[draft.get("draft_id") or draft.get("unique_id") or ""] = (
                     result.supplier_id
-=======
-            else:
-                rendered = self._render_template_string(body_template, template_args)
-
-            comment, message = self._split_existing_comment(rendered)
-            message_content = message if comment else rendered
-            appended_sections: List[str] = []
-            if additional_section_html and additional_section_html not in message_content:
-                appended_sections.append(additional_section_html)
-            if compliance_section_html and compliance_section_html not in message_content:
-                appended_sections.append(compliance_section_html)
-            if appended_sections:
-                message_content = f"{message_content}{''.join(appended_sections)}"
-            elif instruction_suffix and instruction_suffix not in message_content:
-                message_content = f"{message_content}{instruction_suffix}"
-
-            content = self._sanitise_generated_body(message_content)
-            if negotiation_section_html and negotiation_section_html not in content:
-                content = f"{content}{negotiation_section_html}"
-            body_clean = self._clean_body_text(content)
-            threaded_body = self._inject_thread_history(
-                workflow_id=workflow_id,
-                unique_id=unique_id,
-                body_html=body_clean,
-            )
-            body, marker_token = attach_hidden_marker(
-                threaded_body,
-                supplier_id=supplier_id,
-                unique_id=unique_id,
-            )
-            _, visible_body = split_hidden_marker(body)
-            if subject_template_source:
-                subject_args = dict(template_args)
-                subject_args.setdefault("unique_id", unique_id)
-                rendered_subject = self._render_template_string(
-                    subject_template_source, subject_args
->>>>>>> f6b29da (updated changes)
                 )
                 supplier_key = self._thread_supplier_key(result.supplier_id)
                 aggregated_suppliers_state[supplier_key] = result.supplier_thread_state
@@ -4002,96 +3964,10 @@ class EmailDraftingAgent(BaseAgent):
                     result.supplier_id,
                 )
 
-<<<<<<< HEAD
+
             thread_state_root["suppliers"] = aggregated_suppliers_state
             thread_state_root["updated_at"] = datetime.now(timezone.utc).isoformat()
-=======
-            draft_action_id = _resolve_action_id(supplier) or default_action_id
 
-            receiver = self._resolve_receiver(supplier, profile)
-            recipients: List[str] = []
-            if receiver:
-                recipients = self._normalise_recipients([receiver])
-            if recipients:
-                receiver = recipients[0]
-            contact_level = 1 if recipients else 0
-
-            internal_context = {}
-            if isinstance(dynamic_meta.get("internal_context"), dict):
-                internal_context = {
-                    key: value
-                    for key, value in dynamic_meta["internal_context"].items()
-                    if value
-                }
-            if not internal_context:
-                fallback_context = self._build_supplier_personalisation(
-                    supplier,
-                    profile,
-                    template_args,
-                    data,
-                    instruction_settings,
-                    interaction_type,
-                )
-                if fallback_context:
-                    internal_context = {
-                        "supplier_context_html": fallback_context,
-                        "supplier_context_text": self._html_to_plain_text(
-                            fallback_context
-                        ),
-                    }
-
-            draft = {
-                "supplier_id": supplier_id,
-                "supplier_name": supplier_name,
-                "subject": subject,
-                "body": body,
-                "sent_status": False,
-                "sender": self.agent_nick.settings.ses_default_sender,
-                "action_id": draft_action_id,
-                "supplier_profile": profile,
-                "receiver": receiver,
-                "contact_level": contact_level,
-                "recipients": recipients,
-                "unique_id": unique_id,
-                "workflow_id": workflow_id,
-            }
-            if draft_action_id:
-                draft["action_id"] = draft_action_id
-            draft.setdefault("thread_index", 1)
-            metadata: Dict[str, Any] = {
-                "unique_id": unique_id,
-                "interaction_type": interaction_type,
-                "workflow_id": workflow_id,
-            }
-            if supplier_id is not None:
-                metadata["supplier_id"] = supplier_id
-            if supplier_name:
-                metadata["supplier_name"] = supplier_name
-            if internal_context:
-                metadata["internal_context"] = internal_context
-            if marker_token:
-                metadata["dispatch_token"] = marker_token
-            draft["metadata"] = metadata
-            self._record_thread_message(
-                workflow_id=workflow_id,
-                unique_id=unique_id,
-                role="buyer",
-                subject=subject,
-                body_html=body_clean,
-                body_text=visible_body or body_clean,
-                metadata={
-                    "interaction_type": interaction_type,
-                    "supplier_id": supplier_id,
-                    "supplier_name": supplier_name,
-                },
-            )
-            draft = self._apply_workflow_context(draft, context, source_payload=data)
-            drafts.append(draft)
-            self._store_draft(draft)
-            logger.debug(
-                "EmailDraftingAgent created draft %s for supplier %s", unique_id, supplier_id
-            )
->>>>>>> f6b29da (updated changes)
 
         if manual_recipients and manual_has_body:
             manual_comment, manual_message = self._split_existing_comment(manual_body_input)
