@@ -14,6 +14,7 @@ from repositories import (
     draft_rfq_emails_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher import EmailWatcher, EmailWatcherConfig

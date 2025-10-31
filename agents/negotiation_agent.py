@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -17,14 +18,22 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import hashlib
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from html import escape
 from email.utils import parsedate_to_datetime
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from agents.email_drafting_agent import EmailDraftingAgent, DEFAULT_NEGOTIATION_SUBJECT
-from repositories import supplier_response_repo
+from repositories import (
+    supplier_response_repo,
+    workflow_lifecycle_repo,
+    workflow_round_response_repo,
+)
+from repositories.workflow_round_response_repo import RoundStatus
+from services.supplier_response_coordinator import (
+    get_supplier_response_coordinator,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -3766,6 +3775,138 @@ class NegotiationAgent(BaseAgent):
                 mapped[supplier_id].append(row)
         return mapped
 
+    @staticmethod
+    def _run_async_task(coro: Awaitable[Any]) -> Any:
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as exc:
+            if "asyncio.run() cannot be called" not in str(exc):
+                raise
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(coro)
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+    def _record_round_status(
+        self,
+        context: AgentContext,
+        workflow_id: Optional[str],
+        status: str,
+    ) -> None:
+        workflow_key = self._coerce_text(workflow_id)
+        if workflow_key:
+            try:
+                workflow_lifecycle_repo.record_negotiation_status(workflow_key, status)
+            except Exception:
+                logger.debug(
+                    "Failed to persist negotiation status %s for workflow=%s",
+                    status,
+                    workflow_key,
+                    exc_info=True,
+                )
+        routing = getattr(self.agent_nick, "process_routing_service", None)
+        process_id = getattr(context, "process_id", None)
+        if routing and process_id:
+            try:
+                routing.update_agent_status(
+                    process_id,
+                    self.__class__.__name__,
+                    status,
+                    modified_by=getattr(context, "user_id", None),
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to update process routing status to %s for process_id=%s",
+                    status,
+                    process_id,
+                    exc_info=True,
+                )
+
+    def _await_responses_with_coordinator(
+        self,
+        workflow_id: Optional[str],
+        round_number: int,
+        unique_ids: Sequence[str],
+        timeout: float,
+        poll_interval: float,
+    ) -> Optional[Tuple[Any, Optional[RoundStatus]]]:
+        workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key:
+            return None
+        identifiers = [self._coerce_text(uid) for uid in unique_ids if self._coerce_text(uid)]
+        if not identifiers:
+            return None
+
+        try:
+            coordinator = get_supplier_response_coordinator()
+        except Exception:
+            logger.exception("Failed to initialise supplier response coordinator")
+            return None
+
+        if coordinator is None:
+            return None
+
+        try:
+            workflow_round_response_repo.register_expected(
+                workflow_id=workflow_key,
+                expectations=[(round_number, uid, None) for uid in identifiers],
+            )
+        except Exception:
+            logger.debug(
+                "Failed to register round expectations prior to coordinator wait",
+                exc_info=True,
+            )
+
+        try:
+            coordinator.register_expected_responses(
+                workflow_key,
+                identifiers,
+                max(len(identifiers), 1),
+                round_number=round_number,
+            )
+        except Exception:
+            logger.debug(
+                "Coordinator registration failed for workflow=%s", workflow_key, exc_info=True
+            )
+
+        loop_timeout = max(0.0, float(timeout))
+        poll_delay = max(1.0, float(poll_interval))
+
+        async def _wait_async() -> Any:
+            start = time.monotonic()
+
+            def _await_block(wait_value: float) -> Any:
+                return coordinator.await_completion(
+                    workflow_key,
+                    wait_value,
+                    round_number=round_number,
+                )
+
+            state = await asyncio.to_thread(_await_block, 0.0)
+            while True:
+                pending = getattr(state, "pending_unique_ids", [])
+                complete = bool(getattr(state, "complete", False)) and not pending
+                if complete:
+                    return state
+                elapsed = time.monotonic() - start
+                if loop_timeout and elapsed >= loop_timeout:
+                    return state
+                remaining = loop_timeout - elapsed if loop_timeout else poll_delay
+                wait_value = poll_delay if not loop_timeout else max(0.0, min(poll_delay, remaining))
+                if wait_value <= 0:
+                    return state
+                state = await asyncio.to_thread(_await_block, wait_value)
+                await asyncio.sleep(0)
+
+        state = self._run_async_task(_wait_async())
+        round_status = workflow_round_response_repo.get_round_status(
+            workflow_id=workflow_key, round_number=round_number
+        )
+        return state, round_status
+
     def _wait_for_round_responses(
         self,
         context: AgentContext,
@@ -3849,9 +3990,13 @@ class NegotiationAgent(BaseAgent):
             if not drafts:
                 logger.warning("No drafts to wait for in round %s", round_num)
                 pending_suppliers.clear()
+                self._record_round_status(
+                    context, session_workflow_id, "responses_completed"
+                )
                 return result
 
             supplier_by_id: Dict[str, Dict[str, Any]] = {}
+            round_unique_ids: Set[str] = set()
             for draft in drafts:
                 if not isinstance(draft, dict):
                     continue
@@ -3861,6 +4006,11 @@ class NegotiationAgent(BaseAgent):
                 if supplier_id:
                     expected_suppliers.add(supplier_id)
                     supplier_by_id[supplier_id] = draft
+                token = self._coerce_text(
+                    draft.get("unique_id") or draft.get("session_reference")
+                )
+                if token:
+                    round_unique_ids.add(token)
 
             if not expected_suppliers:
                 logger.warning(
@@ -3868,7 +4018,19 @@ class NegotiationAgent(BaseAgent):
                     round_num,
                 )
                 pending_suppliers.clear()
+                self._record_round_status(
+                    context, session_workflow_id, "responses_completed"
+                )
                 return result
+
+            timeout = self._calculate_round_timeout(len(expected_suppliers), round_num)
+            poll_interval = getattr(
+                self.agent_nick.settings, "email_response_poll_seconds", 60
+            )
+
+            self._record_round_status(
+                context, session_workflow_id, "waiting_for_responses"
+            )
 
             logger.info(
                 "Waiting for %s supplier responses for round %s (workflow_id=%s)",
@@ -3884,22 +4046,96 @@ class NegotiationAgent(BaseAgent):
                 negotiation_state=negotiation_state,
             )
 
+            coordinator_outcome = self._await_responses_with_coordinator(
+                session_workflow_id,
+                round_number=round_num,
+                unique_ids=list(round_unique_ids),
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+
+            if coordinator_outcome is not None:
+                state, round_status = coordinator_outcome
+                pending_unique_ids = list(
+                    getattr(state, "pending_unique_ids", []) or []
+                )
+                if pending_unique_ids and session_workflow_id:
+                    try:
+                        workflow_round_response_repo.mark_round_failed(
+                            workflow_id=session_workflow_id,
+                            round_number=round_num,
+                            unique_ids=pending_unique_ids,
+                            reason=getattr(state, "status", None),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to flag pending responses as failed for workflow=%s",
+                            session_workflow_id,
+                            exc_info=True,
+                        )
+
+                repo_responses = self._load_round_supplier_responses(
+                    workflow_id=workflow_id,
+                    unique_ids=list(round_unique_ids),
+                    supplier_ids=list(expected_suppliers),
+                )
+                for supplier_id, responses in repo_responses.items():
+                    if not responses:
+                        continue
+                    aggregated[supplier_id].extend(responses)
+                    responded_suppliers.add(supplier_id)
+                    pending_suppliers.discard(supplier_id)
+
+                if round_status:
+                    pending_suppliers.update(round_status.pending_suppliers())
+                    responded_suppliers.update(round_status.completed_suppliers())
+                    timed_out_suppliers.update(round_status.failed_suppliers())
+
+                if pending_suppliers:
+                    timed_out_suppliers.update(pending_suppliers)
+
+                if timed_out_suppliers:
+                    for supplier_id in sorted(timed_out_suppliers):
+                        self._log_round_event(
+                            workflow_id=workflow_id,
+                            round_number=round_num,
+                            supplier_id=supplier_id,
+                            status="ResponseTimeout",
+                        )
+
+                for supplier_id, responses in aggregated.items():
+                    self._log_round_event(
+                        workflow_id=workflow_id,
+                        round_number=round_num,
+                        supplier_id=supplier_id,
+                        status="ResponseReceived",
+                        response_count=len(responses),
+                        source="watcher",
+                    )
+
+                _persist_session_snapshot()
+
+                all_received_flag = bool(
+                    round_status and round_status.complete and not pending_unique_ids
+                )
+
+                if all_received_flag and not pending_suppliers:
+                    self._record_round_status(
+                        context, session_workflow_id, "responses_completed"
+                    )
+                else:
+                    self._record_round_status(
+                        context, session_workflow_id, "round_failed"
+                    )
+
+                return dict(aggregated), all_received_flag and not pending_suppliers
+
             start_times: Dict[str, float] = {
                 supplier_id: time.time() for supplier_id in expected_suppliers
             }
 
             pending_suppliers.update(expected_suppliers)
             _persist_session_snapshot()
-
-            unique_ids: Set[str] = set()
-            for draft in drafts:
-                if not isinstance(draft, dict):
-                    continue
-                token = self._coerce_text(
-                    draft.get("unique_id") or draft.get("session_reference")
-                )
-                if token:
-                    unique_ids.add(token)
 
             for supplier_id in pending_suppliers:
                 self._log_round_event(
@@ -3911,7 +4147,7 @@ class NegotiationAgent(BaseAgent):
 
             preloaded = self._load_round_supplier_responses(
                 workflow_id=workflow_id,
-                unique_ids=list(unique_ids),
+                unique_ids=list(round_unique_ids),
                 supplier_ids=list(pending_suppliers),
             )
             for supplier_id, responses in preloaded.items():
@@ -3942,8 +4178,10 @@ class NegotiationAgent(BaseAgent):
                     received_total,
                     round_num,
                 )
-                result = (dict(aggregated), True)
-                return result
+                self._record_round_status(
+                    context, session_workflow_id, "responses_completed"
+                )
+                return dict(aggregated), True
 
             supplier_agent = self._get_supplier_agent()
             if supplier_agent is None:
@@ -3953,6 +4191,9 @@ class NegotiationAgent(BaseAgent):
                 )
                 timed_out_suppliers.update(pending_suppliers)
                 _persist_session_snapshot()
+                self._record_round_status(
+                    context, session_workflow_id, "round_failed"
+                )
                 return result
 
             timeout = self._calculate_round_timeout(len(expected_suppliers), round_num)
@@ -4036,7 +4277,7 @@ class NegotiationAgent(BaseAgent):
             if pending_suppliers:
                 follow_up = self._load_round_supplier_responses(
                     workflow_id=workflow_id,
-                    unique_ids=list(unique_ids),
+                    unique_ids=list(round_unique_ids),
                     supplier_ids=list(pending_suppliers),
                 )
                 for supplier_id, responses in follow_up.items():
@@ -4087,8 +4328,41 @@ class NegotiationAgent(BaseAgent):
                 round_num,
             )
 
-            result = (dict(aggregated), not pending_suppliers)
-            return result
+            all_received = not pending_suppliers
+            if not all_received and session_workflow_id:
+                try:
+                    round_status = workflow_round_response_repo.get_round_status(
+                        workflow_id=session_workflow_id, round_number=round_num
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to load round status for workflow=%s",
+                        session_workflow_id,
+                        exc_info=True,
+                    )
+                    round_status = None
+                if round_status and round_status.pending_unique_ids:
+                    try:
+                        workflow_round_response_repo.mark_round_failed(
+                            workflow_id=session_workflow_id,
+                            round_number=round_num,
+                            unique_ids=round_status.pending_unique_ids,
+                            reason="timeout",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to mark pending round responses as failed for workflow=%s",
+                            session_workflow_id,
+                            exc_info=True,
+                        )
+
+            self._record_round_status(
+                context,
+                session_workflow_id,
+                "responses_completed" if all_received else "round_failed",
+            )
+
+            return dict(aggregated), all_received
 
         except Exception:
             logger.exception("Failed to wait for round %s responses", round_num)

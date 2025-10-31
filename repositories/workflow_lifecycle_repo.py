@@ -33,7 +33,16 @@ CREATE TABLE IF NOT EXISTS proc.workflow_lifecycle (
 """
 
 _ALLOWED_SUPPLIER_STATUSES = {"started", "invoked", "running", "awaiting_responses"}
-_ALLOWED_NEGOTIATION_STATUSES = {"started", "running", "completed", "finalized", "failed"}
+_ALLOWED_NEGOTIATION_STATUSES = {
+    "started",
+    "running",
+    "completed",
+    "finalized",
+    "failed",
+    "waiting_for_responses",
+    "responses_completed",
+    "round_failed",
+}
 _WATCHER_EVENTS = {"watcher_started", "watcher_active", "watcher_stopped"}
 
 
