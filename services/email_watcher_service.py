@@ -26,6 +26,26 @@ except Exception:  # pragma: no cover - fallback when settings module unavailabl
 logger = logging.getLogger(__name__)
 
 
+MAX_IMAP_AUTH_RETRIES = 3
+
+
+def send_alert(alert_code: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Publish an alert event for operational visibility."""
+
+    message = {"alert_code": alert_code}
+    if payload:
+        message.update(payload)
+    try:
+        bus = get_event_bus()
+    except Exception:
+        logger.exception("Failed to initialise event bus for alert %s", alert_code)
+        return
+    try:
+        bus.publish("alerts", message)
+    except Exception:
+        logger.exception("Failed to publish alert %s", alert_code)
+
+
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     value = os.environ.get(key)
     if value in (None, ""):
@@ -99,7 +119,9 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
         "workflow_id": row.get("workflow_id"),
         "unique_id": row.get("unique_id"),
         "supplier_id": row.get("supplier_id"),
+        "rfq_id": row.get("rfq_id"),
         "body_text": row.get("response_text", ""),
+        "body_html": row.get("response_body"),
         "subject": row.get("subject"),
         "from_addr": row.get("from_addr"),
         "message_id": row.get("message_id"),
@@ -318,6 +340,8 @@ def run_email_watcher_for_workflow(
         return username
 
     imap_login = _pick_login()
+    if not imap_username and imap_login:
+        imap_username = imap_login.strip() or None
     try:
         imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
     except Exception:
@@ -345,7 +369,7 @@ def run_email_watcher_for_workflow(
         or "INBOX"
     )
 
-    if not all([imap_host, imap_username, imap_password]):
+    if not imap_host or not imap_password or not (imap_username or imap_login):
         logger.warning(
             "IMAP credentials are not configured; skipping EmailWatcher (host=%s user=%s)",
             imap_host,
@@ -379,6 +403,18 @@ def run_email_watcher_for_workflow(
 
         if missing_fields:
             missing_required_fields[unique_id] = missing_fields
+
+        supplier_email = (row.supplier_email or "").strip()
+        if not supplier_email:
+            missing_fields.append("supplier_email")
+
+        subject_value = (row.subject or "").strip()
+        if not subject_value:
+            missing_fields.append("subject")
+
+        if missing_fields:
+            missing_required_fields[identifier] = missing_fields
+            continue
 
     if missing_message_ids:
         logger.warning(
@@ -559,6 +595,22 @@ def run_email_watcher_for_workflow(
         "rows": responses,
         "matched_unique_ids": matched_ids,
     }
+    if workflow_status:
+        response_payload["workflow_status"] = workflow_status
+    if "expected_responses" in result:
+        response_payload["expected_responses"] = result.get("expected_responses")
+    if "elapsed_seconds" in result:
+        response_payload["elapsed_seconds"] = result.get("elapsed_seconds")
+    if "timeout_reached" in result:
+        response_payload["timeout_reached"] = bool(result.get("timeout_reached"))
+    if "pending_suppliers" in result:
+        response_payload["pending_suppliers"] = result.get("pending_suppliers")
+    if "pending_unique_ids" in result:
+        response_payload["pending_unique_ids"] = result.get("pending_unique_ids")
+    if "last_capture_ts" in result:
+        response_payload["last_capture_ts"] = result.get("last_capture_ts")
+    if "timeout_deadline" in result:
+        response_payload["timeout_deadline"] = result.get("timeout_deadline")
 
     if result.get("pending_unique_ids"):
         response_payload["pending_unique_ids"] = list(result["pending_unique_ids"])
@@ -685,6 +737,10 @@ class EmailWatcherService:
         if not workflow_key:
             return
 
+        self._preempt_existing_workflows(workflow_key)
+        if self._thread and self._thread.is_alive():
+            self.stop()
+            self.start()
         with self._forced_lock:
             self._forced_workflows.add(workflow_key)
         self._wake_event.set()
@@ -694,6 +750,95 @@ class EmailWatcherService:
             items = list(self._forced_workflows)
             self._forced_workflows.clear()
         return items
+
+    def _preempt_existing_workflows(self, new_workflow_id: str) -> None:
+        try:
+            active_workflows = workflow_email_tracking_repo.load_active_workflow_ids()
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to enumerate active workflows before preemption"
+            )
+            return
+
+        seen: Set[str] = set()
+        for workflow_id in active_workflows:
+            workflow_key = (workflow_id or "").strip()
+            if not workflow_key or workflow_key == new_workflow_id:
+                continue
+            if workflow_key in seen:
+                continue
+            seen.add(workflow_key)
+            try:
+                workflow_email_tracking_repo.reset_workflow(workflow_key)
+                workflow_lifecycle_repo.record_watcher_event(
+                    workflow_key,
+                    "watcher_stopped",
+                    expected_responses=0,
+                    received_responses=0,
+                    metadata={
+                        "stop_reason": "preempted_by_new_workflow",
+                        "preempted_by": new_workflow_id,
+                    },
+                )
+                logger.info(
+                    "EmailWatcherService preempted workflow=%s in favour of workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+            except Exception:
+                logger.exception(
+                    "EmailWatcherService failed to preempt workflow=%s before starting workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+        if seen:
+            with self._forced_lock:
+                self._forced_workflows = {
+                    wf for wf in self._forced_workflows if wf == new_workflow_id
+                }
+
+    def _should_skip_workflow(self, workflow_id: str) -> bool:
+        """Return ``True`` when ``workflow_id`` should not be processed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return False
+
+        try:
+            lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_key)
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to load lifecycle for workflow=%s",
+                workflow_key,
+            )
+            return False
+
+        if not lifecycle:
+            return False
+
+        negotiation_status = str(
+            lifecycle.get("negotiation_status") or ""
+        ).strip().lower()
+        if negotiation_status not in {"completed", "finalized"}:
+            return False
+
+        watcher_status = str(lifecycle.get("watcher_status") or "").strip().lower()
+        if watcher_status != "stopped":
+            return False
+
+        metadata = lifecycle.get("metadata") or {}
+        stop_reason = str(metadata.get("stop_reason") or "").strip().lower()
+        if stop_reason in {
+            "negotiation_completed",
+            "negotiation_completed_pending_responses",
+        }:
+            logger.debug(
+                "EmailWatcherService suppressing workflow=%s due to completed negotiation",
+                workflow_key,
+            )
+            return True
+
+        return False
 
     def _wait_for_next_cycle(self, seconds: float) -> None:
         if seconds <= 0:
@@ -707,6 +852,25 @@ class EmailWatcherService:
             if awakened:
                 self._wake_event.clear()
                 break
+
+    def update_dependencies(
+        self,
+        *,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+    ) -> None:
+        """Refresh shared dependency references used by the watcher."""
+
+        if agent_registry is not None:
+            self._agent_registry = agent_registry
+        if orchestrator is not None:
+            self._orchestrator = orchestrator
+        if supplier_agent is not None:
+            self._supplier_agent = supplier_agent
+        if negotiation_agent is not None:
+            self._negotiation_agent = negotiation_agent
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -731,6 +895,10 @@ class EmailWatcherService:
                     break
 
                 if not workflow_id:
+                    continue
+
+                if self._should_skip_workflow(workflow_id):
+                    processed_workflow = True
                     continue
 
                 try:

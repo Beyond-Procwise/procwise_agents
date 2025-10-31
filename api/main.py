@@ -24,6 +24,7 @@ from agents.quote_comparison_agent import QuoteComparisonAgent
 from agents.opportunity_miner_agent import OpportunityMinerAgent
 from agents.discrepancy_detection_agent import DiscrepancyDetectionAgent
 from agents.email_drafting_agent import EmailDraftingAgent
+from agents.email_dispatch_agent import EmailDispatchAgent
 from agents.negotiation_agent import NegotiationAgent
 from agents.approvals_agent import ApprovalsAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
@@ -46,6 +47,7 @@ async def lifespan(app: FastAPI):
         negotiation_agent = NegotiationAgent(agent_nick)
         approvals_agent = ApprovalsAgent(agent_nick)
         supplier_interaction_agent = SupplierInteractionAgent(agent_nick)
+        email_dispatch_agent = EmailDispatchAgent(agent_nick)
 
         agent_nick.agents = AgentRegistry(
             {
@@ -56,6 +58,7 @@ async def lifespan(app: FastAPI):
                 "opportunity_miner": OpportunityMinerAgent(agent_nick),
                 "discrepancy_detection": discrepancy_agent,
                 "email_drafting": EmailDraftingAgent(agent_nick),
+                "email_dispatch": email_dispatch_agent,
                 "negotiation": negotiation_agent,
                 "approvals": approvals_agent,
                 "supplier_interaction": supplier_interaction_agent,
@@ -70,6 +73,7 @@ async def lifespan(app: FastAPI):
                 "OpportunityMinerAgent": "opportunity_miner",
                 "DiscrepancyDetectionAgent": "discrepancy_detection",
                 "EmailDraftingAgent": "email_drafting",
+                "EmailDispatchAgent": "email_dispatch",
                 "NegotiationAgent": "negotiation",
                 "ApprovalsAgent": "approvals",
                 "SupplierInteractionAgent": "supplier_interaction",

@@ -88,6 +88,14 @@ class SupplierResponseRecord:
     received_at: datetime
     headers: Dict[str, str]
     mailbox: Optional[str]
+    attachments: Sequence[Dict[str, Any]] = dataclasses.field(default_factory=tuple)
+    matched_sent_email_id: Optional[str] = None
+    round_number: Optional[int] = None
+    matched_dispatch_subject: Optional[str] = None
+    match_score: float = 0.0
+    match_method: str = "unknown"
+    matched_on: Sequence[str] = dataclasses.field(default_factory=tuple)
+    match_confidence: float = 0.0
 
     def normalised_rfq(self) -> str:
         return (self.rfq_id or "").strip().upper()
@@ -104,6 +112,10 @@ class DispatchRecord:
     token: Optional[str]
     message_id: Optional[str]
     mailbox: Optional[str]
+    recipient: Optional[str] = None
+    subject: Optional[str] = None
+    dispatched_at: Optional[datetime] = None
+    round_number: Optional[int] = None
 
     def normalised_token(self) -> Optional[str]:
         token = _normalise_identifier(self.token)
@@ -126,12 +138,14 @@ class DispatchContext:
     by_token: Dict[str, DispatchRecord]
     by_message_id: Dict[str, DispatchRecord]
     by_supplier: Dict[str, List[DispatchRecord]]
+    metadata: Dict[str, Dict[str, Any]]
 
     @classmethod
     def build(cls, records: Sequence[DispatchRecord]) -> "DispatchContext":
         token_index: Dict[str, DispatchRecord] = {}
         message_index: Dict[str, DispatchRecord] = {}
         supplier_index: Dict[str, List[DispatchRecord]] = {}
+        metadata: Dict[str, Dict[str, Any]] = {}
         for record in records:
             token_norm = record.normalised_token()
             if token_norm and token_norm not in token_index:
@@ -148,7 +162,16 @@ class DispatchContext:
             supplier_norm = record.normalised_supplier()
             if supplier_norm:
                 supplier_index.setdefault(supplier_norm, []).append(record)
-        return cls(list(records), token_index, message_index, supplier_index)
+            metadata[record.message_id or f"{record.token}:{record.supplier_id}"] = {
+                "recipient": record.recipient,
+                "subject": record.subject,
+                "dispatched_at": record.dispatched_at.isoformat()
+                if isinstance(record.dispatched_at, datetime)
+                else None,
+                "workflow_id": record.workflow_id,
+                "round_number": record.round_number,
+            }
+        return cls(list(records), token_index, message_index, supplier_index, metadata)
 
     def match_token(self, token: Optional[str]) -> Optional[DispatchRecord]:
         if not token:
@@ -252,7 +275,11 @@ class DatabaseBackend:
                     response_text TEXT,
                     price NUMERIC,
                     lead_time TEXT,
-                    context_summary TEXT
+                    context_summary TEXT,
+                    attachments JSONB,
+                    matched_sent_email_id TEXT,
+                    round_number INTEGER,
+                    matched_dispatch_subject TEXT
                 )
                 """
             )
@@ -280,6 +307,18 @@ class DatabaseBackend:
             )
             cur.execute(
                 f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS mailbox TEXT"
+            )
+            cur.execute(
+                f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS attachments JSONB"
+            )
+            cur.execute(
+                f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS matched_sent_email_id TEXT"
+            )
+            cur.execute(
+                f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS round_number INTEGER"
+            )
+            cur.execute(
+                f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS matched_dispatch_subject TEXT"
             )
             cur.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS supplier_responses_msg_hash"
@@ -318,7 +357,11 @@ class DatabaseBackend:
                     response_text TEXT,
                     price REAL,
                     lead_time TEXT,
-                    context_summary TEXT
+                    context_summary TEXT,
+                    attachments TEXT,
+                    matched_sent_email_id TEXT,
+                    round_number INTEGER,
+                    matched_dispatch_subject TEXT
                 )
                 """
             )
@@ -330,6 +373,10 @@ class DatabaseBackend:
             self._maybe_add_sqlite_column(table, "dispatch_run_id TEXT")
             self._maybe_add_sqlite_column(table, "raw_headers TEXT")
             self._maybe_add_sqlite_column(table, "mailbox TEXT")
+            self._maybe_add_sqlite_column(table, "attachments TEXT")
+            self._maybe_add_sqlite_column(table, "matched_sent_email_id TEXT")
+            self._maybe_add_sqlite_column(table, "round_number INTEGER")
+            self._maybe_add_sqlite_column(table, "matched_dispatch_subject TEXT")
             self._conn.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS supplier_responses_msg_hash"
                 f" ON {table}(message_hash)"
@@ -361,14 +408,26 @@ class DatabaseBackend:
         else:
             headers_payload = json.dumps(record.headers)
 
+        attachments_serialised: Any
+        attachments_list = list(record.attachments)
+        if self.dialect == "postgres":
+            attachments_serialised = (
+                Json(attachments_list)
+                if Json is not None
+                else json.dumps(attachments_list)
+            )
+        else:
+            attachments_serialised = json.dumps(attachments_list)
+
         if self.dialect == "postgres":
             query = f"""
                 INSERT INTO {TABLE_NAME} (
                     workflow_id, action_id, run_id, rfq_id, supplier_id,
                     message_id, message_hash, from_address, subject, body,
-                    raw_headers, mailbox, received_at, dispatch_run_id
+                    raw_headers, mailbox, received_at, dispatch_run_id,
+                    attachments, matched_sent_email_id, round_number, matched_dispatch_subject
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (message_hash) DO UPDATE SET
                     workflow_id = EXCLUDED.workflow_id,
                     action_id = EXCLUDED.action_id,
@@ -382,6 +441,10 @@ class DatabaseBackend:
                     mailbox = EXCLUDED.mailbox,
                     received_at = EXCLUDED.received_at,
                     dispatch_run_id = EXCLUDED.dispatch_run_id,
+                    attachments = EXCLUDED.attachments,
+                    matched_sent_email_id = EXCLUDED.matched_sent_email_id,
+                    round_number = EXCLUDED.round_number,
+                    matched_dispatch_subject = EXCLUDED.matched_dispatch_subject,
                     processed_at = NULL
             """
         else:
@@ -389,9 +452,10 @@ class DatabaseBackend:
                 INSERT INTO "{TABLE_NAME}" (
                     workflow_id, action_id, run_id, rfq_id, supplier_id,
                     message_id, message_hash, from_address, subject, body,
-                    raw_headers, mailbox, received_at, dispatch_run_id
+                    raw_headers, mailbox, received_at, dispatch_run_id,
+                    attachments, matched_sent_email_id, round_number, matched_dispatch_subject
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(message_hash) DO UPDATE SET
                     workflow_id = excluded.workflow_id,
                     action_id = excluded.action_id,
@@ -405,6 +469,10 @@ class DatabaseBackend:
                     mailbox = excluded.mailbox,
                     received_at = excluded.received_at,
                     dispatch_run_id = excluded.dispatch_run_id,
+                    attachments = excluded.attachments,
+                    matched_sent_email_id = excluded.matched_sent_email_id,
+                    round_number = excluded.round_number,
+                    matched_dispatch_subject = excluded.matched_dispatch_subject,
                     processed_at = NULL
             """
 
@@ -422,8 +490,14 @@ class DatabaseBackend:
             record.body,
             headers_payload,
             record.mailbox,
-            record.received_at if self.dialect == "postgres" else record.received_at.isoformat(),
+            record.received_at
+            if self.dialect == "postgres"
+            else record.received_at.isoformat(),
             record.run_id,
+            attachments_serialised,
+            record.matched_sent_email_id,
+            record.round_number,
+            record.matched_dispatch_subject,
         )
 
         with self._conn:  # type: ignore[arg-type]
@@ -663,6 +737,27 @@ class DatabaseBackend:
             workflow_meta = metadata.get("workflow_id") or metadata.get("WORKFLOW_ID")
             action_meta = metadata.get("action_id") or metadata.get("ACTION_ID")
             mailbox_meta = metadata.get("mailbox") or metadata.get("MAILBOX")
+            recipient_meta = metadata.get("recipient") or metadata.get("to")
+            subject_meta = metadata.get("subject") or metadata.get("SUBJECT")
+            round_meta = metadata.get("round") or metadata.get("round_number")
+
+            dispatched_at: Optional[datetime] = None
+            if isinstance(created_at, str):
+                try:
+                    dispatched_at = parsedate_to_datetime(created_at)
+                except Exception:  # pragma: no cover - defensive
+                    dispatched_at = None
+            elif isinstance(created_at, datetime):
+                dispatched_at = created_at if created_at.tzinfo else created_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            round_number: Optional[int] = None
+            if round_meta is not None:
+                try:
+                    round_number = int(round_meta)
+                except (TypeError, ValueError):
+                    round_number = None
 
             record = DispatchRecord(
                 rfq_id=_normalise_identifier(rfq_id),
@@ -672,23 +767,16 @@ class DatabaseBackend:
                 token=_normalise_identifier(token),
                 message_id=_normalise_identifier(message_id),
                 mailbox=_normalise_identifier(mailbox_meta),
+                recipient=_normalise_identifier(recipient_meta) or metadata.get("recipient"),
+                subject=subject_meta,
+                dispatched_at=dispatched_at,
+                round_number=round_number,
             )
             records.append(record)
 
-            candidate_time = created_at
-            if isinstance(candidate_time, str):
-                try:
-                    candidate_dt = parsedate_to_datetime(candidate_time)
-                except Exception:  # pragma: no cover - defensive
-                    candidate_dt = None
-            else:
-                candidate_dt = candidate_time
-            if candidate_dt is not None:
-                candidate_aware = (
-                    candidate_dt if candidate_dt.tzinfo else candidate_dt.replace(tzinfo=timezone.utc)
-                )
-                if last_dispatch is None or candidate_aware > last_dispatch:
-                    last_dispatch = candidate_aware
+            if dispatched_at is not None:
+                if last_dispatch is None or dispatched_at > last_dispatch:
+                    last_dispatch = dispatched_at
 
         return records, last_dispatch
 

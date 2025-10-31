@@ -148,6 +148,7 @@ class RAGService:
         points: List[models.PointStruct] = []
         texts_for_embedding: List[str] = []
         payloads_for_storage: List[Dict[str, Any]] = []
+        target_collection: Optional[str] = None
 
         for payload in payloads:
             if not isinstance(payload, dict):
@@ -166,6 +167,9 @@ class RAGService:
                 or str(uuid.uuid4())
             )
             base_payload["record_id"] = record_id
+
+            if target_collection is None:
+                target_collection = self._extract_source_collection(base_payload)
 
             if text_representation_key in base_payload:
                 base_payload.pop(text_representation_key, None)
@@ -250,7 +254,12 @@ class RAGService:
             if self._bm25_corpus:
                 self._bm25 = BM25Okapi(self._bm25_corpus)
 
-        if points:
+        collection_name = (
+            target_collection
+            or getattr(self.settings, "qdrant_collection_name", None)
+        )
+
+        if points and collection_name:
             self.client.upsert(
                 collection_name=target_collection,
                 points=points,
@@ -266,6 +275,20 @@ class RAGService:
             payloads.append({**metadata, "content": text})
 
         self.upsert_payloads(payloads, text_representation_key="content")
+
+    @staticmethod
+    def _extract_source_collection(payload: Dict[str, Any]) -> Optional[str]:
+        """Return a collection override specified by the payload, if any."""
+
+        candidate = payload.get("source_collection")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        nested = payload.get("payload")
+        if isinstance(nested, dict):
+            nested_candidate = nested.get("source_collection")
+            if isinstance(nested_candidate, str) and nested_candidate.strip():
+                return nested_candidate.strip()
+        return None
 
     def _build_point_id(self, record_id: str, chunk_idx: int) -> str:
         """Create a Qdrant-compatible point ID for the given record chunk."""

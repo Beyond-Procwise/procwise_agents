@@ -19,6 +19,7 @@ from repositories import (
     draft_rfq_emails_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.supplier_response_repo import SupplierResponseRow
 
@@ -1837,6 +1838,21 @@ def test_run_await_workflow_batch(monkeypatch):
     nick = DummyNick()
     agent = SupplierInteractionAgent(nick)
 
+    recorded_statuses = []
+    real_record_status = (
+        workflow_lifecycle_repo.record_supplier_agent_status
+    )
+
+    def fake_record_status(workflow_id, status):
+        recorded_statuses.append((workflow_id, status))
+        return real_record_status(workflow_id, status)
+
+    monkeypatch.setattr(
+        workflow_lifecycle_repo,
+        "record_supplier_agent_status",
+        fake_record_status,
+    )
+
     def fake_expected_unique_ids_and_last_dispatch(*, workflow_id, run_id=None):
         assert workflow_id == "wf-batch"
         return {"uid-1", "uid-2"}, {"uid-1": "SUP-1", "uid-2": "SUP-2"}, datetime.fromtimestamp(0)
@@ -1898,34 +1914,45 @@ def test_run_await_workflow_batch(monkeypatch):
         lambda: None,
     )
 
+    pending_rows = [
+        {
+            "workflow_id": "wf-batch",
+            "unique_id": "uid-1",
+            "supplier_id": "SUP-1",
+            "response_text": "Quote A",
+            "subject": "Re: RFQ-1",
+            "message_id": "m1",
+            "from_addr": "one@example.com",
+            "received_time": datetime.fromtimestamp(0),
+        },
+        {
+            "workflow_id": "wf-batch",
+            "unique_id": "uid-2",
+            "supplier_id": "SUP-2",
+            "response_text": "Quote B",
+            "subject": "Re: RFQ-2",
+            "message_id": "m2",
+            "from_addr": "two@example.com",
+            "received_time": datetime.fromtimestamp(1),
+        },
+    ]
+
     def fake_fetch_pending(*, workflow_id, include_processed=False):
         assert include_processed is False
-        return [
-            {
-                "workflow_id": workflow_id,
-                "unique_id": "uid-1",
-                "supplier_id": "SUP-1",
-                "response_text": "Quote A",
-                "subject": "Re: RFQ-1",
-                "message_id": "m1",
-                "from_addr": "one@example.com",
-                "received_time": datetime.fromtimestamp(0),
-            },
-            {
-                "workflow_id": workflow_id,
-                "unique_id": "uid-2",
-                "supplier_id": "SUP-2",
-                "response_text": "Quote B",
-                "subject": "Re: RFQ-2",
-                "message_id": "m2",
-                "from_addr": "two@example.com",
-                "received_time": datetime.fromtimestamp(1),
-            },
-        ]
+        assert workflow_id == "wf-batch"
+        return list(pending_rows)
+
+    def fake_fetch_all(*, workflow_id):
+        assert workflow_id == "wf-batch"
+        return list(pending_rows)
 
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.supplier_response_repo.fetch_pending",
         fake_fetch_pending,
+    )
+    monkeypatch.setattr(
+        "agents.supplier_interaction_agent.supplier_response_repo.fetch_all",
+        fake_fetch_all,
     )
     monkeypatch.setattr(
         "agents.supplier_interaction_agent.workflow_email_tracking_repo.lookup_workflow_for_unique",
@@ -1962,6 +1989,9 @@ def test_run_await_workflow_batch(monkeypatch):
         "uid-1",
         "uid-2",
     }
+
+    assert ("wf-batch", "invoked") in recorded_statuses
+    assert ("wf-batch", "awaiting_responses") in recorded_statuses
 
 
 def test_dispatch_gate_requires_all_expected(monkeypatch):

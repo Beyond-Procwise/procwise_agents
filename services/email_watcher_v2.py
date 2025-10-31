@@ -43,7 +43,7 @@ class EmailWatcherV2(EmailWatcher):
         dispatch_wait_seconds: int = 90,
         poll_interval_seconds: int = 30,
         max_poll_attempts: int = 10,
-        match_threshold: float = 0.45,
+        match_threshold: float = 0.8,
         email_fetcher: Optional[Callable[..., List[EmailResponse]]] = None,
         mailbox: Optional[str] = None,
         imap_host: Optional[str] = None,

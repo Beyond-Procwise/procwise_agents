@@ -45,6 +45,7 @@ def test_upsert_and_search():
     rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
     rag.upsert_texts(["hello world"], {"record_id": "test"})
     assert nick.qdrant_client.upserts  # ensure upsert called
+    assert nick.qdrant_client.upserts[0]["collection_name"] == "c"
     point_ids = [p.id for p in nick.qdrant_client.upserts[0]["points"]]
     for pid in point_ids:
         uuid.UUID(str(pid))
@@ -68,6 +69,29 @@ def test_upsert_gpu_fallback(monkeypatch, caplog):
     assert "falling back to CPU index" in caplog.text
     hits = rag.search("gpu")
     assert hits[0].payload["record_id"] == "gpu"
+
+
+def test_upsert_payloads_respects_source_collection():
+    nick = SimpleNamespace(
+        device="cpu",
+        settings=SimpleNamespace(qdrant_collection_name="procwise_document_embeddings", reranker_model="x"),
+        qdrant_client=DummyQdrant(),
+        embedding_model=DummyEmbed(),
+    )
+    rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
+
+    rag.upsert_payloads(
+        [
+            {
+                "record_id": "doc-1",
+                "content": "Uploaded content",
+                "source_collection": "uploaded_documents",
+            }
+        ]
+    )
+
+    assert nick.qdrant_client.upserts
+    assert nick.qdrant_client.upserts[0]["collection_name"] == "uploaded_documents"
 
 
 def test_pipeline_answer_returns_documents(monkeypatch):

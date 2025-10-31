@@ -19,6 +19,10 @@ sources.
    `category_level_2` through `category_level_5`.
 5. **Invoices ➜ Invoice Line Items**: `proc.invoice_line_items_agent`
    joins on `invoice_id` to provide detailed invoice lines.
+6. **Supplier Responses ➜ Tracking**: `services.email_watcher_v2.EmailWatcherV2`
+   polls the configured IMAP mailbox, matches replies by workflow/unique ID
+   using `proc.workflow_email_tracking`, and persists structured responses to
+   `proc.supplier_response` for downstream agents.
 
 ## Table Definitions
 
@@ -400,19 +404,42 @@ id serial PRIMARY KEY,
     unique_id text NOT NULL,
     supplier_id text,
     supplier_email text,
+    rfq_id text,
     response_message_id text,
     response_subject text,
+    response_text text,
     response_body text,
+    body_html text,
     response_from text,
+    round_number integer,
+    in_reply_to jsonb,
+    reference_ids jsonb,
     response_date timestamp with time zone,
     original_message_id text,
     original_subject text,
-    match_confidence numeric(3,2),
+    match_confidence numeric(4,2),
+    match_score numeric(4,2),
+    match_evidence jsonb,
+    matched_on jsonb,
+    raw_headers jsonb,
+    price numeric(18,4),
+    currency text,
+    payment_terms text,
+    warranty text,
+    validity text,
+    exceptions text,
+    lead_time integer,
     response_time numeric(18,6),
-    created_at timestamp with time zone DEFAULT now(),
+    tables jsonb,
+    attachments jsonb,
+    received_time timestamp with time zone,
     processed boolean DEFAULT false,
-    CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id)
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT supplier_response_unique UNIQUE (workflow_id, unique_id),
+    CONSTRAINT supplier_response_message_unique UNIQUE (workflow_id, response_message_id)
 ```
+Indexed on `workflow_id`, `supplier_id`, and `unique_id` to accelerate
+workflow polling and supplier lookups from the email watcher.
 
 ### `proc.rfq_targets`
 ```
