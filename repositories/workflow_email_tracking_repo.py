@@ -381,9 +381,9 @@ def record_dispatches(
         cur = conn.cursor()
         q = (
             "INSERT INTO proc.workflow_email_tracking "
-            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
+            "(workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, recipient_emails, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (workflow_id, unique_id) DO UPDATE SET "
             "dispatch_key=EXCLUDED.dispatch_key, "
             "supplier_id=EXCLUDED.supplier_id, "
@@ -422,7 +422,7 @@ def load_workflow_rows(*, workflow_id: str) -> List[WorkflowDispatchRow]:
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, recipient_emails, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking WHERE workflow_id=%s"
         )
@@ -461,7 +461,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
     with get_conn() as conn:
         cur = conn.cursor()
         q = (
-            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, message_id, subject, round_number, "
+            "SELECT workflow_id, unique_id, dispatch_key, supplier_id, supplier_email, recipient_emails, message_id, subject, round_number, "
             "dispatched_at, responded_at, response_message_id, matched, thread_headers "
             "FROM proc.workflow_email_tracking "
             "WHERE workflow_id=%s AND unique_id=%s "
@@ -481,6 +481,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
         "dispatch_key",
         "supplier_id",
         "supplier_email",
+        "recipient_emails",
         "message_id",
         "subject",
         "round_number",
@@ -497,6 +498,7 @@ def lookup_dispatch_row(*, workflow_id: str, unique_id: str) -> Optional[Workflo
         dispatch_key=data.get("dispatch_key"),
         supplier_id=data.get("supplier_id"),
         supplier_email=data.get("supplier_email"),
+        recipient_emails=_parse_email_list(data.get("recipient_emails")),
         message_id=data.get("message_id"),
         subject=data.get("subject"),
         round_number=data.get("round_number"),
