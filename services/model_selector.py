@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Type
 from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
+from agents.base_agent import AgentStatus
+from agents.rag_agent import RAGAgent
 from .rag_service import RAGService
 from utils.gpu import configure_gpu, load_cross_encoder
 
@@ -61,6 +63,9 @@ class RAGPipeline:
         if not default_rag_model:
             default_rag_model = getattr(self.settings, "extraction_model", settings.extraction_model)
         self.default_llm_model = default_rag_model
+        self._static_agent = RAGAgent(agent_nick)
+        threshold = getattr(self.settings, "static_qa_confidence_threshold", 0.68)
+        self._static_confidence_threshold = max(0.0, min(float(threshold), 1.0))
         self.rag = RAGService(agent_nick)
         model_name = getattr(
             self.settings,
@@ -70,6 +75,55 @@ class RAGPipeline:
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
+
+    def _format_static_answer(self, answer: str) -> str:
+        cleaned = answer.strip()
+        if not cleaned:
+            return ""
+        return f"Sure, I can help with that. {cleaned}" if not cleaned.lower().startswith("sure") else cleaned
+
+    def _try_static_answer(self, query: str, user_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            output = self._static_agent.run(query=query, user_id=user_id, session_id=user_id)
+        except Exception:
+            logger.exception("Static procurement QA lookup failed")
+            return None
+
+        if output.status is not AgentStatus.SUCCESS:
+            return None
+
+        confidence = float(output.confidence or 0.0)
+        if confidence < self._static_confidence_threshold:
+            return None
+
+        payload = output.data or {}
+        answer_text = payload.get("answer")
+        if not isinstance(answer_text, str) or not answer_text.strip():
+            return None
+
+        formatted_answer = self._format_static_answer(answer_text)
+        follow_ups = [
+            item.strip()
+            for item in (payload.get("related_prompts") or [])
+            if isinstance(item, str) and item.strip()
+        ][:3]
+
+        history = self.history_manager.get_history(user_id)
+        history.append({"query": query, "answer": formatted_answer})
+        self.history_manager.save_history(user_id, history)
+
+        retrieved = {
+            "source": "static_procurement_qa",
+            "topic": payload.get("topic"),
+            "question": payload.get("question"),
+            "confidence": confidence,
+        }
+
+        return {
+            "answer": formatted_answer,
+            "follow_ups": follow_ups,
+            "retrieved_documents": [retrieved],
+        }
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
         """Return extracted text for each uploaded PDF."""
@@ -130,6 +184,10 @@ class RAGPipeline:
     def answer_question(self, query: str, user_id: str, model_name: Optional[str] = None,
                         files: Optional[List[tuple[bytes, str]]] = None, doc_type: Optional[str] = None,
                         product_type: Optional[str] = None) -> Dict:
+        static_candidate = self._try_static_answer(query, user_id)
+        if static_candidate:
+            return static_candidate
+
         llm_to_use = model_name or self.default_llm_model
         logger.info(
             f"Answering query with model '{llm_to_use}' and filters: doc_type='{doc_type}', product_type='{product_type}'")
