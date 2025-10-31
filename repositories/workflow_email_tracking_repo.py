@@ -530,33 +530,16 @@ def mark_response(
     unique_id: str,
     responded_at: datetime,
     response_message_id: Optional[str],
-    round_number: Optional[int] = None,
 ) -> None:
     responded = _normalise_dt(responded_at)
 
     with get_conn() as conn:
         cur = conn.cursor()
-        if round_number is not None:
-            try:
-                round_value = int(round_number)
-            except Exception:
-                round_value = None
-        else:
-            round_value = None
-
-        if round_value is not None:
-            q = (
-                "UPDATE proc.workflow_email_tracking "
-                "SET responded_at=%s, response_message_id=%s, matched=TRUE, round_number=COALESCE(%s, round_number) "
-                "WHERE workflow_id=%s AND unique_id=%s"
-            )
-            cur.execute(q, (responded, response_message_id, round_value, workflow_id, unique_id))
-        else:
-            q = (
-                "UPDATE proc.workflow_email_tracking SET responded_at=%s, response_message_id=%s, matched=TRUE "
-                "WHERE workflow_id=%s AND unique_id=%s"
-            )
-            cur.execute(q, (responded, response_message_id, workflow_id, unique_id))
+        q = (
+            "UPDATE proc.workflow_email_tracking SET responded_at=%s, response_message_id=%s, matched=TRUE "
+            "WHERE workflow_id=%s AND unique_id=%s"
+        )
+        cur.execute(q, (responded, response_message_id, workflow_id, unique_id))
         cur.close()
 
 

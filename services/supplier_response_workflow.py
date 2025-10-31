@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from repositories import supplier_response_repo, workflow_email_tracking_repo
-from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 
 import logging
 
@@ -491,54 +490,3 @@ class SupplierResponseWorkflow:
             "dispatch": dispatch_info,
             "responses": response_info,
         }
-
-
-def all_supplier_responses_received(
-    workflow_id: str, round_number: Optional[int]
-) -> bool:
-    """Return ``True`` when all tracked responses for ``round_number`` exist."""
-
-    workflow_key = (workflow_id or "").strip()
-    if not workflow_key:
-        return False
-
-    try:
-        workflow_email_tracking_repo.init_schema()
-        rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_key)
-    except Exception:
-        logger.exception(
-            "Failed to load workflow dispatch rows while checking response completion",
-        )
-        return False
-
-    if not rows:
-        return False
-
-    try:
-        target_round = int(round_number) if round_number is not None else None
-    except Exception:
-        target_round = None
-
-    relevant_rows: List[WorkflowDispatchRow] = []
-    for row in rows:
-        row_round = getattr(row, "round_number", None)
-        if target_round is None:
-            relevant_rows.append(row)
-        else:
-            try:
-                row_value = int(row_round) if row_round is not None else None
-            except Exception:
-                row_value = None
-            if row_value == target_round:
-                relevant_rows.append(row)
-
-    if not relevant_rows:
-        return False
-
-    for row in relevant_rows:
-        matched = bool(getattr(row, "matched", False))
-        responded = getattr(row, "responded_at", None) is not None
-        if not matched and not responded:
-            return False
-
-    return True
