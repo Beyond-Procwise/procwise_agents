@@ -244,9 +244,14 @@ class BackendScheduler:
                 registry = getattr(self.agent_nick, "agents", None)
                 self._email_watcher_service = EmailWatcherService(
                     agent_registry=registry,
+<<<<<<< HEAD
                     orchestrator=orchestrator,
                     supplier_agent=supplier_agent,
                     negotiation_agent=negotiation_agent,
+=======
+                    orchestrator=None,
+                    workflow_memory=getattr(self.agent_nick, "workflow_memory", None),
+>>>>>>> f6b29da (updated changes)
                 )
             service = self._email_watcher_service
             updater = getattr(service, "update_dependencies", None)

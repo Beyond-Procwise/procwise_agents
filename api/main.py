@@ -87,10 +87,22 @@ async def lifespan(app: FastAPI):
         )
         app.state.orchestrator = orchestrator
         app.state.rag_pipeline = RAGPipeline(agent_nick)
+<<<<<<< HEAD
         app.state.agent_registry = agent_nick.agents
         app.state.supplier_interaction_agent = supplier_interaction_agent
         app.state.negotiation_agent = negotiation_agent
         app.state.email_watcher_runner = run_email_watcher_for_workflow
+=======
+        email_watcher_service = EmailWatcherService(
+            agent_registry=agent_nick.agents,
+            orchestrator=orchestrator,
+            supplier_agent=supplier_interaction_agent,
+            negotiation_agent=negotiation_agent,
+            workflow_memory=agent_nick.workflow_memory,
+        )
+        email_watcher_service.start()
+        app.state.email_watcher_service = email_watcher_service
+>>>>>>> f6b29da (updated changes)
         logger.info("System initialized successfully.")
     except Exception as e:
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)

@@ -30,6 +30,7 @@ from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
 from services.learning_repository import LearningRepository
+from services.workflow_memory_service import WorkflowMemoryService
 from utils.gpu import configure_gpu
 
 try:  # Optional imports used for dataset persistence
@@ -320,6 +321,30 @@ class BaseAgent:
         logger.info(
             "%s: completed with status %s", self.__class__.__name__, result.status.value
         )
+
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if memory and getattr(memory, "enabled", False):
+            input_summary = (
+                WorkflowMemoryService.summarise_payload(logged_input)
+                if isinstance(logged_input, dict)
+                else {}
+            )
+            output_summary = (
+                WorkflowMemoryService.summarise_payload(logged_output)
+                if isinstance(logged_output, dict)
+                else {}
+            )
+            try:
+                memory.record_agent_execution(
+                    context.workflow_id,
+                    agent_name=self.__class__.__name__,
+                    status=result.status.value,
+                    summary={"input": input_summary, "output": output_summary},
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "Workflow memory recording failed for %s", self.__class__.__name__, exc_info=True
+                )
 
         self._persist_agentic_plan(context, result)
         try:
@@ -1281,6 +1306,7 @@ class AgentNick:
         self.query_engine = QueryEngine(self)
         self.routing_engine = RoutingEngine(self)
         self.process_routing_service = ProcessRoutingService(self)
+        self.workflow_memory = WorkflowMemoryService(self)
         logger.info("Engines initialized.")
 
         self.agents = {}

@@ -11,7 +11,7 @@ from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_service import EmailDispatchService
 from services.event_bus import get_event_bus
 from services.supplier_response_coordinator import get_supplier_response_coordinator
-from repositories import workflow_email_tracking_repo
+from repositories import workflow_email_tracking_repo, workflow_round_response_repo
 
 
 logger = logging.getLogger(__name__)
@@ -304,6 +304,28 @@ class EmailDispatchAgent(BaseAgent):
             except Exception:  # pragma: no cover - defensive logging
                 logger.debug(
                     "Response coordinator registration failed for workflow=%s",
+                    workflow_id,
+                    exc_info=True,
+                )
+            try:
+                expectations = [
+                    (
+                        record.get("round")
+                        or record.get("round_number")
+                        or round_number,
+                        record.get("unique_id"),
+                        record.get("supplier_id"),
+                    )
+                    for record in dispatch_records
+                    if record.get("unique_id")
+                ]
+                workflow_round_response_repo.register_expected(
+                    workflow_id=workflow_id,
+                    expectations=expectations,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.debug(
+                    "Failed to register workflow round expectations for workflow=%s",
                     workflow_id,
                     exc_info=True,
                 )

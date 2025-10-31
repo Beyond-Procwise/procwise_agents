@@ -18,9 +18,8 @@ from repositories import (
     workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from services.email_watcher import EmailWatcher, EmailWatcherConfig
-from services.event_bus import get_event_bus
-from services.supplier_response_workflow import all_supplier_responses_received
+from services.email_watcher_v2 import EmailWatcherV2
+from services.watcher_utils import run_email_watcher_for_workflow
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -223,6 +222,7 @@ def run_email_watcher_for_workflow(
     negotiation_agent: Optional[Any] = None,
     process_routing_service: Optional[Any] = None,
     max_workers: int = 8,
+    workflow_memory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
 
@@ -859,7 +859,7 @@ class EmailWatcherService:
             self.stop()
             self.start()
         with self._forced_lock:
-            self._forced_workflows.add(workflow_key)
+            self._forced_workflows = {workflow_key}
         self._wake_event.set()
 
     def _consume_forced_workflows(self) -> List[str]:
@@ -993,19 +993,11 @@ class EmailWatcherService:
         while not self._stop_event.is_set():
             waiting_for_dispatch = False
             processed_workflow = False
-            try:
-                workflow_ids = workflow_email_tracking_repo.load_active_workflow_ids()
-            except Exception:
-                logger.exception("Failed to load workflows for email watcher service")
-                workflow_ids = []
-
             forced = self._consume_forced_workflows()
             if forced:
-                seen = set(workflow_ids)
-                for workflow_id in forced:
-                    if workflow_id not in seen:
-                        workflow_ids.append(workflow_id)
-                        seen.add(workflow_id)
+                workflow_ids = list(dict.fromkeys(forced))
+            else:
+                workflow_ids = []
 
             for workflow_id in workflow_ids:
                 if self._stop_event.is_set():

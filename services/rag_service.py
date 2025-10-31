@@ -3,7 +3,7 @@ import importlib.util
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 from types import SimpleNamespace
 
 import numpy as np
@@ -496,12 +496,63 @@ class RAGService:
                 return 0.04
             return 0.0
 
-        ranked = sorted(
-            zip(hits, scores),
-            key=lambda x: (float(x[1]) + _priority_bonus(x[0])),
-            reverse=True,
+        scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
+        for hit, score in zip(hits, scores):
+            base_score = float(score)
+            combined = base_score + _priority_bonus(hit)
+            scored_hits.append((hit, combined, base_score))
+
+        if not scored_hits:
+            return []
+
+        scored_hits.sort(key=lambda item: item[1], reverse=True)
+
+        if top_k <= 0:
+            return []
+
+        selected = scored_hits[:top_k]
+
+        def _collection_name(hit_obj: SimpleNamespace) -> str:
+            payload = getattr(hit_obj, "payload", {}) or {}
+            return payload.get("collection_name", self.primary_collection)
+
+        required_collections: Tuple[str, ...] = (
+            self.primary_collection,
+            self.uploaded_collection,
+            self.learning_collection,
         )
-        return [h for h, _ in ranked[:top_k]]
+
+        available_by_collection: Dict[str, List[Tuple[SimpleNamespace, float, float]]] = {}
+        for record in scored_hits:
+            collection = _collection_name(record[0])
+            available_by_collection.setdefault(collection, []).append(record)
+
+        def _has_collection(collection: str) -> bool:
+            return any(_collection_name(hit) == collection for hit, _, _ in selected)
+
+        for collection in required_collections:
+            candidates_for_collection = available_by_collection.get(collection)
+            if not candidates_for_collection or _has_collection(collection):
+                continue
+            replacement_candidate = candidates_for_collection[0]
+            if len(selected) < top_k:
+                selected.append(replacement_candidate)
+            else:
+                lowest_idx = min(range(len(selected)), key=lambda idx: selected[idx][1])
+                selected[lowest_idx] = replacement_candidate
+
+        # Remove duplicates while preserving highest combined score order
+        deduped: List[Tuple[SimpleNamespace, float, float]] = []
+        seen_keys: Set[Tuple[str, str]] = set()
+        for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
+            payload = getattr(hit, "payload", {}) or {}
+            key = (str(getattr(hit, "id", payload.get("record_id"))), _collection_name(hit))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append((hit, combined, base))
+
+        return [hit for hit, _, _ in deduped[:top_k]]
 
     def create_langchain_retriever_tool(
         self,

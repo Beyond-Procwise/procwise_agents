@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import ollama
 import pdfplumber
 from io import BytesIO
@@ -125,9 +126,9 @@ class RAGPipeline:
             "retrieved_documents": [retrieved],
         }
 
-    def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]) -> List[tuple[str, str]]:
-        """Return extracted text for each uploaded PDF."""
-        results: List[tuple[str, str]] = []
+    def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]):
+        """Return extracted text and lightweight summaries for uploaded PDFs."""
+        results: List[Dict[str, str]] = []
         for content_bytes, filename in files:
             try:
                 if filename.lower().endswith('.pdf'):
@@ -135,7 +136,12 @@ class RAGPipeline:
                         text = "\n".join(
                             page.extract_text() for page in pdf.pages if page.extract_text()
                         )
-                        results.append((filename, text))
+                        summary = self._condense_snippet(text, max_sentences=4, max_chars=500)
+                        results.append({
+                            "name": filename,
+                            "text": text,
+                            "summary": summary,
+                        })
             except Exception as e:
                 logger.error(f"Failed to process uploaded file {filename}: {e}")
         return results
@@ -154,14 +160,164 @@ class RAGPipeline:
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         return [h for h, _ in ranked[:top_k]]
 
+    # ------------------------------------------------------------------
+    # Context synthesis helpers
+    # ------------------------------------------------------------------
+    def _condense_snippet(
+        self,
+        text: str,
+        *,
+        max_sentences: int = 3,
+        max_chars: int = 360,
+    ) -> str:
+        """Return a lightly summarised version of ``text`` suitable for prompts."""
+
+        if not isinstance(text, str):
+            return ""
+
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if not cleaned:
+            return ""
+
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        summary = " ".join(sentences[:max_sentences]) if sentences else cleaned
+        if len(summary) > max_chars:
+            truncated = summary[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;")
+            summary = f"{truncated}…" if truncated else summary[:max_chars]
+        return summary
+
+    def _label_for_collection(self, collection: Optional[str]) -> str:
+        if not collection:
+            return "Knowledge base insight"
+        if collection == self.rag.primary_collection:
+            return "ProcWise knowledge base"
+        if collection == self.rag.uploaded_collection:
+            return "Uploaded reference"
+        if collection == self.rag.learning_collection:
+            return "Procurement playbook"
+        if collection == "static_procurement_qa":
+            return "Static procurement guidance"
+        return collection.replace("_", " ").title()
+
+    def _prepare_knowledge_items(self, hits: List) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for hit in hits:
+            payload = getattr(hit, "payload", {}) or {}
+            payload = dict(payload)
+            collection = payload.get("collection_name", self.rag.primary_collection)
+            source_label = self._label_for_collection(collection)
+            payload.setdefault("source_label", source_label)
+            summary_text = (
+                payload.get("summary")
+                or payload.get("text_summary")
+                or payload.get("content", "")
+            )
+            condensed = self._condense_snippet(summary_text)
+            document_label = (
+                payload.get("document_name")
+                or payload.get("title")
+                or payload.get("record_id")
+                or str(getattr(hit, "id", "Document"))
+            )
+            items.append(
+                {
+                    "payload": payload,
+                    "collection": collection,
+                    "source_label": source_label,
+                    "document": document_label,
+                    "summary": condensed,
+                }
+            )
+        return items
+
+    def _synthesise_context(self, knowledge_items: List[Dict[str, Any]]) -> str:
+        if not knowledge_items:
+            return ""
+
+        ordered_collections: List[str] = []
+        for collection in (
+            self.rag.primary_collection,
+            self.rag.uploaded_collection,
+            self.rag.learning_collection,
+            "static_procurement_qa",
+        ):
+            if any(item["collection"] == collection for item in knowledge_items):
+                ordered_collections.append(collection)
+
+        # Include any other collections deterministically afterwards
+        for item in knowledge_items:
+            if item["collection"] not in ordered_collections:
+                ordered_collections.append(item["collection"])
+
+        paragraphs: List[str] = []
+        for collection in ordered_collections:
+            relevant = [item for item in knowledge_items if item["collection"] == collection]
+            if not relevant:
+                continue
+            source_label = self._label_for_collection(collection)
+            snippets: List[str] = []
+            for idx, item in enumerate(relevant):
+                snippet = item.get("summary") or self._condense_snippet(
+                    item["payload"].get("content", "")
+                )
+                if not snippet:
+                    continue
+                doc_label = item.get("document")
+                if idx == 0:
+                    if doc_label:
+                        snippets.append(f"{doc_label} shows {snippet}")
+                    else:
+                        snippets.append(snippet)
+                else:
+                    connector = "Additionally" if idx == 1 else "Meanwhile"
+                    if doc_label:
+                        snippets.append(f"{connector}, {doc_label} adds that {snippet}")
+                    else:
+                        snippets.append(f"{connector}, {snippet}")
+            if not snippets:
+                continue
+            paragraphs.append(f"{source_label}: {' '.join(snippets)}")
+
+        return "\n\n".join(paragraphs)
+
+    def _format_history_context(self, history: List[Dict[str, Any]], limit: int = 3) -> str:
+        if not history:
+            return ""
+        trimmed = history[-limit:]
+        formatted = []
+        for item in trimmed:
+            question = str(item.get("query", "")).strip()
+            answer = str(item.get("answer", "")).strip()
+            if not question and not answer:
+                continue
+            formatted.append(f"Question: {question}\nAnswer: {answer}")
+        return "\n\n".join(formatted)
+
+    def _postprocess_answer(self, answer: str) -> str:
+        if not isinstance(answer, str):
+            return str(answer)
+
+        cleaned = answer.strip()
+        if not cleaned:
+            return ""
+
+        lower = cleaned.lower()
+        if lower.startswith("as an ai"):
+            cleaned = cleaned.split(".", 1)[-1].lstrip() or cleaned
+        if lower.startswith("based on"):
+            cleaned = f"From what I can see, {cleaned[len('based on'):].lstrip()}"
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned
+
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
         system = (
-            "You are a procurement-focused assistant. Respond in valid JSON with keys 'answer' and 'follow_ups' "
-            "where 'follow_ups' is a list of 3 to 5 short questions. Use only the supplied context, "
-            "external procurement knowledge, and never manipulate or infer customer data beyond the prompt. "
-            "Craft the answer as an expert consultant: be descriptive, confident, and keep the tone conversational "
-            "yet professional. Avoid opening with phrases such as 'Based on the'."
+            "You are ProcWise's procurement intelligence analyst. Respond in valid JSON with keys 'answer' and 'follow_ups'. "
+            "Write the answer as two or three short paragraphs using confident, conversational business English. "
+            "Blend factual details with procedural guidance drawn from the supplied context, acknowledge any gaps, and suggest practical next steps. "
+            "Never reference system internals, raw identifiers, or database terminology. "
+            "Ensure 'follow_ups' contains three concise, forward-looking questions that keep the procurement dialogue moving."
         )
         messages = [
             {"role": "system", "content": system},
@@ -228,56 +384,32 @@ class RAGPipeline:
 
         # --- Process Uploaded Files ---
         uploaded = self._extract_text_from_uploads(files) if files else []
-        ad_hoc_context = []
-        for fname, text in uploaded:
-            ad_hoc_context.append(f"--- Content from uploaded file: {fname} ---\n{text}")
-            meta = {"record_id": fname, "document_type": doc_type or "uploaded"}
+        ad_hoc_notes: List[str] = []
+        for idx, file_info in enumerate(uploaded):
+            filename = file_info.get("name") or f"uploaded-reference-{idx + 1}"
+            text = file_info.get("text", "")
+            summary = file_info.get("summary") or self._condense_snippet(text)
+            if summary:
+                ad_hoc_notes.append(f"{filename}: {summary}")
+            metadata = {"record_id": filename, "document_type": doc_type or "uploaded"}
             if product_type:
-                meta["product_type"] = product_type.lower()
-            self.rag.upsert_texts([text], meta)
-        ad_hoc_context = "\n\n".join(ad_hoc_context)
+                metadata["product_type"] = product_type.lower()
+            if text:
+                self.rag.upsert_texts([text], metadata)
+        ad_hoc_context = "\n".join(ad_hoc_notes)
 
         # --- Retrieve from Vector DB ---
         top_k = 6
         reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
-        context_segments: List[str] = []
-        retrieved_documents_payloads: List[Dict[str, Any]] = []
-        for hit in reranked:
-            payload = getattr(hit, "payload", {}) or {}
-            retrieved_documents_payloads.append(payload)
-            chunk_suffix = (
-                f" | Chunk {payload.get('chunk_id')}"
-                if payload.get("chunk_id") is not None
-                else ""
-            )
-            collection_name = payload.get(
-                "collection_name", self.settings.qdrant_collection_name
-            )
-            source_label = {
-                self.rag.primary_collection: "ProcWise knowledge base",
-                self.rag.uploaded_collection: "Uploaded reference",
-                getattr(self.rag, "learning_collection", "learning"): "Procurement playbook",
-            }.get(collection_name, collection_name)
-            details = (
-                payload.get("summary")
-                or payload.get("text_summary")
-                or payload.get("content", "")
-            )
-            if collection_name == getattr(self.rag, "learning_collection", "learning"):
-                intro = "Process guidance"
-            elif collection_name == self.rag.uploaded_collection:
-                intro = "Uploaded details"
-            else:
-                intro = "Document insight"
-            segment = (
-                f"Source: {source_label} | Document: {payload.get('document_name') or payload.get('record_id', hit.id)}"
-                f"{chunk_suffix}\n"
-                f"{intro}: {details}"
-            )
-            context_segments.append(segment)
+        knowledge_items = self._prepare_knowledge_items(reranked)
+        retrieved_documents_payloads: List[Dict[str, Any]] = [
+            item["payload"] for item in knowledge_items
+        ]
 
         try:
-            static_output = self._static_agent.run(query=query, user_id=user_id, session_id=user_id)
+            static_output = self._static_agent.run(
+                query=query, user_id=user_id, session_id=user_id
+            )
         except Exception:
             logger.exception("Static procurement QA lookup failed during context build")
         else:
@@ -293,39 +425,54 @@ class RAGPipeline:
                         "confidence": float(static_output.confidence or 0.0),
                     }
                     retrieved_documents_payloads.append(static_context_payload)
-                    context_segments.append(
-                        "Source: Static procurement guide"
-                        f" | Topic: {payload.get('topic', 'Common procurement guidance')}\n"
-                        f"Contextual answer: {answer_text}"
+                    knowledge_items.append(
+                        {
+                            "payload": static_context_payload,
+                            "collection": "static_procurement_qa",
+                            "source_label": self._label_for_collection("static_procurement_qa"),
+                            "document": payload.get("topic")
+                            or payload.get("question")
+                            or "Procurement guidance",
+                            "summary": self._condense_snippet(
+                                answer_text, max_sentences=2, max_chars=320
+                            ),
+                        }
                     )
 
-        retrieved_context = "\n---\n".join(context_segments) if context_segments else ""
+        retrieved_context = self._synthesise_context(knowledge_items)
 
-        history = []
-        if not reranked:
+        if not knowledge_items and not ad_hoc_context:
             history = self.history_manager.get_history(user_id)
-            history_context = "\n".join([f"Q: {h['query']}\nA: {h['answer']}" for h in history])
+            history_context = self._format_history_context(history)
             if not history_context:
                 return {
-                    "answer": "Could not find relevant documents or chat history to answer the question.",
+                    "answer": "I could not find relevant knowledge or prior conversation to answer that just yet.",
                     "follow_ups": [],
                     "retrieved_documents": [],
                 }
-            prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
-Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided. Respond as an expert procurement consultant with confident, descriptive language, and avoid opening with phrases like 'Based on the'.
+            prompt = f"""No knowledge base excerpts were retrieved for the latest query. Use the recent conversation to craft a helpful response that stays within procurement context and acknowledges any gaps.
 
-### Ad-hoc Context from Uploaded Files:
-{ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
-
-### Chat History:
+### Recent Conversation:
 {history_context}
 
 ### User's Question:
 {query}
+
+Guidelines:
+1. Continue the discussion in a warm, professional tone.
+2. If information is missing, suggest the most practical next step.
+3. Provide three relevant follow-up questions that build on the dialogue.
 """
             model_output = self._generate_response(prompt, llm_to_use)
-            answer = model_output.get("answer", "Could not generate an answer.")
-            follow_ups = model_output.get("follow_ups", [])
+            answer_raw = model_output.get("answer", "Could not generate an answer.")
+            follow_ups_raw = model_output.get("follow_ups", [])
+            answer = self._postprocess_answer(answer_raw)
+            if not isinstance(follow_ups_raw, list):
+                follow_ups = []
+            else:
+                follow_ups = [
+                    str(item).strip() for item in follow_ups_raw if str(item).strip()
+                ][:5]
             history.append({"query": query, "answer": answer})
             self.history_manager.save_history(user_id, history)
             return {
@@ -334,28 +481,39 @@ Only leverage procurement-focused external knowledge when the retrieved context 
                 "retrieved_documents": [],
             }
 
-        # When documents are found, prioritise them over chat history
-        prompt = f"""Use the following information to answer the user's question and suggest follow-ups.
-Only leverage procurement-focused external knowledge when the retrieved context is insufficient, and never infer or manipulate customer-specific data beyond what is provided. Respond as an expert procurement consultant with confident, descriptive language, and avoid opening with phrases like 'Based on the'.
+        prompt = f"""Use the context below to answer the procurement question with a natural, consultant-style summary.
 
-### Ad-hoc Context from Uploaded Files:
-{ad_hoc_context if ad_hoc_context else "No files were uploaded for this query."}
+### Uploaded References:
+{ad_hoc_context if ad_hoc_context else "No user uploads were provided for this query."}
 
-### Retrieved Documents from Knowledge Base:
-{retrieved_context}
+### Knowledge Base Highlights:
+{retrieved_context if retrieved_context else "No direct knowledge snippets matched; rely on procurement best practice and explain any gaps."}
 
 ### User's Question:
 {query}
+
+Guidelines:
+1. Weave the information into two or three short paragraphs that read like a human analyst.
+2. Paraphrase instead of quoting directly, and clarify whether items are complete, pending, or uncertain.
+3. Flag any missing data and suggest the most useful next action.
+4. Provide three forward-looking follow-up questions tailored to the conversation.
 """
 
         model_output = self._generate_response(prompt, llm_to_use)
-        answer = model_output.get("answer", "Could not generate an answer.")
-        follow_ups = model_output.get("follow_ups", [])
+        answer_raw = model_output.get("answer", "Could not generate an answer.")
+        follow_ups_raw = model_output.get("follow_ups", [])
+        answer = self._postprocess_answer(answer_raw)
+        if not isinstance(follow_ups_raw, list):
+            follow_ups = []
+        else:
+            follow_ups = [
+                str(item).strip() for item in follow_ups_raw if str(item).strip()
+            ][:5]
 
-        # Save history after answering
         history = self.history_manager.get_history(user_id)
         history.append({"query": query, "answer": answer})
         self.history_manager.save_history(user_id, history)
+
         return {
             "answer": answer,
             "follow_ups": follow_ups,

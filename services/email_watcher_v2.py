@@ -139,6 +139,152 @@ class _SupplierAgentProxy:
 
 class EmailWatcherV2(EmailWatcher):
     """Thin wrapper around :class:`services.email_watcher.EmailWatcher`."""
+=======
+def _normalise_thread_header(value) -> Sequence[str]:
+    if value in (None, ""):
+        return tuple()
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(v).strip("<> ") for v in value if v)
+    return (str(value).strip("<> "),)
+
+
+def _normalise_identifier(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text.upper() or None
+
+
+def _normalise_email_address(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    _, address = parseaddr(str(value))
+    address = address.strip().lower()
+    return address or None
+
+
+def _default_fetcher(
+    *,
+    host: str,
+    username: str,
+    password: str,
+    mailbox: str,
+    since: datetime,
+    port: int = 993,
+    use_ssl: bool = True,
+    login: Optional[str] = None,
+) -> List[EmailResponse]:
+    client = _imap_client(host, username, password, port=port, use_ssl=use_ssl, login=login)
+    try:
+        client.select(mailbox, readonly=True)
+        since_str = since.strftime("%d-%b-%Y")
+        typ, data = client.search(None, f'(SINCE {since_str})')
+        if typ != "OK":
+            return []
+        ids = (data[0] or b"").decode().split()
+        responses: List[EmailResponse] = []
+        for message_id in ids:
+            typ, payload = client.fetch(message_id, "(RFC822)")
+            if typ != "OK" or not payload or not isinstance(payload[0], tuple):
+                continue
+            raw = payload[0][1]
+            responses.append(_parse_email(raw))
+        return responses
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
+def _score_to_confidence(score: float) -> Decimal:
+    """Convert a floating point score into a quantised confidence value.
+
+    The score produced by the matcher is normalised into the range 0-1 so it can
+    be persisted as a numeric confidence value for downstream processing.  Any
+    unexpected inputs are treated defensively and clamped into range before
+    quantisation to two decimal places.
+    """
+
+    try:
+        if score != score:  # NaN check
+            score = 0.0
+    except Exception:  # pragma: no cover - defensive
+        score = 0.0
+
+    normalised = max(0.0, min(float(score), 1.0))
+    decimal_score = Decimal(str(normalised))
+    return decimal_score.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _calculate_match_score(dispatch: EmailDispatchRecord, email_response: EmailResponse) -> float:
+    score = 0.0
+
+    if email_response.unique_id and email_response.unique_id == dispatch.unique_id:
+        return 1.0
+
+    if (
+        email_response.supplier_id
+        and dispatch.supplier_id
+        and email_response.supplier_id == dispatch.supplier_id
+    ):
+        score += 0.65
+
+    thread_ids = set(dispatch.thread_headers.get("references", ())) | set(
+        dispatch.thread_headers.get("in_reply_to", ())
+    )
+    if dispatch.message_id:
+        thread_ids.add(dispatch.message_id)
+
+    reply_headers = set(email_response.in_reply_to) | set(email_response.references)
+    if dispatch.message_id and dispatch.message_id in reply_headers:
+        score += 0.8
+    elif thread_ids & reply_headers:
+        score += 0.8
+
+    if dispatch.supplier_email and email_response.from_address:
+        dispatch_email = email.utils.parseaddr(str(dispatch.supplier_email))[1].lower()
+        response_email = email.utils.parseaddr(str(email_response.from_address))[1].lower()
+        if dispatch_email and response_email:
+            if dispatch_email == response_email:
+                score += 0.6
+            else:
+                dispatch_domain = dispatch_email.split("@")[-1]
+                response_domain = response_email.split("@")[-1]
+                if dispatch_domain and response_domain and dispatch_domain == response_domain:
+                    score += 0.35
+
+    if dispatch.subject and email_response.subject:
+        normalised_subject = dispatch.subject.lower()
+        if normalised_subject in email_response.subject.lower():
+            score += 0.5
+
+    # Add thread matching logic
+    if dispatch.message_id and email_response.in_reply_to:
+        if dispatch.message_id in email_response.in_reply_to:
+            score += 0.9
+
+    # Add reference chain matching
+    common_refs = set(dispatch.thread_headers.get("references", [])) & set(email_response.references)
+    if common_refs:
+        score += 0.7
+
+    # Add subject line matching with RE:/FW: handling
+    if dispatch.subject and email_response.subject:
+        clean_dispatch = re.sub(r"^(RE|FW):\s*", "", dispatch.subject, flags=re.IGNORECASE)
+        clean_response = re.sub(r"^(RE|FW):\s*", "", email_response.subject, flags=re.IGNORECASE)
+        if clean_dispatch.lower() == clean_response.lower():
+            score += 0.6
+
+    return score
+
+
+class EmailWatcherV2:
+    """Workflow-aware watcher coordinating dispatch/response tracking."""
 
     def __init__(
         self,

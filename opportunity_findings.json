@@ -23,7 +23,11 @@
     "source_records": [
       "526809"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:53.586222",
+=======
+    "detected_on": "2025-10-30T08:25:27.783709",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.00015748128495671022,
     "candidate_suppliers": [
       {
@@ -95,7 +99,11 @@
       "132549",
       "132666"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:53.587071",
+=======
+    "detected_on": "2025-10-30T08:25:27.784431",
+>>>>>>> f6b29da (updated changes)
     "weightage": 7.408143286425125e-05,
     "candidate_suppliers": [
       {
@@ -134,20 +142,32 @@
     "is_rejected": false
   },
   {
+<<<<<<< HEAD
     "opportunity_id": "25",
+=======
+    "opportunity_id": "26",
+>>>>>>> f6b29da (updated changes)
     "opportunity_ref_id": "oppfinderpolicy_004_contract_expiry_opportunity_contract_expiry_opportunity_1fb4444e_s_i000754_c00225",
     "detector_type": "Contract Expiry Opportunity",
     "policy_id": "oppfinderpolicy_004_contract_expiry_opportunity",
     "supplier_id": "SI000754",
     "supplier_name": "Perry Ltd",
+<<<<<<< HEAD
     "category_id": "Office Consumables",
+=======
+    "category_id": "Facilities & Real Estate",
+>>>>>>> f6b29da (updated changes)
     "item_id": "Stationary",
     "item_reference": "C00225",
     "financial_impact_gbp": 987943.66,
     "calculation_details": {
       "contract_title": "Facilitate Wireless Bandwidth",
       "contract_end_date": "2025-12-22",
+<<<<<<< HEAD
       "days_to_expiry": 54,
+=======
+      "days_to_expiry": 53,
+>>>>>>> f6b29da (updated changes)
       "item_reference": "C00225",
       "item_description": "Stationary",
       "risk_score_normalised": 0.0,
@@ -156,11 +176,16 @@
     "source_records": [
       "C00225"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:56.595548",
+=======
+    "detected_on": "2025-10-30T08:25:29.888649",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.46030365988649474,
     "candidate_suppliers": [],
     "context_documents": [
       {
+<<<<<<< HEAD
         "record_id": "PO526689",
         "document_type": "purchase_order",
         "product_type": "it hardware",
@@ -168,6 +193,8 @@
         "content": "po_id: PO526689\nbuyer_id: ORDER\nrequested_by: Number:\ncurrency: GBP\norder_date: 2024-09-18\nexpected_delivery_date: Cover\nship_to_country: United Kingdom\ndelivery_region: West Yorkshire\ntotal_amount: 3391.98\ndelivery_address_line1: 54 Hawthorne Industrial Estate\ndelivery_address_line2: West Yorkshire\ndelivery_city: LS10 1QP\npostal_code: LS10 1QP\ndefault_currency: GBP\npo_status: Open\n_field_context: {'po_id': 'PO Number: 526689', 'supplier_name': 'Assurity Ltd', 'buyer_id': 'Perry Ltd', 'order_date': 'PO Date: 18 Sept 2024', 'currency': 'GBP', 'total_amount': 'Total: £3,391.98', 'delivery_address_line1': '54 Hawthorne Industrial Estate', 'delivery_city': 'LS10 1QP', 'postal_code': 'LS10 1QP', 'ship_to_country': 'United Kingdom', 'delivery_region': 'West Yorkshire', 'tax_percent': 'Tax (20%): £565.33', 'line_number': 'DESCRIPTION UNIT PRICE QTY SUBTOTAL', 'item_description': 'Staedtler Ballpoint Pen Black Ink, 10 per Pack', 'quantity': '100', 'unit_price': '£12.49', 'unit_of_measue': 'each', 'line_total': '£1,249.00', 'tax_amount': 'Tax (20%): £565.33'}\n_field_confidence: {'total_amount': 0.75, 'order_date': 0.75, 'ship_to_country': 0.75, 'delivery_region': 0.75, 'delivery_address_line1': 0.75, 'delivery_address_line2': 0.75, 'delivery_city': 0.75, 'postal_code': 0.75, 'default_currency': 0.75, 'po_status': 0.75}\n_validation: {'is_valid': True, 'confidence_score': 1.0, 'errors': [], 'warnings': [], 'field_scores': {}}\ndoc_type: Purchase_Order\nproduct_type: it hardware"
       },
       {
+=======
+>>>>>>> f6b29da (updated changes)
         "record_id": "PO-000046",
         "document_type": "purchase_order",
         "product_type": "other",
@@ -176,31 +203,60 @@
         "content": "po_id: PO-000046\nline_number: 2\nitem_description: Corner Desk 160x120 walnut finish, modesty panel\nquantity: 4\nunit_price: 378.45\nunit_of_measue: unit\ncurrency: GBP\nline_total: 1513.8\ntax_percent: 20\ntax_amount: 302.76\ntotal_amount: 1816.56"
       },
       {
+<<<<<<< HEAD
         "record_id": "PO526702",
         "document_type": "purchase_order",
         "product_type": "it hardware",
         "data_type": "header",
         "content": "po_id: PO526702\nbuyer_id: ORDER\nrequested_by: Number:\ncurrency: GBP\norder_date: 2024-09-28\nship_to_country: United Kingdom\ndelivery_region: West Sussex\ntotal_amount: 2557.26\ndelivery_address_line1: 28 Victoria Works Business Park, Unit 5B\ndelivery_city: Birmingham\npostal_code: B7 4AX\ndefault_currency: GBP\npo_status: Confirmed\npayment_terms: 3 Marketing Services\nconverted_amount_usd: 12) 3-5 Posts Per Week\n_field_context: {'po_id': 'PO Number: 526702', 'supplier_name': 'Assurity Ltd', 'buyer_id': 'Duncan LLC', 'order_date': 'Assurity Ltd PO Date: 28 Sept 2024', 'currency': 'GBP', 'total_amount': 'Total: £2,557.26', 'delivery_address_line1': '28 Victoria Works Business Park, Unit 5B, Birmingham B7 4AX', 'delivery_city': 'Birmingham', 'postal_code': 'B7 4AX', 'ship_to_country': 'United Kingdom', 'delivery_region': 'West Sussex', 'tax_percent': 'Tax (20%): £426.21', 'line_number': 'DESCRIPTION UNIT PRICE QTY SUBTOTAL', 'item_description': 'Staedtler Ballpoint Pen, Black Ink, 10 per Pack', 'quantity': '100', 'unit_price': '£13.85', 'unit_of_measue': 'unit', 'line_total': '£1,385.00', 'tax_amount': 'Tax (20%): £426.21'}\n_field_confidence: {'total_amount': 0.75, 'order_date': 0.75, 'ship_to_country': 0.75, 'delivery_region': 0.75, 'delivery_address_line1': 0.75, 'delivery_city': 0.75, 'postal_code': 0.75, 'default_currency': 0.75, 'po_status': 0.75}\n_validation: {'is_valid': True, 'confidence_score': 1.0, 'errors': [], 'warnings': [], 'field_scores': {}}\ndoc_type: Purchase_Order\nproduct_type: it hardware"
+=======
+        "record_id": "PO409310",
+        "document_type": "purchase_order",
+        "product_type": "other",
+        "data_type": "line_item",
+        "line_number": 2,
+        "content": "po_id: 409310\nline_number: 2\nitem_description: Branded signage 4 pull-up banners\nquantity: 1\nunit_price: 600.0\ncurrency: GBP\nline_total: 600.0\ntax_percent: 20\ntax_amount: 120.0\ntotal_amount: 720.0"
+      },
+      {
+        "record_id": "PO-000001",
+        "document_type": "purchase_order",
+        "product_type": "other",
+        "data_type": "line_item",
+        "line_number": 4,
+        "content": "po_id: PO-000001\nline_number: 4\nitem_description: Sit-Stand Desk 120x70\nquantity: 5\nunit_price: 652.29\nunit_of_measue: Each\ncurrency: GBP\nline_total: 3261.45\ntax_percent: 20\ntax_amount: 652.29\ntotal_amount: 3913.74"
+>>>>>>> f6b29da (updated changes)
       }
     ],
     "ml_priority_score": 1.0,
     "is_rejected": false
   },
   {
+<<<<<<< HEAD
     "opportunity_id": "27",
+=======
+    "opportunity_id": "23",
+>>>>>>> f6b29da (updated changes)
     "opportunity_ref_id": "oppfinderpolicy_004_contract_expiry_opportunity_contract_expiry_opportunity_0bc91761_s_i000703_c01735",
     "detector_type": "Contract Expiry Opportunity",
     "policy_id": "oppfinderpolicy_004_contract_expiry_opportunity",
     "supplier_id": "SI000703",
     "supplier_name": "Duncan LLC",
+<<<<<<< HEAD
     "category_id": "Office Furniture",
+=======
+    "category_id": "Facilities & Real Estate",
+>>>>>>> f6b29da (updated changes)
     "item_id": "Stationary",
     "item_reference": "C01735",
     "financial_impact_gbp": 893967.68,
     "calculation_details": {
       "contract_title": "Incubate Transparent Metrics",
       "contract_end_date": "2025-12-10",
+<<<<<<< HEAD
       "days_to_expiry": 42,
+=======
+      "days_to_expiry": 41,
+>>>>>>> f6b29da (updated changes)
       "item_reference": "C01735",
       "item_description": "Stationary",
       "risk_score_normalised": 0.0,
@@ -209,11 +265,16 @@
     "source_records": [
       "C01735"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:56.597006",
+=======
+    "detected_on": "2025-10-30T08:25:27.890370",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.4165182809354116,
     "candidate_suppliers": [],
     "context_documents": [
       {
+<<<<<<< HEAD
         "record_id": "PO526640",
         "document_type": "purchase_order",
         "product_type": "other",
@@ -231,11 +292,34 @@
       },
       {
         "record_id": "PO526800",
+=======
+        "record_id": "PO273593",
+        "document_type": "purchase_order",
+        "product_type": "other",
+        "data_type": "line_item",
+        "line_number": 2,
+        "content": "po_id: 273593\nline_number: 2\nitem_description: Onboarding deck proposal design\nquantity: 1\nunit_price: 700.0\ncurrency: GBP\nline_total: 700.0\ntax_percent: 20\ntax_amount: 526.0\ntotal_amount: 3156.0"
+      },
+      {
+        "record_id": "PO409310",
+        "document_type": "purchase_order",
+        "product_type": "other",
+        "data_type": "line_item",
+        "line_number": 2,
+        "content": "po_id: 409310\nline_number: 2\nitem_description: Branded signage 4 pull-up banners\nquantity: 1\nunit_price: 600.0\ncurrency: GBP\nline_total: 600.0\ntax_percent: 20\ntax_amount: 120.0\ntotal_amount: 720.0"
+      },
+      {
+        "record_id": "PO273593",
+>>>>>>> f6b29da (updated changes)
         "document_type": "purchase_order",
         "product_type": "other",
         "data_type": "line_item",
         "line_number": 3,
+<<<<<<< HEAD
         "content": "po_id: 526800\nline_number: 3\nitem_description: Fellowes Office Chair Grey Upholstery, Steel Base\nquantity: 10\nunit_price: 79.99\nunit_of_measue: EA\ncurrency: GBP\nline_total: 799.9\ntax_percent: 20\ntax_amount: 479.94\ntotal_amount: 2879.64"
+=======
+        "content": "po_id: 273593\nline_number: 3\nitem_description: Investor pitch deck proposal design\nquantity: 1\nunit_price: 1050.0\ncurrency: GBP\nline_total: 1050.0\ntax_percent: 20\ntax_amount: 526.0\ntotal_amount: 3156.0"
+>>>>>>> f6b29da (updated changes)
       }
     ],
     "ml_priority_score": 1.0,
@@ -265,7 +349,11 @@
     "source_records": [
       "SI000655"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.490949",
+=======
+    "detected_on": "2025-10-30T08:25:31.764568",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.023284400046484,
     "candidate_suppliers": [],
     "context_documents": [
@@ -315,7 +403,11 @@
     "source_records": [
       "SI000367"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.418272",
+=======
+    "detected_on": "2025-10-30T08:25:31.685894",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.023277411232062842,
     "candidate_suppliers": [],
     "context_documents": [
@@ -367,7 +459,11 @@
     "source_records": [
       "502004"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.612874",
+=======
+    "detected_on": "2025-10-30T08:25:31.866719",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.055910515369246225,
     "candidate_suppliers": [],
     "context_documents": [
@@ -419,7 +515,11 @@
     "source_records": [
       "502001"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.613661",
+=======
+    "detected_on": "2025-10-30T08:25:31.867597",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.017444080795204823,
     "candidate_suppliers": [],
     "context_documents": [
@@ -479,7 +579,11 @@
     "source_records": [
       "507099"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.633776",
+=======
+    "detected_on": "2025-10-30T08:25:31.887815",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.0017369719809763723,
     "candidate_suppliers": [
       {
@@ -550,7 +654,11 @@
     "source_records": [
       "526702"
     ],
+<<<<<<< HEAD
     "detected_on": "2025-10-29T14:26:57.673527",
+=======
+    "detected_on": "2025-10-30T08:25:31.927727",
+>>>>>>> f6b29da (updated changes)
     "weightage": 0.001293117036298383,
     "candidate_suppliers": [
       {
