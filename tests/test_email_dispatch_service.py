@@ -3,6 +3,7 @@ import os
 import sys
 import types
 from types import SimpleNamespace
+from typing import List
 
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
@@ -14,9 +15,20 @@ _backend_scheduler_stub = types.ModuleType("services.backend_scheduler")
 
 
 class _BackendSchedulerProxy:
-    @staticmethod
-    def ensure(agent_nick):
-        return SimpleNamespace(notify_email_dispatch=lambda *_, **__: None)
+    notifications: List[str] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.notifications.clear()
+
+    @classmethod
+    def ensure(cls, agent_nick):
+        class _Notifier:
+            def notify_email_dispatch(self, workflow_id: str):
+                if workflow_id:
+                    cls.notifications.append(workflow_id)
+
+        return _Notifier()
 
 
 _backend_scheduler_stub.BackendScheduler = _BackendSchedulerProxy
@@ -198,6 +210,7 @@ class DummyNick:
 
 
 def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
+    _BackendSchedulerProxy.reset()
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-UNIT-12345"
     draft_payload = {
@@ -285,7 +298,6 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     }
     result = service.send_draft(
         "RFQ-UNIT",
-        is_workflow_email=True,
         workflow_dispatch_context=dispatch_context,
     )
 
@@ -295,10 +307,11 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
-    assert "X-Procwise-RFQ-ID" not in sent_args["headers"]
+    headers_lower = {k.lower(): v for k, v in sent_args["headers"].items()}
+    assert "x-procwise-rfq-id" not in headers_lower
     unique_id = extract_unique_id_from_body(result["body"])
     assert unique_id
-    assert sent_args["headers"]["X-Procwise-Unique-Id"] == unique_id
+    assert headers_lower["x-procwise-unique-id"] == unique_id
     if sent_args["headers"].get("X-Procwise-Workflow-Id"):
         assert (
             sent_args["headers"]["X-Procwise-Workflow-Id"]
@@ -353,9 +366,11 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         row.unique_id == unique_id and row.message_id == "<message-id-1>"
         for row in stored_rows
     )
+    assert _BackendSchedulerProxy.notifications == [metadata.workflow_id]
 
 
-def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
+def test_email_dispatch_service_records_workflow_even_when_flag_false(monkeypatch):
+    _BackendSchedulerProxy.reset()
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-NOLOG-001"
     draft_payload = {
@@ -427,4 +442,5 @@ def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
     stored_rows = workflow_email_tracking_repo.load_workflow_rows(
         workflow_id="wf-no-track"
     )
-    assert not any(row.unique_id == unique_id for row in stored_rows)
+    assert any(row.unique_id == unique_id for row in stored_rows)
+    assert _BackendSchedulerProxy.notifications == ["wf-no-track"]

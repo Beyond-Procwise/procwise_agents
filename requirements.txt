@@ -26,3 +26,4 @@ langchain
 langchain-community
 langchain-openai
 langgraph
+httpx
