@@ -744,6 +744,14 @@ class SupplierInteractionAgent(BaseAgent):
             )
             return []
 
+        routing_service = getattr(self, "process_routing_service", None)
+        if routing_service and routing_service.workflow_has_failed(workflow_id):
+            logger.error(
+                "Workflow %s flagged failed prior to response aggregation; aborting",
+                workflow_id,
+            )
+            return []
+
         metadata: Optional[Dict[str, Any]] = None
         while True:
             metadata = self._load_dispatch_metadata(workflow_id)
@@ -865,6 +873,13 @@ class SupplierInteractionAgent(BaseAgent):
                     workflow_id=workflow_id,
                     expected_unique_ids=expected_unique_ids if expected_unique_ids else None,
                 )
+
+            if routing_service and routing_service.workflow_has_failed(workflow_id):
+                logger.error(
+                    "Workflow %s flagged failed during response wait; aborting",
+                    workflow_id,
+                )
+                break
 
             logger.debug(
                 "Response poll returned no rows despite completion for workflow=%s",
@@ -3317,6 +3332,14 @@ class SupplierInteractionAgent(BaseAgent):
             logger.error(
                 "wait_for_response requires workflow_id; supplier=%s",
                 supplier_id,
+            )
+            return None
+
+        routing_service = getattr(self, "process_routing_service", None)
+        if routing_service and routing_service.workflow_has_failed(workflow_key):
+            logger.error(
+                "Workflow %s already marked as failed; skipping wait_for_response",
+                workflow_key,
             )
             return None
 

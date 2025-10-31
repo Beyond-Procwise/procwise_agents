@@ -194,6 +194,7 @@ def run_email_watcher_for_workflow(
     orchestrator: Optional[Any] = None,
     supplier_agent: Optional[Any] = None,
     negotiation_agent: Optional[Any] = None,
+    process_routing_service: Optional[Any] = None,
     max_workers: int = 8,
 ) -> Dict[str, Any]:
     """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
@@ -469,7 +470,18 @@ def run_email_watcher_for_workflow(
     negotiation_agent = negotiation_agent or _resolve_agent_dependency(
         agent_registry, orchestrator, ("negotiation", "NegotiationAgent")
     )
+    process_routing_service = process_routing_service or _resolve_agent_dependency(
+        agent_registry,
+        orchestrator,
+        ("process_routing_service", "process_router", "ProcessRoutingService"),
+    )
+    if process_routing_service is None and supplier_agent is not None:
+        process_routing_service = getattr(supplier_agent, "process_routing_service", None)
 
+    response_grace_seconds = _resolve_optional_int(
+        "EMAIL_WATCHER_RESPONSE_GRACE_SECONDS",
+        ("email_response_grace_seconds", "response_grace_seconds"),
+    )
     config = EmailWatcherConfig(
         imap_host=imap_host,
         imap_username=imap_username,
@@ -485,11 +497,15 @@ def run_email_watcher_for_workflow(
         poll_jitter_seconds=poll_jitter_seconds,
         poll_max_interval_seconds=poll_max_interval_seconds,
         poll_timeout_seconds=poll_timeout_seconds,
+        response_grace_seconds=response_grace_seconds
+        if response_grace_seconds is not None
+        else EmailWatcherConfig.response_grace_seconds,
     )
     watcher = EmailWatcher(
         config=config,
         supplier_agent=supplier_agent,
         negotiation_agent=negotiation_agent,
+        process_router=process_routing_service,
         sleep=time.sleep,
     )
     logger.info(
@@ -538,6 +554,13 @@ def run_email_watcher_for_workflow(
         "matched_unique_ids": matched_ids,
     }
 
+    if result.get("pending_unique_ids"):
+        response_payload["pending_unique_ids"] = list(result["pending_unique_ids"])
+    if result.get("pending_suppliers"):
+        response_payload["pending_suppliers"] = list(result["pending_suppliers"])
+    if result.get("timeout_reason"):
+        response_payload["timeout_reason"] = result["timeout_reason"]
+
     expected_ids = expected_unique_ids or {
         row.unique_id for row in dispatch_rows if row.unique_id
     }
@@ -580,6 +603,7 @@ class EmailWatcherService:
         orchestrator: Optional[Any] = None,
         supplier_agent: Optional[Any] = None,
         negotiation_agent: Optional[Any] = None,
+        process_routing_service: Optional[Any] = None,
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -606,6 +630,7 @@ class EmailWatcherService:
         self._orchestrator = orchestrator
         self._supplier_agent = supplier_agent
         self._negotiation_agent = negotiation_agent
+        self._process_router = process_routing_service
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -711,6 +736,7 @@ class EmailWatcherService:
                         orchestrator=self._orchestrator,
                         supplier_agent=self._supplier_agent,
                         negotiation_agent=self._negotiation_agent,
+                        process_routing_service=self._process_router,
                     )
                     status = str(result.get("status") or "").lower()
                     processed_workflow = True

@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from agents.base_agent import AgentContext, AgentOutput
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
+from services.process_routing_service import ProcessRoutingService
 from repositories import (
     supplier_interaction_repo,
     supplier_response_repo,
@@ -616,6 +617,7 @@ class EmailWatcherConfig:
     poll_jitter_seconds: float = 2.0
     poll_max_interval_seconds: int = 300
     poll_timeout_seconds: Optional[int] = None
+    response_grace_seconds: int = 180
 
     @classmethod
     def from_settings(cls, settings: Any) -> "EmailWatcherConfig":
@@ -658,6 +660,13 @@ class EmailWatcherConfig:
         jitter = _coerce_float(("poll_jitter_seconds", "imap_poll_jitter_seconds"), 2.0)
         max_interval = _coerce_int(("poll_max_interval_seconds", "imap_poll_max_interval", "imap_poll_max_interval_seconds"), 300)
         timeout_seconds = _coerce_optional_int(("poll_timeout_seconds", "imap_poll_timeout_seconds"))
+        grace_raw = getattr(settings, "response_grace_seconds", getattr(settings, "email_response_grace_seconds", 180))
+        try:
+            grace_value = int(grace_raw)
+        except Exception:
+            grace_value = 180
+        grace_value = max(0, grace_value)
+
         return cls(
             imap_host=getattr(settings, "imap_host", None),
             imap_username=getattr(settings, "imap_username", None),
@@ -676,6 +685,7 @@ class EmailWatcherConfig:
             poll_jitter_seconds=jitter,
             poll_max_interval_seconds=max_interval,
             poll_timeout_seconds=timeout_seconds,
+            response_grace_seconds=grace_value,
         )
 
 
@@ -700,6 +710,9 @@ class _AdaptivePollController:
     empty_attempts: int = field(init=False, default=0)
     total_polls: int = field(init=False, default=0)
     last_delay: float = field(init=False, default=0.0)
+    grace_until: Optional[datetime] = field(init=False, default=None)
+    grace_active: bool = field(init=False, default=False)
+    grace_reason: Optional[str] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.base_interval = max(1.0, float(self.config.poll_interval_seconds))
@@ -731,6 +744,9 @@ class _AdaptivePollController:
         self._current_interval = self.base_interval
         self.last_activity = self.now()
         self.last_delay = 0.0
+        if self.grace_active:
+            self.grace_active = False
+            self.grace_reason = None
 
     def record_empty(self) -> None:
         self.total_polls += 1
@@ -744,13 +760,43 @@ class _AdaptivePollController:
         return delay
 
     def check_limits(self) -> Tuple[bool, Optional[str]]:
+        now = self.now()
+        reason: Optional[str] = None
         if self.timeout_seconds is not None:
-            elapsed = (self.now() - self.start_time).total_seconds()
+            elapsed = (now - self.start_time).total_seconds()
             if elapsed >= self.timeout_seconds:
-                return True, "timeout"
-        if self.empty_attempts >= self.max_empty_attempts:
-            return True, "max_attempts"
+                reason = "timeout"
+        if reason is None and self.empty_attempts >= self.max_empty_attempts:
+            reason = "max_attempts"
+
+        if reason and self.grace_until and now < self.grace_until:
+            if not self.grace_active:
+                self.grace_active = True
+                self.grace_reason = reason
+                self.empty_attempts = 0
+                self.start_time = now
+                self.last_activity = now
+                self._current_interval = self.base_interval
+            return False, None
+
+        if reason:
+            self.grace_active = False
+            self.grace_reason = reason
+            return True, reason
         return False, None
+
+    def activate_grace(self, until: datetime, *, reason: Optional[str] = None) -> bool:
+        now = self.now()
+        if until <= now:
+            return False
+        self.grace_until = until
+        self.grace_active = True
+        self.grace_reason = reason
+        self.empty_attempts = 0
+        self.start_time = now
+        self.last_activity = now
+        self._current_interval = self.base_interval
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +813,7 @@ class EmailWatcher:
         config: EmailWatcherConfig,
         supplier_agent: Optional[SupplierInteractionAgent] = None,
         negotiation_agent: Optional[NegotiationAgent] = None,
+        process_router: Optional[ProcessRoutingService] = None,
         fetcher: Optional[Union[ImapEmailFetcher, Callable[..., List[EmailResponse]], Callable[..., Awaitable[List[EmailResponse]]]]] = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -778,6 +825,7 @@ class EmailWatcher:
         self._sleep = sleep
         self._now = now
         self._trackers: Dict[str, WorkflowTracker] = {}
+        self.process_router = process_router
 
         tracking_repo.init_schema()
         supplier_response_repo.init_schema()
@@ -1044,13 +1092,93 @@ class EmailWatcher:
                         )
                 matched_rows.append(response_row)
             else:
-                logger.warning(
-                    "MATCH FAILED: workflow=%s email_from=%s score=%.2f reason=%s",
-                    tracker.workflow_id,
-                    email_response.from_address,
-                    best_score,
-                    best_reason,
-                )
+                pending_candidates = [
+                    (uid, dispatch)
+                    for uid, dispatch in tracker.email_records.items()
+                    if uid not in tracker.matched_responses
+                ]
+                resolved = False
+                if not matched_id and len(pending_candidates) == 1:
+                    uid, dispatch = pending_candidates[0]
+                    supplier_match = False
+                    response_supplier = _normalise_identifier(email_response.supplier_id)
+                    dispatch_supplier = _normalise_identifier(dispatch.supplier_id)
+                    if response_supplier and dispatch_supplier and response_supplier == dispatch_supplier:
+                        supplier_match = True
+                    else:
+                        response_email = _normalise_email_address(
+                            email_response.from_address or email_response.supplier_email
+                        )
+                        dispatch_email = _normalise_email_address(dispatch.supplier_email)
+                        supplier_match = bool(response_email and dispatch_email and response_email == dispatch_email)
+
+                    if supplier_match or not tracker.matched_responses:
+                        matched_id = uid
+                        best_dispatch = dispatch
+                        best_score = max(best_score, 0.55)
+                        best_reason = "sole-pending-dispatch"
+
+                if matched_id and best_dispatch and best_score >= 0.5:
+                    tracker.record_response(matched_id, email_response)
+                    supplier_email = (
+                        email_response.supplier_email
+                        or _normalise_email_address(email_response.from_address)
+                        or best_dispatch.supplier_email
+                    )
+                    supplier_id = email_response.supplier_id or best_dispatch.supplier_id
+                    response_time = None
+                    if best_dispatch.dispatched_at and email_response.received_at:
+                        delta = email_response.received_at - best_dispatch.dispatched_at
+                        response_time = max(delta.total_seconds(), 0.0)
+
+                    response_row = SupplierResponseRow(
+                        workflow_id=tracker.workflow_id,
+                        unique_id=matched_id,
+                        supplier_id=supplier_id,
+                        supplier_email=supplier_email,
+                        response_text=email_response.body,
+                        response_body=email_response.body_html,
+                        received_time=email_response.received_at,
+                        response_time=response_time,
+                        response_message_id=email_response.message_id,
+                        response_subject=email_response.subject,
+                        response_from=email_response.from_address,
+                        original_message_id=best_dispatch.message_id,
+                        original_subject=best_dispatch.subject,
+                        match_confidence=_score_to_confidence(max(best_score, self.config.match_threshold)),
+                        match_score=max(best_score, self.config.match_threshold),
+                        matched_on=best_reason,
+                        dispatch_id=best_dispatch.dispatch_id or best_dispatch.unique_id,
+                        raw_headers=email_response.raw_headers,
+                        processed=False,
+                    )
+                    supplier_response_repo.insert_response(response_row)
+                    if tracker.workflow_id:
+                        responded_at = email_response.received_at or datetime.now(timezone.utc)
+                        try:
+                            tracking_repo.mark_response(
+                                workflow_id=tracker.workflow_id,
+                                unique_id=matched_id,
+                                responded_at=responded_at,
+                                response_message_id=email_response.message_id,
+                            )
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception(
+                                "Failed to mark workflow email tracking responded workflow=%s unique_id=%s",
+                                tracker.workflow_id,
+                                matched_id,
+                            )
+                    matched_rows.append(response_row)
+                    resolved = True
+
+                if not resolved:
+                    logger.warning(
+                        "MATCH FAILED: workflow=%s email_from=%s score=%.2f reason=%s",
+                        tracker.workflow_id,
+                        email_response.from_address,
+                        best_score,
+                        best_reason,
+                    )
         return matched_rows
 
     # ------------------------------------------------------------------
@@ -1246,6 +1374,10 @@ class EmailWatcher:
         status = "pending"
         timeout_reason: Optional[str] = None
         poll_controller = _AdaptivePollController(config=self.config, now=self._now)
+        grace_deadline: Optional[datetime] = None
+        if self.config.response_grace_seconds > 0:
+            baseline = tracker.last_dispatched_at or start_time
+            grace_deadline = baseline + timedelta(seconds=self.config.response_grace_seconds)
 
         while not tracker.all_responded:
             exceeded, reason = poll_controller.check_limits()
@@ -1285,6 +1417,11 @@ class EmailWatcher:
                 "poll_attempts": poll_controller.total_polls,
                 "last_delay_s": round(poll_controller.last_delay, 2),
             }
+            if grace_deadline:
+                heartbeat["grace_remaining_s"] = max(
+                    0,
+                    int((grace_deadline - self._now()).total_seconds()),
+                )
             logger.info(json.dumps(heartbeat))
 
             if tracker.all_responded:
@@ -1302,6 +1439,23 @@ class EmailWatcher:
                     (self._now() - start_time).total_seconds(),
                 )
                 break
+
+            if not tracker.all_responded and grace_deadline and self._now() < grace_deadline:
+                if poll_controller.activate_grace(grace_deadline, reason=timeout_reason):
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "watcher_grace_period",
+                                "workflow_id": workflow_id,
+                                "grace_until": grace_deadline.isoformat(),
+                                "pending_suppliers": pending_suppliers,
+                                "responses_received": tracker.responded_count,
+                            }
+                        )
+                    )
+                    timeout_reason = None
+                else:
+                    timeout_reason = None
 
             delay = poll_controller.next_delay()
             if delay > 0:
@@ -1326,12 +1480,52 @@ class EmailWatcher:
             "poll_attempts": poll_controller.total_polls,
             "last_delay_s": poll_controller.last_delay,
         }
+        pending_unique_ids = [
+            uid
+            for uid in tracker.email_records
+            if uid not in tracker.matched_responses
+        ]
         if timeout_reason:
             result["timeout_reason"] = timeout_reason
 
-        self._process_agents(tracker)
+        if not complete and pending_unique_ids:
+            status = "failed"
+            result["status"] = status
+            result["pending_unique_ids"] = pending_unique_ids
+            result["pending_suppliers"] = [
+                tracker.email_records[uid].supplier_id
+                for uid in pending_unique_ids
+                if tracker.email_records.get(uid)
+            ]
+            failure_payload = {
+                "reason": timeout_reason or "responses_missing",
+                "pending_unique_ids": pending_unique_ids,
+                "pending_suppliers": [
+                    tracker.email_records[uid].supplier_id
+                    for uid in pending_unique_ids
+                    if tracker.email_records.get(uid)
+                ],
+                "responded_count": tracker.responded_count,
+                "dispatched_count": tracker.dispatched_count,
+            }
+            self._mark_process_failed(tracker.workflow_id, failure_payload)
+        else:
+            self._process_agents(tracker)
+
         logger.info(json.dumps({"event": "watcher_stopped", "workflow_id": workflow_id, "status": status}))
         return result
+
+    def _mark_process_failed(self, workflow_id: Optional[str], details: Dict[str, Any]) -> None:
+        router = getattr(self, "process_router", None)
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key or not router:
+            return
+        try:
+            router.mark_workflow_failed(workflow_key, reason=details.get("reason"), details=details)
+        except Exception:
+            logger.exception(
+                "Failed to mark workflow %s as failed after watcher timeout", workflow_key
+            )
 
     def wait_for_responses(self, workflow_id: str) -> Dict[str, object]:
         try:

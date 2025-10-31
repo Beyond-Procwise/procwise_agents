@@ -1245,6 +1245,100 @@ class ProcessRoutingService:
         if trigger_workflow_id:
             self._trigger_email_watcher_via_api(trigger_workflow_id)
 
+    def mark_workflow_failed(
+        self,
+        workflow_id: str,
+        *,
+        reason: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Mark all processes associated with ``workflow_id`` as failed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT process_id, process_details FROM proc.routing WHERE workflow_id = %s",
+                        (workflow_key,),
+                    )
+                    rows = cursor.fetchall()
+        except Exception:
+            logger.exception("Failed to mark workflow %s as failed", workflow_key)
+            return
+
+        if not rows:
+            return
+
+        for process_id, raw_details in rows:
+            processed_details: Dict[str, Any]
+            if isinstance(raw_details, dict):
+                processed_details = self.normalize_process_details(raw_details)
+            else:
+                try:
+                    payload = json.loads(raw_details) if raw_details else {}
+                except Exception:
+                    payload = {}
+                processed_details = self.normalize_process_details(payload)
+
+            failure_info: Dict[str, Any] = {}
+            if details:
+                failure_info.update(details)
+            if reason:
+                failure_info.setdefault("reason", reason)
+
+            if failure_info:
+                existing_errors = processed_details.setdefault("errors", [])
+                if isinstance(existing_errors, list):
+                    existing_errors.append(failure_info)
+                else:
+                    processed_details["errors"] = [existing_errors, failure_info]
+
+            self.update_process_status(
+                process_id,
+                "failed",
+                modified_by,
+                processed_details,
+            )
+
+    def workflow_has_failed(self, workflow_id: str) -> bool:
+        """Return ``True`` when any recorded process is marked as failed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return False
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT process_status FROM proc.routing WHERE workflow_id = %s",
+                        (workflow_key,),
+                    )
+                    rows = cursor.fetchall()
+        except Exception:
+            logger.exception(
+                "Failed to inspect workflow status for %s", workflow_key
+            )
+            return False
+
+        for row in rows:
+            if not row:
+                continue
+            status_value = row[0]
+            try:
+                if int(status_value) < 0:
+                    return True
+            except Exception:
+                token = str(status_value).strip().lower()
+                if token in {"failed", "failure", "error", "timeout"}:
+                    return True
+        return False
+
     @staticmethod
     def _coerce_truthy(value: Any) -> bool:
         if isinstance(value, bool):
