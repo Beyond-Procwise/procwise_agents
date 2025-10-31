@@ -8,7 +8,6 @@ import os
 import threading
 import time
 from dataclasses import MISSING
-from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from repositories import (
@@ -18,8 +17,7 @@ from repositories import (
     workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from services.email_watcher_v2 import EmailWatcherV2
-from services.watcher_utils import run_email_watcher_for_workflow
+from services.email_watcher import EmailWatcher, EmailWatcherConfig
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -231,6 +229,7 @@ def run_email_watcher_for_workflow(
     _ = orchestrator
     _ = max_workers
     _ = lookback_minutes
+    _ = workflow_memory
 
     workflow_key = (workflow_id or "").strip()
     if not workflow_key:
@@ -238,7 +237,6 @@ def run_email_watcher_for_workflow(
             "status": "failed",
             "reason": "workflow_id is required",
             "workflow_id": workflow_id,
-            "workflow_status": "round_failed",
         }
 
     dispatch_rows = _load_dispatch_rows(workflow_key)
@@ -251,7 +249,6 @@ def run_email_watcher_for_workflow(
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
-            "workflow_status": "waiting_for_responses",
         }
 
     expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
@@ -284,7 +281,6 @@ def run_email_watcher_for_workflow(
             "matched_unique_ids": [],
             "pending_unique_ids": [],
             "missing_required_fields": {},
-            "workflow_status": "waiting_for_responses",
         }
 
     missing_expected_rows = sorted(
@@ -306,21 +302,9 @@ def run_email_watcher_for_workflow(
             "matched_unique_ids": [],
             "pending_unique_ids": missing_expected_rows,
             "missing_required_fields": {uid: ["dispatch_record"] for uid in missing_expected_rows},
-            "workflow_status": "waiting_for_responses",
         }
 
     expected_dispatch_total = len(expected_unique_ids)
-
-    round_numbers = sorted(
-        {
-            int(row.round_number)
-            for row in dispatch_rows
-            if getattr(row, "round_number", None) is not None
-        }
-    )
-    round_metadata: Dict[str, Any] = {"rounds": round_numbers} if round_numbers else {}
-    workflow_status = "waiting_for_responses"
-    event_started = False
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
     imap_user = _env("IMAP_USER")
@@ -402,7 +386,6 @@ def run_email_watcher_for_workflow(
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
-            "workflow_status": "waiting_for_responses",
         }
 
     missing_required_fields: Dict[str, List[str]] = {}
@@ -575,21 +558,6 @@ def run_email_watcher_for_workflow(
         workflow_key,
         expected_dispatch_total,
     )
-    start_time = datetime.now(timezone.utc)
-    start_metadata = {**round_metadata, "status": workflow_status}
-    try:
-        workflow_lifecycle_repo.record_watcher_event(
-            workflow_key,
-            "watcher_started",
-            timestamp=start_time,
-            expected_responses=expected_dispatch_total,
-            metadata=start_metadata,
-        )
-        event_started = True
-    except Exception:
-        logger.exception(
-            "Failed to record watcher start for workflow=%s", workflow_key
-        )
     try:
         result = watcher.wait_for_responses(workflow_key)
     except imaplib.IMAP4.error as exc:
@@ -599,24 +567,6 @@ def run_email_watcher_for_workflow(
             imap_login or imap_username,
             exc,
         )
-        if event_started:
-            stop_time = datetime.now(timezone.utc)
-            stop_metadata = {**round_metadata, "status": "round_failed"}
-            try:
-                workflow_lifecycle_repo.record_watcher_event(
-                    workflow_key,
-                    "watcher_stopped",
-                    timestamp=stop_time,
-                    expected_responses=expected_dispatch_total,
-                    received_responses=0,
-                    metadata=stop_metadata,
-                    runtime_seconds=(stop_time - start_time).total_seconds(),
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to record watcher stop after IMAP error for workflow=%s",
-                    workflow_key,
-                )
         return {
             "status": "failed",
             "reason": "IMAP authentication failed",
@@ -625,7 +575,6 @@ def run_email_watcher_for_workflow(
             "found": 0,
             "rows": [],
             "matched_unique_ids": [],
-            "workflow_status": "round_failed",
         }
     expected = result.get("dispatched_count", expected_dispatch_total)
     responded = result.get("responded_count", 0)
@@ -639,14 +588,6 @@ def run_email_watcher_for_workflow(
         "completed" if result.get("complete") else "pending"
     )
     status = "processed" if watcher_status == "completed" else watcher_status
-    stop_time = datetime.now(timezone.utc)
-    runtime_seconds = (stop_time - start_time).total_seconds()
-    if status in {"processed", "completed"}:
-        workflow_status = "responses_completed"
-    elif status == "failed" or status == "timeout" or status == "max_attempts_exceeded":
-        workflow_status = "round_failed"
-    else:
-        workflow_status = "waiting_for_responses"
 
     response_payload = {
         "status": status,
@@ -656,10 +597,9 @@ def run_email_watcher_for_workflow(
         "found": responded,
         "rows": responses,
         "matched_unique_ids": matched_ids,
-        "workflow_status": workflow_status,
     }
-    if round_numbers:
-        response_payload["rounds"] = round_numbers
+    if workflow_status:
+        response_payload["workflow_status"] = workflow_status
     if "expected_responses" in result:
         response_payload["expected_responses"] = result.get("expected_responses")
     if "elapsed_seconds" in result:
@@ -681,25 +621,10 @@ def run_email_watcher_for_workflow(
         response_payload["pending_suppliers"] = list(result["pending_suppliers"])
     if result.get("timeout_reason"):
         response_payload["timeout_reason"] = result["timeout_reason"]
-    if result.get("timeout_deadline"):
-        response_payload["timeout_deadline"] = result["timeout_deadline"]
 
     expected_ids = expected_unique_ids or {
         row.unique_id for row in dispatch_rows if row.unique_id
     }
-    if status in {"processed", "completed"}:
-        round_check: Optional[int]
-        if len(round_numbers) == 1:
-            try:
-                round_check = int(round_numbers[0])
-            except Exception:
-                round_check = None
-        else:
-            round_check = None
-        if not all_supplier_responses_received(workflow_key, round_check):
-            workflow_status = "waiting_for_responses"
-            response_payload["workflow_status"] = workflow_status
-
     if status not in {"processed", "completed"}:
         missing = sorted(expected_ids - set(matched_ids))
         response_payload["reason"] = (
@@ -708,26 +633,6 @@ def run_email_watcher_for_workflow(
             else "Responses still pending"
         )
         response_payload["missing_unique_ids"] = missing
-        if event_started:
-            stop_metadata = {**round_metadata, "status": workflow_status}
-            if missing:
-                stop_metadata["pending_unique_ids"] = missing
-            if response_payload.get("pending_suppliers"):
-                stop_metadata["pending_suppliers"] = response_payload["pending_suppliers"]
-            try:
-                workflow_lifecycle_repo.record_watcher_event(
-                    workflow_key,
-                    "watcher_stopped",
-                    timestamp=stop_time,
-                    expected_responses=expected,
-                    received_responses=responded,
-                    metadata=stop_metadata,
-                    runtime_seconds=runtime_seconds,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to record watcher stop for workflow=%s", workflow_key
-                )
         return response_payload
 
     if matched_ids:
@@ -740,25 +645,6 @@ def run_email_watcher_for_workflow(
             logger.exception(
                 "Failed to remove supplier responses for workflow %s",
                 workflow_key,
-            )
-
-    if event_started:
-        stop_metadata = {**round_metadata, "status": workflow_status}
-        if response_payload.get("pending_suppliers"):
-            stop_metadata["pending_suppliers"] = response_payload["pending_suppliers"]
-        try:
-            workflow_lifecycle_repo.record_watcher_event(
-                workflow_key,
-                "watcher_stopped",
-                timestamp=stop_time,
-                expected_responses=expected,
-                received_responses=responded,
-                metadata=stop_metadata,
-                runtime_seconds=runtime_seconds,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to record watcher completion for workflow=%s", workflow_key
             )
 
     return response_payload
@@ -812,6 +698,48 @@ class EmailWatcherService:
         self._forced_lock = threading.Lock()
         self._forced_workflows: Set[str] = set()
 
+    def watch_workflow(
+        self,
+        *,
+        workflow_id: str,
+        run_id: Optional[str],
+        wait_seconds_after_last_dispatch: int = 0,
+        lookback_minutes: int = 240,
+        mailbox_name: Optional[str] = None,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+        process_routing_service: Optional[Any] = None,
+        max_workers: int = 8,
+        workflow_memory: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run the watcher synchronously for ``workflow_id``.
+
+        This helper mirrors :func:`run_email_watcher_for_workflow` while
+        defaulting to dependencies captured by the service instance.  It is
+        primarily used by orchestration flows that need to force a watcher
+        pass immediately after dispatch without waiting for the background
+        loop.
+        """
+
+        return self._runner(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            wait_seconds_after_last_dispatch=wait_seconds_after_last_dispatch,
+            lookback_minutes=lookback_minutes,
+            mailbox_name=mailbox_name,
+            agent_registry=agent_registry or self._agent_registry,
+            orchestrator=orchestrator or self._orchestrator,
+            supplier_agent=supplier_agent or self._supplier_agent,
+            negotiation_agent=negotiation_agent or self._negotiation_agent,
+            process_routing_service=(
+                process_routing_service or self._process_router
+            ),
+            max_workers=max_workers,
+            workflow_memory=workflow_memory,
+        )
+
     @staticmethod
     def _env_int(name: str, *, fallback: str) -> int:
         try:
@@ -859,7 +787,7 @@ class EmailWatcherService:
             self.stop()
             self.start()
         with self._forced_lock:
-            self._forced_workflows = {workflow_key}
+            self._forced_workflows.add(workflow_key)
         self._wake_event.set()
 
     def _consume_forced_workflows(self) -> List[str]:
@@ -993,11 +921,19 @@ class EmailWatcherService:
         while not self._stop_event.is_set():
             waiting_for_dispatch = False
             processed_workflow = False
+            try:
+                workflow_ids = workflow_email_tracking_repo.load_active_workflow_ids()
+            except Exception:
+                logger.exception("Failed to load workflows for email watcher service")
+                workflow_ids = []
+
             forced = self._consume_forced_workflows()
             if forced:
-                workflow_ids = list(dict.fromkeys(forced))
-            else:
-                workflow_ids = []
+                seen = set(workflow_ids)
+                for workflow_id in forced:
+                    if workflow_id not in seen:
+                        workflow_ids.append(workflow_id)
+                        seen.add(workflow_id)
 
             for workflow_id in workflow_ids:
                 if self._stop_event.is_set():
