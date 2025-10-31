@@ -27,6 +27,7 @@ from repositories import (
     supplier_interaction_repo,
     supplier_response_repo,
     workflow_email_tracking_repo as tracking_repo,
+    workflow_round_response_repo,
 )
 from repositories.supplier_interaction_repo import SupplierInteractionRow
 from repositories.supplier_response_repo import SupplierResponseRow
@@ -840,6 +841,7 @@ class EmailWatcher:
             return tracker
         tracker = WorkflowTracker(workflow_id=workflow_id)
         rows = tracking_repo.load_workflow_rows(workflow_id=workflow_id)
+        expectations: List[Tuple[Optional[int], Optional[str], Optional[str]]] = []
         if rows:
             dispatches = [
                 EmailDispatchRecord(
@@ -858,6 +860,8 @@ class EmailWatcher:
                 for row in rows
             ]
             tracker.register_dispatches(dispatches)
+            for row in dispatches:
+                expectations.append((row.round_number, row.unique_id, row.supplier_id))
             matched = [row for row in rows if row.matched]
             for row in matched:
                 tracker.record_response(
@@ -872,6 +876,18 @@ class EmailWatcher:
                         body="",
                         received_at=row.responded_at or row.dispatched_at or self._now(),
                     ),
+                )
+        if expectations:
+            try:
+                workflow_round_response_repo.register_expected(
+                    workflow_id=workflow_id,
+                    expectations=expectations,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.debug(
+                    "Failed to register existing round expectations for workflow=%s",
+                    workflow_id,
+                    exc_info=True,
                 )
         self._trackers[workflow_id] = tracker
         return tracker
@@ -888,6 +904,7 @@ class EmailWatcher:
         records: List[EmailDispatchRecord] = []
         repo_rows: List[WorkflowDispatchRow] = []
 
+        round_expectations: List[Tuple[Optional[int], Optional[str], Optional[str]]] = []
         for payload in dispatches:
             unique_id = str(payload.get("unique_id") or email_tracking.generate_unique_email_id(workflow_id))
             supplier_id = payload.get("supplier_id")
@@ -953,9 +970,21 @@ class EmailWatcher:
                     else None,
                 )
             )
+            round_expectations.append((round_number, unique_id, str(supplier_id) if supplier_id else None))
 
         tracker.register_dispatches(records)
         tracking_repo.record_dispatches(workflow_id=workflow_id, dispatches=repo_rows)
+        try:
+            workflow_round_response_repo.register_expected(
+                workflow_id=workflow_id,
+                expectations=round_expectations,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Failed to record round expectations for workflow=%s",
+                workflow_id,
+                exc_info=True,
+            )
         return tracker
 
     # ------------------------------------------------------------------
@@ -1073,6 +1102,7 @@ class EmailWatcher:
                     dispatch_id=best_dispatch.dispatch_id or best_dispatch.unique_id,
                     raw_headers=email_response.raw_headers,
                     processed=False,
+                    round_number=best_dispatch.round_number,
                 )
                 supplier_response_repo.insert_response(response_row)
                 if tracker.workflow_id:
@@ -1090,6 +1120,21 @@ class EmailWatcher:
                             tracker.workflow_id,
                             matched_id,
                         )
+                try:
+                    workflow_round_response_repo.mark_response_received(
+                        workflow_id=tracker.workflow_id,
+                        round_number=best_dispatch.round_number,
+                        unique_id=matched_id,
+                        supplier_id=supplier_id,
+                        responded_at=email_response.received_at,
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "Failed to mark round response received for workflow=%s unique_id=%s",
+                        tracker.workflow_id,
+                        matched_id,
+                        exc_info=True,
+                    )
                 matched_rows.append(response_row)
             else:
                 pending_candidates = [
@@ -1151,6 +1196,7 @@ class EmailWatcher:
                         dispatch_id=best_dispatch.dispatch_id or best_dispatch.unique_id,
                         raw_headers=email_response.raw_headers,
                         processed=False,
+                        round_number=best_dispatch.round_number,
                     )
                     supplier_response_repo.insert_response(response_row)
                     if tracker.workflow_id:
@@ -1168,6 +1214,21 @@ class EmailWatcher:
                                 tracker.workflow_id,
                                 matched_id,
                             )
+                    try:
+                        workflow_round_response_repo.mark_response_received(
+                            workflow_id=tracker.workflow_id,
+                            round_number=best_dispatch.round_number,
+                            unique_id=matched_id,
+                            supplier_id=supplier_id,
+                            responded_at=email_response.received_at,
+                        )
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.debug(
+                            "Failed to mark round response received for workflow=%s unique_id=%s",
+                            tracker.workflow_id,
+                            matched_id,
+                            exc_info=True,
+                        )
                     matched_rows.append(response_row)
                     resolved = True
 
