@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import MISSING
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from repositories import (
@@ -482,6 +483,11 @@ def run_email_watcher_for_workflow(
         "EMAIL_WATCHER_RESPONSE_GRACE_SECONDS",
         ("email_response_grace_seconds", "response_grace_seconds"),
     )
+    default_grace_field = EmailWatcherConfig.__dataclass_fields__["response_grace_seconds"]
+    default_grace_seconds = default_grace_field.default
+    if default_grace_seconds is MISSING:
+        default_grace_seconds = 180
+
     config = EmailWatcherConfig(
         imap_host=imap_host,
         imap_username=imap_username,
@@ -499,7 +505,7 @@ def run_email_watcher_for_workflow(
         poll_timeout_seconds=poll_timeout_seconds,
         response_grace_seconds=response_grace_seconds
         if response_grace_seconds is not None
-        else EmailWatcherConfig.response_grace_seconds,
+        else int(default_grace_seconds),
     )
     watcher = EmailWatcher(
         config=config,
