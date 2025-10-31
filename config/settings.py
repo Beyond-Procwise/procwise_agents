@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     qdrant_collection_name: str = Field(
         default="procwise_document_embeddings", env="QDRANT_COLLECTION_NAME"
     )
+    uploaded_documents_collection_name: str = Field(
+        default="uploaded_documents", env="UPLOADED_DOCUMENTS_COLLECTION_NAME"
+    )
     knowledge_graph_collection_name: str = Field(
         default="procwise_knowledge_graph", env="KNOWLEDGE_GRAPH_COLLECTION_NAME"
     )

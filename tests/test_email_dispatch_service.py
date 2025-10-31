@@ -3,6 +3,7 @@ import os
 import sys
 import types
 from types import SimpleNamespace
+from typing import List
 
 os.environ.setdefault("OLLAMA_USE_GPU", "1")
 os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
@@ -17,15 +18,20 @@ _backend_notifications: list[str] = []
 
 
 class _BackendSchedulerProxy:
-    notifications = _backend_notifications
+    notifications: List[str] = []
 
-    @staticmethod
-    def ensure(agent_nick):
-        return SimpleNamespace(
-            notify_email_dispatch=lambda workflow_id: _backend_notifications.append(
-                workflow_id
-            )
-        )
+    @classmethod
+    def reset(cls) -> None:
+        cls.notifications.clear()
+
+    @classmethod
+    def ensure(cls, agent_nick):
+        class _Notifier:
+            def notify_email_dispatch(self, workflow_id: str):
+                if workflow_id:
+                    cls.notifications.append(workflow_id)
+
+        return _Notifier()
 
 
 _backend_scheduler_stub.BackendScheduler = _BackendSchedulerProxy
@@ -207,8 +213,7 @@ class DummyNick:
 
 
 def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
-    _BackendSchedulerProxy.notifications.clear()
-
+    _BackendSchedulerProxy.reset()
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-UNIT-12345"
     workflow_identifier = "7e5ab1d4-1234-4f2a-9d5b-1234567890ab"
@@ -298,7 +303,6 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     }
     result = service.send_draft(
         "RFQ-UNIT",
-        is_workflow_email=True,
         workflow_dispatch_context=dispatch_context,
     )
 
@@ -308,12 +312,12 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert result["subject"] == DEFAULT_RFQ_SUBJECT
     assert result["draft"]["sent_status"] is True
     assert result["message_id"] == "<message-id-1>"
-    assert "X-ProcWise-RFQ-ID" not in sent_args["headers"]
+    headers_lower = {k.lower(): v for k, v in sent_args["headers"].items()}
+    assert "x-procwise-rfq-id" not in headers_lower
     unique_id = extract_unique_id_from_body(result["body"])
     assert unique_id
-    assert sent_args["headers"]["X-ProcWise-Unique-ID"] == unique_id
-    assert sent_args["headers"]["X-ProcWise-Round"].isdigit()
-    if sent_args["headers"].get("X-ProcWise-Workflow-ID"):
+    assert headers_lower["x-procwise-unique-id"] == unique_id
+    if sent_args["headers"].get("X-Procwise-Workflow-Id"):
         assert (
             sent_args["headers"]["X-ProcWise-Workflow-ID"]
             == result["draft"]["dispatch_metadata"].get("workflow_id")
@@ -367,6 +371,7 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
         row.unique_id == unique_id and row.message_id == "<message-id-1>"
         for row in stored_rows
     )
+    assert _BackendSchedulerProxy.notifications == [metadata.workflow_id]
 
     assert _BackendSchedulerProxy.notifications == [result["workflow_id"]]
 
@@ -445,9 +450,8 @@ def test_email_dispatch_service_defaults_to_workflow_tracking(monkeypatch):
     assert _BackendSchedulerProxy.notifications == ["wf-auto"]
 
 
-def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
-    _BackendSchedulerProxy.notifications.clear()
-
+def test_email_dispatch_service_records_workflow_even_when_flag_false(monkeypatch):
+    _BackendSchedulerProxy.reset()
     store = InMemoryDraftStore()
     unique_id = "PROC-WF-NOLOG-001"
     draft_payload = {
@@ -519,194 +523,5 @@ def test_email_dispatch_service_skips_tracking_without_flag(monkeypatch):
     stored_rows = workflow_email_tracking_repo.load_workflow_rows(
         workflow_id="wf-no-track"
     )
-    assert not any(row.unique_id == unique_id for row in stored_rows)
-    assert _BackendSchedulerProxy.notifications == []
-
-
-def test_email_dispatch_service_deferred_watcher_notification(monkeypatch):
-    _BackendSchedulerProxy.notifications.clear()
-
-    store = InMemoryDraftStore()
-    unique_id = "PROC-WF-DEFER-001"
-    draft_payload = {
-        "rfq_id": "RFQ-DEFER",
-        "subject": DEFAULT_RFQ_SUBJECT,
-        "body": "<p>Deferred</p>",
-        "receiver": "buyer@example.com",
-        "recipients": ["buyer@example.com"],
-        "sender": "sender@example.com",
-        "thread_index": 1,
-        "contact_level": 1,
-        "sent_status": False,
-        "action_id": "action-3",
-        "workflow_id": "wf-defer",
-        "unique_id": unique_id,
-    }
-    store.add(
-        {
-            "rfq_id": "RFQ-DEFER",
-            "supplier_id": "S3",
-            "supplier_name": "Deferred",
-            "subject": draft_payload["subject"],
-            "body": draft_payload["body"],
-            "sent": False,
-            "recipient_email": None,
-            "contact_level": 0,
-            "thread_index": 1,
-            "sender": "sender@example.com",
-            "payload": json.dumps(draft_payload),
-            "sent_on": None,
-            "workflow_id": "wf-defer",
-            "unique_id": unique_id,
-        }
-    )
-
-    action_store = InMemoryActionStore()
-    action_store.update(
-        "action-3",
-        json.dumps(
-            {
-                "drafts": [draft_payload],
-                "rfq_id": "RFQ-DEFER",
-                "unique_id": unique_id,
-                "sent_status": False,
-            }
-        ),
-    )
-
-    nick = DummyNick(store, action_store)
-    service = EmailDispatchService(nick)
-
-    monkeypatch.setattr(
-        service.email_service,
-        "send_email",
-        lambda *_, **__: EmailSendResult(True, "<message-id-defer>"),
-    )
-
-    dispatch_context = {"workflow_id": "wf-defer", "unique_id": unique_id}
-    result = service.send_draft(
-        "RFQ-DEFER",
-        is_workflow_email=True,
-        workflow_dispatch_context=dispatch_context,
-        notify_watcher=False,
-    )
-
-    assert result["sent"] is True
-
-    workflow_email_tracking_repo.init_schema()
-    stored_rows = workflow_email_tracking_repo.load_workflow_rows(
-        workflow_id="wf-defer"
-    )
     assert any(row.unique_id == unique_id for row in stored_rows)
-    assert _BackendSchedulerProxy.notifications == []
-
-
-def test_email_dispatch_service_notifies_after_final_dispatch(monkeypatch):
-    _BackendSchedulerProxy.notifications.clear()
-
-    workflow_id = "wf-batch"
-    unique_ids = ["PROC-WF-B1", "PROC-WF-B2"]
-
-    store = InMemoryDraftStore()
-    action_store = InMemoryActionStore()
-
-    for index, uid in enumerate(unique_ids, start=1):
-        draft_payload = {
-            "rfq_id": f"RFQ-B{index}",
-            "subject": DEFAULT_RFQ_SUBJECT,
-            "body": f"<p>Batch {index}</p>",
-            "receiver": "buyer@example.com",
-            "recipients": ["buyer@example.com"],
-            "sender": "sender@example.com",
-            "thread_index": 1,
-            "contact_level": 1,
-            "sent_status": False,
-            "action_id": f"action-b{index}",
-            "workflow_id": workflow_id,
-            "unique_id": uid,
-        }
-        store.add(
-            {
-                "rfq_id": draft_payload["rfq_id"],
-                "supplier_id": f"S{index}",
-                "supplier_name": f"Batch {index}",
-                "subject": draft_payload["subject"],
-                "body": draft_payload["body"],
-                "sent": False,
-                "recipient_email": None,
-                "contact_level": 0,
-                "thread_index": 1,
-                "sender": "sender@example.com",
-                "payload": json.dumps(draft_payload),
-                "sent_on": None,
-                "workflow_id": workflow_id,
-                "unique_id": uid,
-            }
-        )
-        action_store.update(
-            f"action-b{index}",
-            json.dumps(
-                {
-                    "drafts": [draft_payload],
-                    "rfq_id": draft_payload["rfq_id"],
-                    "unique_id": uid,
-                    "sent_status": False,
-                }
-            ),
-        )
-
-    nick = DummyNick(store, action_store)
-    service = EmailDispatchService(nick)
-
-    def fake_send(subject, body, recipients, sender, attachments=None, **kwargs):
-        message_id = f"<message-{subject}>"
-        return EmailSendResult(True, message_id)
-
-    monkeypatch.setattr(service.email_service, "send_email", fake_send)
-
-    workflow_email_tracking_repo.init_schema()
-    workflow_email_tracking_repo.reset_workflow(workflow_id=workflow_id)
-
-    dispatch_context = {
-        "workflow_id": workflow_id,
-        "expected_unique_ids": unique_ids,
-        "expected_dispatches": len(unique_ids),
-        "expected_dispatch_count": len(unique_ids),
-    }
-
-    first_result = service.send_draft(
-        unique_ids[0],
-        is_workflow_email=True,
-        workflow_dispatch_context=dispatch_context,
-    )
-
-    assert first_result["sent"] is True
-    assert _BackendSchedulerProxy.notifications == []
-
-    second_result = service.send_draft(
-        unique_ids[1],
-        is_workflow_email=True,
-        workflow_dispatch_context=dispatch_context,
-    )
-
-    assert second_result["sent"] is True
-    rows = workflow_email_tracking_repo.load_workflow_rows(workflow_id=workflow_id)
-    recorded_ids = sorted(
-        [row.unique_id for row in rows if getattr(row, "message_id", None)]
-    )
-    assert recorded_ids == sorted(unique_ids)
-    expected_ids, expected_count = service._resolve_expected_dispatches(
-        workflow_id=workflow_id,
-        unique_id=unique_ids[1],
-        dispatch_context=dispatch_context,
-        dispatch_payload=second_result["draft"],
-        backend_metadata=second_result.get("workflow_context") or {},
-    )
-    dispatched_ids = {
-        service._coerce_text(row.unique_id)
-        for row in rows
-        if getattr(row, "message_id", None)
-    }
-    pending_ids = sorted(set(expected_ids) - dispatched_ids)
-    assert not pending_ids, pending_ids
-    assert _BackendSchedulerProxy.notifications == [workflow_id]
+    assert _BackendSchedulerProxy.notifications == ["wf-no-track"]

@@ -3,13 +3,14 @@ import importlib.util
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from types import SimpleNamespace
 
 import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from qdrant_client import models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
 
 configure_gpu()
@@ -26,6 +27,16 @@ class RAGService:
         self.settings = agent_nick.settings
         self.client = agent_nick.qdrant_client
         self.embedder = agent_nick.embedding_model
+        self.primary_collection = getattr(
+            self.settings,
+            "qdrant_collection_name",
+            "procwise_document_embeddings",
+        )
+        self.uploaded_collection = getattr(
+            self.settings,
+            "uploaded_documents_collection_name",
+            "uploaded_documents",
+        )
         # Local FAISS and BM25 indexes to complement Qdrant
         self._faiss_index = None
         self._doc_vectors: List[np.ndarray] = []
@@ -59,16 +70,81 @@ class RAGService:
         step = max_chars - overlap if max_chars > overlap else max_chars
         return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
 
+    def _embedding_dimension(self) -> int:
+        """Determine the embedding dimensionality of the active encoder."""
+
+        getter = getattr(self.embedder, "get_sentence_embedding_dimension", None)
+        if callable(getter):
+            try:
+                dimension = int(getter())
+                if dimension > 0:
+                    return dimension
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug("Failed to query embedding dimension from model", exc_info=True)
+
+        probe = self.embedder.encode("dimension probe", normalize_embeddings=True)
+        if isinstance(probe, np.ndarray):
+            if probe.ndim == 1:
+                return int(probe.shape[0])
+            if probe.ndim == 2:
+                return int(probe.shape[1])
+        if isinstance(probe, list):
+            if probe and isinstance(probe[0], (float, int)):
+                return len(probe)
+            if probe and isinstance(probe[0], (list, tuple, np.ndarray)):
+                first = probe[0]
+                return len(first)
+        raise RuntimeError("Unable to determine embedding dimension for Qdrant collection initialisation")
+
+    def ensure_collection(self, collection_name: Optional[str] = None) -> None:
+        """Ensure the specified Qdrant collection exists with the right vector size."""
+
+        if self.client is None:
+            raise RuntimeError("Qdrant client is not configured on AgentNick")
+
+        target = collection_name or self.primary_collection
+
+        try:
+            self.client.get_collection(collection_name=target)
+            return
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) != 404:
+                return
+        except Exception:
+            try:
+                collections = self.client.get_collections().collections
+            except Exception:
+                collections = []
+            if any(getattr(col, "name", None) == target for col in collections):
+                return
+
+        dimension = self._embedding_dimension()
+        try:
+            self.client.create_collection(
+                collection_name=target,
+                vectors_config=models.VectorParams(
+                    size=int(dimension),
+                    distance=models.Distance.COSINE,
+                ),
+            )
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) != 409:
+                raise
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.warning("Failed to ensure Qdrant collection %s", target, exc_info=True)
+
     def upsert_payloads(
         self,
         payloads: List[Dict[str, Any]],
         text_representation_key: str = "content",
+        collection_name: Optional[str] = None,
     ):
         """Encode and upsert structured payloads into Qdrant, FAISS and BM25."""
 
         if not payloads:
             return
 
+        target_collection = collection_name or self.primary_collection
         points: List[models.PointStruct] = []
         texts_for_embedding: List[str] = []
         payloads_for_storage: List[Dict[str, Any]] = []
@@ -118,6 +194,7 @@ class RAGService:
             for idx, chunk in enumerate(chunks):
                 chunk_payload = dict(base_payload)
                 chunk_payload["chunk_id"] = idx
+                chunk_payload["chunk_index"] = idx
                 if (
                     "content" in chunk_payload
                     and chunk_payload.get("content") != chunk
@@ -135,8 +212,7 @@ class RAGService:
                         chunk_payload.get("text_summary"),
                     )
                 chunk_payload["text_summary"] = chunk
-                if target_collection is None:
-                    target_collection = self._extract_source_collection(chunk_payload)
+                chunk_payload.setdefault("collection_name", target_collection)
                 texts_for_embedding.append(chunk)
                 payloads_for_storage.append(chunk_payload)
 
@@ -185,7 +261,7 @@ class RAGService:
 
         if points and collection_name:
             self.client.upsert(
-                collection_name=collection_name,
+                collection_name=target_collection,
                 points=points,
                 wait=True,
             )
@@ -242,18 +318,42 @@ class RAGService:
         """Retrieve and rerank documents for the given query."""
         candidates: Dict[str, SimpleNamespace] = {}
 
+        query_matrix: Optional[np.ndarray] = None
+        query_vector: Optional[List[float]] = None
+
+        def _ensure_query_vectors() -> Tuple[np.ndarray, List[float]]:
+            nonlocal query_matrix, query_vector
+            if query_matrix is not None and query_vector is not None:
+                return query_matrix, query_vector
+
+            encoded = self.embedder.encode(query, normalize_embeddings=True)
+            arr = (
+                encoded
+                if isinstance(encoded, np.ndarray)
+                else np.array(encoded, dtype="float32")
+            )
+            if arr.ndim == 1:
+                matrix = arr.reshape(1, -1).astype("float32")
+            else:
+                matrix = np.array(arr, dtype="float32")
+            vector = matrix[0].astype("float32").tolist()
+            query_matrix, query_vector = matrix, vector
+            return query_matrix, query_vector
+
         # --- FAISS semantic search ---
         if self._faiss_index is not None and self._doc_vectors:
-            q_vec = self.embedder.encode(query, normalize_embeddings=True)
-            q_vec = np.array([q_vec], dtype="float32")
-            scores, ids = self._faiss_index.search(q_vec, top_k * 5)
+            matrix, _ = _ensure_query_vectors()
+            scores, ids = self._faiss_index.search(matrix, top_k * 5)
             for score, idx in zip(scores[0], ids[0]):
                 if idx < 0 or idx >= len(self._documents):
                     continue
                 doc = self._documents[idx]
-                candidates[doc["id"]] = SimpleNamespace(
-                    id=doc["id"], payload=doc, score=float(score)
-                )
+                key = f"{doc.get('collection_name', self.primary_collection)}:{doc['id']}"
+                existing = candidates.get(key)
+                if existing is None or float(score) > existing.score:
+                    candidates[key] = SimpleNamespace(
+                        id=doc["id"], payload=doc, score=float(score)
+                    )
 
         # --- BM25 lexical search ---
         if self._bm25 is not None:
@@ -263,40 +363,96 @@ class RAGService:
                 enumerate(bm25_scores), key=lambda x: x[1], reverse=True
             )[: top_k * 5]:
                 doc = self._documents[idx]
-                existing = candidates.get(doc["id"])
+                key = f"{doc.get('collection_name', self.primary_collection)}:{doc['id']}"
+                existing = candidates.get(key)
                 if existing is None or score > existing.score:
-                    candidates[doc["id"]] = SimpleNamespace(
+                    candidates[key] = SimpleNamespace(
                         id=doc["id"], payload=doc, score=float(score)
                     )
 
-        hits = list(candidates.values())
-
         # --- Fallback to Qdrant if local indexes empty ---
-        if not hits:
-            q_vec = self.embedder.encode(query, normalize_embeddings=True).tolist()
+        if not candidates and self.client is not None:
+            _, vector = _ensure_query_vectors()
             search_params = models.SearchParams(hnsw_ef=256, exact=False)
-            hits = self.client.search(
-                collection_name=self.settings.qdrant_collection_name,
-                query_vector=q_vec,
-                query_filter=filters,
-                limit=top_k * 5,
-                with_payload=True,
-                with_vectors=False,
-                search_params=search_params,
-            )
-            if not hits:
-                exact_params = models.SearchParams(hnsw_ef=256, exact=True)
-                hits = self.client.search(
-                    collection_name=self.settings.qdrant_collection_name,
-                    query_vector=q_vec,
-                    query_filter=filters,
-                    limit=top_k * 5,
-                    with_payload=True,
-                    with_vectors=False,
-                    search_params=exact_params,
-                )
-            if not hits:
-                return []
+
+            def _search_collection(name: str) -> List[SimpleNamespace]:
+                if not name:
+                    return []
+
+                try:
+                    raw_hits = self.client.search(
+                        collection_name=name,
+                        query_vector=vector,
+                        query_filter=filters,
+                        limit=top_k * 5,
+                        with_payload=True,
+                        with_vectors=False,
+                        search_params=search_params,
+                    )
+                except UnexpectedResponse as exc:
+                    if getattr(exc, "status_code", None) == 404:
+                        return []
+                    logger.warning(
+                        "Qdrant search failed for collection %s", name, exc_info=True
+                    )
+                    return []
+                except Exception:
+                    logger.warning(
+                        "Qdrant search failed for collection %s", name, exc_info=True
+                    )
+                    return []
+
+                if not raw_hits:
+                    try:
+                        raw_hits = self.client.search(
+                            collection_name=name,
+                            query_vector=vector,
+                            query_filter=filters,
+                            limit=top_k * 5,
+                            with_payload=True,
+                            with_vectors=False,
+                            search_params=models.SearchParams(hnsw_ef=256, exact=True),
+                        )
+                    except UnexpectedResponse as exc:
+                        if getattr(exc, "status_code", None) == 404:
+                            return []
+                        logger.warning(
+                            "Exact Qdrant search failed for collection %s", name, exc_info=True
+                        )
+                        return []
+                    except Exception:
+                        logger.warning(
+                            "Exact Qdrant search failed for collection %s", name, exc_info=True
+                        )
+                        return []
+
+                wrapped: List[SimpleNamespace] = []
+                for hit in raw_hits or []:
+                    payload = dict(getattr(hit, "payload", {}) or {})
+                    payload.setdefault("collection_name", name)
+                    wrapped.append(
+                        SimpleNamespace(
+                            id=str(getattr(hit, "id", payload.get("record_id"))),
+                            payload=payload,
+                            score=float(getattr(hit, "score", 0.0)),
+                        )
+                    )
+                return wrapped
+
+            for collection in {
+                self.primary_collection,
+                self.uploaded_collection,
+            }:
+                for hit in _search_collection(collection):
+                    key = f"{hit.payload.get('collection_name', collection)}:{hit.id}"
+                    existing = candidates.get(key)
+                    if existing is None or hit.score > existing.score:
+                        candidates[key] = hit
+
+        if not candidates:
+            return []
+
+        hits = list(candidates.values())
 
         # --- Re-rank with cross-encoder ---
         pairs = [

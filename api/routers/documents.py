@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
+import pdfplumber
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from docx import Document as DocxDocument
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from pptx import Presentation
 from pydantic import BaseModel, Field, field_validator
 
 from services.document_embedding_service import DocumentEmbeddingService
 
 from services.document_extractor import DocumentExtractor
+from services.model_selector import RAGPipeline
 
 # Ensure GPU-related environment variables align with the rest of the API.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -29,6 +36,7 @@ router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
 DEFAULT_S3_BUCKET_NAME = "procwisemvp"
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".pptx", ".txt"}
 
 
 def get_agent_nick(request: Request):
@@ -36,6 +44,72 @@ def get_agent_nick(request: Request):
     if not agent_nick:
         raise HTTPException(status_code=503, detail="AgentNick not available")
     return agent_nick
+
+
+def get_rag_pipeline(request: Request) -> RAGPipeline:
+    pipeline = getattr(request.app.state, "rag_pipeline", None)
+    if not pipeline:
+        raise HTTPException(
+            status_code=503, detail="RAG Pipeline service is not available."
+        )
+    return pipeline
+
+
+def _extract_text_from_bytes(filename: str, data: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{suffix or 'unknown'}'. "
+                "Allowed types: PDF, DOCX, PPTX, TXT."
+            ),
+        )
+
+    if suffix == ".pdf":
+        try:
+            with pdfplumber.open(BytesIO(data)) as pdf:
+                pages = [page.extract_text() for page in pdf.pages]
+        except Exception as exc:  # pragma: no cover - depends on document layout
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read PDF document '{filename}': {exc}",
+            ) from exc
+        return "\n".join(page for page in pages if page)
+
+    if suffix == ".docx":
+        try:
+            document = DocxDocument(BytesIO(data))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read DOCX document '{filename}': {exc}",
+            ) from exc
+        return "\n".join(
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text and paragraph.text.strip()
+        )
+
+    if suffix == ".pptx":
+        try:
+            presentation = Presentation(BytesIO(data))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read PPTX document '{filename}': {exc}",
+            ) from exc
+        slide_text: List[str] = []
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    slide_text.append(shape.text)
+        return "\n".join(slide_text)
+
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="ignore")
 
 
 class S3DocumentExtractionRequest(BaseModel):
@@ -251,6 +325,85 @@ def extract_document_from_s3(
     if documents:
         response_payload["document"] = documents[0]
     return response_payload
+
+
+@router.post("/upload")
+async def upload_documents(
+    files: List[UploadFile] = File(...),
+    pipeline: RAGPipeline = Depends(get_rag_pipeline),
+):
+    """Accept user documents, embed their content, and store them in Qdrant."""
+
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one document must be provided")
+
+    rag_service = pipeline.rag
+    collection_name = getattr(rag_service, "uploaded_collection", "uploaded_documents")
+
+    try:
+        rag_service.ensure_collection(collection_name)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to initialise Qdrant collection for uploads")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to initialise vector collection for uploaded documents.",
+        ) from exc
+
+    processed_files: List[str] = []
+    total_chunks = 0
+
+    for upload in files:
+        filename = Path(upload.filename or "uploaded_document").name
+        try:
+            data = await upload.read()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Unable to read file '{filename}': {exc}"
+            ) from exc
+
+        if not data:
+            logger.warning("Uploaded file %s contained no data", filename)
+            continue
+
+        text = _extract_text_from_bytes(filename, data)
+        text = text.strip()
+        if not text:
+            logger.warning("No extractable text found in %s", filename)
+            continue
+
+        chunk_preview = rag_service._chunk_text(text)
+        if not chunk_preview:
+            logger.warning("Chunking produced no content for %s", filename)
+            continue
+
+        timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        payload = {
+            "record_id": f"upload::{uuid4()}",
+            "document_name": filename,
+            "timestamp_uploaded": timestamp,
+            "content": text,
+            "ingestion_source": "documents_upload",
+        }
+
+        rag_service.upsert_payloads(
+            [payload], text_representation_key="content", collection_name=collection_name
+        )
+        processed_files.append(filename)
+        total_chunks += len(chunk_preview)
+
+    if not processed_files:
+        raise HTTPException(
+            status_code=400,
+            detail="No extractable content was found in the uploaded documents.",
+        )
+
+    return {
+        "status": "success",
+        "files_processed": processed_files,
+        "records_added": total_chunks,
+    }
 
 
 __all__ = ["router"]

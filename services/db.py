@@ -71,6 +71,8 @@ class _FakeCursor:
         ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
             self._store.ensure_tables()
             return
+        if upper_stmt.startswith("CREATE SEQUENCE IF NOT EXISTS PROC.SUPPLIER_RESPONSE_ID_SEQ"):
+            return
         if upper_stmt.startswith("WITH RANKED AS"):
             # Deduplication CTE is a no-op in the in-memory store.
             return
@@ -113,17 +115,15 @@ class _FakeCursor:
 
         # Data manipulation commands for supplier responses
         if upper_stmt.startswith("INSERT INTO PROC.SUPPLIER_RESPONSE"):
-            column_order = [
+            columns = [
                 "workflow_id",
+                "unique_id",
                 "supplier_id",
                 "supplier_email",
-                "rfq_id",
-                "unique_id",
-                "response_text",
-                "response_body",
-                "body_html",
                 "response_message_id",
                 "response_subject",
+                "response_text",
+                "response_body",
                 "response_from",
                 "response_date",
                 "original_message_id",
@@ -131,75 +131,33 @@ class _FakeCursor:
                 "match_confidence",
                 "match_score",
                 "price",
-                "currency",
-                "payment_terms",
-                "warranty",
-                "validity",
-                "exceptions",
                 "lead_time",
                 "response_time",
                 "received_time",
-                "match_evidence",
+                "processed",
+                "dispatch_id",
                 "matched_on",
                 "raw_headers",
-                "tables",
-                "attachments",
-                "processed",
             ]
-            values = {key: params[idx] if idx < len(params) else None for idx, key in enumerate(column_order)}
-            workflow_id = values.get("workflow_id")
-            unique_id = values.get("unique_id")
-            if workflow_id is None or unique_id is None:
-                return
+            values = list(params)
+            if len(values) < 2:
+                raise ValueError(
+                    "INSERT INTO proc.supplier_response requires workflow_id and unique_id"
+                )
+            mapped = {
+                column: (values[idx] if idx < len(values) else None)
+                for idx, column in enumerate(columns)
+            }
+            workflow_id = mapped["workflow_id"]
+            unique_id = mapped["unique_id"]
+            if not workflow_id or not unique_id:
+                raise ValueError(
+                    "Fake supplier_response insert missing workflow_id or unique_id"
+                )
             self._store.upsert_supplier_response(
                 workflow_id,
                 unique_id,
-                values,
-            )
-            return
-
-        if upper_stmt.startswith("UPDATE PROC.SUPPLIER_RESPONSE SET SUPPLIER_ID"):
-            update_keys = [
-                "supplier_id",
-                "supplier_email",
-                "rfq_id",
-                "response_text",
-                "response_body",
-                "body_html",
-                "response_subject",
-                "response_from",
-                "response_date",
-                "original_message_id",
-                "original_subject",
-                "match_confidence",
-                "match_score",
-                "price",
-                "currency",
-                "payment_terms",
-                "warranty",
-                "validity",
-                "exceptions",
-                "lead_time",
-                "response_time",
-                "received_time",
-                "match_evidence",
-                "matched_on",
-                "raw_headers",
-                "tables",
-                "attachments",
-                "processed",
-                "workflow_id",
-                "response_message_id",
-            ]
-            values = {key: params[idx] if idx < len(params) else None for idx, key in enumerate(update_keys)}
-            workflow_id = values.pop("workflow_id")
-            response_message_id = values.pop("response_message_id")
-            if workflow_id is None or response_message_id is None:
-                return
-            self._store.update_supplier_response_by_message_id(
-                workflow_id,
-                response_message_id,
-                values,
+                mapped,
             )
             return
 
@@ -287,9 +245,6 @@ class _FakeCursor:
                 "original_subject",
                 "match_confidence",
                 "match_score",
-                "match_evidence",
-                "matched_on",
-                "raw_headers",
                 "price",
                 "currency",
                 "payment_terms",
@@ -302,6 +257,9 @@ class _FakeCursor:
                 "tables",
                 "attachments",
                 "processed",
+                "dispatch_id",
+                "matched_on",
+                "raw_headers",
             ]
             self.description = [
                 _ColumnDescriptor(col) for col in columns
@@ -324,39 +282,40 @@ class _FakeCursor:
 
         # Workflow email tracking commands
         if upper_stmt.startswith("INSERT INTO PROC.WORKFLOW_EMAIL_TRACKING"):
-            (
-                workflow_id,
-                unique_id,
-                dispatch_key,
-                supplier_id,
-                supplier_email,
-                recipient_emails,
-                message_id,
-                subject,
-                dispatched_at,
-                responded_at,
-                response_message_id,
-                matched,
-                thread_headers,
-            ) = params
+            columns = [
+                "workflow_id",
+                "unique_id",
+                "dispatch_key",
+                "supplier_id",
+                "supplier_email",
+                "message_id",
+                "subject",
+                "round_number",
+                "dispatched_at",
+                "responded_at",
+                "response_message_id",
+                "matched",
+                "thread_headers",
+            ]
+            values = list(params)
+            if len(values) < 2:
+                raise ValueError(
+                    "INSERT INTO proc.workflow_email_tracking requires workflow_id and unique_id"
+                )
+            mapped = {
+                column: (values[idx] if idx < len(values) else None)
+                for idx, column in enumerate(columns)
+            }
+            workflow_id = mapped["workflow_id"]
+            unique_id = mapped["unique_id"]
+            if not workflow_id or not unique_id:
+                raise ValueError(
+                    "Fake workflow_email_tracking insert missing workflow_id or unique_id"
+                )
             self._store.upsert_workflow_tracking(
                 workflow_id,
                 unique_id,
-                {
-                    "workflow_id": workflow_id,
-                    "unique_id": unique_id,
-                    "dispatch_key": dispatch_key,
-                    "supplier_id": supplier_id,
-                    "supplier_email": supplier_email,
-                    "recipient_emails": recipient_emails,
-                    "message_id": message_id,
-                    "subject": subject,
-                    "dispatched_at": dispatched_at,
-                    "responded_at": responded_at,
-                    "response_message_id": response_message_id,
-                    "matched": matched,
-                    "thread_headers": thread_headers,
-                },
+                mapped,
             )
             return
 
@@ -383,6 +342,7 @@ class _FakeCursor:
                 "recipient_emails",
                 "message_id",
                 "subject",
+                "round_number",
                 "dispatched_at",
                 "responded_at",
                 "response_message_id",
@@ -537,20 +497,16 @@ class _FakePostgresStore:
                 "supplier_email",
                 "rfq_id",
                 "unique_id",
-                "response_text",
-                "response_body",
-                "body_html",
                 "response_message_id",
                 "response_subject",
+                "response_text",
+                "response_body",
                 "response_from",
                 "response_date",
                 "original_message_id",
                 "original_subject",
                 "match_confidence",
                 "match_score",
-                "match_evidence",
-                "matched_on",
-                "raw_headers",
                 "price",
                 "currency",
                 "payment_terms",
@@ -560,8 +516,9 @@ class _FakePostgresStore:
                 "lead_time",
                 "response_time",
                 "received_time",
-                "tables",
-                "attachments",
+                "dispatch_id",
+                "matched_on",
+                "raw_headers",
                 "processed",
             ],
             "proc.workflow_email_tracking": [
@@ -573,6 +530,7 @@ class _FakePostgresStore:
                 "recipient_emails",
                 "message_id",
                 "subject",
+                "round_number",
                 "dispatched_at",
                 "responded_at",
                 "response_message_id",

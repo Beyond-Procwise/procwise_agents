@@ -1,0 +1,45 @@
+{
+  "commodity_name": "Industrial Control Valves",
+  "specific_items": "the stainless-steel control valve assemblies detailed in the attached specification",
+  "buyer_name": "Jordan Patel",
+  "buyer_position": "Senior Procurement Manager",
+  "buyer_organisation": "ProcWise Industrial Solutions",
+  "buyer_contact_information": "jordan.patel@procwise.com | +44 20 7946 1234",
+  "suppliers": {
+    "SUP-001": {
+      "name": "ValvePro Manufacturing",
+      "contact_name": "Alex Morgan",
+      "email": "alex.morgan@valvepro.com"
+    },
+    "SUP-002": {
+      "name": "FlowTech Systems",
+      "contact_name": "Jamie Lee",
+      "email": "jamie.lee@flowtechsystems.com"
+    },
+    "SUP-003": {
+      "name": "Precision Valve Works",
+      "contact_name": "Morgan Ellis",
+      "email": "morgan.ellis@precisionvalve.co.uk"
+    }
+  },
+  "negotiation_targets": {
+    "unit_price_reduction_pct": 8,
+    "volume_increase_pct": 15,
+    "final_range_low_pct": 6,
+    "final_range_high_pct": 8
+  },
+  "approval": {
+    "project_name": "Industrial Control Valve Refresh",
+    "supplier_name": "ValvePro Manufacturing",
+    "total_value": "£485,000",
+    "key_justification": "Most competitive price with favourable delivery terms",
+    "suppliers_compared": [
+      "ValvePro Manufacturing",
+      "FlowTech Systems",
+      "Precision Valve Works"
+    ],
+    "reference_id": "WF-VALVE-2024-11",
+    "link_id": "wf-valve-2024-11"
+  },
+  "approver_name": "Priya Desai"
+}

@@ -299,7 +299,7 @@ AGENT_RELATIONSHIP_SUMMARIES: Dict[str, Dict[str, Any]] = {
     },
     "RAGAgent": {
         "description": (
-            "Answers procurement questions by combining document embeddings with the knowledge graph relationships."
+            "Answers procurement questions using the embedded ProcWise MVP knowledge base and topic-specific prompts."
         ),
         "tables": {
             "procwise_document_embeddings",

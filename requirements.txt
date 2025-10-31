@@ -10,6 +10,8 @@ pymupdf
 python-dateutil
 qdrant-client
 sentence-transformers
+python-docx
+python-pptx
 transformers
 pandas
 tiktoken
@@ -26,3 +28,4 @@ langchain
 langchain-community
 langchain-openai
 langgraph
+httpx

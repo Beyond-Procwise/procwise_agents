@@ -203,6 +203,18 @@ class EmailDispatchService:
             else:
                 dispatch_payload_context = None
 
+            workflow_identifier = (
+                backend_metadata.get("workflow_id")
+                or draft.get("workflow_id")
+                or (
+                    dispatch_payload_context.get("workflow_id")
+                    if dispatch_payload_context
+                    else None
+                )
+            )
+            if workflow_identifier:
+                backend_metadata.setdefault("workflow_id", workflow_identifier)
+
             workflow_email_flag = self._coerce_bool_flag(is_workflow_email)
             if workflow_email_flag is None:
                 workflow_email_flag = self._coerce_bool_flag(draft.get("workflow_email"))
@@ -220,6 +232,9 @@ class EmailDispatchService:
                 )
             if workflow_email_flag is None:
                 workflow_email_flag = self._coerce_bool_flag(draft_metadata.get("workflow_email"))
+
+            if workflow_email_flag is None and workflow_identifier:
+                workflow_email_flag = True
 
             parent_agent_hint = draft_metadata.get("parent_agent") or draft.get("parent_agent")
             if (
@@ -251,7 +266,9 @@ class EmailDispatchService:
                     "dispatch_run_id": dispatch_run_id,
                 }
             )
-            dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
+            dispatch_payload.setdefault(
+                "workflow_id", backend_metadata.get("workflow_id") or workflow_identifier
+            )
             dispatch_payload.setdefault("unique_id", unique_id)
             if backend_metadata.get("run_id"):
                 dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
@@ -262,40 +279,52 @@ class EmailDispatchService:
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
-            raw_thread_headers = dispatch_payload.get("thread_headers")
-            thread_headers = self._normalise_thread_headers(raw_thread_headers)
+            round_header_value = (
+                dispatch_payload.get("round")
+                or dispatch_payload.get("thread_index")
+                or backend_metadata.get("round")
+            )
+            try:
+                round_header_int = (
+                    int(round_header_value)
+                    if round_header_value is not None
+                    else draft.get("round")
+                )
+            except Exception:
+                round_header_int = draft.get("round")
+            if round_header_int in (None, ""):
+                round_header_int = 1
+            elif isinstance(round_header_int, int):
+                round_header_int = max(1, round_header_int)
+            else:
+                try:
+                    round_header_int = max(1, int(round_header_int))
+                except Exception:
+                    round_header_int = 1
 
             headers = {
                 "X-ProcWise-Workflow-ID": backend_metadata.get("workflow_id"),
                 "X-ProcWise-Unique-ID": unique_id,
+                "X-ProcWise-Supplier-ID": backend_metadata.get("supplier_id")
+                or draft.get("supplier_id"),
+                "X-ProcWise-Round": str(round_header_int),
             }
             mailbox_header = draft.get("mailbox") or getattr(self.settings, "supplier_mailbox", None)
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
                 headers["X-ProcWise-Mailbox"] = mailbox_header
-            if backend_metadata.get("supplier_id"):
-                headers["X-ProcWise-Supplier-ID"] = backend_metadata.get("supplier_id")
 
-            round_value = self._coerce_round_number(
-                dispatch_payload_context.get("round") if dispatch_payload_context else None,
-                draft.get("round") or draft.get("round_number"),
-                backend_metadata.get("round") if isinstance(backend_metadata, dict) else None,
+            workflow_for_error = (
+                backend_metadata.get("workflow_id")
+                or draft.get("workflow_id")
+                or "unknown"
             )
-            if round_value is not None:
-                backend_metadata["round"] = round_value
-                headers["X-ProcWise-Round"] = str(round_value)
-                dispatch_payload.setdefault("round", round_value)
-                dispatch_payload.setdefault("round_number", round_value)
-            else:
-                headers["X-ProcWise-Round"] = "0"
-                backend_metadata.setdefault("round", 0)
-                dispatch_payload.setdefault("round", 0)
-                dispatch_payload.setdefault("round_number", 0)
-
-            thread_header_values = self._extract_thread_header_values(thread_headers)
-            headers.update(thread_header_values)
-
-            self._validate_metadata_headers(headers)
+            for key, value in list(headers.items()):
+                if value in (None, ""):
+                    raise ValueError(
+                        f"Missing required header {key} for workflow {workflow_for_error}"
+                    )
+                headers[key] = str(value)
 
             send_result = self.email_service.send_email(
                 subject,
@@ -416,19 +445,7 @@ class EmailDispatchService:
                         backend_metadata.setdefault(
                             "workflow_context_identifier", context_unique_id
                         )
-                if workflow_email_flag is None and workflow_identifier:
-                    workflow_email_flag = True
-                    draft_metadata["workflow_email"] = True
-                    dispatch_payload["workflow_email"] = True
-                    metadata_payload = dispatch_payload.get("metadata")
-                    if isinstance(metadata_payload, dict):
-                        metadata_payload["workflow_email"] = True
-
-                should_record_workflow = bool(workflow_email_flag)
-                notified = False
-                notification_evaluated = False
-                should_notify_watcher = False
-                if should_record_workflow and workflow_identifier and unique_id:
+                if workflow_identifier and unique_id:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
