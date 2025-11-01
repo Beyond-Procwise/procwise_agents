@@ -349,11 +349,13 @@ class RAGService:
             query_matrix, query_vector = matrix, vector
             return query_matrix, query_vector
 
-        cached_hits = self._semantic_cache.get_cached_queries(query)
-        direct_cache = self._rebuild_cached_hits(cached_hits, query, top_k)
-        if direct_cache is not None:
-            return direct_cache
-        self._augment_candidates_from_cache(cached_hits, candidates)
+        cached_hits: List[Dict[str, Any]] = []
+        if filters is None:
+            cached_hits = self._semantic_cache.get_cached_queries(query)
+            direct_cache = self._rebuild_cached_hits(cached_hits, query, top_k)
+            if direct_cache is not None:
+                return direct_cache
+            self._augment_candidates_from_cache(cached_hits, candidates)
 
         # --- FAISS semantic search ---
         if self._faiss_index is not None and self._doc_vectors:
