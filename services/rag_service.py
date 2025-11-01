@@ -748,9 +748,19 @@ class RAGService:
             return float(bonus + doc_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
+        rerank_weight = 1.35
+        context_weight = 0.65
         for hit, score in zip(hits, scores):
             base_score = float(score)
-            combined = base_score + hit.aggregated + _priority_bonus(hit)
+            aggregated_score = float(getattr(hit, "aggregated", 0.0))
+            combined = (
+                base_score * rerank_weight
+                + aggregated_score * context_weight
+                + _priority_bonus(hit)
+            )
+            hit.rerank_score = base_score
+            hit.combined_score = combined
+            hit.context_score = aggregated_score
             scored_hits.append((hit, combined, base_score))
 
         if not scored_hits:

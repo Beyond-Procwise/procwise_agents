@@ -1,5 +1,6 @@
 # ProcWise/services/model_selector.py
 
+import hashlib
 import inspect
 import json
 import logging
@@ -9,7 +10,7 @@ import pdfplumber
 from io import BytesIO
 from pathlib import Path
 from botocore.exceptions import ClientError
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
@@ -335,6 +336,136 @@ class RAGPipeline:
             summary = f"{truncated}…" if truncated else summary[:max_chars]
         return self._redact_identifiers(summary)
 
+    def _extract_snippet(self, item: Dict[str, Any]) -> str:
+        summary = item.get("summary") if isinstance(item, dict) else ""
+        if isinstance(summary, str) and summary.strip():
+            return self._redact_identifiers(summary.strip())
+        payload = item.get("payload") if isinstance(item, dict) else {}
+        if isinstance(payload, dict):
+            candidate = payload.get("content") or payload.get("text_summary") or ""
+        else:
+            candidate = ""
+        return self._condense_snippet(candidate)
+
+    def _friendly_opening(self, query: str, acknowledgements: List[str]) -> str:
+        banned_tokens = (
+            "thanks for flagging",
+            "here's what i can confirm",
+        )
+        options: List[str] = []
+        for ack in acknowledgements:
+            if not ack:
+                continue
+            lowered = ack.lower()
+            if any(token in lowered for token in banned_tokens):
+                continue
+            cleaned = self._redact_identifiers(ack)
+            if cleaned:
+                options.append(cleaned)
+        if not options:
+            options = [
+                "Sure, I can help you with that.",
+                "Most definitely, I'll help you get the answer.",
+                "Great! Here is the response to your query.",
+                "You're in the right place for this question.",
+            ]
+        if not options:
+            return ""
+        digest = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
+        index = int(digest[:8], 16) % len(options)
+        return options[index]
+
+    def _select_focus_items(
+        self, items: List[Dict[str, Any]], limit: int = 4
+    ) -> List[Dict[str, Any]]:
+        if not items or limit <= 0:
+            return []
+
+        sortable: List[Dict[str, Any]] = []
+        for item in items:
+            score = item.get("score")
+            if not isinstance(score, (int, float)):
+                score = 0.0
+            item_with_score = dict(item)
+            item_with_score["_ordering_score"] = float(score)
+            sortable.append(item_with_score)
+
+        sortable.sort(
+            key=lambda entry: entry.get("_ordering_score", 0.0), reverse=True
+        )
+
+        selected: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for entry in sortable:
+            doc_label = str(entry.get("document") or "").lower()
+            collection = str(entry.get("collection") or "")
+            key = (doc_label, collection)
+            if key in seen:
+                continue
+            cleaned_entry = dict(entry)
+            cleaned_entry.pop("_ordering_score", None)
+            selected.append(cleaned_entry)
+            seen.add(key)
+            if len(selected) >= limit:
+                break
+
+        if len(selected) < min(limit, len(sortable)):
+            for entry in sortable:
+                candidate = dict(entry)
+                candidate.pop("_ordering_score", None)
+                if candidate in selected:
+                    continue
+                selected.append(candidate)
+                if len(selected) >= limit:
+                    break
+
+        def _original_index(value: Dict[str, Any]) -> int:
+            for idx, item in enumerate(items):
+                if all(item.get(key) == value.get(key) for key in item.keys()):
+                    return idx
+            return len(items)
+
+        selected.sort(key=_original_index)
+        return selected[:limit]
+
+    def _format_primary_statement(self, item: Dict[str, Any]) -> str:
+        snippet = self._extract_snippet(item)
+        if not snippet:
+            return ""
+        doc_label = item.get("document") or item.get("source_label") or "the referenced guidance"
+        doc_label_str = str(doc_label).strip()
+        lowered_doc = doc_label_str.lower()
+        lowered_snippet = snippet.lower()
+        if doc_label_str and lowered_doc in lowered_snippet:
+            body = f"The answer for your query is that {snippet}"
+        elif doc_label_str:
+            body = f"The answer for your query is that {doc_label_str} explains {snippet}"
+        else:
+            body = f"The answer for your query is that {snippet}"
+        return self._to_sentence(body)
+
+    def _format_support_statement(self, item: Dict[str, Any], position: int) -> str:
+        snippet = self._extract_snippet(item)
+        if not snippet:
+            return ""
+        connectors = [
+            "Additionally",
+            "It also clarifies",
+            "Finally",
+        ]
+        connector = connectors[min(position - 1, len(connectors) - 1)]
+        doc_label = item.get("document") or item.get("source_label") or "the same guidance"
+        doc_label_str = str(doc_label).strip()
+        lowered_doc = doc_label_str.lower()
+        lowered_snippet = snippet.lower()
+        if doc_label_str and lowered_doc in lowered_snippet:
+            body = f"{connector}, {snippet}"
+        elif doc_label_str:
+            body = f"{connector}, {doc_label_str} notes {snippet}"
+        else:
+            body = f"{connector}, {snippet}"
+        return self._to_sentence(body)
+
     def _analyse_session_history(
         self, history: List[Dict[str, Any]]
     ) -> tuple[str, List[str], bool]:
@@ -525,6 +656,10 @@ class RAGPipeline:
             source_label = self._label_for_collection(collection)
             payload.setdefault("collection_name", collection)
             payload.setdefault("source_label", source_label)
+            combined_raw = getattr(hit, "combined_score", getattr(hit, "aggregated", 0.0))
+            rerank_raw = getattr(hit, "rerank_score", getattr(hit, "score", 0.0))
+            combined_score = float(combined_raw) if isinstance(combined_raw, (int, float)) else 0.0
+            rerank_score = float(rerank_raw) if isinstance(rerank_raw, (int, float)) else 0.0
             summary_text = (
                 payload.get("summary")
                 or payload.get("text_summary")
@@ -545,6 +680,8 @@ class RAGPipeline:
                     "source_label": source_label,
                     "document": document_label,
                     "summary": condensed,
+                    "score": combined_score,
+                    "rerank_score": rerank_score,
                 }
             )
         return items
@@ -617,41 +754,25 @@ class RAGPipeline:
                 "Here's a quick summary based on the latest procurement guidance.",
             )
         ).strip()
+        redacted_query = self._redact_identifiers(query)
+        if summary_intro and "{query}" in summary_intro:
+            summary_intro = summary_intro.replace("{query}", redacted_query)
 
         paragraphs: List[str] = []
-        opening_parts: List[str] = []
-        if acknowledgements:
-            opening_parts.append(acknowledgements[0])
-        if summary_intro:
-            opening_parts.append(summary_intro)
-        opening = " ".join(opening_parts).strip()
-        if opening:
-            paragraphs.append(self._to_sentence(opening))
+        opening_line = self._friendly_opening(query, acknowledgements)
+        if opening_line:
+            paragraphs.append(self._to_sentence(opening_line))
 
-        if enumerated_items:
+        focus_items = self._select_focus_items(enumerated_items)
+        if summary_intro and (focus_items or ad_hoc_context):
+            paragraphs.append(self._to_sentence(summary_intro))
+        if focus_items:
             statements: List[str] = []
-            for idx, item in enumerate(enumerated_items):
-                source_label = item.get("source_label") or "reference"
-                doc_label = item.get("document") or source_label
-                snippet = item.get("summary") or self._condense_snippet(
-                    (item.get("payload") or {}).get("content", "")
-                )
-                snippet = self._redact_identifiers(snippet)
-                if not snippet:
-                    continue
-                lowered_label = source_label.lower()
-                if "policy" in lowered_label:
-                    opener = "The policy states"
-                elif "uploaded" in lowered_label:
-                    opener = "Your uploaded note adds"
-                elif idx == 0:
-                    opener = f"{doc_label} highlights"
-                elif idx == 1:
-                    opener = f"{doc_label} also notes"
+            for idx, item in enumerate(focus_items):
+                if idx == 0:
+                    sentence = self._format_primary_statement(item)
                 else:
-                    opener = f"{doc_label} further explains"
-                insight = f"{opener} {snippet}".strip()
-                sentence = self._to_sentence(insight)
+                    sentence = self._format_support_statement(item, idx)
                 if sentence:
                     statements.append(sentence)
             if statements:
@@ -909,9 +1030,8 @@ class RAGPipeline:
                 "retrieved_documents": [],
             }
 
-        enumerated_items: List[Dict[str, Any]] = []
-        for item in knowledge_items:
-            enumerated_items.append(dict(item))
+        focus_items = self._select_focus_items(knowledge_items)
+        enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
 
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
