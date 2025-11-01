@@ -17,6 +17,7 @@ from qdrant_client import models
 from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
 from .rag_service import RAGService
+from .nltk_pipeline import NLTKProcessor
 from utils.gpu import configure_gpu, load_cross_encoder
 
 _CITATION_GUIDELINES_PATH = (
@@ -137,7 +138,13 @@ class RAGPipeline:
         "email_thread_id",
     }
 
-    def __init__(self, agent_nick, cross_encoder_cls: Type[CrossEncoder] = CrossEncoder):
+    def __init__(
+        self,
+        agent_nick,
+        cross_encoder_cls: Type[CrossEncoder] = CrossEncoder,
+        *,
+        use_nltk: bool = True,
+    ):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
@@ -158,6 +165,20 @@ class RAGPipeline:
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
         self._citation_guidelines = self._load_citation_guidelines()
+        self.use_nltk = bool(use_nltk)
+        self._nltk_processor: Optional[NLTKProcessor] = None
+        if self.use_nltk:
+            processor = NLTKProcessor()
+            if processor.available:
+                self._nltk_processor = processor
+            else:
+                logger.warning(
+                    "NLTK resources unavailable; continuing without NLTK enhancements"
+                )
+        sentiment_flag = getattr(self.settings, "enable_sentiment_guidance", True)
+        if not sentiment_flag and self._nltk_processor:
+            # Allow settings to disable sentiment steering while keeping preprocessing benefits
+            self._nltk_processor._sentiment = None  # type: ignore[attr-defined]
 
     def _format_static_answer(self, answer: str) -> str:
         cleaned = answer.strip()
@@ -973,6 +994,104 @@ class RAGPipeline:
 
         return "\n\n".join(paragraphs)
 
+    def _sentiment_descriptor(self, sentiment: Optional[Dict[str, float]]) -> str:
+        if not sentiment:
+            return "neutral"
+        compound = sentiment.get("compound")
+        if compound is None:
+            return "neutral"
+        if compound <= -0.2:
+            return "negative"
+        if compound >= 0.4:
+            return "positive"
+        return "neutral"
+
+    def _compose_llm_prompt(
+        self,
+        query: str,
+        context: str,
+        draft_answer: str,
+        nltk_features: Optional[Dict[str, Any]],
+        ad_hoc_context: str,
+    ) -> str:
+        redacted_query = self._redact_identifiers(query)
+        lines: List[str] = [f"User question: {redacted_query}"]
+
+        sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        descriptor = self._sentiment_descriptor(sentiment)
+
+        if nltk_features:
+            keywords = [
+                str(item).strip()
+                for item in nltk_features.get("keywords", [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+            key_phrases = [
+                str(item).strip()
+                for item in nltk_features.get("key_phrases", [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if keywords:
+                lines.append(f"Key terms to emphasise: {', '.join(keywords[:8])}")
+            if key_phrases:
+                lines.append(f"Relevant phrases: {'; '.join(key_phrases[:5])}")
+
+        if descriptor == "negative":
+            tone_line = "Tone guidance: be empathetic and solutions-oriented."
+        elif descriptor == "positive":
+            tone_line = "Tone guidance: keep the response upbeat while staying factual."
+        else:
+            tone_line = "Tone guidance: respond in a calm, professional manner."
+        lines.append(tone_line)
+
+        if ad_hoc_context:
+            lines.append(
+                "User supplied context: "
+                + self._redact_identifiers(ad_hoc_context)
+            )
+
+        if context:
+            lines.append("Knowledge snippets:\n" + context)
+
+        lines.append("Draft summary derived from retrieval:\n" + draft_answer)
+        lines.append(
+            "Rewrite the draft into at most two concise paragraphs. Start with the key takeaway, integrate the knowledge snippets, and avoid filler greetings or repeated statements."
+        )
+        return "\n\n".join(lines)
+
+    def _finalise_llm_answer(
+        self,
+        llm_answer: Any,
+        nltk_features: Optional[Dict[str, Any]],
+        fallback: str,
+    ) -> str:
+        candidate = llm_answer if isinstance(llm_answer, str) else ""
+        candidate = candidate.strip()
+        if not candidate or candidate.lower().startswith("could not generate"):
+            return fallback
+
+        sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        if self._nltk_processor:
+            cleaned = self._nltk_processor.postprocess(candidate, sentiment=sentiment)
+        else:
+            cleaned = self._postprocess_answer(candidate)
+        return cleaned or fallback
+
+    def _merge_followups(
+        self, base_followups: List[str], llm_followups: Optional[List[Any]]
+    ) -> List[str]:
+        suggestions: List[str] = []
+        if llm_followups:
+            for item in llm_followups:
+                if isinstance(item, str) and item.strip():
+                    suggestions.append(item.strip())
+        suggestions.extend(base_followups)
+        deduped: List[str] = []
+        for suggestion in suggestions:
+            if suggestion not in deduped:
+                deduped.append(suggestion)
+        return deduped[:3]
+
     def _build_structured_answer(
         self,
         query: str,
@@ -1150,6 +1269,27 @@ class RAGPipeline:
             product_type,
         )
 
+        raw_nltk_features: Optional[Dict[str, Any]] = None
+        if self._nltk_processor:
+            nltk_feature_record = self._nltk_processor.preprocess(query)
+            raw_nltk_features = {
+                "keywords": nltk_feature_record.keywords,
+                "key_phrases": nltk_feature_record.key_phrases,
+                "sentiment": nltk_feature_record.sentiment,
+            }
+            logger.debug(
+                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.keywords[:6]
+                ],
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.key_phrases[:4]
+                ],
+                nltk_feature_record.sentiment,
+            )
+
         history = self.history_manager.get_history(user_id)
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
@@ -1202,6 +1342,8 @@ class RAGPipeline:
             "memory_fragments": memory_fragments,
             "policy_mode": policy_mode,
         }
+        if raw_nltk_features:
+            hint_kwargs["nltk_features"] = raw_nltk_features
         search_kwargs.update(self._supported_search_kwargs(hint_kwargs))
         reranked = self.rag.search(query, **search_kwargs)
         knowledge_items = self._prepare_knowledge_items(reranked)
@@ -1273,6 +1415,7 @@ class RAGPipeline:
 
         focus_items = self._select_focus_items(knowledge_items)
         enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
+        context_body = self._synthesise_context(knowledge_items)
 
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
@@ -1282,8 +1425,23 @@ class RAGPipeline:
             payload.setdefault("source_label", item.get("source_label"))
             retrieved_documents_payloads.append(payload)
 
-        answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
-        follow_ups = self._build_followups(query, enumerated_items)
+        draft_answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
+        base_followups = self._build_followups(query, enumerated_items)
+
+        prompt = self._compose_llm_prompt(
+            query,
+            context_body,
+            draft_answer,
+            raw_nltk_features,
+            ad_hoc_context,
+        )
+        llm_payload = self._generate_response(prompt, llm_to_use)
+        answer = self._finalise_llm_answer(
+            llm_payload.get("answer"), raw_nltk_features, draft_answer
+        )
+        follow_ups = self._merge_followups(
+            base_followups, llm_payload.get("follow_ups")
+        )
 
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
