@@ -141,8 +141,10 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     )
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("q", "user")
-    assert result["retrieved_documents"][0]["record_id"] == "R1"
+    assert "record_id" not in result["retrieved_documents"][0]
+    assert result["retrieved_documents"][0]["summary"] == "s"
     assert "[doc 1]" in result["answer"]
+    assert "\n-" not in result["answer"]
     assert len(result["follow_ups"]) == 3
 
 
@@ -193,7 +195,10 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
 
-    assert result["answer"] == "I do not have that information as per my knowledge."
+    assert (
+        result["answer"]
+        == "I'm sorry, but I couldn't find that information in the available knowledge base."
+    )
     assert result["retrieved_documents"] == []
     assert len(result["follow_ups"]) == 3
     assert history_store["payloads"], "Fallback answers should still be recorded in history"
