@@ -30,3 +30,4 @@ langchain-openai
 langgraph
 httpx
 langcache
+nltk
