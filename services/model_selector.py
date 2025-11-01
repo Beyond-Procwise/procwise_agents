@@ -1002,18 +1002,31 @@ class RAGPipeline:
     def _filter_identifier_fields(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Remove document and system identifier fields while preserving content."""
 
-        filtered: Dict[str, Any] = {}
-        for key, value in (payload or {}).items():
-            key_str = str(key or "").strip()
-            if not key_str:
-                continue
-            lowered = key_str.lower()
-            if lowered in self._IDENTIFIER_FIELD_KEYS:
-                continue
-            if any(token in lowered for token in ("document_id", "doc_id", "metadata")):
-                continue
-            filtered[key_str] = value
-        return filtered
+        def _filter(value: Any) -> Any:
+            if isinstance(value, dict):
+                nested: Dict[str, Any] = {}
+                for nested_key, nested_value in value.items():
+                    key_str = str(nested_key or "").strip()
+                    if not key_str:
+                        continue
+                    lowered = key_str.lower()
+                    if lowered in self._IDENTIFIER_FIELD_KEYS:
+                        continue
+                    if any(
+                        token in lowered for token in ("document_id", "doc_id", "metadata")
+                    ):
+                        continue
+                    nested[key_str] = _filter(nested_value)
+                return nested
+            if isinstance(value, list):
+                return [_filter(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_filter(item) for item in value)
+            if isinstance(value, set):
+                return [_filter(item) for item in value]
+            return value
+
+        return _filter(payload or {})
 
     def _is_internal_payload(
         self, payload: Dict[str, Any], collection: Optional[str]
