@@ -244,10 +244,10 @@ class RAGPipeline:
 
         defaults: Dict[str, Any] = {
             "acknowledgements": [
-                "Thanks for flagging this — here's what I can confirm.",
-                "Appreciate the context. Here's the current view.",
+                "Here's what I found in the policy documentation.",
+                "Here's a concise summary from the knowledge base.",
             ],
-            "summary_intro": "Current highlights from the knowledge base:",
+            "summary_intro": "These points capture the essentials you should know.",
             "actions_lead": "Let me know if you want me to escalate, refresh the data, or prep outreach notes.",
             "fallback": "I do not have that information as per my knowledge.",
             "default_follow_ups": [
@@ -299,8 +299,13 @@ class RAGPipeline:
         ]
         cleaned = text
         for pattern in patterns:
-            cleaned = re.sub(pattern, "[redacted]", cleaned, flags=re.IGNORECASE)
-        return cleaned
+            cleaned = re.sub(
+                pattern,
+                "a sensitive identifier",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        return re.sub(r"\s+", " ", cleaned).strip()
 
     def _condense_snippet(
         self,
@@ -502,34 +507,49 @@ class RAGPipeline:
         ad_hoc_context: str,
     ) -> str:
         guidelines = self._citation_guidelines
-        acknowledgements = guidelines.get("acknowledgements", [])
-        ack = (
-            acknowledgements[0]
-            if acknowledgements
-            else "Thanks for flagging this — here's what I can confirm."
-        )
-        summary_intro = guidelines.get(
-            "summary_intro", "Here's what I was able to confirm from the knowledge base:"
-        )
+        acknowledgements = [
+            str(item).strip()
+            for item in guidelines.get("acknowledgements", [])
+            if str(item).strip()
+        ]
+        summary_intro = str(
+            guidelines.get(
+                "summary_intro",
+                "Here's what I was able to confirm from the knowledge base.",
+            )
+        ).strip()
 
         paragraphs: List[str] = []
-        opening = f"{ack} {summary_intro}".strip()
+        opening_parts: List[str] = []
+        if acknowledgements:
+            opening_parts.append(acknowledgements[0])
+        if summary_intro:
+            opening_parts.append(summary_intro)
+        opening = " ".join(opening_parts).strip()
         if opening:
             paragraphs.append(self._to_sentence(opening))
 
         if enumerated_items:
             statements: List[str] = []
-            for item in enumerated_items:
-                doc_label = item.get("document") or "Procurement reference"
+            for idx, item in enumerate(enumerated_items):
+                doc_label = (
+                    item.get("document")
+                    or item.get("source_label")
+                    or "This reference"
+                )
                 snippet = item.get("summary") or self._condense_snippet(
                     (item.get("payload") or {}).get("content", "")
                 )
                 snippet = self._redact_identifiers(snippet)
-                citation = item.get("citation") or ""
-                citation = citation.strip()
-                if citation and not citation.startswith("("):
-                    citation = citation if citation.startswith("[") else f"{citation}"
-                insight = f"{doc_label} {citation} {snippet}".strip()
+                if not snippet:
+                    continue
+                if idx == 0:
+                    prefix = f"{doc_label} highlights"
+                elif idx == 1:
+                    prefix = f"{doc_label} also notes"
+                else:
+                    prefix = f"{doc_label} further explains"
+                insight = f"{prefix} {snippet}".strip()
                 sentence = self._to_sentence(insight)
                 if sentence:
                     statements.append(sentence)
@@ -771,10 +791,8 @@ class RAGPipeline:
             }
 
         enumerated_items: List[Dict[str, Any]] = []
-        for idx, item in enumerate(knowledge_items, start=1):
-            enriched = dict(item)
-            enriched["citation"] = f"[doc {idx}]"
-            enumerated_items.append(enriched)
+        for item in knowledge_items:
+            enumerated_items.append(dict(item))
 
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
@@ -782,7 +800,6 @@ class RAGPipeline:
             payload = self._sanitise_payload(payload)
             payload.setdefault("collection_name", item.get("collection"))
             payload.setdefault("source_label", item.get("source_label"))
-            payload["citation"] = item.get("citation")
             retrieved_documents_payloads.append(payload)
 
         answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)

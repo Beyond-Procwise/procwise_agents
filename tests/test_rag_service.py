@@ -143,7 +143,9 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     result = pipeline.answer_question("q", "user")
     assert "record_id" not in result["retrieved_documents"][0]
     assert result["retrieved_documents"][0]["summary"] == "s"
-    assert "[doc 1]" in result["answer"]
+    assert "[doc" not in result["answer"]
+    assert "[redacted" not in result["answer"].lower()
+    assert "s" in result["answer"]
     assert "\n-" not in result["answer"]
     assert len(result["follow_ups"]) == 3
 
