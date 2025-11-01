@@ -30,6 +30,7 @@ from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
 from services.learning_repository import LearningRepository
+from services.static_policy_loader import StaticPolicyLoader
 from services.workflow_memory_service import WorkflowMemoryService
 from utils.gpu import configure_gpu
 
@@ -1283,6 +1284,7 @@ class AgentNick:
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.learning_repository = LearningRepository(self)
+        self.static_policy_loader: Optional[StaticPolicyLoader] = None
         s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
         self._s3_pool_size = s3_pool
         self.s3_client = boto3.client(
@@ -1300,6 +1302,8 @@ class AgentNick:
             self._s3_semaphore = None
         logger.info("Clients initialized.")
 
+        self._initialise_static_policy_corpus()
+
         logger.info("Initializing core engines...")
         self.prompt_engine = PromptEngine(self)
         self.policy_engine = PolicyEngine(self)
@@ -1312,6 +1316,37 @@ class AgentNick:
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    def _initialise_static_policy_corpus(self) -> None:
+        """Ensure the static policy knowledge base is synchronised."""
+
+        if not getattr(self.settings, "static_policy_auto_ingest", True):
+            logger.info("Static policy auto-ingest disabled by configuration")
+            return
+
+        try:
+            loader = StaticPolicyLoader(self)
+        except Exception:  # pragma: no cover - defensive initialisation
+            logger.exception("Failed to initialise static policy loader")
+            return
+
+        self.static_policy_loader = loader
+        try:
+            summary = loader.sync_static_policy()
+        except Exception:  # pragma: no cover - unexpected ingestion failure
+            logger.exception("Static policy ingestion encountered an unexpected error")
+            return
+
+        ingested = summary.get("ingested", 0)
+        skipped = summary.get("skipped", 0)
+        errors: Iterable = summary.get("errors", [])  # type: ignore[assignment]
+
+        if ingested or skipped:
+            logger.info(
+                "Static policy sync complete: %s ingested, %s skipped", ingested, skipped
+            )
+        if errors:
+            logger.warning("Static policy sync reported issues: %s", errors)
 
     @property
     def s3_pool_size(self) -> int:

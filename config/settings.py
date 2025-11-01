@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     learning_collection_name: str = Field(
         default="learning", env="LEARNING_COLLECTION_NAME"
     )
+    static_policy_collection_name: str = Field(
+        default="static_policy", env="STATIC_POLICY_COLLECTION_NAME"
+    )
+    static_policy_s3_prefix: str = Field(
+        default="Static Policy/", env="STATIC_POLICY_S3_PREFIX"
+    )
+    static_policy_s3_bucket: Optional[str] = Field(
+        default=None, env="STATIC_POLICY_S3_BUCKET"
+    )
+    static_policy_auto_ingest: bool = Field(
+        default=True, env="STATIC_POLICY_AUTO_INGEST"
+    )
     context_training_data_dir: str = Field(
         default=os.path.join(PROJECT_ROOT, "resources", "training", "conversations"),
         env="CONTEXT_TRAINING_DATA_DIR",
