@@ -351,28 +351,45 @@ class RAGPipeline:
                     merged[key] = value
         return merged
 
+    def _strip_metadata_terms(self, text: str) -> str:
+        """Remove internal metadata phrases such as document identifiers."""
+
+        if not isinstance(text, str):
+            return ""
+
+        cleaned = text
+        metadata_patterns = (
+            r"(?i)\bDocument\s+ID[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bDocument\s+(?:Reference|Ref|Number)[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bPolicy\s+(?:Reference|Ref|Number|Version)[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bSee\s+Document\s+[A-Za-z0-9._-]+\b",
+        )
+
+        for pattern in metadata_patterns:
+            cleaned = re.sub(pattern, "", cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        return cleaned.strip(" ,;-")
+
     def _redact_identifiers(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
 
-        patterns = [
-            r"\b(?:supplier|rfq|po|invoice|contract)[-_\s]*\w+\b",
-            r"PROC-?WF-\w+",
-            r"\b(?:ID|Ref)[-:\s]*\d+\b",
-            r"\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
-            r"\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
-            r"\b[a-z]+_agent\b",
-            r"\blearning[_-]?(?:event|record|entry)?\b",
-        ]
-        cleaned = text
+        cleaned = self._strip_metadata_terms(text)
+        patterns = (
+            r"(?i)PROC-?WF-[A-Za-z0-9_-]+",
+            r"(?i)\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"(?i)\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"(?i)\b(?:supplier|rfq|po|invoice|contract)\s*(?:number|no\.?|id|reference)?[:#\- ]*[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b",
+        )
+
         for pattern in patterns:
-            cleaned = re.sub(
-                pattern,
-                "a sensitive identifier",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-        return re.sub(r"\s+", " ", cleaned).strip()
+            cleaned = re.sub(pattern, "", cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        return cleaned.strip(" ,;-")
 
     def _remove_placeholders(self, text: str) -> str:
         if not isinstance(text, str):
@@ -398,7 +415,7 @@ class RAGPipeline:
         if not isinstance(text, str):
             return ""
 
-        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = self._strip_metadata_terms(text)
         if not cleaned:
             return ""
 
@@ -1314,6 +1331,7 @@ class RAGPipeline:
             cleaned = f"From what I can see, {cleaned[len('based on'):].lstrip()}"
 
         cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = self._strip_metadata_terms(cleaned)
         return cleaned
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
