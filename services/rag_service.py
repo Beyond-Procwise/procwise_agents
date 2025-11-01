@@ -950,6 +950,14 @@ class RAGService:
                 for hit in hits[:top_k]:
                     rebuilt_hit = self._convert_cache_hit(hit)
                     if rebuilt_hit is not None:
+                        collection_name = (
+                            getattr(rebuilt_hit, "payload", {}) or {}
+                        ).get("collection_name")
+                        if (
+                            collection_name
+                            and collection_name == self.learning_collection
+                        ):
+                            continue
                         rebuilt.append(rebuilt_hit)
                 if rebuilt:
                     return rebuilt[:top_k]

@@ -6,6 +6,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -23,6 +24,11 @@ try:  # Optional heavy dependency
     from unstructured.partition.auto import partition  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     partition = None  # type: ignore
+
+try:  # Optional PDF dependency for deterministic fallback extraction
+    import pdfplumber  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    pdfplumber = None  # type: ignore
 
 
 @dataclass
@@ -224,6 +230,24 @@ class DocumentEmbeddingService:
                         )
             except Exception:
                 logger.exception("unstructured partition failed for %s", filename)
+
+        if suffix == ".pdf" and pdfplumber is not None:
+            try:
+                with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                    pages = [page.extract_text() or "" for page in pdf.pages]
+                    combined = "\n".join(part for part in pages if part)
+                    if combined.strip():
+                        metadata = {
+                            "content_type": "pdf",
+                            "pdf_page_count": len(pdf.pages),
+                        }
+                        return ExtractedContent(
+                            text=combined,
+                            method="pdfplumber_fallback",
+                            metadata=metadata,
+                        )
+            except Exception:
+                logger.exception("pdfplumber fallback failed for %s", filename)
 
         # Fallback: attempt UTF-8 decode regardless of file type
         try:
