@@ -93,6 +93,7 @@ class RAGService:
         self._rrf_k = 60
         self._layout_parser = LayoutAwareParser()
         self._chunker = SemanticChunker(settings=self.settings)
+        self._payload_index_cache: Dict[str, Set[str]] = {}
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -408,6 +409,7 @@ class RAGService:
 
         try:
             self.client.get_collection(collection_name=target)
+            self._refresh_payload_index_cache(target)
             return
         except UnexpectedResponse as exc:
             if getattr(exc, "status_code", None) != 404:
@@ -429,11 +431,113 @@ class RAGService:
                     distance=models.Distance.COSINE,
                 ),
             )
+            self._payload_index_cache.pop(target, None)
         except UnexpectedResponse as exc:
             if getattr(exc, "status_code", None) != 409:
                 raise
         except Exception:  # pragma: no cover - defensive logging only
             logger.warning("Failed to ensure Qdrant collection %s", target, exc_info=True)
+
+        self._refresh_payload_index_cache(target)
+
+    def _refresh_payload_index_cache(self, collection_name: str) -> None:
+        if not self.client or not collection_name:
+            return
+        get_collection = getattr(self.client, "get_collection", None)
+        if get_collection is None:
+            return
+        try:
+            info = get_collection(collection_name=collection_name)
+        except Exception:
+            return
+
+        schema = getattr(info, "payload_schema", {}) or {}
+        if isinstance(schema, dict):
+            self._payload_index_cache[collection_name] = set(schema.keys())
+
+    def _ensure_payload_index(
+        self,
+        collection_name: Optional[str],
+        field_name: Optional[str],
+        schema: models.PayloadSchemaType = models.PayloadSchemaType.KEYWORD,
+    ) -> None:
+        if not collection_name or not field_name or not self.client:
+            return
+
+        create_index = getattr(self.client, "create_payload_index", None)
+        if create_index is None:
+            return
+
+        cached = self._payload_index_cache.setdefault(collection_name, set())
+        if field_name in cached:
+            return
+
+        if not cached:
+            self._refresh_payload_index_cache(collection_name)
+            cached = self._payload_index_cache.setdefault(collection_name, set())
+            if field_name in cached:
+                return
+
+        try:
+            create_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=schema,
+                wait=True,
+            )
+            cached.add(field_name)
+        except UnexpectedResponse as exc:
+            status = getattr(exc, "status_code", None)
+            if status in (400, 409):
+                cached.add(field_name)
+            else:  # pragma: no cover - diagnostic logging only
+                logger.debug(
+                    "Failed to create payload index for %s.%s", collection_name, field_name, exc_info=True
+                )
+        except Exception:  # pragma: no cover - diagnostic logging only
+            logger.debug(
+                "Failed to ensure payload index for %s.%s", collection_name, field_name, exc_info=True
+            )
+
+    def _collect_filter_fields(self, query_filter: Optional[models.Filter]) -> Set[str]:
+        if query_filter is None:
+            return set()
+
+        fields: Set[str] = set()
+        stack: List[Any] = [query_filter]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, models.FieldCondition):
+                key = getattr(current, "key", None)
+                if isinstance(key, str) and key.strip():
+                    fields.add(key.strip())
+                continue
+
+            if isinstance(current, models.Filter):
+                for attr in ("must", "must_not", "should"):
+                    items = getattr(current, attr, None) or []
+                    for item in items:
+                        if item is not None:
+                            stack.append(item)
+
+        return fields
+
+    def _ensure_filter_indexes(
+        self, collection_name: Optional[str], query_filter: Optional[models.Filter]
+    ) -> None:
+        if not collection_name or query_filter is None:
+            return
+
+        try:
+            fields = self._collect_filter_fields(query_filter)
+        except Exception:  # pragma: no cover - diagnostic logging only
+            logger.debug(
+                "Failed to inspect filter for collection %s", collection_name, exc_info=True
+            )
+            return
+
+        for field in fields:
+            self._ensure_payload_index(collection_name, field)
 
     def _purge_disallowed_metadata(self, collection_name: str) -> None:
         if not DISALLOWED_METADATA_KEYS:
@@ -706,14 +810,16 @@ class RAGService:
             search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
 
-        session_key: Optional[str] = None
         if session_id is not None:
             try:
                 cleaned = str(session_id).strip()
             except Exception:
                 cleaned = ""
             if cleaned:
-                session_key = cleaned
+                logger.debug(
+                    "Ignoring session_id '%s' during search; uploaded document retrieval is session-agnostic",
+                    cleaned,
+                )
 
         query_matrix: Optional[np.ndarray] = None
         query_vector: Optional[List[float]] = None
@@ -866,6 +972,7 @@ class RAGService:
                 if not name:
                     return []
 
+                self._ensure_filter_indexes(name, query_filter)
                 try:
                     raw_hits = self.client.search(
                         collection_name=name,
@@ -955,18 +1062,6 @@ class RAGService:
             seen_pairs.add(key)
             base_collections.append((name, filt))
 
-        session_specific_filter: Optional[models.Filter] = None
-        if session_key:
-            session_specific_filter = self._merge_filters(
-                combined_filter,
-                [
-                    models.FieldCondition(
-                        key="session_id", match=models.MatchValue(value=session_key)
-                    )
-                ],
-            )
-            _append_collection(self.uploaded_collection, session_specific_filter)
-
         if policy_mode:
             ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
                 (self.static_policy_collection, combined_filter),
@@ -1038,25 +1133,13 @@ class RAGService:
                 bonus = max(bonus, 0.12)
                 if policy_mode:
                     bonus += 0.22
-            if session_key and collection == self.uploaded_collection:
-                bonus += 0.1
-
             doc_bonus = float(document_weights.get(document_type, 0.0))
             if document_type == "policy":
                 doc_bonus = max(doc_bonus, 0.08)
                 if policy_mode:
                     doc_bonus += 0.15
 
-            session_bonus = 0.0
-            if session_key:
-                try:
-                    payload_session = str(payload.get("session_id", "")).strip()
-                except Exception:
-                    payload_session = ""
-                if payload_session and payload_session == session_key:
-                    session_bonus = 0.4
-
-            return float(bonus + doc_bonus + session_bonus)
+            return float(bonus + doc_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         rerank_weight = 1.35
@@ -1083,36 +1166,6 @@ class RAGService:
             return []
 
         selected = scored_hits[:top_k]
-
-        if session_key:
-            session_hits = [
-                record
-                for record in scored_hits
-                if str((getattr(record[0], "payload", {}) or {}).get("session_id", "")).strip()
-                == session_key
-            ]
-            if session_hits:
-                max_session = max(1, min(len(session_hits), max(1, top_k)))
-                for candidate in session_hits[:max_session]:
-                    if candidate in selected:
-                        continue
-                    if len(selected) < top_k:
-                        selected.append(candidate)
-                        continue
-                    non_session_indices = [
-                        idx
-                        for idx, existing in enumerate(selected)
-                        if str(
-                            (getattr(existing[0], "payload", {}) or {}).get(
-                                "session_id", ""
-                            )
-                        ).strip()
-                        != session_key
-                    ]
-                    if not non_session_indices:
-                        continue
-                    lowest_idx = min(non_session_indices, key=lambda idx: selected[idx][1])
-                    selected[lowest_idx] = candidate
 
         def _collection_name(hit_obj: SimpleNamespace) -> str:
             payload = getattr(hit_obj, "payload", {}) or {}
