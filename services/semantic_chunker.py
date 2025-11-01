@@ -118,10 +118,18 @@ class SemanticChunker:
                 if overlap_ratio is None and isinstance(approx_overlap, (int, float)) and isinstance(approx_chars, (int, float)) and approx_chars:
                     overlap_ratio = max(0.05, min(0.25, float(approx_overlap) / float(approx_chars)))
 
-        min_tokens = max(200, int(min_tokens or 320))
-        max_tokens = max(min_tokens + 50, int(max_tokens or 880))
-        overlap_ratio = float(overlap_ratio or 0.12)
-        overlap_ratio = max(0.05, min(overlap_ratio, 0.2))
+        min_tokens = int(min_tokens or 360)
+        min_tokens = max(300, min_tokens)
+
+        max_tokens = int(max_tokens or 760)
+        if max_tokens <= min_tokens:
+            max_tokens = min_tokens + 120
+        max_tokens = min(max_tokens, 800)
+        if max_tokens - min_tokens < 60:
+            max_tokens = min(800, max(min_tokens + 60, max_tokens))
+
+        overlap_ratio = float(overlap_ratio or 0.1)
+        overlap_ratio = max(0.05, min(overlap_ratio, 0.18))
 
         return {
             "min_tokens": int(min_tokens),

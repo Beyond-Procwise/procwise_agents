@@ -82,6 +82,10 @@ class RAGPipeline:
         "unique_id",
         "workflow_ref",
         "workflow_reference",
+        "effective_date",
+        "supplier",
+        "doc_version",
+        "round_id",
     }
     _SENSITIVE_KEY_MARKERS = (
         "workflow",
