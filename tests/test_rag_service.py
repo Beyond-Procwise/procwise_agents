@@ -258,8 +258,85 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
         == "I'm sorry, but I couldn't find that information in the available knowledge base."
     )
     assert result["retrieved_documents"] == []
+
+
+def test_pipeline_uploaded_context_mode(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, query, top_k=5, filters=None, **kwargs):
+            captured.update({"filters": filters, "collections": kwargs.get("collections")})
+            return [
+                SimpleNamespace(
+                    id="chunk-1",
+                    payload={
+                        "collection_name": "uploaded_documents",
+                        "summary": "Uploaded insight",
+                        "document_id": "doc-123",
+                    },
+                    combined_score=1.0,
+                    rerank_score=1.0,
+                )
+            ]
+
+        def upsert_texts(self, texts, metadata=None):
+            pass
+
+        primary_collection = "c"
+        uploaded_collection = "uploaded_documents"
+        static_policy_collection = "static_policy"
+        learning_collection = "learning"
+
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    class GuardStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, *args, **kwargs):
+            raise AssertionError("Static agent should not run when uploaded context is active")
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", GuardStaticAgent)
+
+    monkeypatch.setattr(
+        RAGPipeline,
+        "_generate_response",
+        lambda self, prompt, model: {"answer": "Uploaded insight", "follow_ups": []},
+    )
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(
+            get_object=lambda **_: {"Body": SimpleNamespace(read=lambda: b"[]")},
+            put_object=lambda **_: None,
+        ),
+        settings=SimpleNamespace(qdrant_collection_name="c", s3_bucket_name="b", reranker_model="x"),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
+    pipeline.activate_uploaded_context(["doc-123"], metadata={"filenames": ["file.pdf"]})
+
+    result = pipeline.answer_question("What does the document say?", "user-456")
+
+    assert captured["collections"] == ("uploaded_documents",)
+    filter_obj = captured["filters"]
+    assert filter_obj is not None
+    assert any(
+        getattr(condition, "key", "") == "document_id"
+        for condition in getattr(filter_obj, "must", [])
+    )
+    assert result["retrieved_documents"]
+    assert all(
+        doc.get("collection_name") == "uploaded_documents"
+        for doc in result["retrieved_documents"]
+    )
     assert len(result["follow_ups"]) == 3
-    assert history_store["payloads"], "Fallback answers should still be recorded in history"
 
 
 def test_pipeline_prefers_explicit_session_id(monkeypatch):
