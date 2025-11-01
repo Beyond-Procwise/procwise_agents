@@ -533,6 +533,7 @@ class RAGService:
                 (self.primary_collection, filters),
                 (self.uploaded_collection, filters),
                 (self.static_policy_collection, filters),
+                (self.learning_collection, filters),
             ):
                 if not candidate:
                     continue
