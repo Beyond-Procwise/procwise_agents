@@ -336,6 +336,149 @@ class RAGPipeline:
             summary = f"{truncated}…" if truncated else summary[:max_chars]
         return self._redact_identifiers(summary)
 
+    def _extract_focus_phrase(self, query: str, max_words: int = 8) -> str:
+        if not isinstance(query, str):
+            return ""
+
+        trimmed = re.sub(r"\s+", " ", query).strip()
+        if not trimmed:
+            return ""
+
+        lowered = trimmed.lower()
+        for token in (" about ", " regarding ", " on ", " for ", " concerning "):
+            idx = lowered.find(token)
+            if idx != -1 and idx + len(token) < len(trimmed):
+                candidate = trimmed[idx + len(token) :].strip(" ?.!;:")
+                if candidate:
+                    trimmed = candidate
+                    lowered = trimmed.lower()
+                    break
+
+        trimmed = trimmed.lstrip("? ")
+        words = re.findall(r"[A-Za-z0-9'/-]+", trimmed)
+        if not words:
+            return ""
+
+        stopwords = {
+            "what",
+            "which",
+            "who",
+            "whom",
+            "whose",
+            "when",
+            "where",
+            "why",
+            "how",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "being",
+            "been",
+            "do",
+            "does",
+            "did",
+            "please",
+            "kindly",
+            "let",
+            "help",
+            "need",
+            "want",
+            "looking",
+            "look",
+            "tell",
+            "give",
+            "provide",
+            "share",
+            "explain",
+            "clarify",
+            "me",
+            "us",
+            "our",
+            "my",
+            "their",
+            "the",
+            "a",
+            "an",
+            "any",
+            "some",
+            "current",
+            "latest",
+            "on",
+            "for",
+            "about",
+            "regarding",
+            "of",
+            "to",
+            "with",
+            "in",
+            "and",
+            "or",
+            "vs",
+            "versus",
+            "this",
+            "that",
+            "these",
+            "those",
+            "it",
+            "its",
+            "into",
+            "from",
+            "can",
+            "could",
+            "would",
+            "should",
+            "will",
+            "shall",
+        }
+
+        filtered: List[str] = []
+        for word in words:
+            if word.lower() in stopwords:
+                continue
+            filtered.append(word)
+            if len(filtered) >= max_words:
+                break
+
+        if not filtered:
+            filtered = words[:max_words]
+
+        return " ".join(filtered)
+
+    def _topic_descriptor(self, topic: str) -> str:
+        if not topic:
+            return ""
+
+        cleaned = re.sub(r"\s+", " ", topic).strip()
+        if not cleaned:
+            return ""
+
+        lowered = cleaned.lower()
+        if lowered.startswith(
+            (
+                "the ",
+                "this ",
+                "that ",
+                "these ",
+                "those ",
+                "any ",
+                "my ",
+                "our ",
+                "your ",
+                "a ",
+                "an ",
+            )
+        ):
+            descriptor = cleaned
+        else:
+            descriptor = f"the {cleaned}"
+
+        if "sensitive identifier" in descriptor.lower():
+            return "this request"
+
+        return descriptor
+
     def _extract_snippet(self, item: Dict[str, Any]) -> str:
         summary = item.get("summary") if isinstance(item, dict) else ""
         if isinstance(summary, str) and summary.strip():
@@ -347,11 +490,27 @@ class RAGPipeline:
             candidate = ""
         return self._condense_snippet(candidate)
 
-    def _friendly_opening(self, query: str, acknowledgements: List[str]) -> str:
+    def _friendly_opening(
+        self,
+        query: str,
+        acknowledgements: List[str],
+        focus_items: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         banned_tokens = (
             "thanks for flagging",
             "here's what i can confirm",
         )
+        focus_phrase = self._extract_focus_phrase(query)
+        if not focus_phrase and focus_items:
+            for item in focus_items:
+                candidate = item.get("document") or item.get("source_label")
+                if isinstance(candidate, str) and candidate.strip():
+                    focus_phrase = candidate
+                    break
+
+        focus_phrase = self._redact_identifiers(focus_phrase)
+        topic_descriptor = self._topic_descriptor(focus_phrase)
+
         options: List[str] = []
         for ack in acknowledgements:
             if not ack:
@@ -359,18 +518,46 @@ class RAGPipeline:
             lowered = ack.lower()
             if any(token in lowered for token in banned_tokens):
                 continue
-            cleaned = self._redact_identifiers(ack)
-            if cleaned:
-                options.append(cleaned)
-        if not options:
+            options.append(ack.strip())
+
+        if topic_descriptor:
+            personalised: List[str] = []
+            for template in options:
+                if "{topic}" in template:
+                    personalised.append(
+                        template.replace("{topic}", topic_descriptor)
+                    )
+                else:
+                    base = template.rstrip(". ")
+                    personalised.append(
+                        f"{base} Let's focus on {topic_descriptor}."
+                    )
+            options = personalised
+        else:
+            fallback_topic = "this topic"
             options = [
-                "Sure, I can help you with that.",
-                "Most definitely, I'll help you get the answer.",
-                "Great! Here is the response to your query.",
-                "You're in the right place for this question.",
+                template.replace("{topic}", fallback_topic)
+                if "{topic}" in template
+                else template
+                for template in options
             ]
+
         if not options:
-            return ""
+            if topic_descriptor:
+                options = [
+                    f"Sure, I can help you with {topic_descriptor}.",
+                    f"Most definitely, I'll help you get the answer on {topic_descriptor}.",
+                    f"Great! Here's what the guidance says about {topic_descriptor}.",
+                    f"You're in the right place for questions about {topic_descriptor}.",
+                ]
+            else:
+                options = [
+                    "Sure, I can help you with this topic.",
+                    "Most definitely, I'll help you get the answer you need.",
+                    "Great! Here is the response based on what I can see.",
+                    "You're in the right place for this question.",
+                ]
+
         digest = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
         index = int(digest[:8], 16) % len(options)
         return options[index]
@@ -465,6 +652,56 @@ class RAGPipeline:
         else:
             body = f"{connector}, {snippet}"
         return self._to_sentence(body)
+
+    def _craft_summary_intro(
+        self,
+        query: str,
+        template: str,
+        focus_items: List[Dict[str, Any]],
+    ) -> str:
+        topic = self._extract_focus_phrase(query)
+        if not topic:
+            for item in focus_items:
+                candidate = (
+                    item.get("document")
+                    or item.get("source_label")
+                    or item.get("collection")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    topic = candidate
+                    break
+
+        topic = self._redact_identifiers(topic)
+        descriptor = self._topic_descriptor(topic) if topic else "this topic"
+        base = (template or "Here’s what stands out about {topic}:").strip()
+        redacted_query = self._redact_identifiers(query)
+        if "{query}" in base:
+            base = base.replace("{query}", redacted_query or "your question")
+
+        if "{topic}" in base:
+            line = base.replace("{topic}", descriptor)
+        elif descriptor:
+            cleaned_base = base.rstrip(" :")
+            if cleaned_base.lower().endswith("about"):
+                line = f"{cleaned_base} {descriptor}"
+            else:
+                line = f"{cleaned_base} about {descriptor}"
+        else:
+            line = base
+
+        source_hint = ""
+        for item in focus_items:
+            candidate = item.get("source_label") or item.get("collection")
+            if isinstance(candidate, str) and candidate.strip():
+                source_hint = self._redact_identifiers(candidate)
+                break
+
+        if source_hint:
+            lowered_line = line.lower()
+            if source_hint.lower() not in lowered_line:
+                line = f"{line.rstrip('.')} drawing from {source_hint}"
+
+        return line.rstrip(" :")
 
     def _analyse_session_history(
         self, history: List[Dict[str, Any]]
@@ -748,24 +985,28 @@ class RAGPipeline:
             for item in guidelines.get("acknowledgements", [])
             if str(item).strip()
         ]
-        summary_intro = str(
+        summary_intro_template = str(
             guidelines.get(
                 "summary_intro",
                 "Here's a quick summary based on the latest procurement guidance.",
             )
         ).strip()
-        redacted_query = self._redact_identifiers(query)
-        if summary_intro and "{query}" in summary_intro:
-            summary_intro = summary_intro.replace("{query}", redacted_query)
+
+        focus_items = self._select_focus_items(enumerated_items)
 
         paragraphs: List[str] = []
-        opening_line = self._friendly_opening(query, acknowledgements)
+        opening_line = self._friendly_opening(query, acknowledgements, focus_items)
         if opening_line:
             paragraphs.append(self._to_sentence(opening_line))
 
-        focus_items = self._select_focus_items(enumerated_items)
-        if summary_intro and (focus_items or ad_hoc_context):
-            paragraphs.append(self._to_sentence(summary_intro))
+        if (focus_items or ad_hoc_context) and summary_intro_template:
+            intro_line = self._craft_summary_intro(
+                query,
+                summary_intro_template,
+                focus_items,
+            )
+            if intro_line:
+                paragraphs.append(self._to_sentence(intro_line))
         if focus_items:
             statements: List[str] = []
             for idx, item in enumerate(focus_items):
