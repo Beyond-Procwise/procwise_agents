@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set
 from types import SimpleNamespace
 
 import numpy as np
@@ -762,7 +762,9 @@ class RAGService:
         session_hint: Optional[str] = None,
         memory_fragments: Optional[List[str]] = None,
         policy_mode: bool = False,
+        nltk_features: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        collections: Optional[Sequence[str]] = None,
     ):
         """Retrieve and rerank documents for the given query."""
         if not query or not query.strip():
@@ -1070,15 +1072,26 @@ class RAGService:
                 (self.learning_collection, combined_filter),
             ]
         else:
-            ordered_candidates = [
-                (self.uploaded_collection, combined_filter),
-                (self.primary_collection, combined_filter),
-                (self.static_policy_collection, combined_filter),
-                (self.learning_collection, combined_filter),
-            ]
+            if session_specific_filter is not None:
+                _append_collection(self.uploaded_collection, session_specific_filter)
 
-        for name, filt in ordered_candidates:
-            _append_collection(name, filt)
+            if policy_mode:
+                ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
+                    (self.static_policy_collection, combined_filter),
+                    (self.uploaded_collection, combined_filter),
+                    (self.primary_collection, combined_filter),
+                    (self.learning_collection, combined_filter),
+                ]
+            else:
+                ordered_candidates = [
+                    (self.uploaded_collection, combined_filter),
+                    (self.primary_collection, combined_filter),
+                    (self.static_policy_collection, combined_filter),
+                    (self.learning_collection, combined_filter),
+                ]
+
+            for name, filt in ordered_candidates:
+                _append_collection(name, filt)
 
         collections_to_query = tuple(base_collections)
 

@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import ollama
 import pdfplumber
@@ -168,24 +168,9 @@ class RAGPipeline:
         )
         self._citation_guidelines = self._load_citation_guidelines()
         self._session_uploads: Dict[str, Dict[str, Any]] = {}
-        self._nltk_processor: Optional[NLTKProcessor]
-        if use_nltk:
-            try:
-                processor = NLTKProcessor()
-            except Exception:  # pragma: no cover - defensive initialisation guard
-                logger.exception(
-                    "Failed to initialise NLTK processor; continuing without it"
-                )
-                processor = None
-            if processor and getattr(processor, "available", True):
-                self._nltk_processor = processor
-            else:
-                if processor and not getattr(processor, "available", True):
-                    logger.info(
-                        "NLTK processor unavailable in this environment; disabling NLTK features"
-                    )
-                self._nltk_processor = None
-        else:
+        self._uploaded_context: Optional[Dict[str, Any]] = None
+        self._nltk_processor = NLTKProcessor() if use_nltk else None
+        if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
 
     def register_session_upload(
@@ -220,15 +205,93 @@ class RAGPipeline:
             "registered_at": timestamp,
         }
 
+        self._set_uploaded_context(
+            filtered_docs,
+            metadata=metadata,
+            session_id=cleaned_id,
+        )
+
+    def activate_uploaded_context(
+        self,
+        document_ids: Sequence[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Force the pipeline to prioritise ad-hoc uploaded documents."""
+
+        self._set_uploaded_context(
+            document_ids,
+            metadata=metadata,
+            session_id=session_id,
+        )
+
+    def clear_uploaded_context(self) -> None:
+        """Disable prioritisation of uploaded document context."""
+
+        self._uploaded_context = None
+
+    def uploaded_context_active(self) -> bool:
+        """Return ``True`` when uploaded document prioritisation is active."""
+
+        record = self._uploaded_context or {}
+        docs = record.get("document_ids")
+        return bool(docs)
+
+    def _set_uploaded_context(
+        self,
+        document_ids: Sequence[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        cleaned: List[str] = []
+        for value in document_ids or []:
+            try:
+                text = str(value).strip()
+            except Exception:
+                text = ""
+            if text:
+                cleaned.append(text)
+
+        if not cleaned:
+            return
+
+        if session_id is not None:
+            try:
+                session_token = str(session_id).strip()
+            except Exception:
+                session_token = ""
+        else:
+            session_token = ""
+
+        try:
+            activated_at = datetime.utcnow().isoformat(timespec="seconds")
+        except Exception:
+            activated_at = datetime.utcnow().isoformat()
+
+        self._uploaded_context = {
+            "document_ids": cleaned,
+            "metadata": dict(metadata or {}),
+            "session_id": session_token or None,
+            "activated_at": activated_at,
+        }
+
     def _format_static_answer(self, answer: str) -> str:
         cleaned = answer.strip()
         if not cleaned:
             return ""
         return f"Sure, I can help with that. {cleaned}" if not cleaned.lower().startswith("sure") else cleaned
 
-    def _try_static_answer(self, query: str, user_id: str) -> Optional[Dict[str, Any]]:
+    def _try_static_answer(
+        self, query: str, user_id: str, *, session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         try:
-            output = self._static_agent.run(query=query, user_id=user_id, session_id=user_id)
+            output = self._static_agent.run(
+                query=query,
+                user_id=user_id,
+                session_id=session_id or user_id,
+            )
         except Exception:
             logger.exception("Static procurement QA lookup failed")
             return None
@@ -351,28 +414,45 @@ class RAGPipeline:
                     merged[key] = value
         return merged
 
+    def _strip_metadata_terms(self, text: str) -> str:
+        """Remove internal metadata phrases such as document identifiers."""
+
+        if not isinstance(text, str):
+            return ""
+
+        cleaned = text
+        metadata_patterns = (
+            r"(?i)\bDocument\s+ID[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bDocument\s+(?:Reference|Ref|Number)[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bPolicy\s+(?:Reference|Ref|Number|Version)[:#\-\s]*[A-Za-z0-9._-]+\b",
+            r"(?i)\bSee\s+Document\s+[A-Za-z0-9._-]+\b",
+        )
+
+        for pattern in metadata_patterns:
+            cleaned = re.sub(pattern, "", cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        return cleaned.strip(" ,;-")
+
     def _redact_identifiers(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
 
-        patterns = [
-            r"\b(?:supplier|rfq|po|invoice|contract)[-_\s]*\w+\b",
-            r"PROC-?WF-\w+",
-            r"\b(?:ID|Ref)[-:\s]*\d+\b",
-            r"\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
-            r"\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
-            r"\b[a-z]+_agent\b",
-            r"\blearning[_-]?(?:event|record|entry)?\b",
-        ]
-        cleaned = text
+        cleaned = self._strip_metadata_terms(text)
+        patterns = (
+            r"(?i)PROC-?WF-[A-Za-z0-9_-]+",
+            r"(?i)\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"(?i)\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"(?i)\b(?:supplier|rfq|po|invoice|contract)\s*(?:number|no\.?|id|reference)?[:#\- ]*[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b",
+        )
+
         for pattern in patterns:
-            cleaned = re.sub(
-                pattern,
-                "a sensitive identifier",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-        return re.sub(r"\s+", " ", cleaned).strip()
+            cleaned = re.sub(pattern, "", cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        return cleaned.strip(" ,;-")
 
     def _remove_placeholders(self, text: str) -> str:
         if not isinstance(text, str):
@@ -398,7 +478,7 @@ class RAGPipeline:
         if not isinstance(text, str):
             return ""
 
-        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = self._strip_metadata_terms(text)
         if not cleaned:
             return ""
 
@@ -655,17 +735,60 @@ class RAGPipeline:
         )
 
         selected: List[Dict[str, Any]] = []
-        seen: Set[Tuple[str, str]] = set()
+        seen: Set[Tuple[str, ...]] = set()
+
+        label_counts: Dict[Tuple[str, str], int] = {}
         for entry in sortable:
-            doc_label = str(entry.get("document") or "").lower()
+            doc_label = str(entry.get("document") or "").strip().lower()
             collection = str(entry.get("collection") or "")
+            if not doc_label:
+                continue
             key = (doc_label, collection)
-            if key in seen:
+            label_counts[key] = label_counts.get(key, 0) + 1
+
+        generic_labels = {"", "procurement reference"}
+
+        def _stable_identifier(entry: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
+            payload = entry.get("payload")
+            if isinstance(payload, dict):
+                for candidate in (
+                    "chunk_id",
+                    "chunk",
+                    "chunkId",
+                    "chunk_index",
+                    "id",
+                    "document_id",
+                    "documentId",
+                    "reference_id",
+                    "referenceId",
+                    "hash",
+                    "checksum",
+                ):
+                    value = payload.get(candidate)
+                    if isinstance(value, (str, int)):
+                        text = str(value).strip()
+                        if text:
+                            return ("payload", candidate.lower(), text.lower())
+            doc_label = str(entry.get("document") or "").strip().lower()
+            collection = str(entry.get("collection") or "")
+            if not doc_label:
+                return None
+            if doc_label in generic_labels or "redacted" in doc_label:
+                return None
+            label_key = (doc_label, collection)
+            if label_counts.get(label_key, 0) != 1:
+                return None
+            return ("label", collection, doc_label)
+
+        for entry in sortable:
+            key = _stable_identifier(entry)
+            if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
-            seen.add(key)
+            if key:
+                seen.add(key)
             if len(selected) >= limit:
                 break
 
@@ -1271,6 +1394,7 @@ class RAGPipeline:
             cleaned = f"From what I can see, {cleaned[len('based on'):].lstrip()}"
 
         cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = self._strip_metadata_terms(cleaned)
         return cleaned
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
@@ -1320,6 +1444,8 @@ class RAGPipeline:
         self,
         query: str,
         user_id: str,
+        *,
+        session_id: Optional[str] = None,
         model_name: Optional[str] = None,
         files: Optional[List[tuple[bytes, str]]] = None,
         doc_type: Optional[str] = None,
@@ -1355,8 +1481,63 @@ class RAGPipeline:
             )
 
         history = self.history_manager.get_history(user_id)
-        session_key = user_id.strip() if isinstance(user_id, str) else None
-        session_record = self._session_uploads.get(session_key) if session_key else None
+
+        candidate_keys: List[str] = []
+        cleaned_session = (
+            session_id.strip()
+            if isinstance(session_id, str)
+            else str(session_id).strip()
+            if session_id is not None
+            else None
+        )
+        if cleaned_session:
+            candidate_keys.append(cleaned_session)
+        cleaned_user = user_id.strip() if isinstance(user_id, str) else str(user_id).strip()
+        if cleaned_user:
+            if cleaned_user not in candidate_keys:
+                candidate_keys.append(cleaned_user)
+
+        session_key: Optional[str] = None
+        session_record: Optional[Dict[str, Any]] = None
+        for candidate in candidate_keys:
+            record = self._session_uploads.get(candidate)
+            if record:
+                session_key = candidate
+                session_record = record
+                break
+
+        if session_key is None and candidate_keys:
+            session_key = candidate_keys[0]
+
+        uploaded_scope = self._uploaded_context or {}
+        uploaded_documents: List[str] = []
+        try:
+            uploaded_documents = [
+                str(doc).strip()
+                for doc in uploaded_scope.get("document_ids", [])
+                if str(doc).strip()
+            ]
+        except Exception:
+            uploaded_documents = []
+
+        restrict_to_uploaded = bool(uploaded_documents)
+        if restrict_to_uploaded:
+            scope_metadata = dict(uploaded_scope.get("metadata") or {})
+            combined_record = dict(session_record or {})
+            combined_metadata = dict(combined_record.get("metadata") or {})
+            combined_metadata.update(scope_metadata)
+            session_record = {
+                "document_ids": list(uploaded_documents),
+                "metadata": combined_metadata,
+            }
+            scope_session = uploaded_scope.get("session_id")
+            if scope_session and not session_key:
+                try:
+                    cleaned_scope_session = str(scope_session).strip()
+                except Exception:
+                    cleaned_scope_session = ""
+                session_key = cleaned_scope_session or session_key
+
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
         )
@@ -1378,6 +1559,14 @@ class RAGPipeline:
                     key="product_type", match=models.MatchValue(value=product_type)
                 )
             )
+        if restrict_to_uploaded and uploaded_documents:
+            if len(uploaded_documents) == 1:
+                doc_match = models.MatchValue(value=uploaded_documents[0])
+            else:
+                doc_match = models.MatchAny(any=uploaded_documents)
+            must_conditions.append(
+                models.FieldCondition(key="document_id", match=doc_match)
+            )
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
         uploaded = self._extract_text_from_uploads(files) if files else []
@@ -1396,9 +1585,11 @@ class RAGPipeline:
                 self.rag.upsert_texts([text], metadata)
         ad_hoc_context = "\n".join(ad_hoc_notes)
 
-        policy_mode = self._is_policy_question(
-            query, doc_type, session_hint, history_policy_signal
-        )
+        policy_mode = False
+        if not restrict_to_uploaded:
+            policy_mode = self._is_policy_question(
+                query, doc_type, session_hint, history_policy_signal
+            )
         search_kwargs = {
             "top_k": 6,
             "filters": qdrant_filter,
@@ -1410,18 +1601,24 @@ class RAGPipeline:
             "memory_fragments": memory_fragments,
             "policy_mode": policy_mode,
         }
+        if raw_nltk_features:
+            hint_kwargs["nltk_features"] = raw_nltk_features
         if session_key:
             hint_kwargs["session_id"] = session_key
         if session_record:
             hint_kwargs["session_documents"] = session_record.get("document_ids")
         search_kwargs.update(self._supported_search_kwargs(hint_kwargs))
+        if restrict_to_uploaded:
+            search_kwargs["collections"] = (self.rag.uploaded_collection,)
         reranked = self.rag.search(query, **search_kwargs)
         knowledge_items = self._prepare_knowledge_items(reranked)
 
-        if knowledge_items:
+        if knowledge_items and not restrict_to_uploaded:
             try:
                 static_output = self._static_agent.run(
-                    query=query, user_id=user_id, session_id=user_id
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_key or cleaned_user,
                 )
             except Exception:
                 logger.exception("Static procurement QA lookup failed during context build")
