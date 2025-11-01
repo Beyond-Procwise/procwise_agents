@@ -107,10 +107,15 @@ class LayeredRAGTrainer:
         collections = {
             "primary": self.rag_service.primary_collection,
             "uploaded": self.rag_service.uploaded_collection,
+            "static_policy": getattr(
+                self.rag_service, "static_policy_collection", None
+            ),
             "learning": self.rag_service.learning_collection,
         }
         ensured: Dict[str, bool] = {}
         for label, name in collections.items():
+            if not name:
+                continue
             try:
                 self.rag_service.ensure_collection(name)
             except Exception:
@@ -376,10 +381,15 @@ class LayeredRAGTrainer:
             "collection": {
                 self.rag_service.primary_collection: 0.12,
                 self.rag_service.uploaded_collection: 0.08,
-                self.rag_service.learning_collection: 0.04,
             },
-            "document_type": {},
+            "document_type": {"policy": 0.1},
         }
+        static_collection = getattr(self.rag_service, "static_policy_collection", None)
+        if static_collection:
+            defaults["collection"][static_collection] = 0.14
+        learning_collection = getattr(self.rag_service, "learning_collection", None)
+        if learning_collection:
+            defaults["collection"].setdefault(learning_collection, 0.02)
         if not self.preference_path.exists():
             return defaults
         try:

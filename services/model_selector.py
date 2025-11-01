@@ -262,6 +262,9 @@ class RAGPipeline:
             return "ProcWise knowledge base"
         if collection == self.rag.uploaded_collection:
             return "Uploaded reference"
+        static_policy_collection = getattr(self.rag, "static_policy_collection", None)
+        if collection == static_policy_collection:
+            return "Procurement policy"
         if collection == self.rag.learning_collection:
             return "Procurement playbook"
         if collection == "static_procurement_qa":
@@ -308,6 +311,7 @@ class RAGPipeline:
         for collection in (
             self.rag.primary_collection,
             self.rag.uploaded_collection,
+            getattr(self.rag, "static_policy_collection", None),
             self.rag.learning_collection,
             "static_procurement_qa",
         ):

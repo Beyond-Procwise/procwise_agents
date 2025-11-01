@@ -48,6 +48,11 @@ class RAGService:
             "uploaded_documents_collection_name",
             "uploaded_documents",
         )
+        self.static_policy_collection = getattr(
+            self.settings,
+            "static_policy_collection_name",
+            "static_policy",
+        )
         self.learning_collection = getattr(
             self.settings,
             "learning_collection_name",
@@ -73,10 +78,60 @@ class RAGService:
         self._semantic_cache = SemanticCacheManager(
             self.settings, namespace="rag_service"
         )
+        self._preference_weights_path = _PREFERENCE_WEIGHTS_PATH
+        self._preference_weights = self._load_preference_weights()
 
     # ------------------------------------------------------------------
     # Embedding helpers
     # ------------------------------------------------------------------
+    def reload_preference_weights(self) -> None:
+        """Reload retrieval preference weights from disk."""
+
+        self._preference_weights = self._load_preference_weights()
+
+    def _load_preference_weights(self) -> Dict[str, Dict[str, float]]:
+        defaults: Dict[str, Dict[str, float]] = {
+            "collection": {},
+            "document_type": {},
+        }
+        defaults["collection"][self.primary_collection] = 0.12
+        defaults["collection"][self.uploaded_collection] = 0.08
+        if self.static_policy_collection:
+            defaults["collection"].setdefault(self.static_policy_collection, 0.14)
+        defaults["document_type"].setdefault("policy", 0.1)
+
+        path_obj = Path(self._preference_weights_path)
+        if not path_obj.exists():
+            return defaults
+
+        try:
+            loaded = json.loads(path_obj.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug(
+                "Falling back to default preference weights due to parse failure",
+                exc_info=True,
+            )
+            return defaults
+
+        if not isinstance(loaded, dict):
+            return defaults
+
+        result = {
+            "collection": dict(defaults["collection"]),
+            "document_type": dict(defaults["document_type"]),
+        }
+
+        for section_key in ("collection", "document_type"):
+            section = loaded.get(section_key)
+            if not isinstance(section, dict):
+                continue
+            for key, value in section.items():
+                if not isinstance(key, str) or not isinstance(value, (int, float)):
+                    continue
+                result[section_key][key] = float(value)
+
+        return result
+
     def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
         """Split text into whitespace-aware chunks with overlap."""
         cleaned = " ".join(text.split())
@@ -472,11 +527,25 @@ class RAGService:
                     )
                 return wrapped
 
-            collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = (
+            base_collections: List[Tuple[str, Optional[models.Filter]]] = []
+            seen_collections: Set[str] = set()
+            for candidate, candidate_filter in (
                 (self.primary_collection, filters),
                 (self.uploaded_collection, filters),
-                (self.learning_collection, None),
+                (self.static_policy_collection, filters),
+                (self.learning_collection, filters),
+            ):
+                if not candidate:
+                    continue
+                if candidate in seen_collections:
+                    continue
+                seen_collections.add(candidate)
+                base_collections.append((candidate, candidate_filter))
+
+            collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = tuple(
+                base_collections
             )
+
             for name, collection_filter in collections_to_query:
                 for hit in _search_collection(name, query_filter=collection_filter):
                     key = f"{hit.payload.get('collection_name', name)}:{hit.id}"
@@ -511,11 +580,19 @@ class RAGService:
             payload = getattr(hit, "payload", {}) or {}
             collection = payload.get("collection_name", self.primary_collection)
             document_type = str(payload.get("document_type", "")).lower()
-            weights = self._preference_weights
-            bonus = weights.get("collection", {}).get(collection, 0.0)
-            if document_type:
-                bonus += weights.get("document_type", {}).get(document_type, 0.0)
-            return float(bonus)
+            weights = getattr(self, "_preference_weights", {}) or {}
+            collection_weights = weights.get("collection", {}) or {}
+            document_weights = weights.get("document_type", {}) or {}
+
+            bonus = float(collection_weights.get(collection, 0.0))
+            if collection == self.static_policy_collection:
+                bonus = max(bonus, 0.12)
+
+            doc_bonus = float(document_weights.get(document_type, 0.0))
+            if document_type == "policy":
+                doc_bonus = max(doc_bonus, 0.08)
+
+            return float(bonus + doc_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         for hit, score in zip(hits, scores):
@@ -537,10 +614,8 @@ class RAGService:
             payload = getattr(hit_obj, "payload", {}) or {}
             return payload.get("collection_name", self.primary_collection)
 
-        required_collections: Tuple[str, ...] = (
-            self.primary_collection,
-            self.uploaded_collection,
-            self.learning_collection,
+        required_collections: Tuple[str, ...] = tuple(
+            name for name, _ in collections_to_query if name
         )
 
         available_by_collection: Dict[str, List[Tuple[SimpleNamespace, float, float]]] = {}
