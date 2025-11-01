@@ -2,9 +2,10 @@ import importlib
 import importlib.util
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,8 @@ from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
 from services.semantic_cache import SemanticCacheManager
+from services.document_extractor import LayoutAwareParser
+from services.semantic_chunker import SemanticChunker
 
 _TRAINING_ROOT = (
     Path(__file__).resolve().parent.parent
@@ -80,6 +83,9 @@ class RAGService:
         )
         self._preference_weights_path = _PREFERENCE_WEIGHTS_PATH
         self._preference_weights = self._load_preference_weights()
+        self._rrf_k = 60
+        self._layout_parser = LayoutAwareParser()
+        self._chunker = SemanticChunker(settings=self.settings)
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -133,16 +139,33 @@ class RAGService:
         return result
 
     def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
-        """Split text into whitespace-aware chunks with overlap."""
-        cleaned = " ".join(text.split())
+        """Chunk text using the structure-aware chunker for previews."""
+        del max_chars, overlap  # legacy parameters retained for compatibility
+        cleaned = (text or "").strip()
         if not cleaned:
             return []
-        configured_max = getattr(self.settings, "rag_chunk_chars", max_chars)
-        configured_overlap = getattr(self.settings, "rag_chunk_overlap", overlap)
-        max_chars = max(configured_max, 200)
-        overlap = max(0, min(configured_overlap, max_chars - 1))
-        step = max_chars - overlap if max_chars > overlap else max_chars
-        return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
+        structured = self._layout_parser.from_text(cleaned, scanned=False)
+        title_hint = None
+        if structured.elements:
+            first = structured.elements[0]
+            candidate = getattr(first, "text", None)
+            if candidate:
+                title_hint = candidate.strip()
+        chunk_seed = {
+            "document_type": "General",
+            "source_type": "Upload",
+            "title": title_hint or "Preview",
+        }
+        chunks = self._chunker.build_from_structured(
+            structured,
+            document_type="General",
+            base_metadata=chunk_seed,
+            title_hint=chunk_seed["title"],
+            default_section="document_overview",
+        )
+        if not chunks:
+            return [cleaned]
+        return [chunk.content for chunk in chunks]
 
     def _embedding_dimension(self) -> int:
         """Determine the embedding dimensionality of the active encoder."""
@@ -390,6 +413,11 @@ class RAGService:
         filters: Optional[models.Filter] = None,
     ):
         """Retrieve and rerank documents for the given query."""
+        if not query or not query.strip():
+            return []
+
+        rewritten_query, auto_conditions = self._rewrite_query(query)
+        combined_filter = self._merge_filters(filters, auto_conditions)
         candidates: Dict[str, SimpleNamespace] = {}
 
         query_matrix: Optional[np.ndarray] = None
@@ -400,7 +428,7 @@ class RAGService:
             if query_matrix is not None and query_vector is not None:
                 return query_matrix, query_vector
 
-            encoded = self.embedder.encode(query, normalize_embeddings=True)
+            encoded = self.embedder.encode(rewritten_query, normalize_embeddings=True)
             arr = (
                 encoded
                 if isinstance(encoded, np.ndarray)
@@ -414,45 +442,89 @@ class RAGService:
             query_matrix, query_vector = matrix, vector
             return query_matrix, query_vector
 
-        cached_hits: List[Dict[str, Any]] = []
-        if filters is None:
-            cached_hits = self._semantic_cache.get_cached_queries(query)
-            direct_cache = self._rebuild_cached_hits(cached_hits, query, top_k)
+        use_cache = combined_filter is None and not auto_conditions
+        cached_entries: List[Dict[str, Any]] = []
+        if use_cache:
+            cached_entries = self._semantic_cache.get_cached_queries(rewritten_query)
+            direct_cache = self._rebuild_cached_hits(
+                cached_entries, rewritten_query, top_k
+            )
             if direct_cache is not None:
                 return direct_cache
-            self._augment_candidates_from_cache(cached_hits, candidates)
 
-        # --- FAISS semantic search ---
+        prefetch = max(50, top_k * 8)
+        weights = {"dense": 1.0, "sparse": 0.75, "qdrant": 1.0, "cache": 0.6}
+
+        def _register_candidate(
+            source: str,
+            payload: Dict[str, Any],
+            doc_id: Any,
+            raw_score: float,
+            rank: int,
+            weight: float,
+        ) -> None:
+            if not isinstance(payload, dict) or doc_id is None:
+                return
+            doc_id_str = str(doc_id)
+            collection = payload.get("collection_name", self.primary_collection)
+            key = f"{collection}:{doc_id_str}"
+            entry = candidates.get(key)
+            if entry is None:
+                entry = SimpleNamespace(
+                    id=doc_id_str,
+                    payload=dict(payload),
+                    score_components={},
+                    aggregated=0.0,
+                )
+                candidates[key] = entry
+            rrf = weight * (1.0 / (self._rrf_k + rank))
+            entry.score_components[source] = {
+                "raw": float(raw_score),
+                "rank": int(rank),
+                "rrf": float(rrf),
+            }
+            entry.aggregated += float(rrf)
+            entry.payload.setdefault("_query_rewrite", rewritten_query)
+
+        if cached_entries:
+            self._augment_candidates_from_cache(
+                cached_entries, _register_candidate, weights["cache"]
+            )
+
         if self._faiss_index is not None and self._doc_vectors:
             matrix, _ = _ensure_query_vectors()
-            scores, ids = self._faiss_index.search(matrix, top_k * 5)
-            for score, idx in zip(scores[0], ids[0]):
+            scores, ids = self._faiss_index.search(matrix, prefetch)
+            for rank, (score, idx) in enumerate(zip(scores[0], ids[0]), 1):
                 if idx < 0 or idx >= len(self._documents):
                     continue
                 doc = self._documents[idx]
-                key = f"{doc.get('collection_name', self.primary_collection)}:{doc['id']}"
-                existing = candidates.get(key)
-                if existing is None or float(score) > existing.score:
-                    candidates[key] = SimpleNamespace(
-                        id=doc["id"], payload=doc, score=float(score)
-                    )
+                payload = dict(doc)
+                payload.setdefault(
+                    "collection_name", doc.get("collection_name", self.primary_collection)
+                )
+                _register_candidate(
+                    "dense", payload, doc.get("id"), float(score), rank, weights["dense"]
+                )
 
-        # --- BM25 lexical search ---
-        if self._bm25 is not None:
-            tokens = query.lower().split()
+        if self._bm25 is not None and self._documents:
+            tokens = rewritten_query.lower().split()
             bm25_scores = self._bm25.get_scores(tokens)
-            for idx, score in sorted(
-                enumerate(bm25_scores), key=lambda x: x[1], reverse=True
-            )[: top_k * 5]:
+            ranked = sorted(
+                enumerate(bm25_scores), key=lambda item: item[1], reverse=True
+            )[:prefetch]
+            for rank, (idx, score) in enumerate(ranked, 1):
+                if idx < 0 or idx >= len(self._documents):
+                    continue
                 doc = self._documents[idx]
-                key = f"{doc.get('collection_name', self.primary_collection)}:{doc['id']}"
-                existing = candidates.get(key)
-                if existing is None or score > existing.score:
-                    candidates[key] = SimpleNamespace(
-                        id=doc["id"], payload=doc, score=float(score)
-                    )
+                payload = dict(doc)
+                payload.setdefault(
+                    "collection_name", doc.get("collection_name", self.primary_collection)
+                )
+                _register_candidate(
+                    "sparse", payload, doc.get("id"), float(score), rank, weights["sparse"]
+                )
 
-        # --- Hybrid retrieval across Qdrant collections ---
+        collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = tuple()
         if self.client is not None:
             _, vector = _ensure_query_vectors()
             search_params = models.SearchParams(hnsw_ef=256, exact=False)
@@ -470,7 +542,7 @@ class RAGService:
                         collection_name=name,
                         query_vector=vector,
                         query_filter=query_filter,
-                        limit=top_k * 5,
+                        limit=prefetch,
                         with_payload=True,
                         with_vectors=False,
                         search_params=search_params,
@@ -494,7 +566,7 @@ class RAGService:
                             collection_name=name,
                             query_vector=vector,
                             query_filter=query_filter,
-                            limit=top_k * 5,
+                            limit=prefetch,
                             with_payload=True,
                             with_vectors=False,
                             search_params=models.SearchParams(
@@ -529,44 +601,49 @@ class RAGService:
 
             base_collections: List[Tuple[str, Optional[models.Filter]]] = []
             seen_collections: Set[str] = set()
-            for candidate, candidate_filter in (
-                (self.primary_collection, filters),
-                (self.uploaded_collection, filters),
-                (self.static_policy_collection, filters),
+            for candidate in (
+                self.primary_collection,
+                self.uploaded_collection,
+                self.static_policy_collection,
+                self.learning_collection,
             ):
-                if not candidate:
-                    continue
-                if candidate in seen_collections:
+                if not candidate or candidate in seen_collections:
                     continue
                 seen_collections.add(candidate)
-                base_collections.append((candidate, candidate_filter))
+                base_collections.append((candidate, combined_filter))
 
-            collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = tuple(
-                base_collections
-            )
+            collections_to_query = tuple(base_collections)
 
             for name, collection_filter in collections_to_query:
-                for hit in _search_collection(name, query_filter=collection_filter):
-                    key = f"{hit.payload.get('collection_name', name)}:{hit.id}"
-                    existing = candidates.get(key)
-                    if existing is None or hit.score > existing.score:
-                        candidates[key] = hit
+                hits = _search_collection(name, query_filter=collection_filter)
+                for rank, hit in enumerate(hits[:prefetch], 1):
+                    payload = dict(hit.payload or {})
+                    payload.setdefault("collection_name", name)
+                    _register_candidate(
+                        "qdrant",
+                        payload,
+                        hit.id,
+                        float(getattr(hit, "score", 0.0)),
+                        rank,
+                        weights["qdrant"],
+                    )
 
         if not candidates:
             return []
 
-        hits = list(candidates.values())
+        ranked_candidates = sorted(
+            candidates.values(), key=lambda item: item.aggregated, reverse=True
+        )
+        hits = ranked_candidates[:prefetch]
+        if not hits:
+            return []
 
-        # --- Re-rank with cross-encoder ---
         pairs = [
             (
-                query,
+                rewritten_query,
                 h.payload.get(
                     "text_summary",
-                    h.payload.get(
-                        "content",
-                        h.payload.get("summary", ""),
-                    ),
+                    h.payload.get("content", h.payload.get("summary", "")),
                 ),
             )
             for h in hits
@@ -579,9 +656,9 @@ class RAGService:
             payload = getattr(hit, "payload", {}) or {}
             collection = payload.get("collection_name", self.primary_collection)
             document_type = str(payload.get("document_type", "")).lower()
-            weights = getattr(self, "_preference_weights", {}) or {}
-            collection_weights = weights.get("collection", {}) or {}
-            document_weights = weights.get("document_type", {}) or {}
+            weights_map = getattr(self, "_preference_weights", {}) or {}
+            collection_weights = weights_map.get("collection", {}) or {}
+            document_weights = weights_map.get("document_type", {}) or {}
 
             bonus = float(collection_weights.get(collection, 0.0))
             if collection == self.static_policy_collection:
@@ -596,7 +673,7 @@ class RAGService:
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         for hit, score in zip(hits, scores):
             base_score = float(score)
-            combined = base_score + _priority_bonus(hit)
+            combined = base_score + hit.aggregated + _priority_bonus(hit)
             scored_hits.append((hit, combined, base_score))
 
         if not scored_hits:
@@ -636,7 +713,6 @@ class RAGService:
                 lowest_idx = min(range(len(selected)), key=lambda idx: selected[idx][1])
                 selected[lowest_idx] = replacement_candidate
 
-        # Remove duplicates while preserving highest combined score order
         deduped: List[Tuple[SimpleNamespace, float, float]] = []
         seen_keys: Set[Tuple[str, str]] = set()
         for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
@@ -649,23 +725,110 @@ class RAGService:
 
         results = [hit for hit, _, _ in deduped[:top_k]]
 
-        cache_payload: List[Dict[str, Any]] = []
-        for hit, combined, base in deduped[:top_k]:
-            payload = self._normalise_payload_for_cache(getattr(hit, "payload", {}) or {})
-            cache_payload.append(
-                {
-                    "id": getattr(hit, "id", payload.get("record_id")),
-                    "collection_name": payload.get(
-                        "collection_name", self.primary_collection
-                    ),
-                    "payload": payload,
-                    "score": base,
-                    "combined_score": combined,
-                }
-            )
-        self._semantic_cache.set_query_results(query, cache_payload)
+        if use_cache:
+            cache_payload: List[Dict[str, Any]] = []
+            for hit, combined, base in deduped[:top_k]:
+                payload = self._normalise_payload_for_cache(
+                    getattr(hit, "payload", {}) or {}
+                )
+                cache_payload.append(
+                    {
+                        "id": getattr(hit, "id", payload.get("record_id")),
+                        "collection_name": payload.get(
+                            "collection_name", self.primary_collection
+                        ),
+                        "payload": payload,
+                        "score": base,
+                        "combined_score": combined,
+                        "aggregated_score": getattr(hit, "aggregated", 0.0),
+                    }
+                )
+            self._semantic_cache.set_query_results(rewritten_query, cache_payload)
 
         return results
+
+    def _rewrite_query(
+        self, query: str
+    ) -> Tuple[str, List[models.FieldCondition]]:
+        normalised = re.sub(r"\s+", " ", query or "").strip()
+        if not normalised:
+            return "", []
+
+        normalised = re.sub(
+            r"(?i)\bpo[-\s]?(\d{3,})\b",
+            lambda match: f"purchase order {match.group(1)}",
+            normalised,
+        )
+
+        conditions: List[models.FieldCondition] = []
+
+        def _ensure_condition(field: str, value: str) -> None:
+            for condition in conditions:
+                if getattr(condition, "key", None) == field:
+                    match_obj = getattr(condition, "match", None)
+                    if isinstance(match_obj, models.MatchValue) and match_obj.value == value:
+                        return
+            conditions.append(
+                models.FieldCondition(key=field, match=models.MatchValue(value=value))
+            )
+
+        lowered = normalised.lower()
+        if "policy" in lowered:
+            _ensure_condition("source_type", "Policy")
+        if "invoice" in lowered:
+            _ensure_condition("source_type", "Invoice")
+        if "purchase order" in lowered:
+            _ensure_condition("source_type", "PO")
+        if "quote" in lowered:
+            _ensure_condition("source_type", "Quote")
+
+        rounds = re.findall(r"\bround(?:\s+|#)(\d+)\b", lowered)
+        for round_id in rounds:
+            _ensure_condition("round_id", round_id)
+
+        years = sorted(set(re.findall(r"\b(20[0-4]\d|19\d{2})\b", lowered)))
+        for year in years:
+            conditions.append(
+                models.FieldCondition(
+                    key="effective_date", match=models.MatchText(text=year)
+                )
+            )
+
+        synonyms: Dict[str, List[str]] = {
+            "payment terms": ["net terms", "discount period"],
+            "lead time": ["delivery time", "turnaround"],
+            "escalation": ["escalation clause"],
+        }
+        expansions: List[str] = []
+        for phrase, alternatives in synonyms.items():
+            if phrase in lowered:
+                expansions.extend(alternatives)
+
+        if expansions:
+            unique = " ".join(sorted(set(expansions)))
+            normalised = f"{normalised} {unique}".strip()
+
+        return normalised, conditions
+
+    def _merge_filters(
+        self,
+        base_filter: Optional[models.Filter],
+        extra_conditions: List[models.FieldCondition],
+    ) -> Optional[models.Filter]:
+        if not extra_conditions:
+            return base_filter
+        if base_filter is None:
+            return models.Filter(must=list(extra_conditions))
+
+        merged_must = list(getattr(base_filter, "must", []) or [])
+        merged_must.extend(extra_conditions)
+        merged_must_not = list(getattr(base_filter, "must_not", []) or [])
+        merged_should = list(getattr(base_filter, "should", []) or [])
+        return models.Filter(
+            must=merged_must,
+            must_not=merged_must_not if merged_must_not else None,
+            should=merged_should if merged_should else None,
+        )
 
     def create_langchain_retriever_tool(
         self,
@@ -803,7 +966,8 @@ class RAGService:
     def _augment_candidates_from_cache(
         self,
         cached_entries: List[Dict[str, Any]],
-        candidates: Dict[str, SimpleNamespace],
+        register: Callable[[str, Dict[str, Any], Any, float, int, float], None],
+        weight: float,
     ) -> None:
         for entry in cached_entries:
             response = entry.get("response")
@@ -817,26 +981,23 @@ class RAGService:
             if not isinstance(hits, list):
                 continue
             similarity = float(entry.get("similarity") or 0.0)
-            weight = max(0.45, min(1.0, similarity))
-            for cached_hit in hits:
+            similarity_weight = max(0.45, min(1.0, similarity))
+            effective_weight = weight * similarity_weight
+            for rank, cached_hit in enumerate(hits, 1):
                 rebuilt = self._convert_cache_hit(cached_hit)
                 if rebuilt is None:
                     continue
-                collection_name = (
-                    getattr(rebuilt, "payload", {}) or {}
-                ).get("collection_name")
-                if collection_name and collection_name == self.learning_collection:
-                    continue
-                score = float(cached_hit.get("combined_score", cached_hit.get("score", 0.0)))
-                adjusted = score * weight
-                key = f"{rebuilt.payload.get('collection_name', self.primary_collection)}:{rebuilt.id}"
-                existing = candidates.get(key)
-                if existing is None or adjusted > existing.score:
-                    candidates[key] = SimpleNamespace(
-                        id=rebuilt.id,
-                        payload=rebuilt.payload,
-                        score=adjusted,
-                    )
+                score = float(
+                    cached_hit.get("combined_score", cached_hit.get("score", 0.0))
+                )
+                register(
+                    "cache",
+                    rebuilt.payload,
+                    rebuilt.id,
+                    score,
+                    rank,
+                    effective_weight,
+                )
 
     def _convert_cache_hit(self, cached_hit: Dict[str, Any]) -> Optional[SimpleNamespace]:
         if not isinstance(cached_hit, dict):

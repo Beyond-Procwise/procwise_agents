@@ -257,11 +257,25 @@ class StaticPolicyLoader(DocumentEmbeddingService):
         if not isinstance(text, str) or not text.strip():
             raise ValueError(f"Document {filename} produced no textual content")
 
+        document_id = self._derive_document_id(bucket, key, etag)
+        chunk_seed: Dict[str, Any] = {
+            "document_id": document_id,
+            "doc_name": Path(filename).stem,
+            "title": extracted.metadata.get("title") or Path(filename).stem,
+            "document_type": "Policy",
+            "source_type": "Policy",
+            "effective_date": extracted.metadata.get("effective_date"),
+            "supplier": extracted.metadata.get("supplier"),
+            "doc_version": extracted.metadata.get("doc_version"),
+            "round_id": extracted.metadata.get("round_id"),
+        }
+
         chunks = self._build_document_chunks(
             text,
             filename=filename,
             document_type_hint="Policy",
             extraction_metadata=extracted.metadata,
+            base_metadata=chunk_seed,
         )
         if not chunks:
             raise ValueError(f"No embeddable chunks produced for {filename}")
@@ -273,7 +287,6 @@ class StaticPolicyLoader(DocumentEmbeddingService):
         vector_size = len(vectors[0])
         self._ensure_policy_collection(vector_size)
 
-        document_id = self._derive_document_id(bucket, key, etag)
         namespace_uuid = uuid.UUID(document_id)
         ingested_at = datetime.utcnow().isoformat(timespec="seconds")
         last_modified_iso = (
@@ -287,7 +300,7 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             "collection_name": self.collection_name,
             "policy_source": "static_policy",
             "official_policy": True,
-            "document_type": "policy",
+            "document_type": "Policy",
             "doc_name": Path(filename).stem,
             "filename": filename,
             "file_extension": Path(filename).suffix.lower(),
@@ -300,7 +313,14 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             "s3_last_modified": last_modified_iso,
             "extraction_method": extracted.method,
         }
+        base_metadata.update(chunk_seed)
         base_metadata.update(extracted.metadata or {})
+        base_metadata.setdefault("source_type", "Policy")
+        base_metadata.setdefault("title", chunk_seed.get("title"))
+        base_metadata.setdefault("effective_date", chunk_seed.get("effective_date"))
+        base_metadata.setdefault("supplier", chunk_seed.get("supplier"))
+        base_metadata.setdefault("doc_version", chunk_seed.get("doc_version"))
+        base_metadata.setdefault("round_id", chunk_seed.get("round_id"))
 
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
@@ -311,8 +331,6 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             payload["chunk_index"] = idx
             payload["content"] = chunk.content
             payload["text_summary"] = chunk.content
-            payload.setdefault("section", chunk.metadata.get("section"))
-            payload.setdefault("content_type", chunk.metadata.get("content_type"))
             payload["embedding_model"] = self._embedding_model_name
 
             point_id = uuid.uuid5(namespace_uuid, str(idx))

@@ -9,12 +9,13 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from qdrant_client import models
 
-from services.document_extractor import LayoutAwareParser, LayoutTable
+from services.document_extractor import LayoutAwareParser
+from services.semantic_chunker import SemanticChunker
 from services.semantic_cache import SemanticCacheManager
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class DocumentEmbeddingService:
         self._rag_service: Optional[Any] = None
         self._rag_service_failed = False
         self._layout_parser = LayoutAwareParser()
+        self._chunker = SemanticChunker(settings=self.settings)
         self._semantic_cache = (
             SemanticCacheManager(self.settings, namespace="document_embeddings")
             if self.settings is not None
@@ -127,11 +129,25 @@ class DocumentEmbeddingService:
             filename=filename,
             document_type_hint=document_type,
             extraction_metadata=extracted.metadata,
+            base_metadata=metadata_payload,
         )
         if not chunks:
             raise ValueError("Document extraction produced no embeddable chunks")
 
-        metadata_payload.setdefault("document_type", self._infer_document_type(text, document_type))
+        first_chunk_metadata = chunks[0].metadata if chunks else {}
+        metadata_payload.setdefault(
+            "document_type", first_chunk_metadata.get("document_type")
+        )
+        metadata_payload.setdefault(
+            "source_type", first_chunk_metadata.get("source_type")
+        )
+        metadata_payload.setdefault("title", first_chunk_metadata.get("title"))
+        metadata_payload.setdefault(
+            "effective_date", first_chunk_metadata.get("effective_date")
+        )
+        metadata_payload.setdefault("supplier", first_chunk_metadata.get("supplier"))
+        metadata_payload.setdefault("doc_version", first_chunk_metadata.get("doc_version"))
+        metadata_payload.setdefault("round_id", first_chunk_metadata.get("round_id"))
         vectors = self._encode_chunks(chunks)
         if not vectors:
             raise ValueError("Embedding model returned no vectors")
@@ -265,165 +281,41 @@ class DocumentEmbeddingService:
         filename: str,
         document_type_hint: Optional[str],
         extraction_metadata: Dict[str, Any],
+        base_metadata: Dict[str, Any],
     ) -> List[DocumentChunk]:
         structured = self._layout_parser.from_text(
             text, scanned=self._looks_like_scanned(text, extraction_metadata)
         )
         doc_type = self._infer_document_type(text, document_type_hint)
-        max_chars, overlap = self._chunk_size_preferences()
+        chunk_metadata_seed = {
+            "doc_name": base_metadata.get("doc_name", Path(filename).stem),
+            "document_type": doc_type,
+            "title": base_metadata.get("title")
+            or extraction_metadata.get("title")
+            or Path(filename).stem,
+            "source_type": base_metadata.get("source_type")
+            or self._derive_source_type(doc_type, base_metadata.get("source_type")),
+            "effective_date": base_metadata.get("effective_date")
+            or extraction_metadata.get("effective_date"),
+            "supplier": base_metadata.get("supplier")
+            or extraction_metadata.get("supplier"),
+            "doc_version": base_metadata.get("doc_version")
+            or extraction_metadata.get("doc_version"),
+            "round_id": base_metadata.get("round_id")
+            or extraction_metadata.get("round_id"),
+        }
+        chunks = self._chunker.build_from_structured(
+            structured,
+            document_type=doc_type,
+            base_metadata=chunk_metadata_seed,
+            title_hint=chunk_metadata_seed["title"],
+            default_section="document_overview",
+        )
 
-        chunks: List[DocumentChunk] = []
-        paragraph_buffer: List[str] = []
-        current_section = "document_overview"
-
-        def flush_paragraph_buffer() -> None:
-            nonlocal paragraph_buffer
-            if not paragraph_buffer:
-                return
-            combined = "\n".join(paragraph_buffer).strip()
-            paragraph_buffer = []
-            for part in self._split_text(combined, max_chars, overlap):
-                if not part.strip():
-                    continue
-                chunks.append(
-                    DocumentChunk(
-                        content=part,
-                        metadata={
-                            "section": current_section,
-                            "content_type": "paragraph",
-                            "document_type": doc_type,
-                        },
-                    )
-                )
-
-        for element in structured.elements:
-            text_value = element.text.strip()
-            if not text_value:
-                continue
-
-            if element.type in {"title", "heading"}:
-                flush_paragraph_buffer()
-                current_section = self._normalise_section_name(text_value)
-                chunks.append(
-                    DocumentChunk(
-                        content=text_value,
-                        metadata={
-                            "section": current_section,
-                            "content_type": "heading",
-                            "document_type": doc_type,
-                        },
-                    )
-                )
-                continue
-
-            if element.type == "key_value":
-                flush_paragraph_buffer()
-                key = element.metadata.get("key") or text_value
-                value = element.metadata.get("value", "")
-                formatted = f"{key}: {value}".strip()
-                chunks.append(
-                    DocumentChunk(
-                        content=formatted,
-                        metadata={
-                            "section": current_section,
-                            "content_type": "key_value",
-                            "field_key": key,
-                            "field_value": value,
-                            "document_type": doc_type,
-                        },
-                    )
-                )
-                continue
-
-            paragraph_buffer.append(text_value)
-            combined_length = sum(len(line) for line in paragraph_buffer)
-            if combined_length >= max_chars:
-                flush_paragraph_buffer()
-
-        flush_paragraph_buffer()
-
-        for table in structured.tables:
-            table_chunks = self._render_table_chunks(
-                table,
-                section=current_section,
-                document_type=doc_type,
-                max_chars=max_chars,
-                overlap=overlap,
-            )
-            chunks.extend(table_chunks)
-
-        # Fall back to whole document if no structured chunks were produced
         if not chunks:
-            for part in self._split_text(text, max_chars, overlap):
-                chunks.append(
-                    DocumentChunk(
-                        content=part,
-                        metadata={
-                            "section": current_section,
-                            "content_type": "paragraph",
-                            "document_type": doc_type,
-                        },
-                    )
-                )
-
-        return chunks
-
-    def _chunk_size_preferences(self) -> Tuple[int, int]:
-        default_max = 1200
-        default_overlap = 220
-        if self.settings is not None:
-            configured_max = getattr(self.settings, "rag_chunk_chars", default_max)
-            configured_overlap = getattr(self.settings, "rag_chunk_overlap", default_overlap)
-            max_chars = max(int(configured_max), 400)
-            overlap = max(0, min(int(configured_overlap), max_chars - 1))
-            return max_chars, overlap
-        return default_max, default_overlap
-
-    def _split_text(self, text: str, max_chars: int, overlap: int) -> List[str]:
-        cleaned = " ".join(text.split())
-        if not cleaned:
-            return []
-        if max_chars <= 0:
-            return [cleaned]
-        step = max_chars - overlap if max_chars > overlap else max_chars
-        return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
-
-    def _render_table_chunks(
-        self,
-        table: LayoutTable,
-        *,
-        section: str,
-        document_type: str,
-        max_chars: int,
-        overlap: int,
-    ) -> List[DocumentChunk]:
-        if not table.headers and not table.rows:
             return []
 
-        lines = []
-        headers = table.headers or []
-        if headers:
-            lines.append(" | ".join(headers))
-            lines.append(" | ".join(["---"] * len(headers)))
-        for row in table.rows:
-            lines.append(" | ".join(row))
-        table_text = "\n".join(lines)
-        chunks: List[DocumentChunk] = []
-        for part in self._split_text(table_text, max_chars, overlap):
-            if not part.strip():
-                continue
-            chunk_metadata = {
-                "section": section,
-                "content_type": "table",
-                "document_type": document_type,
-            }
-            chunk_metadata.update(table.metadata)
-            chunks.append(DocumentChunk(content=part, metadata=chunk_metadata))
-        return chunks
-
-    def _normalise_section_name(self, value: str) -> str:
-        cleaned = "_".join(part for part in value.lower().split() if part)
-        return cleaned or "section"
+        return [DocumentChunk(content=chunk.content, metadata=chunk.metadata) for chunk in chunks]
 
     def _looks_like_scanned(self, text: str, metadata: Dict[str, Any]) -> bool:
         if metadata.get("content_type") == "image":
@@ -512,6 +404,13 @@ class DocumentEmbeddingService:
             "document_type",
             "content_type",
             "section",
+            "section_path",
+            "source_type",
+            "title",
+            "effective_date",
+            "supplier",
+            "doc_version",
+            "round_id",
         }
         for field in required:
             if field in indexed_fields:
@@ -603,6 +502,23 @@ class DocumentEmbeddingService:
             logger.exception(
                 "Failed to propagate uploaded document chunks to primary RAG store"
             )
+
+    def _derive_source_type(
+        self, document_type: Optional[str], explicit: Optional[str]
+    ) -> str:
+        if explicit:
+            return str(explicit)
+        mapping = {
+            "invoice": "Invoice",
+            "purchase_order": "PO",
+            "purchase order": "PO",
+            "po": "PO",
+            "contract": "Contract",
+            "quote": "Quote",
+            "policy": "Policy",
+        }
+        key = (document_type or "uploaded_document").replace("_", " ").lower()
+        return mapping.get(key, "Upload")
 
     def _infer_document_type(
         self, text: str, document_type_hint: Optional[str] = None
