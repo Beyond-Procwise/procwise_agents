@@ -196,6 +196,11 @@ class Settings(BaseSettings):
     )
     rag_chunk_chars: int = Field(default=1800, env="RAG_CHUNK_CHARS")
     rag_chunk_overlap: int = Field(default=350, env="RAG_CHUNK_OVERLAP")
+    rag_chunk_min_tokens: int = Field(default=320, env="RAG_CHUNK_MIN_TOKENS")
+    rag_chunk_max_tokens: int = Field(default=880, env="RAG_CHUNK_MAX_TOKENS")
+    rag_chunk_overlap_ratio: float = Field(
+        default=0.12, env="RAG_CHUNK_OVERLAP_RATIO"
+    )
     ollama_quantized_model: Optional[str] = Field(
         default=None, env="OLLAMA_QUANTIZED_MODEL"
     )
