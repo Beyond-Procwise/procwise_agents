@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 from types import SimpleNamespace
+from typing import Any, Dict
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -259,3 +260,60 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     assert result["retrieved_documents"] == []
     assert len(result["follow_ups"]) == 3
     assert history_store["payloads"], "Fallback answers should still be recorded in history"
+
+
+def test_pipeline_prefers_explicit_session_id(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, query, **kwargs):
+            captured["query"] = query
+            captured["kwargs"] = kwargs
+            return []
+
+        def upsert_texts(self, texts, metadata=None):
+            pass
+
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    class DummyStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, *args, **kwargs):
+            return AgentOutput(status=AgentStatus.SUCCESS, data={}, confidence=0.0)
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
+
+    history_store: Dict[str, Any] = {"payloads": []}
+
+    def _get_object(**kwargs):
+        return {"Body": SimpleNamespace(read=lambda: b"[]")}
+
+    def _put_object(**kwargs):
+        history_store["payloads"].append(kwargs)
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(get_object=_get_object, put_object=_put_object),
+        settings=SimpleNamespace(
+            qdrant_collection_name="c",
+            s3_bucket_name="b",
+            reranker_model="x",
+            static_qa_confidence_threshold=0.5,
+        ),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
+    pipeline.register_session_upload("session-xyz", ["doc-1"])
+
+    pipeline.answer_question("q", "user-123", session_id="session-xyz")
+
+    assert captured["kwargs"]["session_id"] == "session-xyz"
+    assert history_store["payloads"], "History should still be saved even without retrieval"

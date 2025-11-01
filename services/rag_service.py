@@ -658,6 +658,7 @@ class RAGService:
         session_hint: Optional[str] = None,
         memory_fragments: Optional[List[str]] = None,
         policy_mode: bool = False,
+        nltk_features: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
     ):
         """Retrieve and rerank documents for the given query."""
