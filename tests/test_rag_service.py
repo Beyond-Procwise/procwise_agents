@@ -320,7 +320,11 @@ def test_pipeline_uploaded_context_mode(monkeypatch):
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
-    pipeline.activate_uploaded_context(["doc-123"], metadata={"filenames": ["file.pdf"]})
+    pipeline.activate_uploaded_context(
+        ["doc-123"],
+        metadata={"filenames": ["file.pdf"]},
+        session_id="user-456",
+    )
 
     result = pipeline.answer_question("What does the document say?", "user-456")
 

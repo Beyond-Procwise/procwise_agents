@@ -263,15 +263,10 @@ class RAGPipeline:
         except Exception:
             activated_at = datetime.utcnow().isoformat()
 
-        allowed_keys: List[str] = []
-        if session_token:
-            allowed_keys.append(session_token)
-
         self._uploaded_context = {
             "document_ids": cleaned,
             "metadata": dict(metadata or {}),
             "session_id": session_token or None,
-            "allowed_keys": allowed_keys,
             "activated_at": activated_at,
         }
 
@@ -1528,61 +1523,41 @@ class RAGPipeline:
         except Exception:
             uploaded_documents = []
 
-        raw_allowed = uploaded_scope.get("allowed_keys")
-        if isinstance(raw_allowed, (str, bytes)):
-            raw_allowed = [raw_allowed]
-        allowed_list: List[str] = []
-        for value in raw_allowed or []:
+        matched_owner: Optional[str] = None
+        scope_session_token: Optional[str] = None
+        scope_metadata: Dict[str, Any] = {}
+        allowed_identifiers: List[str] = []
+        if uploaded_scope:
             try:
-                cleaned_value = str(value).strip()
+                scope_metadata = dict(uploaded_scope.get("metadata") or {})
             except Exception:
-                cleaned_value = ""
-            if cleaned_value and cleaned_value not in allowed_list:
-                allowed_list.append(cleaned_value)
+                scope_metadata = {}
 
-        scope_allowed = set(allowed_list)
+            raw_scope_session = uploaded_scope.get("session_id") if isinstance(uploaded_scope, dict) else None
+            if raw_scope_session is not None:
+                try:
+                    cleaned_scope_session = str(raw_scope_session).strip()
+                except Exception:
+                    cleaned_scope_session = ""
+                if cleaned_scope_session:
+                    scope_session_token = cleaned_scope_session
+                    allowed_identifiers.append(cleaned_scope_session)
 
-        scope_session_raw = uploaded_scope.get("session_id")
-        scope_session: str = ""
-        if scope_session_raw is not None:
-            try:
-                scope_session = str(scope_session_raw).strip()
-            except Exception:
-                scope_session = ""
-            if scope_session and scope_session not in scope_allowed:
-                allowed_list.append(scope_session)
-                scope_allowed.add(scope_session)
+            uploaded_by = scope_metadata.get("uploaded_by")
+            if isinstance(uploaded_by, str):
+                cleaned_uploaded_by = uploaded_by.strip()
+                if cleaned_uploaded_by:
+                    allowed_identifiers.append(cleaned_uploaded_by)
 
-        candidate_values = [key for key in candidate_keys if key]
-        matched_key: Optional[str] = None
-        for candidate in candidate_values:
-            if candidate in scope_allowed:
-                matched_key = candidate
-                break
-
-        restrict_to_uploaded = bool(uploaded_documents)
-        if restrict_to_uploaded and scope_allowed and not matched_key:
-            restrict_to_uploaded = False
-
-        allowed_list_changed = False
-        if restrict_to_uploaded and not scope_allowed:
-            for candidate in candidate_values:
-                if candidate:
-                    matched_key = candidate
-                    allowed_list.append(candidate)
-                    scope_allowed.add(candidate)
-                    allowed_list_changed = True
+        restrict_to_uploaded = False
+        if uploaded_documents and allowed_identifiers:
+            for candidate in candidate_keys:
+                if candidate and candidate in allowed_identifiers:
+                    matched_owner = candidate
+                    restrict_to_uploaded = True
                     break
 
-        if allowed_list_changed:
-            uploaded_scope["allowed_keys"] = list(allowed_list)
-            self._uploaded_context = uploaded_scope
-        elif scope_allowed and uploaded_scope.get("allowed_keys") != allowed_list:
-            uploaded_scope["allowed_keys"] = list(allowed_list)
-            self._uploaded_context = uploaded_scope
-
         if restrict_to_uploaded:
-            scope_metadata = dict(uploaded_scope.get("metadata") or {})
             combined_record = dict(session_record or {})
             combined_metadata = dict(combined_record.get("metadata") or {})
             combined_metadata.update(scope_metadata)
@@ -1590,8 +1565,10 @@ class RAGPipeline:
                 "document_ids": list(uploaded_documents),
                 "metadata": combined_metadata,
             }
-            if matched_key and session_key != matched_key:
-                session_key = matched_key
+            if scope_session_token and not session_key:
+                session_key = scope_session_token
+            elif matched_owner and not session_key:
+                session_key = matched_owner
 
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
