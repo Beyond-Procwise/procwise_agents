@@ -71,6 +71,24 @@ class Settings(BaseSettings):
     langcache_api_key: Optional[str] = Field(
         default=None, env="LANGCACHE_API_KEY"
     )
+    langcache_server_url: Optional[str] = Field(
+        default=None, env="LANGCACHE_SERVER_URL"
+    )
+    langcache_cache_id: Optional[str] = Field(
+        default=None, env="LANGCACHE_CACHE_ID"
+    )
+    langcache_embedding_ttl_seconds: int = Field(
+        default=604800, env="LANGCACHE_EMBEDDING_TTL_SECONDS"
+    )
+    langcache_query_ttl_seconds: int = Field(
+        default=86400, env="LANGCACHE_QUERY_TTL_SECONDS"
+    )
+    langcache_embedding_similarity_threshold: float = Field(
+        default=0.985, env="LANGCACHE_EMBEDDING_SIMILARITY_THRESHOLD"
+    )
+    langcache_query_similarity_threshold: float = Field(
+        default=0.93, env="LANGCACHE_QUERY_SIMILARITY_THRESHOLD"
+    )
     redis_response_ttl_seconds: int = Field(
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
