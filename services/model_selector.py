@@ -4,12 +4,14 @@ import inspect
 import json
 import logging
 import re
-import ollama
-import pdfplumber
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Type
+
+import ollama
+import pdfplumber
 from botocore.exceptions import ClientError
-from typing import Any, Dict, List, Optional, Type
 from sentence_transformers import CrossEncoder
 from config.settings import settings
 from qdrant_client import models
@@ -157,6 +159,39 @@ class RAGPipeline:
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
         self._citation_guidelines = self._load_citation_guidelines()
+        self._session_uploads: Dict[str, Dict[str, Any]] = {}
+
+    def register_session_upload(
+        self,
+        session_id: str,
+        document_ids: Sequence[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record uploaded document identifiers for the active user session."""
+
+        if not session_id or not document_ids:
+            return
+
+        cleaned_id = session_id.strip() if isinstance(session_id, str) else str(session_id)
+        cleaned_id = cleaned_id.strip()
+        if not cleaned_id:
+            return
+
+        filtered_docs = [doc for doc in document_ids if str(doc).strip()]
+        if not filtered_docs:
+            return
+
+        try:
+            timestamp = datetime.utcnow().isoformat(timespec="seconds")
+        except Exception:
+            timestamp = datetime.utcnow().isoformat()
+
+        self._session_uploads[cleaned_id] = {
+            "document_ids": list(filtered_docs),
+            "metadata": dict(metadata or {}),
+            "registered_at": timestamp,
+        }
 
     def _format_static_answer(self, answer: str) -> str:
         cleaned = answer.strip()
@@ -789,6 +824,8 @@ class RAGPipeline:
         )
 
         history = self.history_manager.get_history(user_id)
+        session_key = user_id.strip() if isinstance(user_id, str) else None
+        session_record = self._session_uploads.get(session_key) if session_key else None
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
         )
@@ -835,11 +872,17 @@ class RAGPipeline:
             "top_k": 6,
             "filters": qdrant_filter,
         }
+        if session_key:
+            search_kwargs["session_id"] = session_key
         hint_kwargs = {
             "session_hint": session_hint,
             "memory_fragments": memory_fragments,
             "policy_mode": policy_mode,
         }
+        if session_key:
+            hint_kwargs["session_id"] = session_key
+        if session_record:
+            hint_kwargs["session_documents"] = session_record.get("document_ids")
         search_kwargs.update(self._supported_search_kwargs(hint_kwargs))
         reranked = self.rag.search(query, **search_kwargs)
         knowledge_items = self._prepare_knowledge_items(reranked)
