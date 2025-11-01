@@ -468,24 +468,38 @@ async def embed_documents(
         detail = failures[0].reason if failures else "No documents were processed."
         raise HTTPException(status_code=400, detail=detail)
 
+    uploaded_document_ids = [doc.document_id for doc in processed]
+    upload_metadata = {
+        "filenames": [
+            doc.metadata.get("filename") or doc.metadata.get("doc_name") for doc in processed
+        ],
+        "total_chunks": total_chunks,
+    }
+
     if resolved_session:
         try:
             pipeline.register_session_upload(
                 resolved_session,
-                [doc.document_id for doc in processed],
-                metadata={
-                    "filenames": [
-                        doc.metadata.get("filename") or doc.metadata.get("doc_name")
-                        for doc in processed
-                    ],
-                    "total_chunks": total_chunks,
-                },
+                uploaded_document_ids,
+                metadata=upload_metadata,
             )
         except AttributeError:
             logger.debug(
                 "RAG pipeline does not support session upload registration",
                 exc_info=True,
             )
+
+    try:
+        pipeline.activate_uploaded_context(
+            uploaded_document_ids,
+            metadata=upload_metadata,
+            session_id=resolved_session,
+        )
+    except AttributeError:
+        logger.debug(
+            "RAG pipeline does not expose uploaded context activation",
+            exc_info=True,
+        )
 
     return DocumentEmbeddingBatchResponse(
         status="success",

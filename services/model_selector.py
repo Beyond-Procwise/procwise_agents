@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import ollama
 import pdfplumber
@@ -168,6 +168,7 @@ class RAGPipeline:
         )
         self._citation_guidelines = self._load_citation_guidelines()
         self._session_uploads: Dict[str, Dict[str, Any]] = {}
+        self._uploaded_context: Optional[Dict[str, Any]] = None
         self._nltk_processor = NLTKProcessor() if use_nltk else None
         if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
@@ -202,6 +203,78 @@ class RAGPipeline:
             "document_ids": list(filtered_docs),
             "metadata": dict(metadata or {}),
             "registered_at": timestamp,
+        }
+
+        self._set_uploaded_context(
+            filtered_docs,
+            metadata=metadata,
+            session_id=cleaned_id,
+        )
+
+    def activate_uploaded_context(
+        self,
+        document_ids: Sequence[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Force the pipeline to prioritise ad-hoc uploaded documents."""
+
+        self._set_uploaded_context(
+            document_ids,
+            metadata=metadata,
+            session_id=session_id,
+        )
+
+    def clear_uploaded_context(self) -> None:
+        """Disable prioritisation of uploaded document context."""
+
+        self._uploaded_context = None
+
+    def uploaded_context_active(self) -> bool:
+        """Return ``True`` when uploaded document prioritisation is active."""
+
+        record = self._uploaded_context or {}
+        docs = record.get("document_ids")
+        return bool(docs)
+
+    def _set_uploaded_context(
+        self,
+        document_ids: Sequence[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        cleaned: List[str] = []
+        for value in document_ids or []:
+            try:
+                text = str(value).strip()
+            except Exception:
+                text = ""
+            if text:
+                cleaned.append(text)
+
+        if not cleaned:
+            return
+
+        if session_id is not None:
+            try:
+                session_token = str(session_id).strip()
+            except Exception:
+                session_token = ""
+        else:
+            session_token = ""
+
+        try:
+            activated_at = datetime.utcnow().isoformat(timespec="seconds")
+        except Exception:
+            activated_at = datetime.utcnow().isoformat()
+
+        self._uploaded_context = {
+            "document_ids": cleaned,
+            "metadata": dict(metadata or {}),
+            "session_id": session_token or None,
+            "activated_at": activated_at,
         }
 
     def _format_static_answer(self, answer: str) -> str:
@@ -1418,6 +1491,35 @@ class RAGPipeline:
         if session_key is None and candidate_keys:
             session_key = candidate_keys[0]
 
+        uploaded_scope = self._uploaded_context or {}
+        uploaded_documents: List[str] = []
+        try:
+            uploaded_documents = [
+                str(doc).strip()
+                for doc in uploaded_scope.get("document_ids", [])
+                if str(doc).strip()
+            ]
+        except Exception:
+            uploaded_documents = []
+
+        restrict_to_uploaded = bool(uploaded_documents)
+        if restrict_to_uploaded:
+            scope_metadata = dict(uploaded_scope.get("metadata") or {})
+            combined_record = dict(session_record or {})
+            combined_metadata = dict(combined_record.get("metadata") or {})
+            combined_metadata.update(scope_metadata)
+            session_record = {
+                "document_ids": list(uploaded_documents),
+                "metadata": combined_metadata,
+            }
+            scope_session = uploaded_scope.get("session_id")
+            if scope_session and not session_key:
+                try:
+                    cleaned_scope_session = str(scope_session).strip()
+                except Exception:
+                    cleaned_scope_session = ""
+                session_key = cleaned_scope_session or session_key
+
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
         )
@@ -1439,6 +1541,14 @@ class RAGPipeline:
                     key="product_type", match=models.MatchValue(value=product_type)
                 )
             )
+        if restrict_to_uploaded and uploaded_documents:
+            if len(uploaded_documents) == 1:
+                doc_match = models.MatchValue(value=uploaded_documents[0])
+            else:
+                doc_match = models.MatchAny(any=uploaded_documents)
+            must_conditions.append(
+                models.FieldCondition(key="document_id", match=doc_match)
+            )
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
         uploaded = self._extract_text_from_uploads(files) if files else []
@@ -1457,9 +1567,11 @@ class RAGPipeline:
                 self.rag.upsert_texts([text], metadata)
         ad_hoc_context = "\n".join(ad_hoc_notes)
 
-        policy_mode = self._is_policy_question(
-            query, doc_type, session_hint, history_policy_signal
-        )
+        policy_mode = False
+        if not restrict_to_uploaded:
+            policy_mode = self._is_policy_question(
+                query, doc_type, session_hint, history_policy_signal
+            )
         search_kwargs = {
             "top_k": 6,
             "filters": qdrant_filter,
@@ -1478,10 +1590,12 @@ class RAGPipeline:
         if session_record:
             hint_kwargs["session_documents"] = session_record.get("document_ids")
         search_kwargs.update(self._supported_search_kwargs(hint_kwargs))
+        if restrict_to_uploaded:
+            search_kwargs["collections"] = (self.rag.uploaded_collection,)
         reranked = self.rag.search(query, **search_kwargs)
         knowledge_items = self._prepare_knowledge_items(reranked)
 
-        if knowledge_items:
+        if knowledge_items and not restrict_to_uploaded:
             try:
                 static_output = self._static_agent.run(
                     query=query,
