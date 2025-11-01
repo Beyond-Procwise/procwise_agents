@@ -1,9 +1,12 @@
-from __future__ import annotations
-
+import os
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 
-from services.static_policy_loader import StaticPolicyLoader
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from services.static_policy_loader import StaticPolicyLoader  # noqa: E402
 
 
 class _DummyBody:
@@ -102,6 +105,60 @@ def _build_agent_nick(s3_client, qdrant_client):
     )
 
 
+def _escape_pdf_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _build_simple_pdf(text: str) -> bytes:
+    escaped = _escape_pdf_text(text)
+    stream = f"BT\n/F1 12 Tf\n72 720 Td\n({escaped}) Tj\nET\n".encode("latin-1")
+
+    objects = [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        ),
+        (
+            4,
+            b"<< /Length %d >>\n" % len(stream)
+            + b"stream\n"
+            + stream
+            + b"endstream",
+        ),
+        (5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+    ]
+
+    header = b"%PDF-1.4\n"
+    body_parts = []
+    offsets = []
+    cursor = len(header)
+    for obj_number, payload in objects:
+        entry = (
+            f"{obj_number} 0 obj\n".encode("latin-1")
+            + payload
+            + b"\nendobj\n"
+        )
+        body_parts.append(entry)
+        offsets.append(cursor)
+        cursor += len(entry)
+
+    xref_offset = cursor
+    xref_header = f"xref\n0 {len(objects) + 1}\n".encode("latin-1")
+    xref_entries = [b"0000000000 65535 f \n"]
+    for offset in offsets:
+        xref_entries.append(f"{offset:010d} 00000 n \n".encode("latin-1"))
+
+    trailer = (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode("latin-1")
+        + f"startxref\n{xref_offset}\n%%EOF\n".encode("latin-1")
+    )
+
+    return header + b"".join(body_parts) + xref_header + b"".join(xref_entries) + trailer
+
+
 def test_static_policy_loader_ingests_and_skips():
     body = b"Procurement Policy\nSection 1\nClause A"
     entries = [
@@ -154,3 +211,29 @@ def test_static_policy_loader_force_refresh_triggers_delete():
     forced_summary = loader.sync_static_policy(force=True)
     assert forced_summary["ingested"] == 1
     assert qdrant_client.deleted
+
+
+def test_static_policy_loader_ingests_pdf_with_pdfplumber_fallback():
+    pdf_bytes = _build_simple_pdf("Policy Clause 1")
+    entries = [
+        {
+            "Key": "Static Policy/policy.pdf",
+            "Size": len(pdf_bytes),
+            "ETag": '"etag-pdf"',
+            "LastModified": datetime(2024, 3, 3, 0, 0),
+            "Body": pdf_bytes,
+        }
+    ]
+    s3_client = DummyS3Client("procwisemvp", entries)
+    qdrant_client = DummyQdrantClient()
+    agent_nick = _build_agent_nick(s3_client, qdrant_client)
+
+    loader = StaticPolicyLoader(agent_nick)
+    summary = loader.sync_static_policy(force=True)
+
+    assert summary["ingested"] == 1
+    assert qdrant_client.upserts
+    payloads = [point.payload for point in qdrant_client.upserts[-1]["points"]]
+    assert all(payload["extraction_method"] == "pdfplumber_fallback" for payload in payloads)
+    assert all(payload.get("pdf_page_count") == 1 for payload in payloads)
+    assert any("Clause 1" in payload["content"] for payload in payloads)
