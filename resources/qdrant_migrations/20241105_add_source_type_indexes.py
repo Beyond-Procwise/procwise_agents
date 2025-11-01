@@ -73,11 +73,7 @@ def _backfill_source_type(
             )
         )
     if expected_value:
-        scroll_filter.must_not.append(
-            models.FieldCondition(
-                key="source_type", match=models.MatchValue(value=expected_value)
-            )
-        )
+        scroll_filter.must.append(models.IsNullCondition(key="source_type"))
 
     offset: Optional[list[int]] = None
     total_updated = 0
@@ -93,7 +89,14 @@ def _backfill_source_type(
         if not points:
             break
 
-        point_ids = [point.id for point in points if point.id is not None]
+        point_ids = []
+        for point in points:
+            if point.id is None:
+                continue
+            payload = getattr(point, "payload", {}) or {}
+            if payload.get("source_type"):
+                continue
+            point_ids.append(point.id)
         if not point_ids:
             continue
         try:
