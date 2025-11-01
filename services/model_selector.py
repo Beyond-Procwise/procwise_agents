@@ -382,6 +382,9 @@ class RAGPipeline:
             r"(?i)\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
             r"(?i)\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
             r"(?i)\b(?:supplier|rfq|po|invoice|contract)\s*(?:number|no\.?|id|reference)?[:#\- ]*[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b",
+            r"(?i)\b[a-z0-9]+_agent\b",
+            r"\b(?:[A-Z][a-z]+){1,4}Agent\b",
+            r"(?i)\blearning[_-]?[A-Za-z0-9]+\b",
         )
 
         for pattern in patterns:
