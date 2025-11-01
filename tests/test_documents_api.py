@@ -147,11 +147,12 @@ def test_embed_document_without_user_id(api_app, monkeypatch):
             self.rag = DummyRAGService()
             self.activations = []
 
-        def activate_uploaded_context(self, document_ids, *, metadata=None):
+        def activate_uploaded_context(self, document_ids, *, metadata=None, session_id=None):
             self.activations.append(
                 {
                     "document_ids": list(document_ids or []),
                     "metadata": dict(metadata or {}),
+                    "session_id": session_id,
                 }
             )
 
@@ -211,6 +212,7 @@ def test_embed_document_without_user_id(api_app, monkeypatch):
         "filenames": ["invoice.txt"],
         "total_chunks": 2,
     }
+    assert activation["session_id"] is None
 
     processed = body["processed"][0]
     assert processed["document_id"] == "doc-001"
