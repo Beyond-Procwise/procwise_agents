@@ -800,6 +800,9 @@ class RAGService:
 
         rewritten_query, auto_conditions = self._rewrite_query(base_query)
         combined_filter = self._merge_filters(filters, auto_conditions)
+        combined_filter, session_key = self._separate_session_scope(
+            combined_filter, session_id
+        )
         policy_mode = bool(policy_mode or self._looks_like_policy_query(base_query, hint_text))
         search_text = rewritten_query or base_query
         feature_hint_parts = feature_keywords[:6] + feature_phrases[:4]
@@ -811,17 +814,6 @@ class RAGService:
         if hint_text:
             search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
-
-        if session_id is not None:
-            try:
-                cleaned = str(session_id).strip()
-            except Exception:
-                cleaned = ""
-            if cleaned:
-                logger.debug(
-                    "Ignoring session_id '%s' during search; uploaded document retrieval is session-agnostic",
-                    cleaned,
-                )
 
         query_matrix: Optional[np.ndarray] = None
         query_vector: Optional[List[float]] = None
@@ -1079,10 +1071,11 @@ class RAGService:
             session_specific_filter = self._merge_filters(
                 combined_filter,
                 [
-                    str(name).strip()
-                    for name in (collections or [])
-                    if isinstance(name, str) and str(name).strip()
-                ]
+                    models.FieldCondition(
+                        key="session_id",
+                        match=models.MatchValue(value=session_key),
+                    )
+                ],
             )
         if forced_collections:
             for name in forced_collections:
@@ -1113,6 +1106,8 @@ class RAGService:
                 ]
 
             for name, filt in ordered_candidates:
+                if session_specific_filter is not None and name == self.uploaded_collection:
+                    continue
                 _append_collection(name, filt)
 
         collections_to_query = tuple(base_collections)
@@ -1403,6 +1398,88 @@ class RAGService:
             must_not=merged_must_not if merged_must_not else None,
             should=merged_should if merged_should else None,
         )
+
+    def _separate_session_scope(
+        self,
+        active_filter: Optional[models.Filter],
+        session_id: Optional[str],
+    ) -> Tuple[Optional[models.Filter], Optional[str]]:
+        """Detach session-specific constraints from the shared filter space."""
+
+        session_token = self._normalise_session_token(session_id)
+        if active_filter is None:
+            return None, session_token
+
+        def _extract_from_condition(condition: Any) -> Tuple[bool, Optional[str]]:
+            if isinstance(condition, models.FieldCondition):
+                key = getattr(condition, "key", None)
+                if key and str(key).strip().lower() == "session_id":
+                    match_obj = getattr(condition, "match", None)
+                    candidate: Optional[str] = None
+                    if isinstance(match_obj, models.MatchValue):
+                        candidate = self._normalise_session_token(match_obj.value)
+                    elif isinstance(match_obj, models.MatchAny):
+                        for item in getattr(match_obj, "any", []) or []:
+                            candidate = self._normalise_session_token(item)
+                            if candidate:
+                                break
+                    return True, candidate
+            if isinstance(condition, dict):
+                key = str(condition.get("key") or condition.get("field") or "").strip().lower()
+                if key == "session_id":
+                    value = condition.get("value")
+                    if value is None:
+                        match_payload = condition.get("match")
+                        if isinstance(match_payload, dict):
+                            value = match_payload.get("value") or match_payload.get("any")
+                    candidate = None
+                    if isinstance(value, list):
+                        for item in value:
+                            candidate = self._normalise_session_token(item)
+                            if candidate:
+                                break
+                    else:
+                        candidate = self._normalise_session_token(value)
+                    return True, candidate
+            return False, None
+
+        def _process_conditions(items: Optional[Sequence[Any]]) -> List[Any]:
+            nonlocal session_token
+            processed: List[Any] = []
+            for condition in list(items or []):
+                should_remove, found = _extract_from_condition(condition)
+                if should_remove:
+                    if not session_token and found:
+                        session_token = found
+                    elif found:
+                        session_token = session_token or found
+                    continue
+                processed.append(condition)
+            return processed
+
+        must_conditions = _process_conditions(getattr(active_filter, "must", None))
+        must_not_conditions = _process_conditions(getattr(active_filter, "must_not", None))
+        should_conditions = _process_conditions(getattr(active_filter, "should", None))
+
+        if not (must_conditions or must_not_conditions or should_conditions):
+            return None, session_token
+
+        cleaned_filter = models.Filter(
+            must=must_conditions or None,
+            must_not=must_not_conditions or None,
+            should=should_conditions or None,
+        )
+        return cleaned_filter, session_token
+
+    @staticmethod
+    def _normalise_session_token(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
 
     def create_langchain_retriever_tool(
         self,

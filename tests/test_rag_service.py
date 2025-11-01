@@ -99,6 +99,44 @@ def test_upsert_payloads_respects_source_collection():
     assert nick.qdrant_client.upserts[0]["collection_name"] == "uploaded_documents"
 
 
+def test_search_scopes_uploaded_collection_to_session():
+    qdrant = DummyQdrant()
+    nick = SimpleNamespace(
+        device="cpu",
+        settings=SimpleNamespace(qdrant_collection_name="c", reranker_model="x"),
+        qdrant_client=qdrant,
+        embedding_model=DummyEmbed(),
+    )
+    rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
+
+    rag.search("session scoped query", session_id="session-abc")
+
+    uploaded_calls = [
+        call for call in qdrant.search_calls if call["collection_name"] == rag.uploaded_collection
+    ]
+    assert uploaded_calls, "Uploaded collection should be queried"
+    for call in uploaded_calls:
+        filt = call["query_filter"]
+        assert filt is not None, "Uploaded collection queries must include a session filter"
+        assert any(
+            getattr(condition, "key", None) == "session_id"
+            for condition in getattr(filt, "must", []) or []
+        )
+
+    other_calls = [
+        call for call in qdrant.search_calls if call["collection_name"] != rag.uploaded_collection
+    ]
+    assert other_calls, "Primary collections should also be queried"
+    for call in other_calls:
+        filt = call["query_filter"]
+        if filt is None:
+            continue
+        assert all(
+            getattr(condition, "key", None) != "session_id"
+            for condition in getattr(filt, "must", []) or []
+        )
+
+
 def test_chunk_text_fallback_splits_long_documents(monkeypatch):
     settings = SimpleNamespace(
         qdrant_collection_name="c",
