@@ -13,6 +13,7 @@ from rank_bm25 import BM25Okapi
 from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
+from services.semantic_cache import SemanticCacheManager
 
 _TRAINING_ROOT = (
     Path(__file__).resolve().parent.parent
@@ -69,60 +70,9 @@ class RAGService:
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
-        self._preference_weights = self._load_preference_weights()
-
-    # ------------------------------------------------------------------
-    # Preference calibration helpers
-    # ------------------------------------------------------------------
-    def _load_preference_weights(self) -> Dict[str, Dict[str, float]]:
-        """Load retrieval preference weights produced by layered training."""
-
-        defaults: Dict[str, Dict[str, float]] = {
-            "collection": {
-                self.primary_collection: 0.12,
-                self.uploaded_collection: 0.08,
-                self.learning_collection: 0.04,
-            },
-            "document_type": {},
-        }
-        if not _PREFERENCE_WEIGHTS_PATH.exists():
-            try:
-                _PREFERENCE_WEIGHTS_PATH.write_text(
-                    json.dumps(defaults, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:  # pragma: no cover - defensive logging only
-                logger.debug("Unable to persist default preference weights", exc_info=True)
-            return defaults
-
-        try:
-            data = json.loads(_PREFERENCE_WEIGHTS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("Failed to load preference weights; falling back to defaults")
-            return defaults
-
-        # Merge to ensure required keys exist
-        merged = {
-            "collection": dict(defaults["collection"]),
-            "document_type": dict(defaults["document_type"]),
-        }
-        if isinstance(data, dict):
-            for key in ("collection", "document_type"):
-                value = data.get(key)
-                if isinstance(value, dict):
-                    merged[key].update(
-                        {
-                            str(k): float(v)
-                            for k, v in value.items()
-                            if isinstance(k, str) and isinstance(v, (int, float))
-                        }
-                    )
-        return merged
-
-    def reload_preference_weights(self) -> None:
-        """Refresh preference weights after a training run."""
-
-        self._preference_weights = self._load_preference_weights()
+        self._semantic_cache = SemanticCacheManager(
+            self.settings, namespace="rag_service"
+        )
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -409,6 +359,14 @@ class RAGService:
             query_matrix, query_vector = matrix, vector
             return query_matrix, query_vector
 
+        cached_hits: List[Dict[str, Any]] = []
+        if filters is None:
+            cached_hits = self._semantic_cache.get_cached_queries(query)
+            direct_cache = self._rebuild_cached_hits(cached_hits, query, top_k)
+            if direct_cache is not None:
+                return direct_cache
+            self._augment_candidates_from_cache(cached_hits, candidates)
+
         # --- FAISS semantic search ---
         if self._faiss_index is not None and self._doc_vectors:
             matrix, _ = _ensure_query_vectors()
@@ -615,7 +573,25 @@ class RAGService:
             seen_keys.add(key)
             deduped.append((hit, combined, base))
 
-        return [hit for hit, _, _ in deduped[:top_k]]
+        results = [hit for hit, _, _ in deduped[:top_k]]
+
+        cache_payload: List[Dict[str, Any]] = []
+        for hit, combined, base in deduped[:top_k]:
+            payload = self._normalise_payload_for_cache(getattr(hit, "payload", {}) or {})
+            cache_payload.append(
+                {
+                    "id": getattr(hit, "id", payload.get("record_id")),
+                    "collection_name": payload.get(
+                        "collection_name", self.primary_collection
+                    ),
+                    "payload": payload,
+                    "score": base,
+                    "combined_score": combined,
+                }
+            )
+        self._semantic_cache.set_query_results(query, cache_payload)
+
+        return results
 
     def create_langchain_retriever_tool(
         self,
@@ -710,6 +686,105 @@ class RAGService:
                 "falling back to CPU index."
             )
             return index
+
+    # ------------------------------------------------------------------
+    # LangCache integration helpers
+    # ------------------------------------------------------------------
+    def _rebuild_cached_hits(
+        self,
+        cached_entries: List[Dict[str, Any]],
+        query: str,
+        top_k: int,
+    ) -> Optional[List[SimpleNamespace]]:
+        rebuilt: List[SimpleNamespace] = []
+        for entry in cached_entries:
+            response = entry.get("response")
+            if not isinstance(response, str):
+                continue
+            try:
+                payload = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            hits = payload.get("hits")
+            if not isinstance(hits, list):
+                continue
+            similarity = float(entry.get("similarity") or 0.0)
+            if entry.get("prompt") == query and similarity >= 0.995:
+                for hit in hits[:top_k]:
+                    rebuilt_hit = self._convert_cache_hit(hit)
+                    if rebuilt_hit is not None:
+                        rebuilt.append(rebuilt_hit)
+                if rebuilt:
+                    return rebuilt[:top_k]
+        return None
+
+    def _augment_candidates_from_cache(
+        self,
+        cached_entries: List[Dict[str, Any]],
+        candidates: Dict[str, SimpleNamespace],
+    ) -> None:
+        for entry in cached_entries:
+            response = entry.get("response")
+            if not isinstance(response, str):
+                continue
+            try:
+                payload = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            hits = payload.get("hits")
+            if not isinstance(hits, list):
+                continue
+            similarity = float(entry.get("similarity") or 0.0)
+            weight = max(0.45, min(1.0, similarity))
+            for cached_hit in hits:
+                rebuilt = self._convert_cache_hit(cached_hit)
+                if rebuilt is None:
+                    continue
+                score = float(cached_hit.get("combined_score", cached_hit.get("score", 0.0)))
+                adjusted = score * weight
+                key = f"{rebuilt.payload.get('collection_name', self.primary_collection)}:{rebuilt.id}"
+                existing = candidates.get(key)
+                if existing is None or adjusted > existing.score:
+                    candidates[key] = SimpleNamespace(
+                        id=rebuilt.id,
+                        payload=rebuilt.payload,
+                        score=adjusted,
+                    )
+
+    def _convert_cache_hit(self, cached_hit: Dict[str, Any]) -> Optional[SimpleNamespace]:
+        if not isinstance(cached_hit, dict):
+            return None
+        payload = cached_hit.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        payload = dict(payload)
+        collection = cached_hit.get(
+            "collection_name", payload.get("collection_name", self.primary_collection)
+        )
+        payload.setdefault("collection_name", collection)
+        hit_id = cached_hit.get("id") or payload.get("record_id")
+        if hit_id is None:
+            return None
+        score = float(cached_hit.get("combined_score", cached_hit.get("score", 0.0)))
+        return SimpleNamespace(id=str(hit_id), payload=payload, score=score)
+
+    def _normalise_payload_for_cache(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        def _normalise(value: Any):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, list):
+                return [_normalise(item) for item in value]
+            if isinstance(value, tuple):
+                return [_normalise(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): _normalise(val) for key, val in value.items()}
+            return str(value)
+
+        try:
+            json.dumps(payload)
+            return payload
+        except (TypeError, ValueError):
+            return _normalise(payload)
 
         try:  # pragma: no cover - depends on GPU libraries
             resources = faiss.StandardGpuResources()

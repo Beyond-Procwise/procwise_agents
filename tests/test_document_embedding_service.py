@@ -86,11 +86,18 @@ def test_embed_document_creates_collection_and_upserts(service):
     point = client.upserts[0]["points"][0]
     assert point.payload["filename"] == "sample.txt"
     assert point.payload["mime_type"] == "text/plain"
+    assert point.payload["doc_name"] == "sample.txt"
+    assert point.payload["document_type"] in {"Contract", "Invoice", "Purchase_Order", "Quote"}
+    assert point.payload["content_type"] in {"paragraph", "heading", "key_value", "table"}
     assert client.collections["uploaded_documents"]["schema"].keys() >= {
         "document_id",
         "filename",
         "file_extension",
         "uploaded_at",
+        "doc_name",
+        "document_type",
+        "content_type",
+        "section",
     }
     assert rag_service.upserts, "Expected propagation to RAG"
     forwarded_payloads, key = rag_service.upserts[0]

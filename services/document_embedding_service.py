@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from qdrant_client import models
+
+from services.document_extractor import LayoutAwareParser, LayoutTable
+from services.semantic_cache import SemanticCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,23 @@ class EmbeddedDocument:
     document_id: str
     collection: str
     chunk_count: int
+    metadata: Dict[str, Any]
+
+
+@dataclass
+class ExtractedContent:
+    """Container for raw text extracted from uploaded files."""
+
+    text: str
+    method: str
+    metadata: Dict[str, Any]
+
+
+@dataclass
+class DocumentChunk:
+    """Represents a semantically meaningful chunk of a document."""
+
+    content: str
     metadata: Dict[str, Any]
 
 
@@ -48,6 +69,13 @@ class DocumentEmbeddingService:
         self._rag_service_factory = rag_service_factory
         self._rag_service: Optional[Any] = None
         self._rag_service_failed = False
+        self._layout_parser = LayoutAwareParser()
+        self._semantic_cache = (
+            SemanticCacheManager(self.settings, namespace="document_embeddings")
+            if self.settings is not None
+            else SemanticCacheManager(None, namespace="document_embeddings")
+        )
+        self._embedding_model_name = self._resolve_embedding_model_name()
         if self.client is None or self.embedder is None:
             raise ValueError("AgentNick must provide Qdrant client and embedding model")
 
@@ -68,23 +96,36 @@ class DocumentEmbeddingService:
 
         document_id = str(uuid.uuid4())
         upload_ts = datetime.utcnow().isoformat(timespec="seconds")
+        base_name = Path(filename).name
         metadata_payload = {
             "document_id": document_id,
             "filename": filename,
             "file_extension": Path(filename).suffix.lower() or "",
+            "doc_name": base_name,
             "uploaded_at": upload_ts,
         }
         if metadata:
             metadata_payload.update(metadata)
 
-        text = self._extract_text(file_bytes=file_bytes, filename=filename)
+        extracted = self._extract_text(file_bytes=file_bytes, filename=filename)
+        text = extracted.text
         if not text.strip():
             raise ValueError("Unable to extract textual content from document")
 
-        chunks = self._chunk_text(text)
+        metadata_payload["extraction_method"] = extracted.method
+        metadata_payload.update(extracted.metadata)
+
+        document_type = metadata_payload.get("document_type")
+        chunks = self._build_document_chunks(
+            text,
+            filename=filename,
+            document_type_hint=document_type,
+            extraction_metadata=extracted.metadata,
+        )
         if not chunks:
             raise ValueError("Document extraction produced no embeddable chunks")
 
+        metadata_payload.setdefault("document_type", self._infer_document_type(text, document_type))
         vectors = self._encode_chunks(chunks)
         if not vectors:
             raise ValueError("Embedding model returned no vectors")
@@ -92,10 +133,19 @@ class DocumentEmbeddingService:
         vector_size = len(vectors[0])
         self._ensure_collection(vector_size)
 
+        chunk_vector_pairs = list(zip(chunks, vectors))
         points: List[models.PointStruct] = []
-        for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+        for idx, (chunk, vector) in enumerate(chunk_vector_pairs):
             payload = dict(metadata_payload)
-            payload.update({"chunk_id": idx, "content": chunk})
+            payload.update(chunk.metadata)
+            payload.update(
+                {
+                    "chunk_id": idx,
+                    "chunk_index": idx,
+                    "content": chunk.content,
+                    "embedding_model": self._embedding_model_name,
+                }
+            )
             point_id = str(uuid.uuid5(uuid.UUID(document_id), str(idx)))
             points.append(
                 models.PointStruct(id=point_id, vector=vector, payload=payload)
@@ -107,7 +157,7 @@ class DocumentEmbeddingService:
             wait=True,
         )
 
-        self._propagate_to_rag(chunks, metadata_payload)
+        self._propagate_to_rag([chunk for chunk, _ in chunk_vector_pairs], metadata_payload)
 
         return EmbeddedDocument(
             document_id=document_id,
@@ -119,11 +169,15 @@ class DocumentEmbeddingService:
     # ------------------------------------------------------------------
     # Extraction helpers
     # ------------------------------------------------------------------
-    def _extract_text(self, *, file_bytes: bytes, filename: str) -> str:
+    def _extract_text(self, *, file_bytes: bytes, filename: str) -> ExtractedContent:
         suffix = Path(filename).suffix.lower()
         if suffix in {".txt", ".md", ""}:
             try:
-                return file_bytes.decode("utf-8", errors="ignore")
+                return ExtractedContent(
+                    text=file_bytes.decode("utf-8", errors="ignore"),
+                    method="direct_decode",
+                    metadata={"content_type": "text"},
+                )
             except Exception:
                 logger.debug("Failed UTF-8 decode for %s", filename, exc_info=True)
 
@@ -140,40 +194,265 @@ class DocumentEmbeddingService:
                     ]
                     combined = "\n".join(text_parts)
                     if combined.strip():
-                        return combined
+                        element_types = {
+                            getattr(element, "category", getattr(element, "type", "unknown"))
+                            for element in elements
+                        }
+                        return ExtractedContent(
+                            text=combined,
+                            method="unstructured_partition",
+                            metadata={
+                                "content_type": self._detect_content_category(filename),
+                                "detected_elements": sorted(element_types),
+                            },
+                        )
             except Exception:
                 logger.exception("unstructured partition failed for %s", filename)
 
         # Fallback: attempt UTF-8 decode regardless of file type
         try:
-            return file_bytes.decode("utf-8", errors="ignore")
+            return ExtractedContent(
+                text=file_bytes.decode("utf-8", errors="ignore"),
+                method="raw_decode",
+                metadata={"content_type": self._detect_content_category(filename)},
+            )
         except Exception:
             logger.warning("Failed to decode document %s", filename)
-            return ""
+            return ExtractedContent(text="", method="raw_decode", metadata={})
 
-    def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
+    def _detect_content_category(self, filename: str) -> str:
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".pdf"}:
+            return "pdf"
+        if suffix in {".doc", ".docx"}:
+            return "docx"
+        if suffix in {".ppt", ".pptx"}:
+            return "pptx"
+        if suffix in {".xls", ".xlsx"}:
+            return "spreadsheet"
+        if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+            return "image"
+        return "text"
+
+    def _build_document_chunks(
+        self,
+        text: str,
+        *,
+        filename: str,
+        document_type_hint: Optional[str],
+        extraction_metadata: Dict[str, Any],
+    ) -> List[DocumentChunk]:
+        structured = self._layout_parser.from_text(
+            text, scanned=self._looks_like_scanned(text, extraction_metadata)
+        )
+        doc_type = self._infer_document_type(text, document_type_hint)
+        max_chars, overlap = self._chunk_size_preferences()
+
+        chunks: List[DocumentChunk] = []
+        paragraph_buffer: List[str] = []
+        current_section = "document_overview"
+
+        def flush_paragraph_buffer() -> None:
+            nonlocal paragraph_buffer
+            if not paragraph_buffer:
+                return
+            combined = "\n".join(paragraph_buffer).strip()
+            paragraph_buffer = []
+            for part in self._split_text(combined, max_chars, overlap):
+                if not part.strip():
+                    continue
+                chunks.append(
+                    DocumentChunk(
+                        content=part,
+                        metadata={
+                            "section": current_section,
+                            "content_type": "paragraph",
+                            "document_type": doc_type,
+                        },
+                    )
+                )
+
+        for element in structured.elements:
+            text_value = element.text.strip()
+            if not text_value:
+                continue
+
+            if element.type in {"title", "heading"}:
+                flush_paragraph_buffer()
+                current_section = self._normalise_section_name(text_value)
+                chunks.append(
+                    DocumentChunk(
+                        content=text_value,
+                        metadata={
+                            "section": current_section,
+                            "content_type": "heading",
+                            "document_type": doc_type,
+                        },
+                    )
+                )
+                continue
+
+            if element.type == "key_value":
+                flush_paragraph_buffer()
+                key = element.metadata.get("key") or text_value
+                value = element.metadata.get("value", "")
+                formatted = f"{key}: {value}".strip()
+                chunks.append(
+                    DocumentChunk(
+                        content=formatted,
+                        metadata={
+                            "section": current_section,
+                            "content_type": "key_value",
+                            "field_key": key,
+                            "field_value": value,
+                            "document_type": doc_type,
+                        },
+                    )
+                )
+                continue
+
+            paragraph_buffer.append(text_value)
+            combined_length = sum(len(line) for line in paragraph_buffer)
+            if combined_length >= max_chars:
+                flush_paragraph_buffer()
+
+        flush_paragraph_buffer()
+
+        for table in structured.tables:
+            table_chunks = self._render_table_chunks(
+                table,
+                section=current_section,
+                document_type=doc_type,
+                max_chars=max_chars,
+                overlap=overlap,
+            )
+            chunks.extend(table_chunks)
+
+        # Fall back to whole document if no structured chunks were produced
+        if not chunks:
+            for part in self._split_text(text, max_chars, overlap):
+                chunks.append(
+                    DocumentChunk(
+                        content=part,
+                        metadata={
+                            "section": current_section,
+                            "content_type": "paragraph",
+                            "document_type": doc_type,
+                        },
+                    )
+                )
+
+        return chunks
+
+    def _chunk_size_preferences(self) -> Tuple[int, int]:
+        default_max = 1200
+        default_overlap = 220
+        if self.settings is not None:
+            configured_max = getattr(self.settings, "rag_chunk_chars", default_max)
+            configured_overlap = getattr(self.settings, "rag_chunk_overlap", default_overlap)
+            max_chars = max(int(configured_max), 400)
+            overlap = max(0, min(int(configured_overlap), max_chars - 1))
+            return max_chars, overlap
+        return default_max, default_overlap
+
+    def _split_text(self, text: str, max_chars: int, overlap: int) -> List[str]:
         cleaned = " ".join(text.split())
         if not cleaned:
             return []
-        if self.settings is not None:
-            max_chars = max(getattr(self.settings, "rag_chunk_chars", max_chars), 200)
-            configured_overlap = getattr(self.settings, "rag_chunk_overlap", overlap)
-            overlap = max(0, min(configured_overlap, max_chars - 1))
+        if max_chars <= 0:
+            return [cleaned]
         step = max_chars - overlap if max_chars > overlap else max_chars
         return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
 
-    def _encode_chunks(self, chunks: Iterable[str]) -> List[List[float]]:
-        chunk_list = [chunk for chunk in chunks if chunk.strip()]
-        if not chunk_list:
+    def _render_table_chunks(
+        self,
+        table: LayoutTable,
+        *,
+        section: str,
+        document_type: str,
+        max_chars: int,
+        overlap: int,
+    ) -> List[DocumentChunk]:
+        if not table.headers and not table.rows:
             return []
-        vectors = self.embedder.encode(
-            chunk_list,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        if isinstance(vectors, np.ndarray):
-            return vectors.astype("float32").tolist()
-        return [list(map(float, vec)) for vec in vectors]
+
+        lines = []
+        headers = table.headers or []
+        if headers:
+            lines.append(" | ".join(headers))
+            lines.append(" | ".join(["---"] * len(headers)))
+        for row in table.rows:
+            lines.append(" | ".join(row))
+        table_text = "\n".join(lines)
+        chunks: List[DocumentChunk] = []
+        for part in self._split_text(table_text, max_chars, overlap):
+            if not part.strip():
+                continue
+            chunk_metadata = {
+                "section": section,
+                "content_type": "table",
+                "document_type": document_type,
+            }
+            chunk_metadata.update(table.metadata)
+            chunks.append(DocumentChunk(content=part, metadata=chunk_metadata))
+        return chunks
+
+    def _normalise_section_name(self, value: str) -> str:
+        cleaned = "_".join(part for part in value.lower().split() if part)
+        return cleaned or "section"
+
+    def _looks_like_scanned(self, text: str, metadata: Dict[str, Any]) -> bool:
+        if metadata.get("content_type") == "image":
+            return True
+        characters = [char for char in text if char.strip()]
+        if not characters:
+            return False
+        non_ascii = sum(1 for char in characters if ord(char) > 126)
+        ratio = non_ascii / len(characters)
+        return ratio > 0.25
+
+    def _encode_chunks(self, chunks: Sequence[DocumentChunk]) -> List[List[float]]:
+        if not chunks:
+            return []
+
+        vectors: Dict[int, List[float]] = {}
+        encode_batches: List[str] = []
+        encode_indices: List[int] = []
+
+        for idx, chunk in enumerate(chunks):
+            text = chunk.content.strip()
+            if not text:
+                continue
+            cached = self._semantic_cache.get_embedding(text, self._embedding_model_name)
+            if cached is not None:
+                vectors[idx] = [float(value) for value in cached]
+                continue
+            encode_batches.append(text)
+            encode_indices.append(idx)
+
+        if encode_batches:
+            raw_vectors = self.embedder.encode(
+                encode_batches,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            if isinstance(raw_vectors, np.ndarray):
+                encoded = raw_vectors.astype("float32").tolist()
+            else:
+                encoded = [list(map(float, vec)) for vec in raw_vectors]
+
+            for idx, vector in zip(encode_indices, encoded):
+                vectors[idx] = vector
+            for text, vector in zip(encode_batches, encoded):
+                self._semantic_cache.set_embedding(text, vector, self._embedding_model_name)
+
+        ordered: List[List[float]] = []
+        for idx in range(len(chunks)):
+            vector = vectors.get(idx)
+            if vector is not None:
+                ordered.append(vector)
+
+        return ordered
 
     def _ensure_collection(self, vector_size: int) -> None:
         try:
@@ -205,6 +484,10 @@ class DocumentEmbeddingService:
             "filename",
             "file_extension",
             "uploaded_at",
+            "doc_name",
+            "document_type",
+            "content_type",
+            "section",
         }
         for field in required:
             if field in indexed_fields:
@@ -264,7 +547,9 @@ class DocumentEmbeddingService:
             return None
         return self._rag_service
 
-    def _propagate_to_rag(self, chunks: List[str], metadata: Dict[str, Any]) -> None:
+    def _propagate_to_rag(
+        self, chunks: Sequence[DocumentChunk], metadata: Dict[str, Any]
+    ) -> None:
         if not chunks:
             return
         rag_service = self._resolve_rag_service()
@@ -274,14 +559,15 @@ class DocumentEmbeddingService:
         payloads: List[Dict[str, Any]] = []
         document_id = metadata.get("document_id")
         for idx, chunk in enumerate(chunks):
-            if not chunk.strip():
+            if not chunk.content.strip():
                 continue
             payload = dict(metadata)
             payload["record_id"] = document_id or metadata.get("record_id") or str(uuid.uuid4())
             payload["chunk_id"] = idx
             payload.setdefault("document_type", "uploaded_document")
             payload["source_collection"] = self.collection_name
-            payload["content"] = chunk
+            payload.update(chunk.metadata)
+            payload["content"] = chunk.content
             payloads.append(payload)
 
         if not payloads:
@@ -293,3 +579,57 @@ class DocumentEmbeddingService:
             logger.exception(
                 "Failed to propagate uploaded document chunks to primary RAG store"
             )
+
+    def _infer_document_type(
+        self, text: str, document_type_hint: Optional[str] = None
+    ) -> str:
+        if document_type_hint:
+            return document_type_hint
+
+        lowered = text.lower()
+        keyword_map: Dict[str, Tuple[Tuple[str, ...], ...]] = {
+            "Invoice": (
+                ("invoice",),
+                ("amount", "due"),
+                ("invoice", "number"),
+                ("total", "tax"),
+            ),
+            "Purchase_Order": (
+                ("purchase", "order"),
+                ("po", "number"),
+                ("ship", "to"),
+            ),
+            "Contract": (
+                ("agreement",),
+                ("contract",),
+                ("term", "length"),
+            ),
+            "Quote": (
+                ("quote",),
+                ("quotation",),
+                ("valid", "until"),
+            ),
+        }
+
+        best_type = "Contract"
+        best_score = -math.inf
+        for doc_type, patterns in keyword_map.items():
+            score = 0.0
+            for pattern in patterns:
+                if all(token in lowered for token in pattern):
+                    score += len(pattern) * 1.5
+            if score > best_score:
+                best_type = doc_type
+                best_score = score
+
+        return best_type
+
+    def _resolve_embedding_model_name(self) -> str:
+        if self.settings is not None:
+            configured = getattr(self.settings, "embedding_model", None)
+            if isinstance(configured, str) and configured:
+                return configured
+        candidate = getattr(self.embedder, "model_name", None)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        return self.embedder.__class__.__name__
