@@ -1064,31 +1064,48 @@ class RAGService:
             seen_pairs.add(key)
             base_collections.append((name, filt))
 
-        if policy_mode:
-            ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
-                (self.static_policy_collection, combined_filter),
-                (self.uploaded_collection, combined_filter),
-                (self.primary_collection, combined_filter),
-                (self.learning_collection, combined_filter),
-            ]
-        else:
-            if session_specific_filter is not None:
-                _append_collection(self.uploaded_collection, session_specific_filter)
+        requested_collections: Tuple[str, ...] = tuple(
+            dict.fromkeys(
+                [
+                    str(name).strip()
+                    for name in (collections or [])
+                    if isinstance(name, str) and str(name).strip()
+                ]
+            )
+        )
 
+        ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = []
+
+        restrict_to_uploaded_only = bool(
+            requested_collections
+            and all(name == self.uploaded_collection for name in requested_collections)
+        )
+
+        if requested_collections:
+            for name in requested_collections:
+                if not name:
+                    continue
+                _append_collection(name, combined_filter)
+
+        if not restrict_to_uploaded_only:
             if policy_mode:
-                ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
-                    (self.static_policy_collection, combined_filter),
-                    (self.uploaded_collection, combined_filter),
-                    (self.primary_collection, combined_filter),
-                    (self.learning_collection, combined_filter),
-                ]
+                ordered_candidates.extend(
+                    [
+                        (self.static_policy_collection, combined_filter),
+                        (self.uploaded_collection, combined_filter),
+                        (self.primary_collection, combined_filter),
+                        (self.learning_collection, combined_filter),
+                    ]
+                )
             else:
-                ordered_candidates = [
-                    (self.uploaded_collection, combined_filter),
-                    (self.primary_collection, combined_filter),
-                    (self.static_policy_collection, combined_filter),
-                    (self.learning_collection, combined_filter),
-                ]
+                ordered_candidates.extend(
+                    [
+                        (self.uploaded_collection, combined_filter),
+                        (self.primary_collection, combined_filter),
+                        (self.static_policy_collection, combined_filter),
+                        (self.learning_collection, combined_filter),
+                    ]
+                )
 
             for name, filt in ordered_candidates:
                 _append_collection(name, filt)
