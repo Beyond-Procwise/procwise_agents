@@ -168,6 +168,9 @@ class RAGPipeline:
         )
         self._citation_guidelines = self._load_citation_guidelines()
         self._session_uploads: Dict[str, Dict[str, Any]] = {}
+        self._nltk_processor = NLTKProcessor() if use_nltk else None
+        if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
+            self._nltk_processor = None
 
     def register_session_upload(
         self,
@@ -207,9 +210,15 @@ class RAGPipeline:
             return ""
         return f"Sure, I can help with that. {cleaned}" if not cleaned.lower().startswith("sure") else cleaned
 
-    def _try_static_answer(self, query: str, user_id: str) -> Optional[Dict[str, Any]]:
+    def _try_static_answer(
+        self, query: str, user_id: str, *, session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         try:
-            output = self._static_agent.run(query=query, user_id=user_id, session_id=user_id)
+            output = self._static_agent.run(
+                query=query,
+                user_id=user_id,
+                session_id=session_id or user_id,
+            )
         except Exception:
             logger.exception("Static procurement QA lookup failed")
             return None
@@ -1277,6 +1286,8 @@ class RAGPipeline:
         self,
         query: str,
         user_id: str,
+        *,
+        session_id: Optional[str] = None,
         model_name: Optional[str] = None,
         files: Optional[List[tuple[bytes, str]]] = None,
         doc_type: Optional[str] = None,
@@ -1312,8 +1323,34 @@ class RAGPipeline:
             )
 
         history = self.history_manager.get_history(user_id)
-        session_key = user_id.strip() if isinstance(user_id, str) else None
-        session_record = self._session_uploads.get(session_key) if session_key else None
+
+        candidate_keys: List[str] = []
+        cleaned_session = (
+            session_id.strip()
+            if isinstance(session_id, str)
+            else str(session_id).strip()
+            if session_id is not None
+            else None
+        )
+        if cleaned_session:
+            candidate_keys.append(cleaned_session)
+        cleaned_user = user_id.strip() if isinstance(user_id, str) else str(user_id).strip()
+        if cleaned_user:
+            if cleaned_user not in candidate_keys:
+                candidate_keys.append(cleaned_user)
+
+        session_key: Optional[str] = None
+        session_record: Optional[Dict[str, Any]] = None
+        for candidate in candidate_keys:
+            record = self._session_uploads.get(candidate)
+            if record:
+                session_key = candidate
+                session_record = record
+                break
+
+        if session_key is None and candidate_keys:
+            session_key = candidate_keys[0]
+
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
         )
@@ -1367,6 +1404,8 @@ class RAGPipeline:
             "memory_fragments": memory_fragments,
             "policy_mode": policy_mode,
         }
+        if raw_nltk_features:
+            hint_kwargs["nltk_features"] = raw_nltk_features
         if session_key:
             hint_kwargs["session_id"] = session_key
         if session_record:
@@ -1378,7 +1417,9 @@ class RAGPipeline:
         if knowledge_items:
             try:
                 static_output = self._static_agent.run(
-                    query=query, user_id=user_id, session_id=user_id
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_key or cleaned_user,
                 )
             except Exception:
                 logger.exception("Static procurement QA lookup failed during context build")
