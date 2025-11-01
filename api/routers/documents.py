@@ -481,6 +481,18 @@ async def embed_documents(
             exc_info=True,
         )
 
+    try:
+        pipeline.activate_uploaded_context(
+            uploaded_document_ids,
+            metadata=upload_metadata,
+            session_id=resolved_session,
+        )
+    except AttributeError:
+        logger.debug(
+            "RAG pipeline does not expose uploaded context activation",
+            exc_info=True,
+        )
+
     return DocumentEmbeddingBatchResponse(
         status="success",
         total_documents=len(processed),
