@@ -16,7 +16,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
 from services.semantic_cache import SemanticCacheManager
 from services.document_extractor import LayoutAwareParser
-from services.semantic_chunker import SemanticChunker
+from services.semantic_chunker import SemanticChunker, SemanticChunk
 
 DISALLOWED_METADATA_KEYS: Set[str] = {
     "effective_date",
@@ -145,15 +145,30 @@ class RAGService:
 
         return result
 
-    def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
-        """Chunk text using the structure-aware chunker for previews."""
+    def _chunk_text(
+        self, text: str, max_chars: int = 1000, overlap: int = 200
+    ) -> List[SemanticChunk]:
+        """Chunk text using the structure-aware chunker for previews.
+
+        The ``max_chars`` and ``overlap`` parameters are retained for backward
+        compatibility with older call sites. They now map to the runtime
+        configuration derived from :class:`SemanticChunker`.
+        """
+
         del max_chars, overlap  # legacy parameters retained for compatibility
         cleaned = (text or "").strip()
         if not cleaned:
             return []
-        structured = self._layout_parser.from_text(cleaned, scanned=False)
+
+        try:
+            structured = self._layout_parser.from_text(cleaned, scanned=False)
+        except Exception:
+            logger.debug("Layout parsing failed; using fallback chunking", exc_info=True)
+            structured = None
+
+        chunks: List[SemanticChunk] = []
         title_hint = None
-        if structured.elements:
+        if structured and structured.elements:
             first = structured.elements[0]
             candidate = getattr(first, "text", None)
             if candidate:
@@ -163,16 +178,199 @@ class RAGService:
             "source_type": "Upload",
             "title": title_hint or "Preview",
         }
-        chunks = self._chunker.build_from_structured(
-            structured,
-            document_type="General",
-            base_metadata=chunk_seed,
-            title_hint=chunk_seed["title"],
-            default_section="document_overview",
-        )
+
+        if structured:
+            try:
+                chunks = self._chunker.build_from_structured(
+                    structured,
+                    document_type="General",
+                    base_metadata=chunk_seed,
+                    title_hint=chunk_seed["title"],
+                    default_section="document_overview",
+                )
+            except Exception:
+                logger.debug(
+                    "Semantic chunking failed; falling back to heuristic chunker",
+                    exc_info=True,
+                )
+                chunks = []
+
+        if not chunks or self._requires_fallback(chunks):
+            return self._fallback_chunk_text(cleaned, seed_metadata=chunk_seed)
+
+        return chunks
+
+    def _requires_fallback(self, chunks: List[SemanticChunk]) -> bool:
+        """Determine whether the semantic chunker output needs refinement."""
+
         if not chunks:
-            return [cleaned]
-        return [chunk.content for chunk in chunks]
+            return True
+
+        if len(chunks) > 1:
+            return False
+
+        char_limit = self._chunk_char_limit()
+        return len(chunks[0].content or "") > int(char_limit * 1.2)
+
+    def _chunk_char_limit(self) -> int:
+        """Return the configured character limit for fallback chunking."""
+
+        approx_chars = getattr(self.settings, "rag_chunk_chars", None)
+        try:
+            approx_value = int(approx_chars) if approx_chars else 0
+        except (TypeError, ValueError):
+            approx_value = 0
+        if approx_value <= 0:
+            approx_value = 1800
+        return max(900, min(approx_value, 2400))
+
+    def _chunk_overlap_chars(self) -> int:
+        """Return the configured overlap (in characters) for fallback chunks."""
+
+        overlap_value = getattr(self.settings, "rag_chunk_overlap", None)
+        try:
+            overlap = int(overlap_value) if overlap_value else 0
+        except (TypeError, ValueError):
+            overlap = 0
+        if overlap <= 0:
+            overlap = int(self._chunk_char_limit() * 0.1)
+        return max(120, min(overlap, int(self._chunk_char_limit() * 0.4)))
+
+    def _fallback_chunk_text(
+        self, text: str, *, seed_metadata: Optional[Dict[str, Any]] = None
+    ) -> List[SemanticChunk]:
+        """Fallback heuristic chunker when structural parsing fails.
+
+        This splitter groups paragraphs and long sentences into overlapping
+        windows so that downstream retrieval receives semantically coherent
+        spans rather than single large blocks of text.
+        """
+
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
+            return []
+
+        char_limit = self._chunk_char_limit()
+        overlap_chars = self._chunk_overlap_chars()
+
+        paragraphs = [
+            part.strip()
+            for part in re.split(r"\n{2,}", text)
+            if part and part.strip()
+        ]
+        if not paragraphs:
+            paragraphs = [cleaned]
+
+        expanded_parts: List[str] = []
+        for paragraph in paragraphs:
+            expanded_parts.extend(self._split_paragraph(paragraph, char_limit))
+
+        chunks: List[SemanticChunk] = []
+        buffer: List[str] = []
+        buffer_len = 0
+        idx = 0
+        while idx < len(expanded_parts):
+            part = expanded_parts[idx]
+            part_len = len(part)
+            if buffer and buffer_len + part_len + 2 > char_limit:
+                chunk_text = self._normalise_chunk("\n\n".join(buffer))
+                if chunk_text:
+                    chunks.append(
+                        SemanticChunk(
+                            content=chunk_text,
+                            metadata=self._fallback_metadata(
+                                seed_metadata, len(chunks)
+                            ),
+                        )
+                    )
+                buffer, buffer_len = self._build_overlap_buffer(
+                    buffer, overlap_chars
+                )
+                continue
+
+            buffer.append(part)
+            buffer_len += part_len + 2
+            idx += 1
+
+        if buffer:
+            chunk_text = self._normalise_chunk("\n\n".join(buffer))
+            if chunk_text:
+                chunks.append(
+                    SemanticChunk(
+                        content=chunk_text,
+                        metadata=self._fallback_metadata(seed_metadata, len(chunks)),
+                    )
+                )
+
+        return chunks
+
+    def _split_paragraph(self, paragraph: str, limit: int) -> List[str]:
+        """Split long paragraphs into sentence-based windows."""
+
+        paragraph = paragraph.strip()
+        if len(paragraph) <= limit:
+            return [paragraph]
+
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+        if not sentences:
+            return [paragraph[i : i + limit] for i in range(0, len(paragraph), limit)]
+
+        parts: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for sentence in sentences:
+            sentence_len = len(sentence)
+            if current and current_len + sentence_len + 1 > limit:
+                parts.append(" ".join(current))
+                current = []
+                current_len = 0
+            current.append(sentence)
+            current_len += sentence_len + 1
+        if current:
+            parts.append(" ".join(current))
+        return parts
+
+    def _build_overlap_buffer(
+        self, buffer: List[str], overlap_chars: int
+    ) -> Tuple[List[str], int]:
+        if not buffer or overlap_chars <= 0:
+            return [], 0
+
+        tail = buffer[-1]
+        overlap_text = self._tail_sentences(tail, overlap_chars)
+        if not overlap_text:
+            return [], 0
+        return [overlap_text], len(overlap_text)
+
+    def _tail_sentences(self, text: str, limit: int) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+        if not sentences:
+            return text[-limit:].strip()
+
+        collected: List[str] = []
+        total = 0
+        for sentence in reversed(sentences):
+            collected.insert(0, sentence)
+            total += len(sentence) + 1
+            if total >= limit:
+                break
+        return " ".join(collected).strip()
+
+    def _normalise_chunk(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def _fallback_metadata(
+        self, seed_metadata: Optional[Dict[str, Any]], index: int
+    ) -> Dict[str, Any]:
+        metadata = dict(seed_metadata or {})
+        metadata.setdefault("section", "document_overview")
+        metadata.setdefault("section_path", "document_overview")
+        metadata.setdefault("content_type", "paragraph")
+        metadata.setdefault("chunk_strategy", "fallback")
+        metadata.setdefault("fallback_index", index)
+        return metadata
 
     def _embedding_dimension(self) -> int:
         """Determine the embedding dimensionality of the active encoder."""
@@ -319,25 +517,42 @@ class RAGService:
                 chunk_payload = dict(base_payload)
                 chunk_payload["chunk_id"] = idx
                 chunk_payload["chunk_index"] = idx
+
+                if isinstance(chunk, SemanticChunk):
+                    chunk_text = chunk.content
+                    chunk_metadata = chunk.metadata or {}
+                else:
+                    chunk_text = str(chunk)
+                    chunk_metadata = {}
+
+                chunk_text = (chunk_text or "").strip()
+                if not chunk_text:
+                    continue
+
+                for key, value in (chunk_metadata or {}).items():
+                    if value in (None, "", [], {}):
+                        continue
+                    chunk_payload.setdefault(key, value)
+
                 if (
                     "content" in chunk_payload
-                    and chunk_payload.get("content") != chunk
+                    and chunk_payload.get("content") != chunk_text
                 ):
                     chunk_payload.setdefault(
                         "_rag_source_content", chunk_payload.get("content")
                     )
-                chunk_payload["content"] = chunk
+                chunk_payload["content"] = chunk_text
                 if (
                     "text_summary" in chunk_payload
-                    and chunk_payload.get("text_summary") != chunk
+                    and chunk_payload.get("text_summary") != chunk_text
                 ):
                     chunk_payload.setdefault(
                         "_rag_source_text_summary",
                         chunk_payload.get("text_summary"),
                     )
-                chunk_payload["text_summary"] = chunk
+                chunk_payload["text_summary"] = chunk_text
                 chunk_payload.setdefault("collection_name", resolved_collection)
-                texts_for_embedding.append(chunk)
+                texts_for_embedding.append(chunk_text)
                 payloads_for_storage.append(chunk_payload)
 
         if not texts_for_embedding:
@@ -456,6 +671,7 @@ class RAGService:
         hint_text = self._compose_hint_text(session_hint, memory_fragments)
         feature_keywords: List[str] = []
         feature_phrases: List[str] = []
+        nltk_features: Optional[Dict[str, Any]] = None
         if isinstance(nltk_features, dict):
             raw_keywords = nltk_features.get("keywords", [])
             raw_phrases = nltk_features.get("key_phrases", [])
