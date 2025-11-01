@@ -443,7 +443,7 @@ class RAGService:
         session_hint: Optional[str] = None,
         memory_fragments: Optional[List[str]] = None,
         policy_mode: bool = False,
-        nltk_features: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ):
         """Retrieve and rerank documents for the given query."""
         if not query or not query.strip():
@@ -489,6 +489,15 @@ class RAGService:
         if hint_text:
             search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
+
+        session_key: Optional[str] = None
+        if session_id is not None:
+            try:
+                cleaned = str(session_id).strip()
+            except Exception:
+                cleaned = ""
+            if cleaned:
+                session_key = cleaned
 
         query_matrix: Optional[np.ndarray] = None
         query_vector: Optional[List[float]] = None
@@ -703,43 +712,78 @@ class RAGService:
                     )
                 return wrapped
 
-            base_collections: List[Tuple[str, Optional[models.Filter]]] = []
-            seen_collections: Set[str] = set()
-            ordered_collections: List[Optional[str]] = [
-                self.primary_collection,
-                self.uploaded_collection,
-                self.static_policy_collection,
-                self.learning_collection,
-            ]
-            if policy_mode and self.static_policy_collection in ordered_collections:
-                ordered_collections = [
-                    self.static_policy_collection,
-                    self.primary_collection,
-                    self.uploaded_collection,
-                    self.learning_collection,
-                ]
+        base_collections: List[Tuple[str, Optional[models.Filter]]] = []
 
-            for candidate in ordered_collections:
-                if not candidate or candidate in seen_collections:
-                    continue
-                seen_collections.add(candidate)
-                base_collections.append((candidate, combined_filter))
+        def _filter_signature(value: Optional[models.Filter]) -> str:
+            if value is None:
+                return "∅"
+            try:
+                return value.model_dump_json(sort_keys=True)
+            except Exception:
+                try:
+                    return json.dumps(value.model_dump(), sort_keys=True)
+                except Exception:
+                    return repr(value)
 
-            collections_to_query = tuple(base_collections)
+        seen_pairs: Set[Tuple[str, str]] = set()
 
-            for name, collection_filter in collections_to_query:
-                hits = _search_collection(name, query_filter=collection_filter)
-                for rank, hit in enumerate(hits[:prefetch], 1):
-                    payload = dict(hit.payload or {})
-                    payload.setdefault("collection_name", name)
-                    _register_candidate(
-                        "qdrant",
-                        payload,
-                        hit.id,
-                        float(getattr(hit, "score", 0.0)),
-                        rank,
-                        weights["qdrant"],
+        def _append_collection(
+            name: Optional[str], filt: Optional[models.Filter]
+        ) -> None:
+            if not name:
+                return
+            signature = _filter_signature(filt)
+            key = (name, signature)
+            if key in seen_pairs:
+                return
+            seen_pairs.add(key)
+            base_collections.append((name, filt))
+
+        session_specific_filter: Optional[models.Filter] = None
+        if session_key:
+            session_specific_filter = self._merge_filters(
+                combined_filter,
+                [
+                    models.FieldCondition(
+                        key="session_id", match=models.MatchValue(value=session_key)
                     )
+                ],
+            )
+            _append_collection(self.uploaded_collection, session_specific_filter)
+
+        if policy_mode:
+            ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
+                (self.static_policy_collection, combined_filter),
+                (self.uploaded_collection, combined_filter),
+                (self.primary_collection, combined_filter),
+                (self.learning_collection, combined_filter),
+            ]
+        else:
+            ordered_candidates = [
+                (self.uploaded_collection, combined_filter),
+                (self.primary_collection, combined_filter),
+                (self.static_policy_collection, combined_filter),
+                (self.learning_collection, combined_filter),
+            ]
+
+        for name, filt in ordered_candidates:
+            _append_collection(name, filt)
+
+        collections_to_query = tuple(base_collections)
+
+        for name, collection_filter in collections_to_query:
+            hits = _search_collection(name, query_filter=collection_filter)
+            for rank, hit in enumerate(hits[:prefetch], 1):
+                payload = dict(hit.payload or {})
+                payload.setdefault("collection_name", name)
+                _register_candidate(
+                    "qdrant",
+                    payload,
+                    hit.id,
+                    float(getattr(hit, "score", 0.0)),
+                    rank,
+                    weights["qdrant"],
+                )
 
         if not candidates:
             return []
@@ -778,6 +822,8 @@ class RAGService:
                 bonus = max(bonus, 0.12)
                 if policy_mode:
                     bonus += 0.22
+            if session_key and collection == self.uploaded_collection:
+                bonus += 0.1
 
             doc_bonus = float(document_weights.get(document_type, 0.0))
             if document_type == "policy":
@@ -785,7 +831,16 @@ class RAGService:
                 if policy_mode:
                     doc_bonus += 0.15
 
-            return float(bonus + doc_bonus)
+            session_bonus = 0.0
+            if session_key:
+                try:
+                    payload_session = str(payload.get("session_id", "")).strip()
+                except Exception:
+                    payload_session = ""
+                if payload_session and payload_session == session_key:
+                    session_bonus = 0.4
+
+            return float(bonus + doc_bonus + session_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         rerank_weight = 1.35
@@ -812,6 +867,36 @@ class RAGService:
             return []
 
         selected = scored_hits[:top_k]
+
+        if session_key:
+            session_hits = [
+                record
+                for record in scored_hits
+                if str((getattr(record[0], "payload", {}) or {}).get("session_id", "")).strip()
+                == session_key
+            ]
+            if session_hits:
+                max_session = max(1, min(len(session_hits), max(1, top_k)))
+                for candidate in session_hits[:max_session]:
+                    if candidate in selected:
+                        continue
+                    if len(selected) < top_k:
+                        selected.append(candidate)
+                        continue
+                    non_session_indices = [
+                        idx
+                        for idx, existing in enumerate(selected)
+                        if str(
+                            (getattr(existing[0], "payload", {}) or {}).get(
+                                "session_id", ""
+                            )
+                        ).strip()
+                        != session_key
+                    ]
+                    if not non_session_indices:
+                        continue
+                    lowest_idx = min(non_session_indices, key=lambda idx: selected[idx][1])
+                    selected[lowest_idx] = candidate
 
         def _collection_name(hit_obj: SimpleNamespace) -> str:
             payload = getattr(hit_obj, "payload", {}) or {}

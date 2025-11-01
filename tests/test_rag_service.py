@@ -102,7 +102,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def search(self, query, top_k=5, filters=None):
+        def search(self, query, top_k=5, filters=None, **kwargs):
             return [SimpleNamespace(id="1", payload={"record_id": "R1", "summary": "s"})]
 
         def upsert_texts(self, texts, metadata=None):
@@ -170,7 +170,7 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def search(self, query, top_k=5, filters=None):
+        def search(self, query, top_k=5, filters=None, **kwargs):
             return []
 
         def upsert_texts(self, texts, metadata=None):
