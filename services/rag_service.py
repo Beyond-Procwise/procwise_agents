@@ -1064,13 +1064,35 @@ class RAGService:
             seen_pairs.add(key)
             base_collections.append((name, filt))
 
-        if policy_mode:
-            ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
-                (self.static_policy_collection, combined_filter),
-                (self.uploaded_collection, combined_filter),
-                (self.primary_collection, combined_filter),
-                (self.learning_collection, combined_filter),
-            ]
+        forced_names: List[str] = []
+        for candidate in collections or []:
+            try:
+                cleaned_name = str(candidate).strip()
+            except Exception:
+                cleaned_name = ""
+            if cleaned_name:
+                forced_names.append(cleaned_name)
+        forced_collections: Tuple[str, ...] = tuple(forced_names)
+
+        session_specific_filter: Optional[models.Filter] = None
+        if session_key:
+            session_specific_filter = self._merge_filters(
+                combined_filter,
+                [
+                    models.FieldCondition(
+                        key="session_id", match=models.MatchValue(value=session_key)
+                    )
+                ],
+            )
+        if forced_collections:
+            for name in forced_collections:
+                if (
+                    session_specific_filter is not None
+                    and name == self.uploaded_collection
+                ):
+                    _append_collection(name, session_specific_filter)
+                else:
+                    _append_collection(name, combined_filter)
         else:
             if session_specific_filter is not None:
                 _append_collection(self.uploaded_collection, session_specific_filter)
