@@ -301,6 +301,7 @@ class LearningRepository:
             "workflow_id": models.PayloadSchemaType.KEYWORD,
             "rfq_id": models.PayloadSchemaType.KEYWORD,
             "supplier_id": models.PayloadSchemaType.KEYWORD,
+            "source_type": models.PayloadSchemaType.KEYWORD,
         }
 
         for field, schema_type in required.items():

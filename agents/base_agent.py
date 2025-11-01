@@ -1443,6 +1443,7 @@ class AgentNick:
             "product_type": models.PayloadSchemaType.KEYWORD,
             "record_id": models.PayloadSchemaType.KEYWORD,
             "workflow_id": models.PayloadSchemaType.KEYWORD,
+            "source_type": models.PayloadSchemaType.KEYWORD,
         }
 
         def ensure_indexes(schema: Dict[str, Any]) -> None:

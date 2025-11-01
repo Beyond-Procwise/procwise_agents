@@ -1,5 +1,6 @@
 # ProcWise/services/model_selector.py
 
+import inspect
 import json
 import logging
 import re
@@ -311,8 +312,8 @@ class RAGPipeline:
         self,
         text: str,
         *,
-        max_sentences: int = 3,
-        max_chars: int = 360,
+        max_sentences: int = 2,
+        max_chars: int = 280,
     ) -> str:
         """Return a lightly summarised version of ``text`` suitable for prompts."""
 
@@ -329,6 +330,100 @@ class RAGPipeline:
             truncated = summary[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;")
             summary = f"{truncated}…" if truncated else summary[:max_chars]
         return self._redact_identifiers(summary)
+
+    def _analyse_session_history(
+        self, history: List[Dict[str, Any]]
+    ) -> tuple[str, List[str], bool]:
+        if not history:
+            return "", [], False
+
+        recent_entries = history[-3:]
+        hint_parts: List[str] = []
+        fragments: List[str] = []
+        policy_signal = False
+
+        for entry in reversed(recent_entries):
+            question = str(entry.get("query", "")).strip()
+            if question:
+                cleaned_question = self._redact_identifiers(question)
+                if cleaned_question:
+                    hint_parts.append(f"Earlier question: {cleaned_question}")
+                    lowered_q = cleaned_question.lower()
+                    if any(token in lowered_q for token in ("policy", "supplier", "approval")):
+                        policy_signal = True
+
+            answer = entry.get("answer")
+            answer_text: str = ""
+            if isinstance(answer, str):
+                answer_text = answer
+            elif isinstance(answer, list):
+                answer_text = " ".join(str(item) for item in answer if item)
+            elif isinstance(answer, dict):
+                answer_text = json.dumps(answer, ensure_ascii=False)
+            elif answer is not None:
+                answer_text = str(answer)
+
+            snippet = self._condense_snippet(
+                answer_text, max_sentences=2, max_chars=220
+            )
+            if snippet:
+                fragments.append(snippet)
+                lowered_snippet = snippet.lower()
+                if any(token in lowered_snippet for token in ("policy", "supplier", "approval")):
+                    policy_signal = True
+
+        session_hint = " ".join(hint_parts[:2])
+        return session_hint, fragments[:3], policy_signal
+
+    def _is_policy_question(
+        self,
+        query: str,
+        doc_type: Optional[str],
+        session_hint: str,
+        history_policy_signal: bool,
+    ) -> bool:
+        tokens = [query or "", session_hint or ""]
+        if doc_type:
+            tokens.append(doc_type)
+        combined = " ".join(token for token in tokens if token).lower()
+        keyword_triggers = (
+            "policy",
+            "approved supplier",
+            "non-approved",
+            "maverick",
+            "delegation",
+            "compliance",
+            "procurement rule",
+            "sourcing rule",
+            "policy breach",
+        )
+        if any(keyword in combined for keyword in keyword_triggers):
+            return True
+        return history_policy_signal
+
+    def _supported_search_kwargs(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            signature = inspect.signature(self.rag.search)
+        except (TypeError, ValueError):
+            return {}
+
+        parameters = signature.parameters
+        has_var_kw = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+        )
+        accepted: Dict[str, Any] = {}
+        for key, value in candidate.items():
+            param = parameters.get(key)
+            if param is not None:
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    accepted[key] = value
+            elif has_var_kw:
+                accepted[key] = value
+        return accepted
 
     def _is_sensitive_key(self, key: Any) -> bool:
         key_str = str(key or "").strip()
@@ -515,7 +610,7 @@ class RAGPipeline:
         summary_intro = str(
             guidelines.get(
                 "summary_intro",
-                "Here's what I was able to confirm from the knowledge base.",
+                "Here's a quick summary based on the latest procurement guidance.",
             )
         ).strip()
 
@@ -532,24 +627,26 @@ class RAGPipeline:
         if enumerated_items:
             statements: List[str] = []
             for idx, item in enumerate(enumerated_items):
-                doc_label = (
-                    item.get("document")
-                    or item.get("source_label")
-                    or "This reference"
-                )
+                source_label = item.get("source_label") or "reference"
+                doc_label = item.get("document") or source_label
                 snippet = item.get("summary") or self._condense_snippet(
                     (item.get("payload") or {}).get("content", "")
                 )
                 snippet = self._redact_identifiers(snippet)
                 if not snippet:
                     continue
-                if idx == 0:
-                    prefix = f"{doc_label} highlights"
+                lowered_label = source_label.lower()
+                if "policy" in lowered_label:
+                    opener = "The policy states"
+                elif "uploaded" in lowered_label:
+                    opener = "Your uploaded note adds"
+                elif idx == 0:
+                    opener = f"{doc_label} highlights"
                 elif idx == 1:
-                    prefix = f"{doc_label} also notes"
+                    opener = f"{doc_label} also notes"
                 else:
-                    prefix = f"{doc_label} further explains"
-                insight = f"{prefix} {snippet}".strip()
+                    opener = f"{doc_label} further explains"
+                insight = f"{opener} {snippet}".strip()
                 sentence = self._to_sentence(insight)
                 if sentence:
                     statements.append(sentence)
@@ -687,6 +784,11 @@ class RAGPipeline:
             product_type,
         )
 
+        history = self.history_manager.get_history(user_id)
+        session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
+            history
+        )
+
         must_conditions: List[models.FieldCondition] = []
         if doc_type:
             normalised_doc_type = doc_type.lower()
@@ -722,7 +824,20 @@ class RAGPipeline:
                 self.rag.upsert_texts([text], metadata)
         ad_hoc_context = "\n".join(ad_hoc_notes)
 
-        reranked = self.rag.search(query, top_k=6, filters=qdrant_filter)
+        policy_mode = self._is_policy_question(
+            query, doc_type, session_hint, history_policy_signal
+        )
+        search_kwargs = {
+            "top_k": 6,
+            "filters": qdrant_filter,
+        }
+        hint_kwargs = {
+            "session_hint": session_hint,
+            "memory_fragments": memory_fragments,
+            "policy_mode": policy_mode,
+        }
+        search_kwargs.update(self._supported_search_kwargs(hint_kwargs))
+        reranked = self.rag.search(query, **search_kwargs)
         knowledge_items = self._prepare_knowledge_items(reranked)
 
         if knowledge_items:
@@ -805,7 +920,6 @@ class RAGPipeline:
         answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
         follow_ups = self._build_followups(query, enumerated_items)
 
-        history = self.history_manager.get_history(user_id)
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
 
