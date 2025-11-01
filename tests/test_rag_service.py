@@ -3,9 +3,9 @@ import sys
 import uuid
 from types import SimpleNamespace
 
-from agents.base_agent import AgentOutput, AgentStatus
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from agents.base_agent import AgentOutput, AgentStatus
 
 from services.rag_service import RAGService
 from services.model_selector import RAGPipeline
@@ -141,18 +141,20 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("q", "user")
     assert result["retrieved_documents"][0]["record_id"] == "R1"
+    assert "[doc 1]" in result["answer"]
+    assert len(result["follow_ups"]) == 3
 
 
-def test_pipeline_prefers_static_dataset(monkeypatch):
+def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     class DummyRAG:
         def __init__(self, *args, **kwargs):
             pass
 
         def search(self, query, top_k=5, filters=None):
-            raise AssertionError("Dynamic search should not be called when static QA matches")
+            return []
 
         def upsert_texts(self, texts, metadata=None):
-            raise AssertionError("Dynamic upsert not expected for static QA responses")
+            pass
 
     monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
 
@@ -161,19 +163,7 @@ def test_pipeline_prefers_static_dataset(monkeypatch):
             pass
 
         def run(self, query, user_id, session_id=None, **kwargs):
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={
-                    "answer": "Year-to-date realised savings are around £2.8 million, mainly from IT and facilities contract renewals.",
-                    "related_prompts": [
-                        "How does this compare with the same period last year?",
-                        "Show me the savings trend over the past 6 months.",
-                    ],
-                    "topic": "Current Total Savings Year-to-Date",
-                    "question": "What is our current total savings year to date?",
-                },
-                confidence=0.92,
-            )
+            return AgentOutput(status=AgentStatus.SUCCESS, data={}, confidence=0.1)
 
     monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
 
@@ -202,10 +192,7 @@ def test_pipeline_prefers_static_dataset(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
     result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
 
-    assert "Year-to-date realised savings" in result["answer"]
-    assert result["retrieved_documents"][0]["source"] == "static_procurement_qa"
-    assert result["follow_ups"] == [
-        "How does this compare with the same period last year?",
-        "Show me the savings trend over the past 6 months.",
-    ]
-    assert history_store["payloads"], "Static answers should be recorded in history"
+    assert result["answer"] == "I do not have that information as per my knowledge."
+    assert result["retrieved_documents"] == []
+    assert len(result["follow_ups"]) == 3
+    assert history_store["payloads"], "Fallback answers should still be recorded in history"

@@ -6,6 +6,7 @@ import re
 import ollama
 import pdfplumber
 from io import BytesIO
+from pathlib import Path
 from botocore.exceptions import ClientError
 from typing import Any, Dict, List, Optional, Type
 from sentence_transformers import CrossEncoder
@@ -15,6 +16,14 @@ from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
 from .rag_service import RAGService
 from utils.gpu import configure_gpu, load_cross_encoder
+
+_CITATION_GUIDELINES_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "resources"
+    / "training"
+    / "rag"
+    / "citation_guidelines.json"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +85,7 @@ class RAGPipeline:
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
+        self._citation_guidelines = self._load_citation_guidelines()
 
     def _format_static_answer(self, answer: str) -> str:
         cleaned = answer.strip()
@@ -163,6 +173,65 @@ class RAGPipeline:
     # ------------------------------------------------------------------
     # Context synthesis helpers
     # ------------------------------------------------------------------
+    def _load_citation_guidelines(self) -> Dict[str, Any]:
+        """Load structured response preferences authored by layered training."""
+
+        defaults: Dict[str, Any] = {
+            "acknowledgements": [
+                "Thanks for flagging this — here's what I can confirm.",
+                "Appreciate the context. Here's the current view.",
+            ],
+            "summary_intro": "Current highlights from the knowledge base:",
+            "actions_lead": "Let me know if you want me to escalate, refresh the data, or prep outreach notes.",
+            "fallback": "I do not have that information as per my knowledge.",
+            "default_follow_ups": [
+                "Would you like me to surface the related purchase order or contract details?",
+                "Should I queue a supplier relationship summary for review?",
+                "Do you want me to capture this question for the next procurement sync?",
+            ],
+        }
+        if not _CITATION_GUIDELINES_PATH.exists():
+            try:
+                _CITATION_GUIDELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _CITATION_GUIDELINES_PATH.write_text(
+                    json.dumps(defaults, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.debug("Unable to persist default citation guidelines", exc_info=True)
+            return defaults
+
+        try:
+            loaded = json.loads(
+                _CITATION_GUIDELINES_PATH.read_text(encoding="utf-8")
+            )
+        except Exception:
+            logger.warning("Failed to load citation guidelines; using defaults")
+            return defaults
+
+        merged = dict(defaults)
+        if isinstance(loaded, dict):
+            for key, value in loaded.items():
+                if key in {"acknowledgements", "default_follow_ups"} and isinstance(value, list):
+                    merged[key] = [str(item) for item in value if str(item).strip()]
+                elif isinstance(value, str):
+                    merged[key] = value
+        return merged
+
+    def _redact_identifiers(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+
+        patterns = [
+            r"\b(?:supplier|rfq|po|invoice|contract)[-_\s]*\w+\b",
+            r"PROC-?WF-\w+",
+            r"\b(?:ID|Ref)[-:\s]*\d+\b",
+        ]
+        cleaned = text
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "[redacted]", cleaned, flags=re.IGNORECASE)
+        return cleaned
+
     def _condense_snippet(
         self,
         text: str,
@@ -184,7 +253,7 @@ class RAGPipeline:
         if len(summary) > max_chars:
             truncated = summary[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;")
             summary = f"{truncated}…" if truncated else summary[:max_chars]
-        return summary
+        return self._redact_identifiers(summary)
 
     def _label_for_collection(self, collection: Optional[str]) -> str:
         if not collection:
@@ -216,9 +285,10 @@ class RAGPipeline:
             document_label = (
                 payload.get("document_name")
                 or payload.get("title")
-                or payload.get("record_id")
-                or str(getattr(hit, "id", "Document"))
+                or payload.get("document_type")
+                or "Procurement reference"
             )
+            document_label = self._redact_identifiers(str(document_label))
             items.append(
                 {
                     "payload": payload,
@@ -279,6 +349,73 @@ class RAGPipeline:
             paragraphs.append(f"{source_label}: {' '.join(snippets)}")
 
         return "\n\n".join(paragraphs)
+
+    def _build_structured_answer(
+        self,
+        query: str,
+        enumerated_items: List[Dict[str, Any]],
+        ad_hoc_context: str,
+    ) -> str:
+        guidelines = self._citation_guidelines
+        acknowledgements = guidelines.get("acknowledgements", [])
+        ack = (
+            acknowledgements[0]
+            if acknowledgements
+            else "Thanks for flagging this — here's what I can confirm."
+        )
+        summary_intro = guidelines.get(
+            "summary_intro", "Here's what I was able to confirm from the knowledge base:"
+        )
+
+        lines: List[str] = [ack, summary_intro]
+        for item in enumerated_items:
+            doc_label = item.get("document") or "Procurement reference"
+            snippet = item.get("summary") or self._condense_snippet(
+                (item.get("payload") or {}).get("content", "")
+            )
+            snippet = self._redact_identifiers(snippet)
+            citation = item.get("citation")
+            line = f"- {doc_label}: {snippet}".strip()
+            if citation:
+                line = f"{line} {citation}".strip()
+            lines.append(line)
+
+        if ad_hoc_context:
+            lines.append(
+                f"- Uploaded notes: {self._redact_identifiers(ad_hoc_context)} [uploads]"
+            )
+
+        actions_lead = guidelines.get("actions_lead")
+        if actions_lead:
+            lines.append(actions_lead)
+
+        return "\n".join(line for line in lines if line)
+
+    def _build_followups(
+        self, query: str, enumerated_items: List[Dict[str, Any]]
+    ) -> List[str]:
+        redacted_query = self._redact_identifiers(query)
+        suggestions: List[str] = []
+        if redacted_query:
+            suggestions.append(
+                f'Should I gather further detail on "{redacted_query}"?'
+            )
+        if enumerated_items:
+            top_doc = enumerated_items[0].get("document")
+            if top_doc:
+                suggestions.append(
+                    f"Would you like me to brief stakeholders responsible for {top_doc}?"
+                )
+        for template in self._citation_guidelines.get("default_follow_ups", []):
+            replacement = template.replace("{query}", redacted_query)
+            suggestions.append(replacement)
+
+        deduped: List[str] = []
+        for suggestion in suggestions:
+            cleaned = suggestion.strip()
+            if cleaned and cleaned not in deduped:
+                deduped.append(cleaned)
+        return deduped[:3]
 
     def _format_history_context(self, history: List[Dict[str, Any]], limit: int = 3) -> str:
         if not history:
@@ -353,165 +490,134 @@ class RAGPipeline:
             logger.error(f"Error generating answer: {e}")
             return {"answer": "Could not generate an answer.", "follow_ups": []}
 
-    def answer_question(self, query: str, user_id: str, model_name: Optional[str] = None,
-                        files: Optional[List[tuple[bytes, str]]] = None, doc_type: Optional[str] = None,
-                        product_type: Optional[str] = None) -> Dict:
-        static_candidate = self._try_static_answer(query, user_id)
-        if static_candidate:
-            return static_candidate
-
+    def answer_question(
+        self,
+        query: str,
+        user_id: str,
+        model_name: Optional[str] = None,
+        files: Optional[List[tuple[bytes, str]]] = None,
+        doc_type: Optional[str] = None,
+        product_type: Optional[str] = None,
+    ) -> Dict:
         llm_to_use = model_name or self.default_llm_model
         logger.info(
-            f"Answering query with model '{llm_to_use}' and filters: doc_type='{doc_type}', product_type='{product_type}'")
+            "Answering query with model '%s' and filters: doc_type='%s', product_type='%s'",
+            llm_to_use,
+            doc_type,
+            product_type,
+        )
 
-        # The vector collection is initialized once during application startup
-        # via ``AgentNick``. Re-initializing here would trigger unnecessary
-        # Qdrant calls and slow down the ``/ask`` endpoint.
-
-        # --- Normalise filters and build Vector DB filter conditions ---
         must_conditions: List[models.FieldCondition] = []
         if doc_type:
-            doc_type = doc_type.lower()
+            normalised_doc_type = doc_type.lower()
             must_conditions.append(
-                models.FieldCondition(key="document_type", match=models.MatchValue(value=doc_type))
+                models.FieldCondition(
+                    key="document_type", match=models.MatchValue(value=normalised_doc_type)
+                )
             )
+        else:
+            normalised_doc_type = None
         if product_type:
             product_type = product_type.lower()
             must_conditions.append(
-                models.FieldCondition(key="product_type", match=models.MatchValue(value=product_type))
+                models.FieldCondition(
+                    key="product_type", match=models.MatchValue(value=product_type)
+                )
             )
         qdrant_filter = models.Filter(must=must_conditions) if must_conditions else None
 
-        # --- Process Uploaded Files ---
         uploaded = self._extract_text_from_uploads(files) if files else []
         ad_hoc_notes: List[str] = []
         for idx, file_info in enumerate(uploaded):
             filename = file_info.get("name") or f"uploaded-reference-{idx + 1}"
+            safe_name = self._redact_identifiers(filename)
             text = file_info.get("text", "")
             summary = file_info.get("summary") or self._condense_snippet(text)
             if summary:
-                ad_hoc_notes.append(f"{filename}: {summary}")
-            metadata = {"record_id": filename, "document_type": doc_type or "uploaded"}
+                ad_hoc_notes.append(f"{safe_name}: {summary}")
+            metadata = {"record_id": filename, "document_type": normalised_doc_type or "uploaded"}
             if product_type:
-                metadata["product_type"] = product_type.lower()
+                metadata["product_type"] = product_type
             if text:
                 self.rag.upsert_texts([text], metadata)
         ad_hoc_context = "\n".join(ad_hoc_notes)
 
-        # --- Retrieve from Vector DB ---
-        top_k = 6
-        reranked = self.rag.search(query, top_k=top_k, filters=qdrant_filter)
+        reranked = self.rag.search(query, top_k=6, filters=qdrant_filter)
         knowledge_items = self._prepare_knowledge_items(reranked)
-        retrieved_documents_payloads: List[Dict[str, Any]] = [
-            item["payload"] for item in knowledge_items
-        ]
 
-        try:
-            static_output = self._static_agent.run(
-                query=query, user_id=user_id, session_id=user_id
-            )
-        except Exception:
-            logger.exception("Static procurement QA lookup failed during context build")
-        else:
-            if static_output.status is AgentStatus.SUCCESS:
-                payload = static_output.data or {}
-                answer_text = payload.get("answer")
-                if isinstance(answer_text, str) and answer_text.strip():
-                    static_context_payload = {
-                        "source": "static_procurement_qa",
-                        "topic": payload.get("topic"),
-                        "question": payload.get("question"),
-                        "answer": answer_text,
-                        "confidence": float(static_output.confidence or 0.0),
-                    }
-                    retrieved_documents_payloads.append(static_context_payload)
-                    knowledge_items.append(
-                        {
-                            "payload": static_context_payload,
-                            "collection": "static_procurement_qa",
-                            "source_label": self._label_for_collection("static_procurement_qa"),
-                            "document": payload.get("topic")
+        if knowledge_items:
+            try:
+                static_output = self._static_agent.run(
+                    query=query, user_id=user_id, session_id=user_id
+                )
+            except Exception:
+                logger.exception("Static procurement QA lookup failed during context build")
+            else:
+                if static_output.status is AgentStatus.SUCCESS:
+                    payload = static_output.data or {}
+                    answer_text = payload.get("answer")
+                    if isinstance(answer_text, str) and answer_text.strip():
+                        safe_document = self._redact_identifiers(
+                            payload.get("topic")
                             or payload.get("question")
-                            or "Procurement guidance",
-                            "summary": self._condense_snippet(
-                                answer_text, max_sentences=2, max_chars=320
-                            ),
+                            or "Procurement guidance"
+                        )
+                        static_context_payload = {
+                            "source": "static_procurement_qa",
+                            "topic": payload.get("topic"),
+                            "question": payload.get("question"),
+                            "answer": answer_text,
+                            "confidence": float(static_output.confidence or 0.0),
+                            "collection_name": "static_procurement_qa",
+                            "source_label": self._label_for_collection("static_procurement_qa"),
                         }
-                    )
-
-        retrieved_context = self._synthesise_context(knowledge_items)
+                        knowledge_items.append(
+                            {
+                                "payload": static_context_payload,
+                                "collection": "static_procurement_qa",
+                                "source_label": self._label_for_collection(
+                                    "static_procurement_qa"
+                                ),
+                                "document": safe_document,
+                                "summary": self._condense_snippet(
+                                    answer_text, max_sentences=2, max_chars=320
+                                ),
+                            }
+                        )
 
         if not knowledge_items and not ad_hoc_context:
+            fallback = self._citation_guidelines.get(
+                "fallback", "I do not have that information as per my knowledge."
+            )
             history = self.history_manager.get_history(user_id)
-            history_context = self._format_history_context(history)
-            if not history_context:
-                return {
-                    "answer": "I could not find relevant knowledge or prior conversation to answer that just yet.",
-                    "follow_ups": [],
-                    "retrieved_documents": [],
-                }
-            prompt = f"""No knowledge base excerpts were retrieved for the latest query. Use the recent conversation to craft a helpful response that stays within procurement context and acknowledges any gaps.
-
-### Recent Conversation:
-{history_context}
-
-### User's Question:
-{query}
-
-Guidelines:
-1. Continue the discussion in a warm, professional tone.
-2. If information is missing, suggest the most practical next step.
-3. Provide three relevant follow-up questions that build on the dialogue.
-"""
-            model_output = self._generate_response(prompt, llm_to_use)
-            answer_raw = model_output.get("answer", "Could not generate an answer.")
-            follow_ups_raw = model_output.get("follow_ups", [])
-            answer = self._postprocess_answer(answer_raw)
-            if not isinstance(follow_ups_raw, list):
-                follow_ups = []
-            else:
-                follow_ups = [
-                    str(item).strip() for item in follow_ups_raw if str(item).strip()
-                ][:5]
-            history.append({"query": query, "answer": answer})
+            history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
+            follow_ups = self._build_followups(query, [])
             return {
-                "answer": answer,
+                "answer": fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
 
-        prompt = f"""Use the context below to answer the procurement question with a natural, consultant-style summary.
+        enumerated_items: List[Dict[str, Any]] = []
+        for idx, item in enumerate(knowledge_items, start=1):
+            enriched = dict(item)
+            enriched["citation"] = f"[doc {idx}]"
+            enumerated_items.append(enriched)
 
-### Uploaded References:
-{ad_hoc_context if ad_hoc_context else "No user uploads were provided for this query."}
+        retrieved_documents_payloads: List[Dict[str, Any]] = []
+        for item in enumerated_items:
+            payload = dict(item.get("payload", {}))
+            payload.setdefault("collection_name", item.get("collection"))
+            payload.setdefault("source_label", item.get("source_label"))
+            payload["citation"] = item.get("citation")
+            retrieved_documents_payloads.append(payload)
 
-### Knowledge Base Highlights:
-{retrieved_context if retrieved_context else "No direct knowledge snippets matched; rely on procurement best practice and explain any gaps."}
-
-### User's Question:
-{query}
-
-Guidelines:
-1. Weave the information into two or three short paragraphs that read like a human analyst.
-2. Paraphrase instead of quoting directly, and clarify whether items are complete, pending, or uncertain.
-3. Flag any missing data and suggest the most useful next action.
-4. Provide three forward-looking follow-up questions tailored to the conversation.
-"""
-
-        model_output = self._generate_response(prompt, llm_to_use)
-        answer_raw = model_output.get("answer", "Could not generate an answer.")
-        follow_ups_raw = model_output.get("follow_ups", [])
-        answer = self._postprocess_answer(answer_raw)
-        if not isinstance(follow_ups_raw, list):
-            follow_ups = []
-        else:
-            follow_ups = [
-                str(item).strip() for item in follow_ups_raw if str(item).strip()
-            ][:5]
+        answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
+        follow_ups = self._build_followups(query, enumerated_items)
 
         history = self.history_manager.get_history(user_id)
-        history.append({"query": query, "answer": answer})
+        history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
 
         return {

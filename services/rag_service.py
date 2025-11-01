@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 from types import SimpleNamespace
 
@@ -12,6 +13,15 @@ from rank_bm25 import BM25Okapi
 from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
+
+_TRAINING_ROOT = (
+    Path(__file__).resolve().parent.parent
+    / "resources"
+    / "training"
+    / "rag"
+)
+_TRAINING_ROOT.mkdir(parents=True, exist_ok=True)
+_PREFERENCE_WEIGHTS_PATH = _TRAINING_ROOT / "preference_weights.json"
 
 configure_gpu()
 
@@ -59,6 +69,60 @@ class RAGService:
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
+        self._preference_weights = self._load_preference_weights()
+
+    # ------------------------------------------------------------------
+    # Preference calibration helpers
+    # ------------------------------------------------------------------
+    def _load_preference_weights(self) -> Dict[str, Dict[str, float]]:
+        """Load retrieval preference weights produced by layered training."""
+
+        defaults: Dict[str, Dict[str, float]] = {
+            "collection": {
+                self.primary_collection: 0.12,
+                self.uploaded_collection: 0.08,
+                self.learning_collection: 0.04,
+            },
+            "document_type": {},
+        }
+        if not _PREFERENCE_WEIGHTS_PATH.exists():
+            try:
+                _PREFERENCE_WEIGHTS_PATH.write_text(
+                    json.dumps(defaults, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug("Unable to persist default preference weights", exc_info=True)
+            return defaults
+
+        try:
+            data = json.loads(_PREFERENCE_WEIGHTS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Failed to load preference weights; falling back to defaults")
+            return defaults
+
+        # Merge to ensure required keys exist
+        merged = {
+            "collection": dict(defaults["collection"]),
+            "document_type": dict(defaults["document_type"]),
+        }
+        if isinstance(data, dict):
+            for key in ("collection", "document_type"):
+                value = data.get(key)
+                if isinstance(value, dict):
+                    merged[key].update(
+                        {
+                            str(k): float(v)
+                            for k, v in value.items()
+                            if isinstance(k, str) and isinstance(v, (int, float))
+                        }
+                    )
+        return merged
+
+    def reload_preference_weights(self) -> None:
+        """Refresh preference weights after a training run."""
+
+        self._preference_weights = self._load_preference_weights()
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -488,13 +552,12 @@ class RAGService:
         def _priority_bonus(hit: SimpleNamespace) -> float:
             payload = getattr(hit, "payload", {}) or {}
             collection = payload.get("collection_name", self.primary_collection)
-            if collection == self.primary_collection:
-                return 0.12
-            if collection == self.uploaded_collection:
-                return 0.08
-            if collection == self.learning_collection:
-                return 0.04
-            return 0.0
+            document_type = str(payload.get("document_type", "")).lower()
+            weights = self._preference_weights
+            bonus = weights.get("collection", {}).get(collection, 0.0)
+            if document_type:
+                bonus += weights.get("document_type", {}).get(document_type, 0.0)
+            return float(bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         for hit, score in zip(hits, scores):
