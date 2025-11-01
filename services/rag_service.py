@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 from types import SimpleNamespace
 
@@ -13,6 +14,15 @@ from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
 from services.semantic_cache import SemanticCacheManager
+
+_TRAINING_ROOT = (
+    Path(__file__).resolve().parent.parent
+    / "resources"
+    / "training"
+    / "rag"
+)
+_TRAINING_ROOT.mkdir(parents=True, exist_ok=True)
+_PREFERENCE_WEIGHTS_PATH = _TRAINING_ROOT / "preference_weights.json"
 
 configure_gpu()
 
@@ -500,13 +510,12 @@ class RAGService:
         def _priority_bonus(hit: SimpleNamespace) -> float:
             payload = getattr(hit, "payload", {}) or {}
             collection = payload.get("collection_name", self.primary_collection)
-            if collection == self.primary_collection:
-                return 0.12
-            if collection == self.uploaded_collection:
-                return 0.08
-            if collection == self.learning_collection:
-                return 0.04
-            return 0.0
+            document_type = str(payload.get("document_type", "")).lower()
+            weights = self._preference_weights
+            bonus = weights.get("collection", {}).get(collection, 0.0)
+            if document_type:
+                bonus += weights.get("document_type", {}).get(document_type, 0.0)
+            return float(bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         for hit, score in zip(hits, scores):

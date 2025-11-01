@@ -1,6 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any, Dict, List
 
 import pytest
 
@@ -67,6 +68,21 @@ def patch_event_bus(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def patch_rag_trainer_factory(monkeypatch):
+    class DummyTrainer:
+        def __init__(self, *args, **kwargs):
+            self.calls: List[Dict[str, Any]] = []
+
+        def train(self, payload: Dict[str, Any]):
+            self.calls.append(dict(payload))
+            return {"layer0": {}}
+
+    trainer = DummyTrainer()
+    monkeypatch.setattr(mts, "LayeredRAGTrainer", lambda *a, **k: trainer)
+    yield trainer
+
+
 def test_dispatch_flushes_pending_negotiation_learnings():
     repo = RepoRecorder()
     nick = SimpleNamespace(
@@ -119,3 +135,31 @@ def test_dispatch_requeues_when_repository_missing():
 
     assert result["negotiation_learnings"][0]["status"] == "skipped"
     assert len(service._pending_negotiation_learnings) == 1
+
+
+def test_run_training_job_triggers_rag_pipeline(monkeypatch):
+    nick = SimpleNamespace(
+        settings=SimpleNamespace(enable_learning=False),
+        policy_engine=SimpleNamespace(),
+        learning_repository=None,
+        get_db_connection=lambda: DummyConn(),
+    )
+
+    service = StubService(nick)
+
+    class Recorder:
+        def __init__(self):
+            self.calls: List[Dict[str, Any]] = []
+
+        def train(self, payload: Dict[str, Any]):
+            self.calls.append(dict(payload))
+            return {"layer0": {"primary": True}}
+
+    recorder = Recorder()
+    service._rag_trainer = recorder  # type: ignore[assignment]
+
+    job = {"agent_slug": "rag_agent", "payload": {"documents": []}}
+    service._run_training_job(job)
+
+    assert recorder.calls, "Expected rag trainer to be invoked"
+    assert job["payload"]["training_result"]["layer0"]["primary"] is True

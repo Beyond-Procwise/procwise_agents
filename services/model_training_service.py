@@ -9,6 +9,7 @@ from copy import deepcopy
 from services.event_bus import get_event_bus
 from models.supplier_ranking_trainer import SupplierRankingTrainer
 from models.context_trainer import ContextTrainer, TrainingConfig
+from services.rag_training_pipeline import LayeredRAGTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class ModelTrainingService:
         self._pending_negotiation_learnings: List[Dict[str, Any]] = []
         self._context_trainer: Optional[ContextTrainer] = None
         self._queued_context_workflows: set[str] = set()
+        self._rag_trainer = LayeredRAGTrainer(agent_nick)
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -539,6 +541,9 @@ class ModelTrainingService:
     def _run_training_job(self, job: Dict[str, Any]) -> None:
         agent_slug = job.get("agent_slug")
         payload = job.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        job["payload"] = payload
         if self._learning_repo is not None:
             try:
                 context_snapshot = self._learning_repo.build_context_snapshot(
@@ -583,6 +588,10 @@ class ModelTrainingService:
                 logger.info(
                     "Supplier ranking training skipped due to insufficient labelled samples"
                 )
+        elif agent_slug == "rag_agent":
+            summary = self._rag_trainer.train(payload)
+            payload["training_result"] = summary
+            logger.info("RAG agent layered training summary: %s", summary)
         elif agent_slug == "context_trainer":
             trainer = self._resolve_context_trainer()
             overrides = {

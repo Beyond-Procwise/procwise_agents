@@ -1,0 +1,14 @@
+{
+  "acknowledgements": [
+    "Thanks for flagging this — here's what I can confirm.",
+    "Appreciate the context. Here's the current view."
+  ],
+  "summary_intro": "Current highlights from the knowledge base:",
+  "actions_lead": "Let me know if you want me to escalate, refresh the data, or prep outreach notes.",
+  "fallback": "I do not have that information as per my knowledge.",
+  "default_follow_ups": [
+    "Would you like me to surface the related purchase order or contract details?",
+    "Should I queue a supplier relationship summary for review?",
+    "Do you want me to capture this question for the next procurement sync?"
+  ]
+}
