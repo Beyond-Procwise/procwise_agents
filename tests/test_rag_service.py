@@ -2,7 +2,7 @@ import os
 import sys
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -338,6 +338,87 @@ def test_pipeline_uploaded_context_mode(monkeypatch):
     )
     assert len(result["follow_ups"]) == 3
 
+
+def test_pipeline_uploaded_context_scoped_to_session(monkeypatch):
+    collections_history: List[Optional[tuple]] = []
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, query, top_k=5, filters=None, **kwargs):
+            collections = kwargs.get("collections")
+            collections_history.append(collections)
+            active_collection = collections[0] if collections else "primary_collection"
+            document_id = "doc-uploaded" if collections else "doc-primary"
+            return [
+                SimpleNamespace(
+                    id=f"chunk-{document_id}",
+                    payload={
+                        "collection_name": active_collection,
+                        "summary": "Relevant insight",
+                        "document_id": document_id,
+                    },
+                    combined_score=1.0,
+                    rerank_score=1.0,
+                )
+            ]
+
+        def upsert_texts(self, texts, metadata=None):
+            pass
+
+        primary_collection = "primary_collection"
+        uploaded_collection = "uploaded_documents"
+        static_policy_collection = "static_policy"
+        learning_collection = "learning"
+
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    class PassiveStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, *args, **kwargs):
+            return AgentOutput(status=AgentStatus.FAILURE, data={})
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", PassiveStaticAgent)
+
+    monkeypatch.setattr(
+        RAGPipeline,
+        "_generate_response",
+        lambda self, prompt, model: {"answer": "Insight", "follow_ups": []},
+    )
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(
+            get_object=lambda **_: {"Body": SimpleNamespace(read=lambda: b"[]")},
+            put_object=lambda **_: None,
+        ),
+        settings=SimpleNamespace(qdrant_collection_name="c", s3_bucket_name="b", reranker_model="x"),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
+    pipeline.activate_uploaded_context(
+        ["doc-uploaded"],
+        metadata={"filenames": ["contract.pdf"]},
+        session_id="session-123",
+    )
+
+    first_result = pipeline.answer_question(
+        "Summarise the uploaded contract", "user-123", session_id="session-123"
+    )
+    second_result = pipeline.answer_question(
+        "Provide other insights", "user-456", session_id="session-999"
+    )
+
+    assert collections_history[0] == ("uploaded_documents",)
+    assert collections_history[1] != ("uploaded_documents",)
+    assert first_result["retrieved_documents"][0]["collection_name"] == "uploaded_documents"
+    assert second_result["retrieved_documents"][0]["collection_name"] != "uploaded_documents"
 
 def test_pipeline_prefers_explicit_session_id(monkeypatch):
     captured: Dict[str, Any] = {}

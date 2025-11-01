@@ -37,6 +37,11 @@ try:  # Optional PDF dependency for deterministic fallback extraction
 except Exception:  # pragma: no cover - optional dependency fallback
     pdfplumber = None  # type: ignore
 
+try:  # Optional PyMuPDF dependency for additional PDF fallback
+    import fitz  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - optional dependency fallback
+    fitz = None  # type: ignore
+
 
 @dataclass
 class EmbeddedDocument:
@@ -260,6 +265,25 @@ class DocumentEmbeddingService:
                         )
             except Exception:
                 logger.exception("pdfplumber fallback failed for %s", filename)
+
+        if suffix == ".pdf" and fitz is not None:
+            try:
+                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                    pages = [page.get_text("text") or "" for page in doc]
+                    combined = "\n".join(part for part in pages if part)
+                    if combined.strip():
+                        metadata = {
+                            "content_type": "pdf",
+                            "pdf_page_count": doc.page_count,
+                            "pymupdf_extraction": True,
+                        }
+                        return ExtractedContent(
+                            text=combined,
+                            method="pymupdf_fallback",
+                            metadata=metadata,
+                        )
+            except Exception:
+                logger.exception("pymupdf fallback failed for %s", filename)
 
         # Fallback: attempt UTF-8 decode regardless of file type
         try:
