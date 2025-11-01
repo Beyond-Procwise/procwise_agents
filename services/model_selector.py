@@ -364,6 +364,18 @@ class RAGPipeline:
             )
         return re.sub(r"\s+", " ", cleaned).strip()
 
+    def _remove_placeholders(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = re.sub(
+            r"\[(?:redacted sensitive reference|doc\s*\d+|document\s*\d+|source\s*\d+)\]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
     def _condense_snippet(
         self,
         text: str,
@@ -633,17 +645,60 @@ class RAGPipeline:
         )
 
         selected: List[Dict[str, Any]] = []
-        seen: Set[Tuple[str, str]] = set()
+        seen: Set[Tuple[str, ...]] = set()
+
+        label_counts: Dict[Tuple[str, str], int] = {}
         for entry in sortable:
-            doc_label = str(entry.get("document") or "").lower()
+            doc_label = str(entry.get("document") or "").strip().lower()
             collection = str(entry.get("collection") or "")
+            if not doc_label:
+                continue
             key = (doc_label, collection)
-            if key in seen:
+            label_counts[key] = label_counts.get(key, 0) + 1
+
+        generic_labels = {"", "procurement reference"}
+
+        def _stable_identifier(entry: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
+            payload = entry.get("payload")
+            if isinstance(payload, dict):
+                for candidate in (
+                    "chunk_id",
+                    "chunk",
+                    "chunkId",
+                    "chunk_index",
+                    "id",
+                    "document_id",
+                    "documentId",
+                    "reference_id",
+                    "referenceId",
+                    "hash",
+                    "checksum",
+                ):
+                    value = payload.get(candidate)
+                    if isinstance(value, (str, int)):
+                        text = str(value).strip()
+                        if text:
+                            return ("payload", candidate.lower(), text.lower())
+            doc_label = str(entry.get("document") or "").strip().lower()
+            collection = str(entry.get("collection") or "")
+            if not doc_label:
+                return None
+            if doc_label in generic_labels or "redacted" in doc_label:
+                return None
+            label_key = (doc_label, collection)
+            if label_counts.get(label_key, 0) != 1:
+                return None
+            return ("label", collection, doc_label)
+
+        for entry in sortable:
+            key = _stable_identifier(entry)
+            if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
-            seen.add(key)
+            if key:
+                seen.add(key)
             if len(selected) >= limit:
                 break
 
@@ -1097,15 +1152,24 @@ class RAGPipeline:
     ) -> str:
         candidate = llm_answer if isinstance(llm_answer, str) else ""
         candidate = candidate.strip()
+        fallback_clean = self._remove_placeholders(fallback)
         if not candidate or candidate.lower().startswith("could not generate"):
-            return fallback
+            return fallback_clean
 
         sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        keywords = (nltk_features or {}).get("keywords") if nltk_features else None
+        key_phrases = (nltk_features or {}).get("key_phrases") if nltk_features else None
         if self._nltk_processor:
-            cleaned = self._nltk_processor.postprocess(candidate, sentiment=sentiment)
+            cleaned = self._nltk_processor.postprocess(
+                candidate,
+                sentiment=sentiment,
+                keywords=keywords,
+                key_phrases=key_phrases,
+            )
         else:
             cleaned = self._postprocess_answer(candidate)
-        return cleaned or fallback
+        cleaned = self._remove_placeholders(cleaned)
+        return cleaned or fallback_clean
 
     def _merge_followups(
         self, base_followups: List[str], llm_followups: Optional[List[Any]]
@@ -1118,8 +1182,11 @@ class RAGPipeline:
         suggestions.extend(base_followups)
         deduped: List[str] = []
         for suggestion in suggestions:
-            if suggestion not in deduped:
-                deduped.append(suggestion)
+            cleaned = self._remove_placeholders(suggestion)
+            if not cleaned:
+                continue
+            if cleaned not in deduped:
+                deduped.append(cleaned)
         return deduped[:3]
 
     def _build_structured_answer(
@@ -1471,6 +1538,7 @@ class RAGPipeline:
                 "fallback",
                 "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
+            fallback = self._remove_placeholders(fallback)
             history = self.history_manager.get_history(user_id)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
