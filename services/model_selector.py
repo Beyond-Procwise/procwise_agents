@@ -65,6 +65,72 @@ class ChatHistoryManager:
 
 
 class RAGPipeline:
+    _BLOCKED_DOC_TYPE_TOKENS = ("learning", "workflow", "event", "log", "trace", "audit")
+    _SENSITIVE_EXACT_KEYS = {
+        "record_id",
+        "source",
+        "source_system",
+        "source_agent",
+        "source_event",
+        "source_name",
+        "filename",
+        "file_name",
+        "file_path",
+        "path",
+        "uri",
+        "unique_id",
+        "workflow_ref",
+        "workflow_reference",
+    }
+    _SENSITIVE_KEY_MARKERS = (
+        "workflow",
+        "session",
+        "event",
+        "agent",
+        "log",
+        "trace",
+        "dispatch",
+        "routing",
+        "draft",
+        "message",
+    )
+    _BLOCKED_PAYLOAD_KEYS = {
+        "workflow_id",
+        "session_reference",
+        "workflow_reference",
+        "workflow_run_id",
+        "workflow_execution_id",
+        "workflow_event",
+        "workflow_stage",
+        "workflow_step",
+        "workflow_state",
+        "workflow_status",
+        "workflow_signature",
+        "workflow_payload",
+        "workflow_context",
+        "event_type",
+        "event_name",
+        "event_payload",
+        "event_id",
+        "event_reference",
+        "message_id",
+        "message_reference",
+        "routing_key",
+        "routing_event",
+        "trace_id",
+        "log_payload",
+        "log_level",
+        "log_message",
+        "agent_name",
+        "agent_id",
+        "agent_reference",
+        "learning_context",
+        "learning_summary",
+        "learning_id",
+        "dispatch_id",
+        "email_thread_id",
+    }
+
     def __init__(self, agent_nick, cross_encoder_cls: Type[CrossEncoder] = CrossEncoder):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
@@ -226,6 +292,10 @@ class RAGPipeline:
             r"\b(?:supplier|rfq|po|invoice|contract)[-_\s]*\w+\b",
             r"PROC-?WF-\w+",
             r"\b(?:ID|Ref)[-:\s]*\d+\b",
+            r"\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
+            r"\b[a-z]+_agent\b",
+            r"\blearning[_-]?(?:event|record|entry)?\b",
         ]
         cleaned = text
         for pattern in patterns:
@@ -255,6 +325,75 @@ class RAGPipeline:
             summary = f"{truncated}…" if truncated else summary[:max_chars]
         return self._redact_identifiers(summary)
 
+    def _is_sensitive_key(self, key: Any) -> bool:
+        key_str = str(key or "").strip()
+        if not key_str:
+            return True
+        lowered = key_str.lower()
+        if lowered in self._SENSITIVE_EXACT_KEYS:
+            return True
+        return any(marker in lowered for marker in self._SENSITIVE_KEY_MARKERS)
+
+    def _sanitise_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._redact_identifiers(value)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            cleaned = [self._sanitise_value(item) for item in value if item is not None]
+            return [item for item in cleaned if item not in ("", [], {})]
+        if isinstance(value, dict):
+            return {
+                str(key): self._sanitise_value(val)
+                for key, val in value.items()
+                if not self._is_sensitive_key(key)
+            }
+        return self._redact_identifiers(str(value))
+
+    def _sanitise_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        for key, value in (payload or {}).items():
+            if self._is_sensitive_key(key):
+                continue
+            cleaned[str(key)] = self._sanitise_value(value)
+        return cleaned
+
+    def _is_internal_payload(
+        self, payload: Dict[str, Any], collection: Optional[str]
+    ) -> bool:
+        if collection and collection == getattr(self.rag, "learning_collection", None):
+            return True
+        doc_type = str(payload.get("document_type") or "").lower()
+        if any(token in doc_type for token in self._BLOCKED_DOC_TYPE_TOKENS):
+            return True
+        for key in payload.keys():
+            lowered = str(key or "").lower()
+            if lowered in self._BLOCKED_PAYLOAD_KEYS:
+                return True
+            if any(
+                marker in lowered
+                for marker in (
+                    "workflow_",
+                    "session_",
+                    "event_",
+                    "agent_",
+                    "learning_",
+                    "dispatch_",
+                    "trace_",
+                    "proc_wf",
+                )
+            ):
+                return True
+        return False
+
+    def _to_sentence(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+        if cleaned[-1] not in ".!?":
+            cleaned = f"{cleaned}."
+        return cleaned
+
     def _label_for_collection(self, collection: Optional[str]) -> str:
         if not collection:
             return "Knowledge base insight"
@@ -265,8 +404,6 @@ class RAGPipeline:
         static_policy_collection = getattr(self.rag, "static_policy_collection", None)
         if collection == static_policy_collection:
             return "Procurement policy"
-        if collection == self.rag.learning_collection:
-            return "Procurement playbook"
         if collection == "static_procurement_qa":
             return "Static procurement guidance"
         return collection.replace("_", " ").title()
@@ -277,7 +414,12 @@ class RAGPipeline:
             payload = getattr(hit, "payload", {}) or {}
             payload = dict(payload)
             collection = payload.get("collection_name", self.rag.primary_collection)
+            if self._is_internal_payload(payload, collection):
+                continue
+            payload = self._sanitise_payload(payload)
+            collection = payload.get("collection_name", collection)
             source_label = self._label_for_collection(collection)
+            payload.setdefault("collection_name", collection)
             payload.setdefault("source_label", source_label)
             summary_text = (
                 payload.get("summary")
@@ -312,7 +454,6 @@ class RAGPipeline:
             self.rag.primary_collection,
             self.rag.uploaded_collection,
             getattr(self.rag, "static_policy_collection", None),
-            self.rag.learning_collection,
             "static_procurement_qa",
         ):
             if any(item["collection"] == collection for item in knowledge_items):
@@ -371,29 +512,44 @@ class RAGPipeline:
             "summary_intro", "Here's what I was able to confirm from the knowledge base:"
         )
 
-        lines: List[str] = [ack, summary_intro]
-        for item in enumerated_items:
-            doc_label = item.get("document") or "Procurement reference"
-            snippet = item.get("summary") or self._condense_snippet(
-                (item.get("payload") or {}).get("content", "")
-            )
-            snippet = self._redact_identifiers(snippet)
-            citation = item.get("citation")
-            line = f"- {doc_label}: {snippet}".strip()
-            if citation:
-                line = f"{line} {citation}".strip()
-            lines.append(line)
+        paragraphs: List[str] = []
+        opening = f"{ack} {summary_intro}".strip()
+        if opening:
+            paragraphs.append(self._to_sentence(opening))
+
+        if enumerated_items:
+            statements: List[str] = []
+            for item in enumerated_items:
+                doc_label = item.get("document") or "Procurement reference"
+                snippet = item.get("summary") or self._condense_snippet(
+                    (item.get("payload") or {}).get("content", "")
+                )
+                snippet = self._redact_identifiers(snippet)
+                citation = item.get("citation") or ""
+                citation = citation.strip()
+                if citation and not citation.startswith("("):
+                    citation = citation if citation.startswith("[") else f"{citation}"
+                insight = f"{doc_label} {citation} {snippet}".strip()
+                sentence = self._to_sentence(insight)
+                if sentence:
+                    statements.append(sentence)
+            if statements:
+                paragraphs.append(" ".join(statements))
 
         if ad_hoc_context:
-            lines.append(
-                f"- Uploaded notes: {self._redact_identifiers(ad_hoc_context)} [uploads]"
+            uploads_sentence = self._to_sentence(
+                f"I also reviewed your uploaded notes: {self._redact_identifiers(ad_hoc_context)}"
             )
+            if uploads_sentence:
+                paragraphs.append(uploads_sentence)
 
         actions_lead = guidelines.get("actions_lead")
         if actions_lead:
-            lines.append(actions_lead)
+            final_sentence = self._to_sentence(actions_lead)
+            if final_sentence:
+                paragraphs.append(final_sentence)
 
-        return "\n".join(line for line in lines if line)
+        return "\n\n".join(paragraphs)
 
     def _build_followups(
         self, query: str, enumerated_items: List[Dict[str, Any]]
@@ -575,6 +731,16 @@ class RAGPipeline:
                             "collection_name": "static_procurement_qa",
                             "source_label": self._label_for_collection("static_procurement_qa"),
                         }
+                        static_context_payload = self._sanitise_payload(
+                            static_context_payload
+                        )
+                        static_context_payload.setdefault(
+                            "collection_name", "static_procurement_qa"
+                        )
+                        static_context_payload.setdefault(
+                            "source_label",
+                            self._label_for_collection("static_procurement_qa"),
+                        )
                         knowledge_items.append(
                             {
                                 "payload": static_context_payload,
@@ -591,7 +757,8 @@ class RAGPipeline:
 
         if not knowledge_items and not ad_hoc_context:
             fallback = self._citation_guidelines.get(
-                "fallback", "I do not have that information as per my knowledge."
+                "fallback",
+                "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
             history = self.history_manager.get_history(user_id)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
@@ -612,6 +779,7 @@ class RAGPipeline:
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
             payload = dict(item.get("payload", {}))
+            payload = self._sanitise_payload(payload)
             payload.setdefault("collection_name", item.get("collection"))
             payload.setdefault("source_label", item.get("source_label"))
             payload["citation"] = item.get("citation")

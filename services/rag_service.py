@@ -533,7 +533,6 @@ class RAGService:
                 (self.primary_collection, filters),
                 (self.uploaded_collection, filters),
                 (self.static_policy_collection, filters),
-                (self.learning_collection, filters),
             ):
                 if not candidate:
                     continue
@@ -788,6 +787,14 @@ class RAGService:
                 for hit in hits[:top_k]:
                     rebuilt_hit = self._convert_cache_hit(hit)
                     if rebuilt_hit is not None:
+                        collection_name = (
+                            getattr(rebuilt_hit, "payload", {}) or {}
+                        ).get("collection_name")
+                        if (
+                            collection_name
+                            and collection_name == self.learning_collection
+                        ):
+                            continue
                         rebuilt.append(rebuilt_hit)
                 if rebuilt:
                     return rebuilt[:top_k]
@@ -814,6 +821,11 @@ class RAGService:
             for cached_hit in hits:
                 rebuilt = self._convert_cache_hit(cached_hit)
                 if rebuilt is None:
+                    continue
+                collection_name = (
+                    getattr(rebuilt, "payload", {}) or {}
+                ).get("collection_name")
+                if collection_name and collection_name == self.learning_collection:
                     continue
                 score = float(cached_hit.get("combined_score", cached_hit.get("score", 0.0)))
                 adjusted = score * weight
