@@ -363,6 +363,7 @@ async def embed_documents(
         return value or None
 
     header_user = _clean(request.headers.get("x-user-id"))
+    header_session = _clean(request.headers.get("x-session-id"))
     query_user = _clean(request.query_params.get("user_id"))
 
     resolved_user: Optional[str] = None
@@ -475,11 +476,14 @@ async def embed_documents(
         ],
         "total_chunks": total_chunks,
     }
+    if resolved_user:
+        upload_metadata["uploaded_by"] = resolved_user
 
     try:
         pipeline.activate_uploaded_context(
             uploaded_document_ids,
             metadata=upload_metadata,
+            session_id=header_session or resolved_user,
         )
     except AttributeError:
         logger.debug(
