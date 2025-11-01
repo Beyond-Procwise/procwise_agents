@@ -18,6 +18,13 @@ from services.semantic_cache import SemanticCacheManager
 from services.document_extractor import LayoutAwareParser
 from services.semantic_chunker import SemanticChunker
 
+DISALLOWED_METADATA_KEYS: Set[str] = {
+    "effective_date",
+    "supplier",
+    "doc_version",
+    "round_id",
+}
+
 _TRAINING_ROOT = (
     Path(__file__).resolve().parent.parent
     / "resources"
@@ -230,6 +237,24 @@ class RAGService:
         except Exception:  # pragma: no cover - defensive logging only
             logger.warning("Failed to ensure Qdrant collection %s", target, exc_info=True)
 
+    def _purge_disallowed_metadata(self, collection_name: str) -> None:
+        if not DISALLOWED_METADATA_KEYS:
+            return
+        try:
+            selector = models.FilterSelector(filter=models.Filter(must=[]))
+            self.client.delete_payload(
+                collection_name=collection_name,
+                keys=list(DISALLOWED_METADATA_KEYS),
+                points=selector,
+                wait=False,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to purge disallowed metadata for collection %s",
+                collection_name,
+                exc_info=True,
+            )
+
     def upsert_payloads(
         self,
         payloads: List[Dict[str, Any]],
@@ -256,6 +281,8 @@ class RAGService:
             else:
                 base_payload = dict(payload)
             base_payload.pop("payload", None)
+            for key in DISALLOWED_METADATA_KEYS:
+                base_payload.pop(key, None)
 
             record_id = (
                 base_payload.get("record_id")
@@ -357,6 +384,7 @@ class RAGService:
         )
 
         if points and collection_name:
+            self._purge_disallowed_metadata(collection_name)
             self.client.upsert(
                 collection_name=collection_name,
                 points=points,
@@ -478,16 +506,37 @@ class RAGService:
         ) -> None:
             if not isinstance(payload, dict) or doc_id is None:
                 return
+            normalised_payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in DISALLOWED_METADATA_KEYS
+            }
             doc_id_str = str(doc_id)
-            collection = payload.get("collection_name", self.primary_collection)
-            key = f"{collection}:{doc_id_str}"
+            collection = normalised_payload.get(
+                "collection_name", self.primary_collection
+            )
+            chunk_marker = normalised_payload.get("chunk_id")
+            if chunk_marker is None:
+                chunk_marker = normalised_payload.get("chunk_index")
+            if chunk_marker is None:
+                chunk_marker = normalised_payload.get("chunk_hash")
+            key = (
+                f"{collection}:{doc_id_str}:{chunk_marker}"
+                if chunk_marker is not None
+                else f"{collection}:{doc_id_str}"
+            )
             entry = candidates.get(key)
             if entry is None:
                 entry = SimpleNamespace(
-                    id=doc_id_str,
-                    payload=dict(payload),
+                    id=(
+                        f"{doc_id_str}:{chunk_marker}"
+                        if chunk_marker is not None
+                        else doc_id_str
+                    ),
+                    payload=dict(normalised_payload),
                     score_components={},
                     aggregated=0.0,
+                    chunk_id=chunk_marker,
                 )
                 candidates[key] = entry
             rrf = weight * (1.0 / (self._rrf_k + rank))
@@ -761,10 +810,19 @@ class RAGService:
                             selected[lowest_idx] = candidate
 
         deduped: List[Tuple[SimpleNamespace, float, float]] = []
-        seen_keys: Set[Tuple[str, str]] = set()
+        seen_keys: Set[Tuple[str, str, Any]] = set()
         for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
             payload = getattr(hit, "payload", {}) or {}
-            key = (str(getattr(hit, "id", payload.get("record_id"))), _collection_name(hit))
+            chunk_marker = payload.get("chunk_id")
+            if chunk_marker is None:
+                chunk_marker = payload.get("chunk_index")
+            if chunk_marker is None:
+                chunk_marker = payload.get("chunk_hash")
+            key = (
+                str(getattr(hit, "id", payload.get("record_id"))),
+                _collection_name(hit),
+                chunk_marker,
+            )
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -828,18 +886,6 @@ class RAGService:
             _ensure_condition("source_type", "PO")
         if "quote" in lowered:
             _ensure_condition("source_type", "Quote")
-
-        rounds = re.findall(r"\bround(?:\s+|#)(\d+)\b", lowered)
-        for round_id in rounds:
-            _ensure_condition("round_id", round_id)
-
-        years = sorted(set(re.findall(r"\b(20[0-4]\d|19\d{2})\b", lowered)))
-        for year in years:
-            conditions.append(
-                models.FieldCondition(
-                    key="effective_date", match=models.MatchText(text=year)
-                )
-            )
 
         synonyms: Dict[str, List[str]] = {
             "payment terms": ["net terms", "discount period"],
@@ -1117,11 +1163,16 @@ class RAGService:
                 return {str(key): _normalise(val) for key, val in value.items()}
             return str(value)
 
+        filtered = {
+            key: value
+            for key, value in (payload or {}).items()
+            if key not in DISALLOWED_METADATA_KEYS
+        }
         try:
-            json.dumps(payload)
-            return payload
+            json.dumps(filtered)
+            return filtered
         except (TypeError, ValueError):
-            return _normalise(payload)
+            return _normalise(filtered)
 
         try:  # pragma: no cover - depends on GPU libraries
             resources = faiss.StandardGpuResources()

@@ -18,6 +18,13 @@ from services.document_extractor import LayoutAwareParser
 from services.semantic_chunker import SemanticChunker
 from services.semantic_cache import SemanticCacheManager
 
+DISALLOWED_METADATA_KEYS: set[str] = {
+    "effective_date",
+    "supplier",
+    "doc_version",
+    "round_id",
+}
+
 logger = logging.getLogger(__name__)
 
 try:  # Optional heavy dependency
@@ -114,6 +121,8 @@ class DocumentEmbeddingService:
         }
         if metadata:
             metadata_payload.update(metadata)
+        for disallowed in DISALLOWED_METADATA_KEYS:
+            metadata_payload.pop(disallowed, None)
 
         extracted = self._extract_text(file_bytes=file_bytes, filename=filename)
         text = extracted.text
@@ -142,24 +151,25 @@ class DocumentEmbeddingService:
             "source_type", first_chunk_metadata.get("source_type")
         )
         metadata_payload.setdefault("title", first_chunk_metadata.get("title"))
-        metadata_payload.setdefault(
-            "effective_date", first_chunk_metadata.get("effective_date")
-        )
-        metadata_payload.setdefault("supplier", first_chunk_metadata.get("supplier"))
-        metadata_payload.setdefault("doc_version", first_chunk_metadata.get("doc_version"))
-        metadata_payload.setdefault("round_id", first_chunk_metadata.get("round_id"))
         vectors = self._encode_chunks(chunks)
         if not vectors:
             raise ValueError("Embedding model returned no vectors")
 
         vector_size = len(vectors[0])
         self._ensure_collection(vector_size)
+        self._remove_disallowed_payload_fields(self.collection_name)
 
         chunk_vector_pairs = list(zip(chunks, vectors))
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(chunk_vector_pairs):
             payload = dict(metadata_payload)
-            payload.update(chunk.metadata)
+            payload.update(
+                {
+                    key: value
+                    for key, value in chunk.metadata.items()
+                    if key not in DISALLOWED_METADATA_KEYS
+                }
+            )
             payload.update(
                 {
                     "chunk_id": idx,
@@ -295,15 +305,10 @@ class DocumentEmbeddingService:
             or Path(filename).stem,
             "source_type": base_metadata.get("source_type")
             or self._derive_source_type(doc_type, base_metadata.get("source_type")),
-            "effective_date": base_metadata.get("effective_date")
-            or extraction_metadata.get("effective_date"),
-            "supplier": base_metadata.get("supplier")
-            or extraction_metadata.get("supplier"),
-            "doc_version": base_metadata.get("doc_version")
-            or extraction_metadata.get("doc_version"),
-            "round_id": base_metadata.get("round_id")
-            or extraction_metadata.get("round_id"),
         }
+        for disallowed in DISALLOWED_METADATA_KEYS:
+            chunk_metadata_seed.pop(disallowed, None)
+
         chunks = self._chunker.build_from_structured(
             structured,
             document_type=doc_type,
@@ -407,10 +412,6 @@ class DocumentEmbeddingService:
             "section_path",
             "source_type",
             "title",
-            "effective_date",
-            "supplier",
-            "doc_version",
-            "round_id",
         }
         for field in required:
             if field in indexed_fields:
@@ -424,6 +425,23 @@ class DocumentEmbeddingService:
                 )
             except Exception:
                 logger.debug("Failed to create payload index for %s", field, exc_info=True)
+
+    def _remove_disallowed_payload_fields(self, collection_name: str) -> None:
+        if not DISALLOWED_METADATA_KEYS:
+            return
+        try:
+            selector = models.FilterSelector(filter=models.Filter(must=[]))
+            self.client.delete_payload(
+                collection_name=collection_name,
+                keys=list(DISALLOWED_METADATA_KEYS),
+                points=selector,
+                wait=False,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to purge disallowed metadata keys from %s", collection_name,
+                exc_info=True,
+            )
 
     def _infer_vector_size(self) -> Optional[int]:
         getter = getattr(self.embedder, "get_sentence_embedding_dimension", None)
@@ -485,6 +503,8 @@ class DocumentEmbeddingService:
             if not chunk.content.strip():
                 continue
             payload = dict(metadata)
+            for key in DISALLOWED_METADATA_KEYS:
+                payload.pop(key, None)
             payload["record_id"] = document_id or metadata.get("record_id") or str(uuid.uuid4())
             payload["chunk_id"] = idx
             payload.setdefault("document_type", "uploaded_document")

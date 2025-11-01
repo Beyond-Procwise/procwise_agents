@@ -14,6 +14,7 @@ from qdrant_client import models
 from services.document_embedding_service import (
     DocumentEmbeddingService,
     EmbeddedDocument,
+    DISALLOWED_METADATA_KEYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -264,10 +265,6 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             "title": extracted.metadata.get("title") or Path(filename).stem,
             "document_type": "Policy",
             "source_type": "Policy",
-            "effective_date": extracted.metadata.get("effective_date"),
-            "supplier": extracted.metadata.get("supplier"),
-            "doc_version": extracted.metadata.get("doc_version"),
-            "round_id": extracted.metadata.get("round_id"),
         }
 
         chunks = self._build_document_chunks(
@@ -317,15 +314,19 @@ class StaticPolicyLoader(DocumentEmbeddingService):
         base_metadata.update(extracted.metadata or {})
         base_metadata.setdefault("source_type", "Policy")
         base_metadata.setdefault("title", chunk_seed.get("title"))
-        base_metadata.setdefault("effective_date", chunk_seed.get("effective_date"))
-        base_metadata.setdefault("supplier", chunk_seed.get("supplier"))
-        base_metadata.setdefault("doc_version", chunk_seed.get("doc_version"))
-        base_metadata.setdefault("round_id", chunk_seed.get("round_id"))
+        for disallowed in DISALLOWED_METADATA_KEYS:
+            base_metadata.pop(disallowed, None)
 
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
-            payload = dict(base_metadata)
-            payload.update(chunk.metadata)
+            payload = {k: v for k, v in base_metadata.items() if k not in DISALLOWED_METADATA_KEYS}
+            payload.update(
+                {
+                    key: value
+                    for key, value in chunk.metadata.items()
+                    if key not in DISALLOWED_METADATA_KEYS
+                }
+            )
             payload["document_type"] = "policy"
             payload["chunk_id"] = idx
             payload["chunk_index"] = idx
@@ -343,6 +344,7 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             points=points,
             wait=True,
         )
+        self._remove_disallowed_payload_fields(self.collection_name)
 
         return EmbeddedDocument(
             document_id=document_id,
