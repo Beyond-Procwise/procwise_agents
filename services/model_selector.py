@@ -168,6 +168,25 @@ class RAGPipeline:
         )
         self._citation_guidelines = self._load_citation_guidelines()
         self._session_uploads: Dict[str, Dict[str, Any]] = {}
+        self._nltk_processor: Optional[NLTKProcessor]
+        if use_nltk:
+            try:
+                processor = NLTKProcessor()
+            except Exception:  # pragma: no cover - defensive initialisation guard
+                logger.exception(
+                    "Failed to initialise NLTK processor; continuing without it"
+                )
+                processor = None
+            if processor and getattr(processor, "available", True):
+                self._nltk_processor = processor
+            else:
+                if processor and not getattr(processor, "available", True):
+                    logger.info(
+                        "NLTK processor unavailable in this environment; disabling NLTK features"
+                    )
+                self._nltk_processor = None
+        else:
+            self._nltk_processor = None
 
     def register_session_upload(
         self,
