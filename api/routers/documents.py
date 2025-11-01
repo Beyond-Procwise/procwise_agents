@@ -363,7 +363,13 @@ async def embed_documents(
         return value or None
 
     header_user = _clean(request.headers.get("x-user-id"))
-    resolved_user = _clean(user_id) or header_user
+    query_user = _clean(request.query_params.get("user_id"))
+
+    resolved_user: Optional[str] = None
+    for candidate in (_clean(user_id), header_user, query_user):
+        if candidate:
+            resolved_user = candidate
+            break
 
     rag_service = pipeline.rag
     collection_name = getattr(rag_service, "uploaded_collection", "uploaded_documents")
@@ -474,18 +480,6 @@ async def embed_documents(
         pipeline.activate_uploaded_context(
             uploaded_document_ids,
             metadata=upload_metadata,
-        )
-    except AttributeError:
-        logger.debug(
-            "RAG pipeline does not expose uploaded context activation",
-            exc_info=True,
-        )
-
-    try:
-        pipeline.activate_uploaded_context(
-            uploaded_document_ids,
-            metadata=upload_metadata,
-            session_id=resolved_session,
         )
     except AttributeError:
         logger.debug(
