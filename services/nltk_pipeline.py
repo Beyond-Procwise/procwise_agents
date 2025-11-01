@@ -190,6 +190,8 @@ class NLTKProcessor:
         text: str,
         *,
         sentiment: Optional[Dict[str, float]] = None,
+        keywords: Optional[List[str]] = None,
+        key_phrases: Optional[List[str]] = None,
     ) -> str:
         clean = (text or "").strip()
         if not clean:
@@ -209,12 +211,29 @@ class NLTKProcessor:
         if not filtered:
             filtered = [clean]
 
+        focus_term = self._derive_focus_term(keywords, key_phrases, sentences)
         tone_sentence = None
         compound = (sentiment or {}).get("compound") if sentiment else None
         if compound is not None and compound < -0.2:
-            tone_sentence = "I understand this situation may feel frustrating; let me walk through the relevant guidance."
+            if focus_term:
+                tone_sentence = (
+                    f"I understand this situation with {focus_term} may feel frustrating; "
+                    "let me walk through the relevant guidance."
+                )
+            else:
+                tone_sentence = (
+                    "I understand this situation may feel frustrating; let me walk through "
+                    "the relevant guidance."
+                )
         elif compound is not None and compound > 0.4:
-            tone_sentence = "Great news—this aligns well with the current guidance."
+            if focus_term:
+                tone_sentence = (
+                    f"Great news—the guidance on {focus_term} aligns with what you're aiming to do."
+                )
+            else:
+                tone_sentence = (
+                    "Great news—this aligns well with the current guidance."
+                )
 
         normalised: List[str] = []
         for idx, sentence in enumerate(filtered):
@@ -231,7 +250,7 @@ class NLTKProcessor:
 
         result = " ".join(normalised) if normalised else clean
         result = re.sub(r"\s+", " ", result)
-        return result.strip()
+        return self._clean_placeholders(result.strip())
 
     def _lemmatize_token(self, token: str, pos_tag_value: str) -> str:
         if not self._lemmatizer:
@@ -281,10 +300,58 @@ class NLTKProcessor:
 
     def _replace_sensitive_terms(self, sentence: str) -> str:
         for pattern in self._PII_PATTERNS:
-            sentence = pattern.sub("[redacted sensitive reference]", sentence)
+            sentence = pattern.sub("a confidential detail", sentence)
         for pattern in self._TOXICITY_PATTERNS:
             sentence = pattern.sub("inappropriate language", sentence)
         return sentence
+
+    def _derive_focus_term(
+        self,
+        keywords: Optional[List[str]],
+        key_phrases: Optional[List[str]],
+        sentences: List[str],
+    ) -> Optional[str]:
+        for source in (key_phrases or []):
+            candidate = self._humanise_focus_term(source)
+            if candidate:
+                return candidate
+        for source in (keywords or []):
+            candidate = self._humanise_focus_term(source)
+            if candidate:
+                return candidate
+        for sentence in sentences:
+            words = re.findall(r"[A-Za-z][A-Za-z0-9&'\- ]+", sentence)
+            for word in words:
+                candidate = self._humanise_focus_term(word)
+                if candidate:
+                    return candidate
+        return None
+
+    def _humanise_focus_term(self, value: str) -> Optional[str]:
+        cleaned = re.sub(r"\s+", " ", (value or "")).strip()
+        if not cleaned:
+            return None
+        cleaned = cleaned.strip(string.punctuation)
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered in {"the", "and", "or", "guidance"}:
+            return None
+        if any(lowered.startswith(prefix) for prefix in self._FILLER_PREFIXES):
+            return None
+        if "thanks for flagging" in lowered:
+            return None
+        return cleaned
+
+    def _clean_placeholders(self, text: str) -> str:
+        cleaned = re.sub(
+            r"\[(?:redacted sensitive reference|doc\s*\d+|document\s*\d+|source\s*\d+)\]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
 
     def _basic_cleanup(self, text: str) -> str:
         cleaned = re.sub(r"\s+", " ", text)

@@ -355,6 +355,18 @@ class RAGPipeline:
             )
         return re.sub(r"\s+", " ", cleaned).strip()
 
+    def _remove_placeholders(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = re.sub(
+            r"\[(?:redacted sensitive reference|doc\s*\d+|document\s*\d+|source\s*\d+)\]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
     def _condense_snippet(
         self,
         text: str,
@@ -1088,15 +1100,24 @@ class RAGPipeline:
     ) -> str:
         candidate = llm_answer if isinstance(llm_answer, str) else ""
         candidate = candidate.strip()
+        fallback_clean = self._remove_placeholders(fallback)
         if not candidate or candidate.lower().startswith("could not generate"):
-            return fallback
+            return fallback_clean
 
         sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        keywords = (nltk_features or {}).get("keywords") if nltk_features else None
+        key_phrases = (nltk_features or {}).get("key_phrases") if nltk_features else None
         if self._nltk_processor:
-            cleaned = self._nltk_processor.postprocess(candidate, sentiment=sentiment)
+            cleaned = self._nltk_processor.postprocess(
+                candidate,
+                sentiment=sentiment,
+                keywords=keywords,
+                key_phrases=key_phrases,
+            )
         else:
             cleaned = self._postprocess_answer(candidate)
-        return cleaned or fallback
+        cleaned = self._remove_placeholders(cleaned)
+        return cleaned or fallback_clean
 
     def _merge_followups(
         self, base_followups: List[str], llm_followups: Optional[List[Any]]
@@ -1109,8 +1130,11 @@ class RAGPipeline:
         suggestions.extend(base_followups)
         deduped: List[str] = []
         for suggestion in suggestions:
-            if suggestion not in deduped:
-                deduped.append(suggestion)
+            cleaned = self._remove_placeholders(suggestion)
+            if not cleaned:
+                continue
+            if cleaned not in deduped:
+                deduped.append(cleaned)
         return deduped[:3]
 
     def _build_structured_answer(
@@ -1430,6 +1454,7 @@ class RAGPipeline:
                 "fallback",
                 "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
+            fallback = self._remove_placeholders(fallback)
             history = self.history_manager.get_history(user_id)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)

@@ -9,6 +9,7 @@ from agents.base_agent import AgentOutput, AgentStatus
 
 from services.rag_service import RAGService
 from services.model_selector import RAGPipeline
+from services.semantic_chunker import SemanticChunk
 
 
 class DummyEmbed:
@@ -95,6 +96,39 @@ def test_upsert_payloads_respects_source_collection():
 
     assert nick.qdrant_client.upserts
     assert nick.qdrant_client.upserts[0]["collection_name"] == "uploaded_documents"
+
+
+def test_chunk_text_fallback_splits_long_documents(monkeypatch):
+    settings = SimpleNamespace(
+        qdrant_collection_name="c",
+        reranker_model="x",
+        rag_chunk_chars=600,
+        rag_chunk_overlap=150,
+    )
+    nick = SimpleNamespace(
+        device="cpu",
+        settings=settings,
+        qdrant_client=DummyQdrant(),
+        embedding_model=DummyEmbed(),
+    )
+    rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
+
+    def _raise_layout_error(*args, **kwargs):
+        raise ValueError("no layout available")
+
+    monkeypatch.setattr(rag._layout_parser, "from_text", _raise_layout_error)
+
+    long_text = "Paragraph one explains procurement policies." + " " + (
+        "This sentence elaborates on approval workflows. " * 80
+    )
+
+    chunks = rag._chunk_text(long_text)
+    assert len(chunks) >= 2
+    for idx, chunk in enumerate(chunks):
+        assert isinstance(chunk, SemanticChunk)
+        assert chunk.metadata.get("chunk_strategy") == "fallback"
+        assert chunk.metadata.get("fallback_index") == idx
+        assert len(chunk.content) <= rag._chunk_char_limit()
 
 
 def test_pipeline_answer_returns_documents(monkeypatch):
