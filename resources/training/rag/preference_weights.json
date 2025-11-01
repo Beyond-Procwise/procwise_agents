@@ -2,7 +2,9 @@
   "collection": {
     "c": 0.12,
     "uploaded_documents": 0.08,
-    "learning": 0.04
+    "static_policy": 0.14
   },
-  "document_type": {}
+  "document_type": {
+    "policy": 0.1
+  }
 }

@@ -49,6 +49,10 @@ class TrainingDispatchResponse(BaseModel):
         default_factory=list,
         description="Negotiation learning records processed during dispatch",
     )
+    workflow_context: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Recent workflow context captured from the learning repository",
+    )
 
 
 def _get_training_endpoint(request: Request) -> ModelTrainingEndpoint:
@@ -91,6 +95,7 @@ def trigger_training_dispatch(
     jobs = result.get("training_jobs", [])
     relationship_jobs = result.get("relationship_jobs", [])
     negotiation_learnings = result.get("negotiation_learnings", [])
+    workflow_context = result.get("workflow_context", [])
     summaries = [
         TrainingJobSummary(
             job_id=job.get("job_id"),
@@ -105,4 +110,5 @@ def trigger_training_dispatch(
         jobs=summaries,
         relationship_jobs=relationship_jobs,
         negotiation_learnings=negotiation_learnings,
+        workflow_context=workflow_context,
     )

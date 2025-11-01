@@ -53,7 +53,7 @@ def test_upsert_and_search():
     assert hits[0].payload["record_id"] == "test"
     # ensure qdrant was queried across configured collections even with local hits
     collections = {call["collection_name"] for call in nick.qdrant_client.search_calls}
-    assert {"c", "uploaded_documents", "learning"}.issubset(collections)
+    assert {"c", "uploaded_documents", "static_policy"}.issubset(collections)
 
 
 def test_upsert_gpu_fallback(monkeypatch, caplog):
@@ -71,7 +71,7 @@ def test_upsert_gpu_fallback(monkeypatch, caplog):
     hits = rag.search("gpu")
     assert hits[0].payload["record_id"] == "gpu"
     collections = {call["collection_name"] for call in nick.qdrant_client.search_calls}
-    assert {"c", "uploaded_documents", "learning"}.issubset(collections)
+    assert {"c", "uploaded_documents", "static_policy"}.issubset(collections)
 
 
 def test_upsert_payloads_respects_source_collection():
@@ -110,6 +110,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
 
         primary_collection = "c"
         uploaded_collection = "uploaded_documents"
+        static_policy_collection = "static_policy"
         learning_collection = "learning"
 
     monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
