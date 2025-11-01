@@ -2,6 +2,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict
 
 import pytest
@@ -128,3 +129,91 @@ def test_extract_document_from_s3_endpoint(api_app):
             metadata = json.loads(row["metadata_json"])
             assert metadata["s3_bucket"] == "procwisemvp"
             assert metadata["s3_object_key"] in objects
+
+
+def test_embed_document_without_user_id(api_app, monkeypatch):
+    client, *_ = api_app
+
+    class DummyRAGService:
+        def __init__(self) -> None:
+            self.created_collections = []
+            self.uploaded_collection = "uploaded_documents"
+
+        def ensure_collection(self, name: str) -> None:
+            self.created_collections.append(name)
+
+    class DummyPipeline:
+        def __init__(self) -> None:
+            self.rag = DummyRAGService()
+            self.activations = []
+
+        def activate_uploaded_context(self, document_ids, *, metadata=None):
+            self.activations.append(
+                {
+                    "document_ids": list(document_ids or []),
+                    "metadata": dict(metadata or {}),
+                }
+            )
+
+    pipeline = DummyPipeline()
+    client.app.state.rag_pipeline = pipeline
+
+    calls: Dict[str, Dict] = {}
+
+    class DummyEmbeddingService:
+        def __init__(self, agent_nick, *, collection_name: str, **_kwargs):
+            calls["init"] = {"collection_name": collection_name, "agent_nick": agent_nick}
+
+        def embed_document(self, *, filename: str, file_bytes: bytes, metadata: Dict[str, str]):
+            calls["embed"] = {
+                "filename": filename,
+                "file_bytes": file_bytes,
+                "metadata": dict(metadata),
+            }
+            return SimpleNamespace(
+                document_id="doc-001",
+                collection="uploaded_documents",
+                chunk_count=2,
+                metadata={
+                    "filename": filename,
+                    "doc_name": filename,
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.routers.documents.DocumentEmbeddingService",
+        DummyEmbeddingService,
+    )
+
+    response = client.post(
+        "/document/embed-document",
+        files={"files": ("invoice.txt", b"Invoice details", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["total_documents"] == 1
+    assert body["total_chunks"] == 2
+    assert body["failed"] == []
+
+    assert "embed" in calls
+    embed_metadata = calls["embed"]["metadata"]
+    assert embed_metadata["mime_type"] == "text/plain"
+    assert embed_metadata["ingestion_source"] == "document_embed_endpoint"
+    assert "uploaded_by" not in embed_metadata
+
+    assert pipeline.rag.created_collections == ["uploaded_documents"]
+    assert len(pipeline.activations) == 1
+    activation = pipeline.activations[0]
+    assert activation["document_ids"] == ["doc-001"]
+    assert activation["metadata"] == {
+        "filenames": ["invoice.txt"],
+        "total_chunks": 2,
+    }
+
+    processed = body["processed"][0]
+    assert processed["document_id"] == "doc-001"
+    assert processed["collection"] == "uploaded_documents"
+    assert processed["chunk_count"] == 2
+    assert processed["metadata"]["filename"] == "invoice.txt"
