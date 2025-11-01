@@ -154,7 +154,6 @@ class DocumentEmbeddingBatchResponse(BaseModel):
     """Aggregate response for multi-document embedding uploads."""
 
     status: str
-    session_id: Optional[str]
     total_documents: int
     total_chunks: int
     processed: List[DocumentEmbeddingResponse]
@@ -346,7 +345,6 @@ def extract_document_from_s3(
 async def embed_documents(
     request: Request,
     files: List[UploadFile] = File(...),
-    session_id: Optional[str] = Form(None),
     user_id: Optional[str] = Form(None),
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
     agent_nick=Depends(get_agent_nick),
@@ -364,10 +362,8 @@ async def embed_documents(
         value = value.strip()
         return value or None
 
-    header_session = _clean(request.headers.get("x-session-id"))
     header_user = _clean(request.headers.get("x-user-id"))
     resolved_user = _clean(user_id) or header_user
-    resolved_session = _clean(session_id) or header_session or resolved_user
 
     rag_service = pipeline.rag
     collection_name = getattr(rag_service, "uploaded_collection", "uploaded_documents")
@@ -428,8 +424,6 @@ async def embed_documents(
             "mime_type": upload.content_type or "",
             "ingestion_source": "document_embed_endpoint",
         }
-        if resolved_session:
-            metadata["session_id"] = resolved_session
         if resolved_user:
             metadata["uploaded_by"] = resolved_user
 
@@ -476,18 +470,16 @@ async def embed_documents(
         "total_chunks": total_chunks,
     }
 
-    if resolved_session:
-        try:
-            pipeline.register_session_upload(
-                resolved_session,
-                uploaded_document_ids,
-                metadata=upload_metadata,
-            )
-        except AttributeError:
-            logger.debug(
-                "RAG pipeline does not support session upload registration",
-                exc_info=True,
-            )
+    try:
+        pipeline.activate_uploaded_context(
+            uploaded_document_ids,
+            metadata=upload_metadata,
+        )
+    except AttributeError:
+        logger.debug(
+            "RAG pipeline does not expose uploaded context activation",
+            exc_info=True,
+        )
 
     try:
         pipeline.activate_uploaded_context(
@@ -503,7 +495,6 @@ async def embed_documents(
 
     return DocumentEmbeddingBatchResponse(
         status="success",
-        session_id=resolved_session,
         total_documents=len(processed),
         total_chunks=total_chunks,
         processed=processed,

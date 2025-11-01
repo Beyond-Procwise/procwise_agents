@@ -270,10 +270,15 @@ class RAGPipeline:
         except Exception:
             activated_at = datetime.utcnow().isoformat()
 
+        allowed_keys: List[str] = []
+        if session_token:
+            allowed_keys.append(session_token)
+
         self._uploaded_context = {
             "document_ids": cleaned,
             "metadata": dict(metadata or {}),
             "session_id": session_token or None,
+            "allowed_keys": allowed_keys,
             "activated_at": activated_at,
         }
 
@@ -445,6 +450,9 @@ class RAGPipeline:
             r"(?i)\bworkflow[-_ ]?(?:id|run|ref|context)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
             r"(?i)\b(?:session|event|trace|dispatch|message)[-_: ]*(?:id|ref)?[-:=\s]*[A-Za-z0-9_-]{4,}\b",
             r"(?i)\b(?:supplier|rfq|po|invoice|contract)\s*(?:number|no\.?|id|reference)?[:#\- ]*[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b",
+            r"(?i)\b[a-z0-9]+_agent\b",
+            r"\b(?:[A-Z][a-z]+){1,4}Agent\b",
+            r"(?i)\blearning[_-]?[A-Za-z0-9]+\b",
         )
 
         for pattern in patterns:
@@ -1509,7 +1517,7 @@ class RAGPipeline:
         if session_key is None and candidate_keys:
             session_key = candidate_keys[0]
 
-        uploaded_scope = self._uploaded_context or {}
+        uploaded_scope = dict(self._uploaded_context or {})
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
@@ -1520,7 +1528,59 @@ class RAGPipeline:
         except Exception:
             uploaded_documents = []
 
+        raw_allowed = uploaded_scope.get("allowed_keys")
+        if isinstance(raw_allowed, (str, bytes)):
+            raw_allowed = [raw_allowed]
+        allowed_list: List[str] = []
+        for value in raw_allowed or []:
+            try:
+                cleaned_value = str(value).strip()
+            except Exception:
+                cleaned_value = ""
+            if cleaned_value and cleaned_value not in allowed_list:
+                allowed_list.append(cleaned_value)
+
+        scope_allowed = set(allowed_list)
+
+        scope_session_raw = uploaded_scope.get("session_id")
+        scope_session: str = ""
+        if scope_session_raw is not None:
+            try:
+                scope_session = str(scope_session_raw).strip()
+            except Exception:
+                scope_session = ""
+            if scope_session and scope_session not in scope_allowed:
+                allowed_list.append(scope_session)
+                scope_allowed.add(scope_session)
+
+        candidate_values = [key for key in candidate_keys if key]
+        matched_key: Optional[str] = None
+        for candidate in candidate_values:
+            if candidate in scope_allowed:
+                matched_key = candidate
+                break
+
         restrict_to_uploaded = bool(uploaded_documents)
+        if restrict_to_uploaded and scope_allowed and not matched_key:
+            restrict_to_uploaded = False
+
+        allowed_list_changed = False
+        if restrict_to_uploaded and not scope_allowed:
+            for candidate in candidate_values:
+                if candidate:
+                    matched_key = candidate
+                    allowed_list.append(candidate)
+                    scope_allowed.add(candidate)
+                    allowed_list_changed = True
+                    break
+
+        if allowed_list_changed:
+            uploaded_scope["allowed_keys"] = list(allowed_list)
+            self._uploaded_context = uploaded_scope
+        elif scope_allowed and uploaded_scope.get("allowed_keys") != allowed_list:
+            uploaded_scope["allowed_keys"] = list(allowed_list)
+            self._uploaded_context = uploaded_scope
+
         if restrict_to_uploaded:
             scope_metadata = dict(uploaded_scope.get("metadata") or {})
             combined_record = dict(session_record or {})
@@ -1530,13 +1590,8 @@ class RAGPipeline:
                 "document_ids": list(uploaded_documents),
                 "metadata": combined_metadata,
             }
-            scope_session = uploaded_scope.get("session_id")
-            if scope_session and not session_key:
-                try:
-                    cleaned_scope_session = str(scope_session).strip()
-                except Exception:
-                    cleaned_scope_session = ""
-                session_key = cleaned_scope_session or session_key
+            if matched_key and session_key != matched_key:
+                session_key = matched_key
 
         session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
             history
