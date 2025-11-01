@@ -655,17 +655,60 @@ class RAGPipeline:
         )
 
         selected: List[Dict[str, Any]] = []
-        seen: Set[Tuple[str, str]] = set()
+        seen: Set[Tuple[str, ...]] = set()
+
+        label_counts: Dict[Tuple[str, str], int] = {}
         for entry in sortable:
-            doc_label = str(entry.get("document") or "").lower()
+            doc_label = str(entry.get("document") or "").strip().lower()
             collection = str(entry.get("collection") or "")
+            if not doc_label:
+                continue
             key = (doc_label, collection)
-            if key in seen:
+            label_counts[key] = label_counts.get(key, 0) + 1
+
+        generic_labels = {"", "procurement reference"}
+
+        def _stable_identifier(entry: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
+            payload = entry.get("payload")
+            if isinstance(payload, dict):
+                for candidate in (
+                    "chunk_id",
+                    "chunk",
+                    "chunkId",
+                    "chunk_index",
+                    "id",
+                    "document_id",
+                    "documentId",
+                    "reference_id",
+                    "referenceId",
+                    "hash",
+                    "checksum",
+                ):
+                    value = payload.get(candidate)
+                    if isinstance(value, (str, int)):
+                        text = str(value).strip()
+                        if text:
+                            return ("payload", candidate.lower(), text.lower())
+            doc_label = str(entry.get("document") or "").strip().lower()
+            collection = str(entry.get("collection") or "")
+            if not doc_label:
+                return None
+            if doc_label in generic_labels or "redacted" in doc_label:
+                return None
+            label_key = (doc_label, collection)
+            if label_counts.get(label_key, 0) != 1:
+                return None
+            return ("label", collection, doc_label)
+
+        for entry in sortable:
+            key = _stable_identifier(entry)
+            if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
-            seen.add(key)
+            if key:
+                seen.add(key)
             if len(selected) >= limit:
                 break
 
