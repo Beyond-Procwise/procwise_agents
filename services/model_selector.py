@@ -1,5 +1,6 @@
 # ProcWise/services/model_selector.py
 
+import hashlib
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ from qdrant_client import models
 from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
 from .rag_service import RAGService
+from .nltk_pipeline import NLTKProcessor
 from utils.gpu import configure_gpu, load_cross_encoder
 
 _CITATION_GUIDELINES_PATH = (
@@ -138,7 +140,13 @@ class RAGPipeline:
         "email_thread_id",
     }
 
-    def __init__(self, agent_nick, cross_encoder_cls: Type[CrossEncoder] = CrossEncoder):
+    def __init__(
+        self,
+        agent_nick,
+        cross_encoder_cls: Type[CrossEncoder] = CrossEncoder,
+        *,
+        use_nltk: bool = True,
+    ):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
@@ -370,6 +378,373 @@ class RAGPipeline:
             summary = f"{truncated}…" if truncated else summary[:max_chars]
         return self._redact_identifiers(summary)
 
+    def _extract_focus_phrase(self, query: str, max_words: int = 8) -> str:
+        if not isinstance(query, str):
+            return ""
+
+        trimmed = re.sub(r"\s+", " ", query).strip()
+        if not trimmed:
+            return ""
+
+        lowered = trimmed.lower()
+        for token in (" about ", " regarding ", " on ", " for ", " concerning "):
+            idx = lowered.find(token)
+            if idx != -1 and idx + len(token) < len(trimmed):
+                candidate = trimmed[idx + len(token) :].strip(" ?.!;:")
+                if candidate:
+                    trimmed = candidate
+                    lowered = trimmed.lower()
+                    break
+
+        trimmed = trimmed.lstrip("? ")
+        words = re.findall(r"[A-Za-z0-9'/-]+", trimmed)
+        if not words:
+            return ""
+
+        stopwords = {
+            "what",
+            "which",
+            "who",
+            "whom",
+            "whose",
+            "when",
+            "where",
+            "why",
+            "how",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "being",
+            "been",
+            "do",
+            "does",
+            "did",
+            "please",
+            "kindly",
+            "let",
+            "help",
+            "need",
+            "want",
+            "looking",
+            "look",
+            "tell",
+            "give",
+            "provide",
+            "share",
+            "explain",
+            "clarify",
+            "me",
+            "us",
+            "our",
+            "my",
+            "their",
+            "the",
+            "a",
+            "an",
+            "any",
+            "some",
+            "current",
+            "latest",
+            "on",
+            "for",
+            "about",
+            "regarding",
+            "of",
+            "to",
+            "with",
+            "in",
+            "and",
+            "or",
+            "vs",
+            "versus",
+            "this",
+            "that",
+            "these",
+            "those",
+            "it",
+            "its",
+            "into",
+            "from",
+            "can",
+            "could",
+            "would",
+            "should",
+            "will",
+            "shall",
+        }
+
+        filtered: List[str] = []
+        for word in words:
+            if word.lower() in stopwords:
+                continue
+            filtered.append(word)
+            if len(filtered) >= max_words:
+                break
+
+        if not filtered:
+            filtered = words[:max_words]
+
+        return " ".join(filtered)
+
+    def _topic_descriptor(self, topic: str) -> str:
+        if not topic:
+            return ""
+
+        cleaned = re.sub(r"\s+", " ", topic).strip()
+        if not cleaned:
+            return ""
+
+        lowered = cleaned.lower()
+        if lowered.startswith(
+            (
+                "the ",
+                "this ",
+                "that ",
+                "these ",
+                "those ",
+                "any ",
+                "my ",
+                "our ",
+                "your ",
+                "a ",
+                "an ",
+            )
+        ):
+            descriptor = cleaned
+        else:
+            descriptor = f"the {cleaned}"
+
+        if "sensitive identifier" in descriptor.lower():
+            return "this request"
+
+        return descriptor
+
+    def _extract_snippet(self, item: Dict[str, Any]) -> str:
+        summary = item.get("summary") if isinstance(item, dict) else ""
+        if isinstance(summary, str) and summary.strip():
+            return self._redact_identifiers(summary.strip())
+        payload = item.get("payload") if isinstance(item, dict) else {}
+        if isinstance(payload, dict):
+            candidate = payload.get("content") or payload.get("text_summary") or ""
+        else:
+            candidate = ""
+        return self._condense_snippet(candidate)
+
+    def _friendly_opening(
+        self,
+        query: str,
+        acknowledgements: List[str],
+        focus_items: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        banned_tokens = (
+            "thanks for flagging",
+            "here's what i can confirm",
+        )
+        focus_phrase = self._extract_focus_phrase(query)
+        if not focus_phrase and focus_items:
+            for item in focus_items:
+                candidate = item.get("document") or item.get("source_label")
+                if isinstance(candidate, str) and candidate.strip():
+                    focus_phrase = candidate
+                    break
+
+        focus_phrase = self._redact_identifiers(focus_phrase)
+        topic_descriptor = self._topic_descriptor(focus_phrase)
+
+        options: List[str] = []
+        for ack in acknowledgements:
+            if not ack:
+                continue
+            lowered = ack.lower()
+            if any(token in lowered for token in banned_tokens):
+                continue
+            options.append(ack.strip())
+
+        if topic_descriptor:
+            personalised: List[str] = []
+            for template in options:
+                if "{topic}" in template:
+                    personalised.append(
+                        template.replace("{topic}", topic_descriptor)
+                    )
+                else:
+                    base = template.rstrip(". ")
+                    personalised.append(
+                        f"{base} Let's focus on {topic_descriptor}."
+                    )
+            options = personalised
+        else:
+            fallback_topic = "this topic"
+            options = [
+                template.replace("{topic}", fallback_topic)
+                if "{topic}" in template
+                else template
+                for template in options
+            ]
+
+        if not options:
+            if topic_descriptor:
+                options = [
+                    f"Sure, I can help you with {topic_descriptor}.",
+                    f"Most definitely, I'll help you get the answer on {topic_descriptor}.",
+                    f"Great! Here's what the guidance says about {topic_descriptor}.",
+                    f"You're in the right place for questions about {topic_descriptor}.",
+                ]
+            else:
+                options = [
+                    "Sure, I can help you with this topic.",
+                    "Most definitely, I'll help you get the answer you need.",
+                    "Great! Here is the response based on what I can see.",
+                    "You're in the right place for this question.",
+                ]
+
+        digest = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
+        index = int(digest[:8], 16) % len(options)
+        return options[index]
+
+    def _select_focus_items(
+        self, items: List[Dict[str, Any]], limit: int = 4
+    ) -> List[Dict[str, Any]]:
+        if not items or limit <= 0:
+            return []
+
+        sortable: List[Dict[str, Any]] = []
+        for item in items:
+            score = item.get("score")
+            if not isinstance(score, (int, float)):
+                score = 0.0
+            item_with_score = dict(item)
+            item_with_score["_ordering_score"] = float(score)
+            sortable.append(item_with_score)
+
+        sortable.sort(
+            key=lambda entry: entry.get("_ordering_score", 0.0), reverse=True
+        )
+
+        selected: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for entry in sortable:
+            doc_label = str(entry.get("document") or "").lower()
+            collection = str(entry.get("collection") or "")
+            key = (doc_label, collection)
+            if key in seen:
+                continue
+            cleaned_entry = dict(entry)
+            cleaned_entry.pop("_ordering_score", None)
+            selected.append(cleaned_entry)
+            seen.add(key)
+            if len(selected) >= limit:
+                break
+
+        if len(selected) < min(limit, len(sortable)):
+            for entry in sortable:
+                candidate = dict(entry)
+                candidate.pop("_ordering_score", None)
+                if candidate in selected:
+                    continue
+                selected.append(candidate)
+                if len(selected) >= limit:
+                    break
+
+        def _original_index(value: Dict[str, Any]) -> int:
+            for idx, item in enumerate(items):
+                if all(item.get(key) == value.get(key) for key in item.keys()):
+                    return idx
+            return len(items)
+
+        selected.sort(key=_original_index)
+        return selected[:limit]
+
+    def _format_primary_statement(self, item: Dict[str, Any]) -> str:
+        snippet = self._extract_snippet(item)
+        if not snippet:
+            return ""
+        doc_label = item.get("document") or item.get("source_label") or "the referenced guidance"
+        doc_label_str = str(doc_label).strip()
+        lowered_doc = doc_label_str.lower()
+        lowered_snippet = snippet.lower()
+        if doc_label_str and lowered_doc in lowered_snippet:
+            body = f"The answer for your query is that {snippet}"
+        elif doc_label_str:
+            body = f"The answer for your query is that {doc_label_str} explains {snippet}"
+        else:
+            body = f"The answer for your query is that {snippet}"
+        return self._to_sentence(body)
+
+    def _format_support_statement(self, item: Dict[str, Any], position: int) -> str:
+        snippet = self._extract_snippet(item)
+        if not snippet:
+            return ""
+        connectors = [
+            "Additionally",
+            "It also clarifies",
+            "Finally",
+        ]
+        connector = connectors[min(position - 1, len(connectors) - 1)]
+        doc_label = item.get("document") or item.get("source_label") or "the same guidance"
+        doc_label_str = str(doc_label).strip()
+        lowered_doc = doc_label_str.lower()
+        lowered_snippet = snippet.lower()
+        if doc_label_str and lowered_doc in lowered_snippet:
+            body = f"{connector}, {snippet}"
+        elif doc_label_str:
+            body = f"{connector}, {doc_label_str} notes {snippet}"
+        else:
+            body = f"{connector}, {snippet}"
+        return self._to_sentence(body)
+
+    def _craft_summary_intro(
+        self,
+        query: str,
+        template: str,
+        focus_items: List[Dict[str, Any]],
+    ) -> str:
+        topic = self._extract_focus_phrase(query)
+        if not topic:
+            for item in focus_items:
+                candidate = (
+                    item.get("document")
+                    or item.get("source_label")
+                    or item.get("collection")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    topic = candidate
+                    break
+
+        topic = self._redact_identifiers(topic)
+        descriptor = self._topic_descriptor(topic) if topic else "this topic"
+        base = (template or "Here’s what stands out about {topic}:").strip()
+        redacted_query = self._redact_identifiers(query)
+        if "{query}" in base:
+            base = base.replace("{query}", redacted_query or "your question")
+
+        if "{topic}" in base:
+            line = base.replace("{topic}", descriptor)
+        elif descriptor:
+            cleaned_base = base.rstrip(" :")
+            if cleaned_base.lower().endswith("about"):
+                line = f"{cleaned_base} {descriptor}"
+            else:
+                line = f"{cleaned_base} about {descriptor}"
+        else:
+            line = base
+
+        source_hint = ""
+        for item in focus_items:
+            candidate = item.get("source_label") or item.get("collection")
+            if isinstance(candidate, str) and candidate.strip():
+                source_hint = self._redact_identifiers(candidate)
+                break
+
+        if source_hint:
+            lowered_line = line.lower()
+            if source_hint.lower() not in lowered_line:
+                line = f"{line.rstrip('.')} drawing from {source_hint}"
+
+        return line.rstrip(" :")
+
     def _analyse_session_history(
         self, history: List[Dict[str, Any]]
     ) -> tuple[str, List[str], bool]:
@@ -560,6 +935,10 @@ class RAGPipeline:
             source_label = self._label_for_collection(collection)
             payload.setdefault("collection_name", collection)
             payload.setdefault("source_label", source_label)
+            combined_raw = getattr(hit, "combined_score", getattr(hit, "aggregated", 0.0))
+            rerank_raw = getattr(hit, "rerank_score", getattr(hit, "score", 0.0))
+            combined_score = float(combined_raw) if isinstance(combined_raw, (int, float)) else 0.0
+            rerank_score = float(rerank_raw) if isinstance(rerank_raw, (int, float)) else 0.0
             summary_text = (
                 payload.get("summary")
                 or payload.get("text_summary")
@@ -580,6 +959,8 @@ class RAGPipeline:
                     "source_label": source_label,
                     "document": document_label,
                     "summary": condensed,
+                    "score": combined_score,
+                    "rerank_score": rerank_score,
                 }
             )
         return items
@@ -634,6 +1015,104 @@ class RAGPipeline:
 
         return "\n\n".join(paragraphs)
 
+    def _sentiment_descriptor(self, sentiment: Optional[Dict[str, float]]) -> str:
+        if not sentiment:
+            return "neutral"
+        compound = sentiment.get("compound")
+        if compound is None:
+            return "neutral"
+        if compound <= -0.2:
+            return "negative"
+        if compound >= 0.4:
+            return "positive"
+        return "neutral"
+
+    def _compose_llm_prompt(
+        self,
+        query: str,
+        context: str,
+        draft_answer: str,
+        nltk_features: Optional[Dict[str, Any]],
+        ad_hoc_context: str,
+    ) -> str:
+        redacted_query = self._redact_identifiers(query)
+        lines: List[str] = [f"User question: {redacted_query}"]
+
+        sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        descriptor = self._sentiment_descriptor(sentiment)
+
+        if nltk_features:
+            keywords = [
+                str(item).strip()
+                for item in nltk_features.get("keywords", [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+            key_phrases = [
+                str(item).strip()
+                for item in nltk_features.get("key_phrases", [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if keywords:
+                lines.append(f"Key terms to emphasise: {', '.join(keywords[:8])}")
+            if key_phrases:
+                lines.append(f"Relevant phrases: {'; '.join(key_phrases[:5])}")
+
+        if descriptor == "negative":
+            tone_line = "Tone guidance: be empathetic and solutions-oriented."
+        elif descriptor == "positive":
+            tone_line = "Tone guidance: keep the response upbeat while staying factual."
+        else:
+            tone_line = "Tone guidance: respond in a calm, professional manner."
+        lines.append(tone_line)
+
+        if ad_hoc_context:
+            lines.append(
+                "User supplied context: "
+                + self._redact_identifiers(ad_hoc_context)
+            )
+
+        if context:
+            lines.append("Knowledge snippets:\n" + context)
+
+        lines.append("Draft summary derived from retrieval:\n" + draft_answer)
+        lines.append(
+            "Rewrite the draft into at most two concise paragraphs. Start with the key takeaway, integrate the knowledge snippets, and avoid filler greetings or repeated statements."
+        )
+        return "\n\n".join(lines)
+
+    def _finalise_llm_answer(
+        self,
+        llm_answer: Any,
+        nltk_features: Optional[Dict[str, Any]],
+        fallback: str,
+    ) -> str:
+        candidate = llm_answer if isinstance(llm_answer, str) else ""
+        candidate = candidate.strip()
+        if not candidate or candidate.lower().startswith("could not generate"):
+            return fallback
+
+        sentiment = (nltk_features or {}).get("sentiment") if nltk_features else None
+        if self._nltk_processor:
+            cleaned = self._nltk_processor.postprocess(candidate, sentiment=sentiment)
+        else:
+            cleaned = self._postprocess_answer(candidate)
+        return cleaned or fallback
+
+    def _merge_followups(
+        self, base_followups: List[str], llm_followups: Optional[List[Any]]
+    ) -> List[str]:
+        suggestions: List[str] = []
+        if llm_followups:
+            for item in llm_followups:
+                if isinstance(item, str) and item.strip():
+                    suggestions.append(item.strip())
+        suggestions.extend(base_followups)
+        deduped: List[str] = []
+        for suggestion in suggestions:
+            if suggestion not in deduped:
+                deduped.append(suggestion)
+        return deduped[:3]
+
     def _build_structured_answer(
         self,
         query: str,
@@ -646,47 +1125,35 @@ class RAGPipeline:
             for item in guidelines.get("acknowledgements", [])
             if str(item).strip()
         ]
-        summary_intro = str(
+        summary_intro_template = str(
             guidelines.get(
                 "summary_intro",
                 "Here's a quick summary based on the latest procurement guidance.",
             )
         ).strip()
 
-        paragraphs: List[str] = []
-        opening_parts: List[str] = []
-        if acknowledgements:
-            opening_parts.append(acknowledgements[0])
-        if summary_intro:
-            opening_parts.append(summary_intro)
-        opening = " ".join(opening_parts).strip()
-        if opening:
-            paragraphs.append(self._to_sentence(opening))
+        focus_items = self._select_focus_items(enumerated_items)
 
-        if enumerated_items:
+        paragraphs: List[str] = []
+        opening_line = self._friendly_opening(query, acknowledgements, focus_items)
+        if opening_line:
+            paragraphs.append(self._to_sentence(opening_line))
+
+        if (focus_items or ad_hoc_context) and summary_intro_template:
+            intro_line = self._craft_summary_intro(
+                query,
+                summary_intro_template,
+                focus_items,
+            )
+            if intro_line:
+                paragraphs.append(self._to_sentence(intro_line))
+        if focus_items:
             statements: List[str] = []
-            for idx, item in enumerate(enumerated_items):
-                source_label = item.get("source_label") or "reference"
-                doc_label = item.get("document") or source_label
-                snippet = item.get("summary") or self._condense_snippet(
-                    (item.get("payload") or {}).get("content", "")
-                )
-                snippet = self._redact_identifiers(snippet)
-                if not snippet:
-                    continue
-                lowered_label = source_label.lower()
-                if "policy" in lowered_label:
-                    opener = "The policy states"
-                elif "uploaded" in lowered_label:
-                    opener = "Your uploaded note adds"
-                elif idx == 0:
-                    opener = f"{doc_label} highlights"
-                elif idx == 1:
-                    opener = f"{doc_label} also notes"
+            for idx, item in enumerate(focus_items):
+                if idx == 0:
+                    sentence = self._format_primary_statement(item)
                 else:
-                    opener = f"{doc_label} further explains"
-                insight = f"{opener} {snippet}".strip()
-                sentence = self._to_sentence(insight)
+                    sentence = self._format_support_statement(item, idx)
                 if sentence:
                     statements.append(sentence)
             if statements:
@@ -823,6 +1290,27 @@ class RAGPipeline:
             product_type,
         )
 
+        raw_nltk_features: Optional[Dict[str, Any]] = None
+        if self._nltk_processor:
+            nltk_feature_record = self._nltk_processor.preprocess(query)
+            raw_nltk_features = {
+                "keywords": nltk_feature_record.keywords,
+                "key_phrases": nltk_feature_record.key_phrases,
+                "sentiment": nltk_feature_record.sentiment,
+            }
+            logger.debug(
+                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.keywords[:6]
+                ],
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.key_phrases[:4]
+                ],
+                nltk_feature_record.sentiment,
+            )
+
         history = self.history_manager.get_history(user_id)
         session_key = user_id.strip() if isinstance(user_id, str) else None
         session_record = self._session_uploads.get(session_key) if session_key else None
@@ -952,9 +1440,9 @@ class RAGPipeline:
                 "retrieved_documents": [],
             }
 
-        enumerated_items: List[Dict[str, Any]] = []
-        for item in knowledge_items:
-            enumerated_items.append(dict(item))
+        focus_items = self._select_focus_items(knowledge_items)
+        enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
+        context_body = self._synthesise_context(knowledge_items)
 
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
@@ -964,8 +1452,23 @@ class RAGPipeline:
             payload.setdefault("source_label", item.get("source_label"))
             retrieved_documents_payloads.append(payload)
 
-        answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
-        follow_ups = self._build_followups(query, enumerated_items)
+        draft_answer = self._build_structured_answer(query, enumerated_items, ad_hoc_context)
+        base_followups = self._build_followups(query, enumerated_items)
+
+        prompt = self._compose_llm_prompt(
+            query,
+            context_body,
+            draft_answer,
+            raw_nltk_features,
+            ad_hoc_context,
+        )
+        llm_payload = self._generate_response(prompt, llm_to_use)
+        answer = self._finalise_llm_answer(
+            llm_payload.get("answer"), raw_nltk_features, draft_answer
+        )
+        follow_ups = self._merge_followups(
+            base_followups, llm_payload.get("follow_ups")
+        )
 
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)

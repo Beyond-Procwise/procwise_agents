@@ -454,10 +454,38 @@ class RAGService:
             return []
 
         hint_text = self._compose_hint_text(session_hint, memory_fragments)
+        feature_keywords: List[str] = []
+        feature_phrases: List[str] = []
+        if isinstance(nltk_features, dict):
+            raw_keywords = nltk_features.get("keywords", [])
+            raw_phrases = nltk_features.get("key_phrases", [])
+            feature_keywords = [
+                str(item).strip()
+                for item in raw_keywords
+                if isinstance(item, str) and str(item).strip()
+            ]
+            feature_phrases = [
+                str(item).strip()
+                for item in raw_phrases
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if feature_keywords or feature_phrases:
+                logger.debug(
+                    "Applying NLTK feature hints: keywords=%s phrases=%s",
+                    feature_keywords[:8],
+                    feature_phrases[:5],
+                )
+
         rewritten_query, auto_conditions = self._rewrite_query(base_query)
         combined_filter = self._merge_filters(filters, auto_conditions)
         policy_mode = bool(policy_mode or self._looks_like_policy_query(base_query, hint_text))
         search_text = rewritten_query or base_query
+        feature_hint_parts = feature_keywords[:6] + feature_phrases[:4]
+        if feature_hint_parts:
+            features_line = ", ".join(dict.fromkeys(feature_hint_parts))
+            search_text = f"{search_text}\n\nFocus terms: {features_line}".strip()
+            if hint_text:
+                hint_text = f"{hint_text} | focus terms: {features_line}"
         if hint_text:
             search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
@@ -582,6 +610,17 @@ class RAGService:
 
         if self._bm25 is not None and self._documents:
             tokens = rewritten_query.lower().split()
+            if feature_keywords:
+                tokens.extend(
+                    keyword.lower()
+                    for keyword in feature_keywords
+                    if keyword.lower() not in tokens
+                )
+            if feature_phrases:
+                for phrase in feature_phrases:
+                    for part in phrase.lower().split():
+                        if part not in tokens:
+                            tokens.append(part)
             bm25_scores = self._bm25.get_scores(tokens)
             ranked = sorted(
                 enumerate(bm25_scores), key=lambda item: item[1], reverse=True
@@ -804,9 +843,19 @@ class RAGService:
             return float(bonus + doc_bonus + session_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
+        rerank_weight = 1.35
+        context_weight = 0.65
         for hit, score in zip(hits, scores):
             base_score = float(score)
-            combined = base_score + hit.aggregated + _priority_bonus(hit)
+            aggregated_score = float(getattr(hit, "aggregated", 0.0))
+            combined = (
+                base_score * rerank_weight
+                + aggregated_score * context_weight
+                + _priority_bonus(hit)
+            )
+            hit.rerank_score = base_score
+            hit.combined_score = combined
+            hit.context_score = aggregated_score
             scored_hits.append((hit, combined, base_score))
 
         if not scored_hits:

@@ -115,6 +115,21 @@ def test_pipeline_answer_returns_documents(monkeypatch):
 
     monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
 
+    def _fake_generate_response(self, prompt, model):
+        return {
+            "answer": "Supplier summary includes s.",
+            "follow_ups": [
+                "Would you like deeper supplier insights?",
+                "Any other procurement roadblocks I can remove?",
+            ],
+        }
+
+    monkeypatch.setattr(
+        RAGPipeline,
+        "_generate_response",
+        _fake_generate_response,
+    )
+
     class DummyStaticAgent:
         def __init__(self, *args, **kwargs):
             pass
@@ -139,7 +154,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
         ),
         ollama_options=lambda: {},
     )
-    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
     result = pipeline.answer_question("q", "user")
     assert "record_id" not in result["retrieved_documents"][0]
     assert result["retrieved_documents"][0]["summary"] == "s"
@@ -194,7 +209,13 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
         ollama_options=lambda: {},
     )
 
-    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder)
+    monkeypatch.setattr(
+        RAGPipeline,
+        "_generate_response",
+        lambda self, prompt, model: {"answer": "", "follow_ups": []},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
     result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
 
     assert (
