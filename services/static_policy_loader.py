@@ -365,6 +365,7 @@ class StaticPolicyLoader(DocumentEmbeddingService):
             "section",
             "source_path",
             "record_id",
+            "source_type",
         )
         for field in indexed_fields:
             try:

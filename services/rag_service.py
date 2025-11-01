@@ -411,13 +411,26 @@ class RAGService:
         query: str,
         top_k: int = 5,
         filters: Optional[models.Filter] = None,
+        *,
+        session_hint: Optional[str] = None,
+        memory_fragments: Optional[List[str]] = None,
+        policy_mode: bool = False,
     ):
         """Retrieve and rerank documents for the given query."""
         if not query or not query.strip():
             return []
 
-        rewritten_query, auto_conditions = self._rewrite_query(query)
+        base_query = re.sub(r"\s+", " ", query or "").strip()
+        if not base_query:
+            return []
+
+        hint_text = self._compose_hint_text(session_hint, memory_fragments)
+        rewritten_query, auto_conditions = self._rewrite_query(base_query)
         combined_filter = self._merge_filters(filters, auto_conditions)
+        policy_mode = bool(policy_mode or self._looks_like_policy_query(base_query, hint_text))
+        search_text = rewritten_query or base_query
+        if hint_text:
+            search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
 
         query_matrix: Optional[np.ndarray] = None
@@ -428,7 +441,7 @@ class RAGService:
             if query_matrix is not None and query_vector is not None:
                 return query_matrix, query_vector
 
-            encoded = self.embedder.encode(rewritten_query, normalize_embeddings=True)
+            encoded = self.embedder.encode(search_text, normalize_embeddings=True)
             arr = (
                 encoded
                 if isinstance(encoded, np.ndarray)
@@ -442,12 +455,12 @@ class RAGService:
             query_matrix, query_vector = matrix, vector
             return query_matrix, query_vector
 
-        use_cache = combined_filter is None and not auto_conditions
+        use_cache = combined_filter is None and not auto_conditions and not hint_text
         cached_entries: List[Dict[str, Any]] = []
         if use_cache:
-            cached_entries = self._semantic_cache.get_cached_queries(rewritten_query)
+            cached_entries = self._semantic_cache.get_cached_queries(search_text)
             direct_cache = self._rebuild_cached_hits(
-                cached_entries, rewritten_query, top_k
+                cached_entries, search_text, top_k
             )
             if direct_cache is not None:
                 return direct_cache
@@ -484,7 +497,9 @@ class RAGService:
                 "rrf": float(rrf),
             }
             entry.aggregated += float(rrf)
-            entry.payload.setdefault("_query_rewrite", rewritten_query)
+            entry.payload.setdefault("_query_rewrite", rewritten_query or base_query)
+            if hint_text:
+                entry.payload.setdefault("_query_context", hint_text)
 
         if cached_entries:
             self._augment_candidates_from_cache(
@@ -601,12 +616,21 @@ class RAGService:
 
             base_collections: List[Tuple[str, Optional[models.Filter]]] = []
             seen_collections: Set[str] = set()
-            for candidate in (
+            ordered_collections: List[Optional[str]] = [
                 self.primary_collection,
                 self.uploaded_collection,
                 self.static_policy_collection,
                 self.learning_collection,
-            ):
+            ]
+            if policy_mode and self.static_policy_collection in ordered_collections:
+                ordered_collections = [
+                    self.static_policy_collection,
+                    self.primary_collection,
+                    self.uploaded_collection,
+                    self.learning_collection,
+                ]
+
+            for candidate in ordered_collections:
                 if not candidate or candidate in seen_collections:
                     continue
                 seen_collections.add(candidate)
@@ -663,10 +687,14 @@ class RAGService:
             bonus = float(collection_weights.get(collection, 0.0))
             if collection == self.static_policy_collection:
                 bonus = max(bonus, 0.12)
+                if policy_mode:
+                    bonus += 0.22
 
             doc_bonus = float(document_weights.get(document_type, 0.0))
             if document_type == "policy":
                 doc_bonus = max(doc_bonus, 0.08)
+                if policy_mode:
+                    doc_bonus += 0.15
 
             return float(bonus + doc_bonus)
 
@@ -713,6 +741,25 @@ class RAGService:
                 lowest_idx = min(range(len(selected)), key=lambda idx: selected[idx][1])
                 selected[lowest_idx] = replacement_candidate
 
+        if policy_mode and self.static_policy_collection:
+            static_hits = [
+                record
+                for record in scored_hits
+                if _collection_name(record[0]) == self.static_policy_collection
+            ]
+            if static_hits:
+                max_static = min(len(static_hits), max(1, top_k // 2))
+                for idx in range(max_static):
+                    candidate = static_hits[idx]
+                    if candidate not in selected:
+                        if len(selected) < top_k:
+                            selected.append(candidate)
+                        else:
+                            lowest_idx = min(
+                                range(len(selected)), key=lambda i: selected[i][1]
+                            )
+                            selected[lowest_idx] = candidate
+
         deduped: List[Tuple[SimpleNamespace, float, float]] = []
         seen_keys: Set[Tuple[str, str]] = set()
         for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
@@ -743,7 +790,7 @@ class RAGService:
                         "aggregated_score": getattr(hit, "aggregated", 0.0),
                     }
                 )
-            self._semantic_cache.set_query_results(rewritten_query, cache_payload)
+            self._semantic_cache.set_query_results(search_text, cache_payload)
 
         return results
 
@@ -809,6 +856,48 @@ class RAGService:
             normalised = f"{normalised} {unique}".strip()
 
         return normalised, conditions
+
+    def _compose_hint_text(
+        self,
+        session_hint: Optional[str],
+        memory_fragments: Optional[List[str]],
+    ) -> str:
+        hints: List[str] = []
+        if session_hint:
+            snippet = re.sub(r"\s+", " ", session_hint).strip()
+            if snippet:
+                hints.append(snippet)
+        if memory_fragments:
+            for fragment in memory_fragments:
+                cleaned = re.sub(r"\s+", " ", str(fragment or "")).strip()
+                if cleaned:
+                    hints.append(cleaned)
+        return " ".join(hints)
+
+    def _looks_like_policy_query(
+        self, query: str, hint_text: Optional[str]
+    ) -> bool:
+        combined = " ".join(
+            part.strip().lower()
+            for part in (query or "", hint_text or "")
+            if part and part.strip()
+        )
+        if not combined:
+            return False
+
+        policy_tokens = (
+            "policy",
+            "policies",
+            "approved supplier",
+            "supplier approval",
+            "compliance",
+            "procurement rule",
+            "sourcing rule",
+            "maverick",
+            "non-approved",
+            "delegation of authority",
+        )
+        return any(token in combined for token in policy_tokens)
 
     def _merge_filters(
         self,
