@@ -71,7 +71,7 @@ class ChatHistoryManager:
 
 class RAGPipeline:
     _BLOCKED_DOC_TYPE_TOKENS = ("learning", "workflow", "event", "log", "trace", "audit")
-    _SENSITIVE_EXACT_KEYS = {
+    _IDENTIFIER_FIELD_KEYS = {
         "record_id",
         "source",
         "source_system",
@@ -84,25 +84,18 @@ class RAGPipeline:
         "path",
         "uri",
         "unique_id",
+        "document_id",
+        "documentid",
+        "doc_id",
+        "docid",
+        "document_reference",
+        "documentref",
         "workflow_ref",
         "workflow_reference",
-        "effective_date",
-        "supplier",
-        "doc_version",
-        "round_id",
+        "workflow_id",
+        "message_id",
+        "metadata",
     }
-    _SENSITIVE_KEY_MARKERS = (
-        "workflow",
-        "session",
-        "event",
-        "agent",
-        "log",
-        "trace",
-        "dispatch",
-        "routing",
-        "draft",
-        "message",
-    )
     _BLOCKED_PAYLOAD_KEYS = {
         "workflow_id",
         "session_reference",
@@ -730,10 +723,20 @@ class RAGPipeline:
             return []
 
         sortable: List[Dict[str, Any]] = []
+        uploaded_collection = getattr(self.rag, "uploaded_collection", "")
+        static_policy_collection = getattr(self.rag, "static_policy_collection", "")
+
         for item in items:
             score = item.get("score")
             if not isinstance(score, (int, float)):
                 score = 0.0
+            collection = str(item.get("collection") or "")
+            if collection and collection == uploaded_collection:
+                score += 0.9
+            elif collection and collection == static_policy_collection:
+                score += 0.35
+            elif collection == "static_procurement_qa":
+                score += 0.3
             item_with_score = dict(item)
             item_with_score["_ordering_score"] = float(score)
             sortable.append(item_with_score)
@@ -1001,38 +1004,21 @@ class RAGPipeline:
                 accepted[key] = value
         return accepted
 
-    def _is_sensitive_key(self, key: Any) -> bool:
-        key_str = str(key or "").strip()
-        if not key_str:
-            return True
-        lowered = key_str.lower()
-        if lowered in self._SENSITIVE_EXACT_KEYS:
-            return True
-        return any(marker in lowered for marker in self._SENSITIVE_KEY_MARKERS)
+    def _filter_identifier_fields(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove document and system identifier fields while preserving content."""
 
-    def _sanitise_value(self, value: Any) -> Any:
-        if isinstance(value, str):
-            return self._redact_identifiers(value)
-        if isinstance(value, (int, float, bool)) or value is None:
-            return value
-        if isinstance(value, (list, tuple)):
-            cleaned = [self._sanitise_value(item) for item in value if item is not None]
-            return [item for item in cleaned if item not in ("", [], {})]
-        if isinstance(value, dict):
-            return {
-                str(key): self._sanitise_value(val)
-                for key, val in value.items()
-                if not self._is_sensitive_key(key)
-            }
-        return self._redact_identifiers(str(value))
-
-    def _sanitise_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        cleaned: Dict[str, Any] = {}
+        filtered: Dict[str, Any] = {}
         for key, value in (payload or {}).items():
-            if self._is_sensitive_key(key):
+            key_str = str(key or "").strip()
+            if not key_str:
                 continue
-            cleaned[str(key)] = self._sanitise_value(value)
-        return cleaned
+            lowered = key_str.lower()
+            if lowered in self._IDENTIFIER_FIELD_KEYS:
+                continue
+            if any(token in lowered for token in ("document_id", "doc_id", "metadata")):
+                continue
+            filtered[key_str] = value
+        return filtered
 
     def _is_internal_payload(
         self, payload: Dict[str, Any], collection: Optional[str]
@@ -1092,7 +1078,7 @@ class RAGPipeline:
             collection = payload.get("collection_name", self.rag.primary_collection)
             if self._is_internal_payload(payload, collection):
                 continue
-            payload = self._sanitise_payload(payload)
+            payload = self._filter_identifier_fields(payload)
             collection = payload.get("collection_name", collection)
             source_label = self._label_for_collection(collection)
             payload.setdefault("collection_name", collection)
@@ -1488,8 +1474,6 @@ class RAGPipeline:
                 nltk_feature_record.sentiment,
             )
 
-        history = self.history_manager.get_history(user_id)
-
         candidate_keys: List[str] = []
         cleaned_session = (
             session_id.strip()
@@ -1516,6 +1500,22 @@ class RAGPipeline:
 
         if session_key is None and candidate_keys:
             session_key = candidate_keys[0]
+
+        static_session_token = (
+            session_key
+            or cleaned_session
+            or cleaned_user
+            or (user_id.strip() if isinstance(user_id, str) else str(user_id))
+        )
+        static_response = self._try_static_answer(
+            query,
+            user_id,
+            session_id=static_session_token,
+        )
+        if static_response:
+            return static_response
+
+        history = self.history_manager.get_history(user_id)
 
         uploaded_scope = dict(self._uploaded_context or {})
         uploaded_documents: List[str] = []
@@ -1696,7 +1696,7 @@ class RAGPipeline:
                             "collection_name": "static_procurement_qa",
                             "source_label": self._label_for_collection("static_procurement_qa"),
                         }
-                        static_context_payload = self._sanitise_payload(
+                        static_context_payload = self._filter_identifier_fields(
                             static_context_payload
                         )
                         static_context_payload.setdefault(
@@ -1743,7 +1743,7 @@ class RAGPipeline:
         retrieved_documents_payloads: List[Dict[str, Any]] = []
         for item in enumerated_items:
             payload = dict(item.get("payload", {}))
-            payload = self._sanitise_payload(payload)
+            payload = self._filter_identifier_fields(payload)
             payload.setdefault("collection_name", item.get("collection"))
             payload.setdefault("source_label", item.get("source_label"))
             retrieved_documents_payloads.append(payload)
