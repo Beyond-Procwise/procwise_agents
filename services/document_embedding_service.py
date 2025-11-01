@@ -131,6 +131,8 @@ class DocumentEmbeddingService:
 
         metadata_payload["extraction_method"] = extracted.method
         metadata_payload.update(extracted.metadata)
+        for disallowed in DISALLOWED_METADATA_KEYS:
+            metadata_payload.pop(disallowed, None)
 
         document_type = metadata_payload.get("document_type")
         chunks = self._build_document_chunks(
