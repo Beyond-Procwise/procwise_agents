@@ -4,6 +4,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -664,24 +665,66 @@ class RAGAgent(BaseAgent):
             return self._render_policy_response(policy_payload, depth_mode)
 
         opening = self._generate_opening_section(query, extracted_data, query_type)
-        sections: List[str] = [opening]
+        closing = self._generate_closing_section(query, extracted_data, query_type)
+
+        template = ResponseStructure.STRUCTURES.get(
+            query_type, ResponseStructure.STRUCTURES["exploratory"]
+        )
+        section_keys = template["sections"]
+        headers = plan["sections"]
+
+        section_bodies: Dict[str, str] = {}
 
         if query_type == "supplier_overview":
-            sections.extend(self._generate_supplier_sections(extracted_data, retrieved_docs))
+            generated = self._generate_supplier_sections(extracted_data, retrieved_docs)
+            section_bodies["overview"] = opening
+            section_bodies["key_suppliers"] = generated[0] if generated else ""
+            section_bodies["insights"] = generated[1] if len(generated) > 1 else ""
+            section_bodies["next_steps"] = closing
         elif query_type == "financial_analysis":
-            sections.extend(self._generate_financial_sections(extracted_data, retrieved_docs))
+            generated = self._generate_financial_sections(extracted_data, retrieved_docs)
+            section_bodies["summary"] = opening
+            section_bodies["key_figures"] = generated[0] if generated else ""
+            section_bodies["breakdown"] = generated[1] if len(generated) > 1 else ""
+            section_bodies["trends"] = generated[2] if len(generated) > 2 else ""
+            section_bodies["recommendations"] = closing
         elif query_type == "comparison":
-            sections.extend(self._generate_comparison_sections(extracted_data, retrieved_docs))
+            generated = self._generate_comparison_sections(extracted_data, retrieved_docs)
+            section_bodies["overview"] = opening
+            section_bodies["comparison_table"] = generated[0] if generated else ""
+            section_bodies["strengths_weaknesses"] = (
+                generated[1] if len(generated) > 1 else ""
+            )
+            section_bodies["recommendation"] = closing
         elif query_type == "simple_lookup":
-            return self._generate_simple_response(query, extracted_data, retrieved_docs)
+            main_section = self._generate_simple_response(query, extracted_data, retrieved_docs)
+            section_bodies["direct_answer"] = main_section
+            section_bodies["context"] = closing
         else:
-            sections.extend(self._generate_exploratory_sections(extracted_data, retrieved_docs))
+            generated = self._generate_exploratory_sections(extracted_data, retrieved_docs)
+            section_bodies["context"] = opening
+            if generated:
+                section_bodies["findings"] = generated[0]
+            if len(generated) > 1:
+                details = generated[1]
+                if len(generated) > 2:
+                    details = "\n\n".join([details] + generated[2:])
+                section_bodies["details"] = details
+            section_bodies.setdefault("details", "")
+            section_bodies["implications"] = closing
 
-        closing = self._generate_closing_section(query, extracted_data, query_type)
-        if closing:
-            sections.append(closing)
+        formatted_sections: List[str] = []
+        for header, key in zip_longest(headers, section_keys, fillvalue=""):
+            if not header:
+                continue
+            body = section_bodies.get(key, "") if key else ""
+            if body and body.strip():
+                formatted_sections.append(f"## {header}\n{body.strip()}")
 
-        return "\n\n".join([segment for segment in sections if segment.strip()])
+        if not formatted_sections:
+            return opening if query_type != "simple_lookup" else section_bodies["direct_answer"]
+
+        return "\n\n".join(formatted_sections)
 
     def _generate_opening_section(
         self, query: str, data: Dict[str, Any], query_type: str
