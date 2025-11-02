@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .base_agent import AgentOutput, AgentStatus, BaseAgent
+from services.feedback_service import FeedbackSentiment, FeedbackService
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,8 @@ class RAGAgent(BaseAgent):
     def __init__(self, agent_nick):
         super().__init__(agent_nick)
         self._session_topics: Dict[Tuple[str, str], int] = {}
+        self.feedback_service = FeedbackService(agent_nick)
+        self._last_interaction: Dict[str, Any] = {}
         self._ensure_index()
 
     # ------------------------------------------------------------------
@@ -87,12 +91,87 @@ class RAGAgent(BaseAgent):
         query: str,
         user_id: str,
         session_id: Optional[str] = None,
+        doc_type: Optional[str] = None,
+        product_type: Optional[str] = None,
         **_: Any,
     ) -> AgentOutput:
         """Return the documented answer for ``query`` from the static dataset."""
 
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
+
+        query = query.strip()
+
+        feedback_detected = False
+        feedback_id: Optional[int] = None
+        feedback_sentiment: Optional[FeedbackSentiment] = None
+        feedback_confidence = 0.0
+        acknowledgment_text: Optional[str] = None
+        ack_prefix: Optional[str] = None
+
+        previous_user = self._last_interaction.get("user_id")
+        if previous_user and previous_user == user_id:
+            feedback_sentiment, feedback_confidence = self.feedback_service.detect_feedback(query)
+            if (
+                feedback_sentiment != FeedbackSentiment.NEUTRAL
+                and feedback_confidence > 0.3
+            ):
+                feedback_detected = True
+                acknowledgment_text = self.feedback_service.generate_acknowledgment(
+                    feedback_sentiment, query
+                )
+                feedback_id = self.feedback_service.store_feedback(
+                    user_id=user_id,
+                    session_id=session_id,
+                    query=self._last_interaction.get("query", ""),
+                    response=self._last_interaction.get("response", ""),
+                    feedback_message=query,
+                    sentiment=feedback_sentiment,
+                    confidence=feedback_confidence,
+                    retrieved_doc_ids=self._last_interaction.get("doc_ids", []),
+                    context_metadata={
+                        "doc_type": doc_type,
+                        "product_type": product_type,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+                if feedback_sentiment == FeedbackSentiment.POSITIVE:
+                    data = {
+                        "question": self._last_interaction.get("query", ""),
+                        "answer": acknowledgment_text,
+                        "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
+                        "related_prompts": [],
+                        "structured": False,
+                        "structure_type": "feedback_acknowledgment",
+                        "sections": [],
+                        "style": "acknowledgment",
+                        "main_points": [],
+                        "source_ids": self._last_interaction.get("doc_ids", []),
+                        "original_answer": self._last_interaction.get("response", ""),
+                        "feedback": {
+                            "captured": True,
+                            "feedback_id": feedback_id,
+                            "sentiment": feedback_sentiment.value,
+                            "confidence": feedback_confidence,
+                            "acknowledgment": acknowledgment_text,
+                        },
+                    }
+                    agentic_plan = "1. Recognise user feedback.\n2. Store it for training.\n3. Acknowledge the positive sentiment."
+                    context_snapshot = {
+                        "feedback_id": feedback_id,
+                        "feedback_sentiment": feedback_sentiment.value,
+                        "feedback_confidence": feedback_confidence,
+                    }
+                    return AgentOutput(
+                        status=AgentStatus.SUCCESS,
+                        data=data,
+                        agentic_plan=agentic_plan,
+                        context_snapshot=context_snapshot,
+                        confidence=1.0,
+                    )
+
+                ack_prefix = acknowledgment_text
 
         key = self._session_key(user_id, session_id)
         query_vector = self._encode_text(query)
@@ -121,6 +200,8 @@ class RAGAgent(BaseAgent):
         structured_answer = self._generate_structured_response(
             query, extracted, docs, plan
         )
+        if ack_prefix:
+            structured_answer = f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
         followups = self._generate_contextual_followups(query, query_type, extracted)
 
         response = {
@@ -137,6 +218,15 @@ class RAGAgent(BaseAgent):
             "original_answer": qa_entry.answer,
         }
 
+        if feedback_detected and feedback_sentiment is not None:
+            response["feedback"] = {
+                "captured": True,
+                "feedback_id": feedback_id,
+                "sentiment": feedback_sentiment.value,
+                "confidence": feedback_confidence,
+                "acknowledgment": acknowledgment_text,
+            }
+
         agentic_plan = (
             "1. Match the query to the closest procurement topic.\n"
             "2. Retrieve the exact answer from the static knowledge base.\n"
@@ -149,12 +239,31 @@ class RAGAgent(BaseAgent):
             "session_topic": topic_entry.topic,
         }
 
+        if feedback_detected and feedback_sentiment is not None:
+            context_snapshot.update(
+                {
+                    "feedback_id": feedback_id,
+                    "feedback_sentiment": feedback_sentiment.value,
+                    "feedback_confidence": feedback_confidence,
+                }
+            )
+
         logger.debug(
             "RAGAgent resolved query '%s' to topic '%s' question '%s'",
             query,
             topic_entry.topic,
             qa_entry.question,
         )
+
+        record_id = payload["record_id"]
+        self._last_interaction = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "query": query,
+            "response": structured_answer,
+            "doc_ids": [record_id],
+            "topic": topic_entry.topic,
+        }
 
         return AgentOutput(
             status=AgentStatus.SUCCESS,
