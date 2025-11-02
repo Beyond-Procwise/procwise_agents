@@ -853,7 +853,7 @@ class RAGPipeline:
 
         generic_labels = {"", "procurement reference"}
 
-        def _stable_identifier(entry: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
+        def _stable_identifier(entry: Dict[str, Any]) -> Optional[tuple[str, ...]]:
             payload = entry.get("payload")
             if isinstance(payload, dict):
                 for candidate in (
@@ -1539,7 +1539,7 @@ class RAGPipeline:
         doc_type: Optional[str] = None,
         product_type: Optional[str] = None,
     ) -> Dict:
-        llm_to_use = model_name or self.default_llm_model
+        llm_to_use = self.default_llm_model
         logger.info(
             "Answering query with model '%s' and filters: doc_type='%s', product_type='%s'",
             llm_to_use,

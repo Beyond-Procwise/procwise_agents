@@ -181,7 +181,7 @@ class Settings(BaseSettings):
         default=False, env="LANGGRAPH_TRACING_ENABLED"
     )
     document_extraction_model: str = Field(
-        default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
+        default="llama3.2", env="DOCUMENT_EXTRACTION_MODEL"
     )
     rag_model: str = Field(default="phi4:latest", env="RAG_LLM_MODEL")
     # ``BAAI/bge-large-en-v1.5`` provides state-of-the-art dense retrieval
