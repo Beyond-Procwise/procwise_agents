@@ -425,7 +425,7 @@ class RAGAgent(BaseAgent):
         elif query_type == "policy_lookup":
             sections.extend(self._generate_policy_sections(extracted_data, retrieved_docs))
         elif query_type == "simple_lookup":
-            return self._generate_simple_response(extracted_data, retrieved_docs)
+            return self._generate_simple_response(query, extracted_data, retrieved_docs)
         else:
             sections.extend(self._generate_exploratory_sections(extracted_data, retrieved_docs))
 
@@ -439,26 +439,65 @@ class RAGAgent(BaseAgent):
         self, query: str, data: Dict[str, Any], query_type: str
     ) -> str:
         main_points = data.get("main_points", [])
+        focus = self._derive_focus_from_query(query)
+
         if not main_points:
-            return "Let me look into this for you."
+            return (
+                f"I took a look at the references about {focus or 'this topic'} and will "
+                "share more detail as soon as I spot something concrete."
+            )
+
+        headline = self._ensure_sentence(main_points[0])
 
         if query_type == "supplier_overview":
-            header = "## Your Supplier Landscape\n\n"
-            context = "Here's what your procurement data shows about your supplier relationships.\n"
+            preface = (
+                f"Thanks for checking in about {focus or 'your supplier landscape'}. "
+                "Here's the top-line view from the sourcing notes:"
+            )
         elif query_type == "financial_analysis":
-            header = "## Financial Overview\n\n"
-            context = "I've pulled together the key financial data from your procurement records.\n"
+            preface = (
+                f"Looking at the spend position for {focus or 'this area'}, "
+                "here's what immediately stands out:"
+            )
         elif query_type == "comparison":
-            header = "## Comparative Analysis\n\n"
-            context = "Let me break down the key differences for you.\n"
+            preface = (
+                f"To help you weigh {focus or 'these options'}, "
+                "here's the headline insight I found:"
+            )
         elif query_type == "policy_lookup":
-            header = "## Policy Reference\n\n"
-            context = "Here's what the procurement policies say about this.\n"
+            preface = (
+                f"You're asking about {focus or 'this policy area'}. "
+                "The policy guidance boils down to this:"
+            )
         else:
-            header = "## Overview\n\n"
-            context = "Based on the available data, here's what I found.\n"
+            preface = (
+                f"I've reviewed the reference notes on {focus or 'this topic'}. "
+                "Here's the quick take-away:"
+            )
 
-        return header + context
+        return f"{preface} {headline}"
+
+    def _derive_focus_from_query(self, query: str) -> str:
+        query = query.strip().rstrip("?!. ")
+        if not query:
+            return "the topic"
+
+        lowered = query.lower()
+        prefixes = ["what is", "what's", "tell me about", "how do", "how does", "can i", "could i"]
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                cleaned = query[len(prefix) :].strip()
+                return cleaned if cleaned else "the topic"
+
+        return query
+
+    def _ensure_sentence(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+        if cleaned[-1] not in ".!?":
+            return f"{cleaned}."
+        return cleaned
 
     def _generate_supplier_sections(
         self, data: Dict[str, Any], docs: List[Any]
@@ -467,32 +506,32 @@ class RAGAgent(BaseAgent):
         supplier_data = self._extract_supplier_info(data.get("main_points", []), docs)
 
         if supplier_data:
-            primary_lines = ["### Primary Suppliers\n"]
+            primary_lines = ["Here are the suppliers that matter most right now:"]
             for supplier in supplier_data[:3]:
-                primary_lines.append(f"**{supplier['name']}**")
+                bullet_lines = [f"- **{supplier['name']}**"]
                 if supplier.get("description"):
-                    primary_lines.append(supplier["description"])
+                    bullet_lines[-1] += f": {supplier['description']}"
                 if supplier.get("metrics"):
-                    primary_lines.append("\n**Key metrics:**")
                     for metric in supplier["metrics"]:
-                        primary_lines.append(f"- {metric}")
+                        bullet_lines.append(f"  - {metric}")
                 if supplier.get("source_id"):
-                    primary_lines.append(f"[Document ID: {supplier['source_id']}]\n")
+                    bullet_lines.append(f"  - Source: {supplier['source_id']}")
+                primary_lines.extend(bullet_lines)
             sections.append("\n".join(primary_lines).strip())
 
         if len(supplier_data) > 1:
-            insights = ["### Key Insights\n"]
+            insights = ["What this mix tells us:"]
             if any(s.get("coverage", 0) >= 0.7 for s in supplier_data):
                 insights.append(
-                    "- You maintain high coverage with strategic suppliers, signalling mature procurement controls"
+                    "- Coverage is concentrated with key partners, so keep an eye on dependency risk."
                 )
             if len(supplier_data) > 5:
                 insights.append(
-                    f"- Supplier base spans {len(supplier_data)} relationships, offering diversification"
+                    f"- With about {len(supplier_data)} active suppliers, you have diversification headroom."
                 )
             default_highlight = data.get("main_points", [])[:2]
             for point in default_highlight:
-                insights.append(f"- {point}")
+                insights.append(f"- {self._ensure_sentence(point)}")
             sections.append("\n".join(insights).strip())
 
         return sections
@@ -504,18 +543,18 @@ class RAGAgent(BaseAgent):
         financial_data = self._extract_financial_info(data.get("main_points", []), docs)
 
         if financial_data.get("totals"):
-            summary_lines = ["### Key Figures\n"]
+            summary_lines = ["Key figures that anchor the conversation:"]
             for key, value in financial_data["totals"].items():
-                summary_lines.append(f"**{key}:** {value}")
+                summary_lines.append(f"- **{key}:** {value}")
             source = data.get("source_ids", [None])[0]
             if source:
-                summary_lines.append(f"\n[Document ID: {source}]")
+                summary_lines.append(f"- Source: {source}")
             sections.append("\n".join(summary_lines).strip())
 
         breakdown_rows = financial_data.get("breakdown") or []
         if breakdown_rows:
             table_lines = [
-                "### Spending Breakdown\n",
+                "Spending split by category:",
                 "| Category | Amount | % of Total |",
                 "|----------|--------|------------|",
             ]
@@ -527,9 +566,9 @@ class RAGAgent(BaseAgent):
 
         trends = financial_data.get("trends") or []
         if trends:
-            trend_lines = ["### Trends & Patterns\n"]
+            trend_lines = ["Patterns worth noting:"]
             for trend in trends:
-                trend_lines.append(f"- {trend}")
+                trend_lines.append(f"- {self._ensure_sentence(trend)}")
             sections.append("\n".join(trend_lines).strip())
 
         return sections
@@ -543,7 +582,7 @@ class RAGAgent(BaseAgent):
         if len(comparison_data) >= 2:
             header_names = " | ".join([c["name"] for c in comparison_data[:3]])
             table_lines = [
-                "### Side-by-Side Comparison\n",
+                "Here's how the options line up:",
                 f"| Aspect | {header_names} |",
                 "|--------|" + "|".join(["--------" for _ in comparison_data[:3]]) + "|",
             ]
@@ -555,17 +594,17 @@ class RAGAgent(BaseAgent):
                     )
             sections.append("\n".join(table_lines))
 
-            analysis_lines = ["### Analysis\n"]
+            analysis_lines = ["What to take from this:"]
             for entity in comparison_data[:3]:
                 analysis_lines.append(f"**{entity['name']}**")
                 strengths = entity.get("strengths") or []
                 if strengths:
-                    analysis_lines.append("Strengths:")
-                    analysis_lines.extend(f"- {item}" for item in strengths)
+                    analysis_lines.append("- Strengths:")
+                    analysis_lines.extend(f"  - {self._ensure_sentence(item)}" for item in strengths)
                 weaknesses = entity.get("weaknesses") or []
                 if weaknesses:
-                    analysis_lines.append("Areas to consider:")
-                    analysis_lines.extend(f"- {item}" for item in weaknesses)
+                    analysis_lines.append("- Watch-outs:")
+                    analysis_lines.extend(f"  - {self._ensure_sentence(item)}" for item in weaknesses)
                 analysis_lines.append("")
             sections.append("\n".join(analysis_lines).strip())
 
@@ -577,15 +616,22 @@ class RAGAgent(BaseAgent):
         sections: List[str] = []
         points = data.get("main_points", [])
         if points:
-            sections.append("### Policy Summary\n\n" + points[0])
+            sections.append(
+                "In practice, the policy is pointing you to this core message: "
+                + self._ensure_sentence(points[0])
+            )
         if len(points) > 1:
-            requirement_lines = ["### Key Requirements\n"]
-            requirement_lines.extend(f"- {point}" for point in points[1:4])
+            requirement_lines = ["Key requirements to keep in mind:"]
+            requirement_lines.extend(
+                f"- {self._ensure_sentence(point)}" for point in points[1:4]
+            )
             sections.append("\n".join(requirement_lines).strip())
         related_entities = data.get("entities", [])[:3]
         if related_entities:
             sections.append(
-                "### Related Policies\n\n" + "\n".join(f"- {entity}" for entity in related_entities)
+                "If you need to cross-reference anything, these related items help:" \
+                + "\n" \
+                + "\n".join(f"- {entity}" for entity in related_entities)
             )
         return sections
 
@@ -595,14 +641,17 @@ class RAGAgent(BaseAgent):
         sections: List[str] = []
         points = data.get("main_points", [])
         if points:
-            sections.append("### Context\n\n" + points[0])
+            sections.append(
+                "Here's the context that frames this question: "
+                + self._ensure_sentence(points[0])
+            )
         if len(points) > 1:
-            findings = ["### Findings\n"]
-            findings.extend(f"- {point}" for point in points[1:4])
+            findings = ["Highlights worth noting:"]
+            findings.extend(f"- {self._ensure_sentence(point)}" for point in points[1:4])
             sections.append("\n".join(findings).strip())
         numbers = data.get("numbers", [])
         if numbers:
-            detail_lines = ["### Supporting Details\n"]
+            detail_lines = ["Figures that back this up:"]
             for number in numbers[:5]:
                 detail_lines.append(f"- {number}")
             sections.append("\n".join(detail_lines).strip())
@@ -612,9 +661,7 @@ class RAGAgent(BaseAgent):
         self, query: str, data: Dict[str, Any], query_type: str
     ) -> str:
         if query_type == "simple_lookup":
-            return ""
-
-        closing = "### What This Means for You\n\n"
+            return "Let me know if you'd like to dig any deeper."  # short and friendly
 
         if query_type == "supplier_overview":
             high_coverage = any(
@@ -622,52 +669,58 @@ class RAGAgent(BaseAgent):
                 for point in data.get("main_points", [])
             )
             if high_coverage:
-                closing += (
-                    "This supplier portfolio shows strong established relationships. "
-                    "Consider reviewing commercial terms to capture leverage while managing dependency risk."
+                closing = (
+                    "It looks like the supplier base is well-covered—worth reviewing leverage while keeping resilience in mind."
                 )
             else:
-                closing += (
-                    "There may be opportunities to strengthen or consolidate supplier coverage for better resilience."
+                closing = (
+                    "There's room to tighten the supplier mix for resilience, so consider follow-up reviews on coverage."
                 )
         elif query_type == "financial_analysis":
             growth = any("increase" in point.lower() for point in data.get("main_points", []))
             if growth:
-                closing += (
-                    "Spending momentum is trending upward. Prioritise variance reviews to protect savings targets."
+                closing = (
+                    "Spend is trending upward, so a quick variance check would help keep savings on track."
                 )
             else:
-                closing += (
-                    "Spend levels look stable—use this window to reassess supplier performance and negotiation plays."
+                closing = (
+                    "With spend running steady, you have space to reassess supplier performance and pricing plays."
                 )
         elif query_type == "comparison":
-            closing += (
-                "Each option brings distinct strengths. Align the choice with your priority—cost discipline, reliability, or innovation."
+            closing = (
+                "Each option leans into different strengths—pick the one that fits your priority, whether that's cost control, reliability, or innovation."
             )
         elif query_type == "policy_lookup":
-            closing += (
-                "Keep these rules on hand for approvals and ensure stakeholders follow the documented thresholds."
+            closing = (
+                "Keep these guardrails close by for approvals, and I'm happy to pull up any supporting examples if you need them."
             )
         else:
-            closing += (
-                "Use these findings to guide next discussions and highlight any gaps that need deeper analysis."
+            closing = (
+                "Use these points to steer the next conversation, and just shout if you want deeper analysis on any thread."
             )
 
         return closing
 
     def _generate_simple_response(
-        self, data: Dict[str, Any], docs: List[Any]
+        self, query: str, data: Dict[str, Any], docs: List[Any]
     ) -> str:
         main_points = data.get("main_points", [])
         if not main_points:
-            return "I couldn't find specific information about this in the available documents."
+            return (
+                "I checked the reference notes but couldn't find a concrete answer yet—"
+                "let me know if you want me to broaden the search."
+            )
 
-        response = main_points[0]
+        focus = self._derive_focus_from_query(query)
+        sentences = [self._ensure_sentence(main_points[0])]
         if len(main_points) > 1:
-            response += f" {main_points[1]}"
+            sentences.append(self._ensure_sentence(main_points[1]))
+        response = (
+            f"On {focus or 'this point'}, here's what the notes say: " + " ".join(sentences)
+        )
         source_ids = data.get("source_ids", [])
         if source_ids:
-            response += f" [Document ID: {source_ids[0]}]"
+            response += f" (Source: {source_ids[0]})"
         return response
 
     def _extract_supplier_info(
