@@ -44,9 +44,15 @@ def agent(monkeypatch):
 def test_rag_agent_returns_static_answer(agent):
     result = agent.run("What is our current total savings year to date?", "user-1")
     assert result.status == AgentStatus.SUCCESS
-    assert "£2.8 million" in result.data["answer"]
+    answer = result.data["answer"]
+    assert answer.startswith("## Financial Overview")
+    assert "### Key Figures" in answer
+    assert result.data["structure_type"] == "financial_analysis"
+    assert result.data["structured"] is True
+    assert any("£" in point for point in result.data["main_points"])
+    assert "£2.8 million" in result.data["original_answer"]
     assert result.data["topic"] == "Current Total Savings Year-to-Date"
-    assert any("savings" in prompt.lower() for prompt in result.data["related_prompts"])
+    assert len(result.data["related_prompts"]) == 3
 
 
 def test_rag_agent_maintains_topic_context(agent):
@@ -61,7 +67,7 @@ def test_rag_agent_maintains_topic_context(agent):
         session_id="session-A",
     )
     assert follow_up.data["topic"] == first.data["topic"]
-    assert "Procurement Intake Tool" in follow_up.data["answer"]
+    assert follow_up.data["answer"].startswith("## Your Supplier Landscape")
 
 
 def test_rag_agent_switches_topic_on_new_question(agent):
@@ -72,4 +78,4 @@ def test_rag_agent_switches_topic_on_new_question(agent):
         session_id="session-B",
     )
     assert next_answer.data["topic"] == "Business Expenses That Cannot Be Claimed"
-    assert "Non-claimable expenses" in next_answer.data["answer"]
+    assert next_answer.data["answer"].startswith("## Policy Reference")
