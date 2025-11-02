@@ -298,6 +298,83 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     assert result["retrieved_documents"] == []
 
 
+def test_pipeline_static_answer_is_conversational(monkeypatch):
+    class DummyStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, query, user_id, session_id=None, **kwargs):
+            payload = {
+                "answer": "Savings are about 14% higher than last year due to improved contract controls and supplier terms.",
+                "topic": "Current Total Savings Year-to-Date",
+                "question": "How does this compare with the same period last year?",
+                "related_prompts": [
+                    "Show me the savings trend over the past 6 months.",
+                    "How much is still in the savings pipeline?",
+                ],
+            }
+            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, confidence=0.82)
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def upsert_texts(self, *args, **kwargs):
+            return None
+
+        def upsert_payloads(self, *args, **kwargs):
+            return None
+
+    def _get_object(**kwargs):
+        return {"Body": SimpleNamespace(read=lambda: b"[]")}
+
+    history_sink: Dict[str, Any] = {}
+
+    def _put_object(**kwargs):
+        history_sink["saved"] = True
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(get_object=_get_object, put_object=_put_object),
+        settings=SimpleNamespace(
+            qdrant_collection_name="c",
+            reranker_model="x",
+            s3_bucket_name="bucket",
+            static_qa_confidence_threshold=0.5,
+        ),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
+
+    result = pipeline.answer_question(
+        "How does this compare with the same period last year?",
+        "user-123",
+    )
+
+    answer = result["answer"]
+
+    assert answer.startswith(
+        'For your question "How does this compare with the same period last year?",'
+    )
+    assert "Sure" not in answer
+    assert "14% higher" in answer
+    assert answer.splitlines()[-1] in RAGPipeline._STATIC_CLOSINGS
+    assert result["follow_ups"] == [
+        "Show me the savings trend over the past 6 months.",
+        "How much is still in the savings pipeline?",
+    ]
+    assert history_sink.get("saved")
+
+
 def test_pipeline_uploaded_context_mode(monkeypatch):
     captured: Dict[str, Any] = {}
 

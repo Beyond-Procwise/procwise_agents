@@ -285,11 +285,90 @@ class RAGPipeline:
             "activated_at": activated_at,
         }
 
-    def _format_static_answer(self, answer: str) -> str:
+    _STATIC_CLOSINGS: Tuple[str, ...] = (
+        "Let me know if you'd like supporting detail or next steps.",
+        "Happy to pull the supporting policy or spend breakdown if that's useful.",
+        "We can dig into related metrics whenever you need it.",
+    )
+
+    def _format_static_answer(
+        self,
+        answer: str,
+        *,
+        question: Optional[str] = None,
+        topic: Optional[str] = None,
+    ) -> str:
         cleaned = answer.strip()
         if not cleaned:
             return ""
-        return f"Sure, I can help with that. {cleaned}" if not cleaned.lower().startswith("sure") else cleaned
+
+        intro = self._craft_static_intro(question, topic)
+        sentences = self._split_sentences(cleaned)
+        softened = [self._soften_sentence(sentence) for sentence in sentences if sentence]
+        if not softened:
+            softened = [cleaned]
+
+        primary = softened[0]
+        remainder = [item for item in softened[1:] if item]
+
+        if remainder:
+            bullet_lines = "\n".join(f"- {item}" for item in remainder)
+            narrative = f"{primary}\n{bullet_lines}"
+        else:
+            narrative = primary
+
+        closing = self._pick_static_closing(question, topic)
+
+        return f"{intro} {narrative}\n{closing}"
+
+    def _craft_static_intro(
+        self, question: Optional[str], topic: Optional[str]
+    ) -> str:
+        if question:
+            subject = question.strip()
+            if len(subject) > 120:
+                subject = subject[:117].rstrip() + "..."
+            return f'For your question "{subject}", here\'s the quick take.'
+        if topic:
+            subject = topic.strip()
+            if subject:
+                return f"Here's the quick take on {subject}."
+        return "Here's what the procurement playbook highlights."
+
+    def _split_sentences(self, text: str) -> List[str]:
+        raw = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9£])", text.strip())
+        return [segment.strip() for segment in raw if segment and segment.strip()]
+
+    def _soften_sentence(self, sentence: str) -> str:
+        text = sentence.strip()
+        if not text:
+            return ""
+        replacements = (
+            (r"\bApproximately\b", "About"),
+            (r"\bapproximately\b", "about"),
+            (r"\bmainly\b", "largely"),
+            (r"\bdue to\b", "thanks to"),
+            (r"\bNon-claimable\b", "Non-claimable"),
+            (r"\bnon-claimable\b", "non-claimable"),
+        )
+        for pattern, replacement in replacements:
+            text = re.sub(pattern, replacement, text)
+        if not text.endswith(('.', '!', '?')):
+            text = f"{text}."
+        else:
+            text = text.rstrip(" ")
+        return text
+
+    def _pick_static_closing(
+        self, question: Optional[str], topic: Optional[str]
+    ) -> str:
+        options = self._STATIC_CLOSINGS
+        key = (question or topic or "").strip().lower()
+        if not key:
+            return options[0]
+        digest = hashlib.sha1(key.encode("utf-8")).digest()
+        index = digest[0] % len(options)
+        return options[index]
 
     def _try_static_answer(
         self, query: str, user_id: str, *, session_id: Optional[str] = None
@@ -316,7 +395,11 @@ class RAGPipeline:
         if not isinstance(answer_text, str) or not answer_text.strip():
             return None
 
-        formatted_answer = self._format_static_answer(answer_text)
+        formatted_answer = self._format_static_answer(
+            answer_text,
+            question=query,
+            topic=payload.get("topic"),
+        )
         follow_ups = [
             item.strip()
             for item in (payload.get("related_prompts") or [])
