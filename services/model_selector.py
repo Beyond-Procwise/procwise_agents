@@ -395,11 +395,15 @@ class RAGPipeline:
         if not isinstance(answer_text, str) or not answer_text.strip():
             return None
 
-        formatted_answer = self._format_static_answer(
-            answer_text,
-            question=query,
-            topic=payload.get("topic"),
-        )
+        structured = bool(payload.get("structured")) or answer_text.lstrip().startswith("##")
+        if structured:
+            formatted_answer = answer_text.strip()
+        else:
+            formatted_answer = self._format_static_answer(
+                answer_text,
+                question=query,
+                topic=payload.get("topic"),
+            )
         follow_ups = [
             item.strip()
             for item in (payload.get("related_prompts") or [])
