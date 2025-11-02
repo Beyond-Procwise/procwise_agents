@@ -83,6 +83,35 @@ def patch_rag_trainer_factory(monkeypatch):
     yield trainer
 
 
+@pytest.fixture(autouse=True)
+def patch_phi4_fine_tuner(monkeypatch):
+    created: List[Any] = []
+
+    class DummyFineTuner:
+        def __init__(self, *args, **kwargs):
+            self.calls: List[bool] = []
+            created.append(self)
+
+        def dispatch(self, *, force: bool = False):
+            self.calls.append(force)
+            return {
+                "status": "completed",
+                "sft_dataset": {"path": "datasets/phi4.jsonl", "sample_count": 0},
+                "preference_dataset": {
+                    "path": "datasets/phi4_pref.jsonl",
+                    "sample_count": 0,
+                },
+                "artifacts": {
+                    "report": "artifacts/report.json",
+                    "adapters": "artifacts/adapters",
+                    "quantized_model": "artifacts/model.gguf",
+                },
+            }
+
+    monkeypatch.setattr(mts, "Phi4HumanizationFineTuner", DummyFineTuner)
+    yield created
+
+
 def test_dispatch_flushes_pending_negotiation_learnings():
     repo = RepoRecorder()
     nick = SimpleNamespace(
@@ -109,6 +138,7 @@ def test_dispatch_flushes_pending_negotiation_learnings():
 
     assert repo.calls and repo.calls[0]["rfq_id"] == "RFQ-10"
     assert result["negotiation_learnings"][0]["status"] == "recorded"
+    assert result["phi4_fine_tuning"]["status"] == "completed"
     assert not service._pending_negotiation_learnings
 
 
@@ -134,6 +164,7 @@ def test_dispatch_requeues_when_repository_missing():
     result = service.dispatch_training_and_refresh(force=True)
 
     assert result["negotiation_learnings"][0]["status"] == "skipped"
+    assert result["phi4_fine_tuning"]["status"] == "completed"
     assert len(service._pending_negotiation_learnings) == 1
 
 
