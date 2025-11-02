@@ -148,16 +148,45 @@ class QueryEngine(BaseEngine):
         safe defaults instead of propagating the failure to SQL execution.
         """
         try:
-            with conn.cursor() as cur:
-                cur.execute(
+            if hasattr(conn, "cursor") and callable(getattr(conn, "cursor")):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = %s AND table_name = %s
+                        """,
+                        (schema, table),
+                    )
+                    return [r[0] for r in cur.fetchall()]
+
+            try:
+                from sqlalchemy import inspect
+            except Exception:  # pragma: no cover - optional dependency
+                inspector = None
+            else:
+                try:
+                    inspector = inspect(conn)
+                except Exception:  # pragma: no cover - fallback to raw execution
+                    inspector = None
+
+            if inspector is not None:
+                return [col["name"] for col in inspector.get_columns(table, schema=schema)]
+
+            if hasattr(conn, "exec_driver_sql"):
+                result = conn.exec_driver_sql(
                     """
                     SELECT column_name
                     FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s
+                    WHERE table_schema = :schema AND table_name = :table
                     """,
-                    (schema, table),
+                    {"schema": schema, "table": table},
                 )
-                return [r[0] for r in cur.fetchall()]
+                try:
+                    rows = result.fetchall()
+                finally:  # pragma: no cover - ensure cursor cleanup
+                    result.close()
+                return [row[0] for row in rows]
         except Exception:
             logger.exception("column introspection failed for %s.%s", schema, table)
             return []
