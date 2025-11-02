@@ -10,6 +10,7 @@ from services.event_bus import get_event_bus
 from models.supplier_ranking_trainer import SupplierRankingTrainer
 from models.context_trainer import ContextTrainer, TrainingConfig
 from services.rag_training_pipeline import LayeredRAGTrainer
+from services.phi4_fine_tuning import Phi4HumanizationFineTuner
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class ModelTrainingService:
         self._context_trainer: Optional[ContextTrainer] = None
         self._queued_context_workflows: set[str] = set()
         self._rag_trainer = LayeredRAGTrainer(agent_nick)
+        self._phi4_fine_tuner: Optional[Phi4HumanizationFineTuner] = None
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -73,6 +75,18 @@ class ModelTrainingService:
             trainer = ContextTrainer(base_cfg)
             self._context_trainer = trainer
         return trainer
+
+    def _resolve_phi4_fine_tuner(self) -> Optional[Phi4HumanizationFineTuner]:
+        settings = getattr(self.agent_nick, "settings", None)
+        if settings is not None:
+            enabled = getattr(settings, "enable_phi4_humanization", True)
+            if not enabled:
+                return None
+        tuner = self._phi4_fine_tuner
+        if not isinstance(tuner, Phi4HumanizationFineTuner):
+            tuner = Phi4HumanizationFineTuner(self.agent_nick)
+            self._phi4_fine_tuner = tuner
+        return tuner
 
     # ------------------------------------------------------------------
     # Database utilities
@@ -368,11 +382,22 @@ class ModelTrainingService:
                 )
             if requeue:
                 self._pending_negotiation_learnings.extend(requeue)
+        phi4_result: Optional[Dict[str, Any]] = None
+        fine_tuner = self._resolve_phi4_fine_tuner()
+        if fine_tuner is not None:
+            try:
+                phi4_result = fine_tuner.dispatch(force=force)
+            except Exception:
+                logger.exception(
+                    "Phi4 humanisation fine-tuning failed during training dispatch"
+                )
+                phi4_result = {"status": "failed"}
         return {
             "training_jobs": training_jobs,
             "relationship_jobs": relationship_jobs,
             "workflow_context": workflow_context,
             "negotiation_learnings": negotiation_learnings,
+            "phi4_fine_tuning": phi4_result,
         }
 
     def queue_negotiation_learning(

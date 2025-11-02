@@ -53,6 +53,10 @@ class TrainingDispatchResponse(BaseModel):
         default_factory=list,
         description="Recent workflow context captured from the learning repository",
     )
+    phi4_fine_tuning: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Summary of the phi4 humanisation fine-tuning pipeline run",
+    )
 
 
 def _get_training_endpoint(request: Request) -> ModelTrainingEndpoint:
@@ -96,6 +100,7 @@ def trigger_training_dispatch(
     relationship_jobs = result.get("relationship_jobs", [])
     negotiation_learnings = result.get("negotiation_learnings", [])
     workflow_context = result.get("workflow_context", [])
+    phi4_fine_tuning = result.get("phi4_fine_tuning")
     summaries = [
         TrainingJobSummary(
             job_id=job.get("job_id"),
@@ -111,4 +116,5 @@ def trigger_training_dispatch(
         relationship_jobs=relationship_jobs,
         negotiation_learnings=negotiation_learnings,
         workflow_context=workflow_context,
+        phi4_fine_tuning=phi4_fine_tuning,
     )
