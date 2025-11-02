@@ -299,10 +299,8 @@ class NLTKProcessor:
         return unique_phrases[:8]
 
     def _replace_sensitive_terms(self, sentence: str) -> str:
-        for pattern in self._PII_PATTERNS:
-            sentence = pattern.sub("a confidential detail", sentence)
-        for pattern in self._TOXICITY_PATTERNS:
-            sentence = pattern.sub("inappropriate language", sentence)
+        """Leave public policy content untouched during summarisation."""
+
         return sentence
 
     def _derive_focus_term(

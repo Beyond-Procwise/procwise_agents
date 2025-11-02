@@ -145,8 +145,10 @@ class RAGPipeline:
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         default_rag_model = getattr(self.settings, "rag_model", None)
         if not default_rag_model:
-            default_rag_model = getattr(self.settings, "extraction_model", settings.extraction_model)
-        self.default_llm_model = default_rag_model
+            default_rag_model = getattr(
+                self.settings, "extraction_model", settings.extraction_model
+            )
+        self.default_llm_model = self._ensure_phi4_default(default_rag_model)
         self._static_agent = RAGAgent(agent_nick)
         threshold = getattr(self.settings, "static_qa_confidence_threshold", 0.68)
         self._static_confidence_threshold = max(0.0, min(float(threshold), 1.0))
@@ -165,6 +167,19 @@ class RAGPipeline:
         self._nltk_processor = NLTKProcessor() if use_nltk else None
         if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
+
+    def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
+        """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
+
+        candidate = (configured_model or "").strip()
+        if candidate and "phi4" in candidate.lower():
+            return candidate
+        if candidate:
+            logger.warning(
+                "Configured RAG model '%s' is not phi4; defaulting to phi4:latest for Joshi.",
+                candidate,
+            )
+        return "phi4:latest"
 
     def register_session_upload(
         self,
