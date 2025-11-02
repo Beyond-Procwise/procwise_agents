@@ -181,7 +181,7 @@ class Settings(BaseSettings):
     document_extraction_model: str = Field(
         default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
     )
-    rag_model: str = Field(default="gemma3:1b-it-qat", env="RAG_LLM_MODEL")
+    rag_model: str = Field(default="phi4:latest", env="RAG_LLM_MODEL")
     # ``BAAI/bge-large-en-v1.5`` provides state-of-the-art dense retrieval
     # performance for procurement terminology while remaining compatible with
     # Qdrant's HNSW indexes. The model outputs 1024 dimensional vectors which

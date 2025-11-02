@@ -692,20 +692,7 @@ class RAGPipeline:
             ]
 
         if not options:
-            if topic_descriptor:
-                options = [
-                    f"Sure, I can help you with {topic_descriptor}.",
-                    f"Most definitely, I'll help you get the answer on {topic_descriptor}.",
-                    f"Great! Here's what the guidance says about {topic_descriptor}.",
-                    f"You're in the right place for questions about {topic_descriptor}.",
-                ]
-            else:
-                options = [
-                    "Sure, I can help you with this topic.",
-                    "Most definitely, I'll help you get the answer you need.",
-                    "Great! Here is the response based on what I can see.",
-                    "You're in the right place for this question.",
-                ]
+            return ""
 
         digest = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
         index = int(digest[:8], 16) % len(options)
@@ -1219,7 +1206,7 @@ class RAGPipeline:
 
         lines.append("Draft summary derived from retrieval:\n" + draft_answer)
         lines.append(
-            "Rewrite the draft into at most two concise paragraphs. Start with the key takeaway, integrate the knowledge snippets, and avoid filler greetings or repeated statements."
+            "Transform the draft into a natural response (ideally one or two concise paragraphs). Lead with the direct answer, weave in the most relevant knowledge details, point out any gaps or next steps, and keep the tone warm yet professional without filler or repetitive phrasing."
         )
         return "\n\n".join(lines)
 
@@ -1379,8 +1366,6 @@ class RAGPipeline:
         lower = cleaned.lower()
         if lower.startswith("as an ai"):
             cleaned = cleaned.split(".", 1)[-1].lstrip() or cleaned
-        if lower.startswith("based on"):
-            cleaned = f"From what I can see, {cleaned[len('based on'):].lstrip()}"
 
         cleaned = re.sub(r"\s+", " ", cleaned)
         cleaned = self._strip_metadata_terms(cleaned)
@@ -1389,11 +1374,13 @@ class RAGPipeline:
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
         system = (
-            "You are ProcWise's procurement intelligence analyst. Respond in valid JSON with keys 'answer' and 'follow_ups'. "
-            "Write the answer as two or three short paragraphs using confident, conversational business English. "
-            "Blend factual details with procedural guidance drawn from the supplied context, acknowledge any gaps, and suggest practical next steps. "
-            "Never reference system internals, raw identifiers, or database terminology. "
-            "Ensure 'follow_ups' contains three concise, forward-looking questions that keep the procurement dialogue moving."
+            "System (Joshi)\n"
+            "You are Joshi, the ProcWise SME. Speak briefly, clearly, and kindly—sound like a professional who cares. "
+            "Answer only from the provided retrieval context or known static guidance. If the context is thin, explain the gap in one sentence or ask a single clarifying question instead of guessing. "
+            "Do not expose internal details, identifiers, or placeholders, and avoid boilerplate openers or stock phrases. "
+            "Respond in valid JSON with keys 'answer' and 'follow_ups'. Craft the answer as one or two short paragraphs that stay grounded in the supplied knowledge, weave in practical implications, and note any limits transparently. "
+            "Keep the tone semi-formal, human, and empathetic; vary the language so the reply never sounds templated. "
+            "Ensure 'follow_ups' contains three concise, context-aware questions that naturally progress the procurement discussion without repeating each other."
         )
         messages = [
             {"role": "system", "content": system},
