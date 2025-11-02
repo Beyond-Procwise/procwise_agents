@@ -1,11 +1,12 @@
 import json
 import logging
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -101,6 +102,7 @@ class RAGAgent(BaseAgent):
             raise ValueError("query must be a non-empty string")
 
         query = query.strip()
+        original_query = query
 
         feedback_detected = False
         feedback_id: Optional[int] = None
@@ -108,70 +110,88 @@ class RAGAgent(BaseAgent):
         feedback_confidence = 0.0
         acknowledgment_text: Optional[str] = None
         ack_prefix: Optional[str] = None
+        depth_mode = "standard"
+        continuation_requested = False
+
+        classification_query = original_query
+        working_query = original_query
 
         previous_user = self._last_interaction.get("user_id")
+        last_query = self._last_interaction.get("query")
         if previous_user and previous_user == user_id:
-            feedback_sentiment, feedback_confidence = self.feedback_service.detect_feedback(query)
-            if (
-                feedback_sentiment != FeedbackSentiment.NEUTRAL
-                and feedback_confidence > 0.3
-            ):
-                feedback_detected = True
-                acknowledgment_text = self.feedback_service.generate_acknowledgment(
-                    feedback_sentiment, query
-                )
-                feedback_id = self.feedback_service.store_feedback(
-                    user_id=user_id,
-                    session_id=session_id,
-                    query=self._last_interaction.get("query", ""),
-                    response=self._last_interaction.get("response", ""),
-                    feedback_message=query,
-                    sentiment=feedback_sentiment,
-                    confidence=feedback_confidence,
-                    retrieved_doc_ids=self._last_interaction.get("doc_ids", []),
-                    context_metadata={
-                        "doc_type": doc_type,
-                        "product_type": product_type,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-
-                if feedback_sentiment == FeedbackSentiment.POSITIVE:
-                    data = {
-                        "question": self._last_interaction.get("query", ""),
-                        "answer": acknowledgment_text,
-                        "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
-                        "related_prompts": [],
-                        "structured": False,
-                        "structure_type": "feedback_acknowledgment",
-                        "sections": [],
-                        "style": "acknowledgment",
-                        "main_points": [],
-                        "source_ids": self._last_interaction.get("doc_ids", []),
-                        "original_answer": self._last_interaction.get("response", ""),
-                        "feedback": {
-                            "captured": True,
-                            "feedback_id": feedback_id,
-                            "sentiment": feedback_sentiment.value,
-                            "confidence": feedback_confidence,
-                            "acknowledgment": acknowledgment_text,
-                        },
-                    }
-                    agentic_plan = "1. Recognise user feedback.\n2. Store it for training.\n3. Acknowledge the positive sentiment."
-                    context_snapshot = {
-                        "feedback_id": feedback_id,
-                        "feedback_sentiment": feedback_sentiment.value,
-                        "feedback_confidence": feedback_confidence,
-                    }
-                    return AgentOutput(
-                        status=AgentStatus.SUCCESS,
-                        data=data,
-                        agentic_plan=agentic_plan,
-                        context_snapshot=context_snapshot,
-                        confidence=1.0,
+            if self.feedback_service.is_continuation_request(original_query):
+                continuation_requested = True
+                depth_mode = "expanded"
+                base_query = last_query or original_query
+                classification_query = base_query
+                working_query = self._expand_query(base_query, original_query, mode="continuation")
+            else:
+                feedback_sentiment, feedback_confidence = self.feedback_service.detect_feedback(original_query)
+                if feedback_sentiment != FeedbackSentiment.NEUTRAL and feedback_confidence >= 0.4:
+                    feedback_detected = True
+                    acknowledgment_text = self.feedback_service.generate_acknowledgment(
+                        feedback_sentiment, original_query
                     )
+                    payload_available = bool(self._last_interaction)
+                    if payload_available:
+                        feedback_id = self.feedback_service.store_feedback(
+                            user_id=user_id,
+                            session_id=session_id,
+                            query=self._last_interaction.get("query", classification_query),
+                            response=self._last_interaction.get("response", ""),
+                            feedback_message=original_query,
+                            sentiment=feedback_sentiment,
+                            confidence=feedback_confidence,
+                            retrieved_doc_ids=self._last_interaction.get("doc_ids", []),
+                            context_metadata={
+                                "doc_type": doc_type,
+                                "product_type": product_type,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
 
-                ack_prefix = acknowledgment_text
+                    if feedback_sentiment == FeedbackSentiment.POSITIVE:
+                        data = {
+                            "question": self._last_interaction.get("query", classification_query),
+                            "answer": acknowledgment_text,
+                            "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
+                            "related_prompts": [],
+                            "structured": False,
+                            "structure_type": "feedback_acknowledgment",
+                            "sections": [],
+                            "style": "acknowledgment",
+                            "main_points": [],
+                            "source_ids": self._last_interaction.get("doc_ids", []),
+                            "original_answer": self._last_interaction.get("response", ""),
+                            "feedback": {
+                                "captured": True,
+                                "feedback_id": feedback_id,
+                                "sentiment": feedback_sentiment.value,
+                                "confidence": feedback_confidence,
+                                "acknowledgment": acknowledgment_text,
+                            },
+                        }
+                        agentic_plan = "1. Recognise user feedback.\n2. Store it for training.\n3. Acknowledge the positive sentiment."
+                        context_snapshot = {
+                            "feedback_id": feedback_id,
+                            "feedback_sentiment": feedback_sentiment.value,
+                            "feedback_confidence": feedback_confidence,
+                        }
+                        return AgentOutput(
+                            status=AgentStatus.SUCCESS,
+                            data=data,
+                            agentic_plan=agentic_plan,
+                            context_snapshot=context_snapshot,
+                            confidence=1.0,
+                        )
+
+                    ack_prefix = acknowledgment_text
+                    depth_mode = "expanded"
+                    base_query = last_query or original_query
+                    classification_query = base_query
+                    working_query = self._expand_query(base_query, None, mode="improvement")
+
+        query = working_query
 
         key = self._session_key(user_id, session_id)
         query_vector = self._encode_text(query)
@@ -194,15 +214,35 @@ class RAGAgent(BaseAgent):
         }
         docs = [SimpleNamespace(payload=payload)]
 
-        extracted = self._extract_answer_signals(qa_entry.answer, record_id)
-        query_type = self._classify_query_type(query)
-        plan = self._plan_response_structure(query, query_type, extracted)
+        answer_scope = self._compose_answer_scope(topic_entry, question_index, depth_mode)
+        extracted = self._extract_answer_signals(answer_scope, record_id, depth_mode)
+        query_type = self._classify_query_type(classification_query)
+        plan = self._plan_response_structure(classification_query, query_type, extracted)
+
+        policy_payload: Optional[Dict[str, Any]] = None
+        if query_type == "policy_lookup":
+            policy_payload = self._extract_policy_payload(
+                policy_name=self._derive_policy_name(classification_query, topic_entry),
+                topic_entry=topic_entry,
+                focus_answer=qa_entry.answer,
+                depth_mode=depth_mode,
+            )
+
         structured_answer = self._generate_structured_response(
-            query, extracted, docs, plan
+            classification_query,
+            extracted,
+            docs,
+            plan,
+            depth_mode=depth_mode,
+            policy_payload=policy_payload,
         )
         if ack_prefix:
-            structured_answer = f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
-        followups = self._generate_contextual_followups(query, query_type, extracted)
+            structured_answer = (
+                f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
+            )
+        followups = self._generate_contextual_followups(
+            classification_query, query_type, extracted, depth_mode
+        )
 
         response = {
             "question": qa_entry.question,
@@ -237,7 +277,11 @@ class RAGAgent(BaseAgent):
             "topic_similarity": float(topic_score),
             "question_similarity": float(question_score),
             "session_topic": topic_entry.topic,
+            "response_depth": depth_mode,
         }
+
+        if continuation_requested:
+            context_snapshot["continuation"] = True
 
         if feedback_detected and feedback_sentiment is not None:
             context_snapshot.update(
@@ -259,10 +303,14 @@ class RAGAgent(BaseAgent):
         self._last_interaction = {
             "user_id": user_id,
             "session_id": session_id,
-            "query": query,
+            "query": classification_query,
             "response": structured_answer,
             "doc_ids": [record_id],
             "topic": topic_entry.topic,
+            "query_type": query_type,
+            "topic_index": topic_index,
+            "question_index": question_index,
+            "depth_mode": depth_mode,
         }
 
         return AgentOutput(
@@ -397,12 +445,85 @@ class RAGAgent(BaseAgent):
             prompts = [other.question for other in topic.qas if other != qa_entry]
         return prompts
 
+    def _expand_query(
+        self, base_query: str, follow_up: Optional[str], mode: str = "continuation"
+    ) -> str:
+        base = (base_query or "").strip()
+        if not base:
+            return (follow_up or "").strip()
+
+        clause = self._build_follow_up_clause(follow_up or "", mode)
+        if not clause:
+            return base
+        return f"{base} — {clause}"
+
+    def _build_follow_up_clause(self, follow_up: str, mode: str) -> str:
+        cleaned = follow_up.strip().rstrip("?.!")
+        cleaned = re.sub(r"^(good|great|ok|okay|thanks)[,\s]+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(please|kindly)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+
+        if mode == "improvement":
+            if cleaned:
+                cleaned_lower = cleaned.lower()
+                if any(word in cleaned_lower for word in ["wrong", "incorrect", "fix"]):
+                    return "provide a corrected, comprehensive answer with the right policy guardrails."
+                return f"provide a corrected, comprehensive answer and address: {cleaned}"
+            return "provide a corrected, comprehensive answer with full policy detail."
+
+        if not cleaned:
+            return "provide comprehensive details and broaden the explanation."
+
+        lowered = cleaned.lower()
+        if any(phrase in lowered for phrase in ["more detail", "be more detailed", "elaborate"]):
+            return "provide comprehensive details and expand each section."
+        if any(keyword in lowered for keyword in ["limit", "cap", "threshold", "spending"]):
+            return "provide comprehensive details on the relevant limits and guardrails."
+        if any(keyword in lowered for keyword in ["example", "examples", "case"]):
+            return "provide comprehensive details and add concrete examples."
+        if lowered.startswith("what about"):
+            remainder = cleaned[10:].strip()
+            return (
+                f"provide comprehensive details covering {remainder}"
+                if remainder
+                else "provide comprehensive details."
+            )
+        if lowered.startswith("how about"):
+            remainder = cleaned[8:].strip()
+            return (
+                f"provide comprehensive details including {remainder}"
+                if remainder
+                else "provide comprehensive details."
+            )
+        return f"provide comprehensive details covering: {cleaned}"
+
     # ------------------------------------------------------------------
     # Structured response planning and generation
     # ------------------------------------------------------------------
-    def _extract_answer_signals(self, answer: str, record_id: str) -> Dict[str, Any]:
+    def _compose_answer_scope(
+        self, topic_entry: TopicRecord, question_index: int, depth_mode: str
+    ) -> str:
+        primary_answer = topic_entry.qas[question_index].answer
+        if depth_mode != "expanded":
+            return primary_answer
+
+        additional_answers: List[str] = []
+        for idx, qa in enumerate(topic_entry.qas):
+            if idx == question_index:
+                continue
+            additional_answers.append(qa.answer)
+            if len(additional_answers) >= 3:
+                break
+
+        combined = " ".join([primary_answer] + additional_answers) if additional_answers else primary_answer
+        return combined
+
+    def _extract_answer_signals(
+        self, answer: str, record_id: str, depth_mode: str = "standard"
+    ) -> Dict[str, Any]:
         sentences = self._split_sentences(answer)
-        main_points = sentences[:6] if sentences else [answer.strip()]
+        limit = 10 if depth_mode == "expanded" else 6
+        main_points = sentences[:limit] if sentences else [answer.strip()]
 
         numbers = re.findall(r"[£$]\s*[\d,.]+|\b\d+(?:\.\d+)?%", answer)
         entity_candidates = re.findall(
@@ -520,8 +641,28 @@ class RAGAgent(BaseAgent):
         extracted_data: Dict[str, Any],
         retrieved_docs: List[Any],
         plan: Dict[str, Any],
+        *,
+        depth_mode: str = "standard",
+        policy_payload: Optional[Dict[str, Any]] = None,
     ) -> str:
         query_type = plan["type"]
+
+        if query_type == "policy_lookup":
+            if not policy_payload:
+                policy_payload = {
+                    "policy_name": self._format_policy_title(query),
+                    "overview": self._ensure_sentence(extracted_data.get("main_points", [""])[0])
+                    if extracted_data.get("main_points")
+                    else "",
+                    "requirements": [],
+                    "restrictions": [],
+                    "spending_limits": [],
+                    "approval_process": [],
+                    "examples": [],
+                    "exceptions": [],
+                }
+            return self._render_policy_response(policy_payload, depth_mode)
+
         opening = self._generate_opening_section(query, extracted_data, query_type)
         sections: List[str] = [opening]
 
@@ -531,8 +672,6 @@ class RAGAgent(BaseAgent):
             sections.extend(self._generate_financial_sections(extracted_data, retrieved_docs))
         elif query_type == "comparison":
             sections.extend(self._generate_comparison_sections(extracted_data, retrieved_docs))
-        elif query_type == "policy_lookup":
-            sections.extend(self._generate_policy_sections(extracted_data, retrieved_docs))
         elif query_type == "simple_lookup":
             return self._generate_simple_response(query, extracted_data, retrieved_docs)
         else:
@@ -719,30 +858,300 @@ class RAGAgent(BaseAgent):
 
         return sections
 
-    def _generate_policy_sections(
-        self, data: Dict[str, Any], docs: List[Any]
+    def _derive_policy_name(self, query: str, topic_entry: TopicRecord) -> str:
+        focus = self._derive_focus_from_query(query)
+        candidate_focus = focus.strip() if focus else ""
+        topic_candidate = topic_entry.topic.strip() if topic_entry.topic else ""
+
+        for candidate in [candidate_focus, topic_candidate]:
+            if not candidate:
+                continue
+            formatted = self._format_policy_title(candidate)
+            if "policy" in formatted.lower():
+                return formatted
+
+        for candidate in [candidate_focus, topic_candidate]:
+            if not candidate:
+                continue
+            formatted = self._format_policy_title(f"{candidate} policy")
+            if formatted:
+                return formatted
+
+        return "Policy Guidance"
+
+    def _format_policy_title(self, text: str) -> str:
+        cleaned = text.strip().rstrip("?.")
+        if not cleaned:
+            return "Policy Guidance"
+        words = cleaned.split()
+        result_words: List[str] = []
+        for index, word in enumerate(words):
+            lower = word.lower()
+            if index == 0 or lower not in {"and", "or", "of", "the"}:
+                result_words.append(lower.capitalize())
+            else:
+                result_words.append(lower)
+        if result_words and result_words[-1].lower() != "policy":
+            result_words.append("Policy")
+        return " ".join(result_words)
+
+    def _extract_policy_payload(
+        self,
+        *,
+        policy_name: str,
+        topic_entry: TopicRecord,
+        focus_answer: str,
+        depth_mode: str,
+    ) -> Dict[str, Any]:
+        categories: Dict[str, List[str]] = defaultdict(list)
+
+        for qa in topic_entry.qas:
+            question_lower = qa.question.lower()
+            sentences = self._split_sentences(qa.answer)
+            for sentence in sentences:
+                clause = self._clean_policy_clause(sentence)
+                lowered = clause.lower()
+                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
+                    categories["requirements"].append(clause)
+                if re.search(
+                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
+                    lowered,
+                ) or "non-claimable" in lowered:
+                    categories["restrictions"].append(clause)
+                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
+                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
+                    lowered,
+                ):
+                    categories["spending_limits"].append(clause)
+                if re.search(r"approval|approve|authoris|manager|finance", lowered):
+                    categories["approval_process"].append(clause)
+                if re.search(r"for example|such as|e.g.|include", lowered):
+                    categories["examples"].append(clause)
+                if re.search(r"unless|exception|exemption|waiver", lowered):
+                    categories["exceptions"].append(clause)
+
+            if "exception" in question_lower or "waiver" in question_lower:
+                categories["exceptions"].extend(sentences)
+            if "example" in question_lower:
+                categories["examples"].extend(sentences)
+            if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
+                categories["spending_limits"].extend(sentences)
+            if "approval" in question_lower or "pre-approv" in question_lower:
+                categories["approval_process"].extend(sentences)
+            if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
+                categories["requirements"].extend(sentences)
+
+        overview_sentences = self._split_sentences(focus_answer)
+        overview = overview_sentences[0] if overview_sentences else focus_answer
+
+        payload = {
+            "policy_name": policy_name,
+            "overview": self._ensure_sentence(self._clean_policy_clause(overview)),
+            "requirements": self._unique_ordered(categories.get("requirements", [])),
+            "restrictions": self._unique_ordered(categories.get("restrictions", [])),
+            "spending_limits": self._unique_ordered(categories.get("spending_limits", [])),
+            "approval_process": self._unique_ordered(categories.get("approval_process", [])),
+            "examples": self._unique_ordered(categories.get("examples", [])),
+            "exceptions": self._unique_ordered(categories.get("exceptions", [])),
+        }
+
+        if depth_mode == "expanded":
+            # Allow more contextual statements when expanding.
+            for key in ["requirements", "restrictions", "spending_limits", "approval_process"]:
+                values = payload[key]
+                if not values and payload["overview"]:
+                    values.append(payload["overview"])
+                payload[key] = values
+
+        return payload
+
+    def _render_policy_response(
+        self, payload: Dict[str, Any], depth_mode: str
+    ) -> str:
+        policy_name = self._format_policy_title(payload.get("policy_name", "Policy Guidance"))
+        overview = payload.get("overview", "")
+        overview_text = self._ensure_sentence(self._clean_policy_clause(overview)) if overview else ""
+
+        lines: List[str] = [f"## {policy_name}"]
+        if overview_text:
+            lines.append(overview_text)
+
+        sections = [
+            ("What You Must Do", "requirements"),
+            ("What's Prohibited", "restrictions"),
+            ("Spending Limits", "spending_limits"),
+            ("Approval Requirements", "approval_process"),
+            ("Examples", "examples"),
+            ("Exceptions", "exceptions"),
+        ]
+
+        for title, key in sections:
+            bullets = self._policy_section_bullets(payload, key, depth_mode)
+            if not bullets:
+                continue
+            lines.append("")
+            lines.append(title)
+            lines.extend(f"- {bullet}" for bullet in bullets)
+
+        return "\n".join(lines)
+
+    def _policy_section_bullets(
+        self, payload: Dict[str, Any], key: str, depth_mode: str
     ) -> List[str]:
-        sections: List[str] = []
-        points = data.get("main_points", [])
-        if points:
-            sections.append(
-                "In practice, the policy is pointing you to this core message: "
-                + self._ensure_sentence(points[0])
-            )
-        if len(points) > 1:
-            requirement_lines = ["Key requirements to keep in mind:"]
-            requirement_lines.extend(
-                f"- {self._ensure_sentence(point)}" for point in points[1:4]
-            )
-            sections.append("\n".join(requirement_lines).strip())
-        related_entities = data.get("entities", [])[:3]
-        if related_entities:
-            sections.append(
-                "If you need to cross-reference anything, these related items help:" \
-                + "\n" \
-                + "\n".join(f"- {entity}" for entity in related_entities)
-            )
-        return sections
+        sentences = list(payload.get(key, []))
+        target = 5 if depth_mode == "expanded" else 3
+        target = min(target, 6)
+
+        bullets: List[str] = []
+        for sentence in sentences:
+            bullets.extend(self._expand_policy_sentence(sentence, key))
+
+        if key == "requirements" and len(bullets) < target:
+            derived = self._derive_requirement_from_restriction(payload.get("restrictions", []))
+            for item in derived:
+                if item not in bullets:
+                    bullets.append(item)
+                    if len(bullets) >= target:
+                        break
+
+        if key == "spending_limits" and len(bullets) < target:
+            for restriction in payload.get("restrictions", []):
+                amounts = re.findall(r"[£$€]\s*[\d,.]+", restriction)
+                if not amounts:
+                    continue
+                bullet = self._ensure_sentence(
+                    f"Treat {amounts[0]} as the ceiling unless Finance approves more."
+                )
+                if bullet not in bullets:
+                    bullets.append(bullet)
+                if len(bullets) >= target:
+                    break
+
+        if key == "approval_process" and len(bullets) < target:
+            for requirement in payload.get("requirements", []):
+                clause = requirement.lower()
+                if "approve" in clause or "sign" in clause:
+                    bullet = self._ensure_sentence(self._clean_policy_clause(requirement))
+                    if bullet not in bullets:
+                        bullets.append(bullet)
+                if len(bullets) >= target:
+                    break
+
+        fallback_map = {
+            "requirements": "Follow this policy before and after each purchase to stay compliant.",
+            "restrictions": "Treat anything not explicitly allowed in the policy as prohibited.",
+            "spending_limits": "Check the policy for specific monetary caps before spending.",
+            "approval_process": "Capture written approval in advance for any exception.",
+            "examples": "Model your claim on the compliant scenarios described in the policy.",
+            "exceptions": "Escalate unusual circumstances to Finance for documented exceptions.",
+        }
+
+        bullets = [self._ensure_sentence(item) for item in self._unique_ordered(bullets)]
+
+        while len(bullets) < target:
+            fallback = fallback_map.get(key)
+            if not fallback or fallback in bullets:
+                break
+            bullets.append(self._ensure_sentence(fallback))
+
+        return bullets[:target]
+
+    def _expand_policy_sentence(self, sentence: str, section: str) -> List[str]:
+        clause = self._clean_policy_clause(sentence)
+        lowered = clause.lower()
+        bullets: List[str] = []
+
+        if section == "requirements":
+            if any(keyword in lowered for keyword in ["pre-approv", "approval"]):
+                bullets.append("Obtain pre-approval before committing the spend this policy covers.")
+            if any(keyword in lowered for keyword in ["submit", "claim", "provide", "retain"]):
+                bullets.append("Submit only eligible, well-documented expenses so they are accepted.")
+            if "policy" in lowered or "intranet" in lowered:
+                bullets.append("Check the official policy on the intranet before you spend or submit claims.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "restrictions":
+            if "include" in lowered:
+                parts = re.split(r"include[s]?", clause, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    items = re.split(r",| and | or ", parts[1])
+                    for item in items:
+                        cleaned_item = item.strip(" .")
+                        if cleaned_item:
+                            cleaned_item = re.sub(r"^the ", "", cleaned_item, flags=re.IGNORECASE)
+                            bullets.append(f"Do not claim {cleaned_item}.")
+            if any(keyword in lowered for keyword in ["declined", "breach", "disciplinary"]):
+                bullets.append("Expect non-claimable expenses to be declined, logged, and escalated if repeated.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "spending_limits":
+            amounts = re.findall(r"[£$€]\s*[\d,.]+", clause)
+            if amounts:
+                for amount in amounts:
+                    bullets.append(f"Stay within the {amount} limit unless you have written approval.")
+            if "per person" in lowered:
+                bullets.append("Keep client entertainment within the per-person threshold stated in the policy.")
+            if not amounts and ("limit" in lowered or "threshold" in lowered):
+                bullets.append(clause)
+        elif section == "approval_process":
+            if any(keyword in lowered for keyword in ["approval", "approve", "manager", "finance"]):
+                bullets.append("Capture manager or Finance approval before using the card for unusual spend.")
+            if "pre-approv" in lowered:
+                bullets.append("Record pre-approval details with the expense submission.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "examples":
+            bullets.append(f"Example: {clause}")
+        elif section == "exceptions":
+            if "unless" in lowered:
+                exception_text = clause.split("unless", 1)[1].strip()
+                bullets.append(
+                    f"Exception: Allowed when {exception_text}"
+                    if exception_text
+                    else f"Exception: {clause}"
+                )
+            else:
+                bullets.append(f"Exception: {clause}")
+
+        return bullets
+
+    def _derive_requirement_from_restriction(
+        self, restrictions: Sequence[str]
+    ) -> List[str]:
+        suggestions: List[str] = []
+        for sentence in restrictions:
+            clause = self._clean_policy_clause(sentence)
+            lowered = clause.lower()
+            if any(keyword in lowered for keyword in ["pre-approv", "unless"]):
+                suggestions.append(
+                    "Secure pre-approval before submitting anything that normally sits on the restricted list."
+                )
+            if any(keyword in lowered for keyword in ["declined", "disciplinary", "breach"]):
+                suggestions.append(
+                    "Validate each expense against the policy so it isn't declined or escalated."
+                )
+        return [self._ensure_sentence(item) for item in self._unique_ordered(suggestions)]
+
+    def _clean_policy_clause(self, sentence: str) -> str:
+        text = sentence.strip()
+        text = re.sub(r"^[Yy]es,?\s*", "", text)
+        text = re.sub(r"^[Nn]o,?\s*", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _unique_ordered(self, items: Iterable[str]) -> List[str]:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for item in items:
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(cleaned)
+        return ordered
 
     def _generate_exploratory_sections(
         self, data: Dict[str, Any], docs: List[Any]
@@ -956,7 +1365,11 @@ class RAGAgent(BaseAgent):
         return list(entities.values())
 
     def _generate_contextual_followups(
-        self, query: str, query_type: str, data: Dict[str, Any]
+        self,
+        query: str,
+        query_type: str,
+        data: Dict[str, Any],
+        depth_mode: str = "standard",
     ) -> List[str]:
         if query_type == "supplier_overview":
             return [
@@ -976,6 +1389,15 @@ class RAGAgent(BaseAgent):
                 "Should I analyse performance metrics for these suppliers?",
                 "Want to see historical trends for comparison?",
             ]
+        if query_type == "policy_lookup":
+            prompts = [
+                "Need a checklist you can share with your team?",
+                "Should I pull the related forms or intranet links?",
+                "Want a quick summary of exceptions versus standard rules?",
+            ]
+            if depth_mode == "expanded":
+                prompts.append("Would examples for specific scenarios (travel, client meetings, etc.) help?")
+            return prompts
         return [
             "Would you like more details on any specific aspect?",
             "Should I search for related procurement policies?",
