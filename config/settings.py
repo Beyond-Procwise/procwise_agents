@@ -1,9 +1,11 @@
 # ProcWise/config/settings.py
 
+import json
 import os
+from typing import Dict, List, Optional
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import List, Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ENV_FILE_PATH = os.path.join(PROJECT_ROOT, '.env')
@@ -201,6 +203,9 @@ class Settings(BaseSettings):
     rag_chunk_overlap_ratio: float = Field(
         default=0.12, env="RAG_CHUNK_OVERLAP_RATIO"
     )
+    agent_model_overrides: Dict[str, str] = Field(
+        default_factory=dict, env="AGENT_MODEL_OVERRIDES"
+    )
     ollama_quantized_model: Optional[str] = Field(
         default=None, env="OLLAMA_QUANTIZED_MODEL"
     )
@@ -249,6 +254,39 @@ class Settings(BaseSettings):
         env_file = ENV_FILE_PATH
         env_file_encoding = 'utf-8'
         extra = "ignore"
+
+    @field_validator("agent_model_overrides", mode="before")
+    @classmethod
+    def _coerce_agent_model_overrides(cls, value):
+        """Normalise overrides supplied via environment variables."""
+
+        if value in (None, "", {}):
+            return {}
+        if isinstance(value, dict):
+            return {
+                str(key).strip(): str(val).strip()
+                for key, val in value.items()
+                if str(key).strip() and str(val).strip()
+            }
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    "AGENT_MODEL_OVERRIDES must be valid JSON mapping"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "AGENT_MODEL_OVERRIDES must decode to a JSON object"
+                )
+            return {
+                str(key).strip(): str(val).strip()
+                for key, val in parsed.items()
+                if str(key).strip() and str(val).strip()
+            }
+        raise TypeError(
+            "Unsupported type for AGENT_MODEL_OVERRIDES; expected dict or JSON string"
+        )
 
 try:
     settings = Settings()

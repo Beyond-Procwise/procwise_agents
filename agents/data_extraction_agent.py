@@ -770,13 +770,27 @@ class DataExtractionAgent(BaseAgent):
     def _select_fast_extraction_model(self) -> str:
         preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
 
+        override_model: Optional[str] = None
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                candidate = resolver(self.__class__.__name__, fallback=None)
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "DataExtractionAgent model override lookup failed", exc_info=True
+                )
+            else:
+                if isinstance(candidate, str) and candidate.strip():
+                    override_model = candidate.strip()
+
         configured_models: Tuple[str, ...] = tuple(
             model
             for model in (
+                override_model,
                 getattr(self.settings, "document_extraction_model", None),
                 getattr(self.settings, "extraction_model", None),
             )
-            if model
+            if isinstance(model, str) and model.strip()
         )
 
         candidates: Tuple[str, ...] = tuple(

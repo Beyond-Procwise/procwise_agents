@@ -3842,11 +3842,26 @@ class SupplierInteractionAgent(BaseAgent):
         }
 
         try:
-            model_name = getattr(
+            fallback_model = getattr(
                 self.settings,
                 "supplier_interaction_model",
                 getattr(self.settings, "extraction_model", None),
             )
+            resolver = getattr(self.agent_nick, "get_agent_model", None)
+            model_name = fallback_model
+            if callable(resolver):
+                try:
+                    candidate = resolver(
+                        self.__class__.__name__, fallback=fallback_model
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "SupplierInteractionAgent model resolution failed",
+                        exc_info=True,
+                    )
+                else:
+                    if isinstance(candidate, str) and candidate.strip():
+                        model_name = candidate.strip()
             response = self.call_ollama(
                 model=model_name,
                 format="json",
