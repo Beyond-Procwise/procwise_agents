@@ -25,17 +25,20 @@ class FeedbackService:
     """Detect, store, and process user feedback for continuous learning."""
 
     POSITIVE_PATTERNS = [
-        r"\b(thanks?|thank you|good|great|excellent|perfect|helpful|exactly|yes|correct)\b",
-        r"\b(that'?s? right|spot on|appreciate|nice|awesome|brilliant)\b",
-        r"\b(this is what i (wanted|needed))\b",
+        r"\b(thank(s| you))\b",
+        r"\b(perfect|excellent|exactly|spot on|nailed it)\b",
+        r"\b(appreciate(s)?|appreciated)\b",
+        r"\b(this is (just )?what i (wanted|needed))\b",
+        r"\b(that'?s? (right|correct))\b",
         r"👍|✓|✔",
     ]
 
     NEGATIVE_PATTERNS = [
-        r"\b(no|not|wrong|incorrect|inaccurate|unhelpful|bad|poor)\b",
-        r"\b(not what i (wanted|expected|asked))\b",
+        r"\b(wrong|incorrect|inaccurate|unacceptable|not what i (wanted|expected|asked))\b",
         r"\b(this (doesn't|does not) (help|work|make sense))\b",
-        r"\b(missing|incomplete|unclear|confusing)\b",
+        r"\b(unhelpful|useless|bad answer)\b",
+        r"\b(missing|incomplete|confusing)\b",
+        r"\b(no,? that'?s? wrong)\b",
         r"👎|✗|✘",
     ]
 
@@ -47,7 +50,15 @@ class FeedbackService:
 
     CLARIFICATION_PATTERNS = [
         r"\b(what do you mean|can you explain|i don't understand|unclear)\b",
-        r"\b(more (details|info|information)|elaborate|expand)\b",
+    ]
+
+    CONTINUATION_PATTERNS = [
+        r"\b(good|great)\b[^.]*\b(but|however)\b",
+        r"\b(please|kindly)?\s*(be|get|provide).*(more detail|detailed|detail|elaborate)\b",
+        r"\b(tell me more|please elaborate|elaborate more)\b",
+        r"\b(what about|how about)\b",
+        r"\b(can you add (more )?(detail|details|limits))\b",
+        r"\b(be more detailed)\b",
     ]
 
     def __init__(self, agent_nick: Any) -> None:
@@ -63,7 +74,11 @@ class FeedbackService:
         """Analyze ``message`` for feedback signals."""
 
         message_lower = message.lower().strip()
-        is_short = len(message.split()) < 15
+
+        if self.is_continuation_request(message_lower):
+            return FeedbackSentiment.NEUTRAL, 0.0
+
+        is_short = len(message_lower.split()) < 15
 
         positive_score = self._pattern_match_score(message_lower, self.POSITIVE_PATTERNS)
         negative_score = self._pattern_match_score(message_lower, self.NEGATIVE_PATTERNS)
@@ -88,7 +103,12 @@ class FeedbackService:
         if max_sentiment == FeedbackSentiment.CORRECTION:
             max_sentiment = FeedbackSentiment.NEGATIVE
 
-        if max_score < 0.2:
+        if max_sentiment == FeedbackSentiment.CLARIFICATION:
+            return FeedbackSentiment.NEUTRAL, 0.0
+
+        threshold = 0.4 if is_short else 0.2
+
+        if max_score < threshold:
             return FeedbackSentiment.NEUTRAL, 0.0
 
         return max_sentiment, max_score
@@ -100,9 +120,23 @@ class FeedbackService:
                 matches += 1
         return min(1.0, matches / max(1, len(patterns) * 0.3))
 
-    def is_feedback_message(self, message: str, confidence_threshold: float = 0.3) -> bool:
+    def is_feedback_message(self, message: str, confidence_threshold: float = 0.4) -> bool:
+        if self.is_continuation_request(message):
+            return False
         sentiment, confidence = self.detect_feedback(message)
         return sentiment != FeedbackSentiment.NEUTRAL and confidence >= confidence_threshold
+
+    def is_continuation_request(self, message: str) -> bool:
+        text = message.lower().strip()
+        if not text:
+            return False
+        if any(re.search(pattern, text) for pattern in self.CONTINUATION_PATTERNS):
+            return True
+        if "more detail" in text or "tell me more" in text:
+            return True
+        if ("good" in text or "great" in text) and ("but" in text or "however" in text):
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Feedback Storage
@@ -329,9 +363,9 @@ class FeedbackService:
             ]
         elif sentiment == FeedbackSentiment.NEGATIVE:
             acknowledgments = [
-                "I appreciate the feedback. Let me try to provide better information. Could you clarify what specifically wasn't accurate?",
-                "Thanks for letting me know. I'm learning from this to improve. What aspect should I focus on differently?",
-                "I understand this wasn't what you expected. Can you help me understand what information would be more useful?",
+                "Understood—I'll tighten that up below.",
+                "Got it, let me correct that right away.",
+                "Thanks for flagging it; here's an improved answer.",
             ]
         elif sentiment == FeedbackSentiment.CLARIFICATION:
             acknowledgments = [
