@@ -42,7 +42,25 @@ except Exception:  # pragma: no cover - optional dependency failures handled gra
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = ("qwen3:30b", "mixtral:8x7b", "gemma3")
+
+def _build_phi4_fallback_models() -> Tuple[str, ...]:
+    """Return fallback model identifiers that keep Joshi on phi4."""
+
+    configured = getattr(settings, "rag_model", None)
+    candidates: List[str] = []
+    for name in (configured, "phi4:latest", "phi4"):
+        if not name:
+            continue
+        if "phi4" not in name.lower():
+            continue
+        if name not in candidates:
+            candidates.append(name)
+    if not candidates:
+        candidates.append("phi4:latest")
+    return tuple(candidates)
+
+
+_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = _build_phi4_fallback_models()
 
 
 class AgentStatus(str, Enum):
