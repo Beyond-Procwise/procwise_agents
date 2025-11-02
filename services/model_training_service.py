@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from copy import deepcopy
 
 from services.event_bus import get_event_bus
+from services.feedback_service import FeedbackSentiment, FeedbackService
 from models.supplier_ranking_trainer import SupplierRankingTrainer
 from models.context_trainer import ContextTrainer, TrainingConfig
 from services.rag_training_pipeline import LayeredRAGTrainer
@@ -42,6 +43,7 @@ class ModelTrainingService:
         self._queued_context_workflows: set[str] = set()
         self._rag_trainer = LayeredRAGTrainer(agent_nick)
         self._phi4_fine_tuner: Optional[Phi4HumanizationFineTuner] = None
+        self._feedback_service = FeedbackService(agent_nick)
         if auto_subscribe:
             self.enable_workflow_capture()
 
@@ -392,13 +394,130 @@ class ModelTrainingService:
                     "Phi4 humanisation fine-tuning failed during training dispatch"
                 )
                 phi4_result = {"status": "failed"}
+
+        feedback_summary = self._process_feedback_for_training()
+
         return {
             "training_jobs": training_jobs,
             "relationship_jobs": relationship_jobs,
             "workflow_context": workflow_context,
             "negotiation_learnings": negotiation_learnings,
             "phi4_fine_tuning": phi4_result,
+            "feedback_summary": feedback_summary,
         }
+
+    def _process_feedback_for_training(self) -> Dict[str, Any]:
+        """Process stored feedback and persist high-confidence training examples."""
+
+        feedback_records = self._feedback_service.get_unprocessed_feedback(limit=100)
+        if not feedback_records:
+            return {
+                "total_processed": 0,
+                "positive_examples": 0,
+                "negative_examples": 0,
+                "training_examples_created": 0,
+            }
+
+        positive_examples: List[Dict[str, Any]] = []
+        negative_examples: List[Dict[str, Any]] = []
+        training_examples: List[Dict[str, Any]] = []
+
+        for record in feedback_records:
+            sentiment = record.get("sentiment")
+            confidence = float(record.get("confidence") or 0.0)
+            if confidence < 0.5:
+                continue
+
+            example = {
+                "query": record.get("query", ""),
+                "response": record.get("response", ""),
+                "sentiment": sentiment,
+                "confidence": confidence,
+                "feedback_message": record.get("feedback_message", ""),
+                "retrieved_docs": record.get("retrieved_doc_ids") or [],
+                "timestamp": record.get("created_at"),
+            }
+
+            if sentiment == FeedbackSentiment.POSITIVE.value:
+                positive_examples.append(example)
+            elif sentiment in (
+                FeedbackSentiment.NEGATIVE.value,
+                FeedbackSentiment.CORRECTION.value,
+            ):
+                negative_examples.append(example)
+
+            training_examples.append(example)
+
+        if training_examples:
+            self._store_training_examples(training_examples)
+
+        processed_ids = [int(record["feedback_id"]) for record in feedback_records]
+        self._feedback_service.mark_feedback_processed(processed_ids)
+
+        statistics = self._feedback_service.get_feedback_statistics()
+
+        logger.info(
+            "Processed %s feedback records: %s positive, %s negative", 
+            len(training_examples),
+            len(positive_examples),
+            len(negative_examples),
+        )
+
+        return {
+            "total_processed": len(feedback_records),
+            "positive_examples": len(positive_examples),
+            "negative_examples": len(negative_examples),
+            "training_examples_created": len(training_examples),
+            "statistics": statistics,
+        }
+
+    def _store_training_examples(self, examples: List[Dict[str, Any]]) -> None:
+        """Persist processed feedback as training examples for later fine-tuning."""
+
+        if not examples:
+            return
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE SCHEMA IF NOT EXISTS proc")
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS proc.rag_training_examples (
+                            example_id BIGSERIAL PRIMARY KEY,
+                            query TEXT NOT NULL,
+                            response TEXT NOT NULL,
+                            sentiment TEXT NOT NULL,
+                            confidence FLOAT NOT NULL,
+                            feedback_message TEXT,
+                            retrieved_docs TEXT[],
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            used_in_training BOOLEAN DEFAULT FALSE
+                        )
+                        """
+                    )
+
+                    for example in examples:
+                        cur.execute(
+                            """
+                            INSERT INTO proc.rag_training_examples
+                                (query, response, sentiment, confidence,
+                                 feedback_message, retrieved_docs)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                example.get("query", ""),
+                                example.get("response", ""),
+                                example.get("sentiment", ""),
+                                example.get("confidence", 0.0),
+                                example.get("feedback_message"),
+                                example.get("retrieved_docs", []),
+                            ),
+                        )
+            conn.commit()
+            logger.info("Stored %s RAG training examples", len(examples))
+        except Exception:  # pragma: no cover
+            logger.exception("Failed to persist RAG training examples")
 
     def queue_negotiation_learning(
         self,
