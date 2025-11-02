@@ -7,6 +7,7 @@ import logging
 import os
 import importlib
 import importlib.util
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -61,6 +62,53 @@ def _build_phi4_fallback_models() -> Tuple[str, ...]:
 
 
 _OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = _build_phi4_fallback_models()
+
+
+def _slugify_agent_name(value: Any) -> str:
+    """Return a lower-case slug for ``value`` suitable for registry lookups."""
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?<!^)(?=[A-Z][a-z0-9])", "_", text)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text).lower().strip("_")
+    return slug
+
+
+_AGENT_MODEL_FIELD_PREFERENCES: Dict[str, Tuple[str, ...]] = {
+    "rag_pipeline": ("rag_model", "extraction_model"),
+    "rag_service": ("rag_model", "extraction_model"),
+    "rag_agent": ("rag_model", "extraction_model"),
+    "prompt_engine": ("rag_model", "extraction_model"),
+    "data_extraction_agent": (
+        "data_extraction_model",
+        "document_extraction_model",
+        "extraction_model",
+    ),
+    "supplier_ranking_agent": ("supplier_ranking_model", "extraction_model"),
+    "supplier_interaction_agent": (
+        "supplier_interaction_model",
+        "extraction_model",
+    ),
+    "email_drafting_agent": (
+        "email_compose_model",
+        "negotiation_email_model",
+        "extraction_model",
+    ),
+    "email_dispatch_agent": ("email_dispatch_model", "extraction_model"),
+    "email_watcher_agent": ("email_watcher_model", "extraction_model"),
+    "negotiation_agent": ("negotiation_email_model", "extraction_model"),
+    "quote_evaluation_agent": ("quote_evaluation_model", "extraction_model"),
+    "quote_comparison_agent": ("quote_comparison_model", "extraction_model"),
+    "approvals_agent": ("approvals_model", "extraction_model"),
+    "opportunity_miner_agent": ("opportunity_miner_model", "extraction_model"),
+    "discrepancy_detection_agent": (
+        "discrepancy_detection_model",
+        "extraction_model",
+    ),
+}
 
 
 class AgentStatus(str, Enum):
@@ -870,7 +918,23 @@ class BaseAgent:
                     exc_info=exc,
                 )
 
-        base_model = getattr(self.settings, "extraction_model", "gpt-oss")
+        fallback_model = getattr(self.settings, "extraction_model", "gpt-oss")
+        base_model = fallback_model
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                resolved_model = resolver(
+                    self.__class__.__name__, fallback=fallback_model
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "Agent-specific model resolution failed for %s",
+                    self.__class__.__name__,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(resolved_model, str) and resolved_model.strip():
+                    base_model = resolved_model.strip()
         quantized = getattr(self.settings, "ollama_quantized_model", None)
 
         missing_models = getattr(self, "_missing_ollama_models", None)
@@ -1329,6 +1393,9 @@ class AgentNick:
         self.routing_engine = RoutingEngine(self)
         self.process_routing_service = ProcessRoutingService(self)
         self.workflow_memory = WorkflowMemoryService(self)
+        self._agent_model_registry: Optional[Dict[str, str]] = None
+        self._agent_model_fallback: Optional[str] = None
+        self._build_agent_model_registry()
         logger.info("Engines initialized.")
 
         self.agents = {}
@@ -1446,6 +1513,67 @@ class AgentNick:
         if self.device == "cuda":
             return {"num_gpu_layers": -1, "keep_alive": "10m"}
         return {"keep_alive": "10m"}
+
+    def _build_agent_model_registry(self) -> Dict[str, str]:
+        """Compile the agent → model preference map with overrides applied."""
+
+        registry: Dict[str, str] = {}
+        overrides = getattr(self.settings, "agent_model_overrides", {}) or {}
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                slug = _slugify_agent_name(key)
+                if not slug:
+                    continue
+                if not isinstance(value, str):
+                    value = str(value)
+                value = value.strip()
+                if value:
+                    registry[slug] = value
+        for slug, fields in _AGENT_MODEL_FIELD_PREFERENCES.items():
+            if slug in registry:
+                continue
+            for field_name in fields:
+                candidate = getattr(self.settings, field_name, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    registry[slug] = candidate.strip()
+                    break
+        fallback = getattr(self.settings, "extraction_model", None)
+        if isinstance(fallback, str) and fallback.strip():
+            self._agent_model_fallback = fallback.strip()
+        self._agent_model_registry = registry
+        return registry
+
+    def refresh_agent_model_registry(self) -> None:
+        """Force regeneration of the cached agent model registry."""
+
+        self._agent_model_registry = None
+        self._build_agent_model_registry()
+
+    def get_agent_model(
+        self,
+        agent_identifier: Any,
+        *,
+        fallback: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the preferred model for ``agent_identifier``."""
+
+        slug = _slugify_agent_name(agent_identifier)
+        registry = self._agent_model_registry
+        if registry is None:
+            registry = self._build_agent_model_registry()
+        if slug:
+            model_name = registry.get(slug)
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+        if fallback is not None:
+            return fallback
+        if isinstance(self._agent_model_fallback, str) and self._agent_model_fallback:
+            return self._agent_model_fallback
+        fallback_model = getattr(self.settings, "extraction_model", None)
+        if isinstance(fallback_model, str) and fallback_model.strip():
+            self._agent_model_fallback = fallback_model.strip()
+            return self._agent_model_fallback
+        return fallback
 
     def get_db_connection(self):
         return psycopg2.connect(

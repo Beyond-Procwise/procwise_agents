@@ -1780,7 +1780,22 @@ class SupplierRankingAgent(BaseAgent):
             score_breakdown="\n".join(breakdown),
         )
         try:
-            resp = self.call_ollama(prompt, model=self.settings.extraction_model)
+            fallback_model = getattr(self.settings, "extraction_model", None)
+            resolver = getattr(self.agent_nick, "get_agent_model", None)
+            model_name = fallback_model
+            if callable(resolver):
+                try:
+                    candidate = resolver(
+                        self.__class__.__name__, fallback=fallback_model
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "SupplierRankingAgent model resolution failed", exc_info=True
+                    )
+                else:
+                    if isinstance(candidate, str) and candidate.strip():
+                        model_name = candidate.strip()
+            resp = self.call_ollama(prompt, model=model_name)
             return resp.get("response", "").strip()
         except Exception:
             logger.exception("Justification generation failed")

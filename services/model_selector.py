@@ -144,10 +144,20 @@ class RAGPipeline:
         self.settings = agent_nick.settings
         self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
         default_rag_model = getattr(self.settings, "rag_model", None)
-        if not default_rag_model:
-            default_rag_model = getattr(
-                self.settings, "extraction_model", settings.extraction_model
-            )
+        fallback_default = default_rag_model or getattr(
+            self.settings, "extraction_model", settings.extraction_model
+        )
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                default_rag_model = resolver(
+                    "rag_pipeline", fallback=fallback_default
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.debug("Failed to resolve agent-specific model for RAG", exc_info=True)
+                default_rag_model = fallback_default
+        else:
+            default_rag_model = fallback_default
         self.default_llm_model = self._ensure_phi4_default(default_rag_model)
         self._static_agent = RAGAgent(agent_nick)
         threshold = getattr(self.settings, "static_qa_confidence_threshold", 0.68)
