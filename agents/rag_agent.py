@@ -1,65 +1,89 @@
-"""Qdrant-backed retrieval agent powering Joshi's procurement RAG workflow."""
-
-from __future__ import annotations
-
 import json
 import logging
-import math
 import re
-import textwrap
+from collections import defaultdict
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
 from .base_agent import AgentOutput, AgentStatus, BaseAgent
-from services.conversation_memory import ConversationMemoryService
 from services.feedback_service import FeedbackSentiment, FeedbackService
-from services.rag_service import RAGService
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _StaticQAEntry:
-    """Single FAQ-style memory used for instant responses."""
+class QARecord:
+    """Represents a single procurement Q&A pair."""
 
-    topic: str
     question: str
     answer: str
-    prompts: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TopicRecord:
+    """Represents a procurement topic and its related prompts."""
+
+    topic: str
+    context_prompts: Tuple[str, ...]
+    qas: Tuple[QARecord, ...]
+
+
+class ResponseStructure:
+    """Canonical section planning for structured answers."""
+
+    STRUCTURES: Dict[str, Dict[str, Any]] = {
+        "supplier_overview": {
+            "sections": ["overview", "key_suppliers", "insights", "next_steps"],
+            "style": "briefing",
+        },
+        "financial_analysis": {
+            "sections": ["summary", "key_figures", "breakdown", "trends", "recommendations"],
+            "style": "analytical",
+        },
+        "comparison": {
+            "sections": ["overview", "comparison_table", "strengths_weaknesses", "recommendation"],
+            "style": "comparative",
+        },
+        "policy_lookup": {
+            "sections": ["policy_summary", "key_requirements", "examples", "related_policies"],
+            "style": "reference",
+        },
+        "exploratory": {
+            "sections": ["context", "findings", "details", "implications"],
+            "style": "investigative",
+        },
+        "simple_lookup": {
+            "sections": ["direct_answer", "context"],
+            "style": "concise",
+        },
+    }
 
 
 class RAGAgent(BaseAgent):
-    """Joshi's retrieval-augmented generation agent."""
+    """Retrieval agent backed by a static procurement knowledge base."""
 
-    _STATIC_DATASET_PATH = (
+    _DATASET_PATH = (
         Path(__file__).resolve().parent.parent
         / "resources"
         / "reference_data"
         / "procwise_mvp_chat_questions.json"
     )
 
-    _STATIC_DATASET: Optional[Tuple[_StaticQAEntry, ...]] = None
-    _STATIC_EMBEDDINGS: Dict[int, np.ndarray] = {}
+    _DATASET: Optional[Tuple[TopicRecord, ...]] = None
+    _EMBEDDING_CACHE: Dict[int, Tuple[np.ndarray, List[np.ndarray]]] = {}
 
-    def __init__(
-        self,
-        agent_nick: Any,
-        *,
-        rag_service: Optional[RAGService] = None,
-        conversation_memory: Optional[ConversationMemoryService] = None,
-    ) -> None:
+    def __init__(self, agent_nick):
         super().__init__(agent_nick)
+        self._session_topics: Dict[Tuple[str, str], int] = {}
         self.feedback_service = FeedbackService(agent_nick)
-        self.rag_service = rag_service or RAGService(agent_nick)
-        self.conversation_memory = conversation_memory or ConversationMemoryService(
-            agent_nick, rag_service=self.rag_service
-        )
-        self._session_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        self._ensure_static_memory()
+        self._last_interaction: Dict[str, Any] = {}
+        self._ensure_index()
 
     # ------------------------------------------------------------------
     # Public API
@@ -69,580 +93,1356 @@ class RAGAgent(BaseAgent):
         query: str,
         user_id: str,
         session_id: Optional[str] = None,
+        doc_type: Optional[str] = None,
+        product_type: Optional[str] = None,
         **_: Any,
     ) -> AgentOutput:
+        """Return the documented answer for ``query`` from the static dataset."""
+
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
 
-        cleaned_query = re.sub(r"\s+", " ", query).strip()
-        session_key = self._session_key(user_id, session_id)
-        state = self._session_state.setdefault(session_key, {"history": []})
-        last_question = state.get("last_question")
-        continuation_detail: Optional[str] = None
+        query = query.strip()
+        original_query = query
 
-        continuation_detected = self.feedback_service.is_continuation_request(cleaned_query)
-        if not continuation_detected and last_question:
-            if self._is_follow_up_phrase(cleaned_query):
-                continuation_detected = True
-        if continuation_detected:
-            if last_question:
-                continuation_detail = cleaned_query
-                cleaned_query = last_question
-        else:
-            sentiment, confidence = self.feedback_service.detect_feedback(cleaned_query)
-            if (
-                sentiment == FeedbackSentiment.POSITIVE
-                and confidence >= 0.4
-                and last_question
-            ):
-                acknowledgment = "Glad that helped! Let me know if you need anything else."
-                payload = {
-                    "answer": acknowledgment,
-                    "follow_up_questions": ["Would you like support with another procurement task?"],
-                    "retrieved_documents": [],
-                }
-                snapshot = {
-                    "feedback_sentiment": sentiment.value,
-                    "feedback_confidence": confidence,
-                    "handled_as_feedback": True,
-                }
-                return AgentOutput(
-                    status=AgentStatus.SUCCESS,
-                    data=payload,
-                    confidence=1.0,
-                    agentic_plan="1. Detect positive feedback.\n2. Acknowledge succinctly.",
-                    context_snapshot=snapshot,
-                )
+        feedback_detected = False
+        feedback_id: Optional[int] = None
+        feedback_sentiment: Optional[FeedbackSentiment] = None
+        feedback_confidence = 0.0
+        acknowledgment_text: Optional[str] = None
+        ack_prefix: Optional[str] = None
+        depth_mode = "standard"
+        continuation_requested = False
 
-        ack_text = self._build_acknowledgment(
-            cleaned_query, continuation_detail, last_question
-        )
-        expanded_query = self._expand_query(cleaned_query, continuation_detail)
+        classification_query = original_query
+        working_query = original_query
 
-        static_hit = self._match_static_memory(expanded_query)
-        if static_hit is not None:
-            entry, similarity = static_hit
-            answer_body = entry.answer.strip()
-            answer = f"{ack_text}\n\n{answer_body}" if answer_body else ack_text
-            followups = list(entry.prompts[:3])
-            retrieved_docs = [
-                {
-                    "title": entry.topic,
-                    "collection": "static_faq",
-                    "source_type": "FAQ",
-                }
-            ]
-            state.update({"last_question": entry.question, "last_answer": answer})
-            self._update_history(state, entry.question, answer)
-            snapshot = {
-                "static_match": True,
-                "static_similarity": float(similarity),
-                "session_id": session_key[1],
-            }
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={
-                    "answer": answer,
-                    "follow_up_questions": followups,
-                    "retrieved_documents": retrieved_docs,
-                },
-                confidence=float(max(0.0, min(1.0, similarity))),
-                agentic_plan=(
-                    "1. Detect question intent.\n"
-                    "2. Match against static procurement FAQs.\n"
-                    "3. Return the stored authoritative answer."
-                ),
-                context_snapshot=snapshot,
+        previous_user = self._last_interaction.get("user_id")
+        last_query = self._last_interaction.get("query")
+        if previous_user and previous_user == user_id:
+            if self.feedback_service.is_continuation_request(original_query):
+                continuation_requested = True
+                depth_mode = "expanded"
+                base_query = last_query or original_query
+                classification_query = base_query
+                working_query = self._expand_query(base_query, original_query, mode="continuation")
+            else:
+                feedback_sentiment, feedback_confidence = self.feedback_service.detect_feedback(original_query)
+                if feedback_sentiment != FeedbackSentiment.NEUTRAL and feedback_confidence >= 0.4:
+                    feedback_detected = True
+                    acknowledgment_text = self.feedback_service.generate_acknowledgment(
+                        feedback_sentiment, original_query
+                    )
+                    payload_available = bool(self._last_interaction)
+                    if payload_available:
+                        feedback_id = self.feedback_service.store_feedback(
+                            user_id=user_id,
+                            session_id=session_id,
+                            query=self._last_interaction.get("query", classification_query),
+                            response=self._last_interaction.get("response", ""),
+                            feedback_message=original_query,
+                            sentiment=feedback_sentiment,
+                            confidence=feedback_confidence,
+                            retrieved_doc_ids=self._last_interaction.get("doc_ids", []),
+                            context_metadata={
+                                "doc_type": doc_type,
+                                "product_type": product_type,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+
+                    if feedback_sentiment == FeedbackSentiment.POSITIVE:
+                        data = {
+                            "question": self._last_interaction.get("query", classification_query),
+                            "answer": acknowledgment_text,
+                            "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
+                            "related_prompts": [],
+                            "structured": False,
+                            "structure_type": "feedback_acknowledgment",
+                            "sections": [],
+                            "style": "acknowledgment",
+                            "main_points": [],
+                            "source_ids": self._last_interaction.get("doc_ids", []),
+                            "original_answer": self._last_interaction.get("response", ""),
+                            "feedback": {
+                                "captured": True,
+                                "feedback_id": feedback_id,
+                                "sentiment": feedback_sentiment.value,
+                                "confidence": feedback_confidence,
+                                "acknowledgment": acknowledgment_text,
+                            },
+                        }
+                        agentic_plan = "1. Recognise user feedback.\n2. Store it for training.\n3. Acknowledge the positive sentiment."
+                        context_snapshot = {
+                            "feedback_id": feedback_id,
+                            "feedback_sentiment": feedback_sentiment.value,
+                            "feedback_confidence": feedback_confidence,
+                        }
+                        return AgentOutput(
+                            status=AgentStatus.SUCCESS,
+                            data=data,
+                            agentic_plan=agentic_plan,
+                            context_snapshot=context_snapshot,
+                            confidence=1.0,
+                        )
+
+                    ack_prefix = acknowledgment_text
+                    depth_mode = "expanded"
+                    base_query = last_query or original_query
+                    classification_query = base_query
+                    working_query = self._expand_query(base_query, None, mode="improvement")
+
+        query = working_query
+
+        key = self._session_key(user_id, session_id)
+        query_vector = self._encode_text(query)
+        topic_index, topic_score = self._select_topic(query_vector, key)
+        question_index, question_score = self._select_question(query_vector, topic_index)
+
+        topic_entry = self._dataset[topic_index]
+        qa_entry = topic_entry.qas[question_index]
+        related_prompts = self._build_related_prompts(topic_entry, qa_entry)
+
+        self._session_topics[key] = topic_index
+
+        record_id = f"static-{topic_index}-{question_index}"
+        payload = {
+            "record_id": record_id,
+            "topic": topic_entry.topic,
+            "question": qa_entry.question,
+            "summary": qa_entry.answer,
+            "document_type": "static_reference",
+        }
+        docs = [SimpleNamespace(payload=payload)]
+
+        answer_scope = self._compose_answer_scope(topic_entry, question_index, depth_mode)
+        extracted = self._extract_answer_signals(answer_scope, record_id, depth_mode)
+        query_type = self._classify_query_type(classification_query)
+        plan = self._plan_response_structure(classification_query, query_type, extracted)
+
+        policy_payload: Optional[Dict[str, Any]] = None
+        if query_type == "policy_lookup":
+            policy_payload = self._extract_policy_payload(
+                policy_name=self._derive_policy_name(classification_query, topic_entry),
+                topic_entry=topic_entry,
+                focus_answer=qa_entry.answer,
+                depth_mode=depth_mode,
             )
 
-        policy_mode = self._looks_like_policy(cleaned_query)
-        memory_fragments = self._recent_history_snippets(state)
-
-        hits = self._search_documents(
-            expanded_query,
-            session_id=session_key[1],
-            memory_fragments=memory_fragments,
-            policy_mode=policy_mode,
+        structured_answer = self._generate_structured_response(
+            classification_query,
+            extracted,
+            docs,
+            plan,
+            depth_mode=depth_mode,
+            policy_payload=policy_payload,
         )
-
-        retrieved_docs = self._summarise_retrieved_documents(hits)
-        context_sections = self._build_context_sections(hits)
-
-        if not context_sections:
-            fallback_answer = (
-                f"{ack_text}\n\n"
-                "I could not locate supporting material for that yet. "
-                "Let me know if you can share more specifics so I can dig deeper."
+        if ack_prefix:
+            structured_answer = (
+                f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
             )
-            followups = [
-                "Do you want me to look at a particular policy or supplier record?",
-            ]
-            state.update({"last_question": cleaned_query, "last_answer": fallback_answer})
-            self._update_history(state, cleaned_query, fallback_answer)
-            snapshot = {
-                "static_match": False,
-                "retrieved_count": 0,
-                "session_id": session_key[1],
-            }
-            return AgentOutput(
-                status=AgentStatus.SUCCESS,
-                data={
-                    "answer": fallback_answer,
-                    "follow_up_questions": followups,
-                    "retrieved_documents": [],
-                },
-                confidence=0.35,
-                agentic_plan=(
-                    "1. Acknowledge the question.\n"
-                    "2. Attempt retrieval across uploads, procurement docs, and policies.\n"
-                    "3. Report limited context and invite clarification."
-                ),
-                context_snapshot=snapshot,
-            )
-
-        llm_answer, llm_followups = self._generate_answer_with_phi4(
-            ack_text,
-            cleaned_query,
-            context_sections,
-            history=memory_fragments,
-            policy_mode=policy_mode,
+        followups = self._generate_contextual_followups(
+            classification_query, query_type, extracted, depth_mode
         )
 
-        followups = (
-            llm_followups
-            if llm_followups
-            else self._default_followups(cleaned_query, policy_mode)
-        )
-        answer = llm_answer or ack_text
-        if not answer.startswith(ack_text):
-            answer = f"{ack_text}\n\n{answer.strip()}" if answer.strip() else ack_text
-
-        state.update({"last_question": cleaned_query, "last_answer": answer})
-        self._update_history(state, cleaned_query, answer)
-
-        top_score = max((float(getattr(hit, "combined_score", 0.0)) for hit in hits), default=0.0)
-        confidence = 1.0 - math.exp(-max(0.0, top_score) / 6.0)
-        snapshot = {
-            "static_match": False,
-            "retrieved_count": len(retrieved_docs),
-            "policy_mode": policy_mode,
-            "session_id": session_key[1],
-            "top_score": top_score,
+        response = {
+            "question": qa_entry.question,
+            "answer": structured_answer,
+            "topic": topic_entry.topic,
+            "related_prompts": followups if followups else related_prompts,
+            "structured": query_type != "simple_lookup",
+            "structure_type": plan["type"],
+            "sections": plan["sections"],
+            "style": plan["style"],
+            "main_points": extracted.get("main_points", []),
+            "source_ids": extracted.get("source_ids", []),
+            "original_answer": qa_entry.answer,
         }
 
+        if feedback_detected and feedback_sentiment is not None:
+            response["feedback"] = {
+                "captured": True,
+                "feedback_id": feedback_id,
+                "sentiment": feedback_sentiment.value,
+                "confidence": feedback_confidence,
+                "acknowledgment": acknowledgment_text,
+            }
+
         agentic_plan = (
-            "1. Interpret the request and craft an acknowledgement.\n"
-            "2. Expand the query, retrieve supporting context across uploads, procurement documents, and policies.\n"
-            "3. Synthesise a grounded response with phi4 and propose next steps."
+            "1. Match the query to the closest procurement topic.\n"
+            "2. Retrieve the exact answer from the static knowledge base.\n"
+            "3. Shape a structured response with contextual follow-ups."
         )
+
+        context_snapshot = {
+            "topic_similarity": float(topic_score),
+            "question_similarity": float(question_score),
+            "session_topic": topic_entry.topic,
+            "response_depth": depth_mode,
+        }
+
+        if continuation_requested:
+            context_snapshot["continuation"] = True
+
+        if feedback_detected and feedback_sentiment is not None:
+            context_snapshot.update(
+                {
+                    "feedback_id": feedback_id,
+                    "feedback_sentiment": feedback_sentiment.value,
+                    "feedback_confidence": feedback_confidence,
+                }
+            )
+
+        logger.debug(
+            "RAGAgent resolved query '%s' to topic '%s' question '%s'",
+            query,
+            topic_entry.topic,
+            qa_entry.question,
+        )
+
+        record_id = payload["record_id"]
+        self._last_interaction = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "query": classification_query,
+            "response": structured_answer,
+            "doc_ids": [record_id],
+            "topic": topic_entry.topic,
+            "query_type": query_type,
+            "topic_index": topic_index,
+            "question_index": question_index,
+            "depth_mode": depth_mode,
+        }
 
         return AgentOutput(
             status=AgentStatus.SUCCESS,
-            data={
-                "answer": answer,
-                "follow_up_questions": followups,
-                "retrieved_documents": retrieved_docs,
-            },
-            confidence=float(max(0.0, min(1.0, confidence))),
+            data=response,
             agentic_plan=agentic_plan,
-            context_snapshot=snapshot,
+            context_snapshot=context_snapshot,
+            confidence=float(min(topic_score, question_score)),
         )
 
     # ------------------------------------------------------------------
-    # Static memory helpers
+    # Internal helpers
     # ------------------------------------------------------------------
-    @classmethod
-    def _load_static_dataset(cls) -> Tuple[_StaticQAEntry, ...]:
-        if cls._STATIC_DATASET is not None:
-            return cls._STATIC_DATASET
-        path = cls._STATIC_DATASET_PATH
-        if not path.exists():
-            logger.warning("Static QA dataset missing at %s", path)
-            cls._STATIC_DATASET = tuple()
-            return cls._STATIC_DATASET
-        with path.open("r", encoding="utf-8") as handle:
-            raw_entries = json.load(handle)
+    def _ensure_index(self) -> None:
+        """Load the dataset and build embeddings for the current embedder."""
 
-        entries: List[_StaticQAEntry] = []
-        for item in raw_entries:
-            topic = str(item.get("topic", "")).strip()
-            prompts = tuple(
-                str(prompt).strip()
-                for prompt in item.get("context_prompts", [])
-                if str(prompt).strip()
-            )
-            for qa in item.get("qas", []):
-                question = str(qa.get("question", "")).strip()
-                answer = str(qa.get("answer", "")).strip()
-                if question and answer:
-                    entries.append(
-                        _StaticQAEntry(topic=topic, question=question, answer=answer, prompts=prompts)
-                    )
-        cls._STATIC_DATASET = tuple(entries)
-        return cls._STATIC_DATASET
+        cls = self.__class__
+        if cls._DATASET is None:
+            cls._DATASET = self._load_dataset()
 
-    def _ensure_static_memory(self) -> None:
-        dataset = self._load_static_dataset()
         embedder = getattr(self.agent_nick, "embedding_model", None)
         if embedder is None or not hasattr(embedder, "encode"):
-            logger.warning("RAGAgent missing embedding model; static QA disabled")
-            return
+            raise ValueError(
+                "agent_nick.embedding_model must provide an 'encode' method for RAGAgent"
+            )
 
         embedder_id = id(embedder)
-        if embedder_id in self._STATIC_EMBEDDINGS:
-            return
+        if embedder_id not in cls._EMBEDDING_CACHE:
+            topic_texts: List[str] = []
+            question_vectors: List[np.ndarray] = []
 
-        if not dataset:
-            self._STATIC_EMBEDDINGS[embedder_id] = np.zeros((0, 1), dtype="float32")
-            return
+            for topic_entry in cls._DATASET:
+                topic_text = " ".join(
+                    [topic_entry.topic]
+                    + [qa.question for qa in topic_entry.qas]
+                    + list(topic_entry.context_prompts)
+                )
+                topic_texts.append(topic_text)
 
-        questions = [entry.question for entry in dataset]
-        try:
-            vectors = embedder.encode(questions)
-        except Exception:
-            logger.exception("Failed to encode static QA questions")
-            vectors = np.zeros((len(questions), 1), dtype="float32")
+            topic_vectors = self._encode_texts(topic_texts)
 
+            for topic_entry in cls._DATASET:
+                questions = [qa.question for qa in topic_entry.qas]
+                question_vectors.append(self._encode_texts(questions))
+
+            cls._EMBEDDING_CACHE[embedder_id] = (topic_vectors, question_vectors)
+
+        self._dataset = cls._DATASET
+        topic_vectors, question_vectors = cls._EMBEDDING_CACHE[embedder_id]
+        self._topic_vectors = topic_vectors
+        self._question_vectors = question_vectors
+
+    def _load_dataset(self) -> Tuple[TopicRecord, ...]:
+        if not self._DATASET_PATH.exists():
+            raise FileNotFoundError(
+                f"Static knowledge base not found at {self._DATASET_PATH}"
+            )
+
+        with self._DATASET_PATH.open("r", encoding="utf-8") as handle:
+            raw_entries = json.load(handle)
+
+        topics: List[TopicRecord] = []
+        for entry in raw_entries:
+            context_prompts = tuple(entry.get("context_prompts", []))
+            qas = tuple(
+                QARecord(question=qa["question"], answer=qa["answer"])
+                for qa in entry.get("qas", [])
+            )
+            topics.append(
+                TopicRecord(
+                    topic=entry["topic"],
+                    context_prompts=context_prompts,
+                    qas=qas,
+                )
+            )
+
+        return tuple(topics)
+
+    def _encode_texts(self, texts: List[str]) -> np.ndarray:
+        embedder = self.agent_nick.embedding_model
+        vectors = embedder.encode(texts)
         array = np.array(vectors, dtype="float32")
         if array.ndim == 1:
             array = array.reshape(1, -1)
         norms = np.linalg.norm(array, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        normalised = array / norms
-        self._STATIC_EMBEDDINGS[embedder_id] = normalised
+        return array / norms
 
-    def _match_static_memory(
-        self, query: str
-    ) -> Optional[Tuple[_StaticQAEntry, float]]:
-        dataset = self._load_static_dataset()
-        if not dataset:
-            return None
-        embedder = getattr(self.agent_nick, "embedding_model", None)
-        if embedder is None or not hasattr(embedder, "encode"):
-            return None
-        embedder_id = id(embedder)
-        vectors = self._STATIC_EMBEDDINGS.get(embedder_id)
-        if vectors is None or not len(vectors):
-            return None
+    def _encode_text(self, text: str) -> np.ndarray:
+        return self._encode_texts([text])[0]
 
-        try:
-            query_vec = embedder.encode([query])
-        except Exception:
-            logger.exception("Failed to encode query for static QA match")
-            return None
-
-        query_arr = np.array(query_vec, dtype="float32")
-        if query_arr.ndim > 1:
-            query_arr = query_arr[0]
-        norm = np.linalg.norm(query_arr)
-        if norm == 0:
-            return None
-        query_arr = query_arr / norm
-        scores = vectors @ query_arr
-        if scores.size == 0:
-            return None
-        best_idx = int(np.argmax(scores))
-        best_score = float(scores[best_idx])
-        if best_score < 0.82:
-            return None
-        return dataset[best_idx], best_score
-
-    # ------------------------------------------------------------------
-    # Retrieval helpers
-    # ------------------------------------------------------------------
-    def _search_documents(
-        self,
-        query: str,
-        *,
-        session_id: Optional[str],
-        memory_fragments: Optional[List[str]],
-        policy_mode: bool,
-    ) -> List[SimpleNamespace]:
-        try:
-            hits = self.rag_service.search(
-                query,
-                top_k=6,
-                session_hint=None,
-                memory_fragments=memory_fragments,
-                policy_mode=policy_mode,
-                session_id=session_id,
-                collections=(
-                    self.rag_service.uploaded_collection,
-                    self.rag_service.primary_collection,
-                    self.rag_service.static_policy_collection,
-                ),
-            )
-        except Exception:
-            logger.exception("RAGService search failed; returning empty hits")
-            return []
-        return list(hits or [])
-
-    def _summarise_retrieved_documents(
-        self, hits: Iterable[SimpleNamespace]
-    ) -> List[Dict[str, Any]]:
-        documents: List[Dict[str, Any]] = []
-        for hit in hits:
-            payload = getattr(hit, "payload", {}) or {}
-            snippet = self._extract_snippet(payload)
-            if not snippet:
-                continue
-            metadata = self._sanitize_metadata(payload)
-            metadata["snippet"] = snippet
-            documents.append(metadata)
-        return documents[:5]
-
-    def _extract_snippet(self, payload: Dict[str, Any]) -> str:
-        for key in ("text_summary", "content", "summary", "description"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                snippet = re.sub(r"\s+", " ", value).strip()
-                if len(snippet) > 1200:
-                    snippet = snippet[:1197] + "..."
-                return snippet
-        return ""
-
-    def _sanitize_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        allowed: Dict[str, Any] = {}
-        for key, value in payload.items():
-            if not isinstance(key, str):
-                continue
-            lowered = key.lower()
-            if "id" in lowered or lowered in {"record_id", "doc_number", "supplier"}:
-                continue
-            if lowered in {"content", "text_summary", "summary", "full_text"}:
-                continue
-            if lowered in {"chunk_id", "chunk_index", "chunk_hash"}:
-                continue
-            if lowered == "collection_name":
-                allowed["collection"] = str(value)
-                continue
-            if isinstance(value, (str, int, float)):
-                allowed[key] = value
-        if "title" not in allowed:
-            allowed["title"] = payload.get("title") or payload.get("document_name") or "Document"
-        if "collection" not in allowed:
-            allowed["collection"] = payload.get("collection_name", "procwise_document_embeddings")
-        if "source_type" not in allowed and payload.get("document_type"):
-            allowed["source_type"] = payload.get("document_type")
-        return allowed
-
-    def _build_context_sections(
-        self, hits: Iterable[SimpleNamespace]
-    ) -> List[str]:
-        sections: List[str] = []
-        seen_snippets: set[str] = set()
-        for idx, hit in enumerate(hits, start=1):
-            payload = getattr(hit, "payload", {}) or {}
-            snippet = self._extract_snippet(payload)
-            if not snippet or snippet in seen_snippets:
-                continue
-            seen_snippets.add(snippet)
-            header_parts: List[str] = []
-            title = payload.get("title") or payload.get("document_name")
-            if title:
-                header_parts.append(str(title))
-            source_type = payload.get("source_type") or payload.get("document_type")
-            if source_type:
-                header_parts.append(str(source_type))
-            collection = payload.get("collection_name")
-            if collection:
-                header_parts.append(str(collection))
-            header = " • ".join(part for part in header_parts if part)
-            cleaned = textwrap.dedent(snippet).strip()
-            sections.append(f"Document {idx}: {header}\n{cleaned}")
-            if len(sections) >= 5:
-                break
-        return sections
-
-    # ------------------------------------------------------------------
-    # Generation helpers
-    # ------------------------------------------------------------------
-    def _generate_answer_with_phi4(
-        self,
-        ack_text: str,
-        question: str,
-        context_sections: Sequence[str],
-        *,
-        history: Optional[List[str]],
-        policy_mode: bool,
-    ) -> Tuple[str, List[str]]:
-        history_text = "\n\n".join(history or [])
-        context_block = "\n\n".join(context_sections)
-        instructions = [
-            "Write as a helpful procurement advisor (Joshi) with a warm, semi-formal tone.",
-            "Do not repeat the acknowledgement – start directly with the guidance.",
-            "Use bullet points for rules, limits, or step-by-step instructions.",
-            "Keep the response concise (roughly 3–6 sentences or bullet points).",
-            "Never mention internal IDs, collection names, or record identifiers.",
-            "If policies are included, organise content under headings such as 'What You Must Do', 'What’s Prohibited', 'Spending Limits', 'Approval Requirements', 'Examples', and 'Exceptions' when relevant.",
-        ]
-        if policy_mode:
-            instructions.append(
-                "Focus on policy obligations and compliance nuances while remaining practical."
-            )
-
-        prompt = (
-            f"User question: {question}\n"
-            f"Acknowledgement prefix: {ack_text}\n"
-            "Prior conversation snippets (last few turns):\n"
-        )
-        prompt = f"{prompt}{history_text or 'None provided.'}\n\nRetrieved context:\n{context_block}".strip()
-
-        system_message = (
-            "You are Joshi, the ProcWise subject-matter expert."
-            " Respond with grounded procurement guidance, cite no internal artefacts,"
-            " and remain empathetic yet efficient."
-            " Return your output wrapped inside <answer>...</answer> and optional"
-            " <followups>...</followups> tags with one question per line."
-        )
-        final_instruction = "\n".join(instructions)
-
-        try:
-            response = self.call_ollama(
-                messages=[
-                    {"role": "system", "content": f"{system_message}\n{final_instruction}"},
-                    {"role": "user", "content": prompt},
-                ],
-                model=getattr(self.settings, "rag_model", "phi4:latest"),
-            )
-        except Exception:
-            logger.exception("phi4 generation failed")
-            return ack_text, []
-
-        content = ""
-        if isinstance(response, dict):
-            message = response.get("message")
-            if isinstance(message, dict):
-                content = message.get("content", "")
-            if not content:
-                content = response.get("response", "")
-        if not isinstance(content, str):
-            content = str(content or "")
-
-        answer = self._extract_tagged_section(content, "answer")
-        raw_followups = [
-            item
-            for item in self._extract_tagged_section(content, "followups").splitlines()
-            if item.strip()
-        ]
-        cleaned_followups: List[str] = []
-        for item in raw_followups:
-            cleaned = re.sub(r"^\s*[-*•]+\s*", "", item).strip()
-            cleaned = re.sub(r"^\s*\d+[.)]\s*", "", cleaned)
-            if cleaned:
-                cleaned_followups.append(cleaned)
-        return answer.strip(), cleaned_followups[:3]
-
-    def _extract_tagged_section(self, text: str, tag: str) -> str:
-        pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
-        match = pattern.search(text or "")
-        if match:
-            return match.group(1).strip()
-        return ""
-
-    def _default_followups(self, query: str, policy_mode: bool) -> List[str]:
-        lowered = query.lower()
-        followups: List[str] = []
-        if policy_mode or "policy" in lowered:
-            followups.append("Would you like me to clarify any prohibited spend examples?")
-            followups.append("Do you need help confirming approval thresholds for your team?")
-        if "supplier" in lowered:
-            followups.append("Should I check recent supplier performance or relationship notes?")
-        followups.append("Is there another procurement control or document you'd like to review?")
-        deduped: List[str] = []
-        for item in followups:
-            if item not in deduped:
-                deduped.append(item)
-        return deduped[:3]
-
-    # ------------------------------------------------------------------
-    # Session utilities
-    # ------------------------------------------------------------------
     def _session_key(self, user_id: str, session_id: Optional[str]) -> Tuple[str, str]:
-        session = session_id or user_id or "default"
-        return user_id, session
+        if not isinstance(user_id, str) or not user_id:
+            raise ValueError("user_id must be provided for session tracking")
+        return user_id, session_id or "__default__"
 
-    def _update_history(self, state: Dict[str, Any], question: str, answer: str) -> None:
-        history = state.setdefault("history", [])
-        history.append({"question": question, "answer": answer})
-        if len(history) > 5:
-            del history[:-5]
+    def _select_topic(
+        self, query_vector: np.ndarray, session_key: Tuple[str, str]
+    ) -> Tuple[int, float]:
+        similarities = self._topic_vectors @ query_vector
+        best_idx = int(np.argmax(similarities))
+        best_score = float(similarities[best_idx])
 
-    def _recent_history_snippets(self, state: Dict[str, Any]) -> List[str]:
-        snippets: List[str] = []
-        for item in state.get("history", [])[-3:]:
-            question = item.get("question")
-            answer = item.get("answer")
-            if question and answer:
-                snippets.append(f"User asked: {question}\nJoshi replied: {answer}")
-        return snippets
+        stored_idx = self._session_topics.get(session_key)
+        if stored_idx is not None:
+            stored_score = float(similarities[stored_idx])
+            if best_idx != stored_idx and best_score > stored_score + 0.05:
+                chosen_idx = best_idx
+                chosen_score = best_score
+            else:
+                chosen_idx = stored_idx
+                chosen_score = stored_score
+        else:
+            chosen_idx = best_idx
+            chosen_score = best_score
 
-    def _build_acknowledgment(
-        self,
-        query: str,
-        continuation_detail: Optional[str],
-        last_question: Optional[str],
-    ) -> str:
-        core_question = query.rstrip("?.!")
-        if continuation_detail and last_question:
-            detail = self._extract_followup_detail(continuation_detail)
-            if detail:
-                return (
-                    f"Got it. You're asking about {last_question.rstrip('?.!')} and you'd like more detail on {detail}."
-                )
-            return f"Got it. You're asking for more detail on {last_question.rstrip('?.!')}"
-        return f"Got it. You're asking about {core_question}."
+        return chosen_idx, chosen_score
 
-    def _extract_followup_detail(self, text: str) -> str:
-        cleaned = re.sub(r"^(please|kindly)\s+", "", text.strip(), flags=re.IGNORECASE)
-        cleaned = cleaned.rstrip("?.!")
-        fillers = {"could you elaborate", "can you elaborate", "any update", "more detail"}
-        lowered = cleaned.lower()
-        for filler in fillers:
-            if lowered == filler:
-                return "that"
-        return cleaned
+    def _select_question(
+        self, query_vector: np.ndarray, topic_idx: int
+    ) -> Tuple[int, float]:
+        question_vectors = self._question_vectors[topic_idx]
+        similarities = question_vectors @ query_vector
+        best_idx = int(np.argmax(similarities))
+        return best_idx, float(similarities[best_idx])
+
+    def _build_related_prompts(
+        self, topic: TopicRecord, qa_entry: QARecord
+    ) -> List[str]:
+        prompts = list(topic.context_prompts)
+        if not prompts:
+            prompts = [other.question for other in topic.qas if other != qa_entry]
+        return prompts
 
     def _expand_query(
-        self, base: str, continuation: Optional[str]
+        self, base_query: str, follow_up: Optional[str], mode: str = "continuation"
     ) -> str:
-        base_clean = base.strip()
-        expansions: List[str] = []
-        synonyms = {
-            "policy": ["procedure", "guideline"],
-            "spend": ["expense", "purchasing"],
-            "supplier": ["vendor", "partner"],
-            "card": ["credit card", "corporate card"],
-            "approval": ["authorisation", "sign-off"],
-            "limit": ["threshold", "cap"],
+        base = (base_query or "").strip()
+        if not base:
+            return (follow_up or "").strip()
+
+        clause = self._build_follow_up_clause(follow_up or "", mode)
+        if not clause:
+            return base
+        return f"{base} — {clause}"
+
+    def _build_follow_up_clause(self, follow_up: str, mode: str) -> str:
+        cleaned = follow_up.strip().rstrip("?.!")
+        cleaned = re.sub(r"^(good|great|ok|okay|thanks)[,\s]+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(please|kindly)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+
+        if mode == "improvement":
+            if cleaned:
+                cleaned_lower = cleaned.lower()
+                if any(word in cleaned_lower for word in ["wrong", "incorrect", "fix"]):
+                    return "provide a corrected, comprehensive answer with the right policy guardrails."
+                return f"provide a corrected, comprehensive answer and address: {cleaned}"
+            return "provide a corrected, comprehensive answer with full policy detail."
+
+        if not cleaned:
+            return "provide comprehensive details and broaden the explanation."
+
+        lowered = cleaned.lower()
+        if any(phrase in lowered for phrase in ["more detail", "be more detailed", "elaborate"]):
+            return "provide comprehensive details and expand each section."
+        if any(keyword in lowered for keyword in ["limit", "cap", "threshold", "spending"]):
+            return "provide comprehensive details on the relevant limits and guardrails."
+        if any(keyword in lowered for keyword in ["example", "examples", "case"]):
+            return "provide comprehensive details and add concrete examples."
+        if lowered.startswith("what about"):
+            remainder = cleaned[10:].strip()
+            return (
+                f"provide comprehensive details covering {remainder}"
+                if remainder
+                else "provide comprehensive details."
+            )
+        if lowered.startswith("how about"):
+            remainder = cleaned[8:].strip()
+            return (
+                f"provide comprehensive details including {remainder}"
+                if remainder
+                else "provide comprehensive details."
+            )
+        return f"provide comprehensive details covering: {cleaned}"
+
+    # ------------------------------------------------------------------
+    # Structured response planning and generation
+    # ------------------------------------------------------------------
+    def _compose_answer_scope(
+        self, topic_entry: TopicRecord, question_index: int, depth_mode: str
+    ) -> str:
+        primary_answer = topic_entry.qas[question_index].answer
+        if depth_mode != "expanded":
+            return primary_answer
+
+        additional_answers: List[str] = []
+        for idx, qa in enumerate(topic_entry.qas):
+            if idx == question_index:
+                continue
+            additional_answers.append(qa.answer)
+            if len(additional_answers) >= 3:
+                break
+
+        combined = " ".join([primary_answer] + additional_answers) if additional_answers else primary_answer
+        return combined
+
+    def _extract_answer_signals(
+        self, answer: str, record_id: str, depth_mode: str = "standard"
+    ) -> Dict[str, Any]:
+        sentences = self._split_sentences(answer)
+        limit = 10 if depth_mode == "expanded" else 6
+        main_points = sentences[:limit] if sentences else [answer.strip()]
+
+        numbers = re.findall(r"[£$]\s*[\d,.]+|\b\d+(?:\.\d+)?%", answer)
+        entity_candidates = re.findall(
+            r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", answer
+        )
+        stop_words = {"The", "For", "In", "On", "And", "Procurement", "This", "That"}
+        entities = [
+            name
+            for name in entity_candidates
+            if name not in stop_words and len(name) > 2
+        ]
+
+        return {
+            "main_points": main_points,
+            "source_ids": [record_id],
+            "entities": list(dict.fromkeys(entities)),
+            "numbers": numbers,
         }
-        lowered = base_clean.lower()
-        for token, extras in synonyms.items():
-            if token in lowered:
-                expansions.extend(extras)
-        if continuation:
-            detail = self._extract_followup_detail(continuation)
-            if detail and detail not in base_clean:
-                expansions.append(detail)
-        unique_expansions = " ".join(dict.fromkeys(expansions))
-        return f"{base_clean} {unique_expansions}".strip()
 
-    def _looks_like_policy(self, query: str) -> bool:
+    def _split_sentences(self, text: str) -> List[str]:
+        raw = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9£])", text.strip())
+        return [segment.strip() for segment in raw if segment and segment.strip()]
+
+    def _classify_query_type(self, query: str) -> str:
+        query_lower = query.lower()
+
+        if any(
+            word in query_lower
+            for word in ["supplier", "vendor", "who supplies", "procurement from"]
+        ):
+            if any(
+                word in query_lower
+                for word in ["compare", "vs", "versus", "difference between"]
+            ):
+                return "comparison"
+            return "supplier_overview"
+
+        if any(
+            word in query_lower
+            for word in ["spend", "cost", "price", "budget", "savings", "value", "£", "$"]
+        ):
+            return "financial_analysis"
+
+        if any(
+            word in query_lower
+            for word in ["policy", "rule", "requirement", "compliance", "regulation"]
+        ) or (
+            "can i" in query_lower
+            and any(term in query_lower for term in ["claim", "use", "submit", "expense"])
+        ) or ("cannot" in query_lower and "claim" in query_lower):
+            return "policy_lookup"
+
+        if any(
+            word in query_lower
+            for word in ["compare", "vs", "versus", "better", "best", "difference"]
+        ):
+            return "comparison"
+
+        if query.count(" ") < 5 and any(
+            word in query_lower for word in ["what is", "who is", "when", "where"]
+        ):
+            return "simple_lookup"
+
+        return "exploratory"
+
+    def _plan_response_structure(
+        self, query: str, query_type: str, extracted_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        template = ResponseStructure.STRUCTURES.get(
+            query_type, ResponseStructure.STRUCTURES["exploratory"]
+        )
+        headers = self._generate_section_headers(query, query_type, extracted_data)
+        return {
+            "type": query_type,
+            "style": template["style"],
+            "sections": headers,
+            "use_tables": query_type in {"comparison", "financial_analysis"},
+            "use_bullets": len(extracted_data.get("main_points", [])) > 2,
+        }
+
+    def _generate_section_headers(
+        self, query: str, query_type: str, extracted: Dict[str, Any]
+    ) -> List[str]:
+        template = ResponseStructure.STRUCTURES.get(
+            query_type, ResponseStructure.STRUCTURES["exploratory"]
+        )
+        base = template["sections"]
+        mapping = {
+            "overview": "Overview",
+            "key_suppliers": "Primary Suppliers",
+            "insights": "Key Insights",
+            "next_steps": "What This Means",
+            "summary": "Summary",
+            "key_figures": "Key Figures",
+            "breakdown": "Spending Breakdown",
+            "trends": "Trends & Patterns",
+            "recommendations": "Recommendations",
+            "comparison_table": "Side-by-Side Comparison",
+            "strengths_weaknesses": "Analysis",
+            "policy_summary": "Policy Summary",
+            "key_requirements": "Key Requirements",
+            "examples": "Practical Examples",
+            "related_policies": "Related Policies",
+            "context": "Context",
+            "findings": "Findings",
+            "details": "Supporting Details",
+            "implications": "Implications",
+            "direct_answer": "Answer",
+        }
+        return [mapping.get(section, section.replace("_", " ").title()) for section in base]
+
+    def _generate_structured_response(
+        self,
+        query: str,
+        extracted_data: Dict[str, Any],
+        retrieved_docs: List[Any],
+        plan: Dict[str, Any],
+        *,
+        depth_mode: str = "standard",
+        policy_payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        query_type = plan["type"]
+
+        if query_type == "policy_lookup":
+            if not policy_payload:
+                policy_payload = {
+                    "policy_name": self._format_policy_title(query),
+                    "overview": self._ensure_sentence(extracted_data.get("main_points", [""])[0])
+                    if extracted_data.get("main_points")
+                    else "",
+                    "requirements": [],
+                    "restrictions": [],
+                    "spending_limits": [],
+                    "approval_process": [],
+                    "examples": [],
+                    "exceptions": [],
+                }
+            return self._render_policy_response(policy_payload, depth_mode)
+
+        opening = self._generate_opening_section(query, extracted_data, query_type)
+        closing = self._generate_closing_section(query, extracted_data, query_type)
+
+        template = ResponseStructure.STRUCTURES.get(
+            query_type, ResponseStructure.STRUCTURES["exploratory"]
+        )
+        section_keys = template["sections"]
+        headers = plan["sections"]
+
+        section_bodies: Dict[str, str] = {}
+
+        if query_type == "supplier_overview":
+            generated = self._generate_supplier_sections(extracted_data, retrieved_docs)
+            section_bodies["overview"] = opening
+            section_bodies["key_suppliers"] = generated[0] if generated else ""
+            section_bodies["insights"] = generated[1] if len(generated) > 1 else ""
+            section_bodies["next_steps"] = closing
+        elif query_type == "financial_analysis":
+            generated = self._generate_financial_sections(extracted_data, retrieved_docs)
+            section_bodies["summary"] = opening
+            section_bodies["key_figures"] = generated[0] if generated else ""
+            section_bodies["breakdown"] = generated[1] if len(generated) > 1 else ""
+            section_bodies["trends"] = generated[2] if len(generated) > 2 else ""
+            section_bodies["recommendations"] = closing
+        elif query_type == "comparison":
+            generated = self._generate_comparison_sections(extracted_data, retrieved_docs)
+            section_bodies["overview"] = opening
+            section_bodies["comparison_table"] = generated[0] if generated else ""
+            section_bodies["strengths_weaknesses"] = (
+                generated[1] if len(generated) > 1 else ""
+            )
+            section_bodies["recommendation"] = closing
+        elif query_type == "simple_lookup":
+            main_section = self._generate_simple_response(query, extracted_data, retrieved_docs)
+            section_bodies["direct_answer"] = main_section
+            section_bodies["context"] = closing
+        else:
+            generated = self._generate_exploratory_sections(extracted_data, retrieved_docs)
+            section_bodies["context"] = opening
+            if generated:
+                section_bodies["findings"] = generated[0]
+            if len(generated) > 1:
+                details = generated[1]
+                if len(generated) > 2:
+                    details = "\n\n".join([details] + generated[2:])
+                section_bodies["details"] = details
+            section_bodies.setdefault("details", "")
+            section_bodies["implications"] = closing
+
+        formatted_sections: List[str] = []
+        for header, key in zip_longest(headers, section_keys, fillvalue=""):
+            if not header:
+                continue
+            body = section_bodies.get(key, "") if key else ""
+            if body and body.strip():
+                formatted_sections.append(f"## {header}\n{body.strip()}")
+
+        if not formatted_sections:
+            return opening if query_type != "simple_lookup" else section_bodies["direct_answer"]
+
+        return "\n\n".join(formatted_sections)
+
+    def _generate_opening_section(
+        self, query: str, data: Dict[str, Any], query_type: str
+    ) -> str:
+        main_points = data.get("main_points", [])
+        focus = self._derive_focus_from_query(query)
+
+        if not main_points:
+            return (
+                f"I took a look at the references about {focus or 'this topic'} and will "
+                "share more detail as soon as I spot something concrete."
+            )
+
+        headline = self._ensure_sentence(main_points[0])
+
+        if query_type == "supplier_overview":
+            preface = (
+                f"Thanks for checking in about {focus or 'your supplier landscape'}. "
+                "Here's the top-line view from the sourcing notes:"
+            )
+        elif query_type == "financial_analysis":
+            preface = (
+                f"Looking at the spend position for {focus or 'this area'}, "
+                "here's what immediately stands out:"
+            )
+        elif query_type == "comparison":
+            preface = (
+                f"To help you weigh {focus or 'these options'}, "
+                "here's the headline insight I found:"
+            )
+        elif query_type == "policy_lookup":
+            preface = (
+                f"You're asking about {focus or 'this policy area'}. "
+                "The policy guidance boils down to this:"
+            )
+        else:
+            preface = (
+                f"I've reviewed the reference notes on {focus or 'this topic'}. "
+                "Here's the quick take-away:"
+            )
+
+        return f"{preface} {headline}"
+
+    def _derive_focus_from_query(self, query: str) -> str:
+        query = query.strip().rstrip("?!. ")
+        if not query:
+            return "the topic"
+
         lowered = query.lower()
-        policy_tokens = ["policy", "procedure", "credit card", "code of conduct", "expense"]
-        return any(token in lowered for token in policy_tokens)
+        prefixes = ["what is", "what's", "tell me about", "how do", "how does", "can i", "could i"]
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                cleaned = query[len(prefix) :].strip()
+                return cleaned if cleaned else "the topic"
 
-    def _is_follow_up_phrase(self, query: str) -> bool:
-        lowered = query.lower().strip()
-        if not lowered:
-            return False
-        if lowered.startswith("could you") and "elaborate" in lowered:
-            return True
-        if lowered.startswith("can you") and "elaborate" in lowered:
-            return True
-        if lowered.startswith("what about") or lowered.startswith("how about"):
-            return True
-        if "more detail" in lowered or "more details" in lowered:
-            return True
-        return False
+        return query
 
+    def _ensure_sentence(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+        if cleaned[-1] not in ".!?":
+            return f"{cleaned}."
+        return cleaned
+
+    def _generate_supplier_sections(
+        self, data: Dict[str, Any], docs: List[Any]
+    ) -> List[str]:
+        sections: List[str] = []
+        supplier_data = self._extract_supplier_info(data.get("main_points", []), docs)
+
+        if supplier_data:
+            primary_lines = ["Here are the suppliers that matter most right now:"]
+            for supplier in supplier_data[:3]:
+                bullet_lines = [f"- **{supplier['name']}**"]
+                if supplier.get("description"):
+                    bullet_lines[-1] += f": {supplier['description']}"
+                if supplier.get("metrics"):
+                    for metric in supplier["metrics"]:
+                        bullet_lines.append(f"  - {metric}")
+                if supplier.get("source_id"):
+                    bullet_lines.append(f"  - Source: {supplier['source_id']}")
+                primary_lines.extend(bullet_lines)
+            sections.append("\n".join(primary_lines).strip())
+
+        if len(supplier_data) > 1:
+            insights = ["What this mix tells us:"]
+            if any(s.get("coverage", 0) >= 0.7 for s in supplier_data):
+                insights.append(
+                    "- Coverage is concentrated with key partners, so keep an eye on dependency risk."
+                )
+            if len(supplier_data) > 5:
+                insights.append(
+                    f"- With about {len(supplier_data)} active suppliers, you have diversification headroom."
+                )
+            default_highlight = data.get("main_points", [])[:2]
+            for point in default_highlight:
+                insights.append(f"- {self._ensure_sentence(point)}")
+            sections.append("\n".join(insights).strip())
+
+        return sections
+
+    def _generate_financial_sections(
+        self, data: Dict[str, Any], docs: List[Any]
+    ) -> List[str]:
+        sections: List[str] = []
+        financial_data = self._extract_financial_info(data.get("main_points", []), docs)
+
+        if financial_data.get("totals"):
+            summary_lines = ["Key figures that anchor the conversation:"]
+            for key, value in financial_data["totals"].items():
+                summary_lines.append(f"- **{key}:** {value}")
+            source = data.get("source_ids", [None])[0]
+            if source:
+                summary_lines.append(f"- Source: {source}")
+            sections.append("\n".join(summary_lines).strip())
+
+        breakdown_rows = financial_data.get("breakdown") or []
+        if breakdown_rows:
+            table_lines = [
+                "Spending split by category:",
+                "| Category | Amount | % of Total |",
+                "|----------|--------|------------|",
+            ]
+            for row in breakdown_rows[:5]:
+                table_lines.append(
+                    f"| {row['category']} | {row['amount']} | {row['percentage']}% |"
+                )
+            sections.append("\n".join(table_lines))
+
+        trends = financial_data.get("trends") or []
+        if trends:
+            trend_lines = ["Patterns worth noting:"]
+            for trend in trends:
+                trend_lines.append(f"- {self._ensure_sentence(trend)}")
+            sections.append("\n".join(trend_lines).strip())
+
+        return sections
+
+    def _generate_comparison_sections(
+        self, data: Dict[str, Any], docs: List[Any]
+    ) -> List[str]:
+        sections: List[str] = []
+        comparison_data = self._extract_comparison_data(data.get("main_points", []), docs)
+
+        if len(comparison_data) >= 2:
+            header_names = " | ".join([c["name"] for c in comparison_data[:3]])
+            table_lines = [
+                "Here's how the options line up:",
+                f"| Aspect | {header_names} |",
+                "|--------|" + "|".join(["--------" for _ in comparison_data[:3]]) + "|",
+            ]
+            for metric in ["coverage", "spend", "contracts", "performance"]:
+                values = [c.get(metric, "N/A") for c in comparison_data[:3]]
+                if any(value != "N/A" for value in values):
+                    table_lines.append(
+                        f"| {metric.title()} | " + " | ".join(str(v) for v in values) + " |"
+                    )
+            sections.append("\n".join(table_lines))
+
+            analysis_lines = ["What to take from this:"]
+            for entity in comparison_data[:3]:
+                analysis_lines.append(f"**{entity['name']}**")
+                strengths = entity.get("strengths") or []
+                if strengths:
+                    analysis_lines.append("- Strengths:")
+                    analysis_lines.extend(f"  - {self._ensure_sentence(item)}" for item in strengths)
+                weaknesses = entity.get("weaknesses") or []
+                if weaknesses:
+                    analysis_lines.append("- Watch-outs:")
+                    analysis_lines.extend(f"  - {self._ensure_sentence(item)}" for item in weaknesses)
+                analysis_lines.append("")
+            sections.append("\n".join(analysis_lines).strip())
+
+        return sections
+
+    def _derive_policy_name(self, query: str, topic_entry: TopicRecord) -> str:
+        focus = self._derive_focus_from_query(query)
+        candidate_focus = focus.strip() if focus else ""
+        topic_candidate = topic_entry.topic.strip() if topic_entry.topic else ""
+
+        for candidate in [candidate_focus, topic_candidate]:
+            if not candidate:
+                continue
+            formatted = self._format_policy_title(candidate)
+            if "policy" in formatted.lower():
+                return formatted
+
+        for candidate in [candidate_focus, topic_candidate]:
+            if not candidate:
+                continue
+            formatted = self._format_policy_title(f"{candidate} policy")
+            if formatted:
+                return formatted
+
+        return "Policy Guidance"
+
+    def _format_policy_title(self, text: str) -> str:
+        cleaned = text.strip().rstrip("?.")
+        if not cleaned:
+            return "Policy Guidance"
+        words = cleaned.split()
+        result_words: List[str] = []
+        for index, word in enumerate(words):
+            lower = word.lower()
+            if index == 0 or lower not in {"and", "or", "of", "the"}:
+                result_words.append(lower.capitalize())
+            else:
+                result_words.append(lower)
+        if result_words and result_words[-1].lower() != "policy":
+            result_words.append("Policy")
+        return " ".join(result_words)
+
+    def _extract_policy_payload(
+        self,
+        *,
+        policy_name: str,
+        topic_entry: TopicRecord,
+        focus_answer: str,
+        depth_mode: str,
+    ) -> Dict[str, Any]:
+        categories: Dict[str, List[str]] = defaultdict(list)
+
+        for qa in topic_entry.qas:
+            question_lower = qa.question.lower()
+            sentences = self._split_sentences(qa.answer)
+            for sentence in sentences:
+                clause = self._clean_policy_clause(sentence)
+                lowered = clause.lower()
+                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
+                    categories["requirements"].append(clause)
+                if re.search(
+                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
+                    lowered,
+                ) or "non-claimable" in lowered:
+                    categories["restrictions"].append(clause)
+                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
+                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
+                    lowered,
+                ):
+                    categories["spending_limits"].append(clause)
+                if re.search(r"approval|approve|authoris|manager|finance", lowered):
+                    categories["approval_process"].append(clause)
+                if re.search(r"for example|such as|e.g.|include", lowered):
+                    categories["examples"].append(clause)
+                if re.search(r"unless|exception|exemption|waiver", lowered):
+                    categories["exceptions"].append(clause)
+
+            if "exception" in question_lower or "waiver" in question_lower:
+                categories["exceptions"].extend(sentences)
+            if "example" in question_lower:
+                categories["examples"].extend(sentences)
+            if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
+                categories["spending_limits"].extend(sentences)
+            if "approval" in question_lower or "pre-approv" in question_lower:
+                categories["approval_process"].extend(sentences)
+            if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
+                categories["requirements"].extend(sentences)
+
+        overview_sentences = self._split_sentences(focus_answer)
+        overview = overview_sentences[0] if overview_sentences else focus_answer
+
+        payload = {
+            "policy_name": policy_name,
+            "overview": self._ensure_sentence(self._clean_policy_clause(overview)),
+            "requirements": self._unique_ordered(categories.get("requirements", [])),
+            "restrictions": self._unique_ordered(categories.get("restrictions", [])),
+            "spending_limits": self._unique_ordered(categories.get("spending_limits", [])),
+            "approval_process": self._unique_ordered(categories.get("approval_process", [])),
+            "examples": self._unique_ordered(categories.get("examples", [])),
+            "exceptions": self._unique_ordered(categories.get("exceptions", [])),
+        }
+
+        if depth_mode == "expanded":
+            # Allow more contextual statements when expanding.
+            for key in ["requirements", "restrictions", "spending_limits", "approval_process"]:
+                values = payload[key]
+                if not values and payload["overview"]:
+                    values.append(payload["overview"])
+                payload[key] = values
+
+        return payload
+
+    def _render_policy_response(
+        self, payload: Dict[str, Any], depth_mode: str
+    ) -> str:
+        policy_name = self._format_policy_title(payload.get("policy_name", "Policy Guidance"))
+        overview = payload.get("overview", "")
+        overview_text = self._ensure_sentence(self._clean_policy_clause(overview)) if overview else ""
+
+        lines: List[str] = [f"## {policy_name}"]
+        if overview_text:
+            lines.append(overview_text)
+
+        sections = [
+            ("What You Must Do", "requirements"),
+            ("What's Prohibited", "restrictions"),
+            ("Spending Limits", "spending_limits"),
+            ("Approval Requirements", "approval_process"),
+            ("Examples", "examples"),
+            ("Exceptions", "exceptions"),
+        ]
+
+        for title, key in sections:
+            bullets = self._policy_section_bullets(payload, key, depth_mode)
+            if not bullets:
+                continue
+            lines.append("")
+            lines.append(title)
+            lines.extend(f"- {bullet}" for bullet in bullets)
+
+        return "\n".join(lines)
+
+    def _policy_section_bullets(
+        self, payload: Dict[str, Any], key: str, depth_mode: str
+    ) -> List[str]:
+        sentences = list(payload.get(key, []))
+        target = 5 if depth_mode == "expanded" else 3
+        target = min(target, 6)
+
+        bullets: List[str] = []
+        for sentence in sentences:
+            bullets.extend(self._expand_policy_sentence(sentence, key))
+
+        if key == "requirements" and len(bullets) < target:
+            derived = self._derive_requirement_from_restriction(payload.get("restrictions", []))
+            for item in derived:
+                if item not in bullets:
+                    bullets.append(item)
+                    if len(bullets) >= target:
+                        break
+
+        if key == "spending_limits" and len(bullets) < target:
+            for restriction in payload.get("restrictions", []):
+                amounts = re.findall(r"[£$€]\s*[\d,.]+", restriction)
+                if not amounts:
+                    continue
+                bullet = self._ensure_sentence(
+                    f"Treat {amounts[0]} as the ceiling unless Finance approves more."
+                )
+                if bullet not in bullets:
+                    bullets.append(bullet)
+                if len(bullets) >= target:
+                    break
+
+        if key == "approval_process" and len(bullets) < target:
+            for requirement in payload.get("requirements", []):
+                clause = requirement.lower()
+                if "approve" in clause or "sign" in clause:
+                    bullet = self._ensure_sentence(self._clean_policy_clause(requirement))
+                    if bullet not in bullets:
+                        bullets.append(bullet)
+                if len(bullets) >= target:
+                    break
+
+        fallback_map = {
+            "requirements": "Follow this policy before and after each purchase to stay compliant.",
+            "restrictions": "Treat anything not explicitly allowed in the policy as prohibited.",
+            "spending_limits": "Check the policy for specific monetary caps before spending.",
+            "approval_process": "Capture written approval in advance for any exception.",
+            "examples": "Model your claim on the compliant scenarios described in the policy.",
+            "exceptions": "Escalate unusual circumstances to Finance for documented exceptions.",
+        }
+
+        bullets = [self._ensure_sentence(item) for item in self._unique_ordered(bullets)]
+
+        while len(bullets) < target:
+            fallback = fallback_map.get(key)
+            if not fallback or fallback in bullets:
+                break
+            bullets.append(self._ensure_sentence(fallback))
+
+        return bullets[:target]
+
+    def _expand_policy_sentence(self, sentence: str, section: str) -> List[str]:
+        clause = self._clean_policy_clause(sentence)
+        lowered = clause.lower()
+        bullets: List[str] = []
+
+        if section == "requirements":
+            if any(keyword in lowered for keyword in ["pre-approv", "approval"]):
+                bullets.append("Obtain pre-approval before committing the spend this policy covers.")
+            if any(keyword in lowered for keyword in ["submit", "claim", "provide", "retain"]):
+                bullets.append("Submit only eligible, well-documented expenses so they are accepted.")
+            if "policy" in lowered or "intranet" in lowered:
+                bullets.append("Check the official policy on the intranet before you spend or submit claims.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "restrictions":
+            if "include" in lowered:
+                parts = re.split(r"include[s]?", clause, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    items = re.split(r",| and | or ", parts[1])
+                    for item in items:
+                        cleaned_item = item.strip(" .")
+                        if cleaned_item:
+                            cleaned_item = re.sub(r"^the ", "", cleaned_item, flags=re.IGNORECASE)
+                            bullets.append(f"Do not claim {cleaned_item}.")
+            if any(keyword in lowered for keyword in ["declined", "breach", "disciplinary"]):
+                bullets.append("Expect non-claimable expenses to be declined, logged, and escalated if repeated.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "spending_limits":
+            amounts = re.findall(r"[£$€]\s*[\d,.]+", clause)
+            if amounts:
+                for amount in amounts:
+                    bullets.append(f"Stay within the {amount} limit unless you have written approval.")
+            if "per person" in lowered:
+                bullets.append("Keep client entertainment within the per-person threshold stated in the policy.")
+            if not amounts and ("limit" in lowered or "threshold" in lowered):
+                bullets.append(clause)
+        elif section == "approval_process":
+            if any(keyword in lowered for keyword in ["approval", "approve", "manager", "finance"]):
+                bullets.append("Capture manager or Finance approval before using the card for unusual spend.")
+            if "pre-approv" in lowered:
+                bullets.append("Record pre-approval details with the expense submission.")
+            if not bullets:
+                bullets.append(clause)
+        elif section == "examples":
+            bullets.append(f"Example: {clause}")
+        elif section == "exceptions":
+            if "unless" in lowered:
+                exception_text = clause.split("unless", 1)[1].strip()
+                bullets.append(
+                    f"Exception: Allowed when {exception_text}"
+                    if exception_text
+                    else f"Exception: {clause}"
+                )
+            else:
+                bullets.append(f"Exception: {clause}")
+
+        return bullets
+
+    def _derive_requirement_from_restriction(
+        self, restrictions: Sequence[str]
+    ) -> List[str]:
+        suggestions: List[str] = []
+        for sentence in restrictions:
+            clause = self._clean_policy_clause(sentence)
+            lowered = clause.lower()
+            if any(keyword in lowered for keyword in ["pre-approv", "unless"]):
+                suggestions.append(
+                    "Secure pre-approval before submitting anything that normally sits on the restricted list."
+                )
+            if any(keyword in lowered for keyword in ["declined", "disciplinary", "breach"]):
+                suggestions.append(
+                    "Validate each expense against the policy so it isn't declined or escalated."
+                )
+        return [self._ensure_sentence(item) for item in self._unique_ordered(suggestions)]
+
+    def _clean_policy_clause(self, sentence: str) -> str:
+        text = sentence.strip()
+        text = re.sub(r"^[Yy]es,?\s*", "", text)
+        text = re.sub(r"^[Nn]o,?\s*", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _unique_ordered(self, items: Iterable[str]) -> List[str]:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for item in items:
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(cleaned)
+        return ordered
+
+    def _generate_exploratory_sections(
+        self, data: Dict[str, Any], docs: List[Any]
+    ) -> List[str]:
+        sections: List[str] = []
+        points = data.get("main_points", [])
+        if points:
+            sections.append(
+                "Here's the context that frames this question: "
+                + self._ensure_sentence(points[0])
+            )
+        if len(points) > 1:
+            findings = ["Highlights worth noting:"]
+            findings.extend(f"- {self._ensure_sentence(point)}" for point in points[1:4])
+            sections.append("\n".join(findings).strip())
+        numbers = data.get("numbers", [])
+        if numbers:
+            detail_lines = ["Figures that back this up:"]
+            for number in numbers[:5]:
+                detail_lines.append(f"- {number}")
+            sections.append("\n".join(detail_lines).strip())
+        return sections
+
+    def _generate_closing_section(
+        self, query: str, data: Dict[str, Any], query_type: str
+    ) -> str:
+        if query_type == "simple_lookup":
+            return "Let me know if you'd like to dig any deeper."  # short and friendly
+
+        if query_type == "supplier_overview":
+            high_coverage = any(
+                "%" in point and any(token in point for token in ["80", "85", "90"])
+                for point in data.get("main_points", [])
+            )
+            if high_coverage:
+                closing = (
+                    "It looks like the supplier base is well-covered—worth reviewing leverage while keeping resilience in mind."
+                )
+            else:
+                closing = (
+                    "There's room to tighten the supplier mix for resilience, so consider follow-up reviews on coverage."
+                )
+        elif query_type == "financial_analysis":
+            growth = any("increase" in point.lower() for point in data.get("main_points", []))
+            if growth:
+                closing = (
+                    "Spend is trending upward, so a quick variance check would help keep savings on track."
+                )
+            else:
+                closing = (
+                    "With spend running steady, you have space to reassess supplier performance and pricing plays."
+                )
+        elif query_type == "comparison":
+            closing = (
+                "Each option leans into different strengths—pick the one that fits your priority, whether that's cost control, reliability, or innovation."
+            )
+        elif query_type == "policy_lookup":
+            closing = (
+                "Keep these guardrails close by for approvals, and I'm happy to pull up any supporting examples if you need them."
+            )
+        else:
+            closing = (
+                "Use these points to steer the next conversation, and just shout if you want deeper analysis on any thread."
+            )
+
+        return closing
+
+    def _generate_simple_response(
+        self, query: str, data: Dict[str, Any], docs: List[Any]
+    ) -> str:
+        main_points = data.get("main_points", [])
+        if not main_points:
+            return (
+                "I checked the reference notes but couldn't find a concrete answer yet—"
+                "let me know if you want me to broaden the search."
+            )
+
+        focus = self._derive_focus_from_query(query)
+        sentences = [self._ensure_sentence(main_points[0])]
+        if len(main_points) > 1:
+            sentences.append(self._ensure_sentence(main_points[1]))
+        response = (
+            f"On {focus or 'this point'}, here's what the notes say: " + " ".join(sentences)
+        )
+        source_ids = data.get("source_ids", [])
+        if source_ids:
+            response += f" (Source: {source_ids[0]})"
+        return response
+
+    def _extract_supplier_info(
+        self, main_points: List[str], docs: List[Any]
+    ) -> List[Dict[str, Any]]:
+        suppliers: List[Dict[str, Any]] = []
+        seen: Dict[str, Dict[str, Any]] = {}
+
+        for point in main_points:
+            names = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", point)
+            for name in names:
+                if len(name) < 3 or name.lower() in {"the", "and", "for"}:
+                    continue
+                entry = seen.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "description": point,
+                        "metrics": [],
+                        "source_id": None,
+                    },
+                )
+                percentages = re.findall(r"\b\d{1,3}%\b", point)
+                entry.setdefault("coverage", 0)
+                if percentages:
+                    try:
+                        coverage_value = max(int(p.rstrip("%")) for p in percentages) / 100.0
+                        entry["coverage"] = max(entry.get("coverage", 0), coverage_value)
+                        entry["metrics"].append(f"Coverage: {percentages[0]}")
+                    except ValueError:
+                        pass
+                currency = re.findall(r"[£$]\s*[\d,.]+", point)
+                if currency:
+                    entry["metrics"].append(f"Spend: {currency[0]}")
+
+        for doc in docs:
+            payload = getattr(doc, "payload", {}) or {}
+            record_id = payload.get("record_id")
+            summary = payload.get("summary", "")
+            names = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", summary)
+            for name in names:
+                entry = seen.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "description": summary,
+                        "metrics": [],
+                        "source_id": record_id,
+                    },
+                )
+                if record_id and not entry.get("source_id"):
+                    entry["source_id"] = record_id
+
+        suppliers.extend(seen.values())
+        suppliers.sort(key=lambda item: (item.get("coverage", 0), len(item.get("metrics", []))), reverse=True)
+        return suppliers
+
+    def _extract_financial_info(
+        self, main_points: List[str], docs: List[Any]
+    ) -> Dict[str, Any]:
+        totals: Dict[str, str] = {}
+        breakdown: List[Dict[str, Any]] = []
+        trends: List[str] = []
+
+        for point in main_points:
+            amounts = re.findall(r"[£$]\s*[\d,.]+", point)
+            if amounts:
+                if "total" in point.lower() or "overall" in point.lower():
+                    totals.setdefault("Total Spend", amounts[0])
+                elif "savings" in point.lower():
+                    totals.setdefault("Savings", amounts[0])
+                elif "quarter" in point.lower() or "month" in point.lower():
+                    totals.setdefault("Period Spend", amounts[0])
+            if any(keyword in point.lower() for keyword in ["increase", "decrease", "growth", "decline"]):
+                trends.append(point)
+
+        for doc in docs:
+            payload = getattr(doc, "payload", {}) or {}
+            summary = payload.get("summary", "")
+            matches = re.findall(r"([A-Z][A-Za-z\s]+):\s*([£$]\s*[\d,.]+)", summary)
+            for category, amount in matches:
+                breakdown.append(
+                    {
+                        "category": category.strip(),
+                        "amount": amount.strip(),
+                        "percentage": 0,
+                    }
+                )
+
+        return {"totals": totals, "breakdown": breakdown, "trends": trends}
+
+    def _extract_comparison_data(
+        self, main_points: List[str], docs: List[Any]
+    ) -> List[Dict[str, Any]]:
+        entities: Dict[str, Dict[str, Any]] = {}
+
+        for point in main_points:
+            names = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", point)
+            for name in names:
+                if len(name) < 3 or name.lower() in {"the", "and", "for"}:
+                    continue
+                entity = entities.setdefault(
+                    name,
+                    {"name": name, "strengths": [], "weaknesses": []},
+                )
+                if any(token in point.lower() for token in ["strong", "lead", "preferred", "faster"]):
+                    entity["strengths"].append(point)
+                if any(token in point.lower() for token in ["risk", "delay", "gap", "limited"]):
+                    entity["weaknesses"].append(point)
+                percents = re.findall(r"\b\d{1,3}%\b", point)
+                if percents:
+                    entity["coverage"] = percents[0]
+                amounts = re.findall(r"[£$]\s*[\d,.]+", point)
+                if amounts:
+                    entity["spend"] = amounts[0]
+
+        for doc in docs:
+            payload = getattr(doc, "payload", {}) or {}
+            summary = payload.get("summary", "")
+            names = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", summary)
+            for name in names:
+                entities.setdefault(name, {"name": name, "strengths": [], "weaknesses": []})
+
+        return list(entities.values())
+
+    def _generate_contextual_followups(
+        self,
+        query: str,
+        query_type: str,
+        data: Dict[str, Any],
+        depth_mode: str = "standard",
+    ) -> List[str]:
+        if query_type == "supplier_overview":
+            return [
+                "Would you like to see contract details for any specific supplier?",
+                "Should I analyse spending patterns across these suppliers?",
+                "Want to explore consolidation opportunities?",
+            ]
+        if query_type == "financial_analysis":
+            return [
+                "Would you like a breakdown by supplier or category?",
+                "Should I compare this to previous periods?",
+                "Want to identify cost-saving opportunities?",
+            ]
+        if query_type == "comparison":
+            return [
+                "Would you like me to add more suppliers to this comparison?",
+                "Should I analyse performance metrics for these suppliers?",
+                "Want to see historical trends for comparison?",
+            ]
+        if query_type == "policy_lookup":
+            prompts = [
+                "Need a checklist you can share with your team?",
+                "Should I pull the related forms or intranet links?",
+                "Want a quick summary of exceptions versus standard rules?",
+            ]
+            if depth_mode == "expanded":
+                prompts.append("Would examples for specific scenarios (travel, client meetings, etc.) help?")
+            return prompts
+        return [
+            "Would you like more details on any specific aspect?",
+            "Should I search for related procurement policies?",
+            "Want to see how this compares across suppliers?",
+        ]
