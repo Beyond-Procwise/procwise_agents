@@ -375,6 +375,74 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
     assert history_sink.get("saved")
 
 
+def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
+    ack_message = "You're welcome! Happy to help. Let me know if you'd like anything else."
+
+    class DummyStaticAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, query, user_id, session_id=None, **kwargs):
+            payload = {
+                "answer": ack_message,
+                "structured": False,
+                "structure_type": "feedback_acknowledgment",
+                "style": "acknowledgment",
+                "feedback": {"captured": True},
+                "topic": "feedback_acknowledgment",
+                "question": "thank you",
+                "related_prompts": [],
+            }
+            return AgentOutput(status=AgentStatus.SUCCESS, data=payload, confidence=0.95)
+
+    class DummyRAG:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def upsert_texts(self, *args, **kwargs):
+            return None
+
+        def upsert_payloads(self, *args, **kwargs):
+            return None
+
+    def _get_object(**kwargs):
+        return {"Body": SimpleNamespace(read=lambda: b"[]")}
+
+    history_sink: Dict[str, Any] = {}
+
+    def _put_object(**kwargs):
+        history_sink["saved"] = True
+
+    monkeypatch.setattr("services.model_selector.RAGAgent", DummyStaticAgent)
+    monkeypatch.setattr("services.model_selector.RAGService", DummyRAG)
+
+    nick = SimpleNamespace(
+        device="cpu",
+        s3_client=SimpleNamespace(get_object=_get_object, put_object=_put_object),
+        settings=SimpleNamespace(
+            qdrant_collection_name="c",
+            reranker_model="x",
+            s3_bucket_name="bucket",
+            static_qa_confidence_threshold=0.5,
+        ),
+        embedding_model=DummyEmbed(),
+        qdrant_client=SimpleNamespace(),
+        ollama_options=lambda: {},
+    )
+
+    pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
+
+    result = pipeline.answer_question("thank you", "user-abc")
+
+    assert result["answer"] == ack_message
+    assert "For your question" not in result["answer"]
+    assert result["follow_ups"] == []
+    assert history_sink.get("saved")
+
+
 def test_pipeline_uploaded_context_mode(monkeypatch):
     captured: Dict[str, Any] = {}
 
