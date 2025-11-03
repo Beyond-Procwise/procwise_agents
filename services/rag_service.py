@@ -798,13 +798,22 @@ class RAGService:
                     feature_phrases[:5],
                 )
 
-        rewritten_query, auto_conditions = self._rewrite_query(base_query)
+        (
+            rewritten_query,
+            auto_conditions,
+            focus_document_types,
+        ) = self._rewrite_query(base_query)
         combined_filter = self._merge_filters(filters, auto_conditions)
         combined_filter, session_key = self._separate_session_scope(
             combined_filter, session_id
         )
         policy_mode = bool(policy_mode or self._looks_like_policy_query(base_query, hint_text))
         search_text = rewritten_query or base_query
+        focus_document_types = {
+            token.strip().lower()
+            for token in (focus_document_types or [])
+            if isinstance(token, str) and token.strip()
+        }
         feature_hint_parts = feature_keywords[:6] + feature_phrases[:4]
         if feature_hint_parts:
             features_line = ", ".join(dict.fromkeys(feature_hint_parts))
@@ -1150,26 +1159,68 @@ class RAGService:
         if hasattr(scores, "tolist"):
             scores = scores.tolist()
 
+        def _matches_focus_payload(payload: Dict[str, Any]) -> bool:
+            if not focus_document_types:
+                return False
+            if not isinstance(payload, dict):
+                return False
+            text_bits: List[str] = []
+            for key in ("document_type", "source_type", "source_category"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    text_bits.append(value.lower())
+            label_fields = payload.get("tags") or payload.get("labels")
+            if isinstance(label_fields, (list, tuple, set)):
+                for item in label_fields:
+                    if isinstance(item, str) and item.strip():
+                        text_bits.append(item.lower())
+            if not text_bits:
+                return False
+            merged = " ".join(text_bits)
+            return any(token in merged for token in focus_document_types)
+
         def _priority_bonus(hit: SimpleNamespace) -> float:
             payload = getattr(hit, "payload", {}) or {}
             collection = payload.get("collection_name", self.primary_collection)
             document_type = str(payload.get("document_type", "")).lower()
+            source_type = str(payload.get("source_type", "")).lower()
             weights_map = getattr(self, "_preference_weights", {}) or {}
             collection_weights = weights_map.get("collection", {}) or {}
             document_weights = weights_map.get("document_type", {}) or {}
 
-            bonus = float(collection_weights.get(collection, 0.0))
-            if collection == self.static_policy_collection:
-                bonus = max(bonus, 0.12)
-                if policy_mode:
-                    bonus += 0.22
+            collection_bonus = float(collection_weights.get(collection, 0.0))
             doc_bonus = float(document_weights.get(document_type, 0.0))
-            if document_type == "policy":
-                doc_bonus = max(doc_bonus, 0.08)
-                if policy_mode:
-                    doc_bonus += 0.15
 
-            return float(bonus + doc_bonus)
+            is_policy_doc = (
+                document_type == "policy"
+                or "policy" in document_type
+                or source_type == "policy"
+                or "policy" in source_type
+            )
+            matches_focus = _matches_focus_payload(payload)
+
+            if collection == self.static_policy_collection and not policy_mode:
+                collection_bonus = min(collection_bonus, 0.08)
+                doc_bonus = min(doc_bonus, 0.05)
+
+            if policy_mode and (
+                collection == self.static_policy_collection or is_policy_doc
+            ):
+                collection_bonus = max(collection_bonus, 0.14)
+                doc_bonus = max(doc_bonus, 0.1)
+
+            if focus_document_types:
+                if matches_focus:
+                    collection_bonus = max(collection_bonus, 0.12) + 0.12
+                    if document_type:
+                        doc_bonus = max(doc_bonus, 0.1)
+                elif not policy_mode and (
+                    collection == self.static_policy_collection or is_policy_doc
+                ):
+                    collection_bonus = min(collection_bonus, 0.02)
+                    doc_bonus = 0.0
+
+            return float(collection_bonus + doc_bonus)
 
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         rerank_weight = 1.35
@@ -1243,6 +1294,23 @@ class RAGService:
                             )
                             selected[lowest_idx] = candidate
 
+        def _matches_focus(hit_obj: SimpleNamespace) -> bool:
+            return _matches_focus_payload(getattr(hit_obj, "payload", {}) or {})
+
+        if focus_document_types and not any(
+            _matches_focus(hit) for hit, _, _ in selected
+        ):
+            for candidate in scored_hits:
+                if _matches_focus(candidate[0]):
+                    if len(selected) < top_k:
+                        selected.append(candidate)
+                    else:
+                        lowest_idx = min(
+                            range(len(selected)), key=lambda i: selected[i][1]
+                        )
+                        selected[lowest_idx] = candidate
+                    break
+
         deduped: List[Tuple[SimpleNamespace, float, float]] = []
         seen_keys: Set[Tuple[str, str, Any]] = set()
         for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
@@ -1288,10 +1356,10 @@ class RAGService:
 
     def _rewrite_query(
         self, query: str
-    ) -> Tuple[str, List[models.FieldCondition]]:
+    ) -> Tuple[str, List[models.FieldCondition], Set[str]]:
         normalised = re.sub(r"\s+", " ", query or "").strip()
         if not normalised:
-            return "", []
+            return "", [], set()
 
         normalised = re.sub(
             r"(?i)\bpo[-\s]?(\d{3,})\b",
@@ -1300,6 +1368,7 @@ class RAGService:
         )
 
         conditions: List[models.FieldCondition] = []
+        focus_tokens: Set[str] = set()
 
         def _ensure_condition(field: str, value: str) -> None:
             for condition in conditions:
@@ -1311,15 +1380,36 @@ class RAGService:
                 models.FieldCondition(key=field, match=models.MatchValue(value=value))
             )
 
+        def _mark_focus(*values: str) -> None:
+            for value in values:
+                if isinstance(value, str) and value.strip():
+                    focus_tokens.add(value.strip().lower())
+
         lowered = normalised.lower()
         if "policy" in lowered:
             _ensure_condition("source_type", "Policy")
+            _mark_focus("policy")
         if "invoice" in lowered:
             _ensure_condition("source_type", "Invoice")
+            _mark_focus("invoice")
         if "purchase order" in lowered:
             _ensure_condition("source_type", "PO")
+            _mark_focus("purchase order", "po")
+        elif re.search(r"\bpo\b", lowered):
+            _ensure_condition("source_type", "PO")
+            _mark_focus("purchase order", "po")
         if "quote" in lowered:
             _ensure_condition("source_type", "Quote")
+            _mark_focus("quote", "quotation")
+        if "quotation" in lowered:
+            _ensure_condition("source_type", "Quote")
+            _mark_focus("quote", "quotation")
+        if "contract" in lowered:
+            _ensure_condition("source_type", "Contract")
+            _mark_focus("contract", "agreement")
+        if "agreement" in lowered:
+            _ensure_condition("source_type", "Contract")
+            _mark_focus("contract", "agreement")
 
         synonyms: Dict[str, List[str]] = {
             "payment terms": ["net terms", "discount period"],
@@ -1335,7 +1425,7 @@ class RAGService:
             unique = " ".join(sorted(set(expansions)))
             normalised = f"{normalised} {unique}".strip()
 
-        return normalised, conditions
+        return normalised, conditions, focus_tokens
 
     def _compose_hint_text(
         self,
