@@ -135,3 +135,63 @@ def test_build_context_snapshot_reads_scroll_results():
     assert snapshot is not None
     assert snapshot["count"] == 1
     assert snapshot["events"][0]["workflow_id"] == "wf-9"
+
+
+def test_record_model_plan_upserts_vectorised_payload():
+    repo, client = _build_repo()
+
+    metadata = {"plan_version": "v1", "dataset_counts": {"sft": 320, "dpo": 240}}
+    plan_text = "Step 1: curate SFT data. Step 2: run DPO."
+
+    point_id = repo.record_model_plan(
+        model_name="phi4-joshi",
+        plan_text=plan_text,
+        plan_metadata=metadata,
+        tags=["humanization", "phi4"],
+    )
+
+    assert point_id is not None
+    assert client.upserts, "expected model plan to be persisted"
+    _, points = client.upserts[-1]
+    payload = points[0].payload
+
+    assert payload["document_type"] == "model_plan"
+    assert payload["model_name"] == "phi4-joshi"
+    assert payload["plan_text"] == plan_text
+    assert sorted(payload["tags"]) == ["humanization", "phi4"]
+    assert payload["metadata"]["plan_version"] == "v1"
+    assert payload["metadata"]["model_name"] == "phi4-joshi"
+
+
+def test_fetch_model_plans_returns_sorted_payloads():
+    repo, client = _build_repo()
+
+    newer = SimpleNamespace(
+        payload={
+            "document_type": "model_plan",
+            "model_name": "phi4-joshi",
+            "plan_text": "newer",
+            "created_at": "2024-11-12T10:00:00+00:00",
+        }
+    )
+    older = SimpleNamespace(
+        payload={
+            "document_type": "model_plan",
+            "model_name": "phi4-joshi",
+            "plan_text": "older",
+            "created_at": "2024-11-11T10:00:00+00:00",
+        }
+    )
+    unrelated = SimpleNamespace(
+        payload={
+            "document_type": "model_plan",
+            "model_name": "other-model",
+            "plan_text": "skip",
+            "created_at": "2024-11-10T10:00:00+00:00",
+        }
+    )
+    client.scroll_batches = [newer, older, unrelated]
+
+    plans = repo.fetch_model_plans(model_name="phi4-joshi", limit=2)
+
+    assert [plan["plan_text"] for plan in plans] == ["newer", "older"]

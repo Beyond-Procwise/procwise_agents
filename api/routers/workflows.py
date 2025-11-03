@@ -52,12 +52,13 @@ def get_agent_nick(request: Request):
 class AskRequest(BaseModel):
     query: str
     user_id: str
+    session_id: Optional[str] = None
     model_name: Optional[str] = None
     doc_type: Optional[str] = None
     product_type: Optional[str] = None
     file_path: Optional[str] = Field(default=None, description="Optional local file path", json_schema_extra={"example": None})
 
-    @field_validator("doc_type", "product_type", "file_path", mode="before")
+    @field_validator("doc_type", "product_type", "file_path", "session_id", mode="before")
     @classmethod
     def _empty_to_none(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -788,8 +789,17 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
 @router.post("/ask")
 async def ask_question(
     req: AskRequest,
+    request: Request,
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
 ):
+    def _clean(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        return value or None
+
     file_data: List[tuple[bytes, str]] = []
     if req.file_path:
         if not os.path.isfile(req.file_path):
@@ -800,10 +810,14 @@ async def ask_question(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
 
+    header_session = _clean(request.headers.get("x-session-id"))
+    resolved_session = _clean(req.session_id) or header_session or _clean(req.user_id)
+
     result = await run_in_threadpool(
         pipeline.answer_question,
         query=req.query,
         user_id=req.user_id,
+        session_id=resolved_session,
         model_name=req.model_name,
         files=file_data or None,
         doc_type=req.doc_type,

@@ -7,6 +7,7 @@ import logging
 import os
 import importlib
 import importlib.util
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +31,8 @@ from engines.query_engine import QueryEngine
 from engines.routing_engine import RoutingEngine
 from services.process_routing_service import ProcessRoutingService
 from services.learning_repository import LearningRepository
+from services.static_policy_loader import StaticPolicyLoader
+from services.workflow_memory_service import WorkflowMemoryService
 from utils.gpu import configure_gpu
 
 try:  # Optional imports used for dataset persistence
@@ -40,7 +43,72 @@ except Exception:  # pragma: no cover - optional dependency failures handled gra
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = ("qwen3:30b", "mixtral:8x7b", "gemma3")
+
+def _build_phi4_fallback_models() -> Tuple[str, ...]:
+    """Return fallback model identifiers that keep Joshi on phi4."""
+
+    configured = getattr(settings, "rag_model", None)
+    candidates: List[str] = []
+    for name in (configured, "phi4:latest", "phi4"):
+        if not name:
+            continue
+        if "phi4" not in name.lower():
+            continue
+        if name not in candidates:
+            candidates.append(name)
+    if not candidates:
+        candidates.append("phi4:latest")
+    return tuple(candidates)
+
+
+_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = _build_phi4_fallback_models()
+
+
+def _slugify_agent_name(value: Any) -> str:
+    """Return a lower-case slug for ``value`` suitable for registry lookups."""
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?<!^)(?=[A-Z][a-z0-9])", "_", text)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text).lower().strip("_")
+    return slug
+
+
+_AGENT_MODEL_FIELD_PREFERENCES: Dict[str, Tuple[str, ...]] = {
+    "rag_pipeline": ("rag_model", "extraction_model"),
+    "rag_service": ("rag_model", "extraction_model"),
+    "rag_agent": ("rag_model", "extraction_model"),
+    "prompt_engine": ("rag_model", "extraction_model"),
+    "data_extraction_agent": (
+        "data_extraction_model",
+        "document_extraction_model",
+        "extraction_model",
+    ),
+    "supplier_ranking_agent": ("supplier_ranking_model", "extraction_model"),
+    "supplier_interaction_agent": (
+        "supplier_interaction_model",
+        "extraction_model",
+    ),
+    "email_drafting_agent": (
+        "email_compose_model",
+        "negotiation_email_model",
+        "extraction_model",
+    ),
+    "email_dispatch_agent": ("email_dispatch_model", "extraction_model"),
+    "email_watcher_agent": ("email_watcher_model", "extraction_model"),
+    "negotiation_agent": ("negotiation_email_model", "extraction_model"),
+    "quote_evaluation_agent": ("quote_evaluation_model", "extraction_model"),
+    "quote_comparison_agent": ("quote_comparison_model", "extraction_model"),
+    "approvals_agent": ("approvals_model", "extraction_model"),
+    "opportunity_miner_agent": ("opportunity_miner_model", "extraction_model"),
+    "discrepancy_detection_agent": (
+        "discrepancy_detection_model",
+        "extraction_model",
+    ),
+}
 
 
 class AgentStatus(str, Enum):
@@ -320,6 +388,30 @@ class BaseAgent:
         logger.info(
             "%s: completed with status %s", self.__class__.__name__, result.status.value
         )
+
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if memory and getattr(memory, "enabled", False):
+            input_summary = (
+                WorkflowMemoryService.summarise_payload(logged_input)
+                if isinstance(logged_input, dict)
+                else {}
+            )
+            output_summary = (
+                WorkflowMemoryService.summarise_payload(logged_output)
+                if isinstance(logged_output, dict)
+                else {}
+            )
+            try:
+                memory.record_agent_execution(
+                    context.workflow_id,
+                    agent_name=self.__class__.__name__,
+                    status=result.status.value,
+                    summary={"input": input_summary, "output": output_summary},
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "Workflow memory recording failed for %s", self.__class__.__name__, exc_info=True
+                )
 
         self._persist_agentic_plan(context, result)
         try:
@@ -826,7 +918,23 @@ class BaseAgent:
                     exc_info=exc,
                 )
 
-        base_model = getattr(self.settings, "extraction_model", "gpt-oss")
+        fallback_model = getattr(self.settings, "extraction_model", "gpt-oss")
+        base_model = fallback_model
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                resolved_model = resolver(
+                    self.__class__.__name__, fallback=fallback_model
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "Agent-specific model resolution failed for %s",
+                    self.__class__.__name__,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(resolved_model, str) and resolved_model.strip():
+                    base_model = resolved_model.strip()
         quantized = getattr(self.settings, "ollama_quantized_model", None)
 
         missing_models = getattr(self, "_missing_ollama_models", None)
@@ -1258,6 +1366,7 @@ class AgentNick:
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
         self.learning_repository = LearningRepository(self)
+        self.static_policy_loader: Optional[StaticPolicyLoader] = None
         s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
         self._s3_pool_size = s3_pool
         self.s3_client = boto3.client(
@@ -1275,17 +1384,54 @@ class AgentNick:
             self._s3_semaphore = None
         logger.info("Clients initialized.")
 
+        self._initialise_static_policy_corpus()
+
         logger.info("Initializing core engines...")
         self.prompt_engine = PromptEngine(self)
         self.policy_engine = PolicyEngine(self)
         self.query_engine = QueryEngine(self)
         self.routing_engine = RoutingEngine(self)
         self.process_routing_service = ProcessRoutingService(self)
+        self.workflow_memory = WorkflowMemoryService(self)
+        self._agent_model_registry: Optional[Dict[str, str]] = None
+        self._agent_model_fallback: Optional[str] = None
+        self._build_agent_model_registry()
         logger.info("Engines initialized.")
 
         self.agents = {}
         self._initialize_qdrant_collection()
         logger.info("AgentNick is ready.")
+
+    def _initialise_static_policy_corpus(self) -> None:
+        """Ensure the static policy knowledge base is synchronised."""
+
+        if not getattr(self.settings, "static_policy_auto_ingest", True):
+            logger.info("Static policy auto-ingest disabled by configuration")
+            return
+
+        try:
+            loader = StaticPolicyLoader(self)
+        except Exception:  # pragma: no cover - defensive initialisation
+            logger.exception("Failed to initialise static policy loader")
+            return
+
+        self.static_policy_loader = loader
+        try:
+            summary = loader.sync_static_policy()
+        except Exception:  # pragma: no cover - unexpected ingestion failure
+            logger.exception("Static policy ingestion encountered an unexpected error")
+            return
+
+        ingested = summary.get("ingested", 0)
+        skipped = summary.get("skipped", 0)
+        errors: Iterable = summary.get("errors", [])  # type: ignore[assignment]
+
+        if ingested or skipped:
+            logger.info(
+                "Static policy sync complete: %s ingested, %s skipped", ingested, skipped
+            )
+        if errors:
+            logger.warning("Static policy sync reported issues: %s", errors)
 
     @property
     def s3_pool_size(self) -> int:
@@ -1368,6 +1514,67 @@ class AgentNick:
             return {"num_gpu_layers": -1, "keep_alive": "10m"}
         return {"keep_alive": "10m"}
 
+    def _build_agent_model_registry(self) -> Dict[str, str]:
+        """Compile the agent → model preference map with overrides applied."""
+
+        registry: Dict[str, str] = {}
+        overrides = getattr(self.settings, "agent_model_overrides", {}) or {}
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                slug = _slugify_agent_name(key)
+                if not slug:
+                    continue
+                if not isinstance(value, str):
+                    value = str(value)
+                value = value.strip()
+                if value:
+                    registry[slug] = value
+        for slug, fields in _AGENT_MODEL_FIELD_PREFERENCES.items():
+            if slug in registry:
+                continue
+            for field_name in fields:
+                candidate = getattr(self.settings, field_name, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    registry[slug] = candidate.strip()
+                    break
+        fallback = getattr(self.settings, "extraction_model", None)
+        if isinstance(fallback, str) and fallback.strip():
+            self._agent_model_fallback = fallback.strip()
+        self._agent_model_registry = registry
+        return registry
+
+    def refresh_agent_model_registry(self) -> None:
+        """Force regeneration of the cached agent model registry."""
+
+        self._agent_model_registry = None
+        self._build_agent_model_registry()
+
+    def get_agent_model(
+        self,
+        agent_identifier: Any,
+        *,
+        fallback: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the preferred model for ``agent_identifier``."""
+
+        slug = _slugify_agent_name(agent_identifier)
+        registry = self._agent_model_registry
+        if registry is None:
+            registry = self._build_agent_model_registry()
+        if slug:
+            model_name = registry.get(slug)
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+        if fallback is not None:
+            return fallback
+        if isinstance(self._agent_model_fallback, str) and self._agent_model_fallback:
+            return self._agent_model_fallback
+        fallback_model = getattr(self.settings, "extraction_model", None)
+        if isinstance(fallback_model, str) and fallback_model.strip():
+            self._agent_model_fallback = fallback_model.strip()
+            return self._agent_model_fallback
+        return fallback
+
     def get_db_connection(self):
         return psycopg2.connect(
             host=self.settings.db_host, dbname=self.settings.db_name,
@@ -1382,6 +1589,7 @@ class AgentNick:
             "product_type": models.PayloadSchemaType.KEYWORD,
             "record_id": models.PayloadSchemaType.KEYWORD,
             "workflow_id": models.PayloadSchemaType.KEYWORD,
+            "source_type": models.PayloadSchemaType.KEYWORD,
         }
 
         def ensure_indexes(schema: Dict[str, Any]) -> None:

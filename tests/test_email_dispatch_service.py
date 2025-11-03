@@ -376,6 +376,88 @@ def test_email_dispatch_service_sends_and_updates_status(monkeypatch):
     assert _BackendSchedulerProxy.notifications == [result["workflow_id"]]
 
 
+def test_email_dispatch_service_returns_existing_dispatch(monkeypatch):
+    _BackendSchedulerProxy.reset()
+
+    store = InMemoryDraftStore()
+    unique_id = "PROC-WF-IDEMP-001"
+    workflow_identifier = "wf-idempotent-001"
+    message_id = "<existing-message-id>"
+    run_id = "existing-run"
+
+    draft_payload = {
+        "rfq_id": "RFQ-IDEMP",
+        "subject": DEFAULT_RFQ_SUBJECT,
+        "body": "<p>Ready</p>",
+        "receiver": "buyer@example.com",
+        "recipients": ["buyer@example.com"],
+        "sender": "sender@example.com",
+        "thread_index": 1,
+        "contact_level": 1,
+        "sent_status": True,
+        "workflow_id": workflow_identifier,
+        "unique_id": unique_id,
+        "dispatch_metadata": {
+            "workflow_id": workflow_identifier,
+            "unique_id": unique_id,
+            "message_id": message_id,
+            "run_id": run_id,
+            "dispatch_token": run_id,
+        },
+        "thread_headers": {
+            "In-Reply-To": ["<prior@procwise.example>"]
+        },
+    }
+
+    store.add(
+        {
+            "rfq_id": "RFQ-IDEMP",
+            "supplier_id": "S1",
+            "supplier_name": "Acme",
+            "subject": draft_payload["subject"],
+            "body": draft_payload["body"],
+            "sent": True,
+            "recipient_email": "buyer@example.com",
+            "contact_level": 1,
+            "thread_index": 1,
+            "sender": "sender@example.com",
+            "payload": json.dumps(draft_payload),
+            "sent_on": "2024-01-01T00:00:00Z",
+            "workflow_id": workflow_identifier,
+            "unique_id": unique_id,
+        }
+    )
+
+    action_store = InMemoryActionStore()
+    nick = DummyNick(store, action_store)
+    service = EmailDispatchService(nick)
+
+    call_count = {"send": 0}
+
+    def fail_send(*args, **kwargs):  # pragma: no cover - guard path
+        call_count["send"] += 1
+        raise AssertionError("send_email should not be invoked for existing dispatches")
+
+    monkeypatch.setattr(service.email_service, "send_email", fail_send)
+
+    result = service.send_draft(
+        unique_id,
+        workflow_dispatch_context={"workflow_id": workflow_identifier, "unique_id": unique_id},
+    )
+
+    assert call_count["send"] == 0
+    assert result["sent"] is True
+    assert result["message_id"] == message_id
+    assert result["recipients"] == ["buyer@example.com"]
+    assert result["workflow_id"] == workflow_identifier
+    assert result["draft"]["dispatch_metadata"]["message_id"] == message_id
+    assert result["draft"]["dispatch_metadata"]["run_id"] == run_id
+    assert result["draft"]["sent_status"] is True
+    assert result["draft"].get("thread_headers", {}).get("In-Reply-To") == [
+        "<prior@procwise.example>"
+    ]
+
+
 def test_email_dispatch_service_defaults_to_workflow_tracking(monkeypatch):
     _BackendSchedulerProxy.notifications.clear()
 

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from config.settings import settings
 from services.event_bus import get_event_bus
 from services.redis_client import get_workflow_redis_client
+from repositories import workflow_round_response_repo
 
 logger = logging.getLogger(__name__)
 
@@ -545,6 +546,18 @@ def notify_response_received(
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "Failed to notify response coordinator for workflow=%s unique_id=%s",
+            workflow_key,
+            unique_key,
+        )
+    try:
+        workflow_round_response_repo.mark_response_received(
+            workflow_id=workflow_key,
+            round_number=round_number,
+            unique_id=unique_key,
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "Failed to update round response status for workflow=%s unique_id=%s",
             workflow_key,
             unique_key,
         )

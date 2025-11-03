@@ -159,6 +159,15 @@ class Orchestrator:
         workflow_id = str(uuid.uuid4())
         logger.info(f"Starting workflow {workflow_name} with ID {workflow_id}")
 
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if memory and getattr(memory, "enabled", False):
+            try:
+                memory.start(workflow_id, workflow_name)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Workflow memory initialisation failed for %s", workflow_id, exc_info=True
+                )
+
         context: Optional[AgentContext] = None
         enriched_input: Dict[str, Any] = {}
 
@@ -218,6 +227,14 @@ class Orchestrator:
                 status="completed",
             )
 
+            self._finalise_workflow_memory(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                context=context,
+                result=result,
+                success=True,
+            )
+
             return {
                 "status": "completed",
                 "workflow_id": workflow_id,
@@ -245,6 +262,13 @@ class Orchestrator:
                 context=context,
                 result={"error": str(e)},
                 status="failed",
+            )
+            self._finalise_workflow_memory(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                context=context,
+                result={"error": str(e)},
+                success=False,
             )
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
@@ -2349,6 +2373,80 @@ class Orchestrator:
             self.event_bus.publish("workflow.complete", payload)
         except Exception:  # pragma: no cover - defensive publication
             logger.exception("Failed to publish workflow.complete event for %s", workflow_id)
+
+    def _finalise_workflow_memory(
+        self,
+        *,
+        workflow_id: str,
+        workflow_name: str,
+        context: Optional[AgentContext],
+        result: Any,
+        success: bool,
+    ) -> None:
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if not memory or not getattr(memory, "enabled", False) or not workflow_id:
+            return
+
+        repository = getattr(self.agent_nick, "learning_repository", None)
+        events: List[Dict[str, Any]] = []
+        if success:
+            try:
+                events = memory.drain_learning_events(workflow_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to drain workflow learning events for %s", workflow_id, exc_info=True
+                )
+                events = []
+
+            if repository:
+                for record in events:
+                    if not isinstance(record, dict) or record.get("type") != "learning_event":
+                        continue
+                    event_payload = record.get("event") if isinstance(record.get("event"), dict) else {}
+                    category = event_payload.get("category")
+                    try:
+                        if category == "email_draft":
+                            repository.record_email_learning(
+                                workflow_id=workflow_id,
+                                draft=event_payload.get("draft") or {},
+                                context=event_payload.get("context") or {},
+                            )
+                        elif category == "negotiation_snapshot":
+                            repository.record_negotiation_learning(
+                                workflow_id=workflow_id,
+                                rfq_id=event_payload.get("rfq_id"),
+                                supplier_id=event_payload.get("supplier_id"),
+                                decision=event_payload.get("decision") or {},
+                                state=event_payload.get("state") or {},
+                                awaiting_response=bool(event_payload.get("awaiting_response")),
+                                supplier_reply_registered=bool(
+                                    event_payload.get("supplier_reply_registered")
+                                ),
+                            )
+                    except Exception:  # pragma: no cover - learning capture failures are non fatal
+                        logger.debug(
+                            "Failed to record learning event for workflow=%s category=%s",
+                            workflow_id,
+                            category,
+                            exc_info=True,
+                        )
+
+                if hasattr(repository, "record_workflow_learning"):
+                    try:
+                        repository.record_workflow_learning(
+                            workflow_id=workflow_id,
+                            workflow_name=workflow_name,
+                            result=result if isinstance(result, dict) else {"result": result},
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.debug(
+                            "Failed to record workflow learning for %s", workflow_id, exc_info=True
+                        )
+
+        try:
+            memory.complete(workflow_id, success=success)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to clear workflow memory for %s", workflow_id, exc_info=True)
 
     def _execute_parallel_agents(
         self, agents: List[str], context: AgentContext, pass_fields: Dict

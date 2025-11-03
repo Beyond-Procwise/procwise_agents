@@ -50,7 +50,23 @@ class PromptEngine:
         connection_factory: Optional[Any] = None,
         prompt_rows: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> None:
-        self.llm_model = settings.extraction_model
+        fallback_model = getattr(settings, "extraction_model", "gpt-oss")
+        resolved_model: Optional[str] = None
+        if agent_nick is not None:
+            resolver = getattr(agent_nick, "get_agent_model", None)
+            if callable(resolver):
+                try:
+                    candidate = resolver("prompt_engine", fallback=None)
+                except Exception:  # pragma: no cover - defensive logging only
+                    logger.debug(
+                        "PromptEngine model resolution failed; using fallback",
+                        exc_info=True,
+                    )
+                else:
+                    if isinstance(candidate, str) and candidate.strip():
+                        resolved_model = candidate.strip()
+
+        self.llm_model = resolved_model or fallback_model
 
         if connection_factory is not None:
             self._connection_factory = connection_factory

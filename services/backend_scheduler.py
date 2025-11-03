@@ -247,6 +247,9 @@ class BackendScheduler:
                     orchestrator=orchestrator,
                     supplier_agent=supplier_agent,
                     negotiation_agent=negotiation_agent,
+                    process_routing_service=getattr(
+                        supplier_agent, "process_routing_service", None
+                    ),
                 )
             service = self._email_watcher_service
             updater = getattr(service, "update_dependencies", None)

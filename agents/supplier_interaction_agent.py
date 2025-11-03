@@ -22,6 +22,7 @@ from repositories import (
 )
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
+from services.watcher_utils import run_email_watcher_for_workflow
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.negotiation_agent import NegotiationAgent
@@ -38,6 +39,8 @@ class SupplierInteractionAgent(BaseAgent):
         "Return structured responses or trigger downstream negotiation actions.",
     )
 
+    WATCHER_COOLDOWN_SECONDS = 30
+
     WORKFLOW_POLL_INTERVAL_SECONDS = 30
     RESPONSE_GATE_POLL_SECONDS = 30
 
@@ -50,6 +53,7 @@ class SupplierInteractionAgent(BaseAgent):
         self._response_coordinator = SupplierResponseWorkflow()
         self._dispatch_schema_ready = False
         self._response_schema_ready = False
+        self._watcher_last_run: Dict[str, float] = {}
 
     # Suppliers occasionally include upper-case letters or non-hex characters
     # in the terminal segment (``RFQ-20240101-ABCD123Z``).  The updated pattern
@@ -627,6 +631,33 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
+    def _trigger_email_watcher(self, workflow_id: Optional[str]) -> None:
+        workflow_key = self._coerce_text(workflow_id)
+        if not workflow_key:
+            return
+        now = time.monotonic()
+        last_run = self._watcher_last_run.get(workflow_key, 0.0)
+        if now - last_run < self.WATCHER_COOLDOWN_SECONDS:
+            return
+        self._watcher_last_run[workflow_key] = now
+        try:
+            run_email_watcher_for_workflow(
+                workflow_id=workflow_key,
+                run_id=None,
+                wait_seconds_after_last_dispatch=0,
+                agent_registry=getattr(self.agent_nick, "agents", None),
+                orchestrator=None,
+                supplier_agent=self,
+                negotiation_agent=self._get_negotiation_agent(),
+                workflow_memory=getattr(self.agent_nick, "workflow_memory", None),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to trigger email watcher for workflow=%s",
+                workflow_key,
+                exc_info=True,
+            )
+
     def _await_supplier_response_rows(
         self,
         workflow_id: str,
@@ -684,6 +715,7 @@ class SupplierInteractionAgent(BaseAgent):
 
         metadata: Optional[Dict[str, Any]] = None
         while True:
+            self._trigger_email_watcher(workflow_id)
             metadata = self._load_dispatch_metadata(workflow_id)
             if metadata is not None:
                 break
@@ -734,14 +766,6 @@ class SupplierInteractionAgent(BaseAgent):
                 expected_unique_ids &= filtered_ids
                 if not expected_unique_ids:
                     expected_unique_ids = filtered_ids
-
-        if not expected_unique_ids:
-            candidate_ids = dispatch_summary.get("unique_ids") or []
-            expected_unique_ids = {
-                self._coerce_text(value)
-                for value in candidate_ids
-                if self._coerce_text(value)
-            }
 
         coordinator = getattr(self, "_response_coordinator", None)
         if coordinator is None:
@@ -797,6 +821,7 @@ class SupplierInteractionAgent(BaseAgent):
             )
 
             if rows:
+                self._watcher_last_run.pop(workflow_id, None)
                 return self._process_responses_concurrently(rows)
 
             if routing_service and routing_service.workflow_has_failed(workflow_id):
@@ -1917,7 +1942,7 @@ class SupplierInteractionAgent(BaseAgent):
             dispatch_rows = [row for row in rows if getattr(row, "dispatched_at", None)]
 
             ordered = {}
-            thread_headers = {}
+            thread_headers = {};
             for row in dispatch_rows:
                 unique_id = self._coerce_text(getattr(row, "unique_id", None))
                 if expected_set and unique_id not in expected_set:
@@ -3817,11 +3842,26 @@ class SupplierInteractionAgent(BaseAgent):
         }
 
         try:
-            model_name = getattr(
+            fallback_model = getattr(
                 self.settings,
                 "supplier_interaction_model",
                 getattr(self.settings, "extraction_model", None),
             )
+            resolver = getattr(self.agent_nick, "get_agent_model", None)
+            model_name = fallback_model
+            if callable(resolver):
+                try:
+                    candidate = resolver(
+                        self.__class__.__name__, fallback=fallback_model
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "SupplierInteractionAgent model resolution failed",
+                        exc_info=True,
+                    )
+                else:
+                    if isinstance(candidate, str) and candidate.strip():
+                        model_name = candidate.strip()
             response = self.call_ollama(
                 model=model_name,
                 format="json",

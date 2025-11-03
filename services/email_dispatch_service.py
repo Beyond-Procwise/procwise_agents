@@ -143,6 +143,11 @@ class EmailDispatchService:
                     "Draft found but missing unique_id. Draft data may be corrupted."
                 )
 
+            existing_dispatch_metadata = (
+                draft.get("dispatch_metadata")
+                if isinstance(draft.get("dispatch_metadata"), dict)
+                else None
+            )
             rfq_identifier = self._normalise_identifier(draft.get("rfq_id"))
 
             recipient_list = self._normalise_recipients(
@@ -178,7 +183,14 @@ class EmailDispatchService:
                 draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
             )
             draft_metadata = dict(draft_metadata_source)
-            dispatch_run_id = uuid.uuid4().hex
+            existing_run_id = self._coerce_text(
+                (existing_dispatch_metadata or {}).get("run_id")
+                or (existing_dispatch_metadata or {}).get("dispatch_token")
+                or draft_metadata.get("run_id")
+                or draft.get("dispatch_run_id")
+                or draft.get("run_id")
+            )
+            dispatch_run_id = existing_run_id or uuid.uuid4().hex
             draft_metadata["dispatch_token"] = dispatch_run_id
             draft_metadata["run_id"] = dispatch_run_id
             body, backend_metadata = self._ensure_tracking_annotation(
@@ -190,6 +202,10 @@ class EmailDispatchService:
                 workflow_id=draft.get("workflow_id"),
             )
             backend_metadata["run_id"] = dispatch_run_id
+            if existing_dispatch_metadata:
+                for key, value in existing_dispatch_metadata.items():
+                    if key not in backend_metadata:
+                        backend_metadata[key] = value
 
             workflow_context_payload = self._normalise_workflow_context(
                 workflow_dispatch_context
@@ -279,6 +295,32 @@ class EmailDispatchService:
                 dispatch_payload["metadata"].setdefault("run_id", dispatch_run_id)
                 dispatch_payload["metadata"]["dispatch_token"] = dispatch_run_id
 
+            thread_headers = self._resolve_initial_thread_headers(
+                draft=draft,
+                dispatch_payload=dispatch_payload,
+                dispatch_context=dispatch_payload_context,
+                backend_metadata=backend_metadata,
+                existing_dispatch_metadata=existing_dispatch_metadata,
+            )
+
+            existing_result = self._maybe_return_existing_dispatch(
+                draft=draft,
+                existing_dispatch_metadata=existing_dispatch_metadata,
+                backend_metadata=backend_metadata,
+                dispatch_payload=dispatch_payload,
+                dispatch_payload_context=dispatch_payload_context,
+                thread_headers=thread_headers,
+                workflow_identifier=workflow_identifier,
+                unique_id=unique_id,
+                recipient_list=recipient_list,
+                sender_email=sender_email,
+                subject=subject,
+                body=body,
+                workflow_email_flag=workflow_email_flag,
+            )
+            if existing_result is not None:
+                return existing_result
+
             round_header_value = (
                 dispatch_payload.get("round")
                 or dispatch_payload.get("thread_index")
@@ -313,6 +355,10 @@ class EmailDispatchService:
             if mailbox_header:
                 backend_metadata["mailbox"] = mailbox_header
                 headers["X-ProcWise-Mailbox"] = mailbox_header
+
+            if thread_headers:
+                header_values = self._extract_thread_header_values(thread_headers)
+                headers.update(header_values)
 
             workflow_for_error = (
                 backend_metadata.get("workflow_id")
@@ -356,6 +402,10 @@ class EmailDispatchService:
             conn.commit()
 
             dispatch_payload["sent_status"] = bool(sent)
+            notification_evaluated = False
+            should_notify_watcher = False
+            should_record_workflow = False
+            notified = False
             if sent:
                 dispatch_payload["sent_on"] = datetime.utcnow().isoformat()
                 dispatch_payload["message_id"] = message_id
@@ -430,6 +480,7 @@ class EmailDispatchService:
                         "workflow_id is required for email dispatch tracking"
                     )
                 backend_metadata.setdefault("workflow_id", workflow_identifier)
+                should_record_workflow = bool(workflow_identifier and unique_id)
                 context_unique_id = None
                 if dispatch_payload_context:
                     backend_metadata.setdefault(
@@ -445,7 +496,7 @@ class EmailDispatchService:
                         backend_metadata.setdefault(
                             "workflow_context_identifier", context_unique_id
                         )
-                if workflow_identifier and unique_id:
+                if should_record_workflow:
                     try:
                         record_workflow_dispatch(
                             workflow_id=workflow_identifier,
@@ -1273,6 +1324,158 @@ class EmailDispatchService:
             if trimmed:
                 headers["Message-ID"] = [trimmed]
         return headers or None
+
+    def _resolve_initial_thread_headers(
+        self,
+        *,
+        draft: Mapping[str, Any],
+        dispatch_payload: Mapping[str, Any],
+        dispatch_context: Optional[Mapping[str, Any]],
+        backend_metadata: Mapping[str, Any],
+        existing_dispatch_metadata: Optional[Mapping[str, Any]],
+    ) -> Optional[Dict[str, List[str]]]:
+        candidates = [
+            draft.get("thread_headers"),
+            draft.get("headers"),
+        ]
+        metadata_candidate = draft.get("metadata")
+        if isinstance(metadata_candidate, Mapping):
+            candidates.extend(
+                [
+                    metadata_candidate.get("thread_headers"),
+                    metadata_candidate.get("headers"),
+                ]
+            )
+        if isinstance(existing_dispatch_metadata, Mapping):
+            candidates.append(existing_dispatch_metadata.get("thread_headers"))
+        payload_metadata = dispatch_payload.get("metadata")
+        if isinstance(payload_metadata, Mapping):
+            candidates.append(payload_metadata.get("thread_headers"))
+        if isinstance(dispatch_context, Mapping):
+            candidates.append(dispatch_context.get("thread_headers"))
+        candidates.append(backend_metadata.get("thread_headers"))
+
+        for candidate in candidates:
+            headers = self._normalise_thread_headers(candidate)
+            if headers:
+                return headers
+        return None
+
+    def _maybe_return_existing_dispatch(
+        self,
+        *,
+        draft: Mapping[str, Any],
+        existing_dispatch_metadata: Optional[Mapping[str, Any]],
+        backend_metadata: Dict[str, Any],
+        dispatch_payload: Dict[str, Any],
+        dispatch_payload_context: Optional[Mapping[str, Any]],
+        thread_headers: Optional[Dict[str, List[str]]],
+        workflow_identifier: Optional[str],
+        unique_id: str,
+        recipient_list: Sequence[str],
+        sender_email: str,
+        subject: str,
+        body: str,
+        workflow_email_flag: Optional[bool],
+    ) -> Optional[Dict[str, Any]]:
+        already_sent = bool(
+            draft.get("sent_status")
+            or draft.get("sent")
+            or (isinstance(existing_dispatch_metadata, Mapping) and existing_dispatch_metadata.get("message_id"))
+        )
+        if not already_sent:
+            return None
+
+        message_id = self._coerce_text(
+            (existing_dispatch_metadata or {}).get("message_id")
+            or backend_metadata.get("message_id")
+        )
+        resolved_thread_headers = thread_headers
+        resolved_recipients = list(recipient_list)
+        dispatch_row = None
+
+        if not message_id and workflow_identifier:
+            try:
+                dispatch_row = workflow_email_tracking_repo.lookup_dispatch_row(
+                    workflow_id=workflow_identifier,
+                    unique_id=unique_id,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                self.logger.exception(
+                    "Failed to look up existing dispatch for workflow %s unique_id=%s",
+                    workflow_identifier,
+                    unique_id,
+                )
+            if dispatch_row and dispatch_row.message_id:
+                message_id = self._coerce_text(dispatch_row.message_id)
+                if not resolved_thread_headers:
+                    resolved_thread_headers = self._normalise_thread_headers(
+                        dispatch_row.thread_headers
+                    )
+                if not resolved_recipients and dispatch_row.recipient_emails:
+                    resolved_recipients = [
+                        str(item).strip()
+                        for item in dispatch_row.recipient_emails
+                        if str(item).strip()
+                    ]
+
+        if not message_id:
+            return None
+
+        resolved_thread_headers = resolved_thread_headers or self._normalise_thread_headers(
+            (existing_dispatch_metadata or {}).get("thread_headers")
+        )
+
+        backend_metadata.setdefault("workflow_id", workflow_identifier)
+        supplier_hint = dispatch_payload.get("supplier_id") or draft.get("supplier_id")
+        if supplier_hint:
+            backend_metadata.setdefault("supplier_id", supplier_hint)
+        backend_metadata["message_id"] = message_id
+        dispatch_payload["message_id"] = message_id
+        dispatch_payload["sent_status"] = True
+        if dispatch_payload_context:
+            dispatch_payload["workflow_context"] = dispatch_payload_context
+        if resolved_thread_headers:
+            backend_metadata.setdefault("thread_headers", resolved_thread_headers)
+            dispatch_payload["thread_headers"] = resolved_thread_headers
+        dispatch_payload.setdefault("workflow_id", backend_metadata.get("workflow_id"))
+        if backend_metadata.get("run_id"):
+            dispatch_payload.setdefault("run_id", backend_metadata.get("run_id"))
+        if draft.get("sent_on") and "sent_on" not in dispatch_payload:
+            dispatch_payload["sent_on"] = draft.get("sent_on")
+
+        resolved_recipients = resolved_recipients or self._normalise_recipients(
+            dispatch_payload.get("recipients")
+        )
+        if not resolved_recipients and dispatch_payload.get("receiver"):
+            resolved_recipients = [dispatch_payload.get("receiver")]  # type: ignore[list-item]
+
+        workflow_flag = workflow_email_flag
+        if workflow_flag is None:
+            workflow_flag = self._coerce_bool_flag(draft.get("workflow_email"))
+
+        self.logger.info(
+            "Skipping duplicate supplier dispatch workflow=%s unique_id=%s message_id=%s",
+            backend_metadata.get("workflow_id") or workflow_identifier,
+            unique_id,
+            message_id,
+        )
+
+        return {
+            "unique_id": unique_id,
+            "sent": True,
+            "recipients": resolved_recipients,
+            "sender": sender_email,
+            "subject": subject,
+            "body": body,
+            "message_id": message_id,
+            "thread_index": dispatch_payload.get("thread_index"),
+            "workflow_id": backend_metadata.get("workflow_id") or workflow_identifier,
+            "run_id": backend_metadata.get("run_id") or dispatch_payload.get("run_id"),
+            "workflow_email": bool(workflow_flag) if workflow_flag is not None else False,
+            "workflow_context": dispatch_payload_context,
+            "draft": dispatch_payload,
+        }
 
     def _normalise_recipients(self, recipients: Optional[Iterable[str]]) -> List[str]:
         if recipients is None:

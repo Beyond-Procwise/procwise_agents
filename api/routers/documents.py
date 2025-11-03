@@ -4,22 +4,19 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import uuid4
 
 import pdfplumber
 from botocore.exceptions import ClientError
 from docx import Document as DocxDocument
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pptx import Presentation
 from pydantic import BaseModel, Field, field_validator
 
 from services.document_embedding_service import DocumentEmbeddingService
-
 from services.document_extractor import DocumentExtractor
 from services.model_selector import RAGPipeline
 
@@ -32,7 +29,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/documents", tags=["Documents"])
+router = APIRouter(prefix="/document", tags=["Documents"])
 
 
 DEFAULT_S3_BUCKET_NAME = "procwisemvp"
@@ -144,6 +141,23 @@ class DocumentEmbeddingResponse(BaseModel):
     collection: str
     chunk_count: int
     metadata: Dict[str, Any]
+
+
+class DocumentEmbeddingError(BaseModel):
+    """Details about documents that failed to embed."""
+
+    filename: str
+    reason: str
+
+
+class DocumentEmbeddingBatchResponse(BaseModel):
+    """Aggregate response for multi-document embedding uploads."""
+
+    status: str
+    total_documents: int
+    total_chunks: int
+    processed: List[DocumentEmbeddingResponse]
+    failed: List[DocumentEmbeddingError] = Field(default_factory=list)
 
 
 def _resolve_s3_path(s3_path: str, default_bucket: str) -> Tuple[str, str]:
@@ -327,15 +341,36 @@ def extract_document_from_s3(
     return response_payload
 
 
-@router.post("/upload")
-async def upload_documents(
+@router.post("/embed-document", response_model=DocumentEmbeddingBatchResponse)
+async def embed_documents(
+    request: Request,
     files: List[UploadFile] = File(...),
+    user_id: Optional[str] = Form(None),
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    agent_nick=Depends(get_agent_nick),
 ):
-    """Accept user documents, embed their content, and store them in Qdrant."""
+    """Upload, extract, embed, and register user-provided documents for the RAG pipeline."""
 
     if not files:
         raise HTTPException(status_code=400, detail="At least one document must be provided")
+
+    def _clean(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        return value or None
+
+    header_user = _clean(request.headers.get("x-user-id"))
+    header_session = _clean(request.headers.get("x-session-id"))
+    query_user = _clean(request.query_params.get("user_id"))
+
+    resolved_user: Optional[str] = None
+    for candidate in (_clean(user_id), header_user, query_user):
+        if candidate:
+            resolved_user = candidate
+            break
 
     rag_service = pipeline.rag
     collection_name = getattr(rag_service, "uploaded_collection", "uploaded_documents")
@@ -351,97 +386,118 @@ async def upload_documents(
             detail="Failed to initialise vector collection for uploaded documents.",
         ) from exc
 
-    processed_files: List[str] = []
+    embedding_service = DocumentEmbeddingService(agent_nick, collection_name=collection_name)
+
+    processed: List[DocumentEmbeddingResponse] = []
+    failures: List[DocumentEmbeddingError] = []
     total_chunks = 0
 
     for upload in files:
         filename = Path(upload.filename or "uploaded_document").name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES:
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason=(
+                        f"Unsupported file type '{suffix or 'unknown'}'. "
+                        "Allowed types: PDF, DOCX, PPTX, TXT."
+                    ),
+                )
+            )
+            continue
+
         try:
             data = await upload.read()
         except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Unable to read file '{filename}': {exc}"
-            ) from exc
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason=f"Unable to read file: {exc}",
+                )
+            )
+            continue
 
         if not data:
-            logger.warning("Uploaded file %s contained no data", filename)
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason="Uploaded file contained no data.",
+                )
+            )
             continue
 
-        text = _extract_text_from_bytes(filename, data)
-        text = text.strip()
-        if not text:
-            logger.warning("No extractable text found in %s", filename)
-            continue
-
-        chunk_preview = rag_service._chunk_text(text)
-        if not chunk_preview:
-            logger.warning("Chunking produced no content for %s", filename)
-            continue
-
-        timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-        payload = {
-            "record_id": f"upload::{uuid4()}",
-            "document_name": filename,
-            "timestamp_uploaded": timestamp,
-            "content": text,
-            "ingestion_source": "documents_upload",
+        metadata: Dict[str, Any] = {
+            "mime_type": upload.content_type or "",
+            "ingestion_source": "document_embed_endpoint",
         }
+        if resolved_user:
+            metadata["uploaded_by"] = resolved_user
 
-        rag_service.upsert_payloads(
-            [payload], text_representation_key="content", collection_name=collection_name
+        try:
+            embedded = embedding_service.embed_document(
+                filename=filename,
+                file_bytes=data,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            failures.append(DocumentEmbeddingError(filename=filename, reason=str(exc)))
+            continue
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Embedding pipeline failed for %s", filename)
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason="Unexpected error while embedding document.",
+                )
+            )
+            continue
+
+        processed.append(
+            DocumentEmbeddingResponse(
+                document_id=embedded.document_id,
+                collection=embedded.collection,
+                chunk_count=embedded.chunk_count,
+                metadata=embedded.metadata,
+            )
         )
-        processed_files.append(filename)
-        total_chunks += len(chunk_preview)
+        total_chunks += embedded.chunk_count
 
-    if not processed_files:
-        raise HTTPException(
-            status_code=400,
-            detail="No extractable content was found in the uploaded documents.",
-        )
+    if not processed:
+        detail = failures[0].reason if failures else "No documents were processed."
+        raise HTTPException(status_code=400, detail=detail)
 
-    return {
-        "status": "success",
-        "files_processed": processed_files,
-        "records_added": total_chunks,
+    uploaded_document_ids = [doc.document_id for doc in processed]
+    upload_metadata = {
+        "filenames": [
+            doc.metadata.get("filename") or doc.metadata.get("doc_name") for doc in processed
+        ],
+        "total_chunks": total_chunks,
     }
+    if resolved_user:
+        upload_metadata["uploaded_by"] = resolved_user
 
-
-__all__ = ["router"]
-
-
-@router.post("/embed-document", response_model=DocumentEmbeddingResponse)
-async def embed_document(
-    file: UploadFile = File(...),
-    agent_nick=Depends(get_agent_nick),
-):
-    """Ingest an uploaded document and persist its embeddings."""
-
-    filename = file.filename or "uploaded-document"
     try:
-        file_bytes = await file.read()
-    except Exception as exc:  # pragma: no cover - defensive I/O guard
-        logger.exception("Failed to read uploaded file %s", filename)
-        raise HTTPException(status_code=500, detail="Unable to read uploaded file") from exc
-
-    service = DocumentEmbeddingService(agent_nick)
-    metadata = {"mime_type": file.content_type or ""}
-    try:
-        embedded = service.embed_document(
-            filename=filename,
-            file_bytes=file_bytes,
-            metadata=metadata,
+        pipeline.activate_uploaded_context(
+            uploaded_document_ids,
+            metadata=upload_metadata,
+            session_id=header_session or resolved_user,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("Embedding pipeline failed for %s", filename)
-        raise HTTPException(status_code=500, detail="Failed to embed uploaded document") from exc
+    except AttributeError:
+        logger.debug(
+            "RAG pipeline does not expose uploaded context activation",
+            exc_info=True,
+        )
 
-    return DocumentEmbeddingResponse(
-        document_id=embedded.document_id,
-        collection=embedded.collection,
-        chunk_count=embedded.chunk_count,
-        metadata=embedded.metadata,
+    return DocumentEmbeddingBatchResponse(
+        status="success",
+        total_documents=len(processed),
+        total_chunks=total_chunks,
+        processed=processed,
+        failed=failures,
     )
 
 
+__all__ = ["router"]

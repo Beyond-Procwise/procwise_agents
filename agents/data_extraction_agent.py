@@ -63,8 +63,10 @@ from utils.procurement_schema import (
 )
 from services.document_extractor import (
     DocumentExtractor,
+    LayoutAwareParser,
     RAW_TABLE_MAPPING as DOC_EXTRACTOR_RAW_TABLES,
 )
+from services.semantic_chunker import SemanticChunker
 
 
 logger = logging.getLogger(__name__)
@@ -717,6 +719,8 @@ class DataExtractionAgent(BaseAgent):
         self.extraction_model = self._select_fast_extraction_model()
         self._document_extractor: Optional[DocumentExtractor] = None
         self._document_extractor_lock = threading.Lock()
+        self._layout_parser = LayoutAwareParser()
+        self._semantic_chunker = SemanticChunker(settings=self.settings)
 
     @staticmethod
     def _json_default(value: Any) -> Any:
@@ -766,13 +770,27 @@ class DataExtractionAgent(BaseAgent):
     def _select_fast_extraction_model(self) -> str:
         preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
 
+        override_model: Optional[str] = None
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                candidate = resolver(self.__class__.__name__, fallback=None)
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "DataExtractionAgent model override lookup failed", exc_info=True
+                )
+            else:
+                if isinstance(candidate, str) and candidate.strip():
+                    override_model = candidate.strip()
+
         configured_models: Tuple[str, ...] = tuple(
             model
             for model in (
+                override_model,
                 getattr(self.settings, "document_extraction_model", None),
                 getattr(self.settings, "extraction_model", None),
             )
-            if model
+            if isinstance(model, str) and model.strip()
         )
 
         candidates: Tuple[str, ...] = tuple(
@@ -5214,7 +5232,11 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
 
-        chunks = self._chunk_text(full_text)
+        chunk_fn = self._chunk_text
+        try:
+            chunks = chunk_fn(full_text, doc_type=doc_type)
+        except TypeError:
+            chunks = chunk_fn(full_text)  # type: ignore[misc]
         if not chunks:
             return
 
@@ -5222,11 +5244,11 @@ class DataExtractionAgent(BaseAgent):
             chunks, normalize_embeddings=True, show_progress_bar=False
         )
 
-        summary = full_text[:200]
         record_id = pk_value or object_key
 
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            chunk_summary = chunk.strip()[:240]
             payload = {
                 "record_id": record_id,
                 "document_type": _normalize_label(doc_type),
@@ -5234,7 +5256,7 @@ class DataExtractionAgent(BaseAgent):
                 "s3_key": object_key,
                 "chunk_id": idx,
                 "content": chunk,
-                "summary": summary,
+                "summary": chunk_summary,
             }
             point_id = _normalize_point_id(f"{record_id}_{idx}")
             points.append(
@@ -5362,24 +5384,72 @@ class DataExtractionAgent(BaseAgent):
                 raise
 
     # ============================ TEXT CHUNKING ===========================
-    def _chunk_text(self, text: str, max_tokens: int = 256, overlap: int = 20) -> List[str]:
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
+    def _chunk_text(
+        self,
+        text: str,
+        *,
+        doc_type: Any = None,
+        max_tokens: int = 720,
+        overlap: int = 80,
+    ) -> List[str]:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
             return []
+
+        doc_label = _normalize_label(doc_type) or "document"
+        default_section = f"{doc_label}_overview"
+        base_metadata = {
+            "document_type": doc_label,
+            "source_type": doc_label.title() if doc_label else "Document",
+            "title": doc_label.replace("_", " ").title() or "Document",
+        }
+
+        try:
+            structured = self._layout_parser.from_text(cleaned, scanned=False)
+            semantic_chunks = self._semantic_chunker.build_from_structured(
+                structured,
+                document_type=doc_label or "document",
+                base_metadata=base_metadata,
+                title_hint=base_metadata["title"],
+                default_section=default_section,
+            )
+        except Exception:
+            logger.debug(
+                "Semantic chunking failed; falling back to token-based splitter",
+                exc_info=True,
+            )
+            semantic_chunks = []
+
+        if semantic_chunks:
+            return [chunk.content for chunk in semantic_chunks if chunk.content.strip()]
+
         try:
             import tiktoken
+
             enc = tiktoken.get_encoding("cl100k_base")
-            tokens = enc.encode(text)
+            tokens = enc.encode(cleaned)
             step = max_tokens - overlap if max_tokens > overlap else max_tokens
-            chunks = []
+            slices: List[str] = []
             for i in range(0, len(tokens), step):
-                chunk_tokens = tokens[i: i + max_tokens]
-                chunks.append(enc.decode(chunk_tokens))
-            return chunks
+                chunk_tokens = tokens[i : i + max_tokens]
+                decoded = enc.decode(chunk_tokens)
+                if decoded.strip():
+                    slices.append(decoded)
+            if slices:
+                return slices
         except Exception:
-            max_chars = max_tokens
-            step = max_chars - overlap if max_chars > overlap else max_chars
-            return [text[i: i + max_chars] for i in range(0, len(text), step)]
+            logger.debug(
+                "Token chunking fallback failed; reverting to character windows",
+                exc_info=True,
+            )
+
+        max_chars = max_tokens * 4
+        step_chars = max_chars - overlap * 4 if max_chars > overlap * 4 else max_chars
+        return [
+            cleaned[i : i + max_chars]
+            for i in range(0, len(cleaned), max(1, step_chars))
+            if cleaned[i : i + max_chars].strip()
+        ]
 
     # ============================ NORMALIZE / VALIDATE ====================
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:

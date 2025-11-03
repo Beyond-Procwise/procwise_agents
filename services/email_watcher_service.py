@@ -14,9 +14,11 @@ from repositories import (
     draft_rfq_emails_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
 from services.email_watcher import EmailWatcher, EmailWatcherConfig
+from services.event_bus import get_event_bus
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -219,6 +221,7 @@ def run_email_watcher_for_workflow(
     negotiation_agent: Optional[Any] = None,
     process_routing_service: Optional[Any] = None,
     max_workers: int = 8,
+    workflow_memory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
 
@@ -227,6 +230,7 @@ def run_email_watcher_for_workflow(
     _ = orchestrator
     _ = max_workers
     _ = lookback_minutes
+    _ = workflow_memory
 
     workflow_key = (workflow_id or "").strip()
     if not workflow_key:
@@ -413,7 +417,7 @@ def run_email_watcher_for_workflow(
             missing_fields.append("subject")
 
         if missing_fields:
-            missing_required_fields[identifier] = missing_fields
+            missing_required_fields[unique_id] = missing_fields
             continue
 
     if missing_message_ids:
@@ -694,6 +698,48 @@ class EmailWatcherService:
         self._thread: Optional[threading.Thread] = None
         self._forced_lock = threading.Lock()
         self._forced_workflows: Set[str] = set()
+
+    def watch_workflow(
+        self,
+        *,
+        workflow_id: str,
+        run_id: Optional[str],
+        wait_seconds_after_last_dispatch: int = 0,
+        lookback_minutes: int = 240,
+        mailbox_name: Optional[str] = None,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+        process_routing_service: Optional[Any] = None,
+        max_workers: int = 8,
+        workflow_memory: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run the watcher synchronously for ``workflow_id``.
+
+        This helper mirrors :func:`run_email_watcher_for_workflow` while
+        defaulting to dependencies captured by the service instance.  It is
+        primarily used by orchestration flows that need to force a watcher
+        pass immediately after dispatch without waiting for the background
+        loop.
+        """
+
+        return self._runner(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            wait_seconds_after_last_dispatch=wait_seconds_after_last_dispatch,
+            lookback_minutes=lookback_minutes,
+            mailbox_name=mailbox_name,
+            agent_registry=agent_registry or self._agent_registry,
+            orchestrator=orchestrator or self._orchestrator,
+            supplier_agent=supplier_agent or self._supplier_agent,
+            negotiation_agent=negotiation_agent or self._negotiation_agent,
+            process_routing_service=(
+                process_routing_service or self._process_router
+            ),
+            max_workers=max_workers,
+            workflow_memory=workflow_memory,
+        )
 
     @staticmethod
     def _env_int(name: str, *, fallback: str) -> int:

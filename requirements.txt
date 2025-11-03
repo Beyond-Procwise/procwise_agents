@@ -29,3 +29,5 @@ langchain-community
 langchain-openai
 langgraph
 httpx
+langcache
+nltk

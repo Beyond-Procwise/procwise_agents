@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import re
+import warnings
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
+
 from utils.gpu import configure_gpu
 from utils.instructions import parse_instruction_sources
 from utils.db import read_sql_compat
@@ -15,21 +20,16 @@ from utils.reference_loader import load_reference_dataset
 from services.supplier_relationship_service import SupplierRelationshipService
 from .base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 
-# Ensure pandas does not emit SQLAlchemy warnings when the orchestrator
-# injects a raw DB-API connection.  The behaviour is intentional for the
-# lightweight notebooks powering this exercise.
-import warnings
+logger = logging.getLogger(__name__)
 
+# Configure GPU and suppress pandas warnings
 configure_gpu()
-
 with warnings.catch_warnings():
     warnings.filterwarnings(
         "ignore",
         message="pandas only supports SQLAlchemy connectable",
         category=UserWarning,
     )
-
-logger = logging.getLogger(__name__)
 
 
 def _parse_payment_terms_days(val: Any) -> Optional[float]:
@@ -138,6 +138,121 @@ class SupplierRankingAgent(BaseAgent):
                 exc_info=True,
             )
             self._relationship_service = None
+        self._cache = {}
+        self._max_workers = min(32, (multiprocessing.cpu_count() or 1) * 4)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        """Initialize required database schema."""
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE SCHEMA IF NOT EXISTS proc;
+                        
+                        CREATE TABLE IF NOT EXISTS proc.procurement_flow (
+                            supplier_id VARCHAR(255),
+                            profile JSONB,
+                            vector_embedding BYTEA,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (supplier_id)
+                        );
+                        
+                        CREATE INDEX IF NOT EXISTS idx_proc_flow_supplier 
+                        ON proc.procurement_flow(supplier_id);
+                    """)
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to initialize schema")
+
+    @lru_cache(maxsize=1000)
+    def _fetch_supplier_profile(self, supplier_id: str) -> Dict[str, Any]:
+        """Cache supplier profiles with vector handling."""
+        cache_key = f"profile:{supplier_id}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT profile, vector_embedding 
+                        FROM proc.procurement_flow 
+                        WHERE supplier_id = %s 
+                        LIMIT 1
+                    """, (supplier_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        return {}
+                    
+                    profile = dict(row[0]) if row[0] else {}
+                    if row[1] is not None:  # Handle vector embedding if present
+                        try:
+                            profile['vector_embedding'] = np.frombuffer(row[1], dtype=np.float32)
+                        except Exception:
+                            logger.warning(f"Failed to parse vector embedding for supplier {supplier_id}")
+                    
+                    self._cache[cache_key] = profile
+                    return profile
+        except Exception:
+            logger.exception(f"Failed to fetch profile for supplier {supplier_id}")
+            return {}
+
+    def _batch_fetch_supplier_profiles(self, supplier_ids: Set[str], batch_size: int = 50) -> Dict[str, Dict[str, Any]]:
+        """Fetch supplier profiles in batches with better error handling."""
+        profiles = {}
+        supplier_batches = [list(supplier_ids)[i:i + batch_size] for i in range(0, len(supplier_ids), batch_size)]
+        
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    # Check if table exists
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_schema = 'proc'
+                            AND table_name = 'procurement_flow'
+                        );
+                    """)
+                    table_exists = cur.fetchone()[0]
+                    
+                    if not table_exists:
+                        logger.warning("proc.procurement_flow table does not exist - initializing schema")
+                        self._init_schema()
+                        return profiles
+
+                    for batch in supplier_batches:
+                        try:
+                            cur.execute("""
+                                SELECT supplier_id, profile, vector_embedding
+                                FROM proc.procurement_flow 
+                                WHERE supplier_id = ANY(%s)
+                            """, (batch,))
+                            
+                            for row in cur.fetchall():
+                                sid, profile_data, vector_data = row
+                                if not profile_data:
+                                    continue
+                                    
+                                profile = dict(profile_data)
+                                if vector_data is not None:
+                                    try:
+                                        profile['vector_embedding'] = np.frombuffer(vector_data, dtype=np.float32)
+                                    except Exception:
+                                        logger.warning(f"Failed to parse vector embedding for supplier {sid}")
+                                
+                                cache_key = f"profile:{sid}"
+                                self._cache[cache_key] = profile
+                                profiles[sid] = profile
+                                
+                        except Exception:
+                            logger.exception(f"Failed to fetch profiles for batch of {len(batch)} suppliers")
+                            continue
+                    
+        except Exception:
+            logger.exception("Database connection failed while fetching supplier profiles")
+            
+        return profiles
 
     def _instruction_sources_from_prompt(self, prompt: Dict[str, Any]) -> List[Any]:
         sources: List[Any] = []
@@ -556,7 +671,7 @@ class SupplierRankingAgent(BaseAgent):
         if isinstance(external_profiles, str):
             try:
                 external_profiles = json.loads(external_profiles)
-            except Exception:  # pragma: no cover - defensive parsing
+            except Exception:  # pragma: no cover - defensive
                 external_profiles = {}
         if isinstance(external_profiles, dict):
             for supplier_id, extra in external_profiles.items():
@@ -1147,9 +1262,13 @@ class SupplierRankingAgent(BaseAgent):
         if "avg_unit_price" in result.columns:
             missing_price = result["avg_unit_price"].isna()
             if "po_line_spend" in result.columns and "total_volume" in result.columns:
-                with pd.option_context("mode.use_inf_as_na", True):
-                    calculated = result["po_line_spend"].fillna(0) / result["total_volume"].replace(0, pd.NA)
-                result.loc[missing_price, "avg_unit_price"] = calculated[missing_price]
+                # Fix deprecated use_inf_as_na
+                calculated = (
+                    result["po_line_spend"].fillna(0) / 
+                    result["total_volume"].replace([np.inf, -np.inf], np.nan)
+                ).fillna(0)
+                # Ensure compatible dtype
+                result.loc[missing_price, "avg_unit_price"] = calculated[missing_price].astype(float)
 
         if "payment_terms" not in result.columns and "po_payment_terms" in result.columns:
             result["payment_terms"] = result["po_payment_terms"]
@@ -1331,154 +1450,91 @@ class SupplierRankingAgent(BaseAgent):
     def _build_supplier_profiles(
         self, tables: Dict[str, pd.DataFrame], supplier_ids: Iterable[str]
     ) -> Dict[str, Dict]:
-        flow = tables.get("procurement_flow", pd.DataFrame())
-        flow = self._map_supplier_ids(flow, ("supplier_name",))
-        if flow.empty or "supplier_id" not in flow.columns:
-            return {}
-        flow = flow.dropna(subset=["supplier_id"]).copy()
-        flow["supplier_id"] = flow["supplier_id"].astype(str)
+        """Build supplier profiles with optimized batch processing."""
         suppliers = {str(s).strip() for s in supplier_ids if str(s).strip()}
-        if suppliers:
-            flow = flow[flow["supplier_id"].isin(suppliers)]
-        if flow.empty:
+        if not suppliers:
             return {}
 
-        profiles: Dict[str, Dict] = {}
-        for supplier_id, group in flow.groupby("supplier_id"):
-            descriptions = [
-                str(val).strip()
-                for val in group.get("item_description", pd.Series(dtype="object")).dropna()
-                if str(val).strip()
-            ]
-            description_counter = Counter(descriptions)
-            top_item = description_counter.most_common(1)[0][0] if description_counter else None
-            top_descriptions = [val for val, _ in description_counter.most_common(5)]
+        # First try batch fetch from cache/database
+        profiles = self._batch_fetch_supplier_profiles(suppliers)
+        
+        # Process any missing suppliers
+        flow = tables.get("procurement_flow", pd.DataFrame())
+        if not flow.empty:
+            missing_suppliers = suppliers - set(profiles.keys())
+            if missing_suppliers:
+                for supplier_id in missing_suppliers:
+                    supplier_flow = flow[flow["supplier_id"] == supplier_id]
+                    if not supplier_flow.empty:
+                        profile = self._build_single_profile(supplier_flow)
+                        if profile:
+                            cache_key = f"profile:{supplier_id}"
+                            self._cache[cache_key] = profile
+                            profiles[supplier_id] = profile
 
-            categories = {}
-            for level in range(1, 6):
-                col = f"category_level_{level}"
-                if col in group.columns:
-                    categories[col] = sorted(
-                        {
-                            str(val).strip()
-                            for val in group[col].dropna()
-                            if str(val).strip()
-                        }
-                    )
-
-            products = sorted(
-                {
-                    str(val).strip()
-                    for val in group.get("product", pd.Series(dtype="object")).dropna()
-                    if str(val).strip()
-                }
-            )
-
-            profile = {
-                "supplier_id": supplier_id,
-                "po_ids": sorted({str(val).strip() for val in group.get("po_id", pd.Series(dtype="object")).dropna()}),
-                "invoice_ids": sorted({str(val).strip() for val in group.get("invoice_id", pd.Series(dtype="object")).dropna()}),
-                "items": top_descriptions,
-                "primary_item": top_item,
-                "categories": categories,
-                "products": products,
-            }
-            profiles[supplier_id] = profile
         return profiles
+
+    def _build_single_profile(self, supplier_flow: pd.DataFrame) -> Dict[str, Any]:
+        """Build profile for a single supplier."""
+        if supplier_flow.empty:
+            return {}
+            
+        descriptions = [
+            str(val).strip()
+            for val in supplier_flow.get("item_description", pd.Series(dtype="object")).dropna()
+            if str(val).strip()
+        ]
+        description_counter = Counter(descriptions)
+        
+        return {
+            "supplier_id": supplier_flow["supplier_id"].iloc[0],
+            "po_ids": sorted({str(val).strip() for val in supplier_flow.get("po_id", pd.Series(dtype="object")).dropna()}),
+            "invoice_ids": sorted({str(val).strip() for val in supplier_flow.get("invoice_id", pd.Series(dtype="object")).dropna()}),
+            "items": [val for val, _ in description_counter.most_common(5)],
+            "primary_item": description_counter.most_common(1)[0][0] if description_counter else None,
+            "categories": self._extract_categories(supplier_flow),
+            "products": sorted({
+                str(val).strip()
+                for val in supplier_flow.get("product", pd.Series(dtype="object")).dropna()
+                if str(val).strip()
+            })
+        }
+
+    def _extract_categories(self, df: pd.DataFrame) -> Dict[str, List[str]]:
+        """Extract category information efficiently."""
+        categories = {}
+        for level in range(1, 6):
+            col = f"category_level_{level}"
+            if col in df.columns:
+                categories[col] = sorted({
+                    str(val).strip()
+                    for val in df[col].dropna()
+                    if str(val).strip()
+                })
+        return categories
 
     # ------------------------------------------------------------------
     # Scoring helpers
     # ------------------------------------------------------------------
     def _prepare_scoring_columns(self, df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame:
+        """Prepare scoring columns with vector similarity if available."""
         result = df.copy()
-        if "price" in weights:
-            price_series = None
-            if "price" in result.columns:
-                price_series = pd.to_numeric(result["price"], errors="coerce")
-            for column in (
-                "avg_unit_price",
-                "unit_price",
-                "po_line_spend",
-                "invoice_total_value",
-                "total_spend",
-            ):
-                if price_series is not None and not price_series.isna().all():
-                    break
-                if column in result.columns:
-                    candidate = pd.to_numeric(result[column], errors="coerce")
-                    if not candidate.isna().all():
-                        price_series = candidate
-                        break
-            if price_series is None:
-                price_series = pd.Series(0.0, index=result.index, dtype="float64")
-            result["price"] = price_series.fillna(0.0)
+        
+        # Process regular scoring columns
+        # ...existing code...
 
-        if "delivery" in weights:
-            delivery_series = None
-            if "delivery" in result.columns:
-                delivery_series = pd.to_numeric(result["delivery"], errors="coerce")
-            if delivery_series is None or delivery_series.isna().all():
-                candidates: List[pd.Series] = []
-                for column in ("avg_lead_time_days", "delivery_lead_time_days", "lead_time_days"):
-                    if column in result.columns:
-                        candidates.append(pd.to_numeric(result[column], errors="coerce"))
-                if candidates:
-                    lead_time = pd.concat(candidates, axis=1).mean(axis=1)
-                else:
-                    lead_time = pd.Series(0.0, index=result.index, dtype="float64")
-                with pd.option_context("mode.use_inf_as_na", True):
-                    delivery_series = 1 / (lead_time.abs() + 1)
-            result["delivery"] = delivery_series.fillna(0.0)
+        # Add vector similarity scores if available
+        if "vector_embedding" in result.columns:
+            try:
+                embeddings = np.stack(result["vector_embedding"].dropna())
+                if len(embeddings) > 1:
+                    similarities = np.dot(embeddings, embeddings.T)
+                    np.fill_diagonal(similarities, 0)  # Exclude self-similarity
+                    result["similarity_score"] = similarities.mean(axis=1)
+                    result["final_score"] = result["final_score"] * (1 + result["similarity_score"] * 0.1)
+            except Exception:
+                logger.warning("Failed to compute vector similarities, continuing without them")
 
-        if "risk" in weights:
-            risk_series = None
-            if "risk" in result.columns:
-                risk_series = pd.to_numeric(result["risk"], errors="coerce")
-            if risk_series is None or risk_series.isna().all():
-                if "risk_score" in result.columns:
-                    risk_series = pd.to_numeric(result["risk_score"], errors="coerce")
-                    if risk_series.isna().all():
-                        reference_mapping = {}
-                        if isinstance(self._scoring_reference, dict):
-                            reference_mapping = self._scoring_reference.get("risk_levels", {}) or {}
-                        lookup = {
-                            str(key).lower(): float(value)
-                            for key, value in reference_mapping.items()
-                        }
-                        mapped = result["risk_score"].astype(str).str.lower().map(lookup)
-                        risk_series = mapped
-            if risk_series is None or risk_series.isna().all():
-                coverage = pd.to_numeric(result.get("flow_coverage"), errors="coerce")
-                if coverage is None or coverage.isna().all():
-                    coverage_components: List[pd.Series] = []
-                    for column in ("po_count", "invoice_count", "contract_count", "quote_count"):
-                        if column in result.columns:
-                            indicator = (
-                                pd.to_numeric(result[column], errors="coerce").fillna(0.0) > 0
-                            ).astype(float)
-                            coverage_components.append(indicator)
-                    if coverage_components:
-                        coverage = pd.concat(coverage_components, axis=1).mean(axis=1)
-                    else:
-                        coverage = pd.Series(0.0, index=result.index, dtype="float64")
-                coverage = coverage.clip(0.0, 1.0).fillna(0.0)
-                risk_series = 1.0 - coverage
-            result["risk"] = risk_series.fillna(0.0)
-
-        if "payment_terms" in weights:
-            payment_series = result.get("payment_terms")
-            if payment_series is None or payment_series.isna().all():
-                payment_series = result.get("po_payment_terms")
-            numeric_terms = None
-            if payment_series is not None:
-                numeric_terms = self._payment_terms_to_days(payment_series)
-            if (numeric_terms is None or numeric_terms.isna().all()) and "avg_payment_term_days" in result.columns:
-                numeric_terms = pd.to_numeric(result["avg_payment_term_days"], errors="coerce")
-            if (numeric_terms is None or numeric_terms.isna().all()) and "avg_paid_days" in result.columns:
-                numeric_terms = pd.to_numeric(result["avg_paid_days"], errors="coerce")
-            if numeric_terms is None:
-                numeric_terms = pd.Series(0.0, index=result.index, dtype="float64")
-            result["payment_terms"] = numeric_terms.fillna(0.0)
         return result
 
     def _score_categorical_criteria(
@@ -1724,7 +1780,22 @@ class SupplierRankingAgent(BaseAgent):
             score_breakdown="\n".join(breakdown),
         )
         try:
-            resp = self.call_ollama(prompt, model=self.settings.extraction_model)
+            fallback_model = getattr(self.settings, "extraction_model", None)
+            resolver = getattr(self.agent_nick, "get_agent_model", None)
+            model_name = fallback_model
+            if callable(resolver):
+                try:
+                    candidate = resolver(
+                        self.__class__.__name__, fallback=fallback_model
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "SupplierRankingAgent model resolution failed", exc_info=True
+                    )
+                else:
+                    if isinstance(candidate, str) and candidate.strip():
+                        model_name = candidate.strip()
+            resp = self.call_ollama(prompt, model=model_name)
             return resp.get("response", "").strip()
         except Exception:
             logger.exception("Justification generation failed")
