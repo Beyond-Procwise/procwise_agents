@@ -405,7 +405,21 @@ class RAGPipeline:
         if not isinstance(answer_text, str) or not answer_text.strip():
             return None
 
-        structured = bool(payload.get("structured")) or answer_text.lstrip().startswith("##")
+        is_feedback_ack = bool(
+            payload.get("structure_type") == "feedback_acknowledgment"
+            or (
+                isinstance(payload.get("feedback"), dict)
+                and payload["feedback"].get("captured")
+                and payload.get("style") == "acknowledgment"
+            )
+        )
+
+        structured = (
+            bool(payload.get("structured"))
+            or answer_text.lstrip().startswith("##")
+            or is_feedback_ack
+        )
+
         if structured:
             formatted_answer = answer_text.strip()
         else:
