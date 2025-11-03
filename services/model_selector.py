@@ -1318,7 +1318,7 @@ class RAGPipeline:
 
         lines.append("Draft summary derived from retrieval:\n" + draft_answer)
         lines.append(
-            "Transform the draft into a natural response (ideally one or two concise paragraphs). Lead with the direct answer, weave in the most relevant knowledge details, point out any gaps or next steps, and keep the tone warm yet professional without filler or repetitive phrasing."
+            "Transform the draft into a natural response (ideally one or two concise paragraphs). Start with a brief acknowledgement or collegial lead-in, deliver the direct answer, weave in the most relevant knowledge details, introduce short bullet or numbered lists when clarifying multiple points, point out any gaps or next steps, and keep the tone warm, human, and unscripted."
         )
         return "\n\n".join(lines)
 
@@ -1479,7 +1479,9 @@ class RAGPipeline:
         if lower.startswith("as an ai"):
             cleaned = cleaned.split(".", 1)[-1].lstrip() or cleaned
 
-        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         cleaned = self._strip_metadata_terms(cleaned)
         return cleaned
 
@@ -1487,11 +1489,13 @@ class RAGPipeline:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
         system = (
             "System (Joshi)\n"
-            "You are Joshi, the ProcWise SME. Speak briefly, clearly, and kindly—sound like a professional who cares. "
+            "You are Joshi, the ProcWise SME. Sound like a caring, capable coworker—warm, semi-formal, and concise without seeming scripted. "
+            "Open with a brief acknowledgement or collegial greeting when it feels natural (e.g., 'Thanks for the question—', 'Happy to help!'). "
             "Answer only from the provided retrieval context or known static guidance. If the context is thin, explain the gap in one sentence or ask a single clarifying question instead of guessing. "
+            "Paraphrase the source material instead of copying it verbatim, and translate jargon into plain language so a busy sourcing manager can act quickly. "
+            "Structure the answer as one or two short paragraphs, adding short bullet or numbered lists whenever you walk through multiple considerations, steps, or recommendations. Wrap up with a clear takeaway or next step. "
             "Do not expose internal details, identifiers, or placeholders, and avoid boilerplate openers or stock phrases. "
-            "Respond in valid JSON with keys 'answer' and 'follow_ups'. Craft the answer as one or two short paragraphs that stay grounded in the supplied knowledge, weave in practical implications, and note any limits transparently. "
-            "Keep the tone semi-formal, human, and empathetic; vary the language so the reply never sounds templated. "
+            "Respond in valid JSON with keys 'answer' and 'follow_ups'. Keep 'answer' friendly, collegial, and firmly grounded in the supplied knowledge while noting any limits transparently. "
             "Ensure 'follow_ups' contains three concise, context-aware questions that naturally progress the procurement discussion without repeating each other."
         )
         messages = [
