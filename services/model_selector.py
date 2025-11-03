@@ -405,10 +405,32 @@ class RAGPipeline:
         if not isinstance(answer_text, str) or not answer_text.strip():
             return None
 
-        formatted_answer = answer_text.strip()
-        follow_up_questions = [
+        is_feedback_ack = bool(
+            payload.get("structure_type") == "feedback_acknowledgment"
+            or (
+                isinstance(payload.get("feedback"), dict)
+                and payload["feedback"].get("captured")
+                and payload.get("style") == "acknowledgment"
+            )
+        )
+
+        structured = (
+            bool(payload.get("structured"))
+            or answer_text.lstrip().startswith("##")
+            or is_feedback_ack
+        )
+
+        if structured:
+            formatted_answer = answer_text.strip()
+        else:
+            formatted_answer = self._format_static_answer(
+                answer_text,
+                question=query,
+                topic=payload.get("topic"),
+            )
+        follow_ups = [
             item.strip()
-            for item in (payload.get("follow_up_questions") or [])
+            for item in (payload.get("related_prompts") or [])
             if isinstance(item, str) and item.strip()
         ][:3]
 
@@ -416,19 +438,17 @@ class RAGPipeline:
         history.append({"query": query, "answer": formatted_answer})
         self.history_manager.save_history(user_id, history)
 
-        retrieved_docs = payload.get("retrieved_documents") or []
-        if not retrieved_docs:
-            retrieved_docs = [
-                {
-                    "source": "static_procurement_qa",
-                    "confidence": confidence,
-                }
-            ]
+        retrieved = {
+            "source": "static_procurement_qa",
+            "topic": payload.get("topic"),
+            "question": payload.get("question"),
+            "confidence": confidence,
+        }
 
         return {
             "answer": formatted_answer,
-            "follow_up_questions": follow_up_questions,
-            "retrieved_documents": retrieved_docs,
+            "follow_ups": follow_ups,
+            "retrieved_documents": [retrieved],
         }
 
     def _extract_text_from_uploads(self, files: List[tuple[bytes, str]]):
@@ -1558,8 +1578,8 @@ class RAGPipeline:
             "Paraphrase the source material instead of copying it verbatim, and translate jargon into plain language so a busy sourcing manager can act quickly. "
             "Structure the answer as one or two short paragraphs, adding short bullet or numbered lists whenever you walk through multiple considerations, steps, or recommendations. Wrap up with a clear takeaway or next step. "
             "Do not expose internal details, identifiers, or placeholders, and avoid boilerplate openers or stock phrases. "
-            "Respond in valid JSON with keys 'answer' and 'follow_up_questions'. Keep 'answer' friendly, collegial, and firmly grounded in the supplied knowledge while noting any limits transparently. "
-            "Ensure 'follow_up_questions' contains three concise, context-aware questions that naturally progress the procurement discussion without repeating each other."
+            "Respond in valid JSON with keys 'answer' and 'follow_ups'. Keep 'answer' friendly, collegial, and firmly grounded in the supplied knowledge while noting any limits transparently. "
+            "Ensure 'follow_ups' contains three concise, context-aware questions that naturally progress the procurement discussion without repeating each other."
         )
         messages = [
             {"role": "system", "content": system},
@@ -1587,18 +1607,13 @@ class RAGPipeline:
                 format="json",
             )
             content = response.get("message", {}).get("content", "")
-            payload = json.loads(content)
-            if isinstance(payload, dict) and "follow_ups" in payload:
-                followups = payload.pop("follow_ups")
-                payload["follow_up_questions"] = followups
-            return payload
+            return json.loads(content)
         except json.JSONDecodeError as e:
             logger.error(f"Error parsing JSON response: {e}")
-            cleaned = content.strip() if isinstance(content, str) else ""
-            return {"answer": cleaned or "Could not generate an answer.", "follow_up_questions": []}
+            return {"answer": content.strip() or "Could not generate an answer.", "follow_ups": []}
         except Exception as e:
             logger.error(f"Error generating answer: {e}")
-            return {"answer": "Could not generate an answer.", "follow_up_questions": []}
+            return {"answer": "Could not generate an answer.", "follow_ups": []}
 
     def answer_question(
         self,
@@ -1877,10 +1892,10 @@ class RAGPipeline:
             history = self.history_manager.get_history(user_id)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
-            follow_up_questions = self._build_followups(query, [])
+            follow_ups = self._build_followups(query, [])
             return {
                 "answer": fallback,
-                "follow_up_questions": follow_up_questions,
+                "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
 
@@ -1910,8 +1925,8 @@ class RAGPipeline:
         answer = self._finalise_llm_answer(
             llm_payload.get("answer"), raw_nltk_features, draft_answer
         )
-        follow_up_questions = self._merge_followups(
-            base_followups, llm_payload.get("follow_up_questions")
+        follow_ups = self._merge_followups(
+            base_followups, llm_payload.get("follow_ups")
         )
 
         history.append({"query": self._redact_identifiers(query), "answer": answer})
@@ -1919,6 +1934,6 @@ class RAGPipeline:
 
         return {
             "answer": answer,
-            "follow_up_questions": follow_up_questions,
+            "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }

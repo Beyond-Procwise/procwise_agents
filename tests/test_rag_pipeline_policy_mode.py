@@ -66,7 +66,7 @@ def test_supplier_history_does_not_trigger_policy_mode(monkeypatch):
     monkeypatch.setattr(
         RAGPipeline,
         "_generate_response",
-        lambda self, prompt, model: {"answer": "LLM answer", "follow_up_questions": []},
+        lambda self, prompt, model: {"answer": "LLM answer", "follow_ups": []},
     )
 
     history_entries = [
