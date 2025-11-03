@@ -58,6 +58,56 @@ def test_upsert_and_search():
     assert {"c", "uploaded_documents", "static_policy"}.issubset(collections)
 
 
+def test_search_prioritises_target_documents_over_policies():
+    class FocusQdrant(DummyQdrant):
+        def search(self, **kwargs):
+            self.search_calls.append(kwargs)
+            name = kwargs.get("collection_name")
+            if name == "static_policy":
+                return [
+                    SimpleNamespace(
+                        id="policy-1",
+                        payload={
+                            "record_id": "policy-1",
+                            "collection_name": name,
+                            "document_type": "policy",
+                            "source_type": "Policy",
+                            "summary": "Policy guidance.",
+                        },
+                        score=0.92,
+                    )
+                ]
+            if name == "c":
+                return [
+                    SimpleNamespace(
+                        id="invoice-77",
+                        payload={
+                            "record_id": "invoice-77",
+                            "collection_name": name,
+                            "document_type": "Invoice",
+                            "source_type": "Invoice",
+                            "summary": "Invoice 77 details.",
+                        },
+                        score=0.55,
+                    )
+                ]
+            return []
+
+    nick = SimpleNamespace(
+        device="cpu",
+        settings=SimpleNamespace(qdrant_collection_name="c", reranker_model="x"),
+        qdrant_client=FocusQdrant(),
+        embedding_model=DummyEmbed(),
+    )
+    rag = RAGService(nick, cross_encoder_cls=DummyCrossEncoder)
+
+    hits = rag.search("Need invoice 77 details and PO reference")
+
+    assert hits, "RAG service should return results"
+    assert hits[0].payload["document_type"].lower() == "invoice"
+    assert any(hit.payload["document_type"].lower() == "invoice" for hit in hits)
+
+
 def test_upsert_gpu_fallback(monkeypatch, caplog):
     monkeypatch.delattr("services.rag_service.faiss.StandardGpuResources", raising=False)
     nick = SimpleNamespace(
