@@ -514,7 +514,7 @@ class ModelTrainingService:
                                 example.get("retrieved_docs", []),
                             ),
                         )
-            conn.commit()
+                conn.commit()
             logger.info("Stored %s RAG training examples", len(examples))
         except Exception:  # pragma: no cover
             logger.exception("Failed to persist RAG training examples")
