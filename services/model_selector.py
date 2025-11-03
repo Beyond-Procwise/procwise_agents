@@ -930,6 +930,7 @@ class RAGPipeline:
             if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
+            cleaned_entry["_focus_score"] = float(entry.get("_ordering_score", 0.0))
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
             if key:
@@ -940,12 +941,38 @@ class RAGPipeline:
         if len(selected) < min(limit, len(sortable)):
             for entry in sortable:
                 candidate = dict(entry)
+                candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
                 candidate.pop("_ordering_score", None)
                 if candidate in selected:
                     continue
                 selected.append(candidate)
                 if len(selected) >= limit:
                     break
+
+        primary_collection = getattr(self.rag, "primary_collection", "")
+        if primary_collection:
+            has_primary_focus = any(
+                item.get("collection") == primary_collection for item in selected
+            )
+            if not has_primary_focus:
+                primary_candidates: List[Dict[str, Any]] = []
+                for entry in sortable:
+                    if entry.get("collection") != primary_collection:
+                        continue
+                    candidate = dict(entry)
+                    candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
+                    candidate.pop("_ordering_score", None)
+                    primary_candidates.append(candidate)
+                if primary_candidates:
+                    replacement = primary_candidates[0]
+                    if len(selected) < limit:
+                        selected.append(replacement)
+                    else:
+                        lowest_idx = min(
+                            range(len(selected)),
+                            key=lambda idx: selected[idx].get("_focus_score", 0.0),
+                        )
+                        selected[lowest_idx] = replacement
 
         def _original_index(value: Dict[str, Any]) -> int:
             for idx, item in enumerate(items):
@@ -954,7 +981,10 @@ class RAGPipeline:
             return len(items)
 
         selected.sort(key=_original_index)
-        return selected[:limit]
+        trimmed = selected[:limit]
+        for entry in trimmed:
+            entry.pop("_focus_score", None)
+        return trimmed
 
     def _format_primary_statement(self, item: Dict[str, Any]) -> str:
         snippet = self._extract_snippet(item)

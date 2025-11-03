@@ -1357,12 +1357,12 @@ class RAGService:
     def _looks_like_policy_query(
         self, query: str, hint_text: Optional[str]
     ) -> bool:
-        combined = " ".join(
-            part.strip().lower()
-            for part in (query or "", hint_text or "")
-            if part and part.strip()
+        """Detect policy-focused prompts without over-weighting conversation memory."""
+
+        query_text = " ".join(
+            part.strip().lower() for part in (query or "",) if part and part.strip()
         )
-        if not combined:
+        if not query_text:
             return False
 
         policy_tokens = (
@@ -1377,7 +1377,27 @@ class RAGService:
             "non-approved",
             "delegation of authority",
         )
-        return any(token in combined for token in policy_tokens)
+        if any(token in query_text for token in policy_tokens):
+            return True
+
+        if not hint_text:
+            return False
+
+        history_text = hint_text.strip().lower()
+        if not history_text:
+            return False
+
+        reinforcing_tokens = (
+            "policy exception",
+            "policy breach",
+            "approval matrix",
+            "delegation of authority",
+            "compliance escalation",
+        )
+        soft_cues = ("approval", "compliance", "policy")
+        return any(token in history_text for token in reinforcing_tokens) and any(
+            cue in query_text for cue in soft_cues
+        )
 
     def _merge_filters(
         self,
