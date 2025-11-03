@@ -191,7 +191,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     def _fake_generate_response(self, prompt, model):
         return {
             "answer": "Supplier summary includes s.",
-            "follow_ups": [
+            "follow_up_questions": [
                 "Would you like deeper supplier insights?",
                 "Any other procurement roadblocks I can remove?",
             ],
@@ -235,7 +235,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     assert "[redacted" not in result["answer"].lower()
     assert "s" in result["answer"]
     assert "\n-" not in result["answer"]
-    assert len(result["follow_ups"]) == 3
+    assert len(result["follow_up_questions"]) == 3
 
 
 def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
@@ -285,7 +285,7 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     monkeypatch.setattr(
         RAGPipeline,
         "_generate_response",
-        lambda self, prompt, model: {"answer": "", "follow_ups": []},
+        lambda self, prompt, model: {"answer": "", "follow_up_questions": []},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -306,11 +306,12 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
         def run(self, query, user_id, session_id=None, **kwargs):
             payload = {
                 "answer": "Savings are about 14% higher than last year due to improved contract controls and supplier terms.",
-                "topic": "Current Total Savings Year-to-Date",
-                "question": "How does this compare with the same period last year?",
-                "related_prompts": [
+                "follow_up_questions": [
                     "Show me the savings trend over the past 6 months.",
                     "How much is still in the savings pipeline?",
+                ],
+                "retrieved_documents": [
+                    {"collection": "static_faq", "title": "Current Total Savings Year-to-Date"}
                 ],
             }
             return AgentOutput(status=AgentStatus.SUCCESS, data=payload, confidence=0.82)
@@ -368,7 +369,7 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
     assert "Sure" not in answer
     assert "14% higher" in answer
     assert answer.splitlines()[-1] in RAGPipeline._STATIC_CLOSINGS
-    assert result["follow_ups"] == [
+    assert result["follow_up_questions"] == [
         "Show me the savings trend over the past 6 months.",
         "How much is still in the savings pipeline?",
     ]
@@ -385,13 +386,8 @@ def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
         def run(self, query, user_id, session_id=None, **kwargs):
             payload = {
                 "answer": ack_message,
-                "structured": False,
-                "structure_type": "feedback_acknowledgment",
-                "style": "acknowledgment",
-                "feedback": {"captured": True},
-                "topic": "feedback_acknowledgment",
-                "question": "thank you",
-                "related_prompts": [],
+                "follow_up_questions": [],
+                "retrieved_documents": [],
             }
             return AgentOutput(status=AgentStatus.SUCCESS, data=payload, confidence=0.95)
 
@@ -439,7 +435,7 @@ def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
 
     assert result["answer"] == ack_message
     assert "For your question" not in result["answer"]
-    assert result["follow_ups"] == []
+    assert result["follow_up_questions"] == []
     assert history_sink.get("saved")
 
 
@@ -487,7 +483,7 @@ def test_pipeline_uploaded_context_mode(monkeypatch):
     monkeypatch.setattr(
         RAGPipeline,
         "_generate_response",
-        lambda self, prompt, model: {"answer": "Uploaded insight", "follow_ups": []},
+        lambda self, prompt, model: {"answer": "Uploaded insight", "follow_up_questions": []},
     )
 
     nick = SimpleNamespace(
@@ -523,7 +519,7 @@ def test_pipeline_uploaded_context_mode(monkeypatch):
         doc.get("collection_name") == "uploaded_documents"
         for doc in result["retrieved_documents"]
     )
-    assert len(result["follow_ups"]) == 3
+    assert len(result["follow_up_questions"]) == 3
 
 
 def test_pipeline_uploaded_context_scoped_to_session(monkeypatch):
@@ -573,7 +569,7 @@ def test_pipeline_uploaded_context_scoped_to_session(monkeypatch):
     monkeypatch.setattr(
         RAGPipeline,
         "_generate_response",
-        lambda self, prompt, model: {"answer": "Insight", "follow_ups": []},
+        lambda self, prompt, model: {"answer": "Insight", "follow_up_questions": []},
     )
 
     nick = SimpleNamespace(
