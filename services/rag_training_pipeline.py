@@ -300,7 +300,13 @@ class LayeredRAGTrainer:
             summary_intro = example.get("summary_intro")
             actions_lead = example.get("actions_lead")
             fallback = example.get("fallback")
-            follow_ups = example.get("follow_ups")
+            follow_ups = (
+                example.get("follow_up_questions")
+                if isinstance(example, dict)
+                else None
+            )
+            if not follow_ups:
+                follow_ups = example.get("follow_ups") if isinstance(example, dict) else None
 
             if isinstance(acknowledgement, str) and acknowledgement.strip():
                 guidelines.setdefault("acknowledgements", [])
