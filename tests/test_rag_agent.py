@@ -45,7 +45,8 @@ def test_rag_agent_returns_static_answer(agent):
     result = agent.run("What is our current total savings year to date?", "user-1")
     assert result.status == AgentStatus.SUCCESS
     answer = result.data["answer"]
-    assert answer.startswith("## Summary")
+    assert "I checked both our procurement records" in answer
+    assert "## Summary" in answer
     assert "Looking at the spend position" in answer
     assert "Key figures that anchor the conversation" in answer
     assert result.data["structure_type"] == "financial_analysis"
@@ -68,7 +69,7 @@ def test_rag_agent_maintains_topic_context(agent):
         session_id="session-A",
     )
     assert follow_up.data["topic"] == first.data["topic"]
-    assert follow_up.data["answer"].startswith("## Overview")
+    assert "## Overview" in follow_up.data["answer"]
     assert "Thanks for checking in about" in follow_up.data["answer"]
 
 
@@ -80,4 +81,4 @@ def test_rag_agent_switches_topic_on_new_question(agent):
         session_id="session-B",
     )
     assert next_answer.data["topic"] == "Business Expenses That Cannot Be Claimed"
-    assert next_answer.data["answer"].startswith("## What Business Expenses Can I Not Claim Policy")
+    assert "## What Business Expenses Can I Not Claim Policy" in next_answer.data["answer"]

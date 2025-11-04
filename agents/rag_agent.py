@@ -13,6 +13,7 @@ import numpy as np
 
 from .base_agent import AgentOutput, AgentStatus, BaseAgent
 from services.feedback_service import FeedbackSentiment, FeedbackService
+from services.rag_service import RAGService
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,11 @@ class RAGAgent(BaseAgent):
         self._session_topics: Dict[Tuple[str, str], int] = {}
         self.feedback_service = FeedbackService(agent_nick)
         self._last_interaction: Dict[str, Any] = {}
+        try:
+            self.rag_service = RAGService(agent_nick)
+        except Exception:
+            logger.exception("Failed to initialise RAGService for RAGAgent", exc_info=True)
+            self.rag_service = None
         self._ensure_index()
 
     # ------------------------------------------------------------------
@@ -205,7 +211,7 @@ class RAGAgent(BaseAgent):
 
         self._session_topics[key] = topic_index
 
-        record_id = f"static-{topic_index}-{question_index}"
+        record_id = self._build_static_source_label(topic_entry, qa_entry)
         payload = {
             "record_id": record_id,
             "topic": topic_entry.topic,
@@ -215,8 +221,30 @@ class RAGAgent(BaseAgent):
         }
         docs = [SimpleNamespace(payload=payload)]
 
-        answer_scope = self._compose_answer_scope(topic_entry, question_index, depth_mode)
-        extracted = self._extract_answer_signals(answer_scope, record_id, depth_mode)
+        (
+            dynamic_docs,
+            primary_docs,
+            policy_docs,
+            dynamic_scope,
+        ) = self._fetch_combined_context(classification_query, session_id)
+        if dynamic_docs:
+            docs.extend(dynamic_docs)
+
+        source_labels = self._collect_source_labels(docs)
+
+        if dynamic_scope:
+            answer_scope = self._merge_context_texts(
+                qa_entry.answer, dynamic_scope, depth_mode
+            )
+        else:
+            answer_scope = self._compose_answer_scope(
+                topic_entry, question_index, depth_mode
+            )
+
+        source_hint = source_labels[0] if source_labels else record_id
+        extracted = self._extract_answer_signals(answer_scope, source_hint, depth_mode)
+        if source_labels:
+            extracted["source_ids"] = source_labels[:5]
         query_type = self._classify_query_type(classification_query)
         plan = self._plan_response_structure(classification_query, query_type, extracted)
 
@@ -227,6 +255,7 @@ class RAGAgent(BaseAgent):
                 topic_entry=topic_entry,
                 focus_answer=qa_entry.answer,
                 depth_mode=depth_mode,
+                policy_docs=policy_docs,
             )
 
         structured_answer = self._generate_structured_response(
@@ -237,6 +266,11 @@ class RAGAgent(BaseAgent):
             depth_mode=depth_mode,
             policy_payload=policy_payload,
         )
+        if not primary_docs and not policy_docs:
+            fallback = self._compose_no_context_message(classification_query)
+            structured_answer = (
+                f"{fallback}\n\n{structured_answer}" if structured_answer else fallback
+            )
         if ack_prefix:
             structured_answer = (
                 f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
@@ -270,8 +304,8 @@ class RAGAgent(BaseAgent):
 
         agentic_plan = (
             "1. Match the query to the closest procurement topic.\n"
-            "2. Retrieve the exact answer from the static knowledge base.\n"
-            "3. Shape a structured response with contextual follow-ups."
+            "2. Pull context from procurement records and policy guidance via Qdrant.\n"
+            "3. Blend the findings into a structured, human-friendly summary."
         )
 
         context_snapshot = {
@@ -279,6 +313,8 @@ class RAGAgent(BaseAgent):
             "question_similarity": float(question_score),
             "session_topic": topic_entry.topic,
             "response_depth": depth_mode,
+            "procurement_hits": len(primary_docs),
+            "policy_hits": len(policy_docs),
         }
 
         if continuation_requested:
@@ -306,7 +342,7 @@ class RAGAgent(BaseAgent):
             "session_id": session_id,
             "query": classification_query,
             "response": structured_answer,
-            "doc_ids": [record_id],
+            "doc_ids": source_labels if source_labels else [record_id],
             "topic": topic_entry.topic,
             "query_type": query_type,
             "topic_index": topic_index,
@@ -389,6 +425,181 @@ class RAGAgent(BaseAgent):
             )
 
         return tuple(topics)
+
+    def _build_static_source_label(
+        self, topic_entry: TopicRecord, qa_entry: QARecord
+    ) -> str:
+        topic = (topic_entry.topic or "ProcWise reference").strip()
+        question = (qa_entry.question or "").strip()
+        if question:
+            base = f"{topic} — {question}"
+        else:
+            base = topic
+        return f"{base} (Reference Note)"
+
+    def _fetch_combined_context(
+        self, query: str, session_id: Optional[str]
+    ) -> Tuple[List[SimpleNamespace], List[SimpleNamespace], List[SimpleNamespace], str]:
+        if not self.rag_service:
+            return [], [], [], ""
+
+        try:
+            collections = []
+            primary_collection = getattr(
+                self.rag_service, "primary_collection", None
+            )
+            policy_collection = getattr(
+                self.rag_service, "static_policy_collection", None
+            )
+            if primary_collection:
+                collections.append(primary_collection)
+            if policy_collection and policy_collection != primary_collection:
+                collections.append(policy_collection)
+
+            hits = self.rag_service.search(
+                query,
+                top_k=8,
+                session_id=session_id,
+                collections=collections or None,
+            )
+        except Exception:
+            logger.exception("RAG search failed inside RAGAgent", exc_info=True)
+            return [], [], [], ""
+
+        if not hits:
+            return [], [], [], ""
+
+        primary_docs: List[SimpleNamespace] = []
+        policy_docs: List[SimpleNamespace] = []
+        combined_segments: List[str] = []
+
+        for index, hit in enumerate(hits):
+            payload = dict(getattr(hit, "payload", {}) or {})
+            nested_payload = payload.get("payload")
+            if isinstance(nested_payload, dict):
+                payload = {**nested_payload, **payload}
+                payload.pop("payload", None)
+
+            collection = payload.get("collection_name")
+            if not isinstance(collection, str) or not collection.strip():
+                collection = primary_collection or "procwise_document_embeddings"
+
+            summary = self._extract_summary_from_payload(payload)
+            title = self._extract_title_from_payload(payload)
+            document_type = payload.get("document_type") or payload.get("source_type")
+            source_label = self._build_source_label_from_details(
+                title, document_type, collection
+            )
+
+            sanitized_payload = {
+                "record_id": source_label,
+                "summary": summary,
+                "document_type": document_type,
+                "collection_name": collection,
+                "source_label": source_label,
+            }
+
+            for extra_key in (
+                "highlights",
+                "policy_references",
+                "sections",
+                "key_points",
+            ):
+                value = payload.get(extra_key)
+                if value:
+                    sanitized_payload[extra_key] = value
+
+            doc = SimpleNamespace(
+                payload=sanitized_payload,
+                score=float(getattr(hit, "combined_score", getattr(hit, "score", 0.0))),
+            )
+
+            if summary:
+                if collection == policy_collection:
+                    combined_segments.append(f"Policy insight: {summary}")
+                else:
+                    combined_segments.append(f"Procurement context: {summary}")
+
+            if collection == policy_collection:
+                policy_docs.append(doc)
+            else:
+                primary_docs.append(doc)
+
+        dynamic_docs = primary_docs + policy_docs
+        combined_scope = "\n\n".join(combined_segments).strip()
+        return dynamic_docs, primary_docs, policy_docs, combined_scope
+
+    def _extract_summary_from_payload(self, payload: Dict[str, Any]) -> str:
+        for key in ("text_summary", "summary", "content", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        highlights = payload.get("highlights")
+        if isinstance(highlights, (list, tuple)):
+            for item in highlights:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+        return ""
+
+    def _extract_title_from_payload(self, payload: Dict[str, Any]) -> str:
+        for key in ("title", "document_title", "document_name", "source_name"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _build_source_label_from_details(
+        self, title: str, document_type: Optional[str], collection: str
+    ) -> str:
+        collection_lower = (collection or "").lower()
+        if "policy" in collection_lower:
+            collection_label = "Policy Library"
+        else:
+            collection_label = "Procurement Records"
+
+        doc_label = (document_type or "").strip()
+        if doc_label:
+            doc_label = doc_label.title()
+
+        base = title or doc_label or "Context"
+        base = re.sub(r"\s+", " ", base).strip()
+        if len(base) > 80:
+            base = base[:77].rstrip() + "…"
+        return f"{base} ({collection_label})"
+
+    def _collect_source_labels(self, docs: List[SimpleNamespace]) -> List[str]:
+        labels: List[str] = []
+        for doc in docs:
+            payload = getattr(doc, "payload", {}) or {}
+            label = payload.get("source_label") or payload.get("record_id")
+            if isinstance(label, str):
+                cleaned = label.strip()
+                if cleaned and cleaned not in labels:
+                    labels.append(cleaned)
+        return labels
+
+    def _merge_context_texts(
+        self, static_answer: str, dynamic_scope: str, depth_mode: str
+    ) -> str:
+        static_clean = (static_answer or "").strip()
+        dynamic_clean = (dynamic_scope or "").strip()
+        if not dynamic_clean:
+            return static_clean
+        if not static_clean:
+            return dynamic_clean
+        if depth_mode == "expanded":
+            return f"{dynamic_clean}\n\nAdditional reference detail: {static_clean}"
+        return f"{dynamic_clean}\n\nReference note: {static_clean}"
+
+    def _compose_no_context_message(self, query: str) -> str:
+        focus = self._derive_focus_from_query(query)
+        focus_text = focus or "this request"
+        return (
+            "I checked both our procurement records and policy library but couldn't "
+            f"find anything specific about {focus_text}. To keep things moving, please "
+            "log the details in ProcWise or reach out to the procurement operations "
+            "team so we can capture the right guidance."
+        )
 
     def _encode_texts(self, texts: List[str]) -> np.ndarray:
         embedder = self.agent_nick.embedding_model
@@ -805,8 +1016,6 @@ class RAGAgent(BaseAgent):
                 if supplier.get("metrics"):
                     for metric in supplier["metrics"]:
                         bullet_lines.append(f"  - {metric}")
-                if supplier.get("source_id"):
-                    bullet_lines.append(f"  - Source: {supplier['source_id']}")
                 primary_lines.extend(bullet_lines)
             sections.append("\n".join(primary_lines).strip())
 
@@ -837,9 +1046,6 @@ class RAGAgent(BaseAgent):
             summary_lines = ["Key figures that anchor the conversation:"]
             for key, value in financial_data["totals"].items():
                 summary_lines.append(f"- **{key}:** {value}")
-            source = data.get("source_ids", [None])[0]
-            if source:
-                summary_lines.append(f"- Source: {source}")
             sections.append("\n".join(summary_lines).strip())
 
         breakdown_rows = financial_data.get("breakdown") or []
@@ -945,6 +1151,7 @@ class RAGAgent(BaseAgent):
         topic_entry: TopicRecord,
         focus_answer: str,
         depth_mode: str,
+        policy_docs: Sequence[SimpleNamespace] = (),
     ) -> Dict[str, Any]:
         categories: Dict[str, List[str]] = defaultdict(list)
 
@@ -984,8 +1191,39 @@ class RAGAgent(BaseAgent):
             if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
                 categories["requirements"].extend(sentences)
 
+        doc_overview_candidates: List[str] = []
+        for doc in policy_docs or []:
+            payload = getattr(doc, "payload", {}) or {}
+            summary = payload.get("summary") or ""
+            if summary:
+                doc_overview_candidates.append(summary)
+            sentences = self._split_sentences(summary)
+            for sentence in sentences:
+                clause = self._clean_policy_clause(sentence)
+                lowered = clause.lower()
+                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
+                    categories["requirements"].append(clause)
+                if re.search(
+                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
+                    lowered,
+                ):
+                    categories["restrictions"].append(clause)
+                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
+                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
+                    lowered,
+                ):
+                    categories["spending_limits"].append(clause)
+                if re.search(r"approval|approve|authoris|manager|finance", lowered):
+                    categories["approval_process"].append(clause)
+                if re.search(r"for example|such as|e.g.|include", lowered):
+                    categories["examples"].append(clause)
+                if re.search(r"unless|exception|exemption|waiver", lowered):
+                    categories["exceptions"].append(clause)
+
         overview_sentences = self._split_sentences(focus_answer)
         overview = overview_sentences[0] if overview_sentences else focus_answer
+        if doc_overview_candidates:
+            overview = doc_overview_candidates[0]
 
         payload = {
             "policy_name": policy_name,
@@ -999,7 +1237,6 @@ class RAGAgent(BaseAgent):
         }
 
         if depth_mode == "expanded":
-            # Allow more contextual statements when expanding.
             for key in ["requirements", "restrictions", "spending_limits", "approval_process"]:
                 values = payload[key]
                 if not values and payload["overview"]:
@@ -1279,9 +1516,6 @@ class RAGAgent(BaseAgent):
         response = (
             f"On {focus or 'this point'}, here's what the notes say: " + " ".join(sentences)
         )
-        source_ids = data.get("source_ids", [])
-        if source_ids:
-            response += f" (Source: {source_ids[0]})"
         return response
 
     def _extract_supplier_info(
